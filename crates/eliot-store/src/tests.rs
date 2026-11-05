@@ -6260,7 +6260,9 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
              DROP TABLE claims;
              DELETE FROM schema_migrations WHERE version = 24;
              DROP TABLE owned_exits;
-             DELETE FROM schema_migrations WHERE version = 25;",
+             DELETE FROM schema_migrations WHERE version = 25;
+             DROP TABLE native_child_registrations;
+             DELETE FROM schema_migrations WHERE version = 26;",
         )
         .expect("roll back to schema 16");
     drop(store);

@@ -1,4 +1,7 @@
-use eliot_core::{Error, ProviderRestriction, Result, SecretPolicy};
+use crate::native_child::{
+    ChildBinding, binding_from_ack, build_registration, is_admission_rejection, register_child,
+};
+use eliot_core::{ChildRegistration, Error, ProviderRestriction, Result, SecretPolicy, SourceGap};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     protocol::MAX_COMMAND_ID_BYTES,
@@ -10,10 +13,15 @@ use eliot_plugin::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    future::Future,
+    pin::Pin,
+    time::Duration,
+};
 use tokio::{
     sync::{mpsc, oneshot, watch},
-    time::{Instant, timeout_at},
+    time::{Instant, MissedTickBehavior, interval, timeout_at},
 };
 
 use crate::native::{
@@ -35,6 +43,10 @@ const RESOLVED_REQUEST_HISTORY: usize = 128;
 /// generation; overflow is a source gap.
 const MAX_CHILD_THREADS: usize = 256;
 const MAX_CHANGED_PATHS: usize = 1_000;
+/// Independent child-gap retry cadence: the event loop drives ONE retained
+/// child gap per tick until its canonical ACK or shutdown. Same 1s cadence
+/// as the host live poll; private, not a public quota config.
+const CHILD_GAP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventStatus {
@@ -63,6 +75,7 @@ pub(crate) struct EventConfig {
     pub agent_id: String,
     pub generation: i64,
     pub secrets: Vec<String>,
+    pub native_scope: String,
 }
 
 pub(crate) struct EventHandle {
@@ -167,7 +180,108 @@ struct EventProcessor {
     writes_blocked: bool,
     gap_reported: bool,
     final_text: Option<String>,
+    native_scope: String,
+    child_bindings: HashMap<String, ChildBinding>,
+    child_states: HashMap<String, ChildState>,
+    child_buffers: HashMap<String, VecDeque<BufferedNativeFrame>>,
+    child_buffer_bytes: usize,
+    child_unknown: HashSet<String>,
+    child_early_lost: HashSet<String>,
+    child_pending: HashMap<String, ChildRegistration>,
     children: ChildThreads,
+    gap_last_served: Option<String>,
+}
+
+struct ChildState {
+    binding: ChildBinding,
+    writes_blocked: bool,
+    gap_reported: bool,
+    gap_number: u64,
+    source_unknown: bool,
+    batch_unknown: bool,
+    failure: Option<String>,
+    final_text: Option<String>,
+    active_turn_id: Option<String>,
+    ready_committed: bool,
+    pending_gap: Option<SourceGap>,
+}
+
+impl ChildState {
+    fn new(binding: ChildBinding) -> Self {
+        Self {
+            binding,
+            writes_blocked: false,
+            gap_reported: false,
+            gap_number: 0,
+            source_unknown: false,
+            batch_unknown: false,
+            failure: None,
+            final_text: None,
+            active_turn_id: None,
+            ready_committed: false,
+            pending_gap: None,
+        }
+    }
+
+    async fn commit_event(
+        &mut self,
+        sink: &mut CommitSink,
+        host: &PeerClient,
+        credential: &str,
+        kind: &str,
+        native_id: String,
+        data: Value,
+    ) -> Result<()> {
+        // Split disjoint field borrows: the source borrows latches, `pending`
+        // borrows only the retained gap slot.
+        let pending = &mut self.pending_gap;
+        let mut source = StreamSource {
+            sink,
+            host,
+            credential,
+            agent_id: &self.binding.agent_id,
+            generation: self.binding.agent_generation,
+            harness: "Codex",
+            id_prefix: "codex",
+            families: &eliot_core::NATIVE_CHILD_FAMILIES,
+            writes_blocked: &mut self.writes_blocked,
+            gap_reported: &mut self.gap_reported,
+            gap_number: &mut self.gap_number,
+            source_unknown: &mut self.source_unknown,
+            batch_unknown: &mut self.batch_unknown,
+            failure: &mut self.failure,
+        };
+        source
+            .commit_event_with_retained(kind, native_id, data, pending)
+            .await
+    }
+
+    async fn record_gap(
+        &mut self,
+        sink: &mut CommitSink,
+        host: &PeerClient,
+        credential: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let pending = &mut self.pending_gap;
+        let mut source = StreamSource {
+            sink,
+            host,
+            credential,
+            agent_id: &self.binding.agent_id,
+            generation: self.binding.agent_generation,
+            harness: "Codex",
+            id_prefix: "codex",
+            families: &eliot_core::NATIVE_CHILD_FAMILIES,
+            writes_blocked: &mut self.writes_blocked,
+            gap_reported: &mut self.gap_reported,
+            gap_number: &mut self.gap_number,
+            source_unknown: &mut self.source_unknown,
+            batch_unknown: &mut self.batch_unknown,
+            failure: &mut self.failure,
+        };
+        source.record_gap_with_retained(reason, pending).await
+    }
 }
 
 /// Native subagent threads of the owned thread. Their frames are not this
@@ -178,28 +292,77 @@ struct EventProcessor {
 #[derive(Default)]
 struct ChildThreads {
     confirmed: HashSet<String>,
-    pending_spawns: HashSet<String>,
-    unconfirmed: HashSet<String>,
+    pending_spawns: HashMap<String, HashSet<String>>,
+    unconfirmed: HashMap<String, Option<String>>,
+    bound: HashSet<String>,
+    parents: HashMap<String, String>,
+    spawn_items: HashMap<String, String>,
 }
 
 impl ChildThreads {
-    /// Whether a frame of `thread` (never the owned thread) belongs to a child.
     fn take_frame(&mut self, thread: &str) -> std::result::Result<bool, &'static str> {
-        if self.confirmed.contains(thread) {
+        if self.confirmed.contains(thread) || self.bound.contains(thread) {
             return Ok(true);
         }
-        if self.pending_spawns.is_empty() {
+        if self.unconfirmed.contains_key(thread) {
+            return Ok(true);
+        }
+        if !self.has_any_window() {
             return Ok(false);
         }
-        if self.unconfirmed.len() >= MAX_CHILD_THREADS && !self.unconfirmed.contains(thread) {
+        if self.unconfirmed.len() >= MAX_CHILD_THREADS && !self.unconfirmed.contains_key(thread) {
             return Err("Codex sent frames from more unannounced threads than are tracked");
         }
-        self.unconfirmed.insert(thread.to_owned());
+        self.unconfirmed.insert(thread.to_owned(), None);
         Ok(true)
+    }
+    fn has_any_window(&self) -> bool {
+        self.has_pending()
+    }
+    fn has_pending(&self) -> bool {
+        self.pending_spawns.values().any(|items| !items.is_empty())
+    }
+    fn pending_count(&self) -> usize {
+        self.pending_spawns.values().map(HashSet::len).sum()
+    }
+    fn pending_items<'a>(&'a self, producer: &'a str) -> Vec<&'a String> {
+        self.pending_spawns
+            .get(producer)
+            .map(|items| items.iter().collect::<Vec<_>>())
+            .unwrap_or_default()
+    }
+    fn producers(&self) -> Vec<String> {
+        self.pending_spawns
+            .iter()
+            .filter(|(_, items)| !items.is_empty())
+            .map(|(producer, _)| producer.clone())
+            .collect()
+    }
+    fn settle_all(&mut self) -> std::result::Result<(), &'static str> {
+        let producers = self.producers();
+        if producers.is_empty() && self.unconfirmed.is_empty() {
+            return Ok(());
+        }
+        if producers.is_empty() {
+            self.unconfirmed.clear();
+            return Err("Codex sent frames from a thread no spawn announced");
+        }
+        let mut error = None;
+        for producer in &producers {
+            if let Err(reason) = self.settle(producer)
+                && error.is_none()
+            {
+                error = Some(reason);
+            }
+        }
+        match error {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
     }
 
     fn is_parent(&self, owned: &str, parent: &str) -> bool {
-        parent == owned || self.confirmed.contains(parent)
+        parent == owned || self.confirmed.contains(parent) || self.bound.contains(parent)
     }
 
     fn confirm(&mut self, owned: &str, thread: &str) -> std::result::Result<(), &'static str> {
@@ -211,43 +374,88 @@ impl ChildThreads {
             return Err("Codex announced more native child threads than are tracked");
         }
         self.confirmed.insert(thread.to_owned());
+        self.bound.insert(thread.to_owned());
         Ok(())
     }
 
-    fn spawn_started(&mut self, item_id: String) -> std::result::Result<(), &'static str> {
-        if self.pending_spawns.len() >= MAX_CHILD_THREADS && !self.pending_spawns.contains(&item_id)
-        {
+    fn spawn_started(
+        &mut self,
+        producer: &str,
+        item_id: String,
+    ) -> std::result::Result<(), &'static str> {
+        let known = self
+            .pending_spawns
+            .get(producer)
+            .is_some_and(|items| items.contains(&item_id));
+        if self.pending_count() >= MAX_CHILD_THREADS && !known {
             return Err("Codex had more native spawns in flight than are tracked");
         }
-        self.pending_spawns.insert(item_id);
+        self.pending_spawns
+            .entry(producer.to_owned())
+            .or_default()
+            .insert(item_id);
         Ok(())
     }
 
     fn spawn_completed(
         &mut self,
+        producer: &str,
         owned: &str,
         item_id: &str,
         receivers: &[String],
     ) -> std::result::Result<(), &'static str> {
-        self.pending_spawns.remove(item_id);
+        if let Some(items) = self.pending_spawns.get_mut(producer) {
+            items.remove(item_id);
+        }
         for receiver in receivers {
             self.confirm(owned, receiver)?;
+            self.spawn_items
+                .insert(receiver.clone(), item_id.to_owned());
         }
-        if self.pending_spawns.is_empty() {
-            return self.settle();
+        let items = self.pending_spawns.get(producer);
+        if items.is_none_or(|items| items.is_empty()) {
+            return self.settle(producer);
         }
         Ok(())
     }
 
-    /// No spawn can confirm a thread any more (last spawn done, turn ended or
-    /// stream closed): an unconfirmed thread was never a child.
-    fn settle(&mut self) -> std::result::Result<(), &'static str> {
-        self.pending_spawns.clear();
-        if self.unconfirmed.is_empty() {
+    fn settle(&mut self, producer: &str) -> std::result::Result<(), &'static str> {
+        self.settle_with_retain(producer, false)
+    }
+
+    fn settle_with_retain(
+        &mut self,
+        producer: &str,
+        retain_unattributed: bool,
+    ) -> std::result::Result<(), &'static str> {
+        self.pending_spawns.remove(producer);
+        if retain_unattributed {
             return Ok(());
         }
-        self.unconfirmed.clear();
-        Err("Codex sent frames from a thread no spawn announced")
+        if self.producers().is_empty() {
+            let count = self.unconfirmed.len();
+            self.unconfirmed.clear();
+            if count > 0 {
+                return Err("Codex sent frames from a thread no spawn announced");
+            }
+        }
+        Ok(())
+    }
+
+    fn is_bound(&self, thread: &str) -> bool {
+        self.bound.contains(thread)
+    }
+
+    fn is_unconfirmed(&self, thread: &str) -> bool {
+        self.unconfirmed.contains_key(thread)
+    }
+
+    fn parent_of(&self, thread: &str) -> Option<String> {
+        self.parents.get(thread).cloned()
+    }
+
+    fn spawn_item_of(&self, thread: &str) -> Option<String> {
+        self.spawn_items.get(thread).cloned()
     }
 }
 
@@ -381,7 +589,16 @@ impl EventProcessor {
             writes_blocked: false,
             gap_reported: false,
             final_text: None,
+            native_scope: config.native_scope.clone(),
+            child_bindings: HashMap::new(),
+            child_states: HashMap::new(),
+            child_buffers: HashMap::new(),
+            child_buffer_bytes: 0,
+            child_unknown: HashSet::new(),
+            child_early_lost: HashSet::new(),
+            child_pending: HashMap::new(),
             children: ChildThreads::default(),
+            gap_last_served: None,
         }
     }
 
@@ -491,8 +708,7 @@ impl EventProcessor {
             }
             Some(NativeFrame::Notification { method, params }) => {
                 if self.take_child_frame(&params) {
-                    // Child-thread lifecycle is not attributed to the parent
-                    // generation; L5.3 native child discovery surfaces it.
+                    self.handle_child_notification(&method, params).await;
                     return;
                 }
                 if self.should_buffer(&method, &params) {
@@ -526,9 +742,7 @@ impl EventProcessor {
                 if !self.planned_stop && self.loss_reason.is_none() {
                     self.defer_gap("Codex native event reader closed");
                 }
-                if let Err(reason) = self.children.settle() {
-                    self.defer_gap(reason);
-                }
+                self.settle_child_tracking();
                 self.report_gap_if_queue_empty(true).await;
                 self.finish_pending_end_stop().await;
             }
@@ -551,8 +765,54 @@ impl EventProcessor {
         }
     }
 
-    /// A frame of a confirmed child, or of an unannounced thread while a spawn
-    /// is in flight, is not this generation's lifecycle.
+    fn settle_spawn_window(&mut self) {
+        self.settle_spawn_window_for(self.status.thread_id.clone().unwrap_or_default().as_str());
+    }
+
+    fn retain_unattributed_excluding(&self, excluding: &str) -> bool {
+        self.child_states
+            .iter()
+            .any(|(thread, state)| thread != excluding && state.active_turn_id.is_some())
+    }
+
+    fn settle_spawn_window_for(&mut self, producer: &str) {
+        let retain = self.retain_unattributed_excluding(producer);
+        if let Err(reason) = self.children.settle_with_retain(producer, retain) {
+            self.defer_gap(reason);
+        }
+        self.collect_orphan_child_state();
+    }
+
+    fn settle_child_tracking(&mut self) {
+        let producers: Vec<String> = self.children.producers();
+        if producers.is_empty() {
+            if let Err(reason) = self.children.settle_all() {
+                self.defer_gap(reason);
+            }
+        } else {
+            for producer in &producers {
+                if let Err(reason) = self.children.settle(producer) {
+                    self.defer_gap(reason);
+                }
+            }
+        }
+        self.collect_orphan_child_state();
+        if !self.child_pending.is_empty() {
+            self.defer_gap("Codex child registration acknowledgement is unresolved");
+            let abandoned: Vec<String> = self.child_pending.keys().cloned().collect();
+            for id in abandoned {
+                self.child_pending.remove(&id);
+                self.release_child_buffer(&id);
+                self.child_early_lost.remove(&id);
+                if self.children.is_bound(&id) && self.child_unknown.len() < MAX_CHILD_THREADS {
+                    self.child_unknown.insert(id);
+                }
+            }
+            self.collect_orphan_child_state();
+        }
+    }
+
+    /// Whether this frame is a native-child frame (bounded/unconfirmed/confirmed).
     fn take_child_frame(&mut self, params: &Value) -> bool {
         let Some(thread) = frame_thread_id(params) else {
             return false;
@@ -565,6 +825,16 @@ impl EventProcessor {
         {
             return false;
         }
+        // A thread already retained as unconfirmed while a spawn window was
+        // open must keep routing to the child after that window closes
+        // (e.g. the root turn completed while A was still active). New
+        // unannounced threads still require an open window below.
+        if self.children.is_unconfirmed(thread) {
+            return true;
+        }
+        if self.children.is_bound(thread) || self.child_states.contains_key(thread) {
+            return true;
+        }
         match self.children.take_frame(thread) {
             Ok(taken) => taken,
             Err(reason) => {
@@ -574,8 +844,7 @@ impl EventProcessor {
         }
     }
 
-    /// Track the owned thread's `spawnAgent` calls; a completed spawn confirms
-    /// its `receiverThreadIds`.
+    /// Track spawnAgent calls; completed receivers register before facts publish.
     async fn observe_spawn(&mut self, item: &Value, completed: bool) -> Result<()> {
         let Some((item_id, receivers)) = spawn_call(item) else {
             return Ok(());
@@ -583,19 +852,57 @@ impl EventProcessor {
         let Some(owned) = self.status.thread_id.clone() else {
             return Ok(());
         };
-        let outcome = if completed {
-            self.children.spawn_completed(&owned, &item_id, &receivers)
-        } else {
-            self.children.spawn_started(item_id)
-        };
+        if !completed {
+            return match self.children.spawn_started(&owned, item_id) {
+                Ok(()) => Ok(()),
+                Err(reason) => self.record_gap(reason).await,
+            };
+        }
+        let outcome = self
+            .children
+            .spawn_completed(&owned, &owned, &item_id, &receivers);
+        for receiver in &receivers {
+            if self.children.is_bound(receiver) {
+                self.children
+                    .parents
+                    .insert(receiver.clone(), owned.clone());
+            }
+        }
+        self.collect_orphan_child_state();
         match outcome {
-            Ok(()) => Ok(()),
-            Err(reason) => self.record_gap(reason).await,
+            Ok(()) => self.ensure_receivers_registered(&receivers).await,
+            Err(reason) => {
+                let confirmed: Vec<String> = receivers
+                    .iter()
+                    .filter(|receiver| self.children.is_bound(receiver))
+                    .cloned()
+                    .collect();
+                let ensure_error = self.ensure_receivers_registered(&confirmed).await.err();
+                let gap_result = self.record_gap(reason).await;
+                if let Some(error) = ensure_error {
+                    return Err(error);
+                }
+                gap_result
+            }
         }
     }
 
-    /// A child thread's request has no Eliot principal to answer it yet; reject
-    /// it as unsupported instead of leaving the child waiting.
+    async fn ensure_receivers_registered(&mut self, receivers: &[String]) -> Result<()> {
+        let mut first_error = None;
+        for receiver in receivers {
+            if let Err(error) = self.ensure_child_registered(receiver).await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// A child request stays unsupported; it is never forwarded to control.
     async fn reject_child_request(&mut self, id: Value, method: &str, params: &Value) {
         let rejected = self
             .native
@@ -681,6 +988,7 @@ impl EventProcessor {
                 "Codex event source acknowledgement is unresolved",
             ));
         }
+        self.native_scope = native_scope.clone();
         self.status.thread_id = Some(thread_id.clone());
         let native_id = format!("codex:{thread_id}:session.ready");
         self.commit_event(
@@ -770,8 +1078,13 @@ impl EventProcessor {
                 | BufferedNativeFrame::Request { params, .. } => self.take_child_frame(params),
             };
             if child {
-                if let BufferedNativeFrame::Request { id, method, params } = frame.frame {
-                    self.reject_child_request(id, &method, &params).await;
+                match frame.frame {
+                    BufferedNativeFrame::Request { id, method, params } => {
+                        self.reject_child_request(id, &method, &params).await;
+                    }
+                    BufferedNativeFrame::Notification { method, params } => {
+                        self.handle_child_notification(&method, params).await;
+                    }
                 }
                 continue;
             }
@@ -1363,9 +1676,7 @@ impl EventProcessor {
                 .record_gap("Codex terminal notification did not match the exact active turn")
                 .await;
         }
-        if let Err(reason) = self.children.settle() {
-            self.defer_gap(reason);
-        }
+        self.settle_spawn_window();
         if notification.turn.status == NativeTurnStatus::InProgress {
             return self
                 .record_gap("Codex turn/completed carried a nonterminal inProgress status")
@@ -1443,10 +1754,33 @@ impl EventProcessor {
         {
             let parent = params.get("thread").and_then(spawned_parent_thread);
             if parent.is_some_and(|parent| self.children.is_parent(&owned, parent)) {
-                return match self.children.confirm(&owned, thread_id) {
-                    Ok(()) => Ok(()),
-                    Err(reason) => self.record_gap(reason).await,
-                };
+                let parent = parent.unwrap().to_owned();
+                let spawn_item = params
+                    .get("thread")
+                    .and_then(spawned_item_id)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        let producers = self.children.producers();
+                        if producers.len() == 1 {
+                            self.children
+                                .pending_items(producers[0].as_str())
+                                .into_iter()
+                                .next()
+                                .cloned()
+                        } else {
+                            None
+                        }
+                    });
+                if let Err(reason) = self.children.confirm(&owned, thread_id) {
+                    return self.record_gap(reason).await;
+                }
+                self.children.parents.insert(thread_id.to_owned(), parent);
+                if let Some(spawn_item) = spawn_item {
+                    self.children
+                        .spawn_items
+                        .insert(thread_id.to_owned(), spawn_item);
+                }
+                return self.ensure_child_registered(thread_id).await;
             }
             return self
                 .record_gap("Codex app-server announced a second thread in one Agent generation")
@@ -1511,7 +1845,817 @@ impl EventProcessor {
         self.stream_source().record_gap(reason).await
     }
 
-    /// The shared stream-commit half of this processor.
+    fn has_pending_child_gap(&self) -> bool {
+        self.child_states
+            .values()
+            .any(|state| state.pending_gap.is_some())
+    }
+
+    /// Fair rotation over retained child gaps: the next pending child after
+    /// the last served (sorted thread order, wrap-around), so one bad child
+    /// cannot starve the others. Synchronous; the caller owns the send.
+    fn next_pending_gap(&mut self) -> Option<(String, SourceGap)> {
+        let mut pending: Vec<String> = self
+            .child_states
+            .iter()
+            .filter(|(_, state)| state.pending_gap.is_some())
+            .map(|(thread, _)| thread.clone())
+            .collect();
+        if pending.is_empty() {
+            return None;
+        }
+        pending.sort();
+        let start = self
+            .gap_last_served
+            .as_ref()
+            .and_then(|last| pending.iter().position(|thread| thread > last))
+            .unwrap_or(0);
+        let thread = pending[start % pending.len()].clone();
+        let gap = self.child_states.get(&thread)?.pending_gap.clone()?;
+        self.gap_last_served = Some(thread.clone());
+        Some((thread, gap))
+    }
+
+    /// Apply one owned attempt result to the matching child only.
+    /// Synchronous; holds `&mut` briefly after the RPC completes, never
+    /// across the wait. Reuses the shared latch logic.
+    fn apply_gap_attempt(
+        &mut self,
+        child_thread: &str,
+        attempted: &SourceGap,
+        result: &Result<Value>,
+    ) -> bool {
+        let Some(state) = self.child_states.get_mut(child_thread) else {
+            return false;
+        };
+        if state.binding.agent_id != attempted.agent_id
+            || state.binding.agent_generation != attempted.generation
+            || state.pending_gap.as_ref() != Some(attempted)
+        {
+            return false;
+        }
+        let host = self.host.clone();
+        let credential = self.credential.clone();
+        let sink = &mut self.sink;
+        let pending = &mut state.pending_gap;
+        let mut source = StreamSource {
+            sink,
+            host: &host,
+            credential: &credential,
+            agent_id: &state.binding.agent_id,
+            generation: state.binding.agent_generation,
+            harness: "Codex",
+            id_prefix: "codex",
+            families: &eliot_core::NATIVE_CHILD_FAMILIES,
+            writes_blocked: &mut state.writes_blocked,
+            gap_reported: &mut state.gap_reported,
+            gap_number: &mut state.gap_number,
+            source_unknown: &mut state.source_unknown,
+            batch_unknown: &mut state.batch_unknown,
+            failure: &mut state.failure,
+        };
+        source.apply_retained_attempt(pending, attempted, result)
+    }
+
+    async fn record_child_gap_visible(&mut self, child_thread: &str, reason: &str) {
+        let Some(state) = self.child_states.get_mut(child_thread) else {
+            return;
+        };
+        let host = self.host.clone();
+        let credential = self.credential.clone();
+        let sink = &mut self.sink;
+        // Child metadata uncertainty stays in child scope: the retained gap,
+        // writes_blocked, source_unknown, and failure all live on the child
+        // state. A busy child gap must not set the parent loss_reason (no
+        // false parent source gap, healthy parent steer stays admitted).
+        // Genuine independent parent loss still sets loss_reason on parent
+        // paths; this path never clears it.
+        let _ = state.record_gap(sink, &host, &credential, reason).await;
+    }
+
+    async fn handle_thread_started_error(&mut self, child_thread: &str, error: Error) {
+        if self.child_states.contains_key(child_thread) {
+            let (should_gap, reason) = {
+                let state = self.child_states.get_mut(child_thread).expect("checked");
+                state.source_unknown = true;
+                let reason = format!(
+                    "Codex child thread/started could not be normalized ({})",
+                    error.code
+                );
+                if state.failure.is_none() {
+                    state.failure = Some(error.message);
+                }
+                (!state.gap_reported && !state.writes_blocked, reason)
+            };
+            if should_gap {
+                self.record_child_gap_visible(child_thread, &reason).await;
+            }
+            // A retained gap stands: retries belong to the owned in-flight
+            // driver; frame handling never awaits retained-gap RPCs.
+            return;
+        }
+        if self.child_pending.contains_key(child_thread)
+            || self.child_unknown.contains(child_thread)
+        {
+            return;
+        }
+        let reason = format!(
+            "Codex child thread/started could not be normalized ({})",
+            error.code
+        );
+        let _ = self.record_gap(&reason).await;
+    }
+
+    async fn handle_child_notification(&mut self, method: &str, params: Value) {
+        let Some(child_thread) = frame_thread_id(&params).map(str::to_owned) else {
+            return;
+        };
+        if method == "thread/started" {
+            if let Err(error) = self.observe_thread_started(&params).await {
+                self.handle_thread_started_error(&child_thread, error).await;
+            }
+            return;
+        }
+        if self
+            .child_states
+            .get(&child_thread)
+            .is_some_and(|state| state.pending_gap.is_some())
+        {
+            // Retained gap stands: drop this frame (covered by the gap) and
+            // leave the retry to the owned in-flight driver. Never await
+            // retained-gap RPCs from the frame path.
+            return;
+        }
+        if !self.child_states.contains_key(&child_thread)
+            && !self.children.is_bound(&child_thread)
+            && !self.children.is_unconfirmed(&child_thread)
+            && !self.child_pending.contains_key(&child_thread)
+            && !self.child_unknown.contains(&child_thread)
+        {
+            return;
+        }
+        if !self
+            .child_states
+            .get(&child_thread)
+            .is_some_and(|state| state.ready_committed)
+            && self.child_unknown.contains(&child_thread)
+        {
+            return;
+        }
+        if !self
+            .child_states
+            .get(&child_thread)
+            .is_some_and(|state| state.ready_committed)
+        {
+            if let Some(state) = self.child_states.get(&child_thread)
+                && state.writes_blocked
+            {
+                return;
+            }
+            if self.child_pending.contains_key(&child_thread) {
+                match self.ensure_child_registered(&child_thread).await {
+                    Ok(()) => {
+                        if !self
+                            .child_states
+                            .get(&child_thread)
+                            .is_some_and(|state| state.ready_committed)
+                        {
+                            self.buffer_child_frame(
+                                &child_thread,
+                                BufferedNativeFrame::Notification {
+                                    method: method.to_owned(),
+                                    params,
+                                },
+                            );
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        if self.child_unknown.contains(&child_thread) {
+                            return;
+                        }
+                        self.buffer_child_frame(
+                            &child_thread,
+                            BufferedNativeFrame::Notification {
+                                method: method.to_owned(),
+                                params,
+                            },
+                        );
+                        return;
+                    }
+                }
+            } else {
+                self.buffer_child_frame(
+                    &child_thread,
+                    BufferedNativeFrame::Notification {
+                        method: method.to_owned(),
+                        params,
+                    },
+                );
+                return;
+            }
+        }
+        if let Err(error) = self
+            .process_child_notification(&child_thread, method, params)
+            .await
+        {
+            let (should_gap, reason) = {
+                let Some(state) = self.child_states.get_mut(&child_thread) else {
+                    return;
+                };
+                state.source_unknown = true;
+                let reason = format!(
+                    "Codex child {method} notification could not be normalized ({})",
+                    error.code
+                );
+                if state.failure.is_none() {
+                    state.failure = Some(error.message);
+                }
+                (!state.gap_reported && !state.writes_blocked, reason)
+            };
+            if should_gap {
+                self.record_child_gap_visible(&child_thread, &reason).await;
+            }
+        }
+    }
+
+    fn buffer_child_frame(&mut self, child_thread: &str, frame: BufferedNativeFrame) {
+        if !self.child_buffers.contains_key(child_thread)
+            && self.child_buffers.len() >= MAX_CHILD_THREADS
+        {
+            self.collect_orphan_child_state();
+            let proven = self.children.is_bound(child_thread)
+                || self.child_states.contains_key(child_thread)
+                || self.child_pending.contains_key(child_thread);
+            if !proven && self.child_buffers.len() >= MAX_CHILD_THREADS {
+                self.defer_gap("Codex child observation exceeded its bound");
+                return;
+            }
+        }
+        let size = child_frame_size(&frame);
+        let queue = self
+            .child_buffers
+            .entry(child_thread.to_owned())
+            .or_default();
+        if queue.len() >= EARLY_EVENT_LIMIT
+            || self.child_buffer_bytes.saturating_add(size) > EARLY_EVENT_BYTES
+        {
+            let discarded: usize = queue.iter().map(child_frame_size).sum();
+            queue.clear();
+            self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(discarded);
+            let trackable = self.children.is_bound(child_thread)
+                || self.children.is_unconfirmed(child_thread)
+                || self.child_states.contains_key(child_thread)
+                || self.child_pending.contains_key(child_thread);
+            if trackable {
+                self.child_early_lost.insert(child_thread.to_owned());
+            } else {
+                self.defer_gap("Codex child observation exceeded its bound");
+            }
+            return;
+        }
+        self.child_buffer_bytes = self.child_buffer_bytes.saturating_add(size);
+        queue.push_back(frame);
+    }
+
+    fn collect_orphan_child_state(&mut self) {
+        let orphans: Vec<String> = self
+            .child_buffers
+            .keys()
+            .chain(self.child_early_lost.iter())
+            .chain(self.child_unknown.iter())
+            .chain(self.child_pending.keys())
+            .filter(|id| {
+                !self.child_states.contains_key(id.as_str())
+                    && !self.children.is_bound(id)
+                    && !self.children.is_unconfirmed(id)
+                    && !self.child_pending.contains_key(id.as_str())
+            })
+            .cloned()
+            .collect();
+        for id in orphans {
+            if self.child_states.contains_key(&id)
+                || self.children.is_bound(&id)
+                || self.children.is_unconfirmed(&id)
+                || self.child_pending.contains_key(&id)
+            {
+                continue;
+            }
+            if let Some(queue) = self.child_buffers.remove(&id) {
+                let discarded: usize = queue.iter().map(child_frame_size).sum();
+                self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(discarded);
+            }
+            self.child_early_lost.remove(&id);
+            if !self.children.is_bound(&id) {
+                self.child_unknown.remove(&id);
+            }
+        }
+    }
+
+    async fn ensure_child_registered(&mut self, child_thread: &str) -> Result<()> {
+        if self.child_states.contains_key(child_thread) {
+            return Ok(());
+        }
+        if self.child_unknown.contains(child_thread) {
+            return Err(Error::new(
+                "not_allowed",
+                "Codex child registration was rejected",
+            ));
+        }
+        if let Some(retained) = self.child_pending.get(child_thread).cloned() {
+            return self.register_pending_child(child_thread, retained).await;
+        }
+        let registration = self.child_registration_for(child_thread)?;
+        if self.child_pending.len() >= MAX_CHILD_THREADS {
+            self.record_gap("Codex pending child registrations exceeded their bound")
+                .await?;
+            return Err(Error::new(
+                "unknown",
+                "Codex child registration is unresolved",
+            ));
+        }
+        self.child_pending
+            .insert(child_thread.to_owned(), registration.clone());
+        self.register_pending_child(child_thread, registration)
+            .await
+    }
+
+    fn child_registration_for(&mut self, child_thread: &str) -> Result<ChildRegistration> {
+        let owned = self
+            .status
+            .thread_id
+            .clone()
+            .ok_or_else(|| Error::new("bad_state", "Codex producer thread is not ready"))?;
+        let parent_thread = self
+            .children
+            .parent_of(child_thread)
+            .unwrap_or_else(|| owned.clone());
+        let (parent_id, parent_generation, parent_native_ref) = if parent_thread == owned {
+            (self.agent_id.clone(), self.generation, owned)
+        } else {
+            let parent_state = self.child_states.get(&parent_thread).ok_or_else(|| {
+                Error::new(
+                    "bad_state",
+                    "Codex nested child parent is not registered yet",
+                )
+            })?;
+            (
+                parent_state.binding.agent_id.clone(),
+                parent_state.binding.agent_generation,
+                parent_thread,
+            )
+        };
+        let spawn_item = self
+            .children
+            .spawn_item_of(child_thread)
+            .unwrap_or_else(|| format!("spawn-{child_thread}"));
+        Ok(build_registration(
+            &spawn_item,
+            &parent_id,
+            parent_generation,
+            &parent_native_ref,
+            &self.native_scope,
+            child_thread,
+        ))
+    }
+
+    async fn register_pending_child(
+        &mut self,
+        child_thread: &str,
+        registration: ChildRegistration,
+    ) -> Result<()> {
+        let ack = match register_child(&self.host, &self.credential, registration.clone()).await {
+            Ok(ack) => ack,
+            Err(error) if is_admission_rejection(&error) => {
+                self.child_pending.remove(child_thread);
+                self.release_child_buffer(child_thread);
+                self.child_early_lost.remove(child_thread);
+                self.child_unknown.insert(child_thread.to_owned());
+                self.record_gap("Codex child registration was rejected")
+                    .await?;
+                return Err(error);
+            }
+            Err(error) => {
+                return Err(Error::new(
+                    error.code.as_str(),
+                    format!(
+                        "Codex child registration acknowledgement is unresolved: {}",
+                        error.message
+                    ),
+                ));
+            }
+        };
+        self.child_pending.remove(child_thread);
+        let binding = binding_from_ack(registration, &ack);
+        self.child_bindings
+            .insert(child_thread.to_owned(), binding.clone());
+        let mut child_state = ChildState::new(binding);
+        let native_id = format!("codex:{child_thread}:session.ready");
+        let native_scope = self.native_scope.clone();
+        if let Err(error) = child_state
+            .commit_event(
+                &mut self.sink,
+                &self.host,
+                &self.credential,
+                "session.ready",
+                native_id,
+                json!({
+                    "native_scope": native_scope,
+                    "native_ref": child_thread,
+                }),
+            )
+            .await
+        {
+            self.child_states
+                .insert(child_thread.to_owned(), child_state);
+            self.release_child_buffer(child_thread);
+            return Err(error);
+        }
+        child_state.ready_committed = true;
+        self.child_states
+            .insert(child_thread.to_owned(), child_state);
+        let mut first_error = None;
+        if self.child_early_lost.remove(child_thread) {
+            let host = self.host.clone();
+            let credential = self.credential.clone();
+            let sink = &mut self.sink;
+            if let Some(state) = self.child_states.get_mut(child_thread)
+                && let Err(error) = state
+                    .record_gap(
+                        sink,
+                        &host,
+                        &credential,
+                        "Codex child early events were lost before registration",
+                    )
+                    .await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Err(error) = self.flush_child_buffer(child_thread).await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn release_child_buffer(&mut self, child_thread: &str) {
+        if let Some(queue) = self.child_buffers.remove(child_thread) {
+            let discarded: usize = queue.iter().map(child_frame_size).sum();
+            self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(discarded);
+        }
+    }
+
+    async fn flush_child_buffer(&mut self, child_thread: &str) -> Result<()> {
+        let Some(mut queue) = self.child_buffers.remove(child_thread) else {
+            return Ok(());
+        };
+        if self
+            .child_states
+            .get(child_thread)
+            .is_some_and(|state| state.pending_gap.is_some())
+        {
+            // Retained gap stands: drop buffered (covered by the gap) without
+            // awaiting retained-gap RPCs; the owned driver settles.
+            let discarded: usize = queue.iter().map(child_frame_size).sum();
+            self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(discarded);
+            return Err(Error::new(
+                "unknown",
+                "Codex child acknowledgement is unresolved",
+            ));
+        }
+        let mut first_unresolved = None;
+        while let Some(frame) = queue.pop_front() {
+            let size = child_frame_size(&frame);
+            self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(size);
+            if self
+                .child_states
+                .get(child_thread)
+                .is_some_and(|state| state.pending_gap.is_some())
+            {
+                // A retained gap stood up mid-flush: drop this and the rest
+                // (covered by the gap) without further RPCs.
+                let rest: usize = queue.iter().map(child_frame_size).sum();
+                self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(rest);
+                return Err(Error::new(
+                    "unknown",
+                    "Codex child acknowledgement is unresolved",
+                ));
+            }
+            match frame {
+                BufferedNativeFrame::Notification { method, params } => {
+                    let result = self
+                        .process_child_notification(child_thread, &method, params)
+                        .await;
+                    if let Err(error) = result {
+                        let (should_gap, code) = {
+                            let Some(state) = self.child_states.get_mut(child_thread) else {
+                                continue;
+                            };
+                            state.source_unknown = true;
+                            let code = error.code.clone();
+                            if state.failure.is_none() {
+                                state.failure = Some(error.message);
+                            }
+                            (!state.gap_reported && !state.writes_blocked, code)
+                        };
+                        if should_gap {
+                            let reason = format!(
+                                "Codex child {method} notification could not be normalized ({code})",
+                            );
+                            let host = self.host.clone();
+                            let credential = self.credential.clone();
+                            let sink = &mut self.sink;
+                            if let Some(state) = self.child_states.get_mut(child_thread)
+                                && let Err(gap_error) =
+                                    state.record_gap(sink, &host, &credential, &reason).await
+                                && first_unresolved.is_none()
+                            {
+                                first_unresolved = Some(gap_error);
+                            }
+                        } else {
+                            // Retained retries belong to the owned driver;
+                            // only note blockage here.
+                            let still_blocked = self
+                                .child_states
+                                .get(child_thread)
+                                .is_some_and(|state| state.writes_blocked);
+                            if still_blocked && first_unresolved.is_none() {
+                                first_unresolved = Some(Error::new(
+                                    "unknown",
+                                    "Codex child acknowledgement is unresolved",
+                                ));
+                            }
+                        }
+                    }
+                }
+                BufferedNativeFrame::Request { id, method, params } => {
+                    self.reject_child_request(id, &method, &params).await;
+                }
+            }
+        }
+        if let Some(error) = first_unresolved {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn process_child_notification(
+        &mut self,
+        child_thread: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<()> {
+        match method {
+            "turn/started" => {
+                let turn_id = params
+                    .get("turn")
+                    .and_then(|turn| turn.get("id"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or_else(|| {
+                        Error::new(
+                            "native_protocol",
+                            "Codex child turn/started omitted turn id",
+                        )
+                    })?;
+                let state = self
+                    .child_states
+                    .get_mut(child_thread)
+                    .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
+                state.active_turn_id = Some(turn_id.to_owned());
+                state.final_text = None;
+                let native_id = event_id(child_thread, turn_id, turn_id, "turn.started")?;
+                state
+                    .commit_event(
+                        &mut self.sink,
+                        &self.host,
+                        &self.credential,
+                        "turn.started",
+                        native_id,
+                        json!({"turn_id": turn_id}),
+                    )
+                    .await?;
+            }
+            "item/started" => {
+                let raw_item = params.get("item").cloned().unwrap_or(Value::Null);
+                self.observe_child_spawn(child_thread, &raw_item, false)
+                    .await?;
+            }
+            "item/completed" => {
+                let raw_item = params.get("item").cloned().unwrap_or(Value::Null);
+                self.observe_child_spawn(child_thread, &raw_item, true)
+                    .await?;
+                let item_type = raw_item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if item_type == "agentMessage" {
+                    self.complete_child_message(child_thread, &raw_item, &params)
+                        .await?;
+                }
+            }
+            "turn/completed" => {
+                self.complete_child_turn(child_thread, params).await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn complete_child_message(
+        &mut self,
+        child_thread: &str,
+        item: &Value,
+        params: &Value,
+    ) -> Result<()> {
+        let item_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "native_protocol",
+                    "Codex child agentMessage omitted item id",
+                )
+            })?;
+        let text = item.get("text").and_then(Value::as_str).ok_or_else(|| {
+            Error::new("native_protocol", "Codex child agentMessage omitted text")
+        })?;
+        let policy = SecretPolicy::new(self.secrets.iter().cloned());
+        let text = policy.redact_text(text);
+        let turn_id = child_message_turn_id(
+            params,
+            self.child_states
+                .get(child_thread)
+                .and_then(|state| state.active_turn_id.as_deref()),
+        );
+        let mut data = json!({
+            "turn_id": turn_id.as_str(),
+            "text": text,
+        });
+        if let Some(phase) = item.get("phase").and_then(Value::as_str) {
+            data["phase"] = Value::String(phase.to_owned());
+        }
+        let encoded_len = match serde_json::to_vec(&data) {
+            Ok(bytes) => bytes.len(),
+            Err(_) => usize::MAX,
+        };
+        let host = self.host.clone();
+        let credential = self.credential.clone();
+        let sink = &mut self.sink;
+        let state = self
+            .child_states
+            .get_mut(child_thread)
+            .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
+        if encoded_len > MAX_EVENT_BYTES {
+            return state
+                .record_gap(
+                    sink,
+                    &host,
+                    &credential,
+                    "Codex child completed message exceeded persisted-event bound",
+                )
+                .await;
+        }
+        let native_id = event_id(child_thread, &turn_id, item_id, "message.completed")?;
+        state
+            .commit_event(
+                sink,
+                &host,
+                &credential,
+                "message.completed",
+                native_id,
+                data,
+            )
+            .await
+    }
+
+    async fn complete_child_turn(&mut self, child_thread: &str, params: Value) -> Result<()> {
+        let notification: NativeTurnCompletedNotification = serde_json::from_value(params)
+            .map_err(|_| {
+                Error::new(
+                    "native_protocol",
+                    "Codex child turn/completed schema mismatch",
+                )
+            })?;
+        self.settle_spawn_window_for(child_thread);
+        let host = self.host.clone();
+        let credential = self.credential.clone();
+        let sink = &mut self.sink;
+        let state = self
+            .child_states
+            .get_mut(child_thread)
+            .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
+        if notification.turn.status == NativeTurnStatus::InProgress {
+            return state
+                .record_gap(
+                    sink,
+                    &host,
+                    &credential,
+                    "Codex child turn/completed carried nonterminal inProgress status",
+                )
+                .await;
+        }
+        let status_text = turn_status(&notification.turn.status);
+        let mut data = json!({
+            "turn_id": notification.turn.id,
+            "status": status_text,
+        });
+        let policy = SecretPolicy::new(self.secrets.iter().cloned());
+        if let Some(text) = state.final_text.take() {
+            attach_final_text(&mut data, &text, &notification.turn.status, &policy);
+        }
+        attach_native_error(&mut data, notification.turn.error.as_ref(), &policy);
+        let native_id = event_id(
+            child_thread,
+            &notification.turn.id,
+            &notification.turn.id,
+            "turn.completed",
+        )?;
+        state
+            .commit_event(sink, &host, &credential, "turn.completed", native_id, data)
+            .await?;
+        state.active_turn_id = None;
+        Ok(())
+    }
+
+    async fn observe_child_spawn(
+        &mut self,
+        parent_thread: &str,
+        item: &Value,
+        completed: bool,
+    ) -> Result<()> {
+        let Some((item_id, receivers)) = spawn_call(item) else {
+            return Ok(());
+        };
+        if !completed {
+            return match self.children.spawn_started(parent_thread, item_id) {
+                Ok(()) => Ok(()),
+                Err(reason) => self.record_child_spawn_gap(parent_thread, reason).await,
+            };
+        }
+        let owned = self.status.thread_id.as_deref().unwrap_or(parent_thread);
+        let outcome = self
+            .children
+            .spawn_completed(parent_thread, owned, &item_id, &receivers);
+        for receiver in &receivers {
+            if self.children.is_bound(receiver) {
+                self.children
+                    .parents
+                    .insert(receiver.clone(), parent_thread.to_owned());
+            }
+        }
+        self.collect_orphan_child_state();
+        match outcome {
+            Ok(()) => self.ensure_nested_receivers(&receivers).await,
+            Err(reason) => {
+                let confirmed: Vec<String> = receivers
+                    .iter()
+                    .filter(|receiver| self.children.is_bound(receiver))
+                    .cloned()
+                    .collect();
+                let ensure_error = self.ensure_nested_receivers(&confirmed).await.err();
+                let gap_result = self.record_child_spawn_gap(parent_thread, reason).await;
+                if let Some(error) = ensure_error {
+                    return Err(error);
+                }
+                gap_result
+            }
+        }
+    }
+
+    async fn ensure_nested_receivers(&mut self, receivers: &[String]) -> Result<()> {
+        let mut first_error = None;
+        for receiver in receivers {
+            if let Err(error) = Box::pin(self.ensure_child_registered(receiver)).await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn record_child_spawn_gap(&mut self, parent_thread: &str, reason: &str) -> Result<()> {
+        if self.child_states.contains_key(parent_thread) {
+            let host = self.host.clone();
+            let credential = self.credential.clone();
+            let sink = &mut self.sink;
+            if let Some(state) = self.child_states.get_mut(parent_thread) {
+                return state.record_gap(sink, &host, &credential, reason).await;
+            }
+        }
+        self.record_gap(reason).await
+    }
     fn stream_source(&mut self) -> StreamSource<'_> {
         StreamSource {
             sink: &mut self.sink,
@@ -1532,6 +2676,15 @@ impl EventProcessor {
     }
 }
 
+/// One owned child-gap attempt: cloned identity plus the RPC future.
+/// Polled in `run()` without borrowing `ChildState`; the result applies
+/// only to the matching child/gen/retained gap.
+struct GapAttempt {
+    child_thread: String,
+    gap: SourceGap,
+    future: Pin<Box<dyn Future<Output = Result<Value>> + Send>>,
+}
+
 async fn run(
     mut frames: mpsc::Receiver<NativeFrame>,
     mut stream: watch::Receiver<StreamState>,
@@ -1539,8 +2692,13 @@ async fn run(
     mut controls: mpsc::Receiver<Control>,
     status_tx: watch::Sender<EventStatus>,
 ) {
+    let mut gap_retry = interval(CHILD_GAP_RETRY_INTERVAL);
+    gap_retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut gap_in_flight: Option<GapAttempt> = None;
     loop {
         let accept_frames = processor.accept_frames;
+        let can_start_gap = gap_in_flight.is_none() && processor.has_pending_child_gap();
+        let gap_pending = gap_in_flight.is_some();
         tokio::select! {
             changed = stream.changed(), if accept_frames => {
                 let current = match changed {
@@ -1567,6 +2725,32 @@ async fn run(
                 }
                 processor.handle_frame(frame).await;
                 processor.report_gap_if_queue_empty(frames.is_empty()).await;
+            }
+            _ = gap_retry.tick(), if can_start_gap => {
+                // Start only; never await the RPC here. One attempt at a
+                // time, fair rotation via `next_pending_gap`.
+                if let Some((child_thread, gap)) = processor.next_pending_gap() {
+                    let host = processor.host.clone();
+                    let credential = processor.credential.clone();
+                    let params = StreamSource::gap_request_params(&credential, &gap);
+                    let deadline = Instant::now() + EVENT_DEADLINE;
+                    let future =
+                        Box::pin(async move { host.call("source.gap", params, deadline).await });
+                    gap_in_flight = Some(GapAttempt {
+                        child_thread,
+                        gap,
+                        future,
+                    });
+                }
+            }
+            result = async {
+                match gap_in_flight.as_mut() {
+                    Some(attempt) => attempt.future.as_mut().await,
+                    None => std::future::pending().await,
+                }
+            }, if gap_pending => {
+                let attempt = gap_in_flight.take().expect("guarded by gap_pending");
+                processor.apply_gap_attempt(&attempt.child_thread, &attempt.gap, &result);
             }
         }
         let _ = status_tx.send(processor.status.clone());
@@ -1604,10 +2788,53 @@ fn spawn_call(item: &Value) -> Option<(String, Vec<String>)> {
     Some((item_id.to_owned(), receivers))
 }
 
+/// Encoded size of one buffered child frame, shared by buffering,
+/// flushing, and overflow accounting so discarded bytes are released exactly.
+fn child_frame_size(frame: &BufferedNativeFrame) -> usize {
+    match frame {
+        BufferedNativeFrame::Notification { method, params } => {
+            serde_json::to_vec(&json!({"method": method, "params": params}))
+                .map(|bytes| bytes.len())
+                .unwrap_or(256)
+        }
+        BufferedNativeFrame::Request { id, method, params } => {
+            serde_json::to_vec(&json!({"id": id, "method": method, "params": params}))
+                .map(|bytes| bytes.len())
+                .unwrap_or(256)
+        }
+    }
+}
+
+/// The exact already-selected native turn id for a child message: the
+/// notification's `turnId`, else the child's active turn, else empty. Owned
+/// so the immutable selection ends before the child state is borrowed mutably.
+fn child_message_turn_id(params: &Value, active_turn_id: Option<&str>) -> String {
+    params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .or(active_turn_id)
+        .unwrap_or_default()
+        .to_owned()
+}
+
 /// The thread a native frame belongs to: `threadId` on notifications and
-/// server requests.
+/// server requests, or `thread.id` on thread notifications.
 fn frame_thread_id(params: &Value) -> Option<&str> {
-    params.get("threadId").and_then(Value::as_str)
+    params.get("threadId").and_then(Value::as_str).or_else(|| {
+        params
+            .get("thread")
+            .and_then(|thread| thread.get("id"))
+            .and_then(Value::as_str)
+    })
+}
+
+fn spawned_item_id(thread: &Value) -> Option<&str> {
+    let spawn = thread.get("source")?.get("subAgent")?.get("thread_spawn")?;
+    spawn
+        .get("call_id")
+        .or_else(|| spawn.get("item_id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
 }
 
 /// The parent of a subagent thread, from the installed 0.161 `Thread.source`
@@ -1805,7 +3032,10 @@ mod tests {
             frame_thread_id(&json!({"threadId": "child"})),
             Some("child")
         );
-        assert_eq!(frame_thread_id(&json!({"thread": {"id": "child"}})), None);
+        assert_eq!(
+            frame_thread_id(&json!({"thread": {"id": "child"}})),
+            Some("child")
+        );
     }
 
     #[test]
@@ -1814,19 +3044,23 @@ mod tests {
         // No spawn in flight: an unknown thread is not taken (caller gaps it).
         assert_eq!(children.take_frame("x"), Ok(false));
 
-        children.spawn_started("call-1".to_owned()).unwrap();
-        children.spawn_started("call-2".to_owned()).unwrap();
+        children
+            .spawn_started("owned", "call-1".to_owned())
+            .unwrap();
+        children
+            .spawn_started("owned", "call-2".to_owned())
+            .unwrap();
         assert_eq!(children.take_frame("child-1"), Ok(true));
         assert_eq!(children.take_frame("child-2"), Ok(true));
         // The first spawn confirms its receiver; the second is still pending.
         assert_eq!(
-            children.spawn_completed("owned", "call-1", &["child-1".to_owned()]),
+            children.spawn_completed("owned", "owned", "call-1", &["child-1".to_owned()]),
             Ok(())
         );
         assert_eq!(children.take_frame("child-1"), Ok(true));
         // child-2 was never named by a spawn: the last completion gaps it.
         assert_eq!(
-            children.spawn_completed("owned", "call-2", &[]),
+            children.spawn_completed("owned", "owned", "call-2", &[]),
             Err("Codex sent frames from a thread no spawn announced")
         );
         assert_eq!(children.take_frame("child-2"), Ok(false));
@@ -1837,14 +3071,14 @@ mod tests {
     #[test]
     fn child_threads_settle_a_stuck_spawn_and_refuse_the_owned_thread() {
         let mut children = ChildThreads::default();
-        children.spawn_started("call".to_owned()).unwrap();
-        assert_eq!(children.settle(), Ok(()));
+        children.spawn_started("owned", "call".to_owned()).unwrap();
+        assert_eq!(children.settle("owned"), Ok(()));
         assert_eq!(children.take_frame("late"), Ok(false));
 
-        children.spawn_started("call".to_owned()).unwrap();
+        children.spawn_started("owned", "call".to_owned()).unwrap();
         assert_eq!(children.take_frame("orphan"), Ok(true));
         assert_eq!(
-            children.settle(),
+            children.settle("owned"),
             Err("Codex sent frames from a thread no spawn announced")
         );
         assert_eq!(
@@ -1856,7 +3090,7 @@ mod tests {
     #[test]
     fn child_threads_are_bounded() {
         let mut children = ChildThreads::default();
-        children.spawn_started("call".to_owned()).unwrap();
+        children.spawn_started("owned", "call".to_owned()).unwrap();
         for index in 0..MAX_CHILD_THREADS {
             assert_eq!(children.take_frame(&format!("t{index}")), Ok(true));
         }
@@ -1867,9 +3101,15 @@ mod tests {
         }
         assert!(children.confirm("owned", "c-extra").is_err());
         for index in 1..MAX_CHILD_THREADS {
-            children.spawn_started(format!("call-{index}")).unwrap();
+            children
+                .spawn_started("owned", format!("call-{index}"))
+                .unwrap();
         }
-        assert!(children.spawn_started("call-extra".to_owned()).is_err());
+        assert!(
+            children
+                .spawn_started("owned", "call-extra".to_owned())
+                .is_err()
+        );
     }
 
     #[test]
@@ -2184,5 +3424,1484 @@ mod tests {
                 assert_eq!(data, original);
             }
         }
+    }
+
+    #[test]
+    fn child_message_turn_id_prefers_params_then_active_turn() {
+        assert_eq!(
+            child_message_turn_id(&json!({"turnId": "turn-params"}), Some("turn-active")),
+            "turn-params"
+        );
+        assert_eq!(
+            child_message_turn_id(&json!({"turnId": "turn-params"}), None),
+            "turn-params"
+        );
+        assert_eq!(
+            child_message_turn_id(&json!({}), Some("turn-active")),
+            "turn-active"
+        );
+        assert_eq!(child_message_turn_id(&json!({}), None), "");
+    }
+
+    async fn child_test_processor() -> (crate::native::NativeProcess, EventProcessor) {
+        let peer = eliot_plugin::Peer::stdio();
+        let launch = crate::native::NativeLaunch {
+            program: std::env::current_exe().expect("test exe").into_os_string(),
+            args: [std::ffi::OsString::from("--list")].to_vec(),
+            cwd: std::env::current_dir().expect("cwd"),
+            environment: Vec::new(),
+        };
+        let native = crate::native::NativeProcess::spawn(
+            launch,
+            eliot_core::SecretPolicy::new(Vec::<String>::new()),
+        )
+        .await
+        .expect("spawn fixture");
+        let processor = EventProcessor::new(
+            native.client(),
+            peer.client(),
+            EventConfig {
+                credential: "test-cred".to_owned(),
+                agent_id: "a1".to_owned(),
+                generation: 1,
+                secrets: Vec::new(),
+                native_scope: String::new(),
+            },
+        );
+        (native, processor)
+    }
+
+    #[tokio::test]
+    async fn child_buffer_overflow_releases_bytes_without_suppressing_identity() {
+        let (_native, mut processor) = child_test_processor().await;
+        processor.status.thread_id = Some("owned".to_owned());
+        processor
+            .children
+            .spawn_started("owned", "call-1".to_owned())
+            .expect("spawn window");
+        assert_eq!(processor.children.take_frame("child-1"), Ok(true));
+        for _ in 0..EARLY_EVENT_LIMIT {
+            processor.buffer_child_frame(
+                "child-1",
+                BufferedNativeFrame::Notification {
+                    method: "turn/started".to_owned(),
+                    params: json!({"threadId": "child-1"}),
+                },
+            );
+        }
+        assert!(processor.child_buffer_bytes > 0);
+        processor.buffer_child_frame(
+            "child-1",
+            BufferedNativeFrame::Notification {
+                method: "turn/started".to_owned(),
+                params: json!({"threadId": "child-1"}),
+            },
+        );
+        assert!(
+            processor
+                .child_buffers
+                .get("child-1")
+                .is_none_or(|queue| queue.is_empty())
+        );
+        assert_eq!(processor.child_buffer_bytes, 0);
+        assert!(processor.child_early_lost.contains("child-1"));
+        assert!(
+            !processor.child_unknown.contains("child-1"),
+            "overflow must not suppress later confirmation"
+        );
+        processor.buffer_child_frame(
+            "child-1",
+            BufferedNativeFrame::Notification {
+                method: "turn/started".to_owned(),
+                params: json!({"threadId": "child-1"}),
+            },
+        );
+        assert_eq!(processor.child_buffers["child-1"].len(), 1);
+        assert!(processor.child_buffer_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn child_flush_gaps_failed_frame_and_processes_remainder() {
+        let (_native, mut processor) = child_test_processor().await;
+        let registration = build_registration("call-1", "a1", 1, "owned", "codex:test", "child-1");
+        let mut state = ChildState::new(ChildBinding {
+            registration,
+            agent_id: "a2".to_owned(),
+            agent_generation: 1,
+            native_ref: "child-1".to_owned(),
+        });
+        state.ready_committed = true;
+        state.writes_blocked = true;
+        processor.child_states.insert("child-1".to_owned(), state);
+        let mut queue = VecDeque::new();
+        queue.push_back(BufferedNativeFrame::Notification {
+            method: "turn/started".to_owned(),
+            params: json!({"threadId": "child-1"}),
+        });
+        queue.push_back(BufferedNativeFrame::Notification {
+            method: "item/started".to_owned(),
+            params: json!({
+                "threadId": "child-1",
+                "item": {"type": "collabAgentToolCall", "id": "call-nested", "tool": "spawnAgent"},
+            }),
+        });
+        processor.child_buffer_bytes = queue.iter().map(child_frame_size).sum();
+        processor.child_buffers.insert("child-1".to_owned(), queue);
+        let error = processor
+            .flush_child_buffer("child-1")
+            .await
+            .expect_err("unresolved child gap must propagate, not report success");
+        assert_eq!(error.code, "unknown");
+        let state = processor
+            .child_states
+            .get("child-1")
+            .expect("known child stays visible");
+        assert!(state.source_unknown);
+        assert!(
+            state
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("omitted turn id"))
+        );
+        assert!(
+            processor
+                .children
+                .pending_spawns
+                .get("child-1")
+                .is_some_and(|items| items.contains("call-nested")),
+            "remainder is processed, not dropped"
+        );
+        assert!(!processor.child_buffers.contains_key("child-1"));
+        assert_eq!(processor.child_buffer_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn parent_completion_retains_pending_child_registration() {
+        let (_native, mut processor) = child_test_processor().await;
+        processor.status.thread_id = Some("owned".to_owned());
+        processor.status.active_turn_id = Some("turn-1".to_owned());
+        processor.status.active_command_id = Some("cmd-1".to_owned());
+        processor.native_scope = "codex:test".to_owned();
+        processor.children.confirm("owned", "child-1").unwrap();
+        processor
+            .children
+            .parents
+            .insert("child-1".to_owned(), "owned".to_owned());
+        processor
+            .children
+            .spawn_items
+            .insert("child-1".to_owned(), "call-1".to_owned());
+        let registration = build_registration("call-1", "a1", 1, "owned", "codex:test", "child-1");
+        processor
+            .child_pending
+            .insert("child-1".to_owned(), registration.clone());
+        processor.buffer_child_frame(
+            "child-1",
+            BufferedNativeFrame::Notification {
+                method: "turn/started".to_owned(),
+                params: json!({"threadId": "child-1"}),
+            },
+        );
+        processor.writes_blocked = true;
+        let params = json!({
+            "threadId": "owned",
+            "turn": {"id": "turn-1", "items": [], "status": "completed"},
+        });
+        let result = processor.complete_turn(params).await;
+        assert!(result.is_err(), "parent commit blocked, settle already ran");
+        assert_eq!(
+            processor.child_pending.get("child-1"),
+            Some(&registration),
+            "exact pending retained across parent completion, child continues"
+        );
+        assert!(!processor.child_unknown.contains("child-1"));
+        assert!(processor.child_buffers.contains_key("child-1"));
+    }
+
+    async fn connected_child_processor(
+        parent_id: &str,
+    ) -> (
+        crate::native::NativeProcess,
+        EventProcessor,
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (host_io, plugin_io) = tokio::io::duplex(64 * 1024);
+        let (plugin_read, plugin_write) = tokio::io::split(plugin_io);
+        let mut peer = eliot_plugin::Peer::from_io(plugin_read, plugin_write);
+        let peer_client = peer.client();
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+        let launch = crate::native::NativeLaunch {
+            program: std::env::current_exe().expect("test exe").into_os_string(),
+            args: [std::ffi::OsString::from("--list")].to_vec(),
+            cwd: std::env::current_dir().expect("cwd"),
+            environment: Vec::new(),
+        };
+        let native = crate::native::NativeProcess::spawn(
+            launch,
+            eliot_core::SecretPolicy::new(Vec::<String>::new()),
+        )
+        .await
+        .expect("spawn fixture");
+        let processor = EventProcessor::new(
+            native.client(),
+            peer_client,
+            EventConfig {
+                credential: "test-cred".to_owned(),
+                agent_id: parent_id.to_owned(),
+                generation: 1,
+                secrets: Vec::new(),
+                native_scope: "codex:test".to_owned(),
+            },
+        );
+        (native, processor, host_io, peer_task)
+    }
+
+    #[tokio::test]
+    async fn ordinary_frame_retries_same_pending_registration_after_lost_ack() {
+        use eliot_plugin::RpcRequest;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+
+        let (_native, mut processor, host_io, peer_task) = connected_child_processor("a1").await;
+        processor.status.thread_id = Some("owned".to_owned());
+        processor.native_scope = "codex:test".to_owned();
+        processor.children.confirm("owned", "child-1").unwrap();
+        processor
+            .children
+            .parents
+            .insert("child-1".to_owned(), "owned".to_owned());
+        processor
+            .children
+            .spawn_items
+            .insert("child-1".to_owned(), "call-1".to_owned());
+        let retained = build_registration("call-1", "a1", 1, "owned", "codex:test", "child-1");
+        processor
+            .child_pending
+            .insert("child-1".to_owned(), retained.clone());
+
+        let (host_read, mut host_write) = split(host_io);
+        let mut host_reader = BufReader::new(host_read);
+        let mut recorded_rpc = Vec::new();
+
+        let fake_host = async {
+            let mut line = String::new();
+
+            // 1. Initial attempt: host returns busy for child registration.
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("read first child registration request");
+            let req1: RpcRequest = serde_json::from_str(&line).expect("decode req1");
+            recorded_rpc.push((req1.method.clone(), req1.params.clone()));
+            assert_eq!(req1.method, "child");
+            let busy_reply = json!({
+                "jsonrpc": "2.0",
+                "id": req1.id,
+                "error": {
+                    "code": -32020,
+                    "message": "host plugin registration is busy",
+                    "data": { "code": "busy" }
+                }
+            });
+            host_write
+                .write_all(format!("{busy_reply}\n").as_bytes())
+                .await
+                .expect("send busy reply");
+
+            // 2. Later ordinary frame retries IDENTICAL registration: host answers canonical ACK.
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("read second child registration request");
+            let req2: RpcRequest = serde_json::from_str(&line).expect("decode req2");
+            recorded_rpc.push((req2.method.clone(), req2.params.clone()));
+            assert_eq!(req2.method, "child");
+            let ack = crate::native_child::tests::test_ack(&retained);
+            let ack_reply = json!({
+                "jsonrpc": "2.0",
+                "id": req2.id,
+                "result": ack,
+            });
+            host_write
+                .write_all(format!("{ack_reply}\n").as_bytes())
+                .await
+                .expect("send canonical child ack");
+
+            // 3. Upon registration ACK, processor commits session.ready.
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("read session.ready commit");
+            let req3: RpcRequest = serde_json::from_str(&line).expect("decode req3");
+            recorded_rpc.push((req3.method.clone(), req3.params.clone()));
+            assert_eq!(req3.method, "events.put");
+            let ready_ack = json!({
+                "jsonrpc": "2.0",
+                "id": req3.id,
+                "result": {
+                    "first_seq": 1,
+                    "last_seq": 1,
+                    "cursor": null,
+                }
+            });
+            host_write
+                .write_all(format!("{ready_ack}\n").as_bytes())
+                .await
+                .expect("send session.ready ack");
+
+            // 4. Processor drains buffered child frames (turn-9, then turn-10).
+            for (idx, expected_turn) in ["turn-9", "turn-10"].iter().enumerate() {
+                line.clear();
+                host_reader
+                    .read_line(&mut line)
+                    .await
+                    .expect("read child fact commit");
+                let req: RpcRequest = serde_json::from_str(&line).expect("decode child fact");
+                recorded_rpc.push((req.method.clone(), req.params.clone()));
+                assert_eq!(req.method, "events.put");
+                assert_eq!(req.params["agent_id"], "a2");
+                assert_eq!(req.params["events"][0]["kind"], "turn.started");
+                assert_eq!(req.params["events"][0]["data"]["turn_id"], *expected_turn);
+                let turn_ack = json!({
+                    "jsonrpc": "2.0",
+                    "id": req.id,
+                    "result": {
+                        "first_seq": 2 + idx as i64,
+                        "last_seq": 2 + idx as i64,
+                        "cursor": null,
+                    }
+                });
+                host_write
+                    .write_all(format!("{turn_ack}\n").as_bytes())
+                    .await
+                    .expect("send turn.started ack");
+            }
+
+            drop(host_write);
+            drop(host_reader);
+            recorded_rpc
+        };
+
+        let driver = async {
+            // First ordinary child frame: registration fails busy, frame is buffered, no facts before ACK.
+            processor
+                .handle_child_notification(
+                    "turn/started",
+                    json!({"threadId": "child-1", "turn": {"id": "turn-9"}}),
+                )
+                .await;
+
+            assert_eq!(
+                processor
+                    .child_pending
+                    .get("child-1")
+                    .map(|r| &r.registration_id),
+                Some(&retained.registration_id),
+                "registration retained across lost ACK / busy"
+            );
+            assert!(!processor.child_unknown.contains("child-1"));
+            assert_eq!(
+                processor.child_buffers.get("child-1").map(|q| q.len()),
+                Some(1)
+            );
+            assert!(
+                !processor.child_states.contains_key("child-1"),
+                "no child facts before registration ACK"
+            );
+
+            // Later ordinary child frame: retries identical registration, receives canonical ACK.
+            processor
+                .handle_child_notification(
+                    "turn/started",
+                    json!({"threadId": "child-1", "turn": {"id": "turn-10"}}),
+                )
+                .await;
+        };
+
+        let (recorded_rpc, ()) = tokio::join!(fake_host, driver);
+        peer_task.await.expect("peer task clean shutdown");
+
+        assert_eq!(recorded_rpc.len(), 5);
+        assert_eq!(recorded_rpc[0].0, "child");
+        assert_eq!(
+            recorded_rpc[0].1["registration"]["registration_id"],
+            retained.registration_id
+        );
+        assert_eq!(recorded_rpc[0].1["registration"]["parent_id"], "a1");
+
+        assert_eq!(recorded_rpc[1].0, "child");
+        assert_eq!(
+            recorded_rpc[1].1, recorded_rpc[0].1,
+            "later ordinary frame retries SAME retained registration"
+        );
+
+        assert_eq!(recorded_rpc[2].0, "events.put");
+        assert_eq!(recorded_rpc[2].1["agent_id"], "a2");
+        assert_eq!(recorded_rpc[2].1["events"][0]["kind"], "session.ready");
+
+        assert_eq!(recorded_rpc[3].0, "events.put");
+        assert_eq!(recorded_rpc[3].1["agent_id"], "a2");
+        assert_eq!(recorded_rpc[3].1["events"][0]["kind"], "turn.started");
+        assert_eq!(recorded_rpc[3].1["events"][0]["data"]["turn_id"], "turn-9");
+
+        assert_eq!(recorded_rpc[4].0, "events.put");
+        assert_eq!(recorded_rpc[4].1["agent_id"], "a2");
+        assert_eq!(recorded_rpc[4].1["events"][0]["kind"], "turn.started");
+        assert_eq!(recorded_rpc[4].1["events"][0]["data"]["turn_id"], "turn-10");
+
+        assert!(!processor.child_pending.contains_key("child-1"));
+        assert!(processor.child_states.contains_key("child-1"));
+        let state = processor.child_states.get("child-1").unwrap();
+        assert_eq!(state.binding.agent_id, "a2");
+        assert_eq!(state.binding.agent_generation, 1);
+        assert!(state.ready_committed);
+        assert!(processor.children.pending_spawns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_gap_ack_failure_stays_in_child_scope() {
+        use eliot_plugin::RpcRequest;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+
+        let (_native, mut processor, host_io, peer_task) = connected_child_processor("a1").await;
+        processor.status.thread_id = Some("owned".to_owned());
+        let registration = build_registration("call-1", "a1", 1, "owned", "codex:test", "child-1");
+        let mut state = ChildState::new(ChildBinding {
+            registration,
+            agent_id: "a2".to_owned(),
+            agent_generation: 1,
+            native_ref: "child-1".to_owned(),
+        });
+        state.ready_committed = true;
+        processor.child_states.insert("child-1".to_owned(), state);
+
+        let (host_read, mut host_write) = split(host_io);
+        let mut host_reader = BufReader::new(host_read);
+        let mut recorded_rpc = Vec::new();
+
+        let fake_host = async {
+            let mut line = String::new();
+
+            // 1. First gap request: busy-before-commit gap.
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("read first child gap request");
+            let req1: RpcRequest = serde_json::from_str(&line).expect("decode req1");
+            recorded_rpc.push((req1.method.clone(), req1.params.clone()));
+            assert_eq!(req1.method, "source.gap");
+            let busy_reply = json!({
+                "jsonrpc": "2.0",
+                "id": req1.id,
+                "error": {
+                    "code": -32020,
+                    "message": "host source gap is busy",
+                    "data": { "code": "busy" }
+                }
+            });
+            host_write
+                .write_all(format!("{busy_reply}\n").as_bytes())
+                .await
+                .expect("send busy gap reply");
+
+            // 2. Owned driver retries SAME gap_id/body (no extra frame for
+            // the retry itself): host answers canonical ACK.
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("read retried child gap request");
+            let req2: RpcRequest = serde_json::from_str(&line).expect("decode req2");
+            recorded_rpc.push((req2.method.clone(), req2.params.clone()));
+            assert_eq!(req2.method, "source.gap");
+            let gap_ack = json!({
+                "jsonrpc": "2.0",
+                "id": req2.id,
+                "result": {
+                    "gap_id": req2.params["gap_id"],
+                    "seq": 1,
+                }
+            });
+            host_write
+                .write_all(format!("{gap_ack}\n").as_bytes())
+                .await
+                .expect("send canonical gap ack");
+
+            // 3. Frame after settled gap commits its turn.started event
+            // (turn-2 arrived while pending and was dropped, covered by the
+            // gap; turn-3 arrives after settle and commits).
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("read child fact after settled gap");
+            let req3: RpcRequest = serde_json::from_str(&line).expect("decode req3");
+            recorded_rpc.push((req3.method.clone(), req3.params.clone()));
+            assert_eq!(req3.method, "events.put");
+            assert_eq!(req3.params["events"][0]["data"]["turn_id"], "turn-3");
+            let fact_ack = json!({
+                "jsonrpc": "2.0",
+                "id": req3.id,
+                "result": {
+                    "first_seq": 2,
+                    "last_seq": 2,
+                    "cursor": null,
+                }
+            });
+            host_write
+                .write_all(format!("{fact_ack}\n").as_bytes())
+                .await
+                .expect("send turn fact ack");
+
+            drop(host_write);
+            drop(host_reader);
+            recorded_rpc
+        };
+
+        let driver = async {
+            // First frame: normalization failure triggers source.gap, host replies busy.
+            processor
+                .handle_child_notification("turn/started", json!({"threadId": "child-1"}))
+                .await;
+
+            // Observe host-facing child gap / source.state before producer drain:
+            let state_before = processor
+                .child_states
+                .get("child-1")
+                .expect("child visible");
+            assert!(
+                state_before.writes_blocked,
+                "writes must be blocked while gap is unresolved"
+            );
+            assert!(
+                state_before.source_unknown,
+                "source must be marked unknown on gap ACK failure"
+            );
+            assert!(
+                state_before.pending_gap.is_some(),
+                "unresolved gap must be retained"
+            );
+            assert_eq!(
+                processor.loss_reason, None,
+                "child metadata uncertainty stays in child scope"
+            );
+            assert!(
+                !processor.status.source_unknown,
+                "parent source stays known while only a child gap is busy"
+            );
+            assert!(
+                !processor.gap_reported,
+                "parent must not report a gap for a child ACK failure"
+            );
+
+            // Frame while pending: dropped (covered by the gap), never
+            // triggers a retained-gap RPC from the frame path.
+            processor
+                .handle_child_notification(
+                    "turn/started",
+                    json!({"threadId": "child-1", "turn": {"id": "turn-2"}}),
+                )
+                .await;
+            assert!(
+                processor.has_pending_child_gap(),
+                "still pending; frame path never retries"
+            );
+            assert_eq!(
+                processor.child_states["child-1"].active_turn_id, None,
+                "dropped while pending, not processed"
+            );
+
+            // Owned attempt for the SAME retained gap (no extra frame for
+            // the retry itself), settled by the canonical ACK.
+            let (retry_thread, retry_gap) =
+                processor.next_pending_gap().expect("pending for driver");
+            assert_eq!(retry_thread, "child-1");
+            let params =
+                eliot_plugin::session::StreamSource::gap_request_params("test-cred", &retry_gap);
+            let host = processor.host.clone();
+            let result = host
+                .call(
+                    "source.gap",
+                    params,
+                    tokio::time::Instant::now() + eliot_plugin::session::EVENT_DEADLINE,
+                )
+                .await;
+            assert!(
+                processor.apply_gap_attempt(&retry_thread, &retry_gap, &result),
+                "canonical ACK settles the matching retained gap"
+            );
+
+            // Frame after settle commits normally.
+            processor
+                .handle_child_notification(
+                    "turn/started",
+                    json!({"threadId": "child-1", "turn": {"id": "turn-3"}}),
+                )
+                .await;
+        };
+
+        let (recorded_rpc, ()) = tokio::join!(fake_host, driver);
+        peer_task.await.expect("peer task clean shutdown");
+
+        assert_eq!(recorded_rpc.len(), 3);
+        // Request 1: first gap attempt
+        assert_eq!(recorded_rpc[0].0, "source.gap");
+        assert_eq!(recorded_rpc[0].1["agent_id"], "a2");
+        assert_eq!(recorded_rpc[0].1["generation"], 1);
+        assert_eq!(recorded_rpc[0].1["source"], "stream");
+        assert!(
+            recorded_rpc[0].1["gap_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("codex:a2:1:gap-")
+        );
+
+        // Request 2: retried gap has identical gap_id and reason body
+        assert_eq!(recorded_rpc[1].0, "source.gap");
+        assert_eq!(recorded_rpc[1].1["agent_id"], "a2");
+        assert_eq!(recorded_rpc[1].1["generation"], 1);
+        assert_eq!(recorded_rpc[1].1["source"], "stream");
+        assert_eq!(
+            recorded_rpc[1].1["gap_id"], recorded_rpc[0].1["gap_id"],
+            "must retry SAME child gap_id"
+        );
+        assert_eq!(
+            recorded_rpc[1].1["reason"], recorded_rpc[0].1["reason"],
+            "must retry SAME child gap body"
+        );
+
+        // Request 3: turn-3 committed after settlement (turn-2 was dropped
+        // while pending, covered by the gap).
+        assert_eq!(recorded_rpc[2].0, "events.put");
+        assert_eq!(recorded_rpc[2].1["agent_id"], "a2");
+        assert_eq!(recorded_rpc[2].1["events"][0]["kind"], "turn.started");
+        assert_eq!(recorded_rpc[2].1["events"][0]["data"]["turn_id"], "turn-3");
+
+        // Observe host-facing child gap / source.state on child state after settlement:
+        let state_after = processor
+            .child_states
+            .get("child-1")
+            .expect("child visible");
+        assert_eq!(state_after.binding.agent_id, "a2");
+        assert_eq!(state_after.binding.agent_generation, 1);
+        assert_eq!(state_after.binding.native_ref, "child-1");
+        assert!(
+            state_after.pending_gap.is_none(),
+            "gap settled by canonical ACK"
+        );
+        assert!(state_after.gap_reported, "gap was reported");
+        assert_eq!(state_after.gap_number, 1);
+        assert!(
+            !state_after.writes_blocked,
+            "writes unblocked after canonical ACK"
+        );
+        assert!(
+            state_after.source_unknown,
+            "source marked unknown due to gap history"
+        );
+        assert!(
+            state_after
+                .failure
+                .as_deref()
+                .is_some_and(|f| f.contains("could not be normalized")),
+            "failure records normalization error"
+        );
+
+        // Assert exact child agent / generation / source from host observation:
+        assert_eq!(recorded_rpc[1].1["agent_id"], "a2");
+        assert_eq!(recorded_rpc[1].1["generation"], 1);
+        assert_eq!(recorded_rpc[1].1["source"], "stream");
+
+        // Parent native source has no false gap after the child ACK: the
+        // healthy-parent steer gate (host checks status.source_unknown)
+        // stays admitted.
+        assert_eq!(processor.loss_reason, None);
+        assert!(!processor.status.source_unknown);
+        assert!(!processor.gap_reported);
+        assert!(processor.status.failure.is_none());
+
+        // No native input / spawn replay:
+        assert!(processor.children.pending_spawns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_child_gap_recovers_without_additional_frame_before_drain() {
+        use eliot_plugin::RpcRequest;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+        use tokio::sync::{mpsc, oneshot, watch};
+
+        let (_native, mut processor, host_io, peer_task) = connected_child_processor("a1").await;
+        processor.status.thread_id = Some("owned".to_owned());
+        // Healthy parent turn: the steer gate needs an active turn and a
+        // known source. The child gap must not disturb either.
+        processor.status.active_command_id = Some("send-1".to_owned());
+        processor.status.active_turn_id = Some("turn-parent".to_owned());
+        let registration = build_registration("call-1", "a1", 1, "owned", "codex:test", "child-1");
+        let mut state = ChildState::new(ChildBinding {
+            registration,
+            agent_id: "a2".to_owned(),
+            agent_generation: 1,
+            native_ref: "child-1".to_owned(),
+        });
+        state.ready_committed = true;
+        processor.child_states.insert("child-1".to_owned(), state);
+
+        // ACTUAL run loop: frames, stream, controls, and status channels.
+        // The producer stays alive (frames open, stream Open) throughout.
+        let (frames_tx, frames_rx) = mpsc::channel(16);
+        let (stream_tx, stream_rx) = watch::channel(StreamState::Open);
+        let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE);
+        let (status_tx, status_rx) = watch::channel(EventStatus::default());
+        let run_handle = tokio::spawn(run(frames_rx, stream_rx, processor, control_rx, status_tx));
+
+        // Coordination without timing: held (gap2 received, ACK not yet
+        // sent), ack (parent served, now send ACK), fact (turn-after
+        // committed, proving unblocked before drain).
+        let (held_tx, held_rx) = oneshot::channel::<()>();
+        let (ack_tx, ack_rx) = oneshot::channel::<()>();
+        let (fact_tx, fact_rx) = oneshot::channel::<()>();
+
+        let (host_read, mut host_write) = split(host_io);
+        let mut host_reader = BufReader::new(host_read);
+        let mut recorded_rpc = Vec::new();
+
+        let fake_host = async {
+            let mut line = String::new();
+
+            // 1. Last child frame's gap: host replies busy immediately.
+            line.clear();
+            timeout_at(
+                Instant::now() + EVENT_DEADLINE,
+                host_reader.read_line(&mut line),
+            )
+            .await
+            .expect("host read first child gap within deadline")
+            .expect("read first child gap request");
+            let req1: RpcRequest = serde_json::from_str(&line).expect("decode req1");
+            recorded_rpc.push((req1.method.clone(), req1.params.clone()));
+            assert_eq!(req1.method, "source.gap");
+            assert_eq!(req1.params["agent_id"], "a2");
+            let busy_reply = json!({
+                "jsonrpc": "2.0",
+                "id": req1.id,
+                "error": {
+                    "code": -32020,
+                    "message": "host source gap is busy",
+                    "data": { "code": "busy" }
+                }
+            });
+            host_write
+                .write_all(format!("{busy_reply}\n").as_bytes())
+                .await
+                .expect("send busy gap reply");
+
+            // 2. Owned retry (no extra child frame): SAME gap_id/body.
+            // Held: no ACK until the parent control is served.
+            line.clear();
+            timeout_at(
+                Instant::now() + EVENT_DEADLINE,
+                host_reader.read_line(&mut line),
+            )
+            .await
+            .expect("host read retried child gap within deadline")
+            .expect("read independently retried child gap");
+            let req2: RpcRequest = serde_json::from_str(&line).expect("decode req2");
+            assert_eq!(req2.method, "source.gap");
+            assert_eq!(
+                req2.params["gap_id"], req1.params["gap_id"],
+                "independent retry keeps SAME gap_id"
+            );
+            assert_eq!(
+                req2.params["reason"], req1.params["reason"],
+                "independent retry keeps SAME gap body"
+            );
+            recorded_rpc.push((req2.method.clone(), req2.params.clone()));
+            held_tx.send(()).expect("signal gap held");
+            timeout_at(Instant::now() + EVENT_DEADLINE, ack_rx)
+                .await
+                .expect("ack signal within deadline")
+                .expect("wait for parent-served signal");
+            let gap_ack = json!({
+                "jsonrpc": "2.0",
+                "id": req2.id,
+                "result": {
+                    "gap_id": req2.params["gap_id"],
+                    "seq": 1,
+                }
+            });
+            host_write
+                .write_all(format!("{gap_ack}\n").as_bytes())
+                .await
+                .expect("send canonical gap ack");
+
+            // 3. Turn-after commits only after settle (proving unblocked
+            // before drain). Any concurrent second gap attempt while held
+            // would arrive here instead and fail the method assertion.
+            line.clear();
+            timeout_at(
+                Instant::now() + EVENT_DEADLINE,
+                host_reader.read_line(&mut line),
+            )
+            .await
+            .expect("host read turn-after fact within deadline")
+            .expect("read turn-after fact");
+            let req3: RpcRequest = serde_json::from_str(&line).expect("decode req3");
+            assert_eq!(req3.method, "events.put");
+            assert_eq!(req3.params["agent_id"], "a2");
+            assert_eq!(req3.params["events"][0]["kind"], "turn.started");
+            assert_eq!(req3.params["events"][0]["data"]["turn_id"], "turn-after");
+            recorded_rpc.push((req3.method.clone(), req3.params.clone()));
+            let fact_ack = json!({
+                "jsonrpc": "2.0",
+                "id": req3.id,
+                "result": {
+                    "first_seq": 2,
+                    "last_seq": 2,
+                    "cursor": null,
+                }
+            });
+            host_write
+                .write_all(format!("{fact_ack}\n").as_bytes())
+                .await
+                .expect("send turn fact ack");
+            fact_tx.send(()).expect("signal fact committed");
+
+            drop(host_write);
+            drop(host_reader);
+            recorded_rpc
+        };
+
+        let mut status_rx = status_rx;
+        let driver = async {
+            // Initial state: no pending gaps (Option::None). Serves parent control.
+            let (initial_tx, initial_rx) = oneshot::channel();
+            control_tx
+                .send(Control::BeginStop { reply: initial_tx })
+                .await
+                .expect("send initial BeginStop");
+            let initial_reply = timeout_at(Instant::now() + EVENT_DEADLINE, initial_rx)
+                .await
+                .expect("initial control within bounded deadline")
+                .expect("parent control served with no pending gaps");
+            assert!(
+                initial_reply.is_ok(),
+                "BeginStop stays responsive before gaps"
+            );
+
+            // Last child frame: normalization failure, gap busy. No more
+            // child frames until after settle (retry is independent).
+            frames_tx
+                .send(NativeFrame::Notification {
+                    method: "turn/started".to_owned(),
+                    params: json!({"threadId": "child-1"}),
+                })
+                .await
+                .expect("send last child frame");
+            timeout_at(Instant::now() + EVENT_DEADLINE, held_rx)
+                .await
+                .expect("held signal within bounded deadline")
+                .expect("retry started without extra frame");
+
+            // Parent control served WHILE the metadata ACK is held.
+            let (reply_tx, reply_rx) = oneshot::channel();
+            control_tx
+                .send(Control::BeginStop { reply: reply_tx })
+                .await
+                .expect("send parent BeginStop");
+            let reply = timeout_at(Instant::now() + EVENT_DEADLINE, reply_rx)
+                .await
+                .expect("held control within bounded deadline")
+                .expect("parent control served while ACK held");
+            assert!(reply.is_ok(), "BeginStop stays responsive");
+            let held_status = status_rx.borrow_and_update().clone();
+            assert!(
+                !held_status.source_unknown,
+                "parent source stays known while child ACK held"
+            );
+            assert_eq!(
+                held_status.active_turn_id.as_deref(),
+                Some("turn-parent"),
+                "healthy parent turn retained while held"
+            );
+
+            // Now let the held ACK settle the child, then wait for the
+            // loop iteration that applies it (status send follows apply).
+            ack_tx.send(()).expect("release held ACK");
+            timeout_at(Instant::now() + EVENT_DEADLINE, status_rx.changed())
+                .await
+                .expect("status change within bounded deadline")
+                .expect("settle applied before drain");
+
+            // After canonical ACK settlement: gap_in_flight is None again; serves parent control again.
+            let (after_ack_tx, after_ack_rx) = oneshot::channel();
+            control_tx
+                .send(Control::BeginStop {
+                    reply: after_ack_tx,
+                })
+                .await
+                .expect("send parent BeginStop after ACK");
+            let after_ack_reply = timeout_at(Instant::now() + EVENT_DEADLINE, after_ack_rx)
+                .await
+                .expect("after-ack control within bounded deadline")
+                .expect("parent control served again after ACK/Option::None");
+            assert!(
+                after_ack_reply.is_ok(),
+                "BeginStop stays responsive after settlement"
+            );
+
+            // Subsequent frame commits (proving writes unblocked) before
+            // the producer drains (frames still open, stream Open).
+            frames_tx
+                .send(NativeFrame::Notification {
+                    method: "turn/started".to_owned(),
+                    params: json!({"threadId": "child-1", "turn": {"id": "turn-after"}}),
+                })
+                .await
+                .expect("send turn-after frame");
+            timeout_at(Instant::now() + EVENT_DEADLINE, fact_rx)
+                .await
+                .expect("fact signal within bounded deadline")
+                .expect("turn-after committed");
+
+            let last_status = status_rx.borrow().clone();
+            assert!(!last_status.source_unknown);
+            assert!(last_status.failure.is_none());
+
+            // Clean shutdown of the actual run loop.
+            let (close_tx, close_rx) = oneshot::channel();
+            control_tx
+                .send(Control::Close { reply: close_tx })
+                .await
+                .expect("send Close");
+            timeout_at(Instant::now() + EVENT_DEADLINE, close_rx)
+                .await
+                .expect("close within bounded deadline")
+                .expect("Close reply");
+            last_status
+        };
+
+        let (recorded_rpc, last_status) = tokio::join!(fake_host, driver);
+        run_handle.await.expect("run clean shutdown");
+        peer_task.await.expect("peer task clean shutdown");
+        drop(stream_tx);
+
+        // Public child boundary: gap, SAME-gap retry, then turn-after fact.
+        // No extra frame between busy and retry; one attempt at a time (no
+        // concurrent second gap while held); settled before drain.
+        assert_eq!(recorded_rpc.len(), 3);
+        assert_eq!(recorded_rpc[0].0, "source.gap");
+        assert_eq!(recorded_rpc[0].1["agent_id"], "a2");
+        assert_eq!(recorded_rpc[0].1["generation"], 1);
+        assert_eq!(recorded_rpc[0].1["source"], "stream");
+        assert_eq!(recorded_rpc[1].0, "source.gap");
+        assert_eq!(recorded_rpc[1].1["agent_id"], "a2");
+        assert_eq!(recorded_rpc[1].1["generation"], 1);
+        assert_eq!(recorded_rpc[1].1["source"], "stream");
+        assert_eq!(
+            recorded_rpc[1].1["gap_id"], recorded_rpc[0].1["gap_id"],
+            "independent retry keeps SAME gap_id"
+        );
+        assert_eq!(
+            recorded_rpc[1].1["reason"], recorded_rpc[0].1["reason"],
+            "independent retry keeps SAME gap body"
+        );
+        assert_eq!(recorded_rpc[2].0, "events.put");
+        assert_eq!(recorded_rpc[2].1["agent_id"], "a2");
+
+        // Parent native source has no false gap; healthy steer gate
+        // (active turn + known source) remains admitted.
+        assert!(!last_status.source_unknown);
+        assert!(!last_status.batch_unknown);
+        assert_eq!(last_status.active_turn_id.as_deref(), Some("turn-parent"));
+
+        // NO child registration / NativeInput / Spawn replay on the wire:
+        // only source.gap and the turn-after events.put.
+        assert!(
+            recorded_rpc
+                .iter()
+                .all(|(method, _)| matches!(method.as_str(), "source.gap" | "events.put"))
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_gap_rotation_is_fair_and_apply_matches_only() {
+        let (_native, mut processor) = child_test_processor().await;
+        for (thread, agent, gap_id) in [
+            ("child-1", "a2", "codex:a2:1:gap-1"),
+            ("child-2", "a3", "codex:a3:1:gap-1"),
+        ] {
+            let registration = build_registration("call-1", "a1", 1, "owned", "codex:test", thread);
+            let mut state = ChildState::new(ChildBinding {
+                registration,
+                agent_id: agent.to_owned(),
+                agent_generation: 1,
+                native_ref: thread.to_owned(),
+            });
+            state.ready_committed = true;
+            state.writes_blocked = true;
+            state.source_unknown = true;
+            state.gap_reported = true;
+            state.gap_number = 1;
+            state.pending_gap = Some(SourceGap {
+                gap_id: gap_id.to_owned(),
+                agent_id: agent.to_owned(),
+                generation: 1,
+                source: "stream".to_owned(),
+                families: vec![
+                    "session".to_owned(),
+                    "turn".to_owned(),
+                    "message".to_owned(),
+                ],
+                reason: format!("gap for {thread}"),
+                from: None,
+                to: None,
+            });
+            processor.child_states.insert(thread.to_owned(), state);
+        }
+        // Fair rotation: sorted order, round-robin, no starvation.
+        let (first, gap1) = processor.next_pending_gap().expect("first");
+        assert_eq!(first, "child-1");
+        let (second, gap2) = processor.next_pending_gap().expect("second");
+        assert_eq!(second, "child-2");
+        let (third, _) = processor.next_pending_gap().expect("wraps");
+        assert_eq!(third, "child-1");
+
+        // Stale attempts are ignored: wrong child, generation, or gap.
+        let good_ack = json!({"gap_id": gap1.gap_id, "seq": 1});
+        assert!(!processor.apply_gap_attempt("child-2", &gap1, &Ok(good_ack.clone())));
+        assert!(processor.child_states["child-2"].pending_gap.is_some());
+        let mut wrong_gen = gap1.clone();
+        wrong_gen.generation = 2;
+        assert!(!processor.apply_gap_attempt("child-1", &wrong_gen, &Ok(good_ack.clone())));
+        let mut stale = gap1.clone();
+        stale.gap_id = "codex:a2:1:gap-999".to_owned();
+        assert!(!processor.apply_gap_attempt(
+            "child-1",
+            &stale,
+            &Ok(json!({"gap_id": stale.gap_id, "seq": 1}))
+        ));
+        // Non-canonical ACK and transport errors retain without settling.
+        assert!(!processor.apply_gap_attempt(
+            "child-1",
+            &gap1,
+            &Ok(json!({"gap_id": gap1.gap_id, "seq": 0}))
+        ));
+        assert!(!processor.apply_gap_attempt("child-2", &gap2, &Err(Error::new("busy", "held"))));
+        assert!(processor.child_states["child-1"].pending_gap.is_some());
+        assert!(processor.child_states["child-2"].pending_gap.is_some());
+        // Canonical ACK settles only the matching child.
+        assert!(processor.apply_gap_attempt("child-1", &gap1, &Ok(good_ack)));
+        assert!(processor.child_states["child-1"].pending_gap.is_none());
+        assert!(!processor.child_states["child-1"].writes_blocked);
+        assert!(
+            processor.child_states["child-2"].pending_gap.is_some(),
+            "other child untouched"
+        );
+        let (remaining, _) = processor.next_pending_gap().expect("remaining");
+        assert_eq!(remaining, "child-2");
+    }
+
+    #[tokio::test]
+    async fn child_orphan_collection_bounds_rejected_unconfirmed() {
+        let (_native, mut processor) = child_test_processor().await;
+        processor.status.thread_id = Some("owned".to_owned());
+        processor
+            .children
+            .spawn_started("owned", "call-1".to_owned())
+            .unwrap();
+        for index in 0..MAX_CHILD_THREADS {
+            let thread = format!("t{index}");
+            assert_eq!(processor.children.take_frame(&thread), Ok(true));
+            processor.buffer_child_frame(
+                &thread,
+                BufferedNativeFrame::Notification {
+                    method: "turn/started".to_owned(),
+                    params: json!({"threadId": thread}),
+                },
+            );
+        }
+        assert_eq!(processor.child_buffers.len(), MAX_CHILD_THREADS);
+        assert!(processor.children.take_frame("t-rejected").is_err());
+        let rejected_params = json!({"threadId": "t-rejected"});
+        assert!(processor.take_child_frame(&rejected_params));
+        processor
+            .handle_child_notification("turn/started", rejected_params)
+            .await;
+        assert!(!processor.child_buffers.contains_key("t-rejected"));
+        assert!(!processor.child_unknown.contains("t-rejected"));
+        assert!(!processor.child_early_lost.contains("t-rejected"));
+        assert!(!processor.child_pending.contains_key("t-rejected"));
+        processor.children.confirm("owned", "t0").unwrap();
+        processor.settle_child_tracking();
+        assert!(processor.loss_reason.is_some(), "loss is explicit gap");
+        assert!(
+            processor.child_buffers.contains_key("t0"),
+            "proven child row is preserved"
+        );
+        assert!(!processor.child_buffers.contains_key("t1"));
+        assert!(!processor.child_buffers.contains_key("t-rejected"));
+        assert!(processor.child_buffers.len() <= MAX_CHILD_THREADS);
+    }
+
+    #[test]
+    fn child_window_settle_is_producer_scoped() {
+        let mut children = ChildThreads::default();
+        children
+            .spawn_started("owned", "call-root".to_owned())
+            .unwrap();
+        children
+            .spawn_started("child-a", "call-nested".to_owned())
+            .unwrap();
+        assert_eq!(children.take_frame("child-b"), Ok(true));
+        assert_eq!(children.settle("owned"), Ok(()));
+        assert!(children.is_unconfirmed("child-b"));
+        assert!(children.has_pending());
+        assert_eq!(
+            children.spawn_completed("child-a", "owned", "call-nested", &["child-b".to_owned()]),
+            Ok(())
+        );
+        assert!(children.is_bound("child-b"));
+        assert!(!children.has_pending());
+    }
+
+    #[tokio::test]
+    async fn nested_spawn_survives_root_completion() {
+        let (_native, mut processor) = child_test_processor().await;
+        processor.status.thread_id = Some("root".to_owned());
+        processor.status.active_turn_id = Some("turn-r".to_owned());
+        processor.status.active_command_id = Some("cmd-r".to_owned());
+        processor.native_scope = "codex:test".to_owned();
+        processor.children.confirm("root", "a").unwrap();
+        processor.agent_id = "a1".to_owned();
+        processor.generation = 1;
+        let reg_a = build_registration("call-a", "a1", 1, "root", "codex:test", "a");
+        let mut state_a = ChildState::new(ChildBinding {
+            registration: reg_a,
+            agent_id: "a2".to_owned(),
+            agent_generation: 1,
+            native_ref: "a".to_owned(),
+        });
+        state_a.ready_committed = true;
+        state_a.active_turn_id = Some("turn-a".to_owned());
+        processor.child_states.insert("a".to_owned(), state_a);
+        processor
+            .children
+            .parents
+            .insert("a".to_owned(), "root".to_owned());
+        processor
+            .children
+            .spawn_items
+            .insert("a".to_owned(), "call-a".to_owned());
+        processor
+            .children
+            .spawn_started("root", "call-root".to_owned())
+            .unwrap();
+        assert_eq!(processor.children.take_frame("b"), Ok(true));
+        processor.buffer_child_frame(
+            "b",
+            BufferedNativeFrame::Notification {
+                method: "turn/started".to_owned(),
+                params: json!({"threadId": "b", "turn": {"id": "turn-b"}}),
+            },
+        );
+        processor.writes_blocked = true;
+        let params = json!({
+            "threadId": "root",
+            "turn": {"id": "turn-r", "items": [], "status": "completed"},
+        });
+        let _ = processor.complete_turn(params).await;
+        assert!(processor.children.is_unconfirmed("b"));
+        assert!(processor.child_buffers.contains_key("b"));
+        assert!(!processor.child_early_lost.contains("b"));
+        processor
+            .children
+            .spawn_started("a", "call-b".to_owned())
+            .unwrap();
+        processor.writes_blocked = false;
+        processor.children.confirm("root", "b").unwrap();
+        processor
+            .children
+            .parents
+            .insert("b".to_owned(), "a".to_owned());
+        processor
+            .children
+            .spawn_items
+            .insert("b".to_owned(), "call-b".to_owned());
+        let reg_b = processor.child_registration_for("b").unwrap();
+        assert_eq!(reg_b.parent_id, "a2");
+        assert_eq!(reg_b.parent_native_ref, "a");
+        assert_eq!(reg_b.native_ref, "b");
+        if let Some(state) = processor.child_states.get_mut("a") {
+            state.active_turn_id = None;
+        }
+        processor.settle_spawn_window_for("a");
+        assert!(processor.children.is_bound("b"));
+    }
+
+    #[tokio::test]
+    async fn nested_spawn_survives_root_completion_when_a_writes_blocked() {
+        let (_native, mut processor) = child_test_processor().await;
+        processor.status.thread_id = Some("root".to_owned());
+        processor.status.active_turn_id = Some("turn-r".to_owned());
+        processor.status.active_command_id = Some("cmd-r".to_owned());
+        processor.native_scope = "codex:test".to_owned();
+        processor.children.confirm("root", "a").unwrap();
+        processor.agent_id = "a1".to_owned();
+        processor.generation = 1;
+        let reg_a = build_registration("call-a", "a1", 1, "root", "codex:test", "a");
+        let mut state_a = ChildState::new(ChildBinding {
+            registration: reg_a,
+            agent_id: "a2".to_owned(),
+            agent_generation: 1,
+            native_ref: "a".to_owned(),
+        });
+        state_a.active_turn_id = Some("turn-a".to_owned());
+        state_a.writes_blocked = true;
+        processor.child_states.insert("a".to_owned(), state_a);
+        processor
+            .children
+            .parents
+            .insert("a".to_owned(), "root".to_owned());
+        processor
+            .children
+            .spawn_items
+            .insert("a".to_owned(), "call-a".to_owned());
+        processor
+            .children
+            .spawn_started("root", "call-root".to_owned())
+            .unwrap();
+        assert_eq!(processor.children.take_frame("b"), Ok(true));
+        processor.buffer_child_frame(
+            "b",
+            BufferedNativeFrame::Notification {
+                method: "turn/started".to_owned(),
+                params: json!({"threadId": "b", "turn": {"id": "turn-b"}}),
+            },
+        );
+        processor.writes_blocked = true;
+        let params = json!({
+            "threadId": "root",
+            "turn": {"id": "turn-r", "items": [], "status": "completed"},
+        });
+        let _ = processor.complete_turn(params).await;
+        assert!(processor.children.is_unconfirmed("b"));
+        assert!(processor.child_buffers.contains_key("b"));
+        assert!(!processor.child_early_lost.contains("b"));
+        processor
+            .children
+            .spawn_started("a", "call-b".to_owned())
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_unconfirmed_b_terminal_survives_root_completion_through_handle_frame() {
+        use eliot_plugin::RpcRequest;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+
+        let (_native, mut processor, host_io, peer_task) = connected_child_processor("a1").await;
+        processor.status.ready = true;
+        processor.status.thread_id = Some("root".to_owned());
+        processor.status.active_turn_id = Some("turn-root".to_owned());
+        processor.status.active_command_id = Some("cmd-root".to_owned());
+        let registration_a = build_registration("call-root", "a1", 1, "root", "codex:test", "a");
+        let mut state_a = ChildState::new(ChildBinding {
+            registration: registration_a,
+            agent_id: "a2".to_owned(),
+            agent_generation: 1,
+            native_ref: "a".to_owned(),
+        });
+        state_a.ready_committed = true;
+        state_a.active_turn_id = Some("turn-a".to_owned());
+        processor.child_states.insert("a".to_owned(), state_a);
+        processor.children.confirm("root", "a").unwrap();
+        processor
+            .children
+            .parents
+            .insert("a".to_owned(), "root".to_owned());
+        processor
+            .children
+            .spawn_items
+            .insert("a".to_owned(), "call-root".to_owned());
+        processor
+            .children
+            .spawn_started("root", "call-root".to_owned())
+            .unwrap();
+        assert_eq!(processor.children.pending_items("root").len(), 1);
+
+        let (host_read, mut host_write) = split(host_io);
+        let mut host_reader = BufReader::new(host_read);
+        let fake_host = async {
+            let mut requests = Vec::new();
+            let mut last_seq = HashMap::<String, i64>::new();
+            for _ in 0..5 {
+                let mut line = String::new();
+                host_reader
+                    .read_line(&mut line)
+                    .await
+                    .expect("read fake-host request");
+                let request: RpcRequest = serde_json::from_str(&line).expect("decode request");
+                requests.push((request.method.clone(), request.params.clone()));
+                let result = match request.method.as_str() {
+                    "child" => {
+                        let registration: eliot_core::ChildRegistration =
+                            serde_json::from_value(request.params["registration"].clone())
+                                .expect("decode child registration");
+                        let mut ack = crate::native_child::tests::test_ack(&registration);
+                        ack.agent.id = "a3".to_owned();
+                        ack.agent.root = "a1".to_owned();
+                        ack.agent.depth = 2;
+                        serde_json::to_value(ack).expect("encode child ACK")
+                    }
+                    "events.put" => {
+                        let agent_id = request.params["agent_id"]
+                            .as_str()
+                            .expect("agent id")
+                            .to_owned();
+                        let count = request.params["events"]
+                            .as_array()
+                            .expect("event batch")
+                            .len() as i64;
+                        let sequence = last_seq.entry(agent_id).or_default();
+                        let first_seq = *sequence + 1;
+                        let end = first_seq + count - 1;
+                        *sequence = end;
+                        json!({
+                            "first_seq": first_seq,
+                            "last_seq": end,
+                            "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                        })
+                    }
+                    method => panic!("unexpected fake-host request: {method}"),
+                };
+                let response = json!({"jsonrpc": "2.0", "id": request.id, "result": result});
+                host_write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .expect("send ACK");
+            }
+            requests
+        };
+        let driver = async {
+            processor
+                .handle_frame(Some(NativeFrame::Notification {
+                    method: "turn/started".to_owned(),
+                    params: json!({"threadId": "b", "turn": {"id": "turn-b"}}),
+                }))
+                .await;
+            assert!(processor.children.is_unconfirmed("b"));
+            assert_eq!(
+                processor.child_buffers.get("b").map(|queue| queue.len()),
+                Some(1)
+            );
+
+            processor
+                .handle_frame(Some(NativeFrame::Notification {
+                    method: "turn/completed".to_owned(),
+                    params: json!({
+                        "threadId": "root",
+                        "turn": {"id": "turn-root", "items": [], "status": "completed"},
+                    }),
+                }))
+                .await;
+            assert!(processor.status.active_turn_id.is_none());
+            assert_eq!(
+                processor
+                    .status
+                    .last_turn
+                    .as_ref()
+                    .map(|turn| turn.turn_id.as_str()),
+                Some("turn-root")
+            );
+            assert!(processor.children.is_unconfirmed("b"));
+            assert!(!processor.children.has_any_window());
+
+            processor
+                .handle_frame(Some(NativeFrame::Notification {
+                    method: "turn/completed".to_owned(),
+                    params: json!({
+                        "threadId": "b",
+                        "turn": {"id": "turn-b", "items": [], "status": "completed"},
+                    }),
+                }))
+                .await;
+            assert!(processor.buffer.is_empty());
+            assert_eq!(
+                processor.child_buffers.get("b").map(|queue| queue.len()),
+                Some(2)
+            );
+
+            processor
+                .children
+                .spawn_started("a", "call-b".to_owned())
+                .unwrap();
+            processor
+                .handle_frame(Some(NativeFrame::Notification {
+                    method: "thread/started".to_owned(),
+                    params: json!({
+                        "thread": {"id": "b", "source": {"subAgent": {"thread_spawn": {
+                            "parent_thread_id": "a", "call_id": "call-b",
+                        }}}},
+                    }),
+                }))
+                .await;
+            assert!(processor.children.is_bound("b"));
+            processor
+                .children
+                .spawn_completed("a", "root", "call-b", &["b".to_owned()])
+                .unwrap();
+            assert!(
+                processor
+                    .child_states
+                    .get("b")
+                    .is_some_and(|state| state.active_turn_id.is_none())
+            );
+            assert!(
+                processor
+                    .child_buffers
+                    .get("b")
+                    .is_none_or(|queue| queue.is_empty())
+            );
+            assert!(processor.buffer.is_empty());
+        };
+        let (requests, ()) = tokio::join!(fake_host, driver);
+        peer_task.abort();
+
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(method, _)| method == "child")
+                .count(),
+            1
+        );
+        let mut parent_completions = 0;
+        let mut b_completed = false;
+        for (method, params) in &requests {
+            if method != "events.put" {
+                continue;
+            }
+            for event in params["events"].as_array().expect("recorded event batch") {
+                if params["agent_id"] == "a1" && event["kind"] == "turn.completed" {
+                    parent_completions += 1;
+                }
+                if params["agent_id"] == "a3"
+                    && event["kind"] == "turn.completed"
+                    && event["data"]["turn_id"] == "turn-b"
+                {
+                    b_completed = true;
+                }
+            }
+        }
+        assert_eq!(
+            parent_completions, 1,
+            "B completion must not create a parent turn"
+        );
+        assert!(
+            b_completed,
+            "registered child batch must contain B's completion"
+        );
     }
 }

@@ -97,6 +97,7 @@ mod git;
 mod goals;
 mod hierarchy;
 mod lifecycle;
+mod native_children;
 mod native_events;
 mod observer;
 mod observer_live;
@@ -792,6 +793,7 @@ impl Store {
 
         let mut events = Vec::new();
         recover_workspaces(&tx, now, &mut events)?;
+        Self::recover_lost_native_children_tx(&tx, now, &mut events)?;
         for (command_id, target, generation) in dispatched_commands {
             let outcome = json!({"reason": "daemon_restart"});
             update_command_state(
@@ -3279,7 +3281,23 @@ fn install_initial_source_plan(
     harness: &str,
     now: i64,
 ) -> Result<()> {
-    for family in source_families_for_harness(harness)? {
+    install_stream_source_plan(
+        tx,
+        agent,
+        generation,
+        source_families_for_harness(harness)?,
+        now,
+    )
+}
+
+fn install_stream_source_plan(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    families: &[&str],
+    now: i64,
+) -> Result<()> {
+    for family in families {
         db!(tx.execute(
             "INSERT INTO source_owners(agent, generation, family, source, mechanism)
              VALUES (?1, ?2, ?3, ?4, 'stream')",

@@ -354,7 +354,10 @@ impl RecoveryPublisher {
             }
             Ok(_) => Err(unknown_error()),
             Err(error) => {
-                if !self.sink.is_unknown() {
+                if !self
+                    .sink
+                    .is_unknown(&self.agent_id, self.generation, TRANSCRIPT_SOURCE)
+                {
                     self.pending = None;
                 }
                 Err(self.safe_error(error, "native event commit"))

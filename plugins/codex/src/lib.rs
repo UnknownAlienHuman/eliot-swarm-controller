@@ -5,6 +5,7 @@ mod events;
 mod host;
 mod live_recovery;
 mod native;
+mod native_child;
 mod observe;
 mod route;
 

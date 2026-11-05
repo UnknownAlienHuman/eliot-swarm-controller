@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 25;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 26;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -638,6 +638,27 @@ impl Store {
                      PRIMARY KEY(agent, generation)
                  );
                  INSERT INTO schema_migrations(version) VALUES (25);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 26 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE native_child_registrations (
+                     producer INTEGER NOT NULL REFERENCES agents(id),
+                     producer_generation INTEGER NOT NULL CHECK(producer_generation > 0),
+                     parent INTEGER NOT NULL REFERENCES agents(id),
+                     parent_generation INTEGER NOT NULL CHECK(parent_generation > 0),
+                     registration_id TEXT NOT NULL,
+                     child INTEGER NOT NULL UNIQUE REFERENCES agents(id),
+                     request TEXT NOT NULL, ack TEXT NOT NULL,
+                     PRIMARY KEY(parent, parent_generation, registration_id)
+                 );
+                 INSERT INTO schema_migrations(version) VALUES (26);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

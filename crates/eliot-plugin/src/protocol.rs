@@ -294,6 +294,13 @@ pub struct ObserverDetachParams {
     pub native_ref: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildParams {
+    pub credential: String,
+    pub registration: eliot_core::ChildRegistration,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

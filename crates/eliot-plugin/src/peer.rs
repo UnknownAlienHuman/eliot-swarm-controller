@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{Stdin, Stdout, stdin, stdout},
+    io::{AsyncRead, AsyncWrite, Stdin, stdin, stdout},
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     time::{Instant, timeout_at},
 };
@@ -36,12 +36,12 @@ struct OutboundFrame {
     written: oneshot::Sender<Result<()>>,
 }
 
-/// Eliot's plugin-side JSON-RPC 2.0 NDJSON peer over stdin/stdout.
+/// Eliot's plugin-side JSON-RPC 2.0 NDJSON peer over stdin/stdout or arbitrary I/O.
 ///
-/// The peer owns the only stdin reader. Callers keep polling `next_request` while
+/// The peer owns the only stream reader. Callers keep polling `next_request` while
 /// outbound calls are pending so responses are routed without a second reader.
-pub struct Peer {
-    reader: FramedRead<Stdin, LinesCodec>,
+pub struct Peer<R = Stdin> {
+    reader: FramedRead<R, LinesCodec>,
     client: PeerClient,
     _writer_task: tokio::task::JoinHandle<()>,
 }
@@ -69,15 +69,22 @@ struct PendingGuard {
 pub struct CommitSink {
     client: PeerClient,
     credential: String,
-    unknown_batch: Option<SourceBatch>,
+    // One unacknowledged batch per (agent_id, generation, source).
+    unknown_batches: HashMap<(String, i64, String), SourceBatch>,
 }
 
-impl Peer {
-    /// Connect the Eliot plugin peer to the process's stdin and stdout.
-    pub fn stdio() -> Self {
+impl<R> Peer<R>
+where
+    R: AsyncRead + Unpin,
+{
+    /// Connect the Eliot plugin peer to arbitrary reader and writer streams.
+    pub fn from_io<W>(reader: R, writer: W) -> Self
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let (writes, write_rx) = mpsc::channel(WRITE_QUEUE_CAPACITY);
         let pending = Arc::new(StdMutex::new(HashMap::new()));
-        let writer = FramedWrite::new(stdout(), LinesCodec::new());
+        let writer = FramedWrite::new(writer, LinesCodec::new());
         let writer_task = tokio::spawn(writer_loop(writer, write_rx, Arc::clone(&pending)));
 
         let client = PeerClient {
@@ -87,7 +94,7 @@ impl Peer {
             next_id: Arc::new(AtomicU64::new(0)),
         };
         let reader = FramedRead::new(
-            stdin(),
+            reader,
             LinesCodec::new_with_max_length(MAX_FRAME_BYTES.saturating_sub(1)),
         );
 
@@ -144,6 +151,13 @@ impl Peer {
                 }
             }
         }
+    }
+}
+
+impl Peer<Stdin> {
+    /// Connect the Eliot plugin peer to the process's stdin and stdout.
+    pub fn stdio() -> Self {
+        Self::from_io(stdin(), stdout())
     }
 }
 
@@ -270,13 +284,14 @@ impl CommitSink {
         Self {
             client,
             credential: credential.into(),
-            unknown_batch: None,
+            unknown_batches: HashMap::new(),
         }
     }
 
     /// Commit one complete event batch and validate its acknowledgement.
     pub async fn commit(&mut self, batch: SourceBatch, deadline: Instant) -> Result<BatchAck> {
-        if self.unknown_batch.is_some() {
+        let key = Self::scope_key(&batch);
+        if self.unknown_batches.contains_key(&key) {
             return Err(unknown_batch_error());
         }
         if self.credential.len() > crate::protocol::MAX_CREDENTIAL_BYTES {
@@ -305,7 +320,7 @@ impl CommitSink {
         let expected_count = i64::try_from(batch.events.len())
             .map_err(|_| Error::new("frame_too_large", "event batch is too large"))?;
         let expected_cursor = batch.cursor.clone();
-        self.unknown_batch = Some(batch.clone());
+        self.unknown_batches.insert(key.clone(), batch.clone());
         let permit = match self.client.acquire_pending(deadline).await {
             Ok(permit) => permit,
             Err(_) => return Err(unknown_batch_error()),
@@ -313,12 +328,12 @@ impl CommitSink {
         let mut params = match serde_json::to_value(batch) {
             Ok(params) => params,
             Err(_) => {
-                self.unknown_batch = None;
+                self.unknown_batches.remove(&key);
                 return Err(Error::new("internal", "event batch could not be encoded"));
             }
         };
         let Some(params) = params.as_object_mut() else {
-            self.unknown_batch = None;
+            self.unknown_batches.remove(&key);
             return Err(Error::new(
                 "internal",
                 "event batch encoding was not an object",
@@ -336,7 +351,7 @@ impl CommitSink {
         {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.unknown_batch = None;
+                self.unknown_batches.remove(&key);
                 return Err(error);
             }
         };
@@ -360,14 +375,15 @@ impl CommitSink {
             return Err(unknown_batch_error());
         }
 
-        self.unknown_batch = None;
+        self.unknown_batches.remove(&key);
         Ok(ack)
     }
 
     /// Settle an uncertain commit only when private source-state readback proves
     /// this exact frozen batch and its complete acknowledgement.
     pub fn settle_from_state(&mut self, batch: &SourceBatch, state: &Value) -> Result<BatchAck> {
-        if self.unknown_batch.as_ref() != Some(batch) {
+        let key = Self::scope_key(batch);
+        if self.unknown_batches.get(&key) != Some(batch) {
             return Err(unknown_batch_error());
         }
 
@@ -405,13 +421,23 @@ impl CommitSink {
             last_seq,
             cursor: batch.cursor.clone(),
         };
-        self.unknown_batch = None;
+        self.unknown_batches.remove(&key);
         Ok(ack)
     }
 
-    /// Whether a commit was sent without a valid acknowledgement.
-    pub fn is_unknown(&self) -> bool {
-        self.unknown_batch.is_some()
+    /// Whether this exact (agent, generation, source) has a commit sent
+    /// without a valid acknowledgement. Other sources never share this latch.
+    pub fn is_unknown(&self, agent_id: &str, generation: i64, source: &str) -> bool {
+        self.unknown_batches
+            .contains_key(&(agent_id.to_owned(), generation, source.to_owned()))
+    }
+
+    fn scope_key(batch: &SourceBatch) -> (String, i64, String) {
+        (
+            batch.agent_id.clone(),
+            batch.generation,
+            batch.source.clone(),
+        )
     }
 }
 
@@ -426,11 +452,13 @@ pub(crate) fn preserve_rpc_error(error: RpcError) -> Error {
     decode_error_diagnostics(Error::new(code, error.message), error.data.as_ref())
 }
 
-async fn writer_loop(
-    mut writer: FramedWrite<Stdout, LinesCodec>,
+async fn writer_loop<W>(
+    mut writer: FramedWrite<W, LinesCodec>,
     mut writes: mpsc::Receiver<OutboundFrame>,
     pending: PendingCalls,
-) {
+) where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     while let Some(outbound) = writes.recv().await {
         let result = writer
             .send(outbound.encoded)
@@ -673,7 +701,8 @@ mod tests {
             cursor: Some("opaque-edge".to_owned()),
         };
         let mut sink = CommitSink::new(test_client(), "credential");
-        sink.unknown_batch = Some(batch.clone());
+        sink.unknown_batches
+            .insert(CommitSink::scope_key(&batch), batch.clone());
 
         let ack = sink
             .settle_from_state(&batch, &batch_readback(&batch))
@@ -681,16 +710,17 @@ mod tests {
         assert_eq!(ack.first_seq, 7);
         assert_eq!(ack.last_seq, 7);
         assert_eq!(ack.cursor, batch.cursor);
-        assert!(!sink.is_unknown());
+        assert!(!sink.is_unknown(&batch.agent_id, batch.generation, &batch.source));
 
         let mut different_payload = batch.clone();
         different_payload.events[0].data["text"] = json!("changed");
-        sink.unknown_batch = Some(batch.clone());
+        sink.unknown_batches
+            .insert(CommitSink::scope_key(&batch), batch.clone());
         assert!(
             sink.settle_from_state(&different_payload, &batch_readback(&batch))
                 .is_err()
         );
-        assert!(sink.is_unknown());
+        assert!(sink.is_unknown(&batch.agent_id, batch.generation, &batch.source));
 
         for (field, value) in [
             ("agent_id", json!("a2")),
@@ -707,13 +737,194 @@ mod tests {
         ] {
             let mut proof = batch_readback(&batch);
             proof[field] = value;
-            sink.unknown_batch = Some(batch.clone());
+            sink.unknown_batches
+                .insert(CommitSink::scope_key(&batch), batch.clone());
             assert!(
                 sink.settle_from_state(&batch, &proof).is_err(),
                 "field={field}"
             );
-            assert!(sink.is_unknown(), "field={field}");
+            assert!(
+                sink.is_unknown(&batch.agent_id, batch.generation, &batch.source),
+                "field={field}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn unknown_batch_is_isolated_through_actual_peer_rpc() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
+
+        fn mk_batch(id: &str, agent: &str, source: &str, edge: &str, native: &str) -> SourceBatch {
+            SourceBatch {
+                batch_id: id.to_owned(),
+                agent_id: agent.to_owned(),
+                generation: 3,
+                source: source.to_owned(),
+                events: vec![eliot_core::NativeEvent {
+                    kind: "message.completed".to_owned(),
+                    native_id: native.to_owned(),
+                    data: json!({"text": id}),
+                    ts: Some(1),
+                }],
+                cursor: Some(edge.to_owned()),
+            }
+        }
+
+        let batch_a = mk_batch("batch-a", "a1", "transcript", "edge-a", "native-a");
+        let batch_b = mk_batch("batch-b", "a2", "transcript", "edge-b", "native-b");
+        let batch_parent = mk_batch(
+            "batch-parent",
+            "a1",
+            "stream",
+            "edge-parent",
+            "native-parent",
+        );
+
+        let (host_io, plugin_io) = duplex(64 * 1024);
+        let (plugin_read, plugin_write) = split(plugin_io);
+        let mut peer = Peer::from_io(plugin_read, plugin_write);
+        let client = peer.client();
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+
+        let (host_read, mut host_write) = split(host_io);
+        let mut host_reader = BufReader::new(host_read);
+        let mut recorded: Vec<(String, Value)> = Vec::new();
+
+        // Fake host: 1) read A, never reply (ACK lost). 2) read B, ack 7. 3) read parent, ack 8.
+        let fake_host = async {
+            let mut line = String::new();
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("A request read");
+            let req_a: RpcRequest = serde_json::from_str(&line).expect("decode A");
+            assert_eq!(req_a.method, "events.put");
+            assert_eq!(req_a.params["agent_id"], "a1");
+            assert_eq!(req_a.params["source"], "transcript");
+            recorded.push((req_a.method.clone(), req_a.params.clone()));
+            // ACK for A is dropped on purpose: no response written.
+
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("B request read");
+            let req_b: RpcRequest = serde_json::from_str(&line).expect("decode B");
+            assert_eq!(req_b.method, "events.put");
+            assert_eq!(req_b.params["agent_id"], "a2");
+            recorded.push((req_b.method.clone(), req_b.params.clone()));
+            let ack_b = RpcResponse::success(
+                req_b.id.clone(),
+                json!({"first_seq":7,"last_seq":7,"cursor":"edge-b"}),
+            );
+            let frame = encode_frame(&ack_b).expect("ack B frame");
+            host_write
+                .write_all(format!("{frame}\n").as_bytes())
+                .await
+                .expect("send ack B");
+
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("parent request read");
+            let req_p: RpcRequest = serde_json::from_str(&line).expect("decode parent");
+            assert_eq!(req_p.method, "events.put");
+            assert_eq!(req_p.params["agent_id"], "a1");
+            assert_eq!(req_p.params["source"], "stream");
+            recorded.push((req_p.method.clone(), req_p.params.clone()));
+            let ack_p = RpcResponse::success(
+                req_p.id.clone(),
+                json!({"first_seq":8,"last_seq":8,"cursor":"edge-parent"}),
+            );
+            let frame = encode_frame(&ack_p).expect("ack parent frame");
+            host_write
+                .write_all(format!("{frame}\n").as_bytes())
+                .await
+                .expect("send ack parent");
+
+            drop(host_write);
+            drop(host_reader);
+            recorded
+        };
+
+        let plugin_calls = async {
+            let mut sink = CommitSink::new(client, "credential");
+            // Fresh deadline per commit: the first deadline expires while A's
+            // ACK is lost, so B/parent need their own windows.
+            let deadline_a = Instant::now() + Duration::from_millis(300);
+
+            // A: processed by host but ACK lost -> unknown, exact batch retained.
+            let err_a = sink
+                .commit(batch_a.clone(), deadline_a)
+                .await
+                .expect_err("A ACK lost");
+            assert_eq!(err_a.code, "unknown");
+            assert!(sink.is_unknown(&batch_a.agent_id, batch_a.generation, &batch_a.source));
+
+            // SAME sink: sibling B and parent different source commit through healthy RPC.
+            let deadline_b = Instant::now() + Duration::from_secs(5);
+            let ack_b = sink
+                .commit(batch_b.clone(), deadline_b)
+                .await
+                .expect("B commit succeeds");
+            assert_eq!(ack_b.first_seq, 7);
+            assert_eq!(ack_b.cursor.as_deref(), Some("edge-b"));
+            let deadline_p = Instant::now() + Duration::from_secs(5);
+            let ack_p = sink
+                .commit(batch_parent.clone(), deadline_p)
+                .await
+                .expect("parent commit succeeds");
+            assert_eq!(ack_p.first_seq, 8);
+            assert_eq!(ack_p.cursor.as_deref(), Some("edge-parent"));
+
+            // A remains blocked; same-scope retry never hits wire.
+            assert!(sink.is_unknown(&batch_a.agent_id, batch_a.generation, &batch_a.source));
+            let err_retry = sink
+                .commit(batch_a.clone(), Instant::now() + Duration::from_secs(5))
+                .await
+                .expect_err("A same-scope blocked");
+            assert_eq!(err_retry.code, "unknown");
+
+            // Mismatched digest / wrong generation / wrong source cannot settle A.
+            let mut wrong_digest = batch_readback(&batch_a);
+            wrong_digest["last_batch_digest"] = serde_json::to_value([9u8; 32]).unwrap();
+            assert!(sink.settle_from_state(&batch_a, &wrong_digest).is_err());
+            let mut wrong_gen = batch_readback(&batch_a);
+            wrong_gen["generation"] = json!(99);
+            assert!(sink.settle_from_state(&batch_a, &wrong_gen).is_err());
+            let mut wrong_source = batch_readback(&batch_a);
+            wrong_source["source"] = json!("other");
+            assert!(sink.settle_from_state(&batch_a, &wrong_source).is_err());
+            let mut wrong_agent = batch_readback(&batch_a);
+            wrong_agent["agent_id"] = json!("a2");
+            assert!(sink.settle_from_state(&batch_a, &wrong_agent).is_err());
+            assert!(sink.is_unknown(&batch_a.agent_id, batch_a.generation, &batch_a.source));
+
+            // Exact readback settles only A.
+            let ack_a = sink
+                .settle_from_state(&batch_a, &batch_readback(&batch_a))
+                .expect("exact readback");
+            assert_eq!(ack_a.first_seq, 7);
+            assert_eq!(ack_a.cursor, batch_a.cursor);
+            assert!(!sink.is_unknown(&batch_a.agent_id, batch_a.generation, &batch_a.source));
+        };
+
+        let (recorded, ()) = tokio::join!(fake_host, plugin_calls);
+        peer_task.await.expect("peer task clean shutdown");
+
+        // Actual wire evidence: exactly three events.put calls (A, B, parent). The
+        // blocked A retry never reached the wire.
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded[0].0, "events.put");
+        assert_eq!(recorded[0].1["agent_id"], "a1");
+        assert_eq!(recorded[0].1["source"], "transcript");
+        assert_eq!(recorded[1].0, "events.put");
+        assert_eq!(recorded[1].1["agent_id"], "a2");
+        assert_eq!(recorded[2].0, "events.put");
+        assert_eq!(recorded[2].1["agent_id"], "a1");
+        assert_eq!(recorded[2].1["source"], "stream");
     }
 
     #[test]
@@ -812,5 +1023,108 @@ mod tests {
                 .all(|value| value.snapshot.truncated)
         );
         assert!(frame.len() < MAX_FRAME_BYTES);
+    }
+
+    #[tokio::test]
+    async fn connected_peer_records_request_and_handles_busy_retry_to_canonical_ack() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
+
+        let (host_io, plugin_io) = duplex(64 * 1024);
+        let (plugin_read, plugin_write) = split(plugin_io);
+        let mut peer = Peer::from_io(plugin_read, plugin_write);
+        let client = peer.client();
+
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+
+        let mut recorded = Vec::new();
+        let (host_read, mut host_write) = split(host_io);
+        let mut host_reader = BufReader::new(host_read);
+
+        let fake_host = async {
+            let mut line = String::new();
+
+            // 1. First call: fake host records request and replies with busy error.
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("first request read");
+            let req1: RpcRequest = serde_json::from_str(&line).expect("decode req1");
+            recorded.push((req1.method.clone(), req1.params.clone()));
+            let busy_reply = RpcResponse::failure(
+                req1.id.clone(),
+                RpcError {
+                    code: -32020,
+                    message: "plugin request queue is full".to_owned(),
+                    data: Some(json!({"code": "busy"})),
+                },
+            );
+            let frame = encode_frame(&busy_reply).expect("encode busy response");
+            host_write
+                .write_all(format!("{frame}\n").as_bytes())
+                .await
+                .expect("send busy response");
+
+            // 2. Second call: fake host records retry and replies with canonical ACK.
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("second request read");
+            let req2: RpcRequest = serde_json::from_str(&line).expect("decode req2");
+            recorded.push((req2.method.clone(), req2.params.clone()));
+            let ack_reply = RpcResponse::success(
+                req2.id.clone(),
+                json!({
+                    "first_seq": 1,
+                    "last_seq": 1,
+                    "cursor": "cursor-1",
+                }),
+            );
+            let frame = encode_frame(&ack_reply).expect("encode ack response");
+            host_write
+                .write_all(format!("{frame}\n").as_bytes())
+                .await
+                .expect("send ack response");
+
+            drop(host_write);
+            drop(host_reader);
+            recorded
+        };
+
+        let plugin_calls = async {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let first_call = client
+                .call(
+                    "events.put",
+                    json!({"credential": "fixture-cred", "events": [{"kind": "test"}]}),
+                    deadline,
+                )
+                .await;
+            let err = first_call.expect_err("first call must fail with busy");
+            assert_eq!(err.code, "busy");
+
+            let second_call = client
+                .call(
+                    "events.put",
+                    json!({"credential": "fixture-cred", "events": [{"kind": "test"}]}),
+                    deadline,
+                )
+                .await;
+            let ack_val = second_call.expect("second call must succeed");
+            let ack: BatchAck = serde_json::from_value(ack_val).expect("decode batch ack");
+            assert_eq!(ack.first_seq, 1);
+            assert_eq!(ack.last_seq, 1);
+            assert_eq!(ack.cursor.as_deref(), Some("cursor-1"));
+        };
+
+        let (recorded, ()) = tokio::join!(fake_host, plugin_calls);
+        peer_task.await.expect("peer task clean shutdown");
+
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].0, "events.put");
+        assert_eq!(recorded[0].1["credential"], "fixture-cred");
+        assert_eq!(recorded[1].0, "events.put");
+        assert_eq!(recorded[1].1["credential"], "fixture-cred");
     }
 }

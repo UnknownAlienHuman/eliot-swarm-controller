@@ -1908,6 +1908,11 @@ async fn commit_batch(
     credential: &str,
     client: &PeerClient,
 ) -> Result<BatchAck, BatchFailure> {
+    let (agent_id, generation, source) = (
+        batch.agent_id.clone(),
+        batch.generation,
+        batch.source.clone(),
+    );
     let mut sink = CommitSink::new(client.clone(), credential.to_owned());
     match sink
         .commit(batch, Instant::now() + EVENTS_PUT_ACK_TIMEOUT)
@@ -1919,7 +1924,7 @@ async fn commit_batch(
             Ok(ack)
         }
         Err(error) => {
-            let uncertain = sink.is_unknown();
+            let uncertain = sink.is_unknown(&agent_id, generation, &source);
             state.batch_unknown = uncertain;
             let error = if uncertain {
                 unknown_effect()

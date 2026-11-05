@@ -51,7 +51,7 @@ fn check_keys(value: &Value, allowed: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn check_nonsecret(connection: &Connection, value: &Value) -> Result<()> {
+pub(super) fn check_nonsecret(connection: &Connection, value: &Value) -> Result<()> {
     fn forbidden_fields(value: &Value) -> bool {
         match value {
             Value::Object(object) => object.iter().any(|(key, value)| {

@@ -192,13 +192,18 @@ Native subagents (`[agents]` / `multi_agent` in the owner's Codex config) arrive
 the same stream. A thread is a child when its `thread/started` names the owned thread
 (or a confirmed child) in `source.subAgent.thread_spawn.parent_thread_id`, or when the
 owned thread's `item/completed` for a `collabAgentToolCall` `spawnAgent` lists it in
-`receiverThreadIds`. A child's first frames can precede both: while a `spawnAgent`
-call is in flight, frames of a not-yet-confirmed thread are dropped and its requests
-rejected, and the thread stays unconfirmed. When the last spawn completes, the turn
-ends or the stream closes, an unconfirmed thread is a source gap, as is any frame from a
-thread that is neither owned nor confirmed outside that window. Until L5.3 connects
-child registration, child facts are discarded rather than buffered for a registered
-child (plugin-protocol.md), and child server requests are rejected as unsupported.
+`receiverThreadIds`. A child's first frames can precede both: while unconfirmed, frames
+are held in a bounded early buffer; overflow drops the buffered frames and records a
+child gap. Registration uses the shared
+[`ChildParams`](../../crates/eliot-plugin/src/protocol.rs) and
+[`ChildRegistration`](../../crates/eliot-core/src/native_child.rs) contract, and no
+child facts publish until its
+[`ChildRegistrationAck`](../../crates/eliot-core/src/native_child.rs) validates. A
+registered child is tokenless and observe-only, with no independent Eliot principal and
+no child control verbs. Child server requests stay unsupported and are rejected, never
+forwarded to control. When the last spawn completes, the turn ends or the stream
+closes, an unconfirmed thread is a source gap, as is any frame from a thread that is
+neither owned nor confirmed outside that window.
 
 Start owns one live stream. It publishes the implemented lifecycle families only; do not
 install hooks or tail rollouts in parallel to duplicate those facts. The reader exists
