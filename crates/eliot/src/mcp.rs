@@ -20,6 +20,8 @@
 //! peer-facing `params` size reuses the daemon 4 MiB frame limit.
 //! stdout is MCP protocol only, diagnostics go to stderr.
 
+mod bounded_io;
+
 use std::path::{Path, PathBuf};
 
 use rmcp::ErrorData as McpError;
@@ -50,6 +52,7 @@ struct ToolArgs {
 pub async fn run_stdio(data_dir: PathBuf) -> Result<(), String> {
     let handler = EliotMcpHandler { data_dir };
     let (stdin, stdout) = rmcp::transport::io::stdio();
+    let stdout = bounded_io::BoundedLineWriter::new(stdout, eliot_daemon::MAX_RPC_FRAME_BYTES);
     let transport = rmcp::transport::async_rw::AsyncRwTransport::new(stdin, stdout)
         .with_max_line_length(eliot_daemon::MAX_RPC_FRAME_BYTES);
     let service = rmcp::service::serve_server(handler, transport)
