@@ -23,6 +23,7 @@
 //! (`control_request/initialize` -> `session_start`, then per `user` input an
 //! `init` + `started` + one `assistant` text + a `completed` result).
 
+#[allow(dead_code)]
 mod support;
 
 use serde_json::{Value, json};
