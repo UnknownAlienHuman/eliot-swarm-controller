@@ -651,6 +651,19 @@ impl MusePlugin {
                     ));
                 }
             };
+            if let Some(reason) = resumed.history.unavailable_reason() {
+                session.session_id = Some(resumed.session.session_id.clone());
+                let loss = session
+                    .events
+                    .view_readback(resumed.session.session_id.clone(), Some(reason))
+                    .await;
+                self.session = Some(session);
+                loss?;
+                return Err(Error::new(
+                    "unknown",
+                    "Muse resumed view is unavailable; no input or settings were sent",
+                ));
+            }
             // Late-joiner pointers are pulled after readiness (below): the
             // full payloads arrive as re-issued server-to-client requests
             // right after this response, and the pull covers any re-issue the
@@ -998,7 +1011,21 @@ impl MusePlugin {
                     match read_owned_session(&session.native_client, &native_session.session_id)
                         .await
                     {
-                        Ok(reread) => reread,
+                        Ok(reread) => {
+                            if let Some(reason) = reread.history.unavailable_reason() {
+                                let loss = session
+                                    .events
+                                    .view_readback(reread.session.session_id.clone(), Some(reason))
+                                    .await;
+                                self.session = Some(session);
+                                loss?;
+                                return Err(Error::new(
+                                    "unknown",
+                                    "Muse settings readback view is unavailable",
+                                ));
+                            }
+                            reread.session
+                        }
                         Err(error) => {
                             let error = discard_failed_start(&mut session, error).await;
                             return Err(self.retain_failed_start(&params, error));
@@ -1862,6 +1889,13 @@ impl MusePlugin {
         else {
             return unknown_snapshot(&params, "Muse session identity was not acknowledged");
         };
+        if event_status.view_unavailable {
+            return view_unknown_snapshot(
+                session,
+                &params,
+                "Muse native observation remains unresolved",
+            );
+        }
         let readback = match read_owned_session(&session.native_client, session_id).await {
             Ok(readback) => readback,
             Err(_) => {
@@ -1871,7 +1905,29 @@ impl MusePlugin {
                 );
             }
         };
-        let native_state = session_state(&readback);
+        // Serialize behind queued health pushes, including when the pull says
+        // excluded. A healthy private read never clears an earlier live gap.
+        if session
+            .events
+            .view_readback(session_id.to_owned(), readback.history.unavailable_reason())
+            .await
+            .is_err()
+        {
+            return view_unknown_snapshot(
+                session,
+                &params,
+                "Muse native view readback is unavailable",
+            );
+        }
+        let event_status = session.events.status();
+        if event_status.view_unavailable {
+            return view_unknown_snapshot(
+                session,
+                &params,
+                "Muse native observation remains unresolved",
+            );
+        }
+        let native_state = session_state(&readback.session);
         if session.command_inputs.contains_key(&params.command_id) && turn_id.is_none() {
             return unknown_snapshot(&params, "Muse command has no exact native turn association");
         }
@@ -1881,7 +1937,7 @@ impl MusePlugin {
                 session_id,
                 turn_id,
                 &params.command_id,
-                readback.active_turn_id.as_deref(),
+                readback.session.active_turn_id.as_deref(),
                 &session.secrets,
             )
             .await
@@ -2058,7 +2114,23 @@ async fn discover_model(
         })
 }
 
-async fn read_owned_session(client: &NativeClient, session_id: &str) -> Result<NativeSession> {
+fn view_unknown_snapshot(
+    session: &AgentSession,
+    params: &AgentSnapshotParams,
+    reason: &str,
+) -> Result<Value> {
+    let mut snapshot = unknown_snapshot(params, reason)?;
+    snapshot["native_scope"] = json!(session.native_scope);
+    snapshot["native_ref"] = json!(session.session_id);
+    snapshot["active_turn"] = json!(session.events.status().active_turn_id);
+    snapshot["batch_unknown"] = json!(session.events.status().batch_unknown);
+    Ok(snapshot)
+}
+
+async fn read_owned_session(
+    client: &NativeClient,
+    session_id: &str,
+) -> Result<NativeSessionReadResult> {
     let response: NativeSessionReadResult = serde_json::from_value(
         client
             .call(
@@ -2081,7 +2153,7 @@ async fn read_owned_session(client: &NativeClient, session_id: &str) -> Result<N
             "Muse session/read returned another native session",
         ));
     }
-    Ok(response.session)
+    Ok(response)
 }
 
 /// One backward `view/page` fetch, newest records first. Every durable-view
@@ -2148,7 +2220,14 @@ async fn verify_resume_preflight(
     session_id: &str,
     retained_turn: Option<&str>,
 ) -> Result<()> {
-    let session = read_owned_session(client, session_id).await?;
+    let readback = read_owned_session(client, session_id).await?;
+    if let Some(reason) = readback.history.unavailable_reason() {
+        return Err(Error::new(
+            "native_readback",
+            format!("Muse retained view is unavailable ({})", reason.label()),
+        ));
+    }
+    let session = readback.session;
     // The newest turn lives at the view head, so one backward page proves
     // it; the retained no-turn case needs no scan because the session turn
     // counter proves absence exactly.

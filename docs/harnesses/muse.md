@@ -38,6 +38,16 @@ readback, not a second concurrent producer. Use an exclusive view/revision curso
 where the installed API guarantees it. Otherwise record a gap and reconcile current
 state, never replay full history as new turns.
 
+`session/viewHealthChanged` with `health="unavailable"` applies only to the owned
+native session in that Agent generation. It records an explicit source gap and latches
+observation unknown without ending the session or completing its turn. A foreign
+session's notification and an unrecognized health value do not change that source.
+The push is best-effort: read/resume also retain `history.noneReason`.
+`projectionUnavailable` degrades observation even when the push is lost; `excluded`
+alone is normal history omission. Missing or unknown reasons remain uncertain.
+Private readback cannot clear a live-source gap, replay history or acknowledge a
+terminal effect. A later healthy read does not establish live-edge recovery.
+
 Guard a pending-request snapshot with a local observation counter so a newer stream
 resolution cannot be overwritten by stale snapshot data. This is an in-memory race guard,
 not another persisted Agent epoch. `notLoaded` alone does not prove session closure.

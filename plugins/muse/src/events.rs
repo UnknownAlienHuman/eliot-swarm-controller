@@ -22,11 +22,13 @@ use crate::native::{
     },
     types::{
         NativeApprovalDecideResult, NativeApprovalResolvedNotification,
-        NativeApprovalUpdatedNotification, NativeItemCompletedNotification,
-        NativeItemStartedNotification, NativeSessionClosedNotification,
-        NativeSessionStartedNotification, NativeTurnCompletedNotification, NativeTurnError,
-        NativeTurnStartedNotification, NativeTurnTerminal, NativeUserInputAnswerResult,
-        NativeUserInputCancelResult, NativeUserInputSettledNotification,
+        NativeApprovalUpdatedNotification, NativeHistoryNoneReason,
+        NativeItemCompletedNotification, NativeItemStartedNotification,
+        NativeSessionClosedNotification, NativeSessionStartedNotification,
+        NativeSessionViewHealthChangedNotification, NativeTurnCompletedNotification,
+        NativeTurnError, NativeTurnStartedNotification, NativeTurnTerminal,
+        NativeUserInputAnswerResult, NativeUserInputCancelResult,
+        NativeUserInputSettledNotification, NativeViewHealth,
     },
 };
 
@@ -46,6 +48,8 @@ pub(crate) struct EventStatus {
     pub failure: Option<String>,
     pub batch_unknown: bool,
     pub source_unknown: bool,
+    /// Lost live view; a private history read cannot re-arm that producer.
+    pub view_unavailable: bool,
     pub stopped: bool,
     /// Local observation counter: bumped on every stream observation that
     /// touches the pending-request set. An in-memory race guard for stale
@@ -76,6 +80,11 @@ pub(crate) struct EventHandle {
 }
 
 enum Control {
+    ViewReadback {
+        session_id: String,
+        reason: Option<NativeHistoryNoneReason>,
+        reply: oneshot::Sender<Result<()>>,
+    },
     Ready {
         native_scope: String,
         session_id: String,
@@ -212,6 +221,19 @@ pub(crate) fn spawn(
 }
 
 impl EventHandle {
+    pub async fn view_readback(
+        &self,
+        session_id: String,
+        reason: Option<NativeHistoryNoneReason>,
+    ) -> Result<()> {
+        self.send(|reply| Control::ViewReadback {
+            session_id,
+            reason,
+            reply,
+        })
+        .await
+    }
+
     pub async fn ready(
         &self,
         native_scope: String,
@@ -380,6 +402,31 @@ impl EventProcessor {
 
     async fn handle_control(&mut self, control: Control) -> bool {
         match control {
+            Control::ViewReadback {
+                session_id,
+                reason,
+                reply,
+            } => {
+                let result = if let Some(reason) = reason {
+                    self.view_unavailable(&session_id, reason).await
+                } else {
+                    Ok(())
+                };
+                let result = result.and_then(|()| {
+                    if self.status.session_id.as_deref() != Some(session_id.as_str())
+                        || self.status.view_unavailable
+                    {
+                        Err(Error::new(
+                            "unknown",
+                            "Muse native observation is unresolved",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                });
+                let _ = reply.send(result);
+                true
+            }
             Control::Ready {
                 native_scope,
                 session_id,
@@ -549,6 +596,9 @@ impl EventProcessor {
     }
 
     fn should_buffer(&self, method: &str) -> bool {
+        if method == "session/viewHealthChanged" {
+            return self.status.session_id.is_none();
+        }
         matches!(
             method,
             "turn/started"
@@ -1171,6 +1221,26 @@ impl EventProcessor {
 
     async fn process_notification(&mut self, method: String, params: Value) -> Result<()> {
         match method.as_str() {
+            "session/viewHealthChanged" => {
+                let notification: NativeSessionViewHealthChangedNotification =
+                    serde_json::from_value(params).map_err(|_| {
+                        Error::new(
+                            "native_protocol",
+                            "Muse view-health notification did not match its schema",
+                        )
+                    })?;
+                if self.status.session_id.as_deref() == Some(notification.session_id.as_str())
+                    && notification.health == NativeViewHealth::Unavailable
+                {
+                    self.view_unavailable(
+                        &notification.session_id,
+                        notification
+                            .none_reason
+                            .unwrap_or(NativeHistoryNoneReason::Unknown),
+                    )
+                    .await?;
+                }
+            }
             "turn/started" => {
                 let notification: NativeTurnStartedNotification = serde_json::from_value(params)
                     .map_err(|_| {
@@ -1739,6 +1809,38 @@ impl EventProcessor {
         self.stream_source()
             .commit_event(kind, native_id, data)
             .await
+    }
+
+    async fn view_unavailable(
+        &mut self,
+        session_id: &str,
+        reason: NativeHistoryNoneReason,
+    ) -> Result<()> {
+        if session_id.trim().is_empty()
+            || self
+                .status
+                .session_id
+                .as_deref()
+                .is_some_and(|owned| owned != session_id)
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "Muse view-health readback named another session",
+            ));
+        }
+        // Pull callers already validated the native response against the owned
+        // resume/read subject. This binds identity, never readiness or a turn.
+        self.status.session_id = Some(session_id.to_owned());
+        self.status.source_unknown = true;
+        self.status.view_unavailable = true;
+        if self.gap_reported || self.writes_blocked {
+            return Ok(());
+        }
+        self.record_gap(&format!(
+            "Muse native view is unavailable ({})",
+            reason.label()
+        ))
+        .await
     }
 
     async fn record_gap(&mut self, reason: &str) -> Result<()> {
