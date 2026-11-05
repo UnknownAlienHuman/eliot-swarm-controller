@@ -1,6 +1,6 @@
 use serde_json::Value;
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
@@ -311,6 +311,7 @@ pub struct Fixture {
     pub workspace: PathBuf,
     pub retain_data: bool,
     daemon: Option<Captured>,
+    daemon_env: Vec<(OsString, OsString)>,
     starts: u32,
 }
 
@@ -325,9 +326,17 @@ impl Fixture {
             workspace,
             root,
             daemon: None,
+            daemon_env: Vec::new(),
             retain_data: false,
             starts: 0,
         }
+    }
+
+    #[allow(dead_code)] // Used by another integration target; support is compiled per target.
+    pub fn env(&mut self, key: impl AsRef<OsStr>, val: impl AsRef<OsStr>) -> &mut Self {
+        self.daemon_env
+            .push((key.as_ref().to_os_string(), val.as_ref().to_os_string()));
+        self
     }
 
     pub fn start(&mut self) {
@@ -338,6 +347,9 @@ impl Fixture {
         data_argument.push(std::path::MAIN_SEPARATOR_STR);
         let mut command = Command::new(CLI);
         scrub_ambient_identity(&mut command);
+        for (key, val) in &self.daemon_env {
+            command.env(key, val);
+        }
         command
             .arg("--data-dir")
             .arg(data_argument)
@@ -681,10 +693,9 @@ impl Drop for Fixture {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn error_snippet_keeps_first_line_within_a_char_bound() {
+        use super::{MAX_ERROR_SNIPPET_CHARS, error_snippet};
         assert_eq!(error_snippet(""), "");
         assert_eq!(
             error_snippet("error: unavailable: daemon is not running\nsecond line"),

@@ -19,6 +19,9 @@
 //! report; on success the plugin's own reaped exit wait plus the shutdown
 //! assertions prove both children died.
 
+#[allow(dead_code)]
+mod support;
+
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -51,6 +54,7 @@ fn main() {
         run_startup_recovery_scenarios().await;
         run_permission_decisions_scenarios().await;
         run_reply_transport_uncertainty_scenarios().await;
+        run_cross_harness_scenarios().await;
     });
     println!("claude_plugin: all scenarios passed");
 }
@@ -303,6 +307,15 @@ async fn run_reply_transport_uncertainty_scenarios() {
         "turn result never clears a live callback fence",
         OwnedChildren::default(),
         scenario_callback_fence_survives_turn_result,
+    )
+    .await;
+}
+
+async fn run_cross_harness_scenarios() {
+    run_scenario(
+        "owner rule send fires once on first Claude terminal",
+        OwnedChildren::default(),
+        scenario_cross_harness_owner_rule_send_fires_once,
     )
     .await;
 }
@@ -4813,4 +4826,320 @@ async fn scenario_repeated_dropped_id_never_rewritten_nor_retried(owned: OwnedCh
         .await
         .expect("shutdown");
     scenario.host.shutdown_child().await;
+}
+
+async fn scenario_cross_harness_owner_rule_send_fires_once(owned: OwnedChildren) {
+    let (mut fixture, report, rule) = cross_harness_setup(&owned).await;
+    let (agent, generation, terminal_seq) = cross_harness_first_turn(&fixture);
+    let firing = cross_harness_wait_firing(&fixture, &rule.id, terminal_seq);
+    let (child, second_seq) = cross_harness_rule_child(
+        &fixture,
+        &firing,
+        &agent,
+        generation,
+        rule.revision,
+        terminal_seq,
+    );
+    cross_harness_second_result_and_no_loop(
+        &fixture, &agent, generation, &child, second_seq, &report, &rule.id,
+    );
+    cross_harness_stop_and_drain(&mut fixture, &owned, &agent, generation, &report).await;
+}
+
+async fn cross_harness_setup(
+    owned: &OwnedChildren,
+) -> (support::Fixture, PathBuf, eliot_core::api::RuleStateView) {
+    let mut fixture = support::Fixture::new("claude cross-harness rule send");
+    fixture.start();
+    fixture.stop(false);
+    let cmd = std::env::current_exe()
+        .expect("test executable")
+        .to_string_lossy()
+        .into_owned();
+    let report = fixture.root.join("claude-report.json");
+    let config = format!(
+        "[profiles.claude-fake]\nharness = \"claude\"\ncmd = {}\nmodel = \"{}\"\npass_env = [\"ELIOT_FAKE_CLAUDE_SCRIPT\", \"ELIOT_FAKE_CLAUDE_REPORT\"]\n",
+        serde_json::to_string(&cmd).expect("cmd toml"),
+        MODEL,
+    );
+    std::fs::write(fixture.data.join("config.toml"), config).expect("write claude profile");
+    std::fs::create_dir_all(fixture.data.join("rules")).expect("create rule dir");
+    let rule = "[[rule]]\nid = \"claude-cross-harness-echo\"\non = { event = \"turn.completed\", match = { \"subject.harness\" = \"claude\" } }\ndo = [{ action = \"send\", target = \"${event.agent}\", expected_generation = \"${event.generation}\", text = \"rule-send-echo\" }]\n";
+    std::fs::write(fixture.data.join("rules").join("claude-echo.toml"), rule)
+        .expect("write owner rule");
+    fixture
+        .env("ELIOT_FAKE_CLAUDE_SCRIPT", "ok")
+        .env("ELIOT_FAKE_CLAUDE_REPORT", &report);
+    fixture.start();
+    owned.set_report(report.clone()).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let state = loop {
+        let reply = support::cli(
+            &fixture.data,
+            &["rule", "show", "claude-cross-harness-echo"],
+        );
+        if reply.status.success() {
+            let state: eliot_core::api::RuleStateView =
+                serde_json::from_str(&reply.stdout).expect("typed rule");
+            assert_eq!(state.id, "claude-cross-harness-echo");
+            assert_eq!(state.project, None);
+            break state;
+        }
+        assert!(std::time::Instant::now() < deadline, "rule load deadline");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    (fixture, report, state)
+}
+
+fn cross_harness_first_turn(fixture: &support::Fixture) -> (String, i64, i64) {
+    let launch_id = ulid::Ulid::new().to_string();
+    let workspace = fixture.workspace.to_string_lossy().into_owned();
+    let launch: eliot_core::Command = serde_json::from_value(fixture.json(&[
+        "--id",
+        &launch_id,
+        "launch",
+        "--profile",
+        "claude-fake",
+        "--workspace",
+        &workspace,
+    ]))
+    .expect("typed launch");
+    assert_eq!(launch.id, launch_id);
+    assert_eq!(launch.verb, "launch");
+    let agent = launch.target.clone().expect("launch agent");
+    let generation = launch.generation.expect("launch generation");
+    let gen_arg = generation.to_string();
+    let send_id = ulid::Ulid::new().to_string();
+    let turn: eliot_core::Turn = serde_json::from_value(fixture.json(&[
+        "--id",
+        &send_id,
+        "send",
+        &agent,
+        "--generation",
+        &gen_arg,
+        "--wait",
+        "--timeout-seconds",
+        "10",
+        "--",
+        "owner-first-send",
+    ]))
+    .expect("typed first turn");
+    assert_eq!(turn.agent, agent);
+    assert_eq!(turn.generation, generation);
+    assert_eq!(turn.state, eliot_core::TurnState::Completed);
+    assert_eq!(turn.final_text.as_deref(), Some("fake reply to the turn."));
+    let events = fixture.events();
+    let seq = events
+        .iter()
+        .find(|event| {
+            event["kind"] == "turn.completed"
+                && event["agent"] == agent
+                && event["generation"] == generation
+                && event["data"]["command_id"] == send_id
+        })
+        .and_then(|event| event["seq"].as_i64())
+        .expect("first terminal seq");
+    let harness = events
+        .iter()
+        .find(|event| event["seq"].as_i64() == Some(seq))
+        .and_then(|event| event["subject"]["harness"].as_str())
+        .unwrap_or_default();
+    assert_eq!(harness, "claude");
+    (agent, generation, seq)
+}
+
+fn cross_harness_wait_firing(fixture: &support::Fixture, rule_id: &str, trigger_seq: i64) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let events = fixture.events();
+        if let Some(firing) = events.iter().find(|event| {
+            event["kind"] == "rule.fired"
+                && event["data"]["rule"] == rule_id
+                && event["data"]["event_seq"] == trigger_seq
+        }) {
+            return firing.clone();
+        }
+        assert!(std::time::Instant::now() < deadline, "rule firing deadline");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn cross_harness_rule_child(
+    fixture: &support::Fixture,
+    firing: &Value,
+    agent: &str,
+    generation: i64,
+    revision: i64,
+    trigger_seq: i64,
+) -> (eliot_core::Command, i64) {
+    assert_eq!(firing["data"]["rule"], "claude-cross-harness-echo");
+    let parent_id = firing["data"]["parent_command"]
+        .as_str()
+        .expect("parent id")
+        .to_owned();
+    let child_id = firing["data"]["child_command"]
+        .as_str()
+        .expect("child id")
+        .to_owned();
+    let parent: eliot_core::Command =
+        serde_json::from_value(fixture.wait_command(&parent_id, "applied")).expect("typed parent");
+    assert_eq!(parent.id, parent_id);
+    assert_eq!(parent.verb, "rule");
+    assert_eq!(parent.principal, "owner");
+    assert_eq!(parent.target, None);
+    assert_eq!(parent.expected_generation, None);
+    assert_eq!(parent.generation, None);
+    assert_eq!(
+        parent.args,
+        json!({
+            "rule": "claude-cross-harness-echo",
+            "revision": revision,
+            "event_seq": trigger_seq,
+        })
+    );
+    assert_eq!(parent.outcome, Some(json!({"children": [child_id]})));
+    let child: eliot_core::Command =
+        serde_json::from_value(fixture.wait_command(&child_id, "applied")).expect("typed child");
+    assert_eq!(child.id, child_id);
+    assert_eq!(child.verb, "send");
+    assert_eq!(child.target.as_deref(), Some(agent));
+    assert_eq!(child.expected_generation, Some(generation));
+    assert_eq!(child.generation, Some(generation));
+    assert_eq!(child.args["text"], "rule-send-echo");
+    let turn_id = child.turn_id.clone().expect("child turn");
+    assert!(!turn_id.trim().is_empty());
+    let children: eliot_core::api::CommandChildrenResponse =
+        serde_json::from_value(fixture.json(&["cmd", "children", &parent_id]))
+            .expect("typed children");
+    assert_eq!(children.children.len(), 1);
+    assert_eq!(children.children[0].id, child_id);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let second_seq = loop {
+        let events = fixture.events();
+        if let Some(seq) = events
+            .iter()
+            .find(|event| {
+                event["kind"] == "turn.completed"
+                    && event["agent"] == agent
+                    && event["generation"] == generation
+                    && event["data"]["command_id"] == child_id
+                    && event["data"]["turn_id"] == turn_id
+            })
+            .and_then(|event| event["seq"].as_i64())
+        {
+            break seq;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "second terminal deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    (child, second_seq)
+}
+
+fn cross_harness_second_result_and_no_loop(
+    fixture: &support::Fixture,
+    agent: &str,
+    generation: i64,
+    child: &eliot_core::Command,
+    second_seq: i64,
+    report: &PathBuf,
+    rule_id: &str,
+) {
+    let turn_id = child.turn_id.as_deref().expect("child turn");
+    let gen_arg = generation.to_string();
+    let request = eliot_core::api::AgentResultRequest {
+        id: agent.to_owned(),
+        generation: Some(generation),
+        turn_id: Some(turn_id.to_owned()),
+        limit: 1,
+    };
+    let result: eliot_core::api::AgentResultResponse = serde_json::from_value(fixture.json(&[
+        "result",
+        agent,
+        "--generation",
+        &gen_arg,
+        "--turn-id",
+        turn_id,
+        "--limit",
+        "1",
+    ]))
+    .expect("typed second result");
+    request.validate_response(&result).expect("result binding");
+    assert_eq!(result.turns.len(), 1);
+    assert_eq!(result.turns[0].turn_id, turn_id);
+    assert_eq!(result.turns[0].agent, agent);
+    assert_eq!(result.turns[0].generation, generation);
+    assert_eq!(result.turns[0].state, eliot_core::TurnState::Completed);
+    assert_eq!(
+        result.turns[0].final_text.as_deref(),
+        Some("fake reply to the turn.")
+    );
+    let text = std::fs::read_to_string(report).expect("fake report");
+    let report_json: Value = serde_json::from_str(&text).expect("report json");
+    assert_eq!(
+        report_json.get("user_inputs").and_then(Value::as_u64),
+        Some(2)
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let events = loop {
+        let events = fixture.events();
+        let reply = support::cli(&fixture.data, &["rule", "show", rule_id]);
+        if reply.status.success() {
+            let state: eliot_core::api::RuleStateView =
+                serde_json::from_str(&reply.stdout).expect("rule cursor");
+            if state.current_cursor >= second_seq {
+                break events;
+            }
+        }
+        assert!(std::time::Instant::now() < deadline, "cursor deadline");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let fires: Vec<_> = events
+        .iter()
+        .filter(|event| event["kind"] == "rule.fired" && event["data"]["rule"] == rule_id)
+        .collect();
+    assert_eq!(fires.len(), 1, "exactly one firing, no loop");
+    assert!(
+        !events.iter().any(|event| {
+            event["kind"] == "rule.rejected"
+                && event["data"]["rule"] == rule_id
+                && event["data"]["event_seq"] == second_seq
+        }),
+        "own terminal suppresses silently, never rejected"
+    );
+}
+
+async fn cross_harness_stop_and_drain(
+    fixture: &mut support::Fixture,
+    owned: &OwnedChildren,
+    agent: &str,
+    generation: i64,
+    report: &PathBuf,
+) {
+    let gen_arg = generation.to_string();
+    let stop_id = ulid::Ulid::new().to_string();
+    let stopped: eliot_core::api::CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+        "--id",
+        &stop_id,
+        "stop",
+        agent,
+        "--generation",
+        &gen_arg,
+    ]))
+    .expect("typed stop");
+    fixture.wait_command(&stopped.command_id, "applied");
+    assert!(owned.cli_exited().await, "fake CLI must exit after stop");
+    let text = std::fs::read_to_string(report).expect("final report");
+    let report_json: Value = serde_json::from_str(&text).expect("report json");
+    assert_eq!(
+        report_json.get("exit").and_then(Value::as_str),
+        Some("stdin-eof")
+    );
+    assert_eq!(
+        report_json.get("user_inputs").and_then(Value::as_u64),
+        Some(2)
+    );
+    fixture.stop(false);
 }
