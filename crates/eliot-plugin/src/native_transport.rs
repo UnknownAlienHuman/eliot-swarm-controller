@@ -122,6 +122,31 @@ pub enum PumpAction<Frame> {
     Skip,
 }
 
+/// Read one retained process exit. The waiter publishes `Some(status)`
+/// then drops its sender; Tokio reports closure even when that final
+/// value is retained, so a closed channel is reread and only a still-
+/// `None` value concludes unknown.
+fn read_process_exit(
+    process_exit: &watch::Receiver<Option<ProcessExit>>,
+    short: &'static str,
+) -> Result<Option<ExitStatus>> {
+    let status = process_exit.borrow().as_ref().map(|exit| exit.status);
+    if status.is_some() {
+        return Ok(status);
+    }
+    if process_exit.has_changed().is_err() {
+        let status = process_exit.borrow().as_ref().map(|exit| exit.status);
+        if status.is_some() {
+            return Ok(status);
+        }
+        return Err(Error::new(
+            "unknown",
+            format!("{short} process exit could not be confirmed"),
+        ));
+    }
+    Ok(None)
+}
+
 impl NativeChild {
     pub async fn spawn(
         launch: NativeLaunch,
@@ -295,14 +320,7 @@ impl NativeChild {
     }
 
     fn process_exit_status(&self) -> Result<Option<ExitStatus>> {
-        let status = self.process_exit.borrow().as_ref().map(|exit| exit.status);
-        if status.is_none() && self.process_exit.has_changed().is_err() {
-            return Err(Error::new(
-                "unknown",
-                format!("{} process exit could not be confirmed", self.labels.short),
-            ));
-        }
-        Ok(status)
+        read_process_exit(&self.process_exit, self.labels.short)
     }
 
     async fn wait_process_exit(&mut self) -> Result<ExitStatus> {
@@ -310,12 +328,17 @@ impl NativeChild {
             if let Some(status) = self.process_exit_status()? {
                 return Ok(status);
             }
-            self.process_exit.changed().await.map_err(|_| {
-                Error::new(
+            if self.process_exit.changed().await.is_err() {
+                // Closed without a prior observed change. Reread the
+                // retained final value before concluding unknown.
+                if let Some(status) = self.process_exit.borrow().as_ref().map(|exit| exit.status) {
+                    return Ok(status);
+                }
+                return Err(Error::new(
                     "unknown",
                     format!("{} process exit could not be confirmed", self.labels.short),
-                )
-            })?;
+                ));
+            }
         }
     }
 
@@ -421,6 +444,13 @@ impl NativeWriter {
         if let Ok(mut writer) = self.writer.try_lock() {
             *writer = None;
         }
+    }
+
+    /// True once the owned child waiter observed the OS exit. Protocol
+    /// layers use it to distinguish a dead child (unknown) from a live
+    /// pre-dispatch refusal (rejected).
+    pub fn process_exited(&self) -> bool {
+        self.process_exited.load(Ordering::Acquire)
     }
 
     /// One already-encoded frame. Raw errors: the protocol layer maps them
@@ -828,4 +858,54 @@ fn mark_stream_malformed(
     let error = Error::new("unknown", message);
     pending.fail_all(error.clone());
     error
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn exit_status() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn exit_status() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+
+    #[test]
+    fn publish_then_close_retains_positive_exit() {
+        // The waiter publishes `Some(status)` then drops its sender.
+        // Tokio reports closure even with the final value retained; the
+        // read must still prove the exit, not conclude unknown.
+        let (exit_tx, exit_rx) = watch::channel(None);
+        exit_tx.send_replace(Some(ProcessExit {
+            status: exit_status(),
+            observed_at: Instant::now(),
+        }));
+        drop(exit_tx);
+        assert!(exit_rx.has_changed().is_err());
+        let status = read_process_exit(&exit_rx, "Test").expect("retained exit");
+        assert!(status.is_some_and(|status| status.success()));
+    }
+
+    #[test]
+    fn close_without_publish_stays_unknown() {
+        // No publish before the drop: there is no exit to prove.
+        let (exit_tx, exit_rx) = watch::channel(None);
+        drop(exit_tx);
+        let error = read_process_exit(&exit_rx, "Test").expect_err("unknown exit");
+        assert_eq!(error.code, "unknown");
+    }
+
+    #[test]
+    fn open_without_publish_stays_pending() {
+        // The waiter has not published and still holds its sender.
+        let (_exit_tx, exit_rx) = watch::channel(None);
+        let status = read_process_exit(&exit_rx, "Test").expect("pending");
+        assert!(status.is_none());
+    }
 }

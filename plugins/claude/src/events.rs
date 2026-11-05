@@ -1255,6 +1255,11 @@ impl EventProcessor {
                 "Claude approval replies accept only empty arguments",
             ));
         }
+        if self.frames_drained && !self.planned_stop {
+            return Err(unknown_control(
+                "Claude event stream was lost before the request reply; outcome is unresolved and will not be repeated",
+            ));
+        }
         Ok(match verb {
             "approve" => PermissionResult::Allow {
                 updated_input: entry.input.clone(),
@@ -1289,6 +1294,15 @@ impl EventProcessor {
             Ok(result) => result,
             Err(outcome) => return Ok(outcome),
         };
+        // The child may have exited after admission but before any write:
+        // a dead destination is unknown, never a live refusal, and no
+        // permission frame is attempted.
+        if native.process_exited() {
+            self.retain_unknown_reply(request_id, command_id).await;
+            return Ok(unknown_control(
+                "Claude process exited before the request reply dispatched; it will not be repeated",
+            ));
+        }
         let Some(entry) = self.pending_requests.get_mut(request_id) else {
             return Ok(rejected_control("Claude request is no longer pending"));
         };
@@ -1298,14 +1312,24 @@ impl EventProcessor {
             .await
         {
             // Proven not written (bound, encode, or deadline before
-            // dispatch): the ask stays available for a later reply.
+            // dispatch): the ask stays available for a later reply. A
+            // child that died under the write leaves a stale ask: latch
+            // unknown instead of restoring availability.
             if matches!(
                 error.code.as_str(),
                 "native_not_dispatched" | "frame_too_large" | "native_encode"
             ) {
+                if native.process_exited() {
+                    self.retain_unknown_reply(request_id, command_id).await;
+                    return Ok(unknown_control(
+                        "Claude request reply destination was lost; it will not be repeated",
+                    ));
+                }
                 if let Some(entry) = self.pending_requests.get_mut(request_id) {
-                    entry.reply_state = NativeReplyState::Available;
-                    entry.reply_command_id = None;
+                    if entry.reply_state == NativeReplyState::Writing {
+                        entry.reply_state = NativeReplyState::Available;
+                        entry.reply_command_id = None;
+                    }
                 }
                 return Ok(rejected_control("Claude request reply was not admitted"));
             }
@@ -1489,6 +1513,21 @@ impl EventProcessor {
                 .await;
         } else if let Some(pending) = self.pending_turn.take() {
             self.settle_pending(pending, TurnOutcome::Unknown);
+        }
+        // The CLI died with these asks open: latch every still-available
+        // one unknown so later replies never attempt native I/O. The
+        // retained asks still close with the turn or stop.
+        let lost: Vec<String> = self
+            .pending_requests
+            .iter()
+            .filter(|(_, entry)| entry.reply_state == NativeReplyState::Available)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for request_id in lost {
+            if let Some(entry) = self.pending_requests.get_mut(&request_id) {
+                entry.reply_state = NativeReplyState::Unknown;
+            }
+            self.retain_uncertain_id(&request_id).await;
         }
     }
 
