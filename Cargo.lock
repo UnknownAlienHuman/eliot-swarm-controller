@@ -436,6 +436,7 @@ dependencies = [
  "eliot-plugin-opencode",
  "libc",
  "rmcp",
+ "serde",
  "serde_json",
  "tokio",
  "ulid",

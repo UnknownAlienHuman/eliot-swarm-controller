@@ -38,7 +38,7 @@ const TOOL_DESCRIPTION: &str =
 
 const INVALID_ARGS_MESSAGE: &str = "tool arguments must be an object with method and params";
 
-#[derive(rmcp::serde::Deserialize)]
+#[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ToolArgs {
     method: String,
@@ -54,7 +54,7 @@ pub async fn run_stdio(data_dir: PathBuf) -> Result<(), String> {
         .with_max_line_length(eliot_daemon::MAX_RPC_FRAME_BYTES);
     let service = rmcp::service::serve_server(handler, transport)
         .await
-        .map_err(|error| format!("mcp stdio serve failed: {error}"))?;
+        .map_err(|_| "mcp stdio initialization failed".to_owned())?;
     let _reason = service
         .waiting()
         .await

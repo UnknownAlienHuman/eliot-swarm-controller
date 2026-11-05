@@ -55,6 +55,7 @@ eliot-plugin-muse.workspace = true
 eliot-plugin-claude.workspace = true
 eliot-plugin-opencode.workspace = true
 eliot-plugin-antigravity.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 ulid.workspace = true

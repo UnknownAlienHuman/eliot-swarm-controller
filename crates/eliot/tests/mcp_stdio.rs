@@ -1,25 +1,26 @@
-//! Real SDK MCP client -> new stdio child -> real daemon/router -> fake.
+//! Real RMCP client -> stdio child -> daemon/router/store -> Fake.
 //!
-//! Exercises the actual `rmcp` stdio service path (`initialize`,
-//! `tools/list`, `tools/call` over `transport-io` / `transport-child-process`)
-//! rather than a hand-rolled JSON-RPC stub: the client spawns the real
-//! `swarm mcp` binary via `rmcp::transport::child_process::TokioChildProcess`.
-//! Fixture daemon/router + fake are the existing test support (`Fixture`).
-//! Dispatch goes through `eliot_daemon::client_call`, so identity is the
-//! inherited process environment of the stdio child: partial or conflicting
-//! Agent/Run/Owner credentials fail closed with `not_allowed` (no owner
-//! fallback), and the same Router scope/errors (`unknown`, `unsupported`,
-//! `id_conflict`, `frame_too_large`) are surfaced through the tool result.
+//! Covers tools/list, var.set/get, and caller-bound command.submit for Fake
+//! launch/send/stop. It checks caller-known IDs, retained same-ID replay,
+//! changed-payload id_conflict, and one returned fake turn_id.
 
 use std::path::Path;
 use std::time::Duration;
 
+use eliot_core::{
+    Command as CoreCommand, CommandState,
+    api::{
+        AgentResultRequest, AgentResultResponse, CommandGetRequest, CommandSubmitRequest,
+        CommandSubmitResponse,
+    },
+};
 use rmcp::model::{
     CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation, JsonObject,
 };
 use rmcp::transport::child_process::TokioChildProcess;
 use serde_json::{Value, json};
 
+#[allow(dead_code)]
 mod support {
     include!("support/mod.rs");
 }
@@ -76,6 +77,12 @@ async fn connect(data_dir: &Path, envs: &[(&str, String)]) -> std::io::Result<Cl
 
 async fn single_connected_scenario() {
     let mut fixture = Fixture::new("mcp-stdio");
+    std::fs::create_dir_all(&fixture.data).expect("fixture data directory");
+    std::fs::write(
+        fixture.data.join("config.toml"),
+        "[profiles.mcp_fake]\nharness = \"fake\"\n",
+    )
+    .expect("write Fake profile");
     fixture.start();
     let mut client = connect(&fixture.data, &[])
         .await
@@ -116,6 +123,95 @@ async fn single_connected_scenario() {
     assert_eq!(readback["result"]["value"], value);
     assert_eq!(readback["result"]["version"], 1);
 
+    let workspace = fixture.workspace.to_string_lossy().into_owned();
+    let canonical_workspace = std::fs::canonicalize(&fixture.workspace)
+        .expect("canonical fixture workspace")
+        .to_string_lossy()
+        .into_owned();
+    let launch_id = ulid::Ulid::new().to_string();
+    let mut launch = CommandSubmitRequest::new(launch_id.clone(), "launch");
+    launch.expected_generation = Some(0);
+    launch.args = json!({"profile": "mcp_fake", "workspace": workspace});
+    let launch_response = submit_mcp(&client, &launch).await;
+    assert_eq!(launch_response.command_id, launch_id);
+    let launched = wait_mcp_applied(&client, &launch_id).await;
+    assert_eq!(launched.id, launch_id);
+    assert_eq!(launched.verb, "launch");
+    assert_eq!(launched.expected_generation, Some(0));
+    assert_eq!(launched.generation, Some(1));
+    assert_eq!(launched.args["profile"], "mcp_fake");
+    assert_eq!(launched.args["workspace"], canonical_workspace);
+    let agent_id = launched.target.clone().expect("Fake launch Agent");
+
+    let send_id = ulid::Ulid::new().to_string();
+    let mut send = CommandSubmitRequest::new(send_id.clone(), "send");
+    send.target = Some(agent_id.clone());
+    send.expected_generation = Some(1);
+    send.args = json!({"text": "one MCP Fake turn"});
+    let first_send = submit_mcp(&client, &send).await;
+    assert_eq!(first_send.command_id, send_id);
+    assert_eq!(first_send.agent.as_deref(), Some(agent_id.as_str()));
+    assert_eq!(first_send.generation, Some(1));
+    let sent = wait_mcp_applied(&client, &send_id).await;
+    assert_eq!(sent.id, send_id);
+    assert_eq!(sent.target.as_deref(), Some(agent_id.as_str()));
+    assert_eq!(sent.expected_generation, Some(1));
+    assert_eq!(sent.generation, Some(1));
+    let turn_id = sent.turn_id.clone().expect("send turn binding");
+
+    let replay = submit_mcp(&client, &send).await;
+    assert_eq!(replay.command_id, send_id);
+    assert_eq!(replay.agent.as_deref(), Some(agent_id.as_str()));
+    assert_eq!(replay.generation, Some(1));
+    assert_eq!(replay.state, sent.state);
+    assert_eq!(replay.outcome, sent.outcome);
+    let replayed = wait_mcp_applied(&client, &send_id).await;
+    assert_eq!(replayed.turn_id.as_deref(), Some(turn_id.as_str()));
+
+    let mut changed = send.clone();
+    changed.args = json!({"text": "changed payload"});
+    let conflict = client
+        .call_tool(tool_call(
+            "command.submit",
+            serde_json::to_value(changed).expect("conflicting submit DTO"),
+        ))
+        .await
+        .expect("id_conflict is a structured tool result");
+    assert_eq!(conflict.is_error, Some(true));
+    let conflict = conflict
+        .structured_content
+        .expect("structured id_conflict result");
+    assert_eq!(conflict["code"], "id_conflict");
+
+    let mut result_request = AgentResultRequest::new(agent_id.clone());
+    result_request.generation = Some(1);
+    let result: AgentResultResponse = serde_json::from_value(
+        mcp_result(
+            &client,
+            "agent.result",
+            serde_json::to_value(result_request).expect("AgentResultRequest DTO"),
+        )
+        .await,
+    )
+    .expect("typed Fake result readback");
+    assert_eq!(result.agent, agent_id);
+    assert_eq!(result.generation, 1);
+    assert_eq!(result.turns.len(), 1, "replay/conflict added a NativeTurn");
+    assert_eq!(result.turns[0].turn_id, turn_id);
+
+    let stop_id = ulid::Ulid::new().to_string();
+    let mut stop = CommandSubmitRequest::new(stop_id.clone(), "stop");
+    stop.target = Some(agent_id.clone());
+    stop.expected_generation = Some(1);
+    stop.args = json!({"force": false});
+    let stop_response = submit_mcp(&client, &stop).await;
+    assert_eq!(stop_response.command_id, stop_id);
+    let stopped = wait_mcp_applied(&client, &stop_id).await;
+    assert_eq!(stopped.id, stop_id);
+    assert_eq!(stopped.verb, "stop");
+    assert_eq!(stopped.target.as_deref(), Some(agent_id.as_str()));
+    assert_eq!(stopped.expected_generation, Some(1));
+
     client.close().await.expect("close MCP client");
     fixture.stop(false);
 }
@@ -127,4 +223,58 @@ fn tool_call(method: &str, params: Value) -> CallToolRequestParams {
     }))
     .expect("MCP tool arguments");
     CallToolRequestParams::new("swarm").with_arguments(arguments)
+}
+
+async fn submit_mcp(
+    client: &ClientService,
+    request: &CommandSubmitRequest,
+) -> CommandSubmitResponse {
+    let response: CommandSubmitResponse = serde_json::from_value(
+        mcp_result(
+            client,
+            "command.submit",
+            serde_json::to_value(request).expect("CommandSubmitRequest DTO"),
+        )
+        .await,
+    )
+    .expect("typed CommandSubmitResponse");
+    request
+        .validate_response(&response)
+        .expect("submit response matches caller binding");
+    response
+}
+
+async fn wait_mcp_applied(client: &ClientService, id: &str) -> CoreCommand {
+    loop {
+        let command: CoreCommand = serde_json::from_value(
+            mcp_result(
+                client,
+                "command.get",
+                serde_json::to_value(CommandGetRequest::new(id)).expect("CommandGetRequest DTO"),
+            )
+            .await,
+        )
+        .expect("typed command readback");
+        assert_eq!(command.id, id);
+        if command.state == CommandState::Applied {
+            return command;
+        }
+        assert_ne!(command.state, CommandState::Unknown);
+        assert!(
+            !command.state.is_terminal(),
+            "command did not apply: {command:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn mcp_result(client: &ClientService, method: &str, params: Value) -> Value {
+    let response = client
+        .call_tool(tool_call(method, params))
+        .await
+        .unwrap_or_else(|error| panic!("MCP {method} call failed: {error}"));
+    assert_ne!(response.is_error, Some(true), "MCP {method} returned error");
+    let response = response.structured_content.expect("structured MCP result");
+    assert_eq!(response["method"], method);
+    response["result"].clone()
 }
