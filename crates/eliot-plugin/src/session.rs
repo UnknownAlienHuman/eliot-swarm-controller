@@ -985,11 +985,6 @@ impl StreamSource<'_> {
         }
     }
 
-    async fn send_gap(&self, gap: &SourceGap) -> Result<Value> {
-        self.send_gap_until(gap, Instant::now() + EVENT_DEADLINE)
-            .await
-    }
-
     async fn send_gap_until(&self, gap: &SourceGap, deadline: Instant) -> Result<Value> {
         self.host
             .call(
