@@ -119,6 +119,12 @@ fn main() {
         println!("ok - controls are rejected once the source is unknown");
         scenario_lost_setter_reply_is_unknown_without_rewrite().await;
         println!("ok - lost setter reply is unknown without a second write");
+        scenario_model_list_failure_is_profile_error_without_write().await;
+        println!("ok - model/list failure is profile_error without a write");
+        scenario_scope_mismatch_is_profile_error_without_write().await;
+        println!("ok - scope mismatch is profile_error without a write");
+        scenario_scope_mismatch_unconfirmed_retains_unknown().await;
+        println!("ok - scope mismatch unconfirmed retains unknown");
         scenario_launch_approval_is_adopted_and_verified().await;
         println!("ok - launch approval is adopted and verified");
         scenario_approval_mismatch_is_rejected_before_ready().await;
@@ -309,7 +315,19 @@ impl FakeMsp {
                 );
                 self.reply(stdout, &id, self.initialize_result())
             }
-            "model/list" => self.reply(stdout, &id, self.model_list_result()),
+            "model/list" => {
+                if self.script == "model-list-internal-error" {
+                    self.reply_error(stdout, &id, -32603, "Internal error");
+                    return true;
+                }
+                self.reply(stdout, &id, self.model_list_result());
+                if self.script == "scope-mismatch-unconfirmed" {
+                    // Valid reply is already routed; poison the stdout reader
+                    // so discard's output drain fails and cleanup is
+                    // unconfirmed (Unknown) without unsafe OS tricks.
+                    writeln!(stdout, "not-json").expect("fixture poison");
+                }
+            }
             "session/start" => {
                 let session_id = format!("fake-session-{}", self.counts["session/start"]);
                 self.session_id = Some(session_id.clone());
@@ -4723,6 +4741,173 @@ async fn scenario_lost_setter_reply_is_unknown_without_rewrite() {
         attempt.report()["counts"]["session/setReasoningEffort"],
         json!(1)
     );
+    let _ = std::fs::remove_dir_all(&attempt.root);
+}
+
+/// A read-only `model/list` internal error is `profile_error`, never
+/// `unknown`: no session/start/resume/input was dispatched, and confirmed
+/// cleanup retains only the failed start for daemon cleanup.
+async fn scenario_model_list_failure_is_profile_error_without_write() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (pending, rx) = Scenario::setup_start(
+        "model-list-internal-error",
+        muse_profile(),
+        agent_id,
+        1,
+        Value::Null,
+        Value::Null,
+    )
+    .await;
+    let mut attempt = pending.finish_expecting_error(rx, "profile_error").await;
+
+    // Read-only catalog query ran once; no session effect was dispatched.
+    let report = attempt.report();
+    assert_eq!(report["counts"]["model/list"], json!(1));
+    assert_eq!(report["session_starts"], json!(0));
+    assert_eq!(report["session_resumes"], json!(0));
+    assert_eq!(report["turn_starts"], json!(0));
+
+    // Retained retry replays the stored error without new native I/O.
+    attempt.retry("profile_error").await;
+    assert_eq!(attempt.report()["counts"]["model/list"], json!(1));
+    assert_eq!(attempt.report()["session_starts"], json!(0));
+
+    // Confirmed cleanup retained only the failed start: no owned session.
+    let stop = attempt
+        .host
+        .call(
+            "agent.stop",
+            json!({
+                "agent_id": attempt.agent_id.clone(),
+                "generation": 1,
+                "command_id": ulid::Ulid::new().to_string(),
+                "force": false,
+            }),
+        )
+        .await;
+    assert_eq!(stop, Err("not_found".to_owned()));
+
+    attempt
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    attempt.host.shutdown_child().await;
+    assert_eq!(attempt.report()["counts"]["model/list"], json!(1));
+    let _ = std::fs::remove_dir_all(&attempt.root);
+}
+
+/// Scope-mismatch with confirmed cleanup is `profile_error` with only the
+/// failed start retained: no preflight read, no session/resume, no input.
+async fn scenario_scope_mismatch_is_profile_error_without_write() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (mut resume_from, source_state) = retained_resume_subject(&agent_id);
+    resume_from["native_scope"] = json!("muse-home:deadbeefdeadbeef");
+    let (pending, rx) = Scenario::setup_start(
+        "resume-happy",
+        muse_profile(),
+        agent_id,
+        2,
+        resume_from,
+        source_state,
+    )
+    .await;
+    let mut attempt = pending.finish_expecting_error(rx, "profile_error").await;
+
+    let report = attempt.report();
+    assert_eq!(report["counts"]["model/list"], json!(1));
+    assert!(report["counts"].get("session/read").is_none());
+    assert_eq!(report["session_starts"], json!(0));
+    assert_eq!(report["session_resumes"], json!(0));
+    assert_eq!(report["turn_starts"], json!(0));
+
+    attempt.retry("profile_error").await;
+    assert_eq!(attempt.report()["counts"]["model/list"], json!(1));
+    assert!(attempt.report()["counts"].get("session/read").is_none());
+
+    let stop = attempt
+        .host
+        .call(
+            "agent.stop",
+            json!({
+                "agent_id": attempt.agent_id.clone(),
+                "generation": 2,
+                "command_id": ulid::Ulid::new().to_string(),
+                "force": false,
+            }),
+        )
+        .await;
+    assert_eq!(stop, Err("not_found".to_owned()));
+
+    attempt
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    attempt.host.shutdown_child().await;
+    let _ = std::fs::remove_dir_all(&attempt.root);
+}
+
+/// Scope-mismatch with unconfirmed cleanup retains the owned session as
+/// `unknown` (never drops to `profile_error`): retry does zero native I/O.
+async fn scenario_scope_mismatch_unconfirmed_retains_unknown() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (mut resume_from, source_state) = retained_resume_subject(&agent_id);
+    resume_from["native_scope"] = json!("muse-home:deadbeefdeadbeef");
+    let (pending, rx) = Scenario::setup_start(
+        "scope-mismatch-unconfirmed",
+        muse_profile(),
+        agent_id.clone(),
+        2,
+        resume_from,
+        source_state,
+    )
+    .await;
+    let mut attempt = pending.finish_expecting_error(rx, "unknown").await;
+
+    let report = attempt.report();
+    assert_eq!(report["counts"]["model/list"], json!(1));
+    assert!(report["counts"].get("session/read").is_none());
+    assert_eq!(report["session_starts"], json!(0));
+    assert_eq!(report["session_resumes"], json!(0));
+    assert_eq!(report["turn_starts"], json!(0));
+
+    // Owned session retained: snapshot is unknown, never not_found.
+    let start_id = attempt
+        .params
+        .get("command_id")
+        .and_then(Value::as_str)
+        .expect("start command id")
+        .to_owned();
+    let snapshot = attempt
+        .host
+        .call(
+            "agent.snapshot",
+            json!({
+                "agent_id": agent_id,
+                "generation": 2,
+                "command_id": start_id,
+                "turn_id": Value::Null,
+            }),
+        )
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        snapshot.get("state").and_then(Value::as_str),
+        Some("unknown")
+    );
+
+    // Retained retry replays unknown without new native I/O.
+    attempt.retry("unknown").await;
+    assert_eq!(attempt.report()["counts"]["model/list"], json!(1));
+    assert!(attempt.report()["counts"].get("session/read").is_none());
+    assert_eq!(attempt.report()["session_resumes"], json!(0));
+
+    // Drain was poisoned to force unconfirmed cleanup: shutdown reports the
+    // same unknown instead of clean shutdown, but the plugin still exits.
+    let shutdown = attempt.host.call("shutdown", json!({})).await;
+    assert_eq!(shutdown, Err("unknown".to_owned()));
+    attempt.host.shutdown_child().await;
     let _ = std::fs::remove_dir_all(&attempt.root);
 }
 
