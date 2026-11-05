@@ -283,7 +283,7 @@ impl OwnedServer {
             // No graceful RPC exists; a short grace lets an in-flight native
             // close settle before the process ends.
             let grace = (Instant::now() + Duration::from_secs(2)).min(deadline);
-            if timeout_at(grace, self.child.wait()).await.is_ok() {
+            if matches!(timeout_at(grace, self.child.wait()).await, Ok(Ok(_))) {
                 self.drain_pipes(deadline).await;
                 return Ok(());
             }

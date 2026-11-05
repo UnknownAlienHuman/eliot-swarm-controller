@@ -3020,7 +3020,19 @@ async fn scenario_stop_of_gone_session_is_unknown(owned: OwnedChildren) {
         error.contains("unknown"),
         "expected unknown readback error, got: {error}"
     );
-    assert!(committed.is_empty(), "unknown stop emits no session.ended");
+    // Closure IS proved here (terminate succeeded on the fake): the
+    // retention failure is independent of control closure. exactly one
+    // matching session.ended is emitted; any unfinished turn stays
+    // unknown and produces no terminal result.
+    let ended: Vec<_> = committed
+        .iter()
+        .filter(|(kind, _)| kind == "session.ended")
+        .collect();
+    assert_eq!(
+        ended.len(),
+        1,
+        "closure-proved unknown stop emits exactly one session.ended: {committed:?}"
+    );
     let requests = scenario.requests();
     assert_eq!(
         count_requests(&requests, "DELETE", "/session/"),
@@ -3047,7 +3059,33 @@ async fn scenario_stop_of_gone_session_is_unknown(owned: OwnedChildren) {
         .await;
     let retry_err = retry_outcome.expect_err("retry settles unknown");
     assert!(retry_err.contains("unknown"), "retry: {retry_err}");
-    assert!(retry_committed.is_empty());
+    assert!(
+        retry_committed.is_empty(),
+        "repeat of the same stop id emits no second session.ended and no new commits"
+    );
+    // shutdown/resource cleanup must not replay native interrupt/GET
+    // against the already-dead server just because stop is Unknown:
+    // closure+Ended are proven, so shutdown ends the generation without
+    // additional native I/O or a second Ended.
+    let before_cleanup = scenario.requests();
+    let interrupts_before = count_requests(&before_cleanup, "POST", "/interrupt");
+    let gets_before = count_requests(&before_cleanup, "GET", "/api/session/");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    let after_cleanup = scenario.requests();
+    assert_eq!(
+        count_requests(&after_cleanup, "POST", "/interrupt"),
+        interrupts_before,
+        "no replayed native interrupt during shutdown"
+    );
+    assert_eq!(
+        count_requests(&after_cleanup, "GET", "/api/session/"),
+        gets_before,
+        "no replayed native GET during shutdown"
+    );
     scenario.host.shutdown_child().await;
 }
 
@@ -3961,8 +3999,45 @@ async fn scenario_stale_choice_rejected_without_write(owned: OwnedChildren) {
     drain_until(&mut scenario.host, "turn.completed").await;
     let requests = requests_at(&scenario.root, "requests.jsonl");
     assert_eq!(count_requests(&requests, "POST", "/reply"), 1);
-    let committed = stop_agent(&mut scenario, 1, false).await;
-    assert_eq!(kinds(&committed), ["session.ended"]);
+    // Cleanup after an uncertain (lost) reply: the persisted permission
+    // is still pending, so the retention readback proves the native
+    // session retained but non-idle => StopUnknown with a proven
+    // control closure (one session.ended) and resource exit 0. This
+    // mirrors scenario_stop_of_gone_session_is_unknown; the primary
+    // one-write/retry-unknown assertions above are unchanged.
+    let stop_id = ulid::Ulid::new().to_string();
+    let agent_id = scenario.agent_id.clone();
+    let (outcome, committed) = scenario
+        .host
+        .pump_call(
+            "agent.stop",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": stop_id,
+                "force": false,
+            }),
+            OP_TIMEOUT,
+            Quiesce::SilenceNow,
+        )
+        .await;
+    let error = outcome.expect_err("cleanup stop after lost reply is unknown");
+    assert!(
+        error.contains("unknown"),
+        "cleanup stop remains unknown, got: {error}"
+    );
+    let ended: Vec<_> = committed
+        .iter()
+        .filter(|(kind, _)| kind == "session.ended")
+        .collect();
+    assert_eq!(
+        ended.len(),
+        1,
+        "closure-proved cleanup emits exactly one session.ended: {committed:?}"
+    );
+    // No second reply write during cleanup.
+    let requests_after = requests_at(&scenario.root, "requests.jsonl");
+    assert_eq!(count_requests(&requests_after, "POST", "/reply"), 1);
     scenario
         .host
         .call("shutdown", json!({}))

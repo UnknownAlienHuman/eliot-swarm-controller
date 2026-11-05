@@ -72,6 +72,7 @@ struct AgentSession {
     unknown_commands: HashSet<String>,
     rejected_commands: HashSet<String>,
     stop_command_id: Option<String>,
+    resources_proved_closed: bool,
     control_bindings: HashMap<String, ControlBinding>,
     control_results: HashMap<String, Value>,
 }
@@ -499,6 +500,7 @@ impl OpenCodePlugin {
             unknown_commands: HashSet::new(),
             rejected_commands: HashSet::new(),
             stop_command_id: None,
+            resources_proved_closed: false,
             control_bindings: HashMap::new(),
             control_results: HashMap::new(),
         };
@@ -1892,7 +1894,7 @@ impl OpenCodePlugin {
 
     async fn shutdown(&mut self) -> Result<Value> {
         if let Some(session) = self.session.as_mut() {
-            if session.phase != SessionPhase::Stopped {
+            if session.phase != SessionPhase::Stopped && !session.resources_proved_closed {
                 terminate_session(session, true).await?;
             }
             session.events.close().await;
@@ -1902,7 +1904,7 @@ impl OpenCodePlugin {
 
     async fn shutdown_owned(&mut self) {
         if let Some(session) = self.session.as_mut() {
-            if session.phase != SessionPhase::Stopped {
+            if session.phase != SessionPhase::Stopped && !session.resources_proved_closed {
                 let _ = terminate_session(session, true).await;
             }
             session.events.close().await;
@@ -1998,15 +2000,36 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
         }
     }
     let process_exit = session.server.terminate(force, deadline).await;
-    let ended = session.events.end_stop().await;
-    if !retained || process_exit.is_err() || ended.is_err() {
-        session.phase = SessionPhase::Unknown;
+    // Gate ended emission on the positive control-closure proof of the
+    // bounded process termination. A drained SSE stream is not closure:
+    // when termination is unproven, session.ended must not be emitted and
+    // capacity must not be freed.
+    let ended = if process_exit.is_ok() {
+        Some(session.events.end_stop().await)
+    } else {
+        None
+    };
+    if !retained || process_exit.is_err() || ended.as_ref().is_none_or(|result| result.is_err()) {
+        // Separate resource closure from outcome uncertainty: when the
+        // severed server is ours is confirmed (terminate Ok) and the held
+        // SSE task was ack-ned (end_stop Ok), this generation's resources
+        // are gone, so shutdown can end them without replaying the native
+        // interrupt/readback against an already-dead server. The stop
+        // outcome itself (retention + command binding) stays Unknown.
+        // The resource-closure proof is kept apart from the semantic stop
+        // outcome cache.
+        session.resources_proved_closed =
+            process_exit.is_ok() && ended.as_ref().is_some_and(|result| result.is_ok());
+        if !session.resources_proved_closed {
+            session.phase = SessionPhase::Unknown;
+        }
         return Err(Error::new(
             "unknown",
             "OpenCode session quiesce/retention, server shutdown, or session.ended outcome is unknown",
         ));
     }
     session.phase = SessionPhase::Stopped;
+    session.resources_proved_closed = true;
     Ok(())
 }
 
