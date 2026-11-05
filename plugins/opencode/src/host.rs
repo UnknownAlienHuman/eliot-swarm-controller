@@ -12,7 +12,7 @@ use eliot_plugin::{
     session::{
         ResumeSubject, TargetEnvironment, contextual_error, decode, known_command, native_no_write,
         not_initialized, optional_profile_text, parse_resume_subject, paths_equal,
-        register_native_process, target_environment, unknown_snapshot, validate_binding,
+        register_native_process, split_provider_model, target_environment, unknown_snapshot, validate_binding,
         validate_identity, validate_source_plan,
     },
 };
@@ -1927,7 +1927,7 @@ fn start_model_ref(profile: &serde_json::Map<String, Value>) -> Result<(String, 
     let model_ref = split_model(&requested_model).ok_or_else(|| {
         Error::new(
             "profile_error",
-            "OpenCode profile model must be provider/model",
+            "OpenCode profile model must be provider/model with non-empty slash segments and no variant suffix",
         )
     })?;
     Ok((requested_model, model_ref))
@@ -2017,12 +2017,9 @@ async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error
     session.server.diagnostic_error(error)
 }
 
-/// Installed model-id syntax is `providerID/id`, slashes included.
+/// The first slash separates `providerID`; the full remaining id stays intact.
 fn split_model(model: &str) -> Option<ModelRef> {
-    let (provider_id, id) = model.split_once('/')?;
-    if provider_id.trim().is_empty() || id.trim().is_empty() || id.contains('/') {
-        return None;
-    }
+    let (provider_id, id) = split_provider_model(model)?;
     Some(ModelRef {
         id: id.to_owned(),
         provider_id: provider_id.to_owned(),
@@ -2083,7 +2080,7 @@ fn opencode_manifest() -> PluginManifest {
 
 #[cfg(test)]
 mod tests {
-    use super::{opencode_manifest, opencode_scope, split_model};
+    use super::{opencode_manifest, opencode_scope, split_model, start_model_ref};
     use eliot_core::{AgentStartParams, Result};
     use eliot_plugin::session::{
         ResumeSubject, optional_profile_text, parse_resume_subject, validate_source_plan,
@@ -2155,8 +2152,39 @@ mod tests {
         let model = split_model("opencode/big-pickle").expect("slash form");
         assert_eq!(model.provider_id, "opencode");
         assert_eq!(model.id, "big-pickle");
-        for bad in ["", "noprovider", "/noid", "provider/", "a/b/c", "/"] {
+        for bad in ["", "noprovider", "/noid", "provider/", "a//b", "/"] {
             assert!(split_model(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn profile_model_preserves_nested_native_id_and_unmapped_variant_selection() {
+        let requested = "openrouter/stealth/crouton-alpha";
+        let profile = json!({"model":requested});
+        let (frozen, model) = start_model_ref(profile.as_object().unwrap()).unwrap();
+        assert_eq!(frozen, requested);
+        assert_eq!(model.provider_id, "openrouter");
+        assert_eq!(model.id, "stealth/crouton-alpha");
+        assert_eq!(model.variant, None);
+        assert_eq!(
+            serde_json::to_value(&model).unwrap(),
+            json!({"providerID":"openrouter", "id":"stealth/crouton-alpha"})
+        );
+        assert_eq!(format!("{}/{}", model.provider_id, model.id), requested);
+        for malformed in [
+            "", "noprovider", "/model", "openrouter/", "openrouter//model",
+            "openrouter/stealth/", "openrouter/stealth//crouton-alpha",
+            "openrouter\\stealth\\crouton-alpha", "openrouter/stealth\\crouton-alpha",
+            "open#router/model", "openrouter/model#", "openrouter/model#default",
+            "openrouter/model##default", "openrouter/model\n", "\topenrouter/model",
+            "openrouter/stealth/ model", "openrouter/stealth/\0model",
+        ] {
+            let profile = json!({"model":malformed});
+            assert_eq!(
+                start_model_ref(profile.as_object().unwrap()).unwrap_err().code,
+                "profile_error",
+                "{malformed:?}"
+            );
         }
     }
 

@@ -80,7 +80,13 @@ never replayed.
 Page all native history/child lists and retain exact parent ids. Parent idle does not
 finish children. Native database discovery, if needed, is read-only and not a parallel
 publisher. Generate per-Agent/server provider config; never edit owner global settings.
-Follow installed model-id syntax, including slashes, and expose requested/effective route.
+The profile model is the exact catalog string `provider/model-id`. Split only its first
+slash: `openrouter/stealth/crouton-alpha` selects provider `openrouter` and model id
+`stealth/crouton-alpha`, without shortening or substituting it. This follows
+[v2.0.32 `Model.Ref.parse`](https://github.com/anomalyco/opencode/blob/v2.0.32/packages/schema/src/model.ts#L27).
+Empty slash segments, backslash separators, whitespace and control characters reject.
+The native `#variant` suffix is not mapped by this slice and rejects; requests retain
+`variant=None` and the existing exact requested/effective model comparison.
 
 L7 verifies two-session isolation when shared mode is selected, adopted-service safety,
 204-vs-execution, lost stream/input, snapshot races, pagination, exact controls and no

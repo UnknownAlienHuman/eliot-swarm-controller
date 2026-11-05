@@ -220,6 +220,23 @@ pub fn optional_profile_text(
     }
 }
 
+/// Split the exact provider/model profile form at its first slash. OpenCode
+/// v2.0.32 Model.Ref.parse keeps later slashes in the model id; its separate
+/// `#variant` syntax is not mapped by the current Eliot profile path.
+pub fn split_provider_model(model: &str) -> Option<(&str, &str)> {
+    if model.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+        || model.contains('\\')
+        || model.contains('#')
+    {
+        return None;
+    }
+    let (provider, id) = model.split_once('/')?;
+    if provider.is_empty() || id.split('/').any(str::is_empty) {
+        return None;
+    }
+    Some((provider, id))
+}
+
 /// A validated retained resume subject: the exact native session to continue
 /// plus the retained generation's last turn summary, when it had one. The
 /// request family is new in the resuming generation, so only the
