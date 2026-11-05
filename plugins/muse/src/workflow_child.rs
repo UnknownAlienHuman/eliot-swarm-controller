@@ -740,7 +740,7 @@ mod tests {
             );
 
             let registration = key
-                .build_registration("parent-agent-sanitized", 7, "muse-home-sanitized")
+                .build_registration("a1", 7, "muse-home-sanitized")
                 .expect("wire identity builds registration");
             let ack = test_ack(&registration);
             registration
