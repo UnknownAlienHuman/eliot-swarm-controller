@@ -365,6 +365,10 @@ struct ProfileEntry {
     #[serde(default)]
     approval_policy: Option<String>,
     #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    dangerously_skip_permissions: Option<bool>,
+    #[serde(default)]
     control: Option<String>,
     #[serde(default)]
     pass_env: Option<Vec<String>>,
@@ -945,6 +949,8 @@ fn snapshot_from_entry(
             || entry.approval_policy.is_some()
             || entry.control.is_some()
             || entry.approval.is_some()
+            || entry.mode.is_some()
+            || entry.dangerously_skip_permissions.is_some()
             || entry.pass_env.is_some()
             || !entry.setup.is_empty()
             || entry.scratch != default_scratch()
@@ -960,7 +966,12 @@ fn snapshot_from_entry(
         }
         return Ok(fake_profile_snapshot());
     }
-    if harness != "codex" && harness != "muse" && harness != "claude" && harness != "opencode" {
+    if harness != "codex"
+        && harness != "muse"
+        && harness != "claude"
+        && harness != "opencode"
+        && harness != "antigravity"
+    {
         return Err(profile_field_error(
             source,
             table_offset,
@@ -978,6 +989,9 @@ fn snapshot_from_entry(
     }
     if harness == "opencode" {
         return opencode_snapshot_from_entry(name, entry, table_offset, source);
+    }
+    if harness == "antigravity" {
+        return antigravity_snapshot_from_entry(name, entry, table_offset, source);
     }
     let model = entry
         .model
@@ -1050,6 +1064,16 @@ fn snapshot_from_entry(
             "approval_policy",
             "must be never or on-request",
             "profile_error",
+        ));
+    }
+    if entry.mode.is_some() || entry.dangerously_skip_permissions.is_some() {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "mode",
+            "mode and dangerously_skip_permissions have no Codex mapping",
+            "unsupported",
         ));
     }
     let pass_env = match entry.pass_env.as_deref() {
@@ -1125,10 +1149,10 @@ fn snapshot_from_entry(
     Ok(Value::Object(snapshot))
 }
 
-/// Validated profile tail shared by the Muse and OpenCode slices: an
-/// explicit pass_env list, a required explicit native `cmd` (no script
-/// wrapper), and validated setup/scratch. Each harness snapshot validates
-/// its own head (model, effort, ...) then folds this tail in.
+/// Validated profile tail shared by the Muse, OpenCode and Antigravity
+/// slices: an explicit pass_env list, a required explicit native `cmd` (no
+/// script wrapper), and validated setup/scratch. Each harness snapshot
+/// validates its own head (model, effort, ...) then folds this tail in.
 struct ProfileTail {
     pass_env: Vec<String>,
     cmd: String,
@@ -1310,6 +1334,16 @@ fn muse_snapshot_from_entry(
             "unsupported",
         ));
     }
+    if entry.mode.is_some() || entry.dangerously_skip_permissions.is_some() {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "mode",
+            "the Muse slice has no mapping for this preset",
+            "unsupported",
+        ));
+    }
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("muse".to_owned()));
@@ -1437,6 +1471,16 @@ fn claude_snapshot_from_entry(
             name,
             "approval_policy",
             "the Claude slice leaves approvals unconnected",
+            "unsupported",
+        ));
+    }
+    if entry.mode.is_some() || entry.dangerously_skip_permissions.is_some() {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "mode",
+            "the Claude slice has no mapping for this preset",
             "unsupported",
         ));
     }
@@ -1584,10 +1628,119 @@ fn opencode_snapshot_from_entry(
             ));
         }
     }
+    if entry.mode.is_some() || entry.dangerously_skip_permissions.is_some() {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "mode",
+            "the OpenCode slice has no mapping for this preset",
+            "unsupported",
+        ));
+    }
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("opencode".to_owned()));
     snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    insert_control(
+        &mut snapshot,
+        name,
+        entry.control.as_deref(),
+        source,
+        table_offset,
+    )?;
+    insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
+    Ok(Value::Object(snapshot))
+}
+
+/// Freeze an Antigravity profile. The L6.4 slice carries an exact model id, a
+/// required explicit native `cmd`, an optional native `mode` and an explicit
+/// `dangerously_skip_permissions` flag. Effort, approval, collaboration,
+/// permission and approval-policy presets have no mapping and stay rejected.
+fn antigravity_snapshot_from_entry(
+    name: &str,
+    entry: &ProfileEntry,
+    table_offset: usize,
+    source: &str,
+) -> core::Result<Value> {
+    let model = entry
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .ok_or_else(|| {
+            profile_field_error(
+                source,
+                table_offset,
+                name,
+                "model",
+                "required non-empty model is missing",
+                "profile_error",
+            )
+        })?;
+    validate_model(name, model, source, table_offset)?;
+    if entry
+        .effort
+        .as_deref()
+        .is_some_and(|effort| !effort.trim().is_empty())
+    {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "effort",
+            "the Antigravity slice has no reasoning-effort mapping",
+            "unsupported",
+        ));
+    }
+    let mode = entry.mode.as_deref().map(str::trim);
+    if mode.is_some_and(|mode| !matches!(mode, "plan" | "auto" | "accept-edits")) {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "mode",
+            "must be plan, auto, or accept-edits",
+            "profile_error",
+        ));
+    }
+    for field in [
+        "approval",
+        "collaboration_mode",
+        "permissions",
+        "approval_policy",
+    ] {
+        let present = match field {
+            "approval" => entry.approval.as_deref(),
+            "collaboration_mode" => entry.collaboration_mode.as_deref(),
+            "permissions" => entry.permissions.as_deref(),
+            _ => entry.approval_policy.as_deref(),
+        };
+        if present.is_some() {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                field,
+                "the Antigravity slice has no mapping for this preset",
+                "unsupported",
+            ));
+        }
+    }
+    let tail = validate_profile_tail(name, entry, table_offset, source)?;
+    let mut snapshot = serde_json::Map::new();
+    snapshot.insert(
+        "harness".to_owned(),
+        Value::String("antigravity".to_owned()),
+    );
+    snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    if let Some(mode) = mode {
+        snapshot.insert("mode".to_owned(), Value::String(mode.to_owned()));
+    }
+    snapshot.insert(
+        "dangerously_skip_permissions".to_owned(),
+        Value::Bool(entry.dangerously_skip_permissions.unwrap_or(false)),
+    );
     insert_control(
         &mut snapshot,
         name,

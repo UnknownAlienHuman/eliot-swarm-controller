@@ -411,6 +411,7 @@ dependencies = [
  "eliot-core",
  "eliot-daemon",
  "eliot-plugin",
+ "eliot-plugin-antigravity",
  "eliot-plugin-claude",
  "eliot-plugin-codex",
  "eliot-plugin-muse",
@@ -471,6 +472,18 @@ dependencies = [
  "tokio",
  "tokio-util",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "eliot-plugin-antigravity"
+version = "0.2.0-dev"
+dependencies = [
+ "eliot-core",
+ "eliot-plugin",
+ "serde",
+ "serde_json",
+ "tokio",
+ "ulid",
 ]
 
 [[package]]

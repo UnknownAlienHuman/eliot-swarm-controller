@@ -2,50 +2,66 @@
 
 Optional L6 adapter. One warm `agy` process belongs to one Eliot Agent generation and
 custody unit. Source: [google-antigravity/antigravity-cli](https://github.com/google-antigravity/antigravity-cli).
-Inherited notes were checked 2026-10-25; verify installed flags/defaults and behavior
-when this adapter is selected, not before Codex bring-up.
+The manifest's native version (`1.5.0`) is diagnostic metadata, not a startup version
+gate. Startup validates the native `init` facts.
 
 ## Native identity and transport
 
 Subject: `(canonical auth/config scope, exact conversation_id)`.
 
 ```text
-agy --input-format stream-json --output-format stream-json
-    [--model M] [--mode accept-edits|auto|plan] [--effort E]
+agy --input-format stream-json --output-format stream-json --model M
+    --dangerously-skip-permissions=false|true [--mode accept-edits|auto|plan]
     [--conversation ID]
 ```
 
 One user line and at most one input in flight; stdout init/step_update/result. Results
 without input ids are correlated only within that same uninterrupted process and its
-single outstanding prompt. Resume starts a new generation with exact conversation id,
-never the old prompt. Late old stdout is stale. Children share parent environment unless
-installed evidence proves otherwise; no fake independent child token.
+single outstanding prompt. Late old stdout is stale. Native child discovery and control
+are unsupported.
 
-Whether init arrives before input is unresolved. If not, use the common
-`start_requires_input` linked command contract. Arm stdout before the initial write.
+The native process emits `init` before input. The adapter uses
+`start_requires_input = false`: arm stdout, validate the conversation id, model and cwd,
+then commit `session.ready` before accepting a separate send. Resume must retain the
+exact conversation id and sends no input by itself.
+
+A `step_update` with `step_type = "system_message"` is bookkeeping metadata, including
+when idle or resuming. Validate its conversation before handling it, and handle it
+before input association. It does not acknowledge input, create a turn, append assistant
+text or complete a turn. Unknown step types still produce an explicit gap with bounded,
+redacted structural diagnostics.
 
 ## Native mapping
 
-Launch/send use the native input stream; local write acceptance is not turn completion.
-Steer is unsupported; inject may prepend to the next send and reports next-turn semantics.
-Interrupt remains unsupported until an exact native method is observed. Stop closes stdin
-and waits; force targets only owned custody. Configure uses launch flags/next-session
-settings. No known headless approval/question reply channel is invented. Eliot Goal is
-separate from native turn control. Slash/foreign control messages are not sent into a
-stream that does not accept them.
+Launch establishes the session before input; send writes one user record to that warm
+process. Local write acceptance is not turn completion. Stop closes stdin and drains
+stdout before settling the session; force targets only owned custody. Resume creates a
+new Agent generation with `--conversation ID`, without replaying the old prompt.
+The adapter exposes no headless approval/question reply channel. Eliot Goal is separate
+from native turn control. Slash/foreign control messages are not sent into the stream.
+
+## Eliot profile slice
+
+`harness = "antigravity"` with explicit `cmd` and exact `model`; optional `mode`
+(`plan`, `auto`, `accept-edits`) and `dangerously_skip_permissions` (default
+false). `effort` is rejected. Connected verbs are launch/resume/send/stop; steer,
+inject, interrupt, configure, approve, deny and answer are `unsupported`. Controlled
+families are session/turn/message/tool with no request family. `profile.store` is unsupported:
+launch carries no native store binding.
 
 ## Facts and recovery
 
-The stdout stream owns supplied session/turn/message/tool/child/usage families. Exact
-terminal result can settle its single outstanding prompt even if no intermediate update
-was emitted. SUCCESS/ERROR/INVALID/CANCELED/INTERRUPTED map from the installed schema;
+The terminal `result` is authoritative for turn completion and can settle its single
+outstanding prompt even if no intermediate update was emitted.
+SUCCESS/ERROR/INVALID/CANCELED/INTERRUPTED map from the installed schema;
 WAITING/RUNNING are nonterminal. A soft-denied tool remains visible even under a successful
 final result. Cumulative usage replaces the previous session counter. Requested,
 effective and served model are separate facts; one never stands in for another.
 
-There is no assumed replay cursor/history API. Loss means explicit gap and only available
-exact current-state readback. Do not replay conversation history or infer success from
-silence/process exit; drain buffered stdout first. Unknown input/result is not retried.
+There is no replay cursor/history API. Snapshots expose retained stream facts, not a
+native history poll. Loss means an explicit gap. Do not replay conversation history or
+infer success from silence/process exit; drain buffered stdout first. Unknown input/result
+is not retried.
 
 ## Permissions and final checks
 

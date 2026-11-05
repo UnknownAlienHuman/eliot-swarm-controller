@@ -107,6 +107,7 @@ struct RuntimeEntry {
 enum RuntimeMessage {
     Command {
         command: Command,
+        dispatch_seq: Option<i64>,
         reply: oneshot::Sender<Result<Value>>,
     },
     Snapshot {
@@ -285,7 +286,7 @@ impl PluginHost {
         }
         if !matches!(
             agent.harness.as_str(),
-            "fake" | "codex" | "muse" | "claude" | "opencode"
+            "fake" | "codex" | "muse" | "claude" | "opencode" | "antigravity"
         ) || agent.generation <= 0
         {
             return Err(Error::new(
@@ -525,7 +526,12 @@ impl PluginHost {
         result.map_err(|error| diagnose_error(error, &stderr_view, &source_credentials))
     }
 
-    pub(crate) async fn command(&self, agent: &Agent, command: Command) -> Result<Value> {
+    pub(crate) async fn command(
+        &self,
+        agent: &Agent,
+        command: Command,
+        dispatch_seq: Option<i64>,
+    ) -> Result<Value> {
         let key = AgentKey {
             id: agent.id.clone(),
             generation: agent.generation,
@@ -559,7 +565,11 @@ impl PluginHost {
         let (reply, response) = oneshot::channel();
         timeout_at(
             Instant::now() + RPC_DEADLINE,
-            sender.send(RuntimeMessage::Command { command, reply }),
+            sender.send(RuntimeMessage::Command {
+                command,
+                dispatch_seq,
+                reply,
+            }),
         )
         .await
         .map_err(|_| Error::new("busy", "Agent plugin command queue is full"))?
@@ -1189,7 +1199,11 @@ async fn run_agent_inner(
                     break;
                 };
                 match message {
-                    RuntimeMessage::Command { command, reply } => {
+                    RuntimeMessage::Command {
+                        command,
+                        dispatch_seq,
+                        reply,
+                    } => {
                         last_command_id = command.id.clone();
                         let verb = command.verb.clone();
                         let result = match plugin_command_args(&command) {
@@ -1203,6 +1217,7 @@ async fn run_agent_inner(
                                     "turn_id": command.turn_id,
                                     "request_id": command.request_id,
                                     "args": args,
+                                    "dispatch_seq": dispatch_seq,
                                 });
                                 client.call("agent.command", params, deadline()).await
                                     .map_err(|error| redact_native_error(error, &source_credentials))
@@ -2110,7 +2125,10 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         return Err(unsupported_manifest());
     }
 
-    if !matches!(harness, "fake" | "codex" | "muse" | "claude" | "opencode") {
+    if !matches!(
+        harness,
+        "fake" | "codex" | "muse" | "claude" | "opencode" | "antigravity"
+    ) {
         return Err(unsupported_manifest());
     }
     let expected_families = ["message", "session", "turn"];
@@ -2136,7 +2154,7 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         .sources
         .get("controlled")
         .ok_or_else(unsupported_manifest)?;
-    let tool_expected = harness == "codex";
+    let tool_expected = harness == "codex" || harness == "antigravity";
     let request_expected = matches!(harness, "fake" | "codex" | "muse" | "claude" | "opencode");
     let expected_count = expected_families.len()
         + if tool_expected { 1 } else { 0 }

@@ -31,8 +31,8 @@ the common exact-identity and authority checks.
 | Native subject | store + thread | config/project + session | host/store + session | server/store + session | config + conversation | command/store + session |
 | Controlled source | app-server stream | SDK stream | MSP stream | exact-session SSE | stdout | ACP connection |
 | Steer | exact turn | unsupported unless an exact native method is demonstrated | exact turn | ? exact native method | unsupported | unsupported in generic v1 |
-| Inject | steer / next send | next supported hook safe point | steer / next send | ? / next send | next send | next prompt |
-| Interrupt | exact turn | active query | exact turn | verify session/execution scope | ? | active prompt cancel |
+| Inject | steer / next send | next supported hook safe point | steer / next send | ? / next send | unsupported | next prompt |
+| Interrupt | exact turn | active query | exact turn | verify session/execution scope | unsupported | active prompt cancel |
 | Requests | native approval/input ids | SDK callbacks | native choice/request ids | installed permission/input ids | no known headless reply channel | negotiated permission/input |
 | Resume | exact thread | exact session | exact session | installed attach/resume | conversation | negotiated load/resume |
 | Native Goal | installed method | ? | installed method | no assumed support | none assumed | none generic |

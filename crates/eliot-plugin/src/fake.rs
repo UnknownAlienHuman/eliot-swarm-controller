@@ -2116,6 +2116,7 @@ mod provider_hold_tests {
             args: json!({"text": text}),
             turn_id: None,
             request_id: None,
+            dispatch_seq: None,
         }
     }
 
@@ -2140,6 +2141,7 @@ mod provider_hold_tests {
             args: json!({}),
             turn_id: Some(turn_id.to_owned()),
             request_id: None,
+            dispatch_seq: None,
         }
     }
 
@@ -2152,6 +2154,7 @@ mod provider_hold_tests {
             args: json!({"text": text}),
             turn_id: Some(turn_id.to_owned()),
             request_id: None,
+            dispatch_seq: None,
         }
     }
 
@@ -2222,6 +2225,7 @@ mod provider_hold_tests {
             },
             turn_id: Some(pending.turn_id.clone()),
             request_id: Some(pending.id.clone()),
+            dispatch_seq: None,
         }
     }
 

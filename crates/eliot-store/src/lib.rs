@@ -3284,6 +3284,7 @@ fn source_families_for_harness(harness: &str) -> Result<&'static [&'static str]>
         "muse" => Ok(&["session", "turn", "message", "request"]),
         "claude" => Ok(&["session", "turn", "message", "request"]),
         "opencode" => Ok(&["session", "turn", "message", "request"]),
+        "antigravity" => Ok(&["session", "turn", "message", "tool"]),
         other => Err(Error::new(
             "unsupported",
             format!("unsupported launch harness {other}"),

@@ -701,7 +701,7 @@ fn project_start_input_binding_tx(
             && agent.active_turn.is_none()
             && matches!(
                 agent.harness.as_str(),
-                "codex" | "fake" | "muse" | "claude" | "opencode"
+                "codex" | "fake" | "muse" | "claude" | "opencode" | "antigravity"
             )
             && agent
                 .native_scope

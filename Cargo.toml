@@ -9,6 +9,7 @@ members = [
     "plugins/muse",
     "plugins/claude",
     "plugins/opencode",
+    "plugins/antigravity",
 ]
 resolver = "3"
 
@@ -26,6 +27,7 @@ eliot-plugin-codex = { path = "plugins/codex" }
 eliot-plugin-muse = { path = "plugins/muse" }
 eliot-plugin-claude = { path = "plugins/claude" }
 eliot-plugin-opencode = { path = "plugins/opencode" }
+eliot-plugin-antigravity = { path = "plugins/antigravity" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "process", "sync", "time", "signal"] }

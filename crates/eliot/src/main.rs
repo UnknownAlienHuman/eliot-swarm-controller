@@ -179,7 +179,7 @@ enum CliCommand {
         #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
         timeout_seconds: u64,
     },
-    /// Resume a retained Codex thread, optionally with new input.
+    /// Resume a retained native session, optionally with new input.
     Resume {
         #[arg(value_name = "AGENT")]
         agent: String,
@@ -719,6 +719,9 @@ enum PluginCommand {
     /// Internal OpenCode plugin entry point (hidden).
     #[command(hide = true)]
     Opencode,
+    /// Internal Antigravity plugin entry point (hidden).
+    #[command(hide = true)]
+    Antigravity,
 }
 
 struct Failure {
@@ -1971,6 +1974,12 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             }
             PluginCommand::Opencode => {
                 eliot_plugin_opencode::run_opencode()
+                    .await
+                    .map_err(|error| Failure::new(1, error.to_string()))?;
+                Ok(0)
+            }
+            PluginCommand::Antigravity => {
+                eliot_plugin_antigravity::run()
                     .await
                     .map_err(|error| Failure::new(1, error.to_string()))?;
                 Ok(0)
