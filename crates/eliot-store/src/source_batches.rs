@@ -704,9 +704,6 @@ impl Store {
             }
             if !observed {
                 update_agent_projection(&tx, &next)?;
-                if native_event.kind == "session.ended" && next.is_terminal() {
-                    capacity::release_proven_generation_tx(&tx, agent_num, batch.generation)?;
-                }
             }
             projection = next;
             committed_events.push(stored);

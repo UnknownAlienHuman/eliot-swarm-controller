@@ -23,6 +23,9 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
+#[allow(dead_code)]
+mod support;
+
 const CLI: &str = env!("CARGO_BIN_EXE_swarm");
 const MODEL: &str = "test-provider/test-model";
 const OP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -37,6 +40,10 @@ const ORPHAN_GRACE: Duration = Duration::from_secs(5);
 const FAKE_MAX_LIFETIME: Duration = Duration::from_secs(180);
 
 fn main() {
+    if std::env::var("ELIOT_FAKE_OPENCODE_DESCENDANT").is_ok() {
+        fake_descendant_main();
+        return;
+    }
     if let Ok(script) = std::env::var("ELIOT_FAKE_OPENCODE_SCRIPT") {
         fake_server_main(&script);
         return;
@@ -92,6 +99,11 @@ async fn run_lifecycle_scenarios() {
     run_scenario(
         "stop of a gone session is unknown",
         scenario_stop_of_gone_session_is_unknown,
+    )
+    .await;
+    run_scenario(
+        "unknown stop with committed End closes the owned family before cap release",
+        scenario_unknown_stop_with_committed_end_closes_owned_family,
     )
     .await;
     run_scenario(
@@ -403,6 +415,10 @@ struct Script {
     interrupt_drop: bool,
     /// Installed agent ids for `GET /api/agent`.
     agents: Vec<String>,
+    /// Spawn one owned descendant at boot that outlives the server, so the
+    /// generation Job stays non-empty until the test ends exactly that PID
+    /// (read from `ELIOT_FAKE_OPENCODE_DESCENDANT_PID`).
+    descendant: bool,
 }
 
 impl Script {
@@ -461,8 +477,18 @@ impl Script {
                         .collect()
                 })
                 .unwrap_or_else(|| vec!["build".to_owned(), "general".to_owned()]),
+            descendant: get("descendant").as_bool().unwrap_or(false),
         }
     }
+}
+
+/// Owned-descendant stand-in: a child of the fake server that outlives it.
+/// It holds no port or pipe and ignores every inherited variable; the
+/// backstop exit mirrors the server so a hard-cancelled run cannot orphan
+/// it for hours, while the daemon-level regression ends it by exact PID.
+fn fake_descendant_main() {
+    std::thread::sleep(FAKE_MAX_LIFETIME);
+    std::process::exit(3);
 }
 
 struct Fixture {
@@ -534,10 +560,27 @@ fn fake_server_main(script_raw: &str) {
             "has_password": true,
             "data_home": data_home,
             "port": port,
+            "server_pid": std::process::id(),
         }))
         .expect("report JSON"),
     )
     .expect("write fixture report");
+
+    if script.descendant {
+        let pid_path = PathBuf::from(
+            std::env::var("ELIOT_FAKE_OPENCODE_DESCENDANT_PID")
+                .expect("fixture descendant pid file"),
+        );
+        let self_exe = std::env::current_exe().expect("fixture executable");
+        let mut spawn = std::process::Command::new(self_exe);
+        spawn.env_remove("ELIOT_FAKE_OPENCODE_SCRIPT");
+        spawn.env("ELIOT_FAKE_OPENCODE_DESCENDANT", "1");
+        spawn.stdin(Stdio::null());
+        spawn.stdout(Stdio::null());
+        spawn.stderr(Stdio::null());
+        let child = spawn.spawn().expect("spawn owned descendant");
+        std::fs::write(&pid_path, child.id().to_string()).expect("write descendant pid");
+    }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3079,6 +3122,296 @@ async fn scenario_stop_of_gone_session_is_unknown(owned: OwnedChildren) {
         "no replayed native GET during shutdown"
     );
     scenario.host.shutdown_child().await;
+}
+
+/// Daemon-level regression for the repaired ordinary Unknown Stop, through
+/// the real daemon/router/CLI: a retention readback failure makes `agent.stop`
+/// return Unknown while the server still closes and exactly one session.ended
+/// commits. A scripted owned descendant outlives the server so the generation
+/// Job stays non-empty until the test ends exactly that PID; the Host's own
+/// wait then proves the family empty and settles the owned exit. The stop
+/// stays Unknown (never Applied, never replayed), capacity stays fenced
+/// until that proof, and the existing owned-exit proof then releases it.
+/// The fence-before-proof window is exact only where family custody is
+/// exact: Unix custody stays degraded by design (leader exit proves control
+/// loss), so the pre-kill fence assertions are Windows-only.
+async fn scenario_unknown_stop_with_committed_end_closes_owned_family(owned: OwnedChildren) {
+    let mut fixture = support::Fixture::new("opencode unknown-stop owned-exit");
+    let log_path = fixture.root.join("requests.jsonl");
+    let report_path = fixture.root.join("report.json");
+    let descendant_pid_path = fixture.root.join("descendant.pid");
+    let script_text = script(json!({"readback_status": 404, "descendant": true})).to_string();
+    fixture
+        .env("ELIOT_FAKE_OPENCODE_SCRIPT", &script_text)
+        .env("ELIOT_FAKE_OPENCODE_LOG", &log_path)
+        .env("ELIOT_FAKE_OPENCODE_REPORT", &report_path)
+        .env("ELIOT_FAKE_OPENCODE_DESCENDANT_PID", &descendant_pid_path);
+    fixture.start();
+    let cmd = std::env::current_exe()
+        .expect("test executable")
+        .to_string_lossy()
+        .into_owned();
+    let config = format!(
+        "[profiles.opencode-cap]\nharness = \"opencode\"\nmodel = \"{}\"\ncmd = {}\npass_env = [\"ELIOT_FAKE_OPENCODE_SCRIPT\", \"ELIOT_FAKE_OPENCODE_LOG\", \"ELIOT_FAKE_OPENCODE_REPORT\", \"ELIOT_FAKE_OPENCODE_DESCENDANT_PID\"]\naccount = \"shared\"\n\n[profiles.fake-cap]\nharness = \"fake\"\naccount = \"shared\"\n\n[accounts.shared]\nmax_live = 1\n",
+        MODEL,
+        serde_json::to_string(&cmd).expect("cmd toml"),
+    );
+    std::fs::write(fixture.data.join("config.toml"), config).expect("write opencode profile");
+
+    let launch_id = ulid::Ulid::new().to_string();
+    let workspace = fixture.workspace.to_string_lossy().into_owned();
+    let launch: eliot_core::Command = serde_json::from_value(fixture.json(&[
+        "--id",
+        &launch_id,
+        "launch",
+        "--profile",
+        "opencode-cap",
+        "--workspace",
+        &workspace,
+    ]))
+    .expect("typed launch");
+    assert_eq!(launch.id, launch_id);
+    let agent = launch.target.clone().expect("launch agent");
+    let generation = launch.generation.expect("launch generation");
+
+    // Readiness is a live state, not a timer: the plugin retains its session
+    // before the ready snapshot reports idle.
+    let ready_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut last_state = String::new();
+    loop {
+        let reply = support::cli(&fixture.data, &["show", &agent]);
+        if reply.status.success() {
+            let shown: Value = serde_json::from_str(&reply.stdout).expect("show JSON");
+            last_state = shown["state"].as_str().unwrap_or_default().to_owned();
+            if last_state == "idle" {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < ready_deadline,
+            "agent ready deadline; last state: {last_state}"
+        );
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Both PIDs are written by the fake at server boot; recording them makes
+    // every exit path (timeout included) reap exactly these processes.
+    let pid_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let descendant_pid: u32 = loop {
+        if let Ok(text) = std::fs::read_to_string(&descendant_pid_path)
+            && let Ok(pid) = text.trim().parse()
+        {
+            break pid;
+        }
+        assert!(std::time::Instant::now() < pid_deadline, "descendant pid deadline");
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(pid_is_live(descendant_pid), "owned descendant must be live before stop");
+    owned.record(descendant_pid);
+    let server_pid = report_at(&fixture.root, "report.json")["server_pid"]
+        .as_u64()
+        .expect("server pid report") as u32;
+    assert!(pid_is_live(server_pid), "fake server must be live before stop");
+    owned.record(server_pid);
+
+    let stop_id = ulid::Ulid::new().to_string();
+    let gen_arg = generation.to_string();
+    let stopped: eliot_core::api::CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+        "--id",
+        &stop_id,
+        "stop",
+        &agent,
+        "--generation",
+        &gen_arg,
+    ]))
+    .expect("typed stop");
+    assert_eq!(stopped.command_id, stop_id);
+
+    // End commits while the stop is still in flight: on exact custody no
+    // exit path can settle the command while the owned descendant keeps
+    // the family non-empty.
+    let end_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let reply = support::cli(&fixture.data, &["show", &agent]);
+        if reply.status.success() {
+            let shown: Value = serde_json::from_str(&reply.stdout).expect("show JSON");
+            if shown["state"] == "stopped" {
+                break;
+            }
+        }
+        assert!(std::time::Instant::now() < end_deadline, "session end deadline");
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mid_requests = requests_at(&fixture.root, "requests.jsonl");
+    let mid_interrupts = count_requests(&mid_requests, "POST", "/interrupt");
+    let mid_gets = count_requests(&mid_requests, "GET", "/api/session/");
+    assert_eq!(
+        count_requests(&mid_requests, "DELETE", "/session/"),
+        0,
+        "ordinary stop never deletes the retained session"
+    );
+    assert_eq!(fixture.json(&["status"])["agents"], 1);
+
+    let blocked_id = ulid::Ulid::new().to_string();
+    let blocked_args = [
+        "--id",
+        blocked_id.as_str(),
+        "launch",
+        "--profile",
+        "fake-cap",
+        "--workspace",
+        workspace.as_str(),
+    ];
+    #[cfg(windows)]
+    {
+        // Fenced: the stop cannot settle, no release event fires, and a
+        // second admission on the full account scope rejects before
+        // admission without a command row or command event.
+        let in_flight = fixture.json(&["cmd", "show", &stop_id]);
+        assert_eq!(
+            in_flight["state"].as_str(),
+            Some("dispatched"),
+            "stop must still be in flight while the owned descendant lives: {in_flight}"
+        );
+        let released_before = fixture.events().iter().any(|event| {
+            event["kind"] == "capacity.released"
+                && event["agent"] == agent
+                && event["generation"] == generation
+        });
+        assert!(!released_before, "capacity must not release before owned-exit proof");
+        let blocked = support::cli(&fixture.data, &blocked_args);
+        assert_eq!(blocked.status.code(), Some(3), "fenced cap must reject before admission");
+        assert!(
+            blocked.stderr.contains("capacity_unavailable"),
+            "fenced cap did not return capacity_unavailable"
+        );
+        let missing = support::cli(&fixture.data, &["cmd", "show", &blocked_id]);
+        assert_eq!(missing.status.code(), Some(1));
+        assert!(
+            missing.stderr.contains("not_found"),
+            "cap-rejected request unexpectedly has a command row"
+        );
+        assert!(
+            fixture
+                .events()
+                .iter()
+                .all(|event| event["data"]["command_id"] != blocked_id),
+            "unadmitted cap rejection wrote a command event"
+        );
+    }
+
+    // The test ends exactly the scripted descendant; the Host's own wait
+    // proves the family empty and settles the owned exit.
+    kill_exact_pid(descendant_pid);
+    let reaped_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if !pid_is_live(descendant_pid) {
+            break;
+        }
+        assert!(std::time::Instant::now() < reaped_deadline, "descendant exit deadline");
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let settled = fixture.wait_command(&stop_id, "unknown");
+    assert_eq!(settled["state"].as_str(), Some("unknown"));
+    assert_eq!(
+        settled["outcome"]["code"].as_str(),
+        Some("unknown"),
+        "original StopUnknown must be preserved, never Applied: {settled}"
+    );
+    assert_eq!(fixture.json(&["show", &agent])["state"].as_str(), Some("stopped"));
+    let ended = fixture
+        .events()
+        .iter()
+        .filter(|event| {
+            event["kind"] == "session.ended"
+                && event["agent"] == agent
+                && event["generation"] == generation
+        })
+        .count();
+    assert_eq!(ended, 1, "exactly one session.ended commits for the stop");
+
+    // Host cleanup and shutdown replay nothing native.
+    let end_requests = requests_at(&fixture.root, "requests.jsonl");
+    assert_eq!(
+        count_requests(&end_requests, "POST", "/interrupt"),
+        mid_interrupts,
+        "host cleanup replayed a native interrupt"
+    );
+    assert_eq!(
+        count_requests(&end_requests, "GET", "/api/session/"),
+        mid_gets,
+        "host cleanup replayed a native GET"
+    );
+    assert_eq!(
+        count_requests(&end_requests, "DELETE", "/session/"),
+        0,
+        "host cleanup deleted the retained session"
+    );
+
+    // The owning plugin and generation Job are provably closed.
+    let processes = fixture.json(&[
+        "processes",
+        &agent,
+        "--generation",
+        &gen_arg,
+        "--limit",
+        "1000",
+    ]);
+    let processes = processes["processes"]
+        .as_array()
+        .expect("stopped generation process page");
+    assert!(!processes.is_empty(), "owned process evidence missing");
+    assert!(
+        processes.iter().all(|process| process["state"] == "exited"),
+        "owned family was not closed before cap release: {processes:?}"
+    );
+
+    // Release: the same rejected id now admits on the freed account scope.
+    let release_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let second = loop {
+        let reply = support::cli(&fixture.data, &blocked_args);
+        if reply.status.success() {
+            break serde_json::from_str::<eliot_core::Command>(&reply.stdout)
+                .expect("typed second launch");
+        }
+        assert_eq!(reply.status.code(), Some(3));
+        assert!(reply.stderr.contains("capacity_unavailable"));
+        assert!(std::time::Instant::now() < release_deadline, "capacity release deadline");
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert_eq!(second.id, blocked_id);
+    let second_agent = second.target.clone().expect("second agent");
+    let second_generation = second.generation.expect("second generation");
+    assert!(
+        fixture.events().iter().any(|event| {
+            event["kind"] == "capacity.released"
+                && event["agent"] == agent
+                && event["generation"] == generation
+        }),
+        "owned-exit proof must emit capacity.released"
+    );
+
+    // Ordinary cleanup keeps a normal stop on the applied path.
+    let second_stop_id = ulid::Ulid::new().to_string();
+    let second_gen_arg = second_generation.to_string();
+    let second_stop: eliot_core::api::CommandSubmitResponse =
+        serde_json::from_value(fixture.json(&[
+            "--id",
+            &second_stop_id,
+            "stop",
+            &second_agent,
+            "--generation",
+            &second_gen_arg,
+        ]))
+        .expect("typed second stop");
+    fixture.wait_command(&second_stop.command_id, "applied");
+    fixture.stop(false);
 }
 
 async fn scenario_invalid_profile_rejected_before_spawn(owned: OwnedChildren) {

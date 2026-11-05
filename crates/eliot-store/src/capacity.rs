@@ -476,8 +476,7 @@ pub(super) fn migrate_reservations_tx(tx: &Transaction<'_>) -> Result<()> {
             let reserved = if generation == 0 {
                 pending_launch_tx(tx, agent)?.then_some(1)
             } else if generation > 0 {
-                if has_terminal_session_tx(tx, agent, generation)?
-                    || has_physical_exit_tx(tx, agent, generation)?
+                if has_physical_exit_tx(tx, agent, generation)?
                     || has_rejected_dispatched_start_tx(tx, agent, generation)?
                 {
                     if pending_resume_tx(tx, agent, generation)? {
@@ -558,20 +557,6 @@ fn has_other_start_claim_tx(
              )
          )",
         params![agent, command_id, generation, previous],
-        |row| row.get(0),
-    )
-    .map_err(sql_error)
-}
-
-fn has_terminal_session_tx(tx: &Transaction<'_>, agent: i64, generation: i64) -> Result<bool> {
-    tx.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM events
-             WHERE agent = ?1 AND generation = ?2 AND family = 'session'
-               AND kind = 'session.ended'
-               AND source NOT IN ('daemon', 'os', 'git', 'workspace_process')
-         )",
-        params![agent, generation],
         |row| row.get(0),
     )
     .map_err(sql_error)
