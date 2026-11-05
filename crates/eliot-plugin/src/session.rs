@@ -797,7 +797,10 @@ impl StreamSource<'_> {
             Ok(_) => return Ok(()),
             Err(error) => error,
         };
-        if self.sink.is_unknown() {
+        if self
+            .sink
+            .is_unknown(self.agent_id, self.generation, "stream")
+        {
             *self.writes_blocked = true;
             *self.source_unknown = true;
             *self.failure = Some(format!(
