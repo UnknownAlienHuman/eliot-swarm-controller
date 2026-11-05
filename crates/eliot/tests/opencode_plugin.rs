@@ -85,8 +85,13 @@ async fn run_lifecycle_scenarios() {
     )
     .await;
     run_scenario(
-        "stop of a gone session applies",
-        scenario_stop_of_gone_session_applies,
+        "stop retains the session for resume (no DELETE)",
+        scenario_stop_retains_session_for_resume,
+    )
+    .await;
+    run_scenario(
+        "stop of a gone session is unknown",
+        scenario_stop_of_gone_session_is_unknown,
     )
     .await;
     run_scenario(
@@ -369,6 +374,7 @@ struct Script {
     assistant_text: Option<String>,
     error: Option<Value>,
     delete_status: u16,
+    readback_status: Option<u16>,
     drop_sse_on_prompt: bool,
     /// One ask bundle per prompt (1-based): `{permission?, form?}` emitted
     /// between the started and terminal envelopes of that prompt.
@@ -428,6 +434,7 @@ impl Script {
                 error => Some(error),
             },
             delete_status: get("delete_status").as_u64().unwrap_or(204) as u16,
+            readback_status: get("readback_status").as_u64().map(|code| code as u16),
             drop_sse_on_prompt: get("drop_sse_on_prompt").as_bool().unwrap_or(false),
             asks: get("asks").as_array().cloned().unwrap_or_default(),
             manual_terminal: get("manual_terminal").as_bool().unwrap_or(false),
@@ -878,6 +885,11 @@ async fn session_read_route(
     query: Option<&str>,
 ) -> Routed {
     if method == "GET" && tail.is_empty() {
+        if let Some(status) = fixture.script.readback_status
+            && status != 200
+        {
+            return Some(Some((status, not_found(id))));
+        }
         let sessions = fixture.sessions.lock().await;
         let session = sessions.get(id).expect("fixture session");
         let mut info = json!({
@@ -2713,8 +2725,8 @@ async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
     let committed = stop_agent(&mut scenario, 1, false).await;
     assert_eq!(kinds(&committed), ["session.ended"]);
 
-    // Exactly one prompt reached the server; stop closed the session
-    // (DELETE) and proved its absence (GET 404).
+    // Exactly one prompt reached the server; ordinary stop quiesced the
+    // session and proved it retained by readback without deleting it.
     let requests = scenario.requests();
     let prompts = requests
         .iter()
@@ -2728,7 +2740,8 @@ async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
         .count();
     assert_eq!(prompts, 1);
     let mut saw_delete = false;
-    let mut saw_get_after_delete = false;
+    let mut saw_interrupt = false;
+    let mut saw_get_after_interrupt = false;
     for entry in &requests {
         let method = entry
             .get("method")
@@ -2741,12 +2754,19 @@ async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
         if method == "DELETE" && path.starts_with("/api/session/") {
             saw_delete = true;
         }
-        if saw_delete && method == "GET" && path.starts_with("/api/session/") {
-            saw_get_after_delete = true;
+        if method == "POST" && path.ends_with("/interrupt") {
+            saw_interrupt = true;
+        }
+        if saw_interrupt && method == "GET" && path.starts_with("/api/session/") {
+            saw_get_after_interrupt = true;
         }
     }
-    assert!(saw_delete, "stop issues the native close");
-    assert!(saw_get_after_delete, "stop proves absence after the close");
+    assert!(!saw_delete, "ordinary stop does not DELETE the session");
+    assert!(saw_interrupt, "stop quiesces via native interrupt");
+    assert!(
+        saw_get_after_interrupt,
+        "stop proves session retention by readback after interrupt"
+    );
 
     let shutdown = scenario
         .host
@@ -2972,16 +2992,62 @@ async fn scenario_lost_prompt_reply_is_unknown_without_rewrite(owned: OwnedChild
     scenario.host.shutdown_child().await;
 }
 
-async fn scenario_stop_of_gone_session_applies(owned: OwnedChildren) {
+async fn scenario_stop_of_gone_session_is_unknown(owned: OwnedChildren) {
     let mut scenario = Scenario::start(
-        &script(json!({ "delete_status": 404 })),
+        &script(json!({ "readback_status": 404 })),
         opencode_profile(),
         owned,
     )
     .await;
-    let committed = stop_agent(&mut scenario, 1, false).await;
-    assert_eq!(kinds(&committed), ["session.ended"]);
-    scenario.host.call("shutdown", json!({})).await.unwrap();
+    let stop_id = ulid::Ulid::new().to_string();
+    let agent_id = scenario.agent_id.clone();
+    let (outcome, committed) = scenario
+        .host
+        .pump_call(
+            "agent.stop",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": stop_id,
+                "force": false,
+            }),
+            OP_TIMEOUT,
+            Quiesce::SilenceNow,
+        )
+        .await;
+    let error = outcome.expect_err("stop of a gone session must be unknown");
+    assert!(
+        error.contains("unknown"),
+        "expected unknown readback error, got: {error}"
+    );
+    assert!(committed.is_empty(), "unknown stop emits no session.ended");
+    let requests = scenario.requests();
+    assert_eq!(
+        count_requests(&requests, "DELETE", "/session/"),
+        0,
+        "zero DELETE on gone session stop"
+    );
+    assert!(
+        count_requests(&requests, "POST", "/interrupt") >= 1,
+        "stop quiesces before readback"
+    );
+    let (retry_outcome, retry_committed) = scenario
+        .host
+        .pump_call(
+            "agent.stop",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": stop_id,
+                "force": false,
+            }),
+            OP_TIMEOUT,
+            Quiesce::SilenceNow,
+        )
+        .await;
+    let retry_err = retry_outcome.expect_err("retry settles unknown");
+    assert!(retry_err.contains("unknown"), "retry: {retry_err}");
+    assert!(retry_committed.is_empty());
     scenario.host.shutdown_child().await;
 }
 
@@ -3387,7 +3453,8 @@ async fn scenario_resume_of_deleted_session_is_not_found(owned: OwnedChildren) {
     let (mut gen1, ready1) = pending.finish(rx).await;
     let (_, turn_id, _) = send_turn(&mut gen1, 1, "doomed work").await;
     let resume = resume_subject(&agent_id, &ready1, &turn_id);
-    // A clean stop deletes the native session: nothing remains to resume.
+    // Generation 1 stops cleanly, retaining its session. Generation 2
+    // starts against an unseeded store where that session is absent.
     stop_agent(&mut gen1, 1, false).await;
     gen1.host
         .call("shutdown", json!({}))
@@ -4346,4 +4413,111 @@ async fn scenario_request_details_commit_redacted(owned: OwnedChildren) {
         .await
         .expect("shutdown");
     scenario.host.shutdown_child().await;
+}
+
+async fn scenario_stop_retains_session_for_resume(owned: OwnedChildren) {
+    // Generation 1: launch and complete one turn, then ordinary stop.
+    let root: PathBuf = std::env::temp_dir().join(format!(
+        "eliot-opencode-stop-retain-{}",
+        ulid::Ulid::new().to_string().to_lowercase()
+    ));
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::create_dir_all(root.join("workspace")).unwrap();
+    let agent_id = ulid::Ulid::new().to_string();
+    let workspace = root.join("workspace").to_string_lossy().into_owned();
+    let (pending, rx) = Scenario::setup_start_in(
+        &root,
+        "instance",
+        "requests.jsonl",
+        "report.json",
+        &script(json!({})),
+        opencode_profile(),
+        agent_id.clone(),
+        1,
+        None,
+        None,
+        owned.clone(),
+    )
+    .await;
+    let (mut gen1, ready1) = pending.finish(rx).await;
+    let (_, turn_id, _) = send_turn(&mut gen1, 1, "retained work").await;
+    let retained_ref = ready1
+        .get("native_ref")
+        .and_then(Value::as_str)
+        .expect("retained ref")
+        .to_owned();
+    let retained_scope = ready1
+        .get("native_scope")
+        .and_then(Value::as_str)
+        .expect("retained scope")
+        .to_owned();
+    let home1 = report_at(&root, "report.json")["data_home"]
+        .as_str()
+        .expect("gen-1 data home")
+        .to_owned();
+    let resume = resume_subject(&agent_id, &ready1, &turn_id);
+    let committed = stop_agent(&mut gen1, 1, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    let req1 = requests_at(&root, "requests.jsonl");
+    assert_eq!(
+        count_requests(&req1, "DELETE", "/session/"),
+        0,
+        "ordinary stop must not DELETE the retained session"
+    );
+    assert!(
+        count_requests(&req1, "POST", "/interrupt") >= 1,
+        "stop quiesces via native interrupt"
+    );
+    gen1.host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    gen1.host.shutdown_child().await;
+    drop(gen1);
+    // Generation 2: resume against the persistent store reattaches the
+    // exact retained session identity across the stop.
+    let (pending, rx) = Scenario::setup_start_in(
+        &root,
+        "instance2",
+        "requests2.jsonl",
+        "report2.json",
+        &script(json!({
+            "seed_session": {
+                "id": retained_ref,
+                "model_id": "test-model",
+                "provider_id": "test-provider",
+                "directory": workspace,
+                "seq": 5,
+            }
+        })),
+        opencode_profile(),
+        agent_id.clone(),
+        2,
+        Some(resume),
+        None,
+        owned,
+    )
+    .await;
+    let (mut gen2, ready2) = pending.finish(rx).await;
+    assert_eq!(
+        ready2.get("native_ref").and_then(Value::as_str),
+        Some(retained_ref.as_str()),
+        "resume reattaches the exact session stop retained"
+    );
+    assert_eq!(
+        ready2.get("native_scope").and_then(Value::as_str),
+        Some(retained_scope.as_str())
+    );
+    let home2 = report_at(&root, "report2.json")["data_home"]
+        .as_str()
+        .expect("gen-2 data home")
+        .to_owned();
+    assert_eq!(home1, home2, "both generations serve the stable store");
+    let committed = stop_agent(&mut gen2, 2, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    gen2.host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    gen2.host.shutdown_child().await;
 }

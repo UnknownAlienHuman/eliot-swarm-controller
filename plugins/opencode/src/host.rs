@@ -739,8 +739,8 @@ impl OpenCodePlugin {
     }
 
     /// Resume read: the retained session must still exist under its exact
-    /// id. Proven absence is `not_found` (a stopped generation deleted it —
-    /// there is nothing to resume); anything ambiguous is `unknown`.
+    /// id. Proven absence is `not_found` (the retained session no longer exists
+    /// in the store — there is nothing to resume); anything ambiguous is `unknown`.
     async fn resume_read_retained(session: &AgentSession, native_ref: &str) -> Result<SessionInfo> {
         let deadline = Instant::now() + RPC_TIMEOUT;
         let absent = session
@@ -1969,34 +1969,41 @@ fn start_paths(
     Ok((workspace, program))
 }
 
-/// Stop proves the native session ended, then ends the owned server:
-/// `DELETE /api/session/{id}` (204 removed, 404 already gone) followed by
-/// a `GET` that must 404. Only the readback decides: proven absent
-/// applies, proven present never does, and an ambiguous readback is
-/// unknown.
+/// Stop quiesces the native session and ends the owned server while
+/// retaining the native session for resume. Ordinary stop never deletes
+/// the session; it quiesces any running execution with the same native
+/// interrupt the resume preflight uses, proves the exact session still
+/// exists by readback, then ends the owned server through generation
+/// process custody. Proven retained applies; proven absent or any
+/// ambiguous readback is unknown. Force ends the owned server without
+/// the quiesce wait and never touches another Agent.
 async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()> {
     let deadline = Instant::now() + RPC_TIMEOUT;
     let begin = session.events.begin_stop().await;
-    let mut removed = begin.is_ok();
-    if removed && let Some(session_id) = session.session_id.clone() {
-        // Only a proven end state ends the generation. The close write
-        // always goes out, but only the readback decides: proven absent
-        // applies, proven present never does, an ambiguous readback is
-        // unknown.
-        let _ = session.http.delete_session(&session_id, deadline).await;
-        let absent = session.http.session_absent(&session_id, deadline).await;
-        removed = match absent {
-            Ok(true) => true,
-            Ok(false) | Err(_) => false,
-        };
+    let mut retained = begin.is_ok();
+    if retained
+        && !force
+        && let Some(session_id) = session.session_id.clone()
+    {
+        if OpenCodePlugin::resume_quiesce(session, &session_id)
+            .await
+            .is_err()
+        {
+            retained = false;
+        } else {
+            match session.http.get_session(&session_id, deadline).await {
+                Ok(info) if info.id == session_id => {}
+                _ => retained = false,
+            }
+        }
     }
     let process_exit = session.server.terminate(force, deadline).await;
     let ended = session.events.end_stop().await;
-    if !removed || process_exit.is_err() || ended.is_err() {
+    if !retained || process_exit.is_err() || ended.is_err() {
         session.phase = SessionPhase::Unknown;
         return Err(Error::new(
             "unknown",
-            "OpenCode session close, server shutdown, or session.ended outcome is unknown",
+            "OpenCode session quiesce/retention, server shutdown, or session.ended outcome is unknown",
         ));
     }
     session.phase = SessionPhase::Stopped;
