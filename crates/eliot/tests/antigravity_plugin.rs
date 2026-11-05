@@ -1154,6 +1154,55 @@ async fn scenario_lost_result_unknown_no_rewrite() {
     let send_id = ulid::Ulid::new().to_string();
     let seq = scenario.host.next_seq;
     scenario.host.next_seq += 5;
+    let (rx, turn_id) = associate_lost_result_send(&mut scenario, &send_id, seq).await;
+    complete_lost_result_after_gap(&mut scenario, rx, &send_id, seq, &turn_id).await;
+    stop_and_shutdown_scenario(&mut scenario, 1).await;
+}
+
+async fn scenario_exit_with_held_stdout_is_unknown() {
+    let agent_id = "a102".to_owned();
+    let (pending, rx) =
+        setup_start("exit3-held-stdout", agent_id, 1, Value::Null, Value::Null).await;
+    let mut scenario = pending.finish(rx, None).await;
+    let _release_holder = ReleaseOnDrop(scenario.root.join("holder-release"));
+    let send_id = ulid::Ulid::new().to_string();
+    let seq = scenario.host.next_seq;
+    scenario.host.next_seq += 5;
+    let turn_id =
+        associate_held_stdout_send(&mut scenario, &send_id, seq, "held stdout prompt").await;
+
+    // The leader is still alive and waiting for this marker; no gap is valid yet.
+    let early =
+        tokio::time::timeout(Duration::from_millis(100), scenario.host.inbound.recv()).await;
+    assert!(
+        early.is_err(),
+        "source loss was reported before process exit"
+    );
+    std::fs::write(scenario.root.join("allow-leader-exit"), "exit").expect("release leader");
+
+    let exit_deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let exiting = wait_for_held_stdout_process_exit(&mut scenario, &send_id, exit_deadline).await;
+    assert_eq!(
+        exiting.get("state").and_then(Value::as_str),
+        Some("unknown")
+    );
+    assert_eq!(
+        exiting.get("source_unknown").and_then(Value::as_bool),
+        Some(false),
+        "stdout still has its bounded drain window"
+    );
+
+    assert_held_stdout_drain_fence(&mut scenario, seq).await;
+    complete_held_stdout_source_loss(&mut scenario, &send_id, seq, &turn_id).await;
+    release_held_stdout_child(&mut scenario).await;
+    stop_and_shutdown_scenario(&mut scenario, 1).await;
+}
+
+async fn associate_lost_result_send(
+    scenario: &mut Scenario,
+    send_id: &str,
+    seq: i64,
+) -> (CallRx, String) {
     let rx = scenario
         .host
         .begin_call(
@@ -1208,7 +1257,7 @@ async fn scenario_lost_result_unknown_no_rewrite() {
             .get("data")
             .and_then(|data| data.get("command_id"))
             .and_then(Value::as_str),
-        Some(send_id.as_str())
+        Some(send_id)
     );
     let turn_id = events[0]
         .get("data")
@@ -1230,6 +1279,16 @@ async fn scenario_lost_result_unknown_no_rewrite() {
             }),
         )
         .await;
+    (rx, turn_id)
+}
+
+async fn complete_lost_result_after_gap(
+    scenario: &mut Scenario,
+    rx: CallRx,
+    send_id: &str,
+    seq: i64,
+    turn_id: &str,
+) {
     let gap = scenario
         .host
         .next_request_for("source.gap after process exit (native step user_input)")
@@ -1247,9 +1306,9 @@ async fn scenario_lost_result_unknown_no_rewrite() {
     );
     assert_eq!(
         applied.get("turn_id").and_then(Value::as_str),
-        Some(turn_id.as_str())
+        Some(turn_id)
     );
-    let snap = snapshot(&mut scenario.host, &scenario.agent_id, 1, &send_id).await;
+    let snap = snapshot(&mut scenario.host, &scenario.agent_id, 1, send_id).await;
     assert_eq!(
         snap.get("source_unknown").and_then(Value::as_bool),
         Some(true)
@@ -1283,31 +1342,21 @@ async fn scenario_lost_result_unknown_no_rewrite() {
     assert_eq!(fake_report(&scenario.root)["input_count"], json!(1));
     // The idle metadata was present and the lost-result behavior is unchanged.
     assert_eq!(fake_report(&scenario.root)["system_messages"], json!(1));
-    stop_clean(&mut scenario.host, &scenario.agent_id, 1).await;
-    scenario
-        .host
-        .call("shutdown", json!({}))
-        .await
-        .expect("shutdown");
-    scenario.host.shutdown_child().await;
 }
 
-async fn scenario_exit_with_held_stdout_is_unknown() {
-    let agent_id = "a102".to_owned();
-    let (pending, rx) =
-        setup_start("exit3-held-stdout", agent_id, 1, Value::Null, Value::Null).await;
-    let mut scenario = pending.finish(rx, None).await;
-    let _release_holder = ReleaseOnDrop(scenario.root.join("holder-release"));
-    let send_id = ulid::Ulid::new().to_string();
-    let seq = scenario.host.next_seq;
-    scenario.host.next_seq += 5;
+async fn associate_held_stdout_send(
+    scenario: &mut Scenario,
+    send_id: &str,
+    seq: i64,
+    prompt: &str,
+) -> String {
     let rx = scenario
         .host
         .begin_call(
             "agent.command",
             json!({"agent_id": scenario.agent_id, "generation": 1,
                 "command_id": send_id, "verb": "send",
-                "args": {"text": "held stdout prompt"}, "turn_id": null, "request_id": null,
+                "args": {"text": prompt}, "turn_id": null, "request_id": null,
                 "dispatch_seq": seq}),
         )
         .await;
@@ -1343,20 +1392,16 @@ async fn scenario_exit_with_held_stdout_is_unknown() {
         applied.get("state").and_then(Value::as_str),
         Some("applied")
     );
-    let turn_id = turn_id.expect("committed turn id");
+    turn_id.expect("committed turn id")
+}
 
-    // The leader is still alive and waiting for this marker; no gap is valid yet.
-    let early =
-        tokio::time::timeout(Duration::from_millis(100), scenario.host.inbound.recv()).await;
-    assert!(
-        early.is_err(),
-        "source loss was reported before process exit"
-    );
-    std::fs::write(scenario.root.join("allow-leader-exit"), "exit").expect("release leader");
-
-    let exit_deadline = std::time::Instant::now() + Duration::from_millis(500);
-    let exiting = loop {
-        let snapshot = snapshot(&mut scenario.host, &scenario.agent_id, 1, &send_id).await;
+async fn wait_for_held_stdout_process_exit(
+    scenario: &mut Scenario,
+    send_id: &str,
+    exit_deadline: std::time::Instant,
+) -> Value {
+    loop {
+        let snapshot = snapshot(&mut scenario.host, &scenario.agent_id, 1, send_id).await;
         if snapshot.get("process_exited").and_then(Value::as_bool) == Some(true) {
             break snapshot;
         }
@@ -1365,17 +1410,10 @@ async fn scenario_exit_with_held_stdout_is_unknown() {
             "owned process exit observation deadline"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
-    };
-    assert_eq!(
-        exiting.get("state").and_then(Value::as_str),
-        Some("unknown")
-    );
-    assert_eq!(
-        exiting.get("source_unknown").and_then(Value::as_bool),
-        Some(false),
-        "stdout still has its bounded drain window"
-    );
+    }
+}
 
+async fn assert_held_stdout_drain_fence(scenario: &mut Scenario, seq: i64) {
     let during_drain = scenario
         .host
         .call(
@@ -1397,7 +1435,14 @@ async fn scenario_exit_with_held_stdout_is_unknown() {
         no_gap_yet.is_err(),
         "source gap preceded the drain deadline"
     );
+}
 
+async fn complete_held_stdout_source_loss(
+    scenario: &mut Scenario,
+    send_id: &str,
+    seq: i64,
+    turn_id: &str,
+) {
     let gap = tokio::time::timeout(Duration::from_secs(5), scenario.host.inbound.recv())
         .await
         .expect("bounded process-exit drain")
@@ -1405,7 +1450,7 @@ async fn scenario_exit_with_held_stdout_is_unknown() {
     assert_eq!(gap.method, "source.gap");
     answer_source_gap(&mut scenario.host, &gap).await;
 
-    let snap = snapshot(&mut scenario.host, &scenario.agent_id, 1, &send_id).await;
+    let snap = snapshot(&mut scenario.host, &scenario.agent_id, 1, send_id).await;
     assert_eq!(snap.get("state").and_then(Value::as_str), Some("unknown"));
     assert_eq!(
         snap.get("source_unknown").and_then(Value::as_bool),
@@ -1426,7 +1471,7 @@ async fn scenario_exit_with_held_stdout_is_unknown() {
     assert_eq!(snap.get("last_turn"), Some(&Value::Null));
     assert_eq!(
         snap.get("active_turn").and_then(Value::as_str),
-        Some(turn_id.as_str())
+        Some(turn_id)
     );
 
     // Replaying the retained command returns its known association without a second write.
@@ -1460,7 +1505,9 @@ async fn scenario_exit_with_held_stdout_is_unknown() {
         .expect_err("lost source blocks a new input");
     assert_eq!(rejected, "unknown");
     assert_eq!(fake_report(&scenario.root)["input_count"], json!(1));
+}
 
+async fn release_held_stdout_child(scenario: &mut Scenario) {
     let holder_pid =
         std::fs::read_to_string(scenario.root.join("holder.pid")).expect("exact helper pid marker");
     assert!(holder_pid.trim().parse::<u32>().is_ok());
@@ -1472,8 +1519,10 @@ async fn scenario_exit_with_held_stdout_is_unknown() {
     })
     .await
     .expect("owned test descendant cleanup");
+}
 
-    stop_clean(&mut scenario.host, &scenario.agent_id, 1).await;
+async fn stop_and_shutdown_scenario(scenario: &mut Scenario, generation: i64) {
+    stop_clean(&mut scenario.host, &scenario.agent_id, generation).await;
     scenario
         .host
         .call("shutdown", json!({}))
