@@ -678,15 +678,13 @@ fn approval_reply_args(
     if let Some(source) = feedback {
         args.insert(
             "feedback".to_owned(),
-            Value::String(
-                render_text(
-                    source,
-                    roots,
-                    MAX_EVENT_BYTES,
-                    verb,
-                    "64 KiB persisted-text bound",
-                )?,
-            ),
+            Value::String(render_text(
+                source,
+                roots,
+                MAX_EVENT_BYTES,
+                verb,
+                "64 KiB persisted-text bound",
+            )?),
         );
     }
     Ok(Some(Value::Object(args)))
