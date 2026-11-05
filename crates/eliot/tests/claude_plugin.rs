@@ -19,6 +19,7 @@
 //! report; on success the plugin's own reaped exit wait plus the shutdown
 //! assertions prove both children died.
 
+#[allow(dead_code)]
 mod support;
 
 use serde_json::{Value, json};
