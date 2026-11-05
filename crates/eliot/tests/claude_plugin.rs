@@ -47,248 +47,264 @@ fn main() {
         .build()
         .expect("test runtime");
     runtime.block_on(async {
-        run_scenario(
-            "launch/send/snapshot/stop",
-            OwnedChildren::default(),
-            scenario_launch_send_snapshot_stop,
-        )
-        .await;
-        run_scenario(
-            "two assistant messages: snapshot matches the stream fold",
-            OwnedChildren::default(),
-            scenario_two_assistant_messages_snapshot_matches_stream,
-        )
-        .await;
-        run_scenario(
-            "failed turn reports its terminal reason",
-            OwnedChildren::default(),
-            scenario_failed_turn_reports_terminal_reason,
-        )
-        .await;
-        run_scenario(
-            "terminal reason is redacted",
-            OwnedChildren::default(),
-            scenario_terminal_reason_is_redacted,
-        )
-        .await;
-        run_scenario(
-            "cancelled input is rejected without a second write",
-            OwnedChildren::default(),
-            scenario_cancelled_input_is_rejected_without_rewrite,
-        )
-        .await;
-        run_scenario(
-            "cancelled active turn reaches a terminal state",
-            OwnedChildren::default(),
-            scenario_cancelled_active_turn_reaches_terminal,
-        )
-        .await;
-        run_scenario(
-            "dropped input is unknown without a second write",
-            OwnedChildren::default(),
-            scenario_dropped_input_is_unknown_without_rewrite,
-        )
-        .await;
-        run_scenario(
-            "rejected oversized send does not wedge the session",
-            OwnedChildren::default(),
-            scenario_rejected_send_does_not_wedge_session,
-        )
-        .await;
-        run_scenario(
-            "interrupt applied once, then stale_turn",
-            OwnedChildren::default(),
-            scenario_interrupt_applied_then_stale,
-        )
-        .await;
-        run_scenario(
-            "interrupt reports a non-empty still_queued",
-            OwnedChildren::default(),
-            scenario_interrupt_reports_nonempty_still_queued,
-        )
-        .await;
-        run_scenario(
-            "unknown model is rejected before session.ready",
-            OwnedChildren::default(),
-            scenario_model_not_in_catalogue_rejected_before_ready,
-        )
-        .await;
-        run_scenario(
-            "late trailing record still rejects with known exit and drain",
-            OwnedChildren::default(),
-            scenario_late_trailing_record_rejects_with_known_drain,
-        )
-        .await;
-        run_scenario(
-            "poisoned drain keeps unknown with the controller retained",
-            OwnedChildren::default(),
-            scenario_poisoned_drain_keeps_unknown_controller,
-        )
-        .await;
-        run_scenario(
-            "a logged-out CLI logs in through its own login, then launches",
-            OwnedChildren::default(),
-            scenario_logged_out_cli_logs_in_then_launches,
-        )
-        .await;
-        run_scenario(
-            "an abandoned CLI login rejects the start before any session",
-            OwnedChildren::default(),
-            scenario_abandoned_login_rejects_start,
-        )
-        .await;
-        run_scenario(
-            "session mismatch is unknown with an explicit gap",
-            OwnedChildren::default(),
-            scenario_session_mismatch_is_unknown_with_gap,
-        )
-        .await;
-        run_scenario(
-            "non-idle initialize is rejected before session.ready",
-            OwnedChildren::default(),
-            scenario_not_idle_rejected_before_ready,
-        )
-        .await;
-        run_scenario(
-            "invalid profile rejected before spawn",
-            OwnedChildren::default(),
-            scenario_invalid_profile_rejected_before_spawn,
-        )
-        .await;
-        run_scenario(
-            "resume realigns drifted settings and sends without a resend",
-            OwnedChildren::default(),
-            scenario_resume_realigns_drifted_settings_and_sends,
-        )
-        .await;
-        run_scenario(
-            "resume without drift skips the permission setter",
-            OwnedChildren::default(),
-            scenario_resume_without_drift_skips_permission_setter,
-        )
-        .await;
-        run_scenario(
-            "foreign resume scope rejected before spawn",
-            OwnedChildren::default(),
-            scenario_resume_scope_mismatch_rejected_before_spawn,
-        )
-        .await;
-        run_scenario(
-            "manual permission mode quirk reported as requested vs effective",
-            OwnedChildren::default(),
-            scenario_permission_mode_quirk_reported,
-        )
-        .await;
-        run_scenario(
-            "approve allows with the echoed input",
-            OwnedChildren::default(),
-            scenario_approve_allows_with_echoed_input,
-        )
-        .await;
-        run_scenario(
-            "approve redacts tool input secrets in committed details",
-            OwnedChildren::default(),
-            scenario_approve_redacts_tool_input_secrets,
-        )
-        .await;
-        run_scenario(
-            "deny denies with a message",
-            OwnedChildren::default(),
-            scenario_deny_denies_with_message,
-        )
-        .await;
-        run_scenario(
-            "reply guards reject without a rewrite",
-            OwnedChildren::default(),
-            scenario_reply_guards_reject_without_rewrite,
-        )
-        .await;
-        run_scenario(
-            "unreplied request closes with the turn",
-            OwnedChildren::default(),
-            scenario_unreplied_request_closes_with_the_turn,
-        )
-        .await;
-        run_scenario(
-            "lost reply is unknown without a rewrite",
-            OwnedChildren::default(),
-            scenario_lost_reply_is_unknown_without_rewrite,
-        )
-        .await;
-        run_scenario(
-            "refused initialize is unknown without a rewrite",
-            OwnedChildren::default(),
-            scenario_initialize_error_is_unknown_without_rewrite,
-        )
-        .await;
-        run_scenario(
-            "setter echo mismatch is unknown",
-            OwnedChildren::default(),
-            scenario_setter_echo_mismatch_is_unknown,
-        )
-        .await;
-        run_scenario(
-            "missing retained session is unknown",
-            OwnedChildren::default(),
-            scenario_retained_session_missing_is_unknown,
-        )
-        .await;
-        run_scenario(
-            "stale-generation resume is rejected before spawn",
-            OwnedChildren::default(),
-            scenario_stale_generation_resume_rejected_before_spawn,
-        )
-        .await;
-        run_scenario(
-            "late old-generation frames gap without applying",
-            OwnedChildren::default(),
-            scenario_late_old_generation_frames_gap_without_applying,
-        )
-        .await;
-        run_scenario(
-            "stray permission ask gets an explicit deny",
-            OwnedChildren::default(),
-            scenario_stray_permission_ask_gets_explicit_deny,
-        )
-        .await;
-        run_scenario(
-            "duplicate permission id denied and original fenced",
-            OwnedChildren::default(),
-            scenario_duplicate_permission_id_denied_and_original_fenced,
-        )
-        .await;
-        run_scenario(
-            "pending overflow denied without opening",
-            OwnedChildren::default(),
-            scenario_pending_overflow_denied_without_opening,
-        )
-        .await;
-        run_scenario(
-            "repeated dropped id never rewritten nor retried",
-            OwnedChildren::default(),
-            scenario_repeated_dropped_id_never_rewritten_nor_retried,
-        )
-        .await;
-        run_scenario(
-            "permission identity exhaustion fences and closes the native input",
-            OwnedChildren::default(),
-            scenario_permission_identity_exhaustion_fails_closed,
-        )
-        .await;
-        run_scenario(
-            "unknown owner reply never denies a conflicting callback again",
-            OwnedChildren::default(),
-            scenario_unknown_owner_reply_conflict_no_second_io,
-        )
-        .await;
-        run_scenario(
-            "turn result never clears a live callback fence",
-            OwnedChildren::default(),
-            scenario_callback_fence_survives_turn_result,
-        )
-        .await;
+        run_lifecycle_output_scenarios().await;
+        run_startup_recovery_scenarios().await;
+        run_permission_decisions_scenarios().await;
+        run_reply_transport_uncertainty_scenarios().await;
     });
     println!("claude_plugin: all scenarios passed");
+}
+
+async fn run_lifecycle_output_scenarios() {
+    run_scenario(
+        "launch/send/snapshot/stop",
+        OwnedChildren::default(),
+        scenario_launch_send_snapshot_stop,
+    )
+    .await;
+    run_scenario(
+        "two assistant messages: snapshot matches the stream fold",
+        OwnedChildren::default(),
+        scenario_two_assistant_messages_snapshot_matches_stream,
+    )
+    .await;
+    run_scenario(
+        "failed turn reports its terminal reason",
+        OwnedChildren::default(),
+        scenario_failed_turn_reports_terminal_reason,
+    )
+    .await;
+    run_scenario(
+        "terminal reason is redacted",
+        OwnedChildren::default(),
+        scenario_terminal_reason_is_redacted,
+    )
+    .await;
+    run_scenario(
+        "cancelled input is rejected without a second write",
+        OwnedChildren::default(),
+        scenario_cancelled_input_is_rejected_without_rewrite,
+    )
+    .await;
+    run_scenario(
+        "cancelled active turn reaches a terminal state",
+        OwnedChildren::default(),
+        scenario_cancelled_active_turn_reaches_terminal,
+    )
+    .await;
+    run_scenario(
+        "dropped input is unknown without a second write",
+        OwnedChildren::default(),
+        scenario_dropped_input_is_unknown_without_rewrite,
+    )
+    .await;
+    run_scenario(
+        "rejected oversized send does not wedge the session",
+        OwnedChildren::default(),
+        scenario_rejected_send_does_not_wedge_session,
+    )
+    .await;
+    run_scenario(
+        "interrupt applied once, then stale_turn",
+        OwnedChildren::default(),
+        scenario_interrupt_applied_then_stale,
+    )
+    .await;
+    run_scenario(
+        "interrupt reports a non-empty still_queued",
+        OwnedChildren::default(),
+        scenario_interrupt_reports_nonempty_still_queued,
+    )
+    .await;
+}
+
+async fn run_startup_recovery_scenarios() {
+    run_scenario(
+        "unknown model is rejected before session.ready",
+        OwnedChildren::default(),
+        scenario_model_not_in_catalogue_rejected_before_ready,
+    )
+    .await;
+    run_scenario(
+        "late trailing record still rejects with known exit and drain",
+        OwnedChildren::default(),
+        scenario_late_trailing_record_rejects_with_known_drain,
+    )
+    .await;
+    run_scenario(
+        "poisoned drain keeps unknown with the controller retained",
+        OwnedChildren::default(),
+        scenario_poisoned_drain_keeps_unknown_controller,
+    )
+    .await;
+    run_scenario(
+        "a logged-out CLI logs in through its own login, then launches",
+        OwnedChildren::default(),
+        scenario_logged_out_cli_logs_in_then_launches,
+    )
+    .await;
+    run_scenario(
+        "an abandoned CLI login rejects the start before any session",
+        OwnedChildren::default(),
+        scenario_abandoned_login_rejects_start,
+    )
+    .await;
+    run_scenario(
+        "session mismatch is unknown with an explicit gap",
+        OwnedChildren::default(),
+        scenario_session_mismatch_is_unknown_with_gap,
+    )
+    .await;
+    run_scenario(
+        "non-idle initialize is rejected before session.ready",
+        OwnedChildren::default(),
+        scenario_not_idle_rejected_before_ready,
+    )
+    .await;
+    run_scenario(
+        "invalid profile rejected before spawn",
+        OwnedChildren::default(),
+        scenario_invalid_profile_rejected_before_spawn,
+    )
+    .await;
+    run_scenario(
+        "resume realigns drifted settings and sends without a resend",
+        OwnedChildren::default(),
+        scenario_resume_realigns_drifted_settings_and_sends,
+    )
+    .await;
+    run_scenario(
+        "resume without drift skips the permission setter",
+        OwnedChildren::default(),
+        scenario_resume_without_drift_skips_permission_setter,
+    )
+    .await;
+    run_scenario(
+        "foreign resume scope rejected before spawn",
+        OwnedChildren::default(),
+        scenario_resume_scope_mismatch_rejected_before_spawn,
+    )
+    .await;
+}
+
+async fn run_permission_decisions_scenarios() {
+    run_scenario(
+        "manual permission mode quirk reported as requested vs effective",
+        OwnedChildren::default(),
+        scenario_permission_mode_quirk_reported,
+    )
+    .await;
+    run_scenario(
+        "approve allows with the echoed input",
+        OwnedChildren::default(),
+        scenario_approve_allows_with_echoed_input,
+    )
+    .await;
+    run_scenario(
+        "approve redacts tool input secrets in committed details",
+        OwnedChildren::default(),
+        scenario_approve_redacts_tool_input_secrets,
+    )
+    .await;
+    run_scenario(
+        "deny denies with a message",
+        OwnedChildren::default(),
+        scenario_deny_denies_with_message,
+    )
+    .await;
+}
+
+async fn run_reply_transport_uncertainty_scenarios() {
+    run_scenario(
+        "reply guards reject without a rewrite",
+        OwnedChildren::default(),
+        scenario_reply_guards_reject_without_rewrite,
+    )
+    .await;
+    run_scenario(
+        "unreplied request closes with the turn",
+        OwnedChildren::default(),
+        scenario_unreplied_request_closes_with_the_turn,
+    )
+    .await;
+    run_scenario(
+        "lost reply is unknown without a rewrite",
+        OwnedChildren::default(),
+        scenario_lost_reply_is_unknown_without_rewrite,
+    )
+    .await;
+    run_scenario(
+        "refused initialize is unknown without a rewrite",
+        OwnedChildren::default(),
+        scenario_initialize_error_is_unknown_without_rewrite,
+    )
+    .await;
+    run_scenario(
+        "setter echo mismatch is unknown",
+        OwnedChildren::default(),
+        scenario_setter_echo_mismatch_is_unknown,
+    )
+    .await;
+    run_scenario(
+        "missing retained session is unknown",
+        OwnedChildren::default(),
+        scenario_retained_session_missing_is_unknown,
+    )
+    .await;
+    run_scenario(
+        "stale-generation resume is rejected before spawn",
+        OwnedChildren::default(),
+        scenario_stale_generation_resume_rejected_before_spawn,
+    )
+    .await;
+    run_scenario(
+        "late old-generation frames gap without applying",
+        OwnedChildren::default(),
+        scenario_late_old_generation_frames_gap_without_applying,
+    )
+    .await;
+    run_scenario(
+        "stray permission ask gets an explicit deny",
+        OwnedChildren::default(),
+        scenario_stray_permission_ask_gets_explicit_deny,
+    )
+    .await;
+    run_scenario(
+        "duplicate permission id denied and original fenced",
+        OwnedChildren::default(),
+        scenario_duplicate_permission_id_denied_and_original_fenced,
+    )
+    .await;
+    run_scenario(
+        "pending overflow denied without opening",
+        OwnedChildren::default(),
+        scenario_pending_overflow_denied_without_opening,
+    )
+    .await;
+    run_scenario(
+        "repeated dropped id never rewritten nor retried",
+        OwnedChildren::default(),
+        scenario_repeated_dropped_id_never_rewritten_nor_retried,
+    )
+    .await;
+    run_scenario(
+        "permission identity exhaustion fences and closes the native input",
+        OwnedChildren::default(),
+        scenario_permission_identity_exhaustion_fails_closed,
+    )
+    .await;
+    run_scenario(
+        "unknown owner reply never denies a conflicting callback again",
+        OwnedChildren::default(),
+        scenario_unknown_owner_reply_conflict_no_second_io,
+    )
+    .await;
+    run_scenario(
+        "turn result never clears a live callback fence",
+        OwnedChildren::default(),
+        scenario_callback_fence_survives_turn_result,
+    )
+    .await;
 }
 
 /// Run one scenario under the hard per-scenario timeout. On success the
