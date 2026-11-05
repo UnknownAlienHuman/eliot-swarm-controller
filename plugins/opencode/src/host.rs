@@ -731,24 +731,27 @@ impl OpenCodePlugin {
             .await;
             return Err(self.retain_failed_start(&parsed.params, error));
         }
-        let retained = match Self::resume_read_retained(&session, &resume.native_ref).await {
-            Ok(retained) => retained,
-            Err(error) => return Err(self.fail_resume(&parsed, session, error).await),
-        };
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        let retained =
+            match Self::resume_read_retained(&session, &resume.native_ref, deadline).await {
+                Ok(retained) => retained,
+                Err(error) => return Err(self.fail_resume(&parsed, session, error).await),
+            };
         session.session_id = Some(retained.id.clone());
-        if let Err(error) = Self::resume_quiesce(&session, &retained.id).await {
+        if let Err(error) = Self::resume_quiesce(&session, &retained.id, deadline).await {
             return Err(self.stash_resume_unknown(session, error.message).await);
         }
-        if let Err(error) = Self::resume_verify_idle(&session, &retained.id).await {
+        if let Err(error) = Self::resume_verify_idle(&session, &retained.id, deadline).await {
             return Err(self.stash_resume_unknown(session, error.message).await);
         }
-        let effective = match Self::resume_configure(&parsed, &session, &retained.id).await {
-            Ok(effective) => effective,
-            Err(error) if error.code == "unknown" => {
-                return Err(self.stash_resume_unknown(session, error.message).await);
-            }
-            Err(error) => return Err(self.fail_resume(&parsed, session, error).await),
-        };
+        let effective =
+            match Self::resume_configure(&parsed, &session, &retained.id, deadline).await {
+                Ok(effective) => effective,
+                Err(error) if error.code == "unknown" => {
+                    return Err(self.stash_resume_unknown(session, error.message).await);
+                }
+                Err(error) => return Err(self.fail_resume(&parsed, session, error).await),
+            };
         if let Err(error) = session
             .events
             .resume_ready(
@@ -782,8 +785,11 @@ impl OpenCodePlugin {
     /// Resume read: the retained session must still exist under its exact
     /// id. Proven absence is `not_found` (the retained session no longer exists
     /// in the store — there is nothing to resume); anything ambiguous is `unknown`.
-    async fn resume_read_retained(session: &AgentSession, native_ref: &str) -> Result<SessionInfo> {
-        let deadline = Instant::now() + RPC_TIMEOUT;
+    async fn resume_read_retained(
+        session: &AgentSession,
+        native_ref: &str,
+        deadline: Instant,
+    ) -> Result<SessionInfo> {
         let absent = session
             .http
             .session_absent(native_ref, deadline)
@@ -831,12 +837,12 @@ impl OpenCodePlugin {
     /// leg poll; anything else refuses the resume as unknown. The native
     /// idle proof is this interrupt plus the empty inbox/permission/form
     /// lists, not served history.
-    async fn resume_quiesce(session: &AgentSession, session_id: &str) -> Result<()> {
-        let interrupted = match session
-            .http
-            .interrupt(session_id, Instant::now() + RPC_TIMEOUT)
-            .await
-        {
+    async fn resume_quiesce(
+        session: &AgentSession,
+        session_id: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        let interrupted = match session.http.interrupt(session_id, deadline).await {
             Ok(interrupted) => interrupted,
             Err(outcome) => {
                 let reason = match outcome {
@@ -856,14 +862,10 @@ impl OpenCodePlugin {
         }
         for _ in 0..RESUME_DRAIN_ROUNDS {
             tokio::time::sleep(RESUME_DRAIN_BEAT).await;
-            if !Self::resume_legs_quiet(session, session_id).await? {
+            if !Self::resume_legs_quiet(session, session_id, deadline).await? {
                 continue;
             }
-            match session
-                .http
-                .interrupt(session_id, Instant::now() + RPC_TIMEOUT)
-                .await
-            {
+            match session.http.interrupt(session_id, deadline).await {
                 Ok(false) => return Ok(()),
                 Ok(true) => continue,
                 Err(outcome) => {
@@ -889,8 +891,13 @@ impl OpenCodePlugin {
     /// Resume idle legs: the inbox, permission and form lists must all be
     /// empty. Anything pending means a retained execution that this
     /// generation must not adopt.
-    async fn resume_verify_idle(session: &AgentSession, session_id: &str) -> Result<()> {
-        let (inbox, permissions, forms) = Self::resume_leg_counts(session, session_id).await?;
+    async fn resume_verify_idle(
+        session: &AgentSession,
+        session_id: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        let (inbox, permissions, forms) =
+            Self::resume_leg_counts(session, session_id, deadline).await?;
         if inbox > 0 {
             return Err(Error::new(
                 "unknown",
@@ -913,8 +920,13 @@ impl OpenCodePlugin {
     }
 
     /// Await-helper for the quiesce drain: all three legs quiet.
-    async fn resume_legs_quiet(session: &AgentSession, session_id: &str) -> Result<bool> {
-        let (inbox, permissions, forms) = Self::resume_leg_counts(session, session_id).await?;
+    async fn resume_legs_quiet(
+        session: &AgentSession,
+        session_id: &str,
+        deadline: Instant,
+    ) -> Result<bool> {
+        let (inbox, permissions, forms) =
+            Self::resume_leg_counts(session, session_id, deadline).await?;
         Ok(inbox == 0 && permissions == 0 && forms == 0)
     }
 
@@ -923,8 +935,8 @@ impl OpenCodePlugin {
     async fn resume_leg_counts(
         session: &AgentSession,
         session_id: &str,
+        deadline: Instant,
     ) -> Result<(usize, usize, usize)> {
-        let deadline = Instant::now() + RPC_TIMEOUT;
         let inbox = session
             .http
             .list_inbox(session_id, deadline)
@@ -975,8 +987,8 @@ impl OpenCodePlugin {
         parsed: &ParsedStart,
         session: &AgentSession,
         session_id: &str,
+        deadline: Instant,
     ) -> Result<Value> {
-        let deadline = Instant::now() + RPC_TIMEOUT;
         let current = session
             .http
             .get_session(session_id, deadline)
@@ -2044,7 +2056,7 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
     } else {
         let _ = note_stage(&mut stage, StopStage::Quiesce);
         if !force && let Some(session_id) = session.session_id.clone() {
-            if OpenCodePlugin::resume_quiesce(session, &session_id)
+            if OpenCodePlugin::resume_quiesce(session, &session_id, deadline)
                 .await
                 .is_err()
             {
