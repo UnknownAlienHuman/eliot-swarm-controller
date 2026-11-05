@@ -25,11 +25,12 @@ The native process emits `init` before input. The adapter uses
 then commit `session.ready` before accepting a separate send. Resume must retain the
 exact conversation id and sends no input by itself.
 
-A `step_update` with `step_type = "system_message"` is bookkeeping metadata, including
-when idle or resuming. Validate its conversation before handling it, and handle it
-before input association. It does not acknowledge input, create a turn, append assistant
-text or complete a turn. Unknown step types still produce an explicit gap with bounded,
-redacted structural diagnostics.
+A `step_update` with `step_type = "system_message"` or a no-content `checkpoint`
+is bookkeeping metadata, including when idle, resuming, or mid-turn. Validate its
+conversation before handling it, and handle it without input association. It does
+not acknowledge input, create a turn, append assistant text or complete a turn.
+Any unproved semantic payload or unknown step type still produces an explicit gap
+with bounded, redacted structural diagnostics.
 
 ## Native mapping
 

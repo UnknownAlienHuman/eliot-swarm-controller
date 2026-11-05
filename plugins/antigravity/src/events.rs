@@ -207,6 +207,12 @@ impl State {
         if step.step_type == "system_message" {
             return Ok(());
         }
+        if step.step_type == "checkpoint" {
+            if step.tool_name.is_some() || step.tool_info.is_some() {
+                return Err(self.unsupported_step_error(&step));
+            }
+            return Ok(());
+        }
         match step.step_type.as_str() {
             "user_input" | "agent_response" => {
                 self.associate().await?;
@@ -495,6 +501,63 @@ mod tests {
         };
         state.step(step).await.expect("system message ignored");
         assert!(state.pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_metadata_recognized_without_associating() {
+        let mut state = test_state();
+        let step = StepUpdate {
+            conversation_id: "conv-1".to_owned(),
+            step_index: 292,
+            state: "DONE".to_owned(),
+            step_type: "checkpoint".to_owned(),
+            tool_name: None,
+            tool_info: None,
+        };
+        state
+            .step(step)
+            .await
+            .expect("checkpoint recognized as metadata");
+        assert!(state.pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_with_unexpected_payload_rejects() {
+        let mut state = test_state();
+        let step = StepUpdate {
+            conversation_id: "conv-1".to_owned(),
+            step_index: 292,
+            state: "DONE".to_owned(),
+            step_type: "checkpoint".to_owned(),
+            tool_name: Some("unexpected_tool".to_owned()),
+            tool_info: None,
+        };
+        let error = state
+            .step(step)
+            .await
+            .expect_err("checkpoint with semantic tool payload must reject");
+        assert_eq!(error.code, "native_protocol");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_during_turn_preserves_association_state() {
+        let mut state = test_state();
+        let _reply_rx = state
+            .prepare("cmd-1".to_owned(), "turn-1".to_owned())
+            .expect("prepared input");
+        let step = StepUpdate {
+            conversation_id: "conv-1".to_owned(),
+            step_index: 292,
+            state: "DONE".to_owned(),
+            step_type: "checkpoint".to_owned(),
+            tool_name: None,
+            tool_info: None,
+        };
+        state
+            .step(step)
+            .await
+            .expect("checkpoint recognized during turn");
+        assert!(!state.pending.as_ref().unwrap().associated);
     }
 
     #[tokio::test]

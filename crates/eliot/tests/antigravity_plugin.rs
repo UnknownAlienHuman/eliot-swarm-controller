@@ -12,9 +12,9 @@
 //! `event:init/step_update/result`, `result.response` is final, cumulative
 //! usage replaces, and there is no native turn id so only one input is
 //! outstanding. No approval/interrupt semantics are invented. The fixture also
-//! emits the captured idle/resumed `system_message` bookkeeping step with its
-//! recorded structural fields only; the plugin treats it as known metadata
-//! that neither associates input nor produces text or a terminal.
+//! emits captured `system_message` and `checkpoint` bookkeeping steps with their
+//! recorded structural fields only; the plugin treats them as known metadata
+//! that neither associate input nor produce text or a terminal.
 
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -48,6 +48,10 @@ fn main() {
         println!("ok - EOF stop and resume without replaying old prompt");
         scenario_lost_result_unknown_no_rewrite().await;
         println!("ok - lost result is unknown without a second write");
+        scenario_checkpoint_frame_no_gap().await;
+        println!("ok - captured checkpoint among actual turn frames, valid final result, no gap");
+        scenario_unknown_step_causes_gap().await;
+        println!("ok - unknown step type still produces explicit gap");
         scenario_command_history_tracking().await;
         println!(
             "ok - command history tracking: monotonic seq, constant memory, conflicts and eviction"
@@ -151,6 +155,22 @@ fn fake_agy_main(script: &str) {
                  "state":"DONE","step_type":step_type}});
             step_index += 1;
             writeln!(stdout, "{}", step).expect("fixture step");
+        }
+        if script == "checkpoint" {
+            // Captured native checkpoint record among actual turn frames.
+            let chk = json!({"event":"step_update","step_update":
+                {"conversation_id":conv,"step_index":step_index,
+                 "state":"DONE","step_type":"checkpoint"}});
+            step_index += 1;
+            writeln!(stdout, "{}", chk).expect("fixture step");
+        }
+        if script == "unknown-step" {
+            // Unknown step type frame among turn frames.
+            let unk = json!({"event":"step_update","step_update":
+                {"conversation_id":conv,"step_index":step_index,
+                 "state":"DONE","step_type":"unknown_future_step"}});
+            step_index += 1;
+            writeln!(stdout, "{}", unk).expect("fixture step");
         }
         if resumed {
             // Captured bookkeeping between input and result on a resumed turn.
@@ -956,6 +976,117 @@ async fn scenario_lost_result_unknown_no_rewrite() {
     assert_eq!(fake_report(&scenario.root)["input_count"], json!(1));
     // The idle metadata was present and the lost-result behavior is unchanged.
     assert_eq!(fake_report(&scenario.root)["system_messages"], json!(1));
+    stop_clean(&mut scenario.host, &scenario.agent_id, 1).await;
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_checkpoint_frame_no_gap() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (pending, rx) = setup_start("checkpoint", agent_id, 1, Value::Null, Value::Null).await;
+    let mut scenario = pending.finish(rx, None).await;
+    let (send_id, turn_id, committed) =
+        send_turn(&mut scenario.host, &scenario.agent_id, 1, "hello prompt").await;
+    assert_eq!(
+        committed[1],
+        (
+            "message.completed".to_owned(),
+            json!({
+                "command_id": send_id, "turn_id": turn_id, "text": "reply:hello prompt"
+            })
+        )
+    );
+    assert_eq!(committed[2].0, "turn.completed");
+    assert_eq!(
+        committed[2].1.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert_eq!(
+        committed[2].1.get("final_text").and_then(Value::as_str),
+        Some("reply:hello prompt")
+    );
+    let snap = snapshot(&mut scenario.host, &scenario.agent_id, 1, &send_id).await;
+    assert_eq!(
+        snap.get("result_known").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        snap.get("source_unknown").and_then(Value::as_bool),
+        Some(false)
+    );
+    stop_clean(&mut scenario.host, &scenario.agent_id, 1).await;
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_unknown_step_causes_gap() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (pending, rx) = setup_start("unknown-step", agent_id, 1, Value::Null, Value::Null).await;
+    let mut scenario = pending.finish(rx, None).await;
+    let send_id = ulid::Ulid::new().to_string();
+    let seq = scenario.host.next_seq;
+    scenario.host.next_seq += 5;
+    let rx = scenario
+        .host
+        .begin_call(
+            "agent.command",
+            json!({"agent_id": scenario.agent_id, "generation": 1,
+                "command_id": send_id, "verb": "send",
+                "args": {"text": "prompt with unknown step"}, "turn_id": null, "request_id": null,
+                "dispatch_seq": seq}),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let applied = loop {
+        tokio::select! {
+            biased;
+            request = scenario.host.next_request() => {
+                assert_eq!(request.method, "events.put");
+                let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("turn.started"));
+                let first = scenario.host.next_seq;
+                scenario.host.next_seq += 1;
+                scenario.host.respond(&request.id, json!({
+                    "first_seq": first, "last_seq": first,
+                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                })).await;
+            }
+            result = &mut rx => break result,
+        }
+    };
+    let applied = applied
+        .expect("send deadline")
+        .expect("send channel")
+        .expect("send applied");
+    assert_eq!(
+        applied.get("state").and_then(Value::as_str),
+        Some("applied")
+    );
+    // The native process emitted an unknown step type: explicit source.gap,
+    // not cleared retroactively by any subsequent frame.
+    let gap = scenario.host.next_request().await;
+    assert_eq!(gap.method, "source.gap");
+    let reason = gap.params.get("reason").and_then(Value::as_str).unwrap();
+    assert!(reason.contains("Antigravity step type is unconnected"));
+    assert!(reason.contains("unknown_future_step"));
+    answer_source_gap(&mut scenario.host, &gap).await;
+    let snap = snapshot(&mut scenario.host, &scenario.agent_id, 1, &send_id).await;
+    assert_eq!(
+        snap.get("source_unknown").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        snap.get("result_known").and_then(Value::as_bool),
+        Some(false)
+    );
     stop_clean(&mut scenario.host, &scenario.agent_id, 1).await;
     scenario
         .host
