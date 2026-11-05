@@ -2148,10 +2148,10 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
     }
     let _ = note_stage(&mut stage, StopStage::Process);
     let process_started = Instant::now();
-    let process_exit = session.server.terminate(force, deadline).await;
+    let process_exit = session.server.terminate_leader(force, deadline).await;
     record_stop_stage(
         trace_path,
-        "server_terminate",
+        "server_leader_exit",
         match &process_exit {
             Ok(()) => "exit_proven",
             Err(error) => stop_error_class(&error.code),
@@ -2182,6 +2182,14 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
     if ended.as_ref().is_some_and(|result| result.is_ok()) {
         session.stop_end_ack_proved = true;
     }
+    let diagnostics_started = Instant::now();
+    session.server.finish_diagnostics(deadline).await;
+    record_stop_stage(
+        trace_path,
+        "server_aux_diagnostics",
+        "finished",
+        diagnostics_started.elapsed(),
+    );
     let stop_unknown = semantic_error
         || process_exit.is_err()
         || ended.as_ref().is_none_or(|result| result.is_err());

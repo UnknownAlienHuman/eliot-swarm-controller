@@ -268,11 +268,20 @@ impl OwnedServer {
         error.with_stderr(eliot_core::StderrSource::Harness, self.stderr_snapshot())
     }
 
-    /// End the owned server. `serve` exposes no shutdown RPC, so both paths
-    /// end the process; the generation Job ends any grandchildren. The
-    /// native session is closed separately with `DELETE /api/session/{id}`
-    /// before this runs.
+    /// End the owned server after native session-control work. `serve` exposes
+    /// no shutdown RPC, so both paths end the process; the generation Job ends
+    /// any grandchildren. Ordinary Stop retains the native session.
     pub async fn terminate(&mut self, force: bool, deadline: Instant) -> Result<()> {
+        let exit = self.terminate_leader(force, deadline).await;
+        if exit.is_ok() {
+            self.finish_diagnostics(deadline).await;
+        }
+        exit
+    }
+
+    /// Prove the exact server leader exited without waiting for its diagnostic
+    /// pipe readers. Stop commits the native EndAck before finishing those pipes.
+    pub(crate) async fn terminate_leader(&mut self, force: bool, deadline: Instant) -> Result<()> {
         let leader_check_started = Instant::now();
         let leader_check = self.child.try_wait();
         crate::host::record_stop_stage(
@@ -293,7 +302,6 @@ impl OwnedServer {
             )
         })?;
         if let Some(_status) = leader_status {
-            self.drain_pipes(deadline).await;
             return Ok(());
         }
         if !force {
@@ -314,7 +322,6 @@ impl OwnedServer {
                 grace_started.elapsed(),
             );
             if matches!(&grace_result, Ok(Ok(_))) {
-                self.drain_pipes(deadline).await;
                 return Ok(());
             }
         }
@@ -373,11 +380,10 @@ impl OwnedServer {
                 "OpenCode serve exit proof is unknown",
             ));
         }
-        self.drain_pipes(deadline).await;
         Ok(())
     }
 
-    async fn drain_pipes(&mut self, deadline: Instant) {
+    pub(crate) async fn finish_diagnostics(&mut self, deadline: Instant) {
         let drain_started = Instant::now();
         if let Some(stdout) = self.stdout.take() {
             let stage_started = Instant::now();
