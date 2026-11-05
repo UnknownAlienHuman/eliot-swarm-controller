@@ -25,6 +25,49 @@ use std::{
 use tokio::{sync::mpsc, time::Instant};
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub(crate) fn stop_trace_path_from_environment(
+    environment: &[(OsString, OsString)],
+) -> Option<PathBuf> {
+    environment.iter().find_map(|(name, value)| {
+        (name.to_string_lossy() == "ELIOT_TEST_OPENCODE_STOP_TRACE_PATH")
+            .then(|| PathBuf::from(value))
+    })
+}
+
+pub(crate) fn record_stop_stage(
+    trace_path: Option<&std::path::Path>,
+    stage: &'static str,
+    class: &'static str,
+    elapsed: std::time::Duration,
+) {
+    let Some(path) = trace_path else {
+        return;
+    };
+    let line = format!("opencode-stop\t{stage}\t{class}\t{}\n", elapsed.as_millis());
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write as _;
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+pub(crate) fn stop_error_class(code: &str) -> &'static str {
+    match code {
+        "bad_state" => "bad_state",
+        "native_process" => "native_process",
+        "native_readback" => "native_readback",
+        "native_spawn" => "native_spawn",
+        "not_found" => "not_found",
+        "source_integrity" => "source_integrity",
+        "timeout" => "timeout",
+        "unknown" => "unknown",
+        _ => "other_error",
+    }
+}
 const MAX_COMMANDS_PER_GENERATION: usize = 32;
 const RESUME_DRAIN_ROUNDS: usize = 20;
 const RESUME_DRAIN_BEAT: std::time::Duration = std::time::Duration::from_millis(250);
@@ -103,6 +146,7 @@ struct AgentSession {
     server: OwnedServer,
     http: crate::native::OpenCodeHttp,
     events: EventHandle,
+    stop_trace_path: Option<PathBuf>,
     command_inputs: HashMap<String, String>,
     command_turns: HashMap<String, String>,
     unknown_commands: HashSet<String>,
@@ -480,6 +524,7 @@ impl OpenCodePlugin {
     /// Start phase 2, launch: spawn the owned server, subscribe the event
     /// stream, and assemble the session. The caller retains any error.
     async fn launch_start_session(peer: &PeerClient, parsed: &ParsedStart) -> Result<AgentSession> {
+        let stop_trace_path = stop_trace_path_from_environment(&parsed.environment);
         let mut server = match OwnedServer::spawn(
             ServerLaunch {
                 program: parsed.program.clone(),
@@ -520,6 +565,7 @@ impl OpenCodePlugin {
                 generation: parsed.params.generation,
                 secrets: parsed.secrets.clone(),
             },
+            stop_trace_path.clone(),
         );
         let session = AgentSession {
             agent_id: parsed.params.agent_id.clone(),
@@ -532,6 +578,7 @@ impl OpenCodePlugin {
             server,
             http,
             events,
+            stop_trace_path,
             command_inputs: HashMap::new(),
             command_turns: HashMap::new(),
             unknown_commands: HashSet::new(),
@@ -2031,6 +2078,14 @@ fn start_paths(
 /// the quiesce wait and never touches another Agent.
 async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()> {
     let deadline = Instant::now() + RPC_TIMEOUT;
+    let trace_path = session.stop_trace_path.as_deref();
+    let stop_started = Instant::now();
+    record_stop_stage(
+        trace_path,
+        "stop_enter",
+        "started",
+        std::time::Duration::ZERO,
+    );
     // A semantic quiesce/retention failure never skips the bounded
     // owned-resource cleanup below. The semantic error is preserved
     // separately, then processed closure and End run without replaying
@@ -2038,19 +2093,50 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
     let mut stage = StopStage::Begin;
     let _ = note_stage(&mut stage, StopStage::Begin);
     let mut semantic_error = false;
-    if session.events.begin_stop().await.is_err() {
+    let begin_started = Instant::now();
+    let begin_result = session.events.begin_stop().await;
+    record_stop_stage(
+        trace_path,
+        "begin_stop",
+        match &begin_result {
+            Ok(()) => "ok",
+            Err(error) => stop_error_class(&error.code),
+        },
+        begin_started.elapsed(),
+    );
+    if begin_result.is_err() {
         semantic_error = true;
     } else {
         let _ = note_stage(&mut stage, StopStage::Quiesce);
         if !force && let Some(session_id) = session.session_id.clone() {
-            if OpenCodePlugin::resume_quiesce(session, &session_id)
-                .await
-                .is_err()
-            {
+            let quiesce_started = Instant::now();
+            let quiesce_result = OpenCodePlugin::resume_quiesce(session, &session_id).await;
+            record_stop_stage(
+                trace_path,
+                "quiesce",
+                match &quiesce_result {
+                    Ok(()) => "ok",
+                    Err(error) => stop_error_class(&error.code),
+                },
+                quiesce_started.elapsed(),
+            );
+            if quiesce_result.is_err() {
                 semantic_error = true;
             } else {
                 let _ = note_stage(&mut stage, StopStage::Retention);
-                let retained = match session.http.get_session(&session_id, deadline).await {
+                let readback_started = Instant::now();
+                let readback = session.http.get_session(&session_id, deadline).await;
+                record_stop_stage(
+                    trace_path,
+                    "retention_readback",
+                    match &readback {
+                        Ok(info) if info.id == session_id => "retained",
+                        Ok(_) => "identity_mismatch",
+                        Err(error) => stop_error_class(&error.code),
+                    },
+                    readback_started.elapsed(),
+                );
+                let retained = match readback {
                     Ok(info) => info.id == session_id,
                     Err(_) => false,
                 };
@@ -2061,24 +2147,51 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
         }
     }
     let _ = note_stage(&mut stage, StopStage::Process);
+    let process_started = Instant::now();
     let process_exit = session.server.terminate(force, deadline).await;
+    record_stop_stage(
+        trace_path,
+        "server_terminate",
+        match &process_exit {
+            Ok(()) => "exit_proven",
+            Err(error) => stop_error_class(&error.code),
+        },
+        process_started.elapsed(),
+    );
     if process_exit.is_ok() {
         session.resources_proved_closed = true;
     }
     // End is attempted only when the process-exit proof binds closure.
     let _ = note_stage(&mut stage, StopStage::EndAck);
+    let end_ack_started = Instant::now();
     let ended = if process_exit.is_ok() {
         Some(session.events.end_stop().await)
     } else {
         None
     };
+    record_stop_stage(
+        trace_path,
+        "end_ack_result",
+        match &ended {
+            Some(Ok(())) => "acked",
+            Some(Err(error)) => stop_error_class(&error.code),
+            None => "skipped_without_exit_proof",
+        },
+        end_ack_started.elapsed(),
+    );
     if ended.as_ref().is_some_and(|result| result.is_ok()) {
         session.stop_end_ack_proved = true;
     }
-    if semantic_error
+    let stop_unknown = semantic_error
         || process_exit.is_err()
-        || ended.as_ref().is_none_or(|result| result.is_err())
-    {
+        || ended.as_ref().is_none_or(|result| result.is_err());
+    record_stop_stage(
+        trace_path,
+        "stop_result",
+        if stop_unknown { "unknown" } else { "applied" },
+        stop_started.elapsed(),
+    );
+    if stop_unknown {
         session.phase = SessionPhase::Unknown;
         return Err(Error::new(
             "unknown",

@@ -3144,19 +3144,34 @@ async fn scenario_unknown_stop_with_committed_end_closes_owned_family(owned: Own
     let log_path = fixture.root.join("requests.jsonl");
     let report_path = fixture.root.join("report.json");
     let descendant_pid_path = fixture.root.join("descendant.pid");
+    let stop_trace_path = fixture.root.join("stop-stage-trace.tsv");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stop_trace_path)
+        .expect("create fixture-private Stop stage capture");
+    assert!(
+        stop_trace_path.is_file(),
+        "Stop stage capture exists before daemon start"
+    );
+    assert!(
+        stop_trace_path.is_file(),
+        "fixture-private Stop stage capture exists before daemon start"
+    );
     let script_text = script(json!({"readback_status": 404, "descendant": true})).to_string();
     fixture
         .env("ELIOT_FAKE_OPENCODE_SCRIPT", &script_text)
         .env("ELIOT_FAKE_OPENCODE_LOG", &log_path)
         .env("ELIOT_FAKE_OPENCODE_REPORT", &report_path)
-        .env("ELIOT_FAKE_OPENCODE_DESCENDANT_PID", &descendant_pid_path);
+        .env("ELIOT_FAKE_OPENCODE_DESCENDANT_PID", &descendant_pid_path)
+        .env("ELIOT_TEST_OPENCODE_STOP_TRACE_PATH", &stop_trace_path);
     fixture.start();
     let cmd = std::env::current_exe()
         .expect("test executable")
         .to_string_lossy()
         .into_owned();
     let config = format!(
-        "[profiles.opencode-cap]\nharness = \"opencode\"\nmodel = \"{}\"\ncmd = {}\npass_env = [\"ELIOT_FAKE_OPENCODE_SCRIPT\", \"ELIOT_FAKE_OPENCODE_LOG\", \"ELIOT_FAKE_OPENCODE_REPORT\", \"ELIOT_FAKE_OPENCODE_DESCENDANT_PID\"]\naccount = \"shared\"\n\n[profiles.fake-cap]\nharness = \"fake\"\naccount = \"shared\"\n\n[accounts.shared]\nmax_live = 1\n",
+        "[profiles.opencode-cap]\nharness = \"opencode\"\nmodel = \"{}\"\ncmd = {}\npass_env = [\"ELIOT_FAKE_OPENCODE_SCRIPT\", \"ELIOT_FAKE_OPENCODE_LOG\", \"ELIOT_FAKE_OPENCODE_REPORT\", \"ELIOT_FAKE_OPENCODE_DESCENDANT_PID\", \"ELIOT_TEST_OPENCODE_STOP_TRACE_PATH\"]\naccount = \"shared\"\n\n[profiles.fake-cap]\nharness = \"fake\"\naccount = \"shared\"\n\n[accounts.shared]\nmax_live = 1\n",
         MODEL,
         serde_json::to_string(&cmd).expect("cmd toml"),
     );
@@ -3253,6 +3268,15 @@ async fn scenario_unknown_stop_with_committed_end_closes_owned_family(owned: Own
             if shown["state"] == "stopped" {
                 break;
             }
+        }
+        if std::time::Instant::now() >= end_deadline {
+            let trace = std::fs::read_to_string(&stop_trace_path)
+                .expect("read pre-cleanup OpenCode Stop stage trace");
+            assert!(
+                !trace.trim().is_empty(),
+                "Stop stage trace capture was empty"
+            );
+            eprintln!("pre-cleanup OpenCode Stop stages:\n{trace}end-pre-cleanup-trace");
         }
         assert!(
             std::time::Instant::now() < end_deadline,
