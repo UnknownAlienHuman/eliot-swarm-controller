@@ -166,12 +166,27 @@ pub struct Store {
     hierarchy_limits: core::api::HierarchyLimits,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreOpenPhase {
+    ConnectionOpened,
+    PragmasApplied,
+    Migrated,
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_observer(path, |_| {})
+    }
+
+    pub fn open_with_observer<F>(path: &Path, mut on_phase: F) -> Result<Self>
+    where
+        F: FnMut(StoreOpenPhase),
+    {
         let connection = Connection::open(path).map_err(sql_error)?;
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(sql_error)?;
+        on_phase(StoreOpenPhase::ConnectionOpened);
         connection
             .execute_batch(
                 "PRAGMA journal_mode=WAL;
@@ -179,6 +194,7 @@ impl Store {
                  PRAGMA foreign_keys=ON;",
             )
             .map_err(sql_error)?;
+        on_phase(StoreOpenPhase::PragmasApplied);
 
         let mut store = Self {
             connection,
@@ -187,6 +203,7 @@ impl Store {
             hierarchy_limits: core::api::HierarchyLimits::default(),
         };
         store.migrate()?;
+        on_phase(StoreOpenPhase::Migrated);
         Ok(store)
     }
 

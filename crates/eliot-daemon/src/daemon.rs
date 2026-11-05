@@ -59,7 +59,18 @@ async fn run_owned(
     policy: Arc<SecretPolicy>,
 ) -> Result<()> {
     let store_path = data_dir.path().join("eliot.db");
-    let store = eliot_store::Store::open(&store_path)?;
+    logging::record(&policy, "daemon.store_opening", &[], None);
+    let store = eliot_store::Store::open_with_observer(&store_path, |phase| match phase {
+        eliot_store::StoreOpenPhase::ConnectionOpened => {
+            logging::record(&policy, "daemon.store_connection_opened", &[], None);
+        }
+        eliot_store::StoreOpenPhase::PragmasApplied => {
+            logging::record(&policy, "daemon.store_pragmas_applied", &[], None);
+        }
+        eliot_store::StoreOpenPhase::Migrated => {
+            logging::record(&policy, "daemon.store_migrated", &[], None);
+        }
+    })?;
     // Startup phase markers: a readiness timeout names the phase that stalled.
     logging::record(&policy, "daemon.store_opened", &[], None);
     let store = std::sync::Arc::new(Mutex::new(store));
