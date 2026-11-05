@@ -83,6 +83,15 @@ no mapping and are rejected. The effective permission mode and effective model c
 from native init facts; init does not establish the served model. See the
 [Antigravity page](../harnesses/antigravity.md).
 
+A Muse profile selects `harness = "muse"` with an explicit native `cmd`, an exact `model`,
+optional `effort`, optional `approval`, and `permissions` (`workspace-write`, the default,
+or `danger-full-access`; `read-only` remains unsupported). Sandbox posture is fixed at
+host birth (`--disable-sandbox` for `danger-full-access`); the MSP session wire has no
+sandbox or permissions readback field and is not negotiable per session, so effective
+permissions stay unknown (`null` / unverified) until a real native tool probe confirms
+posture. `collaboration_mode` and `approval_policy`
+presets stay rejected. See the [Muse page](../harnesses/muse.md).
+
 ## Owner workspace setup
 
 Global profiles accept ordered setup entries only for an explicit `launch --worktree`.

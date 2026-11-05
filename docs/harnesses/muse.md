@@ -69,7 +69,17 @@ for its pointer set and opens only what still binds to the live turn; anything
 naming the dead generation's turn is receipted and dropped as an orphan, never
 answered, and a failed pull never fails the resume.
 
-## Route and final checks
+## Host permissions, route and final checks
+
+Sandbox posture is fixed at owned host birth (`muse serve` flags); MSP session/turn
+wire carries no sandbox field and posture is not negotiable per session. Profile
+`permissions = "danger-full-access"` passes `--disable-sandbox` at host launch; omission
+or `workspace-write` preserves the default sandbox posture. Read-only permissions remain
+unsupported. The installed MSP schema carries no sandbox or permissions readback field,
+so effective permissions are reported as unknown (`permissions: null`,
+`permissions_verified: false`) and never derived from the requested flag or any
+unproven wire alias. The host flag remains applied at birth; a real native tool probe
+is still required to confirm effective posture.
 
 Do not assume a generic base-URL override. Use explicit native account/billing profiles
 and report what the host actually exposes. L7 covers lost replies, exact request/turn

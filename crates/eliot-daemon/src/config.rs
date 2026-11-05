@@ -1239,10 +1239,12 @@ fn insert_profile_tail(
 
 /// Freeze a Muse profile. The PR1 slice carries an explicit model id, a
 /// required explicit native `cmd` (no PATH default: resolving `muse` would
-/// land on the launcher wrapper and orphan the host on stop) and an optional
-/// reasoning effort; collaboration presets, adopted routes and non-default
-/// permission/approval postures stay rejected until their native mappings
-/// land.
+/// land on the launcher wrapper and orphan the host on stop), an optional
+/// reasoning effort, optional approval mode, and explicit permissions
+/// (`workspace-write` or `danger-full-access`; host birth control passes
+/// `--disable-sandbox` for full access); collaboration presets, adopted routes,
+/// read-only permissions and approval policies stay rejected until their native
+/// mappings land.
 fn muse_snapshot_from_entry(
     name: &str,
     entry: &ProfileEntry,
@@ -1304,18 +1306,18 @@ fn muse_snapshot_from_entry(
             "unsupported",
         ));
     }
-    if entry
+    let permissions = entry
         .permissions
         .as_deref()
         .map(str::trim)
-        .is_some_and(|permissions| permissions != PERMISSION_WORKSPACE_WRITE)
-    {
+        .unwrap_or(PERMISSION_WORKSPACE_WRITE);
+    if permissions != PERMISSION_WORKSPACE_WRITE && permissions != PERMISSION_DANGER_FULL_ACCESS {
         return Err(profile_field_error(
             source,
             table_offset,
             name,
             "permissions",
-            "the Muse slice runs the host-default sandbox posture",
+            "the Muse slice supports only workspace-write or danger-full-access",
             "unsupported",
         ));
     }
@@ -1356,7 +1358,7 @@ fn muse_snapshot_from_entry(
     }
     snapshot.insert(
         "permissions".to_owned(),
-        Value::String(PERMISSION_WORKSPACE_WRITE.to_owned()),
+        Value::String(permissions.to_owned()),
     );
     snapshot.insert(
         "approval_policy".to_owned(),
@@ -3341,6 +3343,46 @@ pass_env = ["EXAMPLE_API_KEY"]
         assert_eq!(snapshot["permissions"], "workspace-write");
         assert_eq!(snapshot["approval_policy"], "never");
         assert_eq!(snapshot["pass_env"], json!(["EXAMPLE_API_KEY"]));
+
+        let full_access = resolve_text_profile(
+            r#"
+[profiles.muse-full]
+harness = "muse"
+cmd = "C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe"
+model = "muse-spark-1.3-contributor"
+permissions = "danger-full-access"
+"#,
+            "muse-full",
+        )
+        .unwrap();
+        assert_eq!(full_access["permissions"], "danger-full-access");
+
+        let explicit_write = resolve_text_profile(
+            r#"
+[profiles.muse-write]
+harness = "muse"
+cmd = "C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe"
+model = "muse-spark-1.3-contributor"
+permissions = "workspace-write"
+"#,
+            "muse-write",
+        )
+        .unwrap();
+        assert_eq!(explicit_write["permissions"], "workspace-write");
+
+        let read_only_err = resolve_text_profile(
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\ncmd='C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe'\npermissions='read-only'\n",
+            "muse",
+        )
+        .expect_err("read-only unsupported");
+        assert_eq!(read_only_err.code, "unsupported");
+
+        let dsp_err = resolve_text_profile(
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\ncmd='C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe'\ndangerously_skip_permissions=true\n",
+            "muse",
+        )
+        .expect_err("dangerously_skip_permissions unsupported");
+        assert_eq!(dsp_err.code, "unsupported");
 
         for source in [
             "[profiles.muse]\nharness='muse'\n",

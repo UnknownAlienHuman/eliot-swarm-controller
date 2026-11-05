@@ -365,6 +365,16 @@ impl MusePlugin {
                 "Muse profile approval is not a supported approval mode",
             ));
         }
+        let requested_permissions = optional_profile_text(profile, "permissions", "Muse")?
+            .unwrap_or_else(|| "workspace-write".to_owned());
+        if requested_permissions != "workspace-write"
+            && requested_permissions != "danger-full-access"
+        {
+            return Err(Error::new(
+                "profile_error",
+                "Muse profile permissions must be workspace-write or danger-full-access",
+            ));
+        }
         let workspace = params
             .workspace
             .as_deref()
@@ -400,13 +410,12 @@ impl MusePlugin {
             "Muse",
         )?;
         secrets.push(initialized.credential.clone());
-        // Sandbox posture is fixed at host birth (`muse serve` flags) and stays
-        // the host default until a permissions mapping lands; approval mode is
-        // profile-selected when the frozen profile carries one (server default
-        // otherwise).
+        // Sandbox posture is fixed at host birth (`muse serve` flags):
+        // canonical danger-full-access passes --disable-sandbox, while
+        // workspace-write preserves the host-default sandbox posture.
         let launch = NativeLaunch {
             program,
-            args: vec![OsString::from("serve")],
+            args: muse_serve_args(&requested_permissions),
             cwd: workspace.clone(),
             environment,
         };
@@ -1059,6 +1068,8 @@ impl MusePlugin {
             "effort_verified": effort_verified,
             "approval": effective_approval.clone(),
             "approval_verified": approval_verified,
+            "permissions": Value::Null,
+            "permissions_verified": false,
             "schema_fingerprint": initialized_native.fingerprint.clone(),
         });
         // The effective settings are checked BEFORE readiness: on any
@@ -1129,6 +1140,7 @@ impl MusePlugin {
                 "model": requested_model,
                 "effort": initialized_native.effort,
                 "approval": requested_approval,
+                "permissions": requested_permissions,
                 "cwd": workspace.to_string_lossy(),
             },
             "effective": effective,
@@ -2705,12 +2717,26 @@ fn muse_manifest() -> PluginManifest {
     }
 }
 
+/// Native arguments for `muse serve`. Full access passes `--disable-sandbox`
+/// at host startup; default/workspace-write retains host-default sandboxing.
+fn muse_serve_args(permissions: &str) -> Vec<OsString> {
+    let mut args = vec![OsString::from("serve")];
+    if permissions == "danger-full-access" {
+        args.push(OsString::from("--disable-sandbox"));
+    }
+    args
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{muse_manifest, muse_scope, new_command_id, validate_resume_preflight};
+    use super::{
+        MusePlugin, muse_manifest, muse_scope, muse_serve_args, new_command_id,
+        validate_resume_preflight,
+    };
     use crate::native::types::NativeSession;
-    use eliot_plugin::session::validate_source_plan;
+    use eliot_plugin::{Peer, session::validate_source_plan};
     use serde_json::json;
+    use std::ffi::OsString;
 
     fn preflight_session(
         status: &str,
@@ -2899,5 +2925,54 @@ mod tests {
         }
         let empty = preflight_session("idle", None, Some(0));
         assert!(validate_resume_preflight(&empty, None, Some(("foreign", "completed"))).is_err());
+    }
+
+    #[test]
+    fn host_argv_distinguishes_default_from_danger_full_access() {
+        assert_eq!(
+            muse_serve_args("workspace-write"),
+            vec![OsString::from("serve")]
+        );
+        assert_eq!(
+            muse_serve_args("danger-full-access"),
+            vec![OsString::from("serve"), OsString::from("--disable-sandbox")]
+        );
+    }
+
+    #[tokio::test]
+    async fn start_rejects_unsupported_permissions_before_spawn() {
+        // Existing wire fixture seam: Peer::stdio() is the only public PeerClient
+        // constructor; the permissions check returns before any peer use,
+        // spawn, or native call, so no transport I/O occurs.
+        let peer = Peer::stdio();
+        let client = peer.client();
+        let mut plugin = MusePlugin::default();
+        let init_params = json!({
+            "protocol": "eliot-plugin/1",
+            "instance_dir": "C:\\temp",
+            "credential": "test-credential"
+        });
+        plugin.initialize(&init_params).unwrap();
+        let start_params = json!({
+            "agent_id": "agent-1",
+            "generation": 1,
+            "command_id": "018f0a00-0000-7000-8000-000000000001",
+            "source_plan": {
+                "session": "stream", "turn": "stream", "message": "stream", "request": "stream"
+            },
+            "profile": {
+                "harness": "muse",
+                "model": "muse-spark-1.3-contributor",
+                "permissions": "read-only",
+                "cmd": "C:\\Tools\\MuseCode\\muse-bin-1.4.0-R4161.1.exe"
+            },
+            "workspace": std::env::current_dir().unwrap().to_str().unwrap()
+        });
+        let err = plugin
+            .start(&start_params, &client)
+            .await
+            .expect_err("must reject read-only");
+        assert_eq!(err.code, "profile_error");
+        assert!(err.message.contains("permissions"));
     }
 }
