@@ -184,7 +184,7 @@ struct EventProcessor {
     gap_number: u64,
     accept_frames: bool,
     planned_stop: bool,
-    loss_reason: Option<&'static str>,
+    loss_reason: Option<String>,
     frames_drained: bool,
     pending_end_stop: Option<oneshot::Sender<Result<()>>>,
     writes_blocked: bool,
@@ -619,9 +619,9 @@ impl EventProcessor {
         }
     }
 
-    fn defer_gap(&mut self, reason: &'static str) {
+    fn defer_gap(&mut self, reason: impl Into<String>) {
         if self.loss_reason.is_none() {
-            self.loss_reason = Some(reason);
+            self.loss_reason = Some(reason.into());
         }
     }
 
@@ -629,9 +629,9 @@ impl EventProcessor {
         if queue_empty
             && !self.gap_reported
             && !self.writes_blocked
-            && let Some(reason) = self.loss_reason
+            && let Some(reason) = self.loss_reason.clone()
         {
-            let _ = self.record_gap(reason).await;
+            let _ = self.record_gap(&reason).await;
         }
     }
 
@@ -902,10 +902,30 @@ impl EventProcessor {
                         .await;
                     return Ok(());
                 }
-                return self.reject_request(id, &method, &params, error).await;
+                let gap_reason = native_request_gap_reason(
+                    &method,
+                    &error.code,
+                    &params,
+                    session_id,
+                    turn_id,
+                    self.status.active_turn_id.is_some(),
+                );
+                return self
+                    .reject_request(id, &method, &params, error, gap_reason)
+                    .await;
             }
             Err(error) => {
-                return self.reject_request(id, &method, &params, error).await;
+                let gap_reason = native_request_gap_reason(
+                    &method,
+                    &error.code,
+                    &params,
+                    session_id,
+                    turn_id,
+                    self.status.active_turn_id.is_some(),
+                );
+                return self
+                    .reject_request(id, &method, &params, error, gap_reason)
+                    .await;
             }
         };
         // The receipt acknowledges presentation only (SS5.3.3): it changes no
@@ -1009,6 +1029,7 @@ impl EventProcessor {
         method: &str,
         params: &Value,
         error: Error,
+        gap_reason: String,
     ) -> Result<()> {
         let rejected = self
             .native
@@ -1022,7 +1043,7 @@ impl EventProcessor {
         } else if rejected.is_err() {
             self.defer_gap("Muse native request rejection was not written");
         } else {
-            self.defer_gap("Muse native request did not match its exact session/turn schema");
+            self.defer_gap(gap_reason);
         }
         Ok(())
     }
@@ -2422,6 +2443,43 @@ fn event_id(session_id: &str, turn_id: &str, item_id: &str, kind: &str) -> Resul
     shared_event_id(session_id, turn_id, item_id, kind, "muse", "Muse")
 }
 
+/// Builds a gap reason from fixed classes and boolean comparisons only.
+fn native_request_gap_reason(
+    method: &str,
+    error_code: &str,
+    params: &Value,
+    expected_session: &str,
+    active_turn: &str,
+    active_parent_turn_present: bool,
+) -> String {
+    let method_class = match method {
+        "approval/request" => "approval",
+        "userInput/request" => "userInput",
+        _ => "other",
+    };
+    let error_class = match error_code {
+        "native_protocol" => "native_protocol",
+        "source_integrity" => "source_integrity",
+        "unsupported" => "unsupported",
+        _ => "other",
+    };
+    let session_id = params.get("sessionId");
+    let session_value = session_id.and_then(Value::as_str);
+    let turn_id = params.get("turnId");
+    let turn_value = turn_id.and_then(Value::as_str);
+
+    format!(
+        "Muse native request validation: method_class={method_class} error_code={error_class} active_parent_turn_present={active_parent_turn_present} session_id_present={} session_id_nonblank={} session_id_matches_expected={} turn_id_present={} turn_id_nonblank={} turn_id_matches_active={} subagent_origin_present={}",
+        session_id.is_some(),
+        session_value.is_some_and(|value| !value.trim().is_empty()),
+        session_value.is_some_and(|value| value == expected_session),
+        turn_id.is_some(),
+        turn_value.is_some_and(|value| !value.trim().is_empty()),
+        turn_value.is_some_and(|value| value == active_turn),
+        params.get("subagentOrigin").is_some(),
+    )
+}
+
 /// The native approval/user-input id carried by raw server-request params, if
 /// any. Used only to recognize resume-expected orphans; binding still goes
 /// through the typed describe path.
@@ -2530,6 +2588,71 @@ fn attach_provider_restriction(
 mod tests {
     use super::*;
     use eliot_plugin::protocol::MAX_COMMAND_ID_BYTES;
+
+    #[test]
+    fn native_request_gap_reason_keeps_only_bounded_metadata() {
+        let session_marker = "SESSION_VALUE_MUST_NOT_BE_RECORDED";
+        let active_turn_marker = "ACTIVE_TURN_VALUE_MUST_NOT_BE_RECORDED";
+        let params = json!({
+            "sessionId": session_marker,
+            "turnId": "STALE_TURN_VALUE_MUST_NOT_BE_RECORDED",
+            "approvalId": "APPROVAL_ID_MUST_NOT_BE_RECORDED",
+            "toolCallId": "TOOL_CALL_ID_MUST_NOT_BE_RECORDED",
+            "rawArgs": "TOOL_ARGUMENTS_MUST_NOT_BE_RECORDED",
+            "token": "TOKEN_MUST_NOT_BE_RECORDED",
+            "subagentOrigin": {
+                "childRunId": "CHILD_RUN_ID_MUST_NOT_BE_RECORDED",
+                "childSessionId": "CHILD_SESSION_ID_MUST_NOT_BE_RECORDED",
+            },
+        });
+
+        let reason = native_request_gap_reason(
+            "approval/request",
+            "source_integrity",
+            &params,
+            session_marker,
+            active_turn_marker,
+            true,
+        );
+
+        assert!(reason.len() <= 512);
+        assert!(reason.contains("method_class=approval"));
+        assert!(reason.contains("error_code=source_integrity"));
+        assert!(reason.contains("active_parent_turn_present=true"));
+        assert!(reason.contains("session_id_present=true"));
+        assert!(reason.contains("session_id_nonblank=true"));
+        assert!(reason.contains("session_id_matches_expected=true"));
+        assert!(reason.contains("turn_id_present=true"));
+        assert!(reason.contains("turn_id_nonblank=true"));
+        assert!(reason.contains("turn_id_matches_active=false"));
+        assert!(reason.contains("subagent_origin_present=true"));
+        for marker in [
+            session_marker,
+            active_turn_marker,
+            "STALE_TURN_VALUE_MUST_NOT_BE_RECORDED",
+            "APPROVAL_ID_MUST_NOT_BE_RECORDED",
+            "TOOL_CALL_ID_MUST_NOT_BE_RECORDED",
+            "TOOL_ARGUMENTS_MUST_NOT_BE_RECORDED",
+            "TOKEN_MUST_NOT_BE_RECORDED",
+            "CHILD_RUN_ID_MUST_NOT_BE_RECORDED",
+            "CHILD_SESSION_ID_MUST_NOT_BE_RECORDED",
+        ] {
+            assert!(!reason.contains(marker));
+        }
+
+        let unknown = native_request_gap_reason(
+            "untrusted method value",
+            "untrusted error value",
+            &Value::Null,
+            "expected-session",
+            "active-turn",
+            false,
+        );
+        assert!(unknown.contains("method_class=other"));
+        assert!(unknown.contains("error_code=other"));
+        assert!(!unknown.contains("untrusted method value"));
+        assert!(!unknown.contains("untrusted error value"));
+    }
 
     #[test]
     fn terminal_mapping_cancels_to_interrupted() {
