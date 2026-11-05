@@ -31,9 +31,10 @@ const MAX_HTTP_BYTES: usize = 1024 * 1024;
 const SSE_QUEUE: usize = 64;
 
 /// Classified native HTTP outcome. `Rejected` is authoritative
-/// non-admission (a complete error body proving no effect, or a transport
-/// failure before any byte was sent); `Unknown` is every ambiguous case
-/// after a write may have been admitted.
+/// non-admission (a complete error body proving no effect);
+/// `NotDispatched` proves no byte was sent (request construction,
+/// invalid identity, or TCP connect failure); `Unknown` is every
+/// ambiguous case after a write may have been admitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpOutcome {
     Rejected { status: Option<u16>, reason: String },
@@ -629,6 +630,9 @@ impl From<reqwest::Error> for HttpOutcome {
         // Only failures before any byte could be sent prove non-dispatch:
         // request construction and the TCP connect itself. Everything past
         // that point (send, wait, body) leaves a write uncertain.
+        // The loopback server is plain HTTP with retry disabled, so
+        // reqwest 0.13.5 is_connect (ErrorKind::Connect only) can only fire
+        // before the first request byte leaves the socket.
         if error.is_builder() || error.is_connect() {
             return Self::NotDispatched {
                 reason: format!(
@@ -870,5 +874,137 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn refused_connection_is_not_dispatched() {
+        // Reserve then release a loopback port: nothing listens, so the
+        // TCP connect is refused before any HTTP byte can leave.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let http = OpenCodeHttp::new(port, "test-password".to_owned()).expect("client");
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let model = ModelRef {
+            id: "test-model".to_owned(),
+            provider_id: "test-provider".to_owned(),
+            variant: None,
+        };
+        match http.create_session("test", &model, "/tmp", deadline).await {
+            Err(HttpOutcome::NotDispatched { reason }) => {
+                assert!(reason.contains("not dispatched"), "reason={reason}");
+                assert!(reason.contains("connect"), "reason={reason}");
+            }
+            other => panic!("refused connect must be NotDispatched, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_reply_after_request_is_unknown_without_retry() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+
+        // Accept loop: count every TCP connect, read its request bytes,
+        // then drop without any reply. Runs until the test aborts it.
+        let accept_hits = hits.clone();
+        let accept_seen = seen.clone();
+        let accept_task = tokio::spawn(async move {
+            loop {
+                let accept =
+                    tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
+                        .await;
+                let Ok(Ok((mut socket, _))) = accept else {
+                    continue;
+                };
+                accept_hits.fetch_add(1, Ordering::SeqCst);
+                let seen = accept_seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let start = tokio::time::Instant::now();
+                    loop {
+                        if start.elapsed() > std::time::Duration::from_secs(1) {
+                            break;
+                        }
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(200),
+                            socket.read(&mut tmp),
+                        )
+                        .await
+                        {
+                            Ok(Ok(0)) => break,
+                            Ok(Ok(n)) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    if let Ok(Ok(n)) = tokio::time::timeout(
+                                        std::time::Duration::from_millis(100),
+                                        socket.read(&mut tmp),
+                                    )
+                                    .await
+                                    {
+                                        buf.extend_from_slice(&tmp[..n]);
+                                    }
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    if let Ok(mut guard) = seen.lock() {
+                        guard.extend_from_slice(&buf);
+                    }
+                    // Drop without any reply: the write outcome stays ambiguous.
+                });
+            }
+        });
+
+        let http = OpenCodeHttp::new(port, "test-password".to_owned()).expect("client");
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let model = ModelRef {
+            id: "test-model".to_owned(),
+            provider_id: "test-provider".to_owned(),
+            variant: None,
+        };
+        match http.create_session("test", &model, "/tmp", deadline).await {
+            Err(HttpOutcome::Unknown { reason }) => {
+                assert!(reason.contains("after dispatch"), "reason={reason}");
+                assert!(reason.contains("unknown"), "reason={reason}");
+            }
+            other => {
+                accept_task.abort();
+                panic!("dropped reply must be Unknown, got {other:?}");
+            }
+        }
+
+        // Give any automatic retry a window to arrive, then prove the
+        // client wrote exactly once.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        accept_task.abort();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "client must not retry a write"
+        );
+        let seen = seen.lock().expect("seen").clone();
+        assert!(
+            seen.windows(b"POST /api/session".len())
+                .any(|w| w == b"POST /api/session"),
+            "server must have seen the request bytes, got {} bytes",
+            seen.len()
+        );
     }
 }
