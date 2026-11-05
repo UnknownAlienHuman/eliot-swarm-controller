@@ -71,7 +71,20 @@ struct ProcessResult {
     #[cfg(test)]
     stderr: Vec<u8>,
     quiescent: bool,
+    quiescence_class: Option<&'static str>,
     interrupted: bool,
+}
+
+fn quiescence_class_for(result: &Result<bool>) -> Option<&'static str> {
+    match result {
+        Ok(true) => None,
+        Ok(false) => Some("timeout"),
+        Err(error) => match error.code.as_str() {
+            "platform_io" => Some("platform_io"),
+            "process_custody_unknown" => Some("process_custody_unknown"),
+            _ => Some("other"),
+        },
+    }
 }
 
 #[derive(Clone)]
@@ -416,11 +429,15 @@ pub(crate) async fn execute(
         }
     };
     if !object_check.quiescent {
-        return execution(
+        let mut unknown = execution(
             CommandState::Unknown,
             "git_fetch_registered_object_verifier_quiescence_unknown",
             None,
         );
+        if let Some(class) = object_check.quiescence_class {
+            unknown.outcome["quiescence_class"] = Value::from(class);
+        }
+        return unknown;
     }
     if object_check.interrupted || object_check.exit_code != Some(0) {
         let mut failed = execution(
@@ -1656,6 +1673,7 @@ async fn run_owned_git(
             #[cfg(test)]
             stderr: Vec::new(),
             quiescent: true,
+            quiescence_class: None,
             interrupted: true,
         });
     }
@@ -1829,12 +1847,13 @@ async fn run_owned_git(
             #[cfg(test)]
             stderr: Vec::new(),
             quiescent: true,
+            quiescence_class: None,
             interrupted: true,
         });
     }
     let mut child = OwnedChild::spawn(command)?;
     let Some(stdout) = child.take_stdout() else {
-        let (exit_code, quiescent) = stop_owned_child(&mut child).await;
+        let (exit_code, quiescent, quiescence_class) = stop_owned_child(&mut child).await;
         return Ok(ProcessResult {
             exit_code,
             stdout: Vec::new(),
@@ -1842,11 +1861,12 @@ async fn run_owned_git(
             #[cfg(test)]
             stderr: Vec::new(),
             quiescent,
+            quiescence_class,
             interrupted: true,
         });
     };
     let Some(stderr) = child.take_stderr() else {
-        let (exit_code, quiescent) = stop_owned_child(&mut child).await;
+        let (exit_code, quiescent, quiescence_class) = stop_owned_child(&mut child).await;
         return Ok(ProcessResult {
             exit_code,
             stdout: Vec::new(),
@@ -1854,11 +1874,12 @@ async fn run_owned_git(
             #[cfg(test)]
             stderr: Vec::new(),
             quiescent,
+            quiescence_class,
             interrupted: true,
         });
     };
     let Some(mut stdin) = child.take_stdin() else {
-        let (exit_code, quiescent) = stop_owned_child(&mut child).await;
+        let (exit_code, quiescent, quiescence_class) = stop_owned_child(&mut child).await;
         return Ok(ProcessResult {
             exit_code,
             stdout: Vec::new(),
@@ -1866,6 +1887,7 @@ async fn run_owned_git(
             #[cfg(test)]
             stderr: Vec::new(),
             quiescent,
+            quiescence_class,
             interrupted: true,
         });
     };
@@ -1884,13 +1906,13 @@ async fn run_owned_git(
                 .map_err(|_| unavailable("Git stdin close failed"))?;
             Ok::<(), Error>(())
         };
-        let (stdout, stderr, (), (exit_code, quiescent)) = tokio::try_join!(
+        let (stdout, stderr, (), (exit_code, quiescent, quiescence_class)) = tokio::try_join!(
             capture_bounded(stdout, eliot_core::limits::MAX_FRAME_BYTES),
             capture_bounded(stderr, eliot_core::MAX_STDERR_BYTES),
             write,
             wait_owned_child(&mut child),
         )?;
-        Ok::<_, Error>((stdout, stderr, exit_code, quiescent))
+        Ok::<_, Error>((stdout, stderr, exit_code, quiescent, quiescence_class))
     };
     let result = if let Some(receiver) = cancellation.as_mut() {
         tokio::select! {
@@ -1902,17 +1924,20 @@ async fn run_owned_git(
         Some(timeout_at(deadline, captured).await)
     };
     match result {
-        Some(Ok(Ok((stdout, stderr, exit_code, quiescent)))) => Ok(ProcessResult {
-            exit_code,
-            stdout,
-            stderr_len: stderr.len(),
-            #[cfg(test)]
-            stderr,
-            quiescent,
-            interrupted: false,
-        }),
+        Some(Ok(Ok((stdout, stderr, exit_code, quiescent, quiescence_class)))) => {
+            Ok(ProcessResult {
+                exit_code,
+                stdout,
+                stderr_len: stderr.len(),
+                #[cfg(test)]
+                stderr,
+                quiescent,
+                quiescence_class,
+                interrupted: false,
+            })
+        }
         Some(Ok(Err(_))) | Some(Err(_)) | None => {
-            let (exit_code, quiescent) = stop_owned_child(&mut child).await;
+            let (exit_code, quiescent, quiescence_class) = stop_owned_child(&mut child).await;
             Ok(ProcessResult {
                 exit_code,
                 stdout: Vec::new(),
@@ -1920,6 +1945,7 @@ async fn run_owned_git(
                 #[cfg(test)]
                 stderr: Vec::new(),
                 quiescent,
+                quiescence_class,
                 interrupted: true,
             })
         }
@@ -1944,18 +1970,19 @@ async fn capture_bounded<R: AsyncRead + Unpin>(mut reader: R, cap: usize) -> Res
     }
 }
 
-async fn wait_owned_child(child: &mut OwnedChild) -> Result<(Option<i32>, bool)> {
+async fn wait_owned_child(
+    child: &mut OwnedChild,
+) -> Result<(Option<i32>, bool, Option<&'static str>)> {
     #[cfg(windows)]
     {
         let status = child
             .wait()
             .await
             .map_err(|_| unavailable("Git child wait failed"))?;
-        let quiescent = child
-            .wait_family_empty(GIT_CLEANUP_TIME)
-            .await
-            .unwrap_or(false);
-        Ok((status.code(), quiescent))
+        let quiescence: Result<bool> = child.wait_family_empty(GIT_CLEANUP_TIME).await;
+        let quiescence_class = quiescence_class_for(&quiescence);
+        let quiescent = quiescence.unwrap_or(false);
+        Ok((status.code(), quiescent, quiescence_class))
     }
     #[cfg(target_os = "linux")]
     {
@@ -1963,15 +1990,14 @@ async fn wait_owned_child(child: &mut OwnedChild) -> Result<(Option<i32>, bool)>
             .wait_exit_unreaped()
             .await
             .map_err(|_| unavailable("Git leader exit observation failed"))?;
-        let quiescent = child
-            .wait_group_empty_except_leader(GIT_CLEANUP_TIME)
-            .await
-            .unwrap_or(false);
+        let quiescence: Result<bool> = child.wait_group_empty_except_leader(GIT_CLEANUP_TIME).await;
+        let quiescence_class = quiescence_class_for(&quiescence);
         let status = child
             .wait()
             .await
             .map_err(|_| unavailable("Git child wait failed"))?;
-        Ok((status.code(), quiescent))
+        let quiescent = quiescence.unwrap_or(false);
+        Ok((status.code(), quiescent, quiescence_class))
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
@@ -1979,7 +2005,7 @@ async fn wait_owned_child(child: &mut OwnedChild) -> Result<(Option<i32>, bool)>
             .wait()
             .await
             .map_err(|_| unavailable("Git child wait failed"))?;
-        Ok((status.code(), false))
+        Ok((status.code(), false, Some("other")))
     }
     #[cfg(not(any(windows, unix)))]
     {
@@ -1991,11 +2017,12 @@ async fn wait_owned_child(child: &mut OwnedChild) -> Result<(Option<i32>, bool)>
     }
 }
 
-async fn stop_owned_child(child: &mut OwnedChild) -> (Option<i32>, bool) {
+async fn stop_owned_child(child: &mut OwnedChild) -> (Option<i32>, bool, Option<&'static str>) {
     let _ = child.terminate();
     match timeout_at(Instant::now() + GIT_CLEANUP_TIME, wait_owned_child(child)).await {
         Ok(Ok(result)) => result,
-        _ => (None, false),
+        Ok(Err(error)) => (None, false, quiescence_class_for(&Err(error))),
+        Err(_) => (None, false, Some("timeout")),
     }
 }
 
@@ -2834,5 +2861,27 @@ mod tests {
         if let Some(view) = execution.cleanup_view.take() {
             cleanup_after_settlement(&fixture.data_root, &view);
         }
+    }
+
+    #[test]
+    fn quiescence_class_preserves_error_category() {
+        assert_eq!(quiescence_class_for(&Ok(true)), None);
+        assert_eq!(quiescence_class_for(&Ok(false)), Some("timeout"));
+        assert_eq!(
+            quiescence_class_for(&Err(Error::new("platform_io", "synthetic"))),
+            Some("platform_io")
+        );
+        assert_eq!(
+            quiescence_class_for(&Err(Error::new("process_custody_unknown", "synthetic"))),
+            Some("process_custody_unknown")
+        );
+        assert_eq!(
+            quiescence_class_for(&Err(Error::new("unavailable", "synthetic"))),
+            Some("other")
+        );
+        assert_eq!(
+            quiescence_class_for(&Err(Error::new("some_other_code", "synthetic"))),
+            Some("other")
+        );
     }
 }
