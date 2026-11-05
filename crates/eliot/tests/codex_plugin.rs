@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[allow(dead_code)]
 #[path = "support/mod.rs"]
 mod support;
 use support::{Fixture, cli};
@@ -573,11 +574,10 @@ async fn scenario_native_child_observation() {
     let codex_home = fixture.root.join("codex_home");
     std::fs::create_dir_all(&codex_home).expect("create codex_home");
 
-    unsafe {
-        std::env::set_var("ELIOT_FAKE_CODEX_SCRIPT", "scenario-children");
-        std::env::set_var("ELIOT_FAKE_CODEX_REPORT", report_path.to_str().unwrap());
-        std::env::set_var("ELIOT_FAKE_CODEX_HOME", codex_home.to_str().unwrap());
-    }
+    fixture
+        .env("ELIOT_FAKE_CODEX_SCRIPT", "scenario-children")
+        .env("ELIOT_FAKE_CODEX_REPORT", &report_path)
+        .env("ELIOT_FAKE_CODEX_HOME", &codex_home);
 
     let self_exe = std::env::current_exe().expect("current test exe");
     let config_toml = format!(
