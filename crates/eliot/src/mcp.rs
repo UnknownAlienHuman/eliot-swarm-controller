@@ -29,12 +29,21 @@ use rmcp::model::{
     PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::{MaybeSendFuture, RequestContext, RoleServer};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
 const TOOL_NAME: &str = "swarm";
 const TOOL_DESCRIPTION: &str =
     "Generic Eliot management call: { method, params } -> authenticated daemon RPC result";
+
+const INVALID_ARGS_MESSAGE: &str = "tool arguments must be an object with method and params";
+
+#[derive(rmcp::serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolArgs {
+    method: String,
+    params: Map<String, Value>,
+}
 
 /// MCP stdio entry point. The `data_dir` already comes from `--data-dir` /
 /// `ELIOT_HOME` resolution in `main.rs`; no daemon is started here.
@@ -80,40 +89,19 @@ impl ServerHandler for EliotMcpHandler {
         let data_dir = self.data_dir.clone();
         async move {
             if request.name.as_ref() != TOOL_NAME {
-                return Err(McpError::method_not_found::<
-                    rmcp::model::CallToolRequestMethod,
-                >());
+                return Err(McpError::invalid_params("tool not found", None));
             }
-            let Some(arguments) = request.arguments else {
-                return Err(McpError::invalid_params(
-                    "tool arguments must be an object with method and params",
-                    None,
-                ));
-            };
-            let method = arguments
-                .get("method")
-                .and_then(Value::as_str)
-                .filter(|method| !method.trim().is_empty());
-            let Some(method) = method else {
-                return Err(McpError::invalid_params(
-                    "tool arguments must be an object with method and params",
-                    None,
-                ));
-            };
-            let params = arguments.get("params");
-            let Some(params) = params else {
-                return Err(McpError::invalid_params(
-                    "tool arguments must be an object with method and params",
-                    None,
-                ));
-            };
-            if !params.is_object() {
-                return Err(McpError::invalid_params(
-                    "tool arguments must be an object with method and params",
-                    None,
-                ));
+            let args = request
+                .arguments
+                .map(Value::Object)
+                .ok_or_else(|| McpError::invalid_params(INVALID_ARGS_MESSAGE, None))?;
+            let parsed: ToolArgs = serde_json::from_value(args)
+                .map_err(|_| McpError::invalid_params(INVALID_ARGS_MESSAGE, None))?;
+            if parsed.method.trim().is_empty() {
+                return Err(McpError::invalid_params(INVALID_ARGS_MESSAGE, None));
             }
-            if let Ok(encoded) = serde_json::to_string(params)
+            let params = Value::Object(parsed.params);
+            if let Ok(encoded) = serde_json::to_string(&params)
                 && encoded.len().saturating_add(1) > eliot_daemon::MAX_RPC_FRAME_BYTES
             {
                 return Ok(CallToolResult::error(vec![rmcp::model::ContentBlock::text(
@@ -121,9 +109,9 @@ impl ServerHandler for EliotMcpHandler {
                 )])
                 .into());
             }
-            match eliot_daemon::client_call(Path::new(&data_dir), method, params.clone()).await {
+            match eliot_daemon::client_call(Path::new(&data_dir), &parsed.method, params).await {
                 Ok(value) => Ok(CallToolResult::structured(
-                    json!({ "method": method, "result": value }),
+                    json!({ "method": parsed.method, "result": value }),
                 )
                 .into()),
                 Err(error) => Ok(CallToolResult::structured_error(json!({
