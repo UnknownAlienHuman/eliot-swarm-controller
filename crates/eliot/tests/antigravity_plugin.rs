@@ -1367,10 +1367,14 @@ async fn associate_held_stdout_send(
             biased;
             request = scenario.host.next_request() => {
                 assert_eq!(request.method, "events.put");
+                assert_eq!(request.params["agent_id"], scenario.agent_id);
+                assert_eq!(request.params["generation"], 1);
+                assert_eq!(request.params["source"], "stream");
                 let events = request.params.get("events").and_then(Value::as_array)
                     .cloned().unwrap_or_default();
                 assert_eq!(events.len(), 1);
                 assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("turn.started"));
+                assert_eq!(events[0]["data"]["command_id"], send_id);
                 turn_id = events[0].get("data").and_then(|data| data.get("turn_id"))
                     .and_then(Value::as_str).map(ToOwned::to_owned);
                 assert!(turn_id.as_ref().is_some_and(|turn| !turn.is_empty()));
@@ -1400,15 +1404,21 @@ async fn wait_for_held_stdout_process_exit(
     send_id: &str,
     exit_deadline: std::time::Instant,
 ) -> Value {
+    let tokio_deadline = tokio::time::Instant::from_std(exit_deadline);
     loop {
-        let snapshot = snapshot(&mut scenario.host, &scenario.agent_id, 1, send_id).await;
-        if snapshot.get("process_exited").and_then(Value::as_bool) == Some(true) {
-            break snapshot;
-        }
+        let snapshot = tokio::time::timeout_at(
+            tokio_deadline,
+            snapshot(&mut scenario.host, &scenario.agent_id, 1, send_id),
+        )
+        .await;
         assert!(
             std::time::Instant::now() < exit_deadline,
             "owned process exit observation deadline"
         );
+        let snapshot = snapshot.expect("owned process exit observation deadline");
+        if snapshot.get("process_exited").and_then(Value::as_bool) == Some(true) {
+            break snapshot;
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
