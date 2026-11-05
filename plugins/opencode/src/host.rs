@@ -39,6 +39,7 @@ struct OpenCodePlugin {
 struct Initialized {
     credential: String,
     instance_dir: String,
+    store_root: String,
 }
 
 struct FailedStart {
@@ -99,6 +100,7 @@ struct ParsedStart {
     secrets: Vec<String>,
     credential: String,
     instance_dir: String,
+    store_root: String,
     resume: Option<ResumeSubject>,
 }
 
@@ -236,19 +238,24 @@ impl OpenCodePlugin {
     fn initialize(&mut self, raw: &Value) -> Result<Value> {
         let params: InitializeParams =
             decode(raw, "OpenCode plugin initialize params are invalid")?;
+        let store_root = params.store_root.clone().unwrap_or_default();
         if params.protocol != "eliot-plugin/1"
             || params.instance_dir.trim().is_empty()
             || params.credential.trim().is_empty()
             || params.credential.len() > eliot_plugin::protocol::MAX_CREDENTIAL_BYTES
+            || params.store_root.is_none()
+            || !Path::new(&store_root).is_absolute()
+            || store_root.trim().is_empty()
         {
             return Err(Error::new(
                 "invalid",
-                "OpenCode plugin initialize requires protocol, private instance directory, and credential",
+                "OpenCode plugin initialize requires protocol, private instance directory, absolute store root, and credential",
             ));
         }
         if let Some(existing) = &self.initialized {
             if existing.credential != params.credential
                 || existing.instance_dir != params.instance_dir
+                || existing.store_root != store_root
             {
                 return Err(Error::new(
                     "bad_state",
@@ -259,6 +266,7 @@ impl OpenCodePlugin {
             self.initialized = Some(Initialized {
                 credential: params.credential,
                 instance_dir: params.instance_dir,
+                store_root,
             });
         }
         serde_json::to_value(opencode_manifest())
@@ -347,6 +355,7 @@ impl OpenCodePlugin {
             secrets,
             credential: initialized.credential.clone(),
             instance_dir: initialized.instance_dir.clone(),
+            store_root: initialized.store_root.clone(),
             resume,
         })))
     }
@@ -438,6 +447,7 @@ impl OpenCodePlugin {
                 program: parsed.program.clone(),
                 workspace: parsed.workspace.clone(),
                 instance_dir: PathBuf::from(&parsed.instance_dir),
+                store_root: PathBuf::from(&parsed.store_root),
                 agent_id: parsed.params.agent_id.clone(),
                 environment: parsed.environment.clone(),
                 model: parsed.requested_model.clone(),

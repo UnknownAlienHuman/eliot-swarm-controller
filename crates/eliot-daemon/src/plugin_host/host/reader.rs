@@ -29,6 +29,7 @@ pub(super) struct ReaderTransport {
     pub secrets: Arc<[String]>,
     pub credential: String,
     instance_dir: PathBuf,
+    store_root: PathBuf,
     observer: Option<CustodyObserver>,
     requests: JoinHandle<()>,
     stderr: StderrCapture,
@@ -183,6 +184,7 @@ impl PluginHost {
                 secrets,
                 credential,
                 instance_dir,
+                store_root: self.state.data_root.join("plugins"),
                 observer,
                 requests,
                 stderr,
@@ -203,7 +205,9 @@ impl ReaderTransport {
     ) -> Result<PluginManifest> {
         let value = self.client.call("initialize", json!({
             "protocol": "eliot-plugin/1", "credential": self.credential,
-            "instance_dir": self.instance_dir.to_string_lossy(), "config": {"harness": harness},
+            "instance_dir": self.instance_dir.to_string_lossy(),
+            "store_root": self.store_root.to_string_lossy(),
+            "config": {"harness": harness},
         }), until).await?;
         let manifest: PluginManifest = serde_json::from_value(value)
             .map_err(|_| Error::new("unsupported", "invalid reader manifest"))?;

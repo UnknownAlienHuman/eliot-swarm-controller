@@ -2100,6 +2100,7 @@ impl Scenario {
                     "protocol": "eliot-plugin/1",
                     "credential": credential,
                     "instance_dir": root.join(instance).to_string_lossy(),
+                    "store_root": root.to_string_lossy(),
                     "config": {},
                 }),
             )
@@ -3028,6 +3029,7 @@ async fn scenario_invalid_profile_rejected_before_spawn(owned: OwnedChildren) {
                 "protocol": "eliot-plugin/1",
                 "credential": format!("credential-{}", ulid::Ulid::new()),
                 "instance_dir": root.join("instance").to_string_lossy(),
+                "store_root": root.to_string_lossy(),
                 "config": {},
             }),
         )

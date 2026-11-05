@@ -717,6 +717,12 @@ impl EventProcessor {
         session_id: String,
         effective: Value,
     ) -> Result<()> {
+        if self.loss_reason.is_some() {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode retained session event stream lost native frames during resume",
+            ));
+        }
         if self.stashed_started.is_some()
             || !self.seen_inbox.is_empty()
             || self.preflight_activity()
@@ -1936,7 +1942,9 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{Control, EventConfig, EventHandle, EventProcessor, EventStatus, TurnFacts};
+    use super::{
+        Control, EventConfig, EventHandle, EventProcessor, EventStatus, StreamState, TurnFacts,
+    };
     use tokio::time::Instant;
 
     fn handle_with(status: EventStatus) -> EventHandle {
@@ -2042,5 +2050,40 @@ mod tests {
                 .await
                 .expect_err("no association without our terminal turn");
         }
+    }
+
+    /// A native queue-overflow loss observed before resume preflight must
+    /// refuse `resume_ready` even when no inbox/start activity is visible:
+    /// the lost frames could have carried exactly that activity.
+    #[tokio::test]
+    async fn resume_ready_refuses_a_deferred_native_frame_loss() {
+        let http = crate::native::client::OpenCodeHttp::new(1, "pw".to_owned()).expect("client");
+        let peer = eliot_plugin::Peer::stdio();
+        let mut processor = EventProcessor::new(
+            http,
+            peer.client(),
+            EventConfig {
+                credential: "cred".to_owned(),
+                agent_id: "agent".to_owned(),
+                generation: 1,
+                secrets: Vec::new(),
+            },
+        );
+        processor.handle_stream_state(StreamState::Overflow).await;
+        assert_eq!(
+            processor.loss_reason,
+            Some("OpenCode event queue overflowed")
+        );
+        assert!(processor.status.failure.is_none());
+        let error = processor
+            .resume_ready(
+                "scope".to_owned(),
+                "session-1".to_owned(),
+                serde_json::json!({}),
+            )
+            .await
+            .expect_err("resume must refuse after observed native frame loss");
+        assert_eq!(error.code, "unknown");
+        assert!(!processor.status.ready);
     }
 }

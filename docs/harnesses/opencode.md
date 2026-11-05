@@ -16,6 +16,11 @@ per Agent unless the installed API demonstrates exact session event/request attr
 isolated tool environment, isolated stop and restoration of that environment after
 restart. Otherwise an owner-run shared session is observe-only.
 
+The host-owned store root is passed at `initialize` as `store_root`; the plugin
+derives the per-Agent store as `opencode-{agent_id}/data` under that root. It
+equals the old `instance_dir` parent (`{data_root}/plugins`), so the on-disk
+layout and per-Agent identity are unchanged across generations.
+
 Server custody is separate from Agent custody. Adopted services are never signalled or
 repaired. New/uncertain controller takeover increments Eliot generation; exact recovery
 of the same live controller may preserve it.

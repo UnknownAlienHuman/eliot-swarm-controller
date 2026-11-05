@@ -56,6 +56,7 @@ pub struct ServerLaunch {
     pub program: OsString,
     pub workspace: PathBuf,
     pub instance_dir: PathBuf,
+    pub store_root: PathBuf,
     pub agent_id: String,
     pub environment: Vec<(OsString, OsString)>,
     pub model: String,
@@ -81,7 +82,7 @@ impl OwnedServer {
     /// `env_clear` and no third allowlist.
     pub async fn spawn(launch: ServerLaunch, secrets: &[String]) -> Result<Self> {
         let config_dir = launch.instance_dir.join("config").join("opencode");
-        let data_dir = stable_store_dir(&launch.instance_dir, &launch.agent_id)?;
+        let data_dir = stable_store_dir(&launch.store_root, &launch.agent_id)?;
         std::fs::create_dir_all(&config_dir).map_err(|error| {
             Error::new(
                 "native_spawn",
@@ -314,13 +315,16 @@ impl OwnedServer {
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The per-Agent session store: `opencode-{agent_id}/data` next to the
-/// plugin instance directories. The daemon creates every instance directory
-/// directly under `{data_root}/plugins`
-/// (`plugin_host/host.rs::create_instance_dir_with`), so the instance
-/// parent is that directory; a missing parent fails the start honestly
-/// instead of serving an unrelated store. The agent id allowlist keeps the
-/// derived segment a single safe path component (`a12`, ULIDs).
-fn stable_store_dir(instance_dir: &Path, agent_id: &str) -> Result<PathBuf> {
+/// host-owned `store_root` (the old `instance_dir` parent, `{data_root}/plugins`).
+/// The per-generation `instance_dir` does not affect this path. The agent id
+/// allowlist keeps the derived segment a single safe path component.
+fn stable_store_dir(store_root: &Path, agent_id: &str) -> Result<PathBuf> {
+    if !store_root.is_absolute() || store_root.as_os_str().is_empty() {
+        return Err(Error::new(
+            "invalid",
+            "OpenCode store root must be an absolute path",
+        ));
+    }
     if agent_id.is_empty()
         || agent_id.len() > 64
         || !agent_id
@@ -332,13 +336,7 @@ fn stable_store_dir(instance_dir: &Path, agent_id: &str) -> Result<PathBuf> {
             "OpenCode Agent id cannot name a stable session store",
         ));
     }
-    let plugins_dir = instance_dir.parent().ok_or_else(|| {
-        Error::new(
-            "invalid",
-            "OpenCode instance directory has no plugin parent",
-        )
-    })?;
-    Ok(plugins_dir
+    Ok(store_root
         .join(format!("opencode-{agent_id}"))
         .join("data"))
 }
@@ -376,31 +374,30 @@ mod tests {
 
     #[test]
     fn stable_store_is_per_agent_beside_the_instance_dirs() {
-        let instance = PathBuf::from("/eliot/plugins/a12-g1-01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        let store = stable_store_dir(&instance, "a12").expect("stable store");
-        assert_eq!(store, PathBuf::from("/eliot/plugins/opencode-a12/data"));
-        // A later generation of the same Agent serves the same store.
-        let instance2 = PathBuf::from("/eliot/plugins/a12-g2-01ARZ3NDEKTSV4RRFFQ69G5FAW");
-        assert_eq!(
-            stable_store_dir(&instance2, "a12").expect("stable store"),
-            store
-        );
+        // Platform-absolute root without I/O: `is_absolute` on Windows
+        // rejects root-relative `/eliot/plugins`, so build from temp_dir.
+        let store_root = std::env::temp_dir().join(format!("eliot-plugins-{}", std::process::id()));
+        let store = stable_store_dir(&store_root, "a12").expect("stable store");
+        assert_eq!(store, store_root.join("opencode-a12").join("data"));
         // Another Agent gets another store.
         assert_ne!(
-            stable_store_dir(&instance, "a13").expect("stable store"),
+            stable_store_dir(&store_root, "a13").expect("stable store"),
             store
         );
         // Uppercase ULID agent ids (the plugin-test shape) are safe too.
         assert!(
-            stable_store_dir(&instance, "01ARZ3NDEKTSV4RRFFQ69G5FAV").is_ok(),
+            stable_store_dir(&store_root, "01ARZ3NDEKTSV4RRFFQ69G5FAV").is_ok(),
             "ULID agent id"
         );
         for bad in ["", "a/12", "a\\12", "..", "a 12", &"a".repeat(65)] {
             assert!(
-                stable_store_dir(&instance, bad).is_err(),
+                stable_store_dir(&store_root, bad).is_err(),
                 "unsafe agent id {bad:?}"
             );
         }
+        // Malformed (relative/empty) store roots are rejected before I/O.
+        assert!(stable_store_dir(Path::new("plugins"), "a12").is_err());
+        assert!(stable_store_dir(Path::new(""), "a12").is_err());
     }
 
     #[test]

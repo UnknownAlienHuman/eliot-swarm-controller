@@ -219,6 +219,8 @@ pub struct InitializeParams {
     pub protocol: String,
     pub credential: String,
     pub instance_dir: String,
+    #[serde(default)]
+    pub store_root: Option<String>,
     #[serde(default = "empty_object")]
     pub config: Value,
 }
