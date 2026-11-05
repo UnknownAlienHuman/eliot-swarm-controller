@@ -96,17 +96,17 @@ pub(crate) struct WorkflowChildKey {
     parent_session: String,
     workflow_run: String,
     child_id: String,
-    attempt: u32,
+    attempt: i64,
 }
 
 impl WorkflowChildKey {
     /// Build K. Parts must be non-blank with no control characters;
-    /// `attempt` is the 1-based wire retry index.
+    /// `attempt` is retained as the exact signed integer from the SDK wire.
     pub(crate) fn new(
         parent_session: impl Into<String>,
         workflow_run: impl Into<String>,
         child_id: impl Into<String>,
-        attempt: u32,
+        attempt: i64,
     ) -> Result<Self> {
         let key = Self {
             parent_session: parent_session.into(),
@@ -126,12 +126,6 @@ impl WorkflowChildKey {
                     "Muse workflow child omitted its exact child identity",
                 ));
             }
-        }
-        if self.attempt == 0 {
-            return Err(Error::new(
-                "native_protocol",
-                "Muse workflow child attempt is not a positive retry index",
-            ));
         }
         Ok(())
     }
@@ -204,12 +198,6 @@ pub(crate) fn muse_child_key(
     child_id: &str,
     attempt: i64,
 ) -> Result<WorkflowChildKey> {
-    let attempt = u32::try_from(attempt).map_err(|_| {
-        Error::new(
-            "native_protocol",
-            "Muse workflow child attempt is not a positive retry index",
-        )
-    })?;
     WorkflowChildKey::new(parent_session, workflow_run_id, child_id, attempt)
 }
 
@@ -508,6 +496,7 @@ impl WorkflowChildState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::types::NativeWorkflowItemNotification;
     use eliot_core::{Agent, AgentControl, AgentOrigin, AgentState};
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -519,6 +508,40 @@ mod tests {
     const CHILD: &str = "child-sanitized";
     const ITEM: &str = "workflow-item-sanitized";
     const PARENT_TURN: &str = "parent-turn-sanitized";
+
+    fn workflow_child_wire(
+        attempt: i64,
+        revision: i64,
+        item_status: &str,
+        child_status: &str,
+        terminal: Option<&str>,
+    ) -> NativeWorkflowItemNotification {
+        let mut child = json!({
+            "childId": CHILD,
+            "attempt": attempt,
+            "status": child_status,
+        });
+        if let Some(terminal) = terminal {
+            child["terminal"] = json!(terminal);
+        }
+        serde_json::from_value(json!({
+            "sessionId": PARENT,
+            "sourceRange": {
+                "stream": {"kind": "session", "id": PARENT},
+                "first": {"id": ITEM, "sequence": revision},
+                "last": {"id": format!("revision-{revision}"), "sequence": revision},
+            },
+            "item": {
+                "itemId": ITEM,
+                "kind": "workflow",
+                "revision": revision,
+                "status": item_status,
+                "workflowRunId": RUN,
+                "children": [child],
+            },
+        }))
+        .expect("sanitized SDK workflow child revision")
+    }
 
     fn key() -> WorkflowChildKey {
         WorkflowChildKey::new(PARENT, RUN, CHILD, 1).expect("sanitized key")
@@ -656,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn key_parts_reject_blank_control_and_bad_attempt() {
+    fn key_parts_reject_blank_and_control_identity() {
         for (parent, run, child) in [
             ("", RUN, CHILD),
             ("   ", RUN, CHILD),
@@ -669,14 +692,122 @@ mod tests {
                 "parent={parent:?} run={run:?} child={child:?}"
             );
         }
-        for attempt in [0, -1, i64::MIN, i64::from(u32::MAX) + 1] {
+    }
+
+    #[test]
+    fn sdk_wire_attempts_reach_registration_turn_facts_without_collision() {
+        let attempts = [1_i64, 0, -1, 4_294_967_296];
+        let mut tracked = std::collections::HashMap::new();
+        let mut native_refs = std::collections::HashSet::new();
+        let mut registration_ids = std::collections::HashSet::new();
+        let mut turn_ids = std::collections::HashSet::new();
+
+        for attempt in attempts {
+            let scheduled = workflow_child_wire(attempt, 2, "inProgress", "scheduled", None);
+            let child = scheduled.item.children.first().expect("wire child");
+            assert_eq!(child.attempt, attempt);
+            let key = muse_child_key(
+                &scheduled.session_id,
+                &scheduled.item.workflow_run_id,
+                &child.child_id,
+                child.attempt,
+            )
+            .expect("exact wire attempt remains keyable");
+            assert_eq!(
+                key.native_ref(),
+                format!("muse:child:{PARENT}:{RUN}:{CHILD}:{attempt}")
+            );
+            let native_ref = key.native_ref();
+            let registration_id = key.registration_id();
+            let turn_id = key.turn_id();
+            assert!(native_refs.insert(native_ref.clone()), "attempt={attempt}");
             assert!(
-                muse_child_key(PARENT, RUN, CHILD, attempt).is_err(),
+                registration_ids.insert(registration_id.clone()),
                 "attempt={attempt}"
             );
+            assert!(turn_ids.insert(turn_id.clone()), "attempt={attempt}");
+
+            let mut state = WorkflowChildState::new();
+            state.observe_rev(
+                scheduled.item.revision,
+                &scheduled.item.status,
+                scheduled.source_range.clone(),
+            );
+            assert_eq!(
+                state.plan(&child.status, child.terminal.as_deref()),
+                PlannedAction::Register,
+                "attempt={attempt}"
+            );
+
+            let registration = key
+                .build_registration("parent-agent-sanitized", 7, "muse-home-sanitized")
+                .expect("wire identity builds registration");
+            let ack = test_ack(&registration);
+            registration
+                .validate_ack(&ack, "muse", &WORKFLOW_CHILD_FAMILIES)
+                .expect("matching observe-only ACK");
+            let binding = binding_from_ack(registration.clone(), &ack);
+            assert_eq!(binding.registration.native_ref, native_ref);
+            assert_eq!(binding.registration.registration_id, registration_id);
+            assert_eq!(binding.native_ref, native_ref);
+            state.binding = Some(binding);
+
+            let live = workflow_child_wire(attempt, 3, "inProgress", "started", None);
+            let live_child = live.item.children.first().expect("live wire child");
+            state.observe_rev(
+                live.item.revision,
+                &live.item.status,
+                live.source_range.clone(),
+            );
+            assert_eq!(
+                state.plan(&live_child.status, live_child.terminal.as_deref()),
+                PlannedAction::Start,
+                "attempt={attempt}"
+            );
+            assert_eq!(start_event_data(&key), json!({"turn_id": turn_id}));
+            assert_eq!(
+                child_event_id(&key, "turn.started").expect("start identity"),
+                format!("{turn_id}:turn.started")
+            );
+            state.started = true;
+
+            let terminal =
+                workflow_child_wire(attempt, 4, "completed", "terminal", Some("completed"));
+            let terminal_child = terminal.item.children.first().expect("terminal wire child");
+            state.observe_rev(
+                terminal.item.revision,
+                &terminal.item.status,
+                terminal.source_range.clone(),
+            );
+            assert_eq!(
+                state.plan(&terminal_child.status, terminal_child.terminal.as_deref()),
+                PlannedAction::Complete {
+                    status: "completed"
+                },
+                "attempt={attempt}"
+            );
+            assert_eq!(
+                complete_event_data(&key, "completed"),
+                json!({"turn_id": turn_id, "status": "completed"})
+            );
+            assert_eq!(
+                child_event_id(&key, "turn.completed").expect("complete identity"),
+                format!("{turn_id}:turn.completed")
+            );
+            state.completed_status = Some("completed".to_owned());
+            state.completed_revision = Some(terminal.item.revision);
+            assert_eq!(
+                state.plan(&terminal_child.status, terminal_child.terminal.as_deref()),
+                PlannedAction::Ignore,
+                "duplicate terminal stays deduplicated for attempt={attempt}"
+            );
+            assert!(tracked.insert(key, state).is_none(), "attempt={attempt}");
         }
-        assert!(muse_child_key(PARENT, RUN, CHILD, 1).is_ok());
-        assert!(muse_child_key(PARENT, RUN, CHILD, i64::from(u32::MAX)).is_ok());
+
+        assert_eq!(tracked.len(), attempts.len());
+        assert_eq!(native_refs.len(), attempts.len());
+        assert_eq!(registration_ids.len(), attempts.len());
+        assert_eq!(turn_ids.len(), attempts.len());
     }
 
     #[test]
