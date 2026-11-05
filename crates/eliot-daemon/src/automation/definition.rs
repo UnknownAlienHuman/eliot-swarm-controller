@@ -100,12 +100,20 @@ enum AgentActionDefinition {
         expected_generation: Value,
         expected_turn_id: Value,
         request_id: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        choice: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feedback: Option<Value>,
     },
     Deny {
         target: Value,
         expected_generation: Value,
         expected_turn_id: Value,
         request_id: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        choice: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feedback: Option<Value>,
     },
     Answer {
         target: Value,
@@ -335,6 +343,20 @@ impl AgentActionDefinition {
             Self::Approve { request_id, .. } => Some((request_id, "approve")),
             Self::Deny { request_id, .. } => Some((request_id, "deny")),
             Self::Answer { request_id, .. } => Some((request_id, "answer")),
+            _ => None,
+        }
+    }
+
+    fn approval_choice(&self) -> Option<&Value> {
+        match self {
+            Self::Approve { choice, .. } | Self::Deny { choice, .. } => choice.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn approval_feedback(&self) -> Option<&Value> {
+        match self {
+            Self::Approve { feedback, .. } | Self::Deny { feedback, .. } => feedback.as_ref(),
             _ => None,
         }
     }
@@ -609,6 +631,8 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         .transpose()?
         .map(|text| json!({"text": text}))
         .or_else(|| action.answers().map(|answers| json!({"answers": answers})))
+        .or_else(|| approval_reply_args(action, &roots, verb))
+        .or_else(|| Some(json!({})))
         .unwrap_or_else(|| json!({}));
     let expected_turn_id = action
         .turn_binding()
@@ -631,6 +655,41 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         expected_turn_id,
         request_id,
     )))
+}
+
+fn approval_reply_args(
+    action: &AgentActionDefinition,
+    roots: &TemplateRoots<'_>,
+    verb: &str,
+) -> Option<Value> {
+    let choice = action.approval_choice();
+    let feedback = action.approval_feedback();
+    if choice.is_none() && feedback.is_none() {
+        return None;
+    }
+    let mut args = serde_json::Map::new();
+    if let Some(source) = choice {
+        args.insert(
+            "choice_id".to_owned(),
+            Value::String(render_exact_string(source, roots, verb, "choice").ok()?),
+        );
+    }
+    if let Some(source) = feedback {
+        args.insert(
+            "feedback".to_owned(),
+            Value::String(
+                render_text(
+                    source,
+                    roots,
+                    MAX_EVENT_BYTES,
+                    verb,
+                    "64 KiB persisted-text bound",
+                )
+                .ok()?,
+            ),
+        );
+    }
+    Some(Value::Object(args))
 }
 
 fn render_event_binding(
@@ -992,6 +1051,30 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
     }
     if let Some((request_id, verb)) = action.request_binding() {
         validate_event_binding_template(request_id, verb, "request_id")?;
+    }
+    if let Some(choice) = action.approval_choice() {
+        validate_event_binding_template(choice, action.verb(), "choice")?;
+    }
+    if let Some(feedback) = action.approval_feedback() {
+        validate_text_template(
+            feedback,
+            true,
+            MAX_EVENT_BYTES,
+            action.verb(),
+            "64 KiB persisted-text bound",
+        )?;
+        let text = feedback.as_str().ok_or_else(|| {
+            Error::new(
+                "invalid",
+                format!("{} feedback must be a string", action.verb()),
+            )
+        })?;
+        if text.trim().is_empty() {
+            return Err(Error::new(
+                "invalid",
+                format!("{} feedback cannot be empty", action.verb()),
+            ));
+        }
     }
     Ok(())
 }
@@ -2570,6 +2653,36 @@ do = [{ action = 'git.fetch', repository = 'project-one', remote = 'origin', sou
             if verb == "answer" {
                 assert_eq!(wire_action["answers"], expected_args["answers"]);
             }
+            let saved = serde_json::to_string(&rule).unwrap();
+            let restored = RuleDefinition::deserialize_saved(&saved).unwrap();
+            assert_eq!(
+                restored.semantic_digest().unwrap(),
+                rule.semantic_digest().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn approve_and_deny_forward_optional_choice_and_feedback_args() {
+        for verb in ["approve", "deny"] {
+            let source = APPROVE_REQUEST_RULE
+                .replace("action = 'approve'", &format!("action = '{verb}'"))
+                .replace(
+                    "request_id = '${event.data.request_id}' }]",
+                    "request_id = '${event.data.request_id}', choice = 'always', feedback = 'trust it' }]",
+                );
+            let rule = load(Cursor::new(source)).unwrap().remove(0);
+            let command = evaluate(&rule, &request_opened_event())
+                .unwrap()
+                .expect("approval command");
+            assert_eq!(command.verb, verb);
+            assert_eq!(
+                command.args,
+                json!({"choice_id": "always", "feedback": "trust it"})
+            );
+            let wire = serde_json::to_value(&rule).unwrap()["do"][0].clone();
+            assert_eq!(wire["choice"], "always");
+            assert_eq!(wire["feedback"], "trust it");
             let saved = serde_json::to_string(&rule).unwrap();
             let restored = RuleDefinition::deserialize_saved(&saved).unwrap();
             assert_eq!(

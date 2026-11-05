@@ -244,7 +244,9 @@ nonempty string `data.turn_id` and `request_id` to its nonempty string `data.req
 both may be literal values or whole-value templates, but must equal the captured fields.
 Rule rendering uses only that event and never fills a missing id or retargets another
 request; Router/Store revalidate the exact current request before the effect. `approve`
-and `deny` produce empty command args. `answer` accepts a literal answers map, passes it unchanged
+and `deny` accept optional `choice` (whole-value template allowed, rendered to `choice_id`) and
+optional `feedback` (text template allowed, rendered to `feedback`); neither defaults to any
+choice. `answer` accepts a literal answers map, passes it unchanged
 under `SubmitCommand.args.answers`, and does not template-expand question ids or values.
 Each question id maps to an object containing its native `answers` array. For one answer,
 `SubmitCommand.args` is `{"answers":{"question-id":{"answers":["Continue"]}}}`.
