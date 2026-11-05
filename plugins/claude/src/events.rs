@@ -9,7 +9,7 @@ use eliot_plugin::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
@@ -153,6 +153,8 @@ struct EventProcessor {
     gap_number: u64,
     pending_turn: Option<PendingTurn>,
     pending_requests: HashMap<String, PendingNativeRequest>,
+    deny_uncertain: HashSet<String>,
+    permission_admission_fenced: bool,
     message_seq: u64,
     accept_frames: bool,
     planned_stop: bool,
@@ -514,6 +516,8 @@ impl EventProcessor {
             gap_number: 0,
             pending_turn: None,
             pending_requests: HashMap::new(),
+            deny_uncertain: HashSet::new(),
+            permission_admission_fenced: false,
             message_seq: 0,
             accept_frames: true,
             planned_stop: false,
@@ -956,18 +960,31 @@ impl EventProcessor {
             .await
     }
 
-    /// Deny a permission ask that has no exact active turn to bind to.
-    /// The CLI unblocks on the explicit deny; the uncommitted ask is still a
-    /// stream gap (recorded by the caller). Best-effort before readiness or
-    /// after stop, when no client or live session remains.
-    async fn deny_stray_request(&self, request_id: &str) {
-        let Some(native) = self.native.as_ref() else {
+    /// One native callback exists per request ID; a possible write fences it.
+    /// Neither a conflicting ask nor a turn result proves that ID safe to reuse.
+    async fn deny_stray_request(&mut self, request_id: &str) {
+        if self.permission_admission_fenced || self.deny_uncertain.contains(request_id) {
+            return;
+        }
+        if self.pending_requests.get(request_id).is_some_and(|entry| {
+            matches!(
+                entry.reply_state,
+                NativeReplyState::Writing | NativeReplyState::Unknown
+            )
+        }) {
+            self.retain_uncertain_id(request_id).await;
+            return;
+        }
+        let Some(native) = self.native.clone() else {
             return;
         };
         if self.status.session_id.is_none() || self.status.stopped {
             return;
         }
-        let _ = native
+        if !self.retain_uncertain_id(request_id).await {
+            return;
+        }
+        let result = native
             .respond_control(
                 request_id,
                 PermissionResult::Deny {
@@ -976,6 +993,100 @@ impl EventProcessor {
                 Instant::now() + EVENT_DEADLINE,
             )
             .await;
+        if let Err(error) = result
+            && matches!(
+                error.code.as_str(),
+                "native_not_dispatched" | "frame_too_large" | "native_encode"
+            )
+        {
+            self.deny_uncertain.remove(request_id);
+        }
+    }
+
+    async fn retain_uncertain_id(&mut self, request_id: &str) -> bool {
+        if self.permission_admission_fenced {
+            return false;
+        }
+        if self.deny_uncertain.contains(request_id) {
+            return true;
+        }
+        if self.deny_uncertain.len() >= MAX_PENDING_REQUESTS {
+            self.fence_permission_session().await;
+            return false;
+        }
+        self.deny_uncertain.insert(request_id.to_owned());
+        true
+    }
+
+    async fn fence_permission_session(&mut self) {
+        if self.permission_admission_fenced {
+            return;
+        }
+        self.permission_admission_fenced = true;
+        self.status.source_unknown = true;
+        self.status.failure = Some(
+            "Claude permission identity tracking is exhausted; native outcome is unknown"
+                .to_owned(),
+        );
+        self.publish_now();
+        if !self.gap_reported && !self.writes_blocked {
+            let _ = self
+                .record_gap("Claude permission identity tracking is exhausted")
+                .await;
+        }
+        if let Some(native) = self.native.clone() {
+            // EOF fences further callback delivery. Only host custody/stop can
+            // establish process exit and publish session.ended after its drain.
+            let _ = native.shutdown_input(Instant::now() + EVENT_DEADLINE).await;
+        }
+    }
+
+    async fn retain_unknown_reply(&mut self, request_id: &str, command_id: &str) {
+        if let Some(entry) = self.pending_requests.get_mut(request_id) {
+            entry.reply_state = NativeReplyState::Unknown;
+            entry.reply_command_id = Some(command_id.to_owned());
+        }
+        self.retain_uncertain_id(request_id).await;
+    }
+
+    /// Identical retained asks are no-ops. A conflicting ID cannot establish
+    /// whether the original or replacement callback would consume a decision;
+    /// an in-flight or uncertain owner reply therefore forbids a second write.
+    async fn handle_retained_duplicate(
+        &mut self,
+        request_id: &str,
+        body: &CanUseToolBody,
+    ) -> Option<Result<()>> {
+        let existing = self.pending_requests.get(request_id)?;
+        let same = existing.tool_name == body.tool_name
+            && existing.tool_use_id == body.tool_use_id
+            && Some(&existing.input) == body.input.as_ref();
+        if same {
+            return Some(Ok(()));
+        }
+        if self.deny_uncertain.contains(request_id)
+            || matches!(
+                existing.reply_state,
+                NativeReplyState::Writing | NativeReplyState::Unknown
+            )
+        {
+            if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                entry.reply_state = NativeReplyState::Unknown;
+            }
+            self.retain_uncertain_id(request_id).await;
+            return Some(
+                self.record_gap("Claude permission ask reused a fenced native request id")
+                    .await,
+            );
+        }
+        self.deny_stray_request(request_id).await;
+        if let Some(entry) = self.pending_requests.get_mut(request_id) {
+            entry.reply_state = NativeReplyState::Unknown;
+        }
+        Some(
+            self.record_gap("Claude permission ask reused its native request id")
+                .await,
+        )
     }
 
     /// One CLI `control_request`: only the `can_use_tool` permission ask is
@@ -1020,20 +1131,22 @@ impl EventProcessor {
                 "Claude can_use_tool omitted its tool name or input",
             ));
         }
-        // A re-issued open is idempotent when it repeats the retained ask;
-        // the same native id with another ask is an integrity gap.
-        if let Some(existing) = self.pending_requests.get(request_id) {
-            let same = existing.tool_name == body.tool_name
-                && existing.tool_use_id == body.tool_use_id
-                && Some(&existing.input) == body.input.as_ref();
-            if same {
-                return Ok(());
-            }
+        if self.permission_admission_fenced {
+            return Err(Error::new(
+                "unknown",
+                "Claude native permission admission is fenced",
+            ));
+        }
+        if let Some(result) = self.handle_retained_duplicate(request_id, &body).await {
+            return result;
+        }
+        if self.deny_uncertain.contains(request_id) {
             return self
-                .record_gap("Claude permission ask reused its native request id")
+                .record_gap("Claude permission ask reused a fenced native request id")
                 .await;
         }
         if self.pending_requests.len() >= MAX_PENDING_REQUESTS {
+            self.deny_stray_request(request_id).await;
             return self
                 .record_gap("Claude pending native request bound was exceeded")
                 .await;
@@ -1062,6 +1175,7 @@ impl EventProcessor {
             "details": details,
         });
         if serde_json::to_vec(&data).map_or(usize::MAX, |bytes| bytes.len()) > MAX_EVENT_BYTES {
+            self.deny_stray_request(request_id).await;
             return self
                 .record_gap("Claude normalized request exceeded the persisted-event bound")
                 .await;
@@ -1069,6 +1183,7 @@ impl EventProcessor {
         let native_id = match request_event_id(request_id, "request.opened", "claude", "Claude") {
             Ok(native_id) => native_id,
             Err(_) => {
+                self.deny_stray_request(request_id).await;
                 return self
                     .record_gap("Claude native request event identity exceeded its bound")
                     .await;
@@ -1099,6 +1214,11 @@ impl EventProcessor {
         verb: &str,
         args: &Value,
     ) -> std::result::Result<PermissionResult, Value> {
+        if self.permission_admission_fenced {
+            return Err(unknown_control(
+                "Claude native permission admission is fenced and unresolved",
+            ));
+        }
         let Some(entry) = self.pending_requests.get(request_id) else {
             return Err(rejected_control("Claude request is no longer pending"));
         };
@@ -1189,10 +1309,7 @@ impl EventProcessor {
                 }
                 return Ok(rejected_control("Claude request reply was not admitted"));
             }
-            if let Some(entry) = self.pending_requests.get_mut(request_id) {
-                entry.reply_state = NativeReplyState::Unknown;
-                entry.reply_command_id = Some(command_id.to_owned());
-            }
+            self.retain_unknown_reply(request_id, command_id).await;
             return Ok(unknown_control(
                 "Claude request reply may have been dispatched; it will not be repeated",
             ));
@@ -1208,10 +1325,7 @@ impl EventProcessor {
         let native_id = match request_event_id(request_id, "request.resolved", "claude", "Claude") {
             Ok(native_id) => native_id,
             Err(_) => {
-                if let Some(entry) = self.pending_requests.get_mut(request_id) {
-                    entry.reply_state = NativeReplyState::Unknown;
-                    entry.reply_command_id = Some(command_id.to_owned());
-                }
+                self.retain_unknown_reply(request_id, command_id).await;
                 self.record_gap("Claude native request event identity exceeded its bound")
                     .await?;
                 return Ok(unknown_control(
@@ -1220,10 +1334,7 @@ impl EventProcessor {
             }
         };
         if let Err(error) = self.commit_event("request.resolved", native_id, data).await {
-            if let Some(entry) = self.pending_requests.get_mut(request_id) {
-                entry.reply_state = NativeReplyState::Unknown;
-                entry.reply_command_id = Some(command_id.to_owned());
-            }
+            self.retain_unknown_reply(request_id, command_id).await;
             return Ok(unknown_control(&format!(
                 "Claude request resolution was not committed: {}",
                 error.message
@@ -1295,6 +1406,7 @@ impl EventProcessor {
         // Unanswered asks die with their turn: close them before the terminal
         // commit, without a command binding.
         self.close_pending_requests(Some(&turn_id)).await?;
+        // Callback fences outlive turn completion while this transport exists.
         if self
             .status
             .last_turn
@@ -1410,6 +1522,7 @@ impl EventProcessor {
         // The stopped session consumes no more asks: close every retained one
         // before `session.ended`.
         self.close_pending_requests(None).await?;
+        // Keep generation fences until this drained processor is dropped.
         let native_id = format!(
             "claude:{}:session.ended",
             self.status.session_id.as_deref().unwrap_or("unresolved")
