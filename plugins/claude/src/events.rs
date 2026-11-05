@@ -1325,11 +1325,11 @@ impl EventProcessor {
                         "Claude request reply destination is unavailable; it will not be repeated",
                     ));
                 }
-                if let Some(entry) = self.pending_requests.get_mut(request_id) {
-                    if entry.reply_state == NativeReplyState::Writing {
-                        entry.reply_state = NativeReplyState::Available;
-                        entry.reply_command_id = None;
-                    }
+                if let Some(entry) = self.pending_requests.get_mut(request_id)
+                    && entry.reply_state == NativeReplyState::Writing
+                {
+                    entry.reply_state = NativeReplyState::Available;
+                    entry.reply_command_id = None;
                 }
                 return Ok(rejected_control("Claude request reply was not admitted"));
             }
