@@ -56,6 +56,42 @@ enum SessionPhase {
     Stopped,
 }
 
+/// Static stop-stage class for one unknown error message. Safe by
+/// construction: a fixed literal, never a payload, native error, or secret.
+#[derive(Clone, Copy)]
+enum StopStage {
+    Begin,
+    Quiesce,
+    Retention,
+    Process,
+    EndAck,
+}
+
+impl StopStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Begin => "begin",
+            Self::Quiesce => "quiesce",
+            Self::Retention => "retention",
+            Self::Process => "process",
+            Self::EndAck => "end_ack",
+        }
+    }
+}
+
+fn note_stage(stage: &mut StopStage, next: StopStage) -> StopStage {
+    // This is a function call, so the compiler treats the stage value
+    // as read here; sequential semantic stages advance the same
+    // variable without a dead-assignment lint. The observable value at
+    // the final stage is the furthest semantic step reached.
+    *stage = next;
+    *stage
+}
+
+fn native_io_blocked(session: &AgentSession) -> bool {
+    session.resources_proved_closed || session.stop_end_ack_proved
+}
+
 struct AgentSession {
     agent_id: String,
     generation: i64,
@@ -73,6 +109,7 @@ struct AgentSession {
     rejected_commands: HashSet<String>,
     stop_command_id: Option<String>,
     resources_proved_closed: bool,
+    stop_end_ack_proved: bool,
     control_bindings: HashMap<String, ControlBinding>,
     control_results: HashMap<String, Value>,
 }
@@ -501,6 +538,7 @@ impl OpenCodePlugin {
             rejected_commands: HashSet::new(),
             stop_command_id: None,
             resources_proved_closed: false,
+            stop_end_ack_proved: false,
             control_bindings: HashMap::new(),
             control_results: HashMap::new(),
         };
@@ -1166,7 +1204,7 @@ impl OpenCodePlugin {
             params.generation,
             "OpenCode",
         )?;
-        if session.phase != SessionPhase::Ready {
+        if session.phase != SessionPhase::Ready || native_io_blocked(session) {
             return Err(Error::new(
                 "unknown",
                 "OpenCode session or event source outcome is unresolved",
@@ -1377,7 +1415,7 @@ impl OpenCodePlugin {
             params.generation,
             "OpenCode",
         )?;
-        if session.phase != SessionPhase::Ready {
+        if session.phase != SessionPhase::Ready || native_io_blocked(session) {
             return Err(Error::new(
                 "unknown",
                 "OpenCode session or event source outcome is unresolved",
@@ -1516,7 +1554,7 @@ impl OpenCodePlugin {
             params.generation,
             "OpenCode",
         )?;
-        if session.phase != SessionPhase::Ready {
+        if session.phase != SessionPhase::Ready || native_io_blocked(session) {
             return Err(Error::new(
                 "unknown",
                 "OpenCode session or event source outcome is unresolved",
@@ -1690,6 +1728,15 @@ impl OpenCodePlugin {
         };
         if let Some(receipt) = Self::snapshot_stop_receipt(session, &params, &event_status) {
             return Ok(receipt);
+        }
+        if native_io_blocked(session) {
+            // Closed resources block new native I/O regardless of the last
+            // semantic phase; an Unknown-phase session with a proved exit
+            // never gets a readback/reply/interrupt write after closure.
+            return unknown_snapshot(
+                &params,
+                "OpenCode native resources are closed; native readback is unavailable",
+            );
         }
         let request = match Self::resolve_snapshot_request(session, &params, &event_status) {
             Ok(request) => request,
@@ -1894,6 +1941,9 @@ impl OpenCodePlugin {
 
     async fn shutdown(&mut self) -> Result<Value> {
         if let Some(session) = self.session.as_mut() {
+            // Shutdown with proved resource closure ends the owned path
+            // without replaying native interrupt/GET or a blind End. An
+            // already-acked End is likewise never repeated.
             if session.phase != SessionPhase::Stopped && !session.resources_proved_closed {
                 terminate_session(session, true).await?;
             }
@@ -1981,55 +2031,64 @@ fn start_paths(
 /// the quiesce wait and never touches another Agent.
 async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()> {
     let deadline = Instant::now() + RPC_TIMEOUT;
-    let begin = session.events.begin_stop().await;
-    let mut retained = begin.is_ok();
-    if retained
-        && !force
-        && let Some(session_id) = session.session_id.clone()
-    {
-        if OpenCodePlugin::resume_quiesce(session, &session_id)
-            .await
-            .is_err()
-        {
-            retained = false;
-        } else {
-            match session.http.get_session(&session_id, deadline).await {
-                Ok(info) if info.id == session_id => {}
-                _ => retained = false,
+    // A semantic quiesce/retention failure never skips the bounded
+    // owned-resource cleanup below. The semantic error is preserved
+    // separately, then processed closure and End run without replaying
+    // the unknown effects above. Any error leaves phase Unknown.
+    let mut stage = StopStage::Begin;
+    let _ = note_stage(&mut stage, StopStage::Begin);
+    let mut semantic_error = false;
+    if session.events.begin_stop().await.is_err() {
+        semantic_error = true;
+    } else {
+        let _ = note_stage(&mut stage, StopStage::Quiesce);
+        if !force && let Some(session_id) = session.session_id.clone() {
+            if OpenCodePlugin::resume_quiesce(session, &session_id)
+                .await
+                .is_err()
+            {
+                semantic_error = true;
+            } else {
+                let _ = note_stage(&mut stage, StopStage::Retention);
+                let retained = match session.http.get_session(&session_id, deadline).await {
+                    Ok(info) => info.id == session_id,
+                    Err(_) => false,
+                };
+                if !retained {
+                    semantic_error = true;
+                }
             }
         }
     }
+    let _ = note_stage(&mut stage, StopStage::Process);
     let process_exit = session.server.terminate(force, deadline).await;
-    // Gate ended emission on the positive control-closure proof of the
-    // bounded process termination. A drained SSE stream is not closure:
-    // when termination is unproven, session.ended must not be emitted and
-    // capacity must not be freed.
+    if process_exit.is_ok() {
+        session.resources_proved_closed = true;
+    }
+    // End is attempted only when the process-exit proof binds closure.
+    let _ = note_stage(&mut stage, StopStage::EndAck);
     let ended = if process_exit.is_ok() {
         Some(session.events.end_stop().await)
     } else {
         None
     };
-    if !retained || process_exit.is_err() || ended.as_ref().is_none_or(|result| result.is_err()) {
-        // Separate resource closure from outcome uncertainty: when the
-        // severed server is ours is confirmed (terminate Ok) and the held
-        // SSE task was ack-ned (end_stop Ok), this generation's resources
-        // are gone, so shutdown can end them without replaying the native
-        // interrupt/readback against an already-dead server. The stop
-        // outcome itself (retention + command binding) stays Unknown.
-        // The resource-closure proof is kept apart from the semantic stop
-        // outcome cache.
-        session.resources_proved_closed =
-            process_exit.is_ok() && ended.as_ref().is_some_and(|result| result.is_ok());
-        if !session.resources_proved_closed {
-            session.phase = SessionPhase::Unknown;
-        }
+    if ended.as_ref().is_some_and(|result| result.is_ok()) {
+        session.stop_end_ack_proved = true;
+    }
+    if semantic_error
+        || process_exit.is_err()
+        || ended.as_ref().is_none_or(|result| result.is_err())
+    {
+        session.phase = SessionPhase::Unknown;
         return Err(Error::new(
             "unknown",
-            "OpenCode session quiesce/retention, server shutdown, or session.ended outcome is unknown",
+            format!(
+                "OpenCode stop outcome is unknown at stage {}",
+                stage.as_str()
+            ),
         ));
     }
     session.phase = SessionPhase::Stopped;
-    session.resources_proved_closed = true;
     Ok(())
 }
 

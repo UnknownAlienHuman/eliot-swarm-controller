@@ -2971,24 +2971,16 @@ async fn scenario_lost_prompt_reply_is_unknown_without_rewrite(owned: OwnedChild
         })
         .count();
     assert_eq!(prompts, 1, "exactly one prompt write");
-    // Shutdown ends the unstopped generation, so it commits session.ended.
-    let (outcome, committed) = scenario
-        .host
-        .pump_call(
-            "shutdown",
-            json!({}),
-            OP_TIMEOUT,
-            Quiesce::UntilKind("session.ended"),
-        )
-        .await;
-    assert_eq!(
-        outcome
-            .expect("shutdown")
-            .get("state")
-            .and_then(Value::as_str),
-        Some("shutdown")
-    );
+    // Stop the unstopped generation: with no live turn the retained
+    // session passes the retention readback, so this becomes a normal
+    // Applied stop with exactly one End.
+    let committed = stop_agent(&mut scenario, 1, false).await;
     assert_eq!(kinds(&committed), ["session.ended"]);
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
     scenario.host.shutdown_child().await;
 }
 
@@ -3999,43 +3991,10 @@ async fn scenario_stale_choice_rejected_without_write(owned: OwnedChildren) {
     drain_until(&mut scenario.host, "turn.completed").await;
     let requests = requests_at(&scenario.root, "requests.jsonl");
     assert_eq!(count_requests(&requests, "POST", "/reply"), 1);
-    // Cleanup after an uncertain (lost) reply: the persisted permission
-    // is still pending, so the retention readback proves the native
-    // session retained but non-idle => StopUnknown with a proven
-    // control closure (one session.ended) and resource exit 0. This
-    // mirrors scenario_stop_of_gone_session_is_unknown; the primary
-    // one-write/retry-unknown assertions above are unchanged.
-    let stop_id = ulid::Ulid::new().to_string();
-    let agent_id = scenario.agent_id.clone();
-    let (outcome, committed) = scenario
-        .host
-        .pump_call(
-            "agent.stop",
-            json!({
-                "agent_id": agent_id,
-                "generation": 1,
-                "command_id": stop_id,
-                "force": false,
-            }),
-            OP_TIMEOUT,
-            Quiesce::SilenceNow,
-        )
-        .await;
-    let error = outcome.expect_err("cleanup stop after lost reply is unknown");
-    assert!(
-        error.contains("unknown"),
-        "cleanup stop remains unknown, got: {error}"
-    );
-    let ended: Vec<_> = committed
-        .iter()
-        .filter(|(kind, _)| kind == "session.ended")
-        .collect();
-    assert_eq!(
-        ended.len(),
-        1,
-        "closure-proved cleanup emits exactly one session.ended: {committed:?}"
-    );
-    // No second reply write during cleanup.
+    // Ordinary cleanup here is Applied with exactly one End and no
+    // replay: the settled turn is idle, so this stop is the healthy path.
+    let committed = stop_agent(&mut scenario, 1, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
     let requests_after = requests_at(&scenario.root, "requests.jsonl");
     assert_eq!(count_requests(&requests_after, "POST", "/reply"), 1);
     scenario
@@ -4165,8 +4124,75 @@ async fn scenario_lost_reply_is_unknown_without_rewrite(owned: OwnedChildren) {
     assert!(committed.is_empty());
     let requests = requests_at(&scenario.root, "requests.jsonl");
     assert_eq!(count_requests(&requests, "POST", "/reply"), 1);
-    let committed = stop_agent(&mut scenario, 1, false).await;
-    assert_eq!(kinds(&committed), ["session.ended"]);
+    // True lost-reply stop is Unknown, not Applied: the persistence drop
+    // returns None before the plugin removes the native permission, so
+    // the execution stays live. The stop interrupt does stop it, but the
+    // pending permission keeps the retained session non-idle, so the
+    // retention readback proves retained-but-non-idle => Unknown with
+    // one real interrupted terminal preserved before End. Asserting
+    // kinds == ["session.ended"] here would require an Applied outcome
+    // that this path cannot produce; the legitimate cleanup is Unknown
+    // with the interrupted terminal retained, never a fabricated Applied.
+    let stop_id = ulid::Ulid::new().to_string();
+    let agent_id = scenario.agent_id.clone();
+    let (outcome, committed) = scenario
+        .host
+        .pump_call(
+            "agent.stop",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": stop_id,
+                "force": false,
+            }),
+            OP_TIMEOUT,
+            Quiesce::SilenceNow,
+        )
+        .await;
+    let error = outcome.expect_err("lost-reply stop is unknown, not applied");
+    assert!(
+        error.contains("unknown"),
+        "lost-reply stop remains unknown, got: {error}"
+    );
+    // The interrupted terminal was already committed before End. The
+    // matrix names it as the real interrupted terminal preserved before
+    // End, so the committed status is "interrupted", not a fabricated
+    // completion. Ordering is asserted by position, not by a guessed
+    // exact list, because message.completed may legitimately precede
+    // the terminal. Exactly one End, terminal before it, no second
+    // reply write.
+    let ended_positions: Vec<usize> = committed
+        .iter()
+        .enumerate()
+        .filter(|(_, (kind, _))| kind == "session.ended")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(ended_positions.len(), 1, "exactly one End: {committed:?}");
+    let end_pos = ended_positions[0];
+    assert_eq!(end_pos, committed.len() - 1, "End is last: {committed:?}");
+    let terminals: Vec<&Value> = committed
+        .iter()
+        .take(end_pos)
+        .filter(|(kind, _)| kind == "turn.completed")
+        .map(|(_, data)| data)
+        .collect();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "one turn.completed before End: {committed:?}"
+    );
+    assert_eq!(
+        terminals[0].get("turn_id").and_then(Value::as_str),
+        Some(turn_id.as_str()),
+        "terminal names the live turn: {committed:?}"
+    );
+    assert_eq!(
+        terminals[0].get("status").and_then(Value::as_str),
+        Some("interrupted"),
+        "interrupted terminal status is interrupted, not completed: {committed:?}"
+    );
+    let requests_after = requests_at(&scenario.root, "requests.jsonl");
+    assert_eq!(count_requests(&requests_after, "POST", "/reply"), 1);
     scenario
         .host
         .call("shutdown", json!({}))

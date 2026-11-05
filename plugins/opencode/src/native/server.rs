@@ -288,16 +288,23 @@ impl OwnedServer {
                 return Ok(());
             }
         }
-        timeout_at(deadline, self.child.kill())
-            .await
-            .map_err(|_| Error::new("unknown", "OpenCode serve termination outcome is unknown"))?
-            .map_err(|error| {
-                Error::new(
+        if let Err(error) = timeout_at(deadline, self.child.kill()).await {
+            // Kill outcome is ambiguous without the wait proof below.
+            if !matches!(timeout_at(deadline, self.child.wait()).await, Ok(Ok(_))) {
+                return Err(Error::new(
                     "unknown",
-                    format!("OpenCode serve termination failed: {error}"),
-                )
-            })?;
-        let _ = timeout_at(deadline, self.child.wait()).await;
+                    "OpenCode serve termination outcome is unknown",
+                ));
+            }
+            let _ = error;
+            return Ok(());
+        }
+        if !matches!(timeout_at(deadline, self.child.wait()).await, Ok(Ok(_))) {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode serve exit proof is unknown",
+            ));
+        }
         self.drain_pipes(deadline).await;
         Ok(())
     }
