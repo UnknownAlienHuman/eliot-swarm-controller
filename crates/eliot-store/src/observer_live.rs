@@ -185,70 +185,112 @@ impl Store {
         now: i64,
     ) -> Result<Change<SourceHealthUpdate>> {
         self.ensure_writer_healthy()?;
-        let result = (|| {
-            update.validate()?;
-            if matches!(
-                update.source.as_str(),
-                "daemon" | "os" | "git" | "workspace_process"
-            ) {
-                return Err(Error::new(
-                    "not_allowed",
-                    "observer health cannot change monitor sources",
-                ));
-            }
-            let id = parse_agent_id(&update.agent_id)?;
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            let agent = load_agent_by_num(&tx, id)?
-                .ok_or_else(|| Error::new("not_found", "health Agent was not found"))?;
-            observer::require_live_subject(&tx, &agent, update.generation, expected_subject)?;
-            if update.source != "observe" {
-                let families = source_handoff::owner_bindings(&tx, id, update.generation)?
-                    .into_iter()
-                    .filter(|owner| owner.source == update.source)
-                    .map(|owner| owner.family)
-                    .collect::<Vec<_>>();
-                require_transcript_families(&tx, &agent, &update.source, &families)?;
-            }
-            let state = load_source_state(&tx, id, update.generation, &update.source)?.ok_or_else(
-                || Error::new("source_integrity", "health source has no committed state"),
-            )?;
-            if state.state != "open" {
-                return Err(Error::new(
-                    "source_integrity",
-                    "health cannot reopen a closed source",
-                ));
-            }
-            let mut events = Vec::new();
-            if state.health != update.health {
-                let changed = tx.execute("UPDATE source_state SET health = ?1, updated_at = ?2 WHERE agent = ?3 AND generation = ?4 AND source = ?5 AND state = 'open'",
-                    params![update.health,now,id,update.generation,update.source]).map_err(sql_error)?;
-                if changed != 1 {
-                    return Err(Error::new(
-                        "source_integrity",
-                        "health source changed before commit",
-                    ));
-                }
-                events.push(insert_daemon_event(
-                    &tx,
-                    now,
-                    "source.health",
-                    "source",
-                    Some(id),
-                    Some(update.generation),
-                    json!({"source":update.source,"state":"open","health":update.health}),
-                )?);
-            }
-            commit_transaction(tx, &self.write_faulted)?;
-            Ok(Change {
-                value: update,
-                events,
-            })
-        })();
+        let result = self.set_source_health_inner(update, Some(expected_subject), now);
         self.fault_on_persistence_error(&result);
         result
+    }
+
+    /// Controlled health for the credential-bound Agent/generation. It rejects
+    /// monitor sources, stale generations, closed rows, and observer
+    /// escalation, with the same commit semantics as the observed path:
+    /// unchanged health is a no-op with no event.
+    pub fn set_source_health(
+        &mut self,
+        update: SourceHealthUpdate,
+        now: i64,
+    ) -> Result<Change<SourceHealthUpdate>> {
+        self.ensure_writer_healthy()?;
+        let result = self.set_source_health_inner(update, None, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn set_source_health_inner(
+        &mut self,
+        update: SourceHealthUpdate,
+        expected_subject: Option<(&str, &str)>,
+        now: i64,
+    ) -> Result<Change<SourceHealthUpdate>> {
+        update.validate()?;
+        if matches!(
+            update.source.as_str(),
+            "daemon" | "os" | "git" | "workspace_process"
+        ) {
+            return Err(match expected_subject {
+                Some(_) => Error::new(
+                    "not_allowed",
+                    "observer health cannot change monitor sources",
+                ),
+                None => Error::new(
+                    "not_allowed",
+                    "controlled health cannot change monitor sources",
+                ),
+            });
+        }
+        let id = parse_agent_id(&update.agent_id)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let agent = load_agent_by_num(&tx, id)?
+            .ok_or_else(|| Error::new("not_found", "health Agent was not found"))?;
+        match expected_subject {
+            Some(subject) => {
+                observer::require_live_subject(&tx, &agent, update.generation, subject)?;
+                if update.source != "observe" {
+                    let families = source_handoff::owner_bindings(&tx, id, update.generation)?
+                        .into_iter()
+                        .filter(|owner| owner.source == update.source)
+                        .map(|owner| owner.family)
+                        .collect::<Vec<_>>();
+                    require_transcript_families(&tx, &agent, &update.source, &families)?;
+                }
+            }
+            None => {
+                if update.generation <= 0 || update.generation != agent.generation {
+                    return Err(Error::new(
+                        "stale_generation",
+                        "health requires the current admitted generation",
+                    ));
+                }
+                observer::require_controlled(&agent)?;
+            }
+        }
+        let state =
+            load_source_state(&tx, id, update.generation, &update.source)?.ok_or_else(|| {
+                Error::new("source_integrity", "health source has no committed state")
+            })?;
+        if state.state != "open" {
+            return Err(Error::new(
+                "source_integrity",
+                "health cannot reopen a closed source",
+            ));
+        }
+        let mut events = Vec::new();
+        if state.health != update.health {
+            let changed = tx.execute("UPDATE source_state SET health = ?1, updated_at = ?2 WHERE agent = ?3 AND generation = ?4 AND source = ?5 AND state = 'open'",
+                params![update.health,now,id,update.generation,update.source]).map_err(sql_error)?;
+            if changed != 1 {
+                return Err(Error::new(
+                    "source_integrity",
+                    "health source changed before commit",
+                ));
+            }
+            events.push(insert_daemon_event(
+                &tx,
+                now,
+                "source.health",
+                "source",
+                Some(id),
+                Some(update.generation),
+                json!({"source":update.source,"state":"open","health":update.health}),
+            )?);
+        }
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(Change {
+            value: update,
+            events,
+        })
     }
 }
 
@@ -320,6 +362,51 @@ mod tests {
             .record_observed_source_handoff(request(&agent), SUBJECT, now + 2)
             .unwrap();
         (store, agent, command, now)
+    }
+
+    fn controlled() -> (Store, String, i64) {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        let command_id = Ulid::new().to_string();
+        let admitted = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: command_id.clone(),
+                    target: None,
+                    selector: None,
+                    verb: "launch".to_owned(),
+                    args: json!({"project":"controlled-health","harness":"fake","profile":"fake",
+                        "profile_snapshot":{},"workspace":"controlled-health-workspace"}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .unwrap();
+        let agent = admitted.command.target.unwrap();
+        store.dispatch(&command_id, now).unwrap();
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: "ready".to_owned(),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ready".to_owned(),
+                        native_id: "ready".to_owned(),
+                        data: json!({"command_id":command_id}),
+                    }],
+                    cursor: Some("native:ready".to_owned()),
+                },
+                now,
+            )
+            .unwrap();
+        (store, agent, now)
     }
 
     fn batch(agent: &str, id: &str, kind: &str, data: Value, ts: i64) -> SourceBatch {
@@ -764,5 +851,129 @@ mod tests {
         assert_eq!(store.get_agent(&agent).unwrap().unwrap(), before);
         assert_eq!(store.list_source_states(&agent, 3).unwrap(), sources);
         assert!(store.observer_ready(&agent, 3, SUBJECT).unwrap());
+    }
+
+    #[test]
+    fn controlled_health_persists_stale_and_rejects_unauthorized_stale_and_closed() {
+        let (mut store, agent, now) = controlled();
+        let stale = SourceHealthUpdate::new(&agent, 1, "stream", "stale");
+        let committed = store.set_source_health(stale.clone(), now + 1).unwrap();
+        assert_eq!(committed.value, stale);
+        assert_eq!(committed.events.len(), 1);
+        assert_eq!(committed.events[0].kind, "source.health");
+        let state = store.read_source_state(&agent, 1, "stream").unwrap();
+        assert_eq!(state["state"], "open");
+        assert_eq!(state["health"], "stale");
+        assert_eq!(state["cursor"], "native:ready");
+        let high_water = store.high_water().unwrap();
+        assert!(
+            store
+                .set_source_health(stale, now + 2)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        assert_eq!(store.high_water().unwrap(), high_water);
+        assert_eq!(
+            store
+                .set_source_health(SourceHealthUpdate::new(&agent, 1, "stream", "ok"), now + 3)
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
+        let high_water = store.high_water().unwrap();
+        for source in ["daemon", "os", "git", "workspace_process"] {
+            assert_eq!(
+                store
+                    .set_source_health(SourceHealthUpdate::new(&agent, 1, source, "stale"), now + 4)
+                    .unwrap_err()
+                    .code,
+                "not_allowed"
+            );
+        }
+        for generation in [0, 2] {
+            assert_eq!(
+                store
+                    .set_source_health(
+                        SourceHealthUpdate::new(&agent, generation, "stream", "stale"),
+                        now + 4
+                    )
+                    .unwrap_err()
+                    .code,
+                "stale_generation"
+            );
+        }
+        assert_eq!(store.high_water().unwrap(), high_water);
+        let (mut observed, observer, _, _) = ready();
+        assert_eq!(
+            observed
+                .set_source_health(
+                    SourceHealthUpdate::new(&observer, 1, "transcript", "stale"),
+                    now + 4
+                )
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        store.close_native_sources(&agent, 1, now + 5).unwrap();
+        assert_eq!(
+            store
+                .set_source_health(
+                    SourceHealthUpdate::new(&agent, 1, "stream", "stale"),
+                    now + 6
+                )
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
+        // Health is lifecycle-independent: a Stopped Agent keeps its open source.
+        let (mut terminal, ended, ended_now) = controlled();
+        terminal
+            .record_source_handoff(
+                SourceHandoff {
+                    agent_id: ended.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    families: vec!["message".to_owned()],
+                    successor: "transcript".to_owned(),
+                    mechanism: "fake_recovery".to_owned(),
+                    cursor: Some("native:ready".to_owned()),
+                    gap: None,
+                },
+                ended_now + 1,
+            )
+            .unwrap();
+        terminal
+            .put_batch(
+                SourceBatch {
+                    batch_id: "ended".to_owned(),
+                    agent_id: ended.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ended".to_owned(),
+                        native_id: "ended".to_owned(),
+                        data: json!({}),
+                    }],
+                    cursor: None,
+                },
+                ended_now + 2,
+            )
+            .unwrap();
+        let stopped = terminal.get_agent(&ended).unwrap().unwrap();
+        assert_eq!(stopped.state, AgentState::Stopped);
+        let updated = terminal
+            .set_source_health(
+                SourceHealthUpdate::new(&ended, 1, "transcript", "stale"),
+                ended_now + 3,
+            )
+            .unwrap();
+        assert_eq!(updated.events.len(), 1);
+        let state = terminal.read_source_state(&ended, 1, "transcript").unwrap();
+        assert_eq!(state["state"], "open");
+        assert_eq!(state["health"], "stale");
+        assert_eq!(terminal.get_agent(&ended).unwrap().unwrap(), stopped);
     }
 }

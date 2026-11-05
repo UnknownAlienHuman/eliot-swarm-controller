@@ -829,8 +829,26 @@ impl StreamSource<'_> {
         reason: &str,
         retained: &mut Option<SourceGap>,
     ) -> Result<()> {
+        self.record_gap_inner_until(reason, retained, Instant::now() + EVENT_DEADLINE)
+            .await
+    }
+
+    /// Use a caller-owned absolute deadline when a loss must also settle a
+    /// separate bounded source-health update.
+    pub async fn record_gap_until(&mut self, reason: &str, deadline: Instant) -> Result<()> {
+        let mut ignored = None;
+        self.record_gap_inner_until(reason, &mut ignored, deadline)
+            .await
+    }
+
+    async fn record_gap_inner_until(
+        &mut self,
+        reason: &str,
+        retained: &mut Option<SourceGap>,
+        deadline: Instant,
+    ) -> Result<()> {
         let had_retained = retained.is_some();
-        if had_retained && !self.try_settle_retained(retained).await {
+        if had_retained && !self.try_settle_retained_until(retained, deadline).await {
             *self.source_unknown = true;
             return Err(Error::new(
                 "unknown",
@@ -884,7 +902,7 @@ impl StreamSource<'_> {
             from: None,
             to: None,
         };
-        let result = self.send_gap(&gap).await;
+        let result = self.send_gap_until(&gap, deadline).await;
         match result {
             Ok(ack) if Self::is_canonical_gap_ack(&gap, &ack) => {
                 *self.failure = Some(format!("{reason}; terminal outcome is unknown"));
@@ -906,10 +924,19 @@ impl StreamSource<'_> {
     }
 
     async fn try_settle_retained(&mut self, retained: &mut Option<SourceGap>) -> bool {
+        self.try_settle_retained_until(retained, Instant::now() + EVENT_DEADLINE)
+            .await
+    }
+
+    async fn try_settle_retained_until(
+        &mut self,
+        retained: &mut Option<SourceGap>,
+        deadline: Instant,
+    ) -> bool {
         let Some(gap) = retained.clone() else {
             return true;
         };
-        let result = self.send_gap(&gap).await;
+        let result = self.send_gap_until(&gap, deadline).await;
         self.apply_retained_attempt(retained, &gap, &result)
     }
 
@@ -958,12 +985,12 @@ impl StreamSource<'_> {
         }
     }
 
-    async fn send_gap(&self, gap: &SourceGap) -> Result<Value> {
+    async fn send_gap_until(&self, gap: &SourceGap, deadline: Instant) -> Result<Value> {
         self.host
             .call(
                 "source.gap",
                 Self::gap_request_params(self.credential, gap),
-                Instant::now() + EVENT_DEADLINE,
+                deadline,
             )
             .await
     }

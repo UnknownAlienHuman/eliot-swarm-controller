@@ -1,14 +1,17 @@
 use std::{collections::HashMap, sync::Arc};
 
-use eliot_core::{Error, Result, SecretPolicy};
+use eliot_core::{Error, Result, SecretPolicy, SourceHealthUpdate};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     native_transport::StreamState,
-    session::{StreamSource, attach_final_text, attach_native_error, event_id},
+    session::{EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error, event_id},
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::{
+    sync::{Mutex, mpsc, oneshot, watch},
+    time::Instant,
+};
 
 use crate::native::{AgyFrame, ResultRecord, StepUpdate};
 
@@ -47,6 +50,9 @@ pub(crate) struct State {
     writes_blocked: bool,
     gap_reported: bool,
     gap_number: u64,
+    source_health_attempted: bool,
+    pub source_health_stale: bool,
+    pub source_health_unknown: bool,
     pub failure: Option<String>,
     pub source_unknown: bool,
     pub batch_unknown: bool,
@@ -80,6 +86,9 @@ impl State {
             writes_blocked: false,
             gap_reported: false,
             gap_number: 0,
+            source_health_attempted: false,
+            source_health_stale: false,
+            source_health_unknown: false,
             failure: None,
             source_unknown: false,
             batch_unknown: false,
@@ -381,9 +390,12 @@ impl State {
 
     pub async fn lose(&mut self, reason: &str) {
         self.source_unknown = true;
+        let health_deadline = Instant::now() + EVENT_DEADLINE;
         if !self.gap_reported && !self.writes_blocked {
-            let _ = self.source().record_gap(reason).await;
+            let mut source = self.source();
+            let _ = source.record_gap_until(reason, health_deadline).await;
         }
+        self.mark_source_stale(health_deadline).await;
         self.failure.get_or_insert_with(|| reason.to_owned());
         if let Some(reply) = self.pending.as_mut().and_then(|p| p.reply.take()) {
             let _ = reply.send(Err(Error::new(
@@ -391,6 +403,56 @@ impl State {
                 "Antigravity input outcome is unknown",
             )));
         }
+    }
+
+    async fn mark_source_stale(&mut self, deadline: Instant) {
+        if self.source_health_attempted {
+            return;
+        }
+        self.source_health_attempted = true;
+        let update =
+            SourceHealthUpdate::new(self.agent.clone(), self.generation, "stream", "stale");
+        let Ok(mut request) = serde_json::to_value(&update) else {
+            self.source_health_unknown = true;
+            return;
+        };
+        if update.validate().is_err() {
+            self.source_health_unknown = true;
+            return;
+        }
+        request["credential"] = json!(self.credential);
+        let acknowledgement = self.host.call("source.health", request, deadline).await;
+        if acknowledgement.as_ref().is_ok_and(|value| {
+            serde_json::from_value::<SourceHealthUpdate>(value.clone())
+                .is_ok_and(|ack| ack == update)
+        }) {
+            self.source_health_stale = true;
+            return;
+        }
+
+        // A lost health acknowledgement is settled by readback, never by replay.
+        let readback = self
+            .host
+            .call(
+                "source.state",
+                json!({
+                    "credential": self.credential,
+                    "agent_id": self.agent,
+                    "generation": self.generation,
+                    "source": "stream",
+                }),
+                deadline,
+            )
+            .await;
+        let confirmed = readback.as_ref().is_ok_and(|state| {
+            state.get("agent_id").and_then(Value::as_str) == Some(self.agent.as_str())
+                && state.get("generation").and_then(Value::as_i64) == Some(self.generation)
+                && state.get("source").and_then(Value::as_str) == Some("stream")
+                && state.get("state").and_then(Value::as_str) == Some("open")
+                && state.get("health").and_then(Value::as_str) == Some("stale")
+        });
+        self.source_health_stale = confirmed;
+        self.source_health_unknown = !confirmed;
     }
 
     fn source(&mut self) -> StreamSource<'_> {
@@ -483,6 +545,8 @@ mod tests {
         assert!(state.pending.as_ref().unwrap().reply.is_some());
 
         state.writes_blocked = true;
+        // This unit test has no host responder for the independent health RPC.
+        state.source_health_attempted = true;
         state.lose(&error.message).await;
         let ack = reply_rx.try_recv().expect("reply received");
         assert_eq!(ack.expect_err("no ACK on unknown step").code, "unknown");

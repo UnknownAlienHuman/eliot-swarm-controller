@@ -252,7 +252,11 @@ A source row's `open|closed` lifecycle, health and latest historical gap are ind
 A gap neither closes the source nor changes its owner or health automatically.
 `source.health` changes only health and `updated_at` on an already-open current-generation
 native source; an unchanged value is a no-op with no event. It does not clear a gap,
-move a cursor, change ownership or reopen a closed row. The committed health event and
+move a cursor, change ownership or reopen a closed row. A controlled caller binds
+`agent_id`/`generation` to its source credential; the observe-only caller keeps its
+settled exact-subject proof. The controlled path rejects reserved `daemon`, `os`,
+`git` and `workspace_process` sources, stale generations, closed rows, and
+observer/child escalation. The committed health event and
 `source.state` readback carry lifecycle `state:"open"`; the four-field ACK does not.
 The event is published before the response. After an uncertain reply, settle through
 `source.state`, matching agent/generation/source and verifying open state plus requested

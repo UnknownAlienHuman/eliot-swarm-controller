@@ -4035,7 +4035,22 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.code, "unsupported");
+        assert_eq!(error.code, "invalid");
+        assert_eq!(store.lock().await.high_water().unwrap(), before_health);
+        let error = source_handoff::record_source_health(
+            &store,
+            &bus,
+            json!({"agent_id":agent_id, "generation":1, "source":"transcript", "health":"stale"}),
+            source_handoff::SourceBinding {
+                observation: None,
+                ..binding
+            },
+            &[],
+            deadline(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
         assert_eq!(store.lock().await.high_water().unwrap(), before_health);
         let health = json!({"credential":credential, "agent_id":agent_id, "generation":1, "source":"transcript", "health":"stale"});
         let health_ack = client

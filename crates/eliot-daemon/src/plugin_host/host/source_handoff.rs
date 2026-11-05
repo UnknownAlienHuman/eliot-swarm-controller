@@ -113,12 +113,7 @@ pub(super) async fn record_source_health(
     secrets: &[String],
     until: Instant,
 ) -> CoreResult<Value> {
-    let subject = binding.expected_subject()?.ok_or_else(|| {
-        CoreError::new(
-            "unsupported",
-            "controlled source.health has no current caller",
-        )
-    })?;
+    let subject = binding.expected_subject()?;
     let update: SourceHealthUpdate = serde_json::from_value(params)
         .map_err(|_| CoreError::new("invalid", "source.health params are malformed"))?;
     binding.validate(&update.agent_id, update.generation)?;
@@ -133,11 +128,16 @@ pub(super) async fn record_source_health(
             "source.health contains a known secret in immutable metadata",
         ));
     }
+    // Store rechecks source, generation, Agent authority, and the open-row
+    // fence transactionally. Never hold its lock across an await.
     let (result, faulted) = {
         let mut store = timeout_at(until, store.lock())
             .await
             .map_err(|_| CoreError::new("busy", "Store lock deadline elapsed for source.health"))?;
-        let result = store.set_native_source_health(update, subject, super::now_ms());
+        let result = match subject {
+            Some(subject) => store.set_native_source_health(update, subject, super::now_ms()),
+            None => store.set_source_health(update, super::now_ms()),
+        };
         (result, store.is_write_faulted())
     };
     match result {

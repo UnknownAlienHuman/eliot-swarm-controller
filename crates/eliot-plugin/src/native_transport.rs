@@ -13,16 +13,16 @@ use std::{
     process::{ExitStatus, Stdio},
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::{
-    process::{Child, ChildStdin, ChildStdout, Command},
+    process::{ChildStdin, ChildStdout, Command},
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
 };
@@ -34,6 +34,7 @@ use crate::{StderrCapture, StderrView, spawn_stderr, sync::LockExt};
 
 const MAX_NATIVE_FRAME_BYTES: usize = 1024 * 1024;
 const NATIVE_EVENT_QUEUE: usize = 64;
+const NATIVE_EXIT_DRAIN: Duration = Duration::from_secs(1);
 
 /// Display nouns for transport diagnostics, e.g. `("Muse", "Muse session
 /// host")`. The protocol layers pass their exact historical labels so
@@ -59,12 +60,15 @@ pub enum StreamState {
     Malformed,
 }
 
-/// One owned native child: process handle, stdin writer queue, stdout-reader
+/// One owned native child: process waiter, stdin writer queue, stdout-reader
 /// task ownership, stderr capture. The protocol layer spawns its own reader
 /// task over the returned stdout (framing is its business) and hands the
 /// task back for drain ownership.
 pub struct NativeChild {
-    child: Child,
+    pid: Option<u32>,
+    kill: Option<oneshot::Sender<()>>,
+    process_exit: watch::Receiver<Option<ProcessExit>>,
+    process_task: Option<tokio::task::JoinHandle<()>>,
     writer: NativeWriter,
     output_reader: Option<tokio::task::JoinHandle<Result<()>>>,
     output_reader_result: Option<Result<()>>,
@@ -75,13 +79,19 @@ pub struct NativeChild {
     labels: NativeLabels,
 }
 
+#[derive(Clone)]
+struct ProcessExit {
+    status: ExitStatus,
+    observed_at: Instant,
+}
+
 /// One stdin writer queue. Cloned into the protocol client; every write and
 /// close serializes on the queue with the caller's absolute deadline. The
-/// queue empties only through [`NativeWriter::shutdown_input`], which drops
-/// the stdin handle so the child really sees EOF.
+/// queue empties on input shutdown or child exit.
 #[derive(Clone)]
 pub struct NativeWriter {
     writer: Arc<tokio::sync::Mutex<Option<FramedWrite<ChildStdin, LinesCodec>>>>,
+    process_exited: Arc<AtomicBool>,
     labels: NativeLabels,
 }
 
@@ -110,6 +120,31 @@ pub enum PumpAction<Frame> {
     Malformed(String),
     /// A record the protocol ignores (e.g. an echo of our own input).
     Skip,
+}
+
+/// Read one retained process exit. The waiter publishes `Some(status)`
+/// then drops its sender; Tokio reports closure even when that final
+/// value is retained, so a closed channel is reread and only a still-
+/// `None` value concludes unknown.
+fn read_process_exit(
+    process_exit: &watch::Receiver<Option<ProcessExit>>,
+    short: &'static str,
+) -> Result<Option<ExitStatus>> {
+    let status = process_exit.borrow().as_ref().map(|exit| exit.status);
+    if status.is_some() {
+        return Ok(status);
+    }
+    if process_exit.has_changed().is_err() {
+        let status = process_exit.borrow().as_ref().map(|exit| exit.status);
+        if status.is_some() {
+            return Ok(status);
+        }
+        return Err(Error::new(
+            "unknown",
+            format!("{short} process exit could not be confirmed"),
+        ));
+    }
+    Ok(None)
 }
 
 impl NativeChild {
@@ -156,9 +191,39 @@ impl NativeChild {
             )
         })?;
         let stderr = spawn_stderr(stderr, Arc::new(policy.clone()));
+        let pid = child.id();
+        let (exit_tx, process_exit) = watch::channel(None);
+        let (kill, mut kill_rx) = oneshot::channel();
+        let writer = NativeWriter::new(stdin, labels);
+        let exit_writer = writer.clone();
+        let process_task = tokio::spawn(async move {
+            let result = tokio::select! {
+                status = child.wait() => status,
+                _ = &mut kill_rx => {
+                    match child.start_kill() {
+                        Ok(()) => child.wait().await,
+                        Err(kill_error) => match child.try_wait() {
+                            Ok(Some(status)) => Ok(status),
+                            Ok(None) => Err(kill_error),
+                            Err(wait_error) => Err(wait_error),
+                        },
+                    }
+                }
+            };
+            exit_writer.mark_process_exited();
+            if let Ok(status) = result {
+                exit_tx.send_replace(Some(ProcessExit {
+                    status,
+                    observed_at: Instant::now(),
+                }));
+            }
+        });
         let child = Self {
-            child,
-            writer: NativeWriter::new(stdin, labels),
+            pid,
+            kill: Some(kill),
+            process_exit,
+            process_task: Some(process_task),
+            writer,
             output_reader: None,
             output_reader_result: None,
             stderr_view: stderr.view(),
@@ -179,7 +244,16 @@ impl NativeChild {
 
     /// The actual native child PID; birth and custody are verified by the host.
     pub fn pid(&self) -> Option<u32> {
-        self.child.id()
+        self.pid
+    }
+
+    fn process_exit_signal(&self) -> watch::Receiver<Option<ProcessExit>> {
+        self.process_exit.clone()
+    }
+
+    /// True only after the owned child waiter observed its OS exit status.
+    pub fn process_exit_observed(&self) -> bool {
+        self.process_exit.borrow().is_some()
     }
 
     pub fn stderr_snapshot(&self) -> StderrSnapshot {
@@ -245,6 +319,29 @@ impl NativeChild {
         result
     }
 
+    fn process_exit_status(&self) -> Result<Option<ExitStatus>> {
+        read_process_exit(&self.process_exit, self.labels.short)
+    }
+
+    async fn wait_process_exit(&mut self) -> Result<ExitStatus> {
+        loop {
+            if let Some(status) = self.process_exit_status()? {
+                return Ok(status);
+            }
+            if self.process_exit.changed().await.is_err() {
+                // Closed without a prior observed change. Reread the
+                // retained final value before concluding unknown.
+                if let Some(status) = self.process_exit.borrow().as_ref().map(|exit| exit.status) {
+                    return Ok(status);
+                }
+                return Err(Error::new(
+                    "unknown",
+                    format!("{} process exit could not be confirmed", self.labels.short),
+                ));
+            }
+        }
+    }
+
     /// Flush input, then end the owned process. The graceful close only fires
     /// when the process is still running; the kill path only fires when the
     /// graceful close cannot be confirmed.
@@ -269,12 +366,7 @@ impl NativeChild {
         deadline: Instant,
         drop_input: bool,
     ) -> Result<ExitStatus> {
-        if let Some(status) = self.child.try_wait().map_err(|error| {
-            Error::new(
-                "native_process",
-                format!("{} process readback failed: {error}", self.labels.short),
-            )
-        })? {
+        if let Some(status) = self.process_exit_status()? {
             self.await_output_drained(deadline).await?;
             return Ok(status);
         }
@@ -287,56 +379,37 @@ impl NativeChild {
                 let _ = self.writer.close_input(close_deadline).await;
             }
             let grace_deadline = (Instant::now() + Duration::from_secs(2)).min(deadline);
-            if let Ok(Ok(status)) = timeout_at(grace_deadline, self.child.wait()).await {
+            if let Ok(Ok(status)) = timeout_at(grace_deadline, self.wait_process_exit()).await {
                 self.await_output_drained(deadline).await?;
                 return Ok(status);
             }
         }
 
-        match timeout_at(deadline, self.child.kill()).await {
-            Err(_) => {
-                return Err(Error::new(
-                    "unknown",
-                    format!(
-                        "{} process termination outcome is unknown",
-                        self.labels.short
-                    ),
-                ));
-            }
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                if let Some(status) = self.child.try_wait().map_err(|readback| {
-                    Error::new(
-                        "unknown",
-                        format!(
-                            "{} process exit readback failed after termination error: {readback}",
-                            self.labels.short
-                        ),
-                    )
-                })? {
-                    self.await_output_drained(deadline).await?;
-                    return Ok(status);
-                }
-                return Err(Error::new(
-                    "native_process",
-                    format!("{} process termination failed: {error}", self.labels.short),
-                ));
-            }
+        if let Some(status) = self.process_exit_status()? {
+            self.await_output_drained(deadline).await?;
+            return Ok(status);
         }
-        let status = timeout_at(deadline, self.child.wait())
+
+        if Instant::now() >= deadline {
+            return Err(Error::new(
+                "unknown",
+                format!(
+                    "{} process termination outcome is unknown",
+                    self.labels.short
+                ),
+            ));
+        }
+        if let Some(kill) = self.kill.take() {
+            let _ = kill.send(());
+        }
+        let status = timeout_at(deadline, self.wait_process_exit())
             .await
             .map_err(|_| {
                 Error::new(
                     "unknown",
                     format!("{} process exit could not be confirmed", self.labels.short),
                 )
-            })?
-            .map_err(|error| {
-                Error::new(
-                    "native_process",
-                    format!("{} process wait failed: {error}", self.labels.short),
-                )
-            })?;
+            })??;
         self.await_output_drained(deadline).await?;
         Ok(status)
     }
@@ -346,6 +419,9 @@ impl Drop for NativeChild {
     fn drop(&mut self) {
         if let Some(reader) = &self.output_reader {
             reader.abort();
+        }
+        if let Some(process) = self.process_task.take() {
+            process.abort();
         }
         // StderrCapture owns and cancels its reader; client views cannot keep it alive.
     }
@@ -358,14 +434,34 @@ impl NativeWriter {
                 stdin,
                 LinesCodec::new(),
             )))),
+            process_exited: Arc::new(AtomicBool::new(false)),
             labels,
         }
+    }
+
+    fn mark_process_exited(&self) {
+        self.process_exited.store(true, Ordering::Release);
+        if let Ok(mut writer) = self.writer.try_lock() {
+            *writer = None;
+        }
+    }
+
+    /// True once the owned child waiter finished (exit or wait error)
+    /// and fenced input. Conservative input unavailability only; it does
+    /// NOT prove an OS exit. Protocol layers use it to distinguish an
+    /// unavailable destination (unknown) from a live pre-dispatch
+    /// refusal (rejected).
+    pub fn process_unavailable(&self) -> bool {
+        self.process_exited.load(Ordering::Acquire)
     }
 
     /// One already-encoded frame. Raw errors: the protocol layer maps them
     /// through its own diagnostics. Only a queued write proves dispatch; a
     /// lost write is unknown, never silently dropped.
     pub async fn send(&self, encoded: String, deadline: Instant) -> Result<()> {
+        if self.process_exited.load(Ordering::Acquire) {
+            return Err(self.process_exited_error());
+        }
         let mut writer = match timeout_at(deadline, self.writer.lock()).await {
             Ok(writer) => writer,
             Err(_) => {
@@ -378,6 +474,10 @@ impl NativeWriter {
                 ));
             }
         };
+        if self.process_exited.load(Ordering::Acquire) {
+            *writer = None;
+            return Err(self.process_exited_error());
+        }
         let Some(writer) = writer.as_mut() else {
             return Err(Error::new(
                 "native_not_dispatched",
@@ -403,6 +503,13 @@ impl NativeWriter {
                 format!("{} write outcome is unknown", self.labels.server),
             )),
         }
+    }
+
+    fn process_exited_error(&self) -> Error {
+        Error::new(
+            "native_not_dispatched",
+            format!("{} process exited before input dispatch", self.labels.short),
+        )
     }
 
     /// Flush input. This does not close the pipe: the stdin handle stays
@@ -570,6 +677,7 @@ where
     Classify: FnMut(Value) -> PumpAction<Frame> + Send + 'static,
 {
     let (mut transport, stdout) = NativeChild::spawn(launch, policy, labels).await?;
+    let process_exit = transport.process_exit_signal();
     let pending = PendingCalls::new(id_prefix, labels);
     let (frame_tx, frame_rx) = native_frame_channel();
     let (stream_tx, stream_rx) = watch::channel(StreamState::Open);
@@ -579,22 +687,48 @@ where
         stream_tx,
         pending.clone(),
         labels.server,
+        process_exit,
         classify,
     ));
     transport.set_output_reader(output_reader);
     Ok((transport, pending, frame_rx, stream_rx))
 }
 
+fn finish_exit_drain_deadline(
+    overflowed: bool,
+    stream: &watch::Sender<StreamState>,
+    pending: &PendingCalls,
+    server: &str,
+) -> Result<()> {
+    if overflowed {
+        stream.send_replace(StreamState::Overflow);
+        let error = Error::new(
+            "unknown",
+            format!("{server} event queue overflowed before exit drain ended"),
+        );
+        pending.fail_all(error.clone());
+        return Err(error);
+    }
+    stream.send_replace(StreamState::Malformed);
+    pending.fail_all(Error::new(
+        "unknown",
+        format!("{server} stdout remained open after its process exit drain deadline"),
+    ));
+    // The owner sees `Malformed` and records the uncovered-tail gap.
+    Ok(())
+}
+
 /// Bounded stdout line pump: length-checked NDJSON lines, protocol
-/// classification of each parsed record, one overflow gap, output drained
-/// before any loss conclusion. The classifier owns every protocol decision;
-/// the pump owns every transport decision.
-pub async fn pump_framed_lines<Frame, Classify>(
+/// classification of each parsed record, one overflow gap, and a bounded
+/// post-exit drain before any loss conclusion. The classifier owns every
+/// protocol decision; the pump owns every transport decision.
+async fn pump_framed_lines<Frame, Classify>(
     stdout: ChildStdout,
     frames: mpsc::Sender<Frame>,
     stream: watch::Sender<StreamState>,
     pending: PendingCalls,
     server: &'static str,
+    mut process_exit: watch::Receiver<Option<ProcessExit>>,
     mut classify: Classify,
 ) -> Result<()>
 where
@@ -606,7 +740,59 @@ where
         LinesCodec::new_with_max_length(MAX_NATIVE_FRAME_BYTES.saturating_sub(1)),
     );
     let mut overflowed = false;
-    while let Some(line) = reader.next().await {
+    let mut exit_deadline = process_exit
+        .borrow()
+        .as_ref()
+        .map(|exit| exit.observed_at + NATIVE_EXIT_DRAIN);
+    if exit_deadline.is_none() && process_exit.has_changed().is_err() {
+        exit_deadline = Some(Instant::now() + NATIVE_EXIT_DRAIN);
+    }
+    let mut post_deadline_ready_lines = 0;
+    loop {
+        let line = match exit_deadline {
+            Some(deadline) if Instant::now() >= deadline => {
+                if post_deadline_ready_lines >= NATIVE_EVENT_QUEUE {
+                    return finish_exit_drain_deadline(overflowed, &stream, &pending, server);
+                }
+                match reader.next().now_or_never() {
+                    Some(line) => {
+                        post_deadline_ready_lines += 1;
+                        line
+                    }
+                    None => {
+                        return finish_exit_drain_deadline(overflowed, &stream, &pending, server);
+                    }
+                }
+            }
+            Some(deadline) => {
+                tokio::select! {
+                    // Prefer ready output while time remains. The loop checks
+                    // the deadline before every poll, so continuous output
+                    // cannot starve it.
+                    biased;
+                    line = reader.next() => line,
+                    _ = tokio::time::sleep_until(deadline) => continue,
+                }
+            }
+            None => {
+                tokio::select! {
+                    line = reader.next() => line,
+                    _ = process_exit.changed() => {
+                        exit_deadline = Some(
+                            process_exit
+                                .borrow()
+                                .as_ref()
+                                .map(|exit| exit.observed_at + NATIVE_EXIT_DRAIN)
+                                .unwrap_or_else(|| Instant::now() + NATIVE_EXIT_DRAIN),
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+        let Some(line) = line else {
+            break;
+        };
         let line = match line {
             Ok(line) if line.len().saturating_add(1) <= MAX_NATIVE_FRAME_BYTES => line,
             _ => {
@@ -674,4 +860,54 @@ fn mark_stream_malformed(
     let error = Error::new("unknown", message);
     pending.fail_all(error.clone());
     error
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn exit_status() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn exit_status() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+
+    #[test]
+    fn publish_then_close_retains_positive_exit() {
+        // The waiter publishes `Some(status)` then drops its sender.
+        // Tokio reports closure even with the final value retained; the
+        // read must still prove the exit, not conclude unknown.
+        let (exit_tx, exit_rx) = watch::channel(None);
+        exit_tx.send_replace(Some(ProcessExit {
+            status: exit_status(),
+            observed_at: Instant::now(),
+        }));
+        drop(exit_tx);
+        assert!(exit_rx.has_changed().is_err());
+        let status = read_process_exit(&exit_rx, "Test").expect("retained exit");
+        assert!(status.is_some_and(|status| status.success()));
+    }
+
+    #[test]
+    fn close_without_publish_stays_unknown() {
+        // No publish before the drop: there is no exit to prove.
+        let (exit_tx, exit_rx) = watch::channel(None);
+        drop(exit_tx);
+        let error = read_process_exit(&exit_rx, "Test").expect_err("unknown exit");
+        assert_eq!(error.code, "unknown");
+    }
+
+    #[test]
+    fn open_without_publish_stays_pending() {
+        // The waiter has not published and still holds its sender.
+        let (_exit_tx, exit_rx) = watch::channel(None);
+        let status = read_process_exit(&exit_rx, "Test").expect("pending");
+        assert!(status.is_none());
+    }
 }
