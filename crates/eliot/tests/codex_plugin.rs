@@ -151,7 +151,18 @@ impl FakeCodex {
                 self.reply(stdout, id, json!({"requirements": null}));
             }
             "account/read" => {
-                self.reply(stdout, id, json!({"account": {"type": "chatgpt"}}));
+                self.reply(
+                    stdout,
+                    id,
+                    json!({
+                        "account": {
+                            "type": "chatgpt",
+                            "email": null,
+                            "planType": "pro",
+                        },
+                        "requiresOpenaiAuth": true,
+                    }),
+                );
             }
             "model/list" => {
                 self.reply(
@@ -205,8 +216,11 @@ impl FakeCodex {
                         "model": "test-model",
                         "modelProvider": "openai",
                         "cwd": cwd,
-                        "sandbox": "workspace-write",
+                        "sandbox": {
+                            "type": "workspaceWrite",
+                        },
                         "approvalPolicy": "never",
+                        "approvalsReviewer": "user",
                         "reasoningEffort": "medium",
                     }),
                 );
