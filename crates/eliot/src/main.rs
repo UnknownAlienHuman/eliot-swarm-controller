@@ -219,6 +219,10 @@ enum CliCommand {
         generation: GenerationArgs,
         #[arg(long, value_name = "REQUEST")]
         request: Option<String>,
+        #[arg(long, value_name = "CHOICE_ID")]
+        choice: Option<String>,
+        #[arg(long, value_name = "FEEDBACK")]
+        feedback: Option<String>,
     },
     /// Deny a pending native request.
     Deny {
@@ -228,6 +232,10 @@ enum CliCommand {
         generation: GenerationArgs,
         #[arg(long, value_name = "REQUEST")]
         request: Option<String>,
+        #[arg(long, value_name = "CHOICE_ID")]
+        choice: Option<String>,
+        #[arg(long, value_name = "FEEDBACK")]
+        feedback: Option<String>,
     },
     /// Answer a pending native question from a bounded JSON file.
     Answer {
@@ -1456,8 +1464,15 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             agent,
             generation: GenerationArgs { generation },
             request,
+            choice,
+            feedback,
         } => {
-            let mut params = submit_request(id, Some(agent), "approve", json!({}))?;
+            let mut params = submit_request(
+                id,
+                Some(agent),
+                "approve",
+                approval_reply_args(choice, feedback),
+            )?;
             params.expected_generation = generation;
             params.request_id = request;
             submit_and_print(&data_dir, &params, json_output).await
@@ -1466,8 +1481,15 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             agent,
             generation: GenerationArgs { generation },
             request,
+            choice,
+            feedback,
         } => {
-            let mut params = submit_request(id, Some(agent), "deny", json!({}))?;
+            let mut params = submit_request(
+                id,
+                Some(agent),
+                "deny",
+                approval_reply_args(choice, feedback),
+            )?;
             params.expected_generation = generation;
             params.request_id = request;
             submit_and_print(&data_dir, &params, json_output).await
@@ -2150,6 +2172,17 @@ fn submit_request(
     request.target = target;
     request.args = args;
     Ok(request)
+}
+
+fn approval_reply_args(choice: Option<String>, feedback: Option<String>) -> Value {
+    let mut args = serde_json::Map::new();
+    if let Some(choice) = choice {
+        args.insert("choice_id".to_owned(), Value::String(choice));
+    }
+    if let Some(feedback) = feedback {
+        args.insert("feedback".to_owned(), Value::String(feedback));
+    }
+    Value::Object(args)
 }
 
 async fn submit_command(
