@@ -672,11 +672,13 @@ impl FakeMsp {
                     self.emit_workflow_revision(
                         stdout,
                         &session_id,
-                        &parent_turn,
-                        5,
                         "item/completed",
-                        Self::workflow_child_terminal(),
-                        Some("workflow-summary-redacted"),
+                        (
+                            &parent_turn,
+                            5,
+                            Self::workflow_child_terminal(),
+                            Some("workflow-summary-redacted"),
+                        ),
                     );
                 }
                 if self.script == "stepchild" && self.turn_count == 3 {
@@ -692,20 +694,14 @@ impl FakeMsp {
                     self.emit_workflow_revision(
                         stdout,
                         &session_id,
-                        &parent_turn,
-                        6,
                         "item/updated",
-                        children.clone(),
-                        None,
+                        (&parent_turn, 6, children.clone(), None),
                     );
                     self.emit_workflow_revision(
                         stdout,
                         &session_id,
-                        &parent_turn,
-                        7,
                         "item/completed",
-                        children,
-                        Some("workflow-summary-redacted"),
+                        (&parent_turn, 7, children, Some("workflow-summary-redacted")),
                     );
                 }
                 self.reply(
@@ -972,38 +968,26 @@ impl FakeMsp {
                     self.emit_workflow_revision(
                         stdout,
                         &session_id,
-                        &command,
-                        1,
                         "item/started",
-                        json!([]),
-                        None,
+                        (&command, 1, json!([]), None),
                     );
                     self.emit_workflow_revision(
                         stdout,
                         &session_id,
-                        &command,
-                        2,
                         "item/updated",
-                        Self::workflow_child_status("scheduled"),
-                        None,
+                        (&command, 2, Self::workflow_child_status("scheduled"), None),
                     );
                     self.emit_workflow_revision(
                         stdout,
                         &session_id,
-                        &command,
-                        3,
                         "item/updated",
-                        Self::workflow_child_status("started"),
-                        None,
+                        (&command, 3, Self::workflow_child_status("started"), None),
                     );
                     self.emit_workflow_revision(
                         stdout,
                         &session_id,
-                        &command,
-                        4,
                         "item/updated",
-                        Self::workflow_child_terminal(),
-                        None,
+                        (&command, 4, Self::workflow_child_terminal(), None),
                     );
                 }
             }
@@ -1864,12 +1848,10 @@ impl FakeMsp {
         &mut self,
         stdout: &mut std::io::StdoutLock,
         session_id: &str,
-        parent_turn: &str,
-        revision: i64,
         method: &str,
-        children: Value,
-        message: Option<&str>,
+        workflow_item_revision: (&str, i64, Value, Option<&str>),
     ) {
+        let (parent_turn, revision, children, message) = workflow_item_revision;
         let cursor = self.next_cursor();
         let mut item = json!({
             "itemId": "fake-workflow-item-1",
