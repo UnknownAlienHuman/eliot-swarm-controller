@@ -256,9 +256,10 @@ impl Store {
                 observer::require_controlled(&agent)?;
             }
         }
-        let state = load_source_state(&tx, id, update.generation, &update.source)?.ok_or_else(
-            || Error::new("source_integrity", "health source has no committed state"),
-        )?;
+        let state =
+            load_source_state(&tx, id, update.generation, &update.source)?.ok_or_else(|| {
+                Error::new("source_integrity", "health source has no committed state")
+            })?;
         if state.state != "open" {
             return Err(Error::new(
                 "source_integrity",
@@ -885,10 +886,7 @@ mod tests {
         for source in ["daemon", "os", "git", "workspace_process"] {
             assert_eq!(
                 store
-                    .set_source_health(
-                        SourceHealthUpdate::new(&agent, 1, source, "stale"),
-                        now + 4
-                    )
+                    .set_source_health(SourceHealthUpdate::new(&agent, 1, source, "stale"), now + 4)
                     .unwrap_err()
                     .code,
                 "not_allowed"
@@ -921,7 +919,10 @@ mod tests {
         store.close_native_sources(&agent, 1, now + 5).unwrap();
         assert_eq!(
             store
-                .set_source_health(SourceHealthUpdate::new(&agent, 1, "stream", "stale"), now + 6)
+                .set_source_health(
+                    SourceHealthUpdate::new(&agent, 1, "stream", "stale"),
+                    now + 6
+                )
                 .unwrap_err()
                 .code,
             "source_integrity"

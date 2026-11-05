@@ -135,9 +135,7 @@ pub(super) async fn record_source_health(
             .await
             .map_err(|_| CoreError::new("busy", "Store lock deadline elapsed for source.health"))?;
         let result = match subject {
-            Some(subject) => {
-                store.set_native_source_health(update, subject, super::now_ms())
-            }
+            Some(subject) => store.set_native_source_health(update, subject, super::now_ms()),
             None => store.set_source_health(update, super::now_ms()),
         };
         (result, store.is_write_faulted())
