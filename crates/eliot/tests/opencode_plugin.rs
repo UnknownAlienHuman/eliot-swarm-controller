@@ -578,8 +578,12 @@ fn fake_server_main(script_raw: &str) {
         spawn.stdin(Stdio::null());
         spawn.stdout(Stdio::null());
         spawn.stderr(Stdio::null());
-        let child = spawn.spawn().expect("spawn owned descendant");
+        let mut child = spawn.spawn().expect("spawn owned descendant");
         std::fs::write(&pid_path, child.id().to_string()).expect("write descendant pid");
+        // Reap the exact child off the fake server's startup path.
+        drop(std::thread::spawn(move || {
+            let _ = child.wait();
+        }));
     }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
