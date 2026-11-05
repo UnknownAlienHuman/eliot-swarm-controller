@@ -2195,6 +2195,8 @@ const BASE_ENVIRONMENT_NAMES: &[&str] = &[
     "HOME",
     "LOCALAPPDATA",
     "SystemRoot",
+    "SystemDrive",
+    "ProgramData",
     "PATHEXT",
     "PATH",
     "TEMP",
@@ -3000,6 +3002,30 @@ mod tests {
         .unwrap();
         assert_eq!(environment["CODEX_HOME"], "current-legacy-home");
         assert!(legacy.get("pass_env_values").is_none());
+    }
+
+    #[test]
+    fn windows_baseline_forwards_systemdrive_and_programdata() {
+        let profile = json!({});
+        let environment = build_process_environment_with(&profile, |name| match name {
+            "SystemDrive" => Some(OsString::from("C:")),
+            "ProgramData" => Some(OsString::from("C:\\ProgramData")),
+            _ => None,
+        })
+        .unwrap();
+        #[cfg(windows)]
+        {
+            assert_eq!(environment["SystemDrive"], "C:");
+            assert_eq!(environment["ProgramData"], "C:\\ProgramData");
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(environment.get("SystemDrive").is_none());
+            assert!(environment.get("ProgramData").is_none());
+        }
+        let missing = build_process_environment_with(&profile, |_| None).unwrap();
+        assert!(missing.get("SystemDrive").is_none());
+        assert!(missing.get("ProgramData").is_none());
     }
 
     fn batch() -> SourceBatch {
