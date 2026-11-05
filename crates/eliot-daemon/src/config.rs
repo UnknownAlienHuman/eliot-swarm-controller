@@ -3606,7 +3606,9 @@ pass_env = ["OPENAI_API_KEY"]
                 "[profiles.oc]\nharness='opencode'\nmodel={model_literal}\ncmd='C:/Tools/opencode.exe'\n"
             );
             assert_eq!(
-                resolve_text_profile(&source, "oc").expect_err("invalid or unmapped model syntax").code,
+                resolve_text_profile(&source, "oc")
+                    .expect_err("invalid or unmapped model syntax")
+                    .code,
                 "profile_error",
                 "{model:?}"
             );

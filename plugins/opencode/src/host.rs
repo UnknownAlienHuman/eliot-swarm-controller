@@ -12,8 +12,8 @@ use eliot_plugin::{
     session::{
         ResumeSubject, TargetEnvironment, contextual_error, decode, known_command, native_no_write,
         not_initialized, optional_profile_text, parse_resume_subject, paths_equal,
-        register_native_process, split_provider_model, target_environment, unknown_snapshot, validate_binding,
-        validate_identity, validate_source_plan,
+        register_native_process, split_provider_model, target_environment, unknown_snapshot,
+        validate_binding, validate_identity, validate_source_plan,
     },
 };
 use serde_json::{Value, json};
@@ -2172,16 +2172,29 @@ mod tests {
         );
         assert_eq!(format!("{}/{}", model.provider_id, model.id), requested);
         for malformed in [
-            "", "noprovider", "/model", "openrouter/", "openrouter//model",
-            "openrouter/stealth/", "openrouter/stealth//crouton-alpha",
-            "openrouter\\stealth\\crouton-alpha", "openrouter/stealth\\crouton-alpha",
-            "open#router/model", "openrouter/model#", "openrouter/model#default",
-            "openrouter/model##default", "openrouter/model\n", "\topenrouter/model",
-            "openrouter/stealth/ model", "openrouter/stealth/\0model",
+            "",
+            "noprovider",
+            "/model",
+            "openrouter/",
+            "openrouter//model",
+            "openrouter/stealth/",
+            "openrouter/stealth//crouton-alpha",
+            "openrouter\\stealth\\crouton-alpha",
+            "openrouter/stealth\\crouton-alpha",
+            "open#router/model",
+            "openrouter/model#",
+            "openrouter/model#default",
+            "openrouter/model##default",
+            "openrouter/model\n",
+            "\topenrouter/model",
+            "openrouter/stealth/ model",
+            "openrouter/stealth/\0model",
         ] {
             let profile = json!({"model":malformed});
             assert_eq!(
-                start_model_ref(profile.as_object().unwrap()).unwrap_err().code,
+                start_model_ref(profile.as_object().unwrap())
+                    .unwrap_err()
+                    .code,
                 "profile_error",
                 "{malformed:?}"
             );

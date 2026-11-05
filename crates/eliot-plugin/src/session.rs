@@ -224,7 +224,9 @@ pub fn optional_profile_text(
 /// v2.0.32 Model.Ref.parse keeps later slashes in the model id; its separate
 /// `#variant` syntax is not mapped by the current Eliot profile path.
 pub fn split_provider_model(model: &str) -> Option<(&str, &str)> {
-    if model.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+    if model
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control())
         || model.contains('\\')
         || model.contains('#')
     {
