@@ -331,6 +331,10 @@ impl Fixture {
     }
 
     pub fn start(&mut self) {
+        self.start_with_env(&[]);
+    }
+
+    pub fn start_with_env(&mut self, extra: &[(&str, &str)]) {
         assert!(self.daemon.is_none());
         let _start_guard = DaemonStartGuard::enter();
         self.starts += 1;
@@ -342,6 +346,9 @@ impl Fixture {
             .arg("--data-dir")
             .arg(data_argument)
             .args(["daemon", "--foreground"]);
+        for (name, value) in extra {
+            command.env(name, value);
+        }
         self.daemon = Some(Captured::spawn(command));
         let child_id = self.daemon.as_ref().unwrap().child.id();
         let started = Instant::now();
