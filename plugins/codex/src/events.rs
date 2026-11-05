@@ -1,7 +1,7 @@
 use crate::native_child::{
     ChildBinding, binding_from_ack, build_registration, is_admission_rejection, register_child,
 };
-use eliot_core::{ChildRegistration, Error, ProviderRestriction, Result, SecretPolicy};
+use eliot_core::{ChildRegistration, Error, ProviderRestriction, Result, SecretPolicy, SourceGap};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     protocol::MAX_COMMAND_ID_BYTES,
@@ -193,6 +193,7 @@ struct ChildState {
     final_text: Option<String>,
     active_turn_id: Option<String>,
     ready_committed: bool,
+    pending_gap: Option<SourceGap>,
 }
 
 impl ChildState {
@@ -208,6 +209,7 @@ impl ChildState {
             final_text: None,
             active_turn_id: None,
             ready_committed: false,
+            pending_gap: None,
         }
     }
 
@@ -220,6 +222,9 @@ impl ChildState {
         native_id: String,
         data: Value,
     ) -> Result<()> {
+        // Split disjoint field borrows: the source borrows latches, `pending`
+        // borrows only the retained gap slot.
+        let pending = &mut self.pending_gap;
         let mut source = StreamSource {
             sink,
             host,
@@ -236,7 +241,9 @@ impl ChildState {
             batch_unknown: &mut self.batch_unknown,
             failure: &mut self.failure,
         };
-        source.commit_event(kind, native_id, data).await
+        source
+            .commit_event_with_retained(kind, native_id, data, pending)
+            .await
     }
 
     async fn record_gap(
@@ -246,6 +253,7 @@ impl ChildState {
         credential: &str,
         reason: &str,
     ) -> Result<()> {
+        let pending = &mut self.pending_gap;
         let mut source = StreamSource {
             sink,
             host,
@@ -262,7 +270,7 @@ impl ChildState {
             batch_unknown: &mut self.batch_unknown,
             failure: &mut self.failure,
         };
-        source.record_gap(reason).await
+        source.record_gap_with_retained(reason, pending).await
     }
 }
 
@@ -1719,11 +1727,46 @@ impl EventProcessor {
         self.stream_source().record_gap(reason).await
     }
 
+    async fn settle_child_pending_gap(&mut self, child_thread: &str) -> bool {
+        if !self
+            .child_states
+            .get(child_thread)
+            .is_some_and(|state| state.pending_gap.is_some())
+        {
+            return false;
+        }
+        let host = self.host.clone();
+        let credential = self.credential.clone();
+        let sink = &mut self.sink;
+        let Some(state) = self.child_states.get_mut(child_thread) else {
+            return false;
+        };
+        let pending = &mut state.pending_gap;
+        let mut source = StreamSource {
+            sink,
+            host: &host,
+            credential: &credential,
+            agent_id: &state.binding.agent_id,
+            generation: state.binding.agent_generation,
+            harness: "Codex",
+            id_prefix: "codex",
+            families: &eliot_core::NATIVE_CHILD_FAMILIES,
+            writes_blocked: &mut state.writes_blocked,
+            gap_reported: &mut state.gap_reported,
+            gap_number: &mut state.gap_number,
+            source_unknown: &mut state.source_unknown,
+            batch_unknown: &mut state.batch_unknown,
+            failure: &mut state.failure,
+        };
+        source.drive_retained_gap(pending).await
+    }
+
     async fn record_child_gap_visible(&mut self, child_thread: &str, reason: &str) {
         let gap_result = if let Some(state) = self.child_states.get_mut(child_thread) {
-            state
-                .record_gap(&mut self.sink, &self.host, &self.credential, reason)
-                .await
+            let host = self.host.clone();
+            let credential = self.credential.clone();
+            let sink = &mut self.sink;
+            state.record_gap(sink, &host, &credential, reason).await
         } else {
             return;
         };
@@ -1734,7 +1777,7 @@ impl EventProcessor {
 
     async fn handle_thread_started_error(&mut self, child_thread: &str, error: Error) {
         if self.child_states.contains_key(child_thread) {
-            let (should_gap, reason) = {
+            let (should_gap, reason, has_pending) = {
                 let state = self.child_states.get_mut(child_thread).expect("checked");
                 state.source_unknown = true;
                 let reason = format!(
@@ -1744,10 +1787,16 @@ impl EventProcessor {
                 if state.failure.is_none() {
                     state.failure = Some(error.message);
                 }
-                (!state.gap_reported && !state.writes_blocked, reason)
+                (
+                    !state.gap_reported && !state.writes_blocked,
+                    reason,
+                    state.pending_gap.is_some(),
+                )
             };
             if should_gap {
                 self.record_child_gap_visible(child_thread, &reason).await;
+            } else if has_pending {
+                let _ = self.settle_child_pending_gap(child_thread).await;
             }
             return;
         }
@@ -1772,6 +1821,13 @@ impl EventProcessor {
                 self.handle_thread_started_error(&child_thread, error).await;
             }
             return;
+        }
+        if self
+            .child_states
+            .get(&child_thread)
+            .is_some_and(|state| state.pending_gap.is_some())
+        {
+            let _ = self.settle_child_pending_gap(&child_thread).await;
         }
         if !self.child_states.contains_key(&child_thread)
             && !self.children.is_bound(&child_thread)
@@ -2062,19 +2118,23 @@ impl EventProcessor {
         self.child_states
             .insert(child_thread.to_owned(), child_state);
         let mut first_error = None;
-        if self.child_early_lost.remove(child_thread)
-            && let Some(state) = self.child_states.get_mut(child_thread)
-            && let Err(error) = state
-                .record_gap(
-                    &mut self.sink,
-                    &self.host,
-                    &self.credential,
-                    "Codex child early events were lost before registration",
-                )
-                .await
-            && first_error.is_none()
-        {
-            first_error = Some(error);
+        if self.child_early_lost.remove(child_thread) {
+            let host = self.host.clone();
+            let credential = self.credential.clone();
+            let sink = &mut self.sink;
+            if let Some(state) = self.child_states.get_mut(child_thread)
+                && let Err(error) = state
+                    .record_gap(
+                        sink,
+                        &host,
+                        &credential,
+                        "Codex child early events were lost before registration",
+                    )
+                    .await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
         if let Err(error) = self.flush_child_buffer(child_thread).await
             && first_error.is_none()
@@ -2098,38 +2158,66 @@ impl EventProcessor {
         let Some(mut queue) = self.child_buffers.remove(child_thread) else {
             return Ok(());
         };
+        if self
+            .child_states
+            .get(child_thread)
+            .is_some_and(|state| state.pending_gap.is_some())
+        {
+            let _ = self.settle_child_pending_gap(child_thread).await;
+        }
         let mut first_unresolved = None;
         while let Some(frame) = queue.pop_front() {
             let size = child_frame_size(&frame);
             self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(size);
             match frame {
                 BufferedNativeFrame::Notification { method, params } => {
-                    if let Err(error) = self
+                    let result = self
                         .process_child_notification(child_thread, &method, params)
-                        .await
-                        && let Some(state) = self.child_states.get_mut(child_thread)
-                    {
-                        state.source_unknown = true;
-                        let code = error.code.clone();
-                        if state.failure.is_none() {
-                            state.failure = Some(error.message);
-                        }
-                        if !state.gap_reported && !state.writes_blocked {
+                        .await;
+                    if let Err(error) = result {
+                        let (should_gap, code, has_pending) = {
+                            let Some(state) = self.child_states.get_mut(child_thread) else {
+                                continue;
+                            };
+                            state.source_unknown = true;
+                            let code = error.code.clone();
+                            if state.failure.is_none() {
+                                state.failure = Some(error.message);
+                            }
+                            (
+                                !state.gap_reported && !state.writes_blocked,
+                                code,
+                                state.pending_gap.is_some(),
+                            )
+                        };
+                        if should_gap {
                             let reason = format!(
                                 "Codex child {method} notification could not be normalized ({code})",
                             );
-                            if let Err(gap_error) = state
-                                .record_gap(&mut self.sink, &self.host, &self.credential, &reason)
-                                .await
+                            let host = self.host.clone();
+                            let credential = self.credential.clone();
+                            let sink = &mut self.sink;
+                            if let Some(state) = self.child_states.get_mut(child_thread)
+                                && let Err(gap_error) =
+                                    state.record_gap(sink, &host, &credential, &reason).await
                                 && first_unresolved.is_none()
                             {
                                 first_unresolved = Some(gap_error);
                             }
-                        } else if state.writes_blocked && first_unresolved.is_none() {
-                            first_unresolved = Some(Error::new(
-                                "unknown",
-                                "Codex child acknowledgement is unresolved",
-                            ));
+                        } else {
+                            if has_pending {
+                                let _ = self.settle_child_pending_gap(child_thread).await;
+                            }
+                            let still_blocked = self
+                                .child_states
+                                .get(child_thread)
+                                .is_some_and(|state| state.writes_blocked);
+                            if still_blocked && first_unresolved.is_none() {
+                                first_unresolved = Some(Error::new(
+                                    "unknown",
+                                    "Codex child acknowledgement is unresolved",
+                                ));
+                            }
                         }
                     }
                 }
@@ -2245,6 +2333,9 @@ impl EventProcessor {
             Ok(bytes) => bytes.len(),
             Err(_) => usize::MAX,
         };
+        let host = self.host.clone();
+        let credential = self.credential.clone();
+        let sink = &mut self.sink;
         let state = self
             .child_states
             .get_mut(child_thread)
@@ -2252,9 +2343,9 @@ impl EventProcessor {
         if encoded_len > MAX_EVENT_BYTES {
             return state
                 .record_gap(
-                    &mut self.sink,
-                    &self.host,
-                    &self.credential,
+                    sink,
+                    &host,
+                    &credential,
                     "Codex child completed message exceeded persisted-event bound",
                 )
                 .await;
@@ -2262,9 +2353,9 @@ impl EventProcessor {
         let native_id = event_id(child_thread, &turn_id, item_id, "message.completed")?;
         state
             .commit_event(
-                &mut self.sink,
-                &self.host,
-                &self.credential,
+                sink,
+                &host,
+                &credential,
                 "message.completed",
                 native_id,
                 data,
@@ -2280,6 +2371,9 @@ impl EventProcessor {
                     "Codex child turn/completed schema mismatch",
                 )
             })?;
+        let host = self.host.clone();
+        let credential = self.credential.clone();
+        let sink = &mut self.sink;
         let state = self
             .child_states
             .get_mut(child_thread)
@@ -2287,9 +2381,9 @@ impl EventProcessor {
         if notification.turn.status == NativeTurnStatus::InProgress {
             return state
                 .record_gap(
-                    &mut self.sink,
-                    &self.host,
-                    &self.credential,
+                    sink,
+                    &host,
+                    &credential,
                     "Codex child turn/completed carried nonterminal inProgress status",
                 )
                 .await;
@@ -2311,14 +2405,7 @@ impl EventProcessor {
             "turn.completed",
         )?;
         state
-            .commit_event(
-                &mut self.sink,
-                &self.host,
-                &self.credential,
-                "turn.completed",
-                native_id,
-                data,
-            )
+            .commit_event(sink, &host, &credential, "turn.completed", native_id, data)
             .await?;
         state.active_turn_id = None;
         Ok(())
@@ -2383,13 +2470,15 @@ impl EventProcessor {
     }
 
     async fn record_child_spawn_gap(&mut self, parent_thread: &str, reason: &str) -> Result<()> {
-        if let Some(state) = self.child_states.get_mut(parent_thread) {
-            state
-                .record_gap(&mut self.sink, &self.host, &self.credential, reason)
-                .await
-        } else {
-            self.record_gap(reason).await
+        if self.child_states.contains_key(parent_thread) {
+            let host = self.host.clone();
+            let credential = self.credential.clone();
+            let sink = &mut self.sink;
+            if let Some(state) = self.child_states.get_mut(parent_thread) {
+                return state.record_gap(sink, &host, &credential, reason).await;
+            }
         }
+        self.record_gap(reason).await
     }
     fn stream_source(&mut self) -> StreamSource<'_> {
         StreamSource {
@@ -3298,10 +3387,51 @@ mod tests {
         assert!(processor.child_buffers.contains_key("child-1"));
     }
 
+    async fn connected_child_processor(
+        parent_id: &str,
+    ) -> (
+        crate::native::NativeProcess,
+        EventProcessor,
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (host_io, plugin_io) = tokio::io::duplex(64 * 1024);
+        let (plugin_read, plugin_write) = tokio::io::split(plugin_io);
+        let mut peer = eliot_plugin::Peer::from_io(plugin_read, plugin_write);
+        let peer_client = peer.client();
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+        let launch = crate::native::NativeLaunch {
+            program: std::env::current_exe().expect("test exe").into_os_string(),
+            args: [std::ffi::OsString::from("--list")].to_vec(),
+            cwd: std::env::current_dir().expect("cwd"),
+            environment: Vec::new(),
+        };
+        let native = crate::native::NativeProcess::spawn(
+            launch,
+            eliot_core::SecretPolicy::new(Vec::<String>::new()),
+        )
+        .await
+        .expect("spawn fixture");
+        let processor = EventProcessor::new(
+            native.client(),
+            peer_client,
+            EventConfig {
+                credential: "test-cred".to_owned(),
+                agent_id: parent_id.to_owned(),
+                generation: 1,
+                secrets: Vec::new(),
+                native_scope: "codex:test".to_owned(),
+            },
+        );
+        (native, processor, host_io, peer_task)
+    }
+
     #[tokio::test]
     async fn ordinary_frame_retries_same_pending_registration_after_lost_ack() {
-        let (_native, mut processor) = child_test_processor().await;
-        processor.agent_id = "a1000000000000000000000000001".to_owned();
+        use eliot_plugin::RpcRequest;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+
+        let (_native, mut processor, host_io, peer_task) = connected_child_processor("a1").await;
         processor.status.thread_id = Some("owned".to_owned());
         processor.native_scope = "codex:test".to_owned();
         processor.children.confirm("owned", "child-1").unwrap();
@@ -3313,48 +3443,199 @@ mod tests {
             .children
             .spawn_items
             .insert("child-1".to_owned(), "call-1".to_owned());
-        let retained = build_registration(
-            "call-1",
-            "a1000000000000000000000000001",
-            1,
-            "owned",
-            "codex:test",
-            "child-1",
-        );
+        let retained = build_registration("call-1", "a1", 1, "owned", "codex:test", "child-1");
         processor
             .child_pending
             .insert("child-1".to_owned(), retained.clone());
-        let started = std::time::Instant::now();
-        processor
-            .handle_child_notification(
-                "turn/started",
-                json!({"threadId": "child-1", "turn": {"id": "turn-9"}}),
-            )
-            .await;
-        assert!(
-            started.elapsed() >= std::time::Duration::from_secs(25),
-            "ordinary frame must attempt host register (lost-ACK timeout), not just buffer"
-        );
-        assert_eq!(
+
+        let (host_read, mut host_write) = split(host_io);
+        let mut host_reader = BufReader::new(host_read);
+        let mut recorded_rpc = Vec::new();
+
+        let fake_host = async {
+            let mut line = String::new();
+
+            // 1. Initial attempt: host returns busy for child registration.
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("read first child registration request");
+            let req1: RpcRequest = serde_json::from_str(&line).expect("decode req1");
+            recorded_rpc.push((req1.method.clone(), req1.params.clone()));
+            assert_eq!(req1.method, "child");
+            let busy_reply = json!({
+                "jsonrpc": "2.0",
+                "id": req1.id,
+                "error": {
+                    "code": -32020,
+                    "message": "host plugin registration is busy",
+                    "data": { "code": "busy" }
+                }
+            });
+            host_write
+                .write_all(format!("{busy_reply}\n").as_bytes())
+                .await
+                .expect("send busy reply");
+
+            // 2. Later ordinary frame retries IDENTICAL registration: host answers canonical ACK.
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("read second child registration request");
+            let req2: RpcRequest = serde_json::from_str(&line).expect("decode req2");
+            recorded_rpc.push((req2.method.clone(), req2.params.clone()));
+            assert_eq!(req2.method, "child");
+            let ack = crate::native_child::tests::test_ack(&retained);
+            let ack_reply = json!({
+                "jsonrpc": "2.0",
+                "id": req2.id,
+                "result": ack,
+            });
+            host_write
+                .write_all(format!("{ack_reply}\n").as_bytes())
+                .await
+                .expect("send canonical child ack");
+
+            // 3. Upon registration ACK, processor commits session.ready.
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("read session.ready commit");
+            let req3: RpcRequest = serde_json::from_str(&line).expect("decode req3");
+            recorded_rpc.push((req3.method.clone(), req3.params.clone()));
+            assert_eq!(req3.method, "events.put");
+            let ready_ack = json!({
+                "jsonrpc": "2.0",
+                "id": req3.id,
+                "result": {
+                    "first_seq": 1,
+                    "last_seq": 1,
+                    "cursor": null,
+                }
+            });
+            host_write
+                .write_all(format!("{ready_ack}\n").as_bytes())
+                .await
+                .expect("send session.ready ack");
+
+            // 4. Processor drains buffered child frames (turn-9, then turn-10).
+            for (idx, expected_turn) in ["turn-9", "turn-10"].iter().enumerate() {
+                line.clear();
+                host_reader
+                    .read_line(&mut line)
+                    .await
+                    .expect("read child fact commit");
+                let req: RpcRequest = serde_json::from_str(&line).expect("decode child fact");
+                recorded_rpc.push((req.method.clone(), req.params.clone()));
+                assert_eq!(req.method, "events.put");
+                assert_eq!(req.params["agent_id"], "a2");
+                assert_eq!(req.params["events"][0]["kind"], "turn.started");
+                assert_eq!(req.params["events"][0]["data"]["turn_id"], *expected_turn);
+                let turn_ack = json!({
+                    "jsonrpc": "2.0",
+                    "id": req.id,
+                    "result": {
+                        "first_seq": 2 + idx as i64,
+                        "last_seq": 2 + idx as i64,
+                        "cursor": null,
+                    }
+                });
+                host_write
+                    .write_all(format!("{turn_ack}\n").as_bytes())
+                    .await
+                    .expect("send turn.started ack");
+            }
+
+            drop(host_write);
+            drop(host_reader);
+            recorded_rpc
+        };
+
+        let driver = async {
+            // First ordinary child frame: registration fails busy, frame is buffered, no facts before ACK.
             processor
-                .child_pending
-                .get("child-1")
-                .map(|r| &r.registration_id),
-            Some(&retained.registration_id),
-            "later ordinary frame retries SAME retained, no rebuild, no confirmation repeat"
-        );
-        assert!(!processor.child_unknown.contains("child-1"));
+                .handle_child_notification(
+                    "turn/started",
+                    json!({"threadId": "child-1", "turn": {"id": "turn-9"}}),
+                )
+                .await;
+
+            assert_eq!(
+                processor
+                    .child_pending
+                    .get("child-1")
+                    .map(|r| &r.registration_id),
+                Some(&retained.registration_id),
+                "registration retained across lost ACK / busy"
+            );
+            assert!(!processor.child_unknown.contains("child-1"));
+            assert_eq!(
+                processor.child_buffers.get("child-1").map(|q| q.len()),
+                Some(1)
+            );
+            assert!(
+                !processor.child_states.contains_key("child-1"),
+                "no child facts before registration ACK"
+            );
+
+            // Later ordinary child frame: retries identical registration, receives canonical ACK.
+            processor
+                .handle_child_notification(
+                    "turn/started",
+                    json!({"threadId": "child-1", "turn": {"id": "turn-10"}}),
+                )
+                .await;
+        };
+
+        let (recorded_rpc, ()) = tokio::join!(fake_host, driver);
+        peer_task.await.expect("peer task clean shutdown");
+
+        assert_eq!(recorded_rpc.len(), 5);
+        assert_eq!(recorded_rpc[0].0, "child");
         assert_eq!(
-            processor.child_buffers.get("child-1").map(|q| q.len()),
-            Some(1)
+            recorded_rpc[0].1["registration"]["registration_id"],
+            retained.registration_id
         );
+        assert_eq!(recorded_rpc[0].1["registration"]["parent_id"], "a1");
+
+        assert_eq!(recorded_rpc[1].0, "child");
+        assert_eq!(
+            recorded_rpc[1].1, recorded_rpc[0].1,
+            "later ordinary frame retries SAME retained registration"
+        );
+
+        assert_eq!(recorded_rpc[2].0, "events.put");
+        assert_eq!(recorded_rpc[2].1["agent_id"], "a2");
+        assert_eq!(recorded_rpc[2].1["events"][0]["kind"], "session.ready");
+
+        assert_eq!(recorded_rpc[3].0, "events.put");
+        assert_eq!(recorded_rpc[3].1["agent_id"], "a2");
+        assert_eq!(recorded_rpc[3].1["events"][0]["kind"], "turn.started");
+        assert_eq!(recorded_rpc[3].1["events"][0]["data"]["turn_id"], "turn-9");
+
+        assert_eq!(recorded_rpc[4].0, "events.put");
+        assert_eq!(recorded_rpc[4].1["agent_id"], "a2");
+        assert_eq!(recorded_rpc[4].1["events"][0]["kind"], "turn.started");
+        assert_eq!(recorded_rpc[4].1["events"][0]["data"]["turn_id"], "turn-10");
+
+        assert!(!processor.child_pending.contains_key("child-1"));
+        assert!(processor.child_states.contains_key("child-1"));
+        let state = processor.child_states.get("child-1").unwrap();
+        assert_eq!(state.binding.agent_id, "a2");
+        assert_eq!(state.binding.agent_generation, 1);
+        assert!(state.ready_committed);
         assert!(processor.children.pending_spawns.is_empty());
-        assert!(!processor.child_states.contains_key("child-1"));
     }
 
     #[tokio::test]
     async fn child_gap_ack_failure_carries_to_parent_visible_loss() {
-        let (_native, mut processor) = child_test_processor().await;
+        use eliot_plugin::RpcRequest;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+
+        let (_native, mut processor, host_io, peer_task) = connected_child_processor("a1").await;
         processor.status.thread_id = Some("owned".to_owned());
         let registration = build_registration("call-1", "a1", 1, "owned", "codex:test", "child-1");
         let mut state = ChildState::new(ChildBinding {
@@ -3365,27 +3646,197 @@ mod tests {
         });
         state.ready_committed = true;
         processor.child_states.insert("child-1".to_owned(), state);
-        processor
-            .handle_child_notification("turn/started", json!({"threadId": "child-1"}))
-            .await;
-        let state = processor
+
+        let (host_read, mut host_write) = split(host_io);
+        let mut host_reader = BufReader::new(host_read);
+        let mut recorded_rpc = Vec::new();
+
+        let fake_host = async {
+            let mut line = String::new();
+
+            // 1. First gap request: busy-before-commit gap.
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("read first child gap request");
+            let req1: RpcRequest = serde_json::from_str(&line).expect("decode req1");
+            recorded_rpc.push((req1.method.clone(), req1.params.clone()));
+            assert_eq!(req1.method, "source.gap");
+            let busy_reply = json!({
+                "jsonrpc": "2.0",
+                "id": req1.id,
+                "error": {
+                    "code": -32020,
+                    "message": "host source gap is busy",
+                    "data": { "code": "busy" }
+                }
+            });
+            host_write
+                .write_all(format!("{busy_reply}\n").as_bytes())
+                .await
+                .expect("send busy gap reply");
+
+            // 2. Later frame retries SAME child gap_id/body: host answers canonical ACK.
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("read retried child gap request");
+            let req2: RpcRequest = serde_json::from_str(&line).expect("decode req2");
+            recorded_rpc.push((req2.method.clone(), req2.params.clone()));
+            assert_eq!(req2.method, "source.gap");
+            let gap_ack = json!({
+                "jsonrpc": "2.0",
+                "id": req2.id,
+                "result": {
+                    "gap_id": req2.params["gap_id"],
+                    "seq": 1,
+                }
+            });
+            host_write
+                .write_all(format!("{gap_ack}\n").as_bytes())
+                .await
+                .expect("send canonical gap ack");
+
+            // 3. Subsequent child frame after settled gap commits its turn.started event.
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("read child fact after settled gap");
+            let req3: RpcRequest = serde_json::from_str(&line).expect("decode req3");
+            recorded_rpc.push((req3.method.clone(), req3.params.clone()));
+            assert_eq!(req3.method, "events.put");
+            let fact_ack = json!({
+                "jsonrpc": "2.0",
+                "id": req3.id,
+                "result": {
+                    "first_seq": 2,
+                    "last_seq": 2,
+                    "cursor": null,
+                }
+            });
+            host_write
+                .write_all(format!("{fact_ack}\n").as_bytes())
+                .await
+                .expect("send turn fact ack");
+
+            drop(host_write);
+            drop(host_reader);
+            recorded_rpc
+        };
+
+        let driver = async {
+            // First frame: normalization failure triggers source.gap, host replies busy.
+            processor
+                .handle_child_notification("turn/started", json!({"threadId": "child-1"}))
+                .await;
+
+            // Observe host-facing child gap / source.state before producer drain:
+            let state_before = processor
+                .child_states
+                .get("child-1")
+                .expect("child visible");
+            assert!(
+                state_before.writes_blocked,
+                "writes must be blocked while gap is unresolved"
+            );
+            assert!(
+                state_before.source_unknown,
+                "source must be marked unknown on gap ACK failure"
+            );
+            assert!(
+                state_before.pending_gap.is_some(),
+                "unresolved gap must be retained"
+            );
+            assert_eq!(
+                processor.loss_reason,
+                Some("Codex child source gap acknowledgement is unresolved"),
+                "unresolved child gap carries to parent visible loss"
+            );
+
+            // Later frame: arrives, triggers retry of SAME child gap_id/body, settled by canonical ACK.
+            processor
+                .handle_child_notification(
+                    "turn/started",
+                    json!({"threadId": "child-1", "turn": {"id": "turn-2"}}),
+                )
+                .await;
+        };
+
+        let (recorded_rpc, ()) = tokio::join!(fake_host, driver);
+        peer_task.await.expect("peer task clean shutdown");
+
+        assert_eq!(recorded_rpc.len(), 3);
+        // Request 1: first gap attempt
+        assert_eq!(recorded_rpc[0].0, "source.gap");
+        assert_eq!(recorded_rpc[0].1["agent_id"], "a2");
+        assert_eq!(recorded_rpc[0].1["generation"], 1);
+        assert_eq!(recorded_rpc[0].1["source"], "stream");
+        assert!(
+            recorded_rpc[0].1["gap_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("codex:a2:1:gap-")
+        );
+
+        // Request 2: retried gap has identical gap_id and reason body
+        assert_eq!(recorded_rpc[1].0, "source.gap");
+        assert_eq!(recorded_rpc[1].1["agent_id"], "a2");
+        assert_eq!(recorded_rpc[1].1["generation"], 1);
+        assert_eq!(recorded_rpc[1].1["source"], "stream");
+        assert_eq!(
+            recorded_rpc[1].1["gap_id"], recorded_rpc[0].1["gap_id"],
+            "must retry SAME child gap_id"
+        );
+        assert_eq!(
+            recorded_rpc[1].1["reason"], recorded_rpc[0].1["reason"],
+            "must retry SAME child gap body"
+        );
+
+        // Request 3: fact committed after gap settlement
+        assert_eq!(recorded_rpc[2].0, "events.put");
+        assert_eq!(recorded_rpc[2].1["agent_id"], "a2");
+        assert_eq!(recorded_rpc[2].1["events"][0]["kind"], "turn.started");
+
+        // Observe host-facing child gap / source.state on child state after settlement:
+        let state_after = processor
             .child_states
             .get("child-1")
             .expect("child visible");
-        assert!(state.writes_blocked);
-        assert!(state.source_unknown);
+        assert_eq!(state_after.binding.agent_id, "a2");
+        assert_eq!(state_after.binding.agent_generation, 1);
+        assert_eq!(state_after.binding.native_ref, "child-1");
         assert!(
-            state
+            state_after.pending_gap.is_none(),
+            "gap settled by canonical ACK"
+        );
+        assert!(state_after.gap_reported, "gap was reported");
+        assert_eq!(state_after.gap_number, 1);
+        assert!(
+            !state_after.writes_blocked,
+            "writes unblocked after canonical ACK"
+        );
+        assert!(
+            state_after.source_unknown,
+            "source marked unknown due to gap history"
+        );
+        assert!(
+            state_after
                 .failure
                 .as_deref()
-                .is_some_and(|failure| failure.contains("gap acknowledgement is unknown")),
-            "unresolved gap outcome stays in child failure, not swallowed"
+                .is_some_and(|f| f.contains("could not be normalized")),
+            "failure records normalization error"
         );
-        assert_eq!(
-            processor.loss_reason,
-            Some("Codex child source gap acknowledgement is unresolved"),
-            "unresolved child gap carries to parent visible loss, not hidden open/ok"
-        );
+
+        // Assert exact child agent / generation / source from host observation:
+        assert_eq!(recorded_rpc[1].1["agent_id"], "a2");
+        assert_eq!(recorded_rpc[1].1["generation"], 1);
+        assert_eq!(recorded_rpc[1].1["source"], "stream");
+
+        // No native input / spawn replay:
+        assert!(processor.children.pending_spawns.is_empty());
     }
 
     #[tokio::test]

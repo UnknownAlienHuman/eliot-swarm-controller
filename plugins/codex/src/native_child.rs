@@ -102,7 +102,7 @@ pub(crate) fn binding_from_ack(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use eliot_core::{Agent, AgentControl, AgentOrigin, AgentState};
     use serde_json::{Value, json};
@@ -111,7 +111,7 @@ mod tests {
     fn registration() -> ChildRegistration {
         build_registration(
             "call-1",
-            "a1000000000000000000000000001",
+            "a1",
             1,
             "parent-thread",
             "codex:test-scope",
@@ -121,7 +121,7 @@ mod tests {
 
     pub(crate) fn test_ack(reg: &ChildRegistration) -> ChildRegistrationAck {
         let mut agent = Agent::new(
-            "a1000000000000000000000000002",
+            "a2",
             "proj".to_owned(),
             "codex".to_owned(),
             "prof".to_owned(),

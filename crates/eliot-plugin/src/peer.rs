@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{Stdin, Stdout, stdin, stdout},
+    io::{AsyncRead, AsyncWrite, Stdin, stdin, stdout},
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     time::{Instant, timeout_at},
 };
@@ -36,12 +36,12 @@ struct OutboundFrame {
     written: oneshot::Sender<Result<()>>,
 }
 
-/// Eliot's plugin-side JSON-RPC 2.0 NDJSON peer over stdin/stdout.
+/// Eliot's plugin-side JSON-RPC 2.0 NDJSON peer over stdin/stdout or arbitrary I/O.
 ///
-/// The peer owns the only stdin reader. Callers keep polling `next_request` while
+/// The peer owns the only stream reader. Callers keep polling `next_request` while
 /// outbound calls are pending so responses are routed without a second reader.
-pub struct Peer {
-    reader: FramedRead<Stdin, LinesCodec>,
+pub struct Peer<R = Stdin> {
+    reader: FramedRead<R, LinesCodec>,
     client: PeerClient,
     _writer_task: tokio::task::JoinHandle<()>,
 }
@@ -72,12 +72,18 @@ pub struct CommitSink {
     unknown_batch: Option<SourceBatch>,
 }
 
-impl Peer {
-    /// Connect the Eliot plugin peer to the process's stdin and stdout.
-    pub fn stdio() -> Self {
+impl<R> Peer<R>
+where
+    R: AsyncRead + Unpin,
+{
+    /// Connect the Eliot plugin peer to arbitrary reader and writer streams.
+    pub fn from_io<W>(reader: R, writer: W) -> Self
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let (writes, write_rx) = mpsc::channel(WRITE_QUEUE_CAPACITY);
         let pending = Arc::new(StdMutex::new(HashMap::new()));
-        let writer = FramedWrite::new(stdout(), LinesCodec::new());
+        let writer = FramedWrite::new(writer, LinesCodec::new());
         let writer_task = tokio::spawn(writer_loop(writer, write_rx, Arc::clone(&pending)));
 
         let client = PeerClient {
@@ -87,7 +93,7 @@ impl Peer {
             next_id: Arc::new(AtomicU64::new(0)),
         };
         let reader = FramedRead::new(
-            stdin(),
+            reader,
             LinesCodec::new_with_max_length(MAX_FRAME_BYTES.saturating_sub(1)),
         );
 
@@ -144,6 +150,13 @@ impl Peer {
                 }
             }
         }
+    }
+}
+
+impl Peer<Stdin> {
+    /// Connect the Eliot plugin peer to the process's stdin and stdout.
+    pub fn stdio() -> Self {
+        Self::from_io(stdin(), stdout())
     }
 }
 
@@ -426,11 +439,13 @@ pub(crate) fn preserve_rpc_error(error: RpcError) -> Error {
     decode_error_diagnostics(Error::new(code, error.message), error.data.as_ref())
 }
 
-async fn writer_loop(
-    mut writer: FramedWrite<Stdout, LinesCodec>,
+async fn writer_loop<W>(
+    mut writer: FramedWrite<W, LinesCodec>,
     mut writes: mpsc::Receiver<OutboundFrame>,
     pending: PendingCalls,
-) {
+) where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     while let Some(outbound) = writes.recv().await {
         let result = writer
             .send(outbound.encoded)
@@ -812,5 +827,108 @@ mod tests {
                 .all(|value| value.snapshot.truncated)
         );
         assert!(frame.len() < MAX_FRAME_BYTES);
+    }
+
+    #[tokio::test]
+    async fn connected_peer_records_request_and_handles_busy_retry_to_canonical_ack() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
+
+        let (host_io, plugin_io) = duplex(64 * 1024);
+        let (plugin_read, plugin_write) = split(plugin_io);
+        let mut peer = Peer::from_io(plugin_read, plugin_write);
+        let client = peer.client();
+
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+
+        let mut recorded = Vec::new();
+        let (host_read, mut host_write) = split(host_io);
+        let mut host_reader = BufReader::new(host_read);
+
+        let fake_host = async {
+            let mut line = String::new();
+
+            // 1. First call: fake host records request and replies with busy error.
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("first request read");
+            let req1: RpcRequest = serde_json::from_str(&line).expect("decode req1");
+            recorded.push((req1.method.clone(), req1.params.clone()));
+            let busy_reply = RpcResponse::failure(
+                req1.id.clone(),
+                RpcError {
+                    code: -32020,
+                    message: "plugin request queue is full".to_owned(),
+                    data: Some(json!({"code": "busy"})),
+                },
+            );
+            let frame = encode_frame(&busy_reply).expect("encode busy response");
+            host_write
+                .write_all(format!("{frame}\n").as_bytes())
+                .await
+                .expect("send busy response");
+
+            // 2. Second call: fake host records retry and replies with canonical ACK.
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("second request read");
+            let req2: RpcRequest = serde_json::from_str(&line).expect("decode req2");
+            recorded.push((req2.method.clone(), req2.params.clone()));
+            let ack_reply = RpcResponse::success(
+                req2.id.clone(),
+                json!({
+                    "first_seq": 1,
+                    "last_seq": 1,
+                    "cursor": "cursor-1",
+                }),
+            );
+            let frame = encode_frame(&ack_reply).expect("encode ack response");
+            host_write
+                .write_all(format!("{frame}\n").as_bytes())
+                .await
+                .expect("send ack response");
+
+            drop(host_write);
+            drop(host_reader);
+            recorded
+        };
+
+        let plugin_calls = async {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let first_call = client
+                .call(
+                    "events.put",
+                    json!({"credential": "fixture-cred", "events": [{"kind": "test"}]}),
+                    deadline,
+                )
+                .await;
+            let err = first_call.expect_err("first call must fail with busy");
+            assert_eq!(err.code, "busy");
+
+            let second_call = client
+                .call(
+                    "events.put",
+                    json!({"credential": "fixture-cred", "events": [{"kind": "test"}]}),
+                    deadline,
+                )
+                .await;
+            let ack_val = second_call.expect("second call must succeed");
+            let ack: BatchAck = serde_json::from_value(ack_val).expect("decode batch ack");
+            assert_eq!(ack.first_seq, 1);
+            assert_eq!(ack.last_seq, 1);
+            assert_eq!(ack.cursor.as_deref(), Some("cursor-1"));
+        };
+
+        let (recorded, ()) = tokio::join!(fake_host, plugin_calls);
+        peer_task.await.expect("peer task clean shutdown");
+
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].0, "events.put");
+        assert_eq!(recorded[0].1["credential"], "fixture-cred");
+        assert_eq!(recorded[1].0, "events.put");
+        assert_eq!(recorded[1].1["credential"], "fixture-cred");
     }
 }
