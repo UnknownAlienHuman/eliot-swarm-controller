@@ -167,7 +167,10 @@ terminal members instead of failing on them (an all-terminal send applies with n
 children); `stop` still names every member. A plain `stop` affects only its target:
 parent completion or stop never marks children complete and sends nothing to them.
 `stop --tree` is the only stop that names a subtree, as an explicit expansion, not
-a cascade. Native child discovery stays a later increment, as do tree forms for mail
+a cascade. Native-child observation is implemented for Codex only through the shared
+[`ChildParams`](../../crates/eliot-plugin/src/protocol.rs) and
+[`ChildRegistration`](../../crates/eliot-core/src/native_child.rs) contract; Muse
+native children and child control stay later increments, as do tree forms for mail
 recipients (non-Agent ids stay `invalid`) and watch filters (a tree value matches
 no events today).
 

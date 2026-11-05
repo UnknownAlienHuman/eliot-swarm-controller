@@ -280,9 +280,14 @@ of the predecessor's `last_store_seq`. For a gap-backed handoff, `0 < gap_seq < 
 `source` is the expected predecessor. `families` is a unique nonempty set; order is not
 significant, and Store sorts it before hashing the canonical operation and forming the
 ACK. Store rechecks the selected harness subset: Fake supports `session`, `turn` and
-`message`; Codex supports those plus `tool` and `request`. Other native families such as
-`child`, `goal` and `usage` return `unsupported`; daemon-owned families and reserved
-`daemon`, `os`, `git` and `workspace_process` sources return `not_allowed`. Exactly one
+`message`; Codex supports those plus `tool` and `request`. Handoff transfer for
+`child`, `goal` and `usage` stays `unsupported`; Codex native-child observation is
+implemented separately through the shared
+[`ChildParams`](../../crates/eliot-plugin/src/protocol.rs) /
+[`ChildRegistration`](../../crates/eliot-core/src/native_child.rs) contract and its
+[observation grant](../../crates/eliot-store/src/native_children.rs). Daemon-owned
+families and reserved `daemon`, `os`, `git` and `workspace_process` sources return
+`not_allowed`. Exactly one
 of `cursor` or `gap` is non-null. A cursor must equal the predecessor's committed
 exclusive cursor; a gap carries its stable id/reason and optional from/to boundary.
 There is no `handoff_id`.

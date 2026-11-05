@@ -64,13 +64,13 @@ impl Store {
             .optional()
             .map_err(sql_error)?;
         if let Some((retained_request, retained_ack)) = retained {
-            if decode_json::<ChildRegistration>(&retained_request)? != request {
+            if decode_child_registration(&retained_request)? != request {
                 return Err(Error::new(
                     "id_conflict",
                     "child registration id changed its binding",
                 ));
             }
-            let ack: ChildRegistrationAck = decode_json(&retained_ack)?;
+            let ack: ChildRegistrationAck = decode_child_registration_ack(&retained_ack)?;
             let child = load_agent_by_num(&tx, parse_agent_id(&ack.agent.id)?)?
                 .ok_or_else(|| Error::new("source_integrity", "registered child disappeared"))?;
             require_grant(
@@ -253,7 +253,7 @@ impl Store {
             };
             let mut events = Vec::new();
             for (child_num, ack) in registrations {
-                let ack: ChildRegistrationAck = decode_json(&ack)?;
+                let ack: ChildRegistrationAck = decode_child_registration_ack(&ack)?;
                 let child = load_agent_by_num(&tx, child_num)?.ok_or_else(|| {
                     Error::new("source_integrity", "registered native child disappeared")
                 })?;
@@ -494,7 +494,7 @@ fn registration_for_child(
             "child is not bound to this producer generation",
         )
     })?;
-    decode_json(&request)
+    decode_child_registration(&request)
 }
 
 fn require_child_identity(
@@ -597,6 +597,14 @@ pub(super) fn require_families(families: &[String]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn decode_child_registration(value: &str) -> Result<ChildRegistration> {
+    serde_json::from_str(value).map_err(|error| Error::new("internal", error.to_string()))
+}
+
+fn decode_child_registration_ack(value: &str) -> Result<ChildRegistrationAck> {
+    serde_json::from_str(value).map_err(|error| Error::new("internal", error.to_string()))
 }
 
 #[cfg(test)]

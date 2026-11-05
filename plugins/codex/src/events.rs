@@ -177,6 +177,7 @@ struct EventProcessor {
     child_buffers: HashMap<String, VecDeque<BufferedNativeFrame>>,
     child_buffer_bytes: usize,
     child_unknown: HashSet<String>,
+    child_early_lost: HashSet<String>,
     children: ChildThreads,
 }
 
@@ -498,6 +499,7 @@ impl EventProcessor {
             child_buffers: HashMap::new(),
             child_buffer_bytes: 0,
             child_unknown: HashSet::new(),
+            child_early_lost: HashSet::new(),
             children: ChildThreads::default(),
         }
     }
@@ -716,8 +718,16 @@ impl EventProcessor {
         match outcome {
             Ok(()) => {
                 if completed {
+                    let mut first_error = None;
                     for receiver in receivers {
-                        let _ = self.ensure_child_registered(&receiver).await;
+                        if let Err(error) = self.ensure_child_registered(&receiver).await
+                            && first_error.is_none()
+                        {
+                            first_error = Some(error);
+                        }
+                    }
+                    if let Some(error) = first_error {
+                        return Err(error);
                     }
                 }
                 Ok(())
@@ -1667,11 +1677,38 @@ impl EventProcessor {
         let Some(child_thread) = frame_thread_id(&params).map(str::to_owned) else {
             return;
         };
-        if self.child_unknown.contains(&child_thread) {
+        if method == "thread/started" {
+            if let Err(error) = self.observe_thread_started(&params).await {
+                if let Some(state) = self.child_states.get_mut(&child_thread) {
+                    state.source_unknown = true;
+                    if state.failure.is_none() {
+                        state.failure = Some(error.message);
+                    }
+                    if !state.gap_reported && !state.writes_blocked {
+                        let reason = format!(
+                            "Codex child thread/started could not be normalized ({})",
+                            error.code
+                        );
+                        let _ = state
+                            .record_gap(&mut self.sink, &self.host, &self.credential, &reason)
+                            .await;
+                    }
+                } else {
+                    self.child_unknown.insert(child_thread);
+                    let reason = format!(
+                        "Codex child thread/started could not be normalized ({})",
+                        error.code
+                    );
+                    let _ = self.record_gap(&reason).await;
+                }
+            }
             return;
         }
-        if method == "thread/started" {
-            let _ = self.observe_thread_started(&params).await;
+        let committed = self
+            .child_states
+            .get(&child_thread)
+            .is_some_and(|state| state.ready_committed);
+        if !committed && self.child_unknown.contains(&child_thread) {
             return;
         }
         let is_ready = self
@@ -1711,18 +1748,7 @@ impl EventProcessor {
     }
 
     fn buffer_child_frame(&mut self, child_thread: &str, frame: BufferedNativeFrame) {
-        let size = match &frame {
-            BufferedNativeFrame::Notification { method, params } => {
-                serde_json::to_vec(&json!({"method": method, "params": params}))
-                    .map(|bytes| bytes.len())
-                    .unwrap_or(256)
-            }
-            BufferedNativeFrame::Request { id, method, params } => {
-                serde_json::to_vec(&json!({"id": id, "method": method, "params": params}))
-                    .map(|bytes| bytes.len())
-                    .unwrap_or(256)
-            }
-        };
+        let size = child_frame_size(&frame);
         let queue = self
             .child_buffers
             .entry(child_thread.to_owned())
@@ -1730,8 +1756,10 @@ impl EventProcessor {
         if queue.len() >= EARLY_EVENT_LIMIT
             || self.child_buffer_bytes.saturating_add(size) > EARLY_EVENT_BYTES
         {
+            let discarded: usize = queue.iter().map(child_frame_size).sum();
             queue.clear();
-            self.child_unknown.insert(child_thread.to_owned());
+            self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(discarded);
+            self.child_early_lost.insert(child_thread.to_owned());
             return;
         }
         self.child_buffer_bytes = self.child_buffer_bytes.saturating_add(size);
@@ -1786,7 +1814,11 @@ impl EventProcessor {
             Err(error) => {
                 if is_admission_rejection(&error) {
                     self.child_unknown.insert(child_thread.to_owned());
-                    self.child_buffers.remove(child_thread);
+                    if let Some(queue) = self.child_buffers.remove(child_thread) {
+                        let discarded: usize = queue.iter().map(child_frame_size).sum();
+                        self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(discarded);
+                    }
+                    self.child_early_lost.remove(child_thread);
                     return Ok(());
                 }
                 self.child_unknown.insert(child_thread.to_owned());
@@ -1814,6 +1846,18 @@ impl EventProcessor {
         child_state.ready_committed = true;
         self.child_states
             .insert(child_thread.to_owned(), child_state);
+        if self.child_early_lost.remove(child_thread)
+            && let Some(state) = self.child_states.get_mut(child_thread)
+        {
+            let _ = state
+                .record_gap(
+                    &mut self.sink,
+                    &self.host,
+                    &self.credential,
+                    "Codex child early events were lost before registration",
+                )
+                .await;
+        }
         self.flush_child_buffer(child_thread).await
     }
 
@@ -1822,23 +1866,29 @@ impl EventProcessor {
             return Ok(());
         };
         while let Some(frame) = queue.pop_front() {
-            let size = match &frame {
-                BufferedNativeFrame::Notification { method, params } => {
-                    serde_json::to_vec(&json!({"method": method, "params": params}))
-                        .map(|bytes| bytes.len())
-                        .unwrap_or(256)
-                }
-                BufferedNativeFrame::Request { id, method, params } => {
-                    serde_json::to_vec(&json!({"id": id, "method": method, "params": params}))
-                        .map(|bytes| bytes.len())
-                        .unwrap_or(256)
-                }
-            };
+            let size = child_frame_size(&frame);
             self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(size);
             match frame {
                 BufferedNativeFrame::Notification { method, params } => {
-                    self.process_child_notification(child_thread, &method, params)
-                        .await?;
+                    if let Err(error) = self
+                        .process_child_notification(child_thread, &method, params)
+                        .await
+                        && let Some(state) = self.child_states.get_mut(child_thread)
+                    {
+                        state.source_unknown = true;
+                        if state.failure.is_none() {
+                            state.failure = Some(error.message);
+                        }
+                        if !state.gap_reported && !state.writes_blocked {
+                            let reason = format!(
+                                "Codex child {method} notification could not be normalized ({})",
+                                error.code
+                            );
+                            let _ = state
+                                .record_gap(&mut self.sink, &self.host, &self.credential, &reason)
+                                .await;
+                        }
+                    }
                 }
                 BufferedNativeFrame::Request { id, method, params } => {
                     self.reject_child_request(id, &method, &params).await;
@@ -1932,17 +1982,14 @@ impl EventProcessor {
         })?;
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
         let text = policy.redact_text(text);
-        let turn_id = params
-            .get("turnId")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                self.child_states
-                    .get(child_thread)
-                    .and_then(|state| state.active_turn_id.as_deref())
-            })
-            .unwrap_or_default();
+        let turn_id = child_message_turn_id(
+            params,
+            self.child_states
+                .get(child_thread)
+                .and_then(|state| state.active_turn_id.as_deref()),
+        );
         let mut data = json!({
-            "turn_id": turn_id,
+            "turn_id": turn_id.as_str(),
             "text": text,
         });
         if let Some(phase) = item.get("phase").and_then(Value::as_str) {
@@ -1966,7 +2013,7 @@ impl EventProcessor {
                 )
                 .await;
         }
-        let native_id = event_id(child_thread, turn_id, item_id, "message.completed")?;
+        let native_id = event_id(child_thread, &turn_id, item_id, "message.completed")?;
         state
             .commit_event(
                 &mut self.sink,
@@ -2057,8 +2104,16 @@ impl EventProcessor {
         match outcome {
             Ok(()) => {
                 if completed {
+                    let mut first_error = None;
                     for receiver in receivers {
-                        let _ = self.ensure_child_registered(&receiver).await;
+                        if let Err(error) = Box::pin(self.ensure_child_registered(&receiver)).await
+                            && first_error.is_none()
+                        {
+                            first_error = Some(error);
+                        }
+                    }
+                    if let Some(error) = first_error {
+                        return Err(error);
                     }
                 }
                 Ok(())
@@ -2164,6 +2219,35 @@ fn spawn_call(item: &Value) -> Option<(String, Vec<String>)> {
         .map(str::to_owned)
         .collect();
     Some((item_id.to_owned(), receivers))
+}
+
+/// Encoded size of one buffered child frame, shared by buffering,
+/// flushing, and overflow accounting so discarded bytes are released exactly.
+fn child_frame_size(frame: &BufferedNativeFrame) -> usize {
+    match frame {
+        BufferedNativeFrame::Notification { method, params } => {
+            serde_json::to_vec(&json!({"method": method, "params": params}))
+                .map(|bytes| bytes.len())
+                .unwrap_or(256)
+        }
+        BufferedNativeFrame::Request { id, method, params } => {
+            serde_json::to_vec(&json!({"id": id, "method": method, "params": params}))
+                .map(|bytes| bytes.len())
+                .unwrap_or(256)
+        }
+    }
+}
+
+/// The exact already-selected native turn id for a child message: the
+/// notification's `turnId`, else the child's active turn, else empty. Owned
+/// so the immutable selection ends before the child state is borrowed mutably.
+fn child_message_turn_id(params: &Value, active_turn_id: Option<&str>) -> String {
+    params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .or(active_turn_id)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// The thread a native frame belongs to: `threadId` on notifications and
@@ -2763,5 +2847,143 @@ mod tests {
                 assert_eq!(data, original);
             }
         }
+    }
+
+    #[test]
+    fn child_message_turn_id_prefers_params_then_active_turn() {
+        assert_eq!(
+            child_message_turn_id(&json!({"turnId": "turn-params"}), Some("turn-active")),
+            "turn-params"
+        );
+        assert_eq!(
+            child_message_turn_id(&json!({"turnId": "turn-params"}), None),
+            "turn-params"
+        );
+        assert_eq!(
+            child_message_turn_id(&json!({}), Some("turn-active")),
+            "turn-active"
+        );
+        assert_eq!(child_message_turn_id(&json!({}), None), "");
+    }
+
+    async fn child_test_processor() -> (crate::native::NativeProcess, EventProcessor) {
+        let peer = eliot_plugin::Peer::stdio();
+        let launch = crate::native::NativeLaunch {
+            program: std::env::current_exe().expect("test exe").into_os_string(),
+            args: [std::ffi::OsString::from("--list")].to_vec(),
+            cwd: std::env::current_dir().expect("cwd"),
+            environment: Vec::new(),
+        };
+        let native = crate::native::NativeProcess::spawn(
+            launch,
+            eliot_core::SecretPolicy::new(Vec::<String>::new()),
+        )
+        .await
+        .expect("spawn fixture");
+        let processor = EventProcessor::new(
+            native.client(),
+            peer.client(),
+            EventConfig {
+                credential: "test-cred".to_owned(),
+                agent_id: "a1".to_owned(),
+                generation: 1,
+                secrets: Vec::new(),
+                native_scope: String::new(),
+            },
+        );
+        (native, processor)
+    }
+
+    #[tokio::test]
+    async fn child_buffer_overflow_releases_bytes_without_suppressing_identity() {
+        let (_native, mut processor) = child_test_processor().await;
+        for _ in 0..EARLY_EVENT_LIMIT {
+            processor.buffer_child_frame(
+                "child-1",
+                BufferedNativeFrame::Notification {
+                    method: "turn/started".to_owned(),
+                    params: json!({"threadId": "child-1"}),
+                },
+            );
+        }
+        assert!(processor.child_buffer_bytes > 0);
+        processor.buffer_child_frame(
+            "child-1",
+            BufferedNativeFrame::Notification {
+                method: "turn/started".to_owned(),
+                params: json!({"threadId": "child-1"}),
+            },
+        );
+        assert!(
+            processor
+                .child_buffers
+                .get("child-1")
+                .is_none_or(|queue| queue.is_empty())
+        );
+        assert_eq!(processor.child_buffer_bytes, 0);
+        assert!(processor.child_early_lost.contains("child-1"));
+        assert!(
+            !processor.child_unknown.contains("child-1"),
+            "overflow must not suppress later confirmation"
+        );
+        processor.buffer_child_frame(
+            "child-1",
+            BufferedNativeFrame::Notification {
+                method: "turn/started".to_owned(),
+                params: json!({"threadId": "child-1"}),
+            },
+        );
+        assert_eq!(processor.child_buffers["child-1"].len(), 1);
+        assert!(processor.child_buffer_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn child_flush_gaps_failed_frame_and_processes_remainder() {
+        let (_native, mut processor) = child_test_processor().await;
+        let registration = build_registration("call-1", "a1", 1, "owned", "codex:test", "child-1");
+        let mut state = ChildState::new(ChildBinding {
+            registration,
+            agent_id: "a2".to_owned(),
+            agent_generation: 1,
+            native_ref: "child-1".to_owned(),
+        });
+        state.ready_committed = true;
+        state.writes_blocked = true;
+        processor.child_states.insert("child-1".to_owned(), state);
+        let mut queue = VecDeque::new();
+        queue.push_back(BufferedNativeFrame::Notification {
+            method: "turn/started".to_owned(),
+            params: json!({"threadId": "child-1"}),
+        });
+        queue.push_back(BufferedNativeFrame::Notification {
+            method: "item/started".to_owned(),
+            params: json!({
+                "threadId": "child-1",
+                "item": {"type": "collabAgentToolCall", "id": "call-nested", "tool": "spawnAgent"},
+            }),
+        });
+        processor.child_buffer_bytes = queue.iter().map(child_frame_size).sum();
+        processor.child_buffers.insert("child-1".to_owned(), queue);
+        processor
+            .flush_child_buffer("child-1")
+            .await
+            .expect("flush settles every frame");
+        let state = processor
+            .child_states
+            .get("child-1")
+            .expect("known child stays visible");
+        assert!(state.source_unknown);
+        assert!(
+            state
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("omitted turn id"))
+        );
+        assert!(
+            processor.children.pending_spawns.contains("call-nested"),
+            "remainder is processed, not dropped"
+        );
+        assert!(!processor.child_buffers.contains_key("child-1"));
+        assert_eq!(processor.child_buffer_bytes, 0);
     }
 }

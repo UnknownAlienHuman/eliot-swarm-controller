@@ -102,18 +102,17 @@ pub(super) async fn record_child_gap(
     let mut gap: SourceGap = serde_json::from_value(params)
         .map_err(|_| Error::new("invalid", "source.gap params are malformed"))?;
     super::redact_source_gap(&mut gap, secrets)?;
-    let (result, faulted) = {
-        let mut store = timeout_at(until, store.lock())
-            .await
-            .map_err(|_| Error::new("busy", "Store lock deadline elapsed for source.gap"))?;
-        let result =
-            store.record_native_child_source_gap(producer, producer_generation, gap, now_ms());
-        (result, store.is_write_faulted())
-    };
+    let mut store = timeout_at(until, store.lock())
+        .await
+        .map_err(|_| Error::new("busy", "Store lock deadline elapsed for source.gap"))?;
+    let result = store.record_native_child_source_gap(producer, producer_generation, gap, now_ms());
+    let faulted = store.is_write_faulted();
     match result {
         Ok(change) => {
             bus.publish(&change.events);
-            serde_json::to_value(change.value).map_err(|_| {
+            let ack = change.value;
+            drop(store);
+            serde_json::to_value(ack).map_err(|_| {
                 Error::new(
                     "internal",
                     "source.gap acknowledgement could not be encoded",
