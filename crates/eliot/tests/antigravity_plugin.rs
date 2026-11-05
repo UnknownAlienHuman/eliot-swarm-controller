@@ -1159,35 +1159,80 @@ async fn scenario_lost_result_unknown_no_rewrite() {
                 "dispatch_seq": seq}),
         )
         .await;
-    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
-    let applied = loop {
-        tokio::select! {
-            biased;
-            request = scenario.host.next_request_for("events.put after send (native step user_input)") => {
-                assert_eq!(
-                    request.method,
-                    "events.put",
-                    "unexpected request while associating send: {}",
-                    request.diagnostic()
-                );
-                let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
-                assert_eq!(
-                    events[0].get("kind").and_then(Value::as_str),
-                    Some("turn.started"),
-                    "unexpected event: {}",
-                    request.diagnostic()
-                );
-                let first = scenario.host.next_seq;
-                scenario.host.next_seq += 1;
-                scenario.host.respond(&request.id, json!({
-                    "first_seq": first, "last_seq": first,
-                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
-                })).await;
-            }
-            result = &mut rx => break result,
-        }
-    };
-    let applied = applied
+    // Association first: the send reply is buffered by the BackgroundPeer
+    // oneshot, so consume the committed turn.started, then any valid EOF
+    // gap/health, then await the already-created reply. A gap before
+    // association still fails the first-request check below.
+    let started = scenario
+        .host
+        .next_request_for("events.put after send (native step user_input)")
+        .await;
+    assert_eq!(
+        started.method,
+        "events.put",
+        "unexpected request while associating send: {}",
+        started.diagnostic()
+    );
+    let events = started
+        .params
+        .get("events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        events[0].get("kind").and_then(Value::as_str),
+        Some("turn.started"),
+        "unexpected event: {}",
+        started.diagnostic()
+    );
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        started.params.get("agent_id").and_then(Value::as_str),
+        Some(scenario.agent_id.as_str())
+    );
+    assert_eq!(
+        started.params.get("generation").and_then(Value::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        started.params.get("source").and_then(Value::as_str),
+        Some("stream")
+    );
+    assert_eq!(
+        events[0]
+            .get("data")
+            .and_then(|data| data.get("command_id"))
+            .and_then(Value::as_str),
+        Some(send_id.as_str())
+    );
+    let turn_id = events[0]
+        .get("data")
+        .and_then(|data| data.get("turn_id"))
+        .and_then(Value::as_str)
+        .expect("turn.started turn_id")
+        .to_owned();
+    assert!(!turn_id.is_empty());
+    assert_eq!(fake_report(&scenario.root)["input_count"], json!(1));
+    let first = scenario.host.next_seq;
+    scenario.host.next_seq += 1;
+    scenario
+        .host
+        .respond(
+            &started.id,
+            json!({
+                "first_seq": first, "last_seq": first,
+                "cursor": started.params.get("cursor").cloned().unwrap_or(Value::Null),
+            }),
+        )
+        .await;
+    let gap = scenario
+        .host
+        .next_request_for("source.gap after process exit (native step user_input)")
+        .await;
+    assert_eq!(gap.method, "source.gap");
+    answer_source_gap(&mut scenario.host, &gap).await;
+    let applied = tokio::time::timeout(OP_TIMEOUT, rx)
+        .await
         .expect("send deadline")
         .expect("send channel")
         .expect("send applied");
@@ -1195,14 +1240,10 @@ async fn scenario_lost_result_unknown_no_rewrite() {
         applied.get("state").and_then(Value::as_str),
         Some("applied")
     );
-    // The native process exited without a result: the stream gaps, the turn
-    // stays unresolved, and the snapshot retains unknown.
-    let gap = scenario
-        .host
-        .next_request_for("source.gap after process exit (native step user_input)")
-        .await;
-    assert_eq!(gap.method, "source.gap");
-    answer_source_gap(&mut scenario.host, &gap).await;
+    assert_eq!(
+        applied.get("turn_id").and_then(Value::as_str),
+        Some(turn_id.as_str())
+    );
     let snap = snapshot(&mut scenario.host, &scenario.agent_id, 1, &send_id).await;
     assert_eq!(
         snap.get("source_unknown").and_then(Value::as_bool),
@@ -1706,6 +1747,36 @@ fn scenario_exit_with_held_stdout_public_projection() {
             });
         if harness_exit.is_some() {
             break;
+        }
+        if std::time::Instant::now() >= process_deadline {
+            let rows = processes["processes"].as_array().unwrap();
+            let harness: Vec<serde_json::Value> = rows
+                .iter()
+                .filter(|process| process["role"] == "harness")
+                .map(|process| {
+                    let exit = if process["exit_code"] == 3 {
+                        "3"
+                    } else if process["exit_code"].is_null() {
+                        "null"
+                    } else {
+                        "other"
+                    };
+                    json!({
+                        "state": process["state"],
+                        "exit_code_class": exit,
+                        "owner_generation_match": process["owner"]
+                            .as_str()
+                            .map(|owner| owner.ends_with(&format!("#{generation}"))),
+                    })
+                })
+                .collect();
+            panic!(
+                "public harness exit readback deadline: total_rows={} harness_count={} harness={} processes_truncated={:?}",
+                rows.len(),
+                harness.len(),
+                harness,
+                processes.get("processes_truncated")
+            );
         }
         assert!(
             std::time::Instant::now() < process_deadline,
