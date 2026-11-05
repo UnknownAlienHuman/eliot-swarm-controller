@@ -41,6 +41,16 @@ fn main() {
         println!("ok - launch/send/snapshot/stop");
         scenario_two_agent_messages_snapshot_matches_stream().await;
         println!("ok - two agentMessages: snapshot matches the stream fold");
+        scenario_view_health_idle_and_foreign_pushes().await;
+        println!("ok - idle view-health loss, foreign/unknown pushes, excluded/notLoaded reads");
+        scenario_view_health_active_loss().await;
+        println!("ok - push/pull view loss preserves turn and blocks false completion/replay");
+        scenario_resume_view_unavailable().await;
+        println!("ok - unavailable resume history gaps without input or settings replay");
+        scenario_resume_buffered_health_behind_orphan().await;
+        println!("ok - resume request then health before binding cannot strand the gap");
+        scenario_view_health_during_final_read().await;
+        println!("ok - unavailable push during final view read overrides private completion");
         scenario_failed_turn_reports_restriction().await;
         println!("ok - failed turn reports its restriction");
         scenario_lost_reply_is_unknown_without_rewrite().await;
@@ -193,6 +203,8 @@ fn fake_msp_main(script: &str) {
     if matches!(
         fake.script.as_str(),
         "resume-happy"
+            | "resume-view-health"
+            | "resume-buffered-health"
             | "resume-pending"
             | "drop-session-resume"
             | "resume-stale-replay"
@@ -475,7 +487,7 @@ impl FakeMsp {
                     ])
                 } else if matches!(
                     self.script.as_str(),
-                    "resume-stale-pull" | "resume-undecodable-pull"
+                    "resume-stale-pull" | "resume-undecodable-pull" | "resume-buffered-health"
                 ) {
                     json!([
                         {
@@ -504,8 +516,27 @@ impl FakeMsp {
                         "snapshot": null,
                     })
                 } else {
-                    json!({"items": null, "mode": "none", "noneReason": "excluded", "snapshot": null})
+                    json!({"items": null, "mode": "none", "noneReason": if self.script == "resume-view-health" { "projectionUnavailable" } else { "excluded" }, "snapshot": null})
                 };
+                if self.script == "resume-buffered-health" {
+                    // Both frames precede the verified response identity. The
+                    // deferred orphan must not block the later health record.
+                    let orphan = self.approval_request_params(
+                        RETAINED_SESSION,
+                        RETAINED_TURN,
+                        "fake-approval-1",
+                        1,
+                    );
+                    self.emit_request(stdout, "approval/request", orphan);
+                    self.emit(
+                        stdout,
+                        "session/viewHealthChanged",
+                        json!({
+                            "sessionId": RETAINED_SESSION, "health": "unavailable",
+                            "noneReason": "projectionUnavailable",
+                        }),
+                    );
+                }
                 self.reply(
                     stdout,
                     &id,
@@ -516,7 +547,7 @@ impl FakeMsp {
                         "viewCursor": self.head_cursor(),
                     }),
                 );
-                self.emit(stdout, "session/started", json!({"session": session}));
+                // MSP resume never emits session/started. The reply binds identity.
                 if self.script == "resume-pending" {
                     // SS5.6: the full payloads arrive as re-issued
                     // server-to-client requests right after the resume
@@ -641,6 +672,9 @@ impl FakeMsp {
                         "viewCursor": cursor,
                     }),
                 );
+                if self.script.starts_with("view-health-") {
+                    return true; // No terminal until an explicit native fact.
+                }
                 let cursor = self.next_cursor();
                 self.emit(
                     stdout,
@@ -876,16 +910,39 @@ impl FakeMsp {
                     return true;
                 }
                 let session_id = self.session_id.clone().unwrap_or_default();
-                let (status, active): (&str, Option<&str>) = if self.turn_active {
-                    ("running", Some("fake-active-turn"))
+                let health_read = self.counts.get("session/read").copied().unwrap_or(0);
+                if matches!(
+                    self.script.as_str(),
+                    "view-health-push" | "view-health-foreign" | "view-health-unknown"
+                ) {
+                    self.emit(stdout, "session/viewHealthChanged", json!({
+                        "sessionId": if self.script == "view-health-foreign" { "foreign-session" } else { &session_id },
+                        "health": if self.script == "view-health-unknown" { "futureHealth" } else { "unavailable" },
+                        "noneReason": "projectionUnavailable",
+                    }));
+                }
+                let history = if self.script == "view-health-pull" && health_read == 1 {
+                    json!({"items": null, "mode": "none", "noneReason": "projectionUnavailable", "snapshot": null})
+                } else if self.script.starts_with("view-health-") {
+                    json!({"items": null, "mode": "none", "noneReason": "excluded", "snapshot": null})
                 } else {
-                    ("idle", None)
+                    json!({"items": [], "mode": "inline", "snapshot": null})
                 };
+                let (status, active): (&str, Option<&str>) =
+                    if self.script == "view-health-final-read" {
+                        ("idle", None)
+                    } else if self.turn_active {
+                        ("running", Some("fake-active-turn"))
+                    } else if self.script == "view-health-not-loaded" {
+                        ("notLoaded", None)
+                    } else {
+                        ("idle", None)
+                    };
                 self.reply(
                     stdout,
                     &id,
                     json!({
-                        "history": {"items": [], "mode": "inline", "snapshot": null},
+                        "history": history,
                         "pendingRequests": [],
                         "session": self.session_object(&session_id, status, active, &self.session_model, ""),
                         "viewCursor": self.head_cursor(),
@@ -1244,12 +1301,7 @@ impl FakeMsp {
                 self.reply(stdout, &id, pulled);
             }
             "view/page" => {
-                let events = self.page_events(&params);
-                self.reply(
-                    stdout,
-                    &id,
-                    json!({"events": events.0, "nextCursor": events.1}),
-                );
+                self.reply_view_page(stdout, &id, &params);
             }
             _ => self.reply_error(stdout, &id, -32601, "Method not found"),
         }
@@ -1303,6 +1355,44 @@ impl FakeMsp {
 
     fn head_cursor(&self) -> String {
         format!("fake-cursor-{}", self.cursor_seq)
+    }
+
+    fn reply_view_page(&mut self, stdout: &mut std::io::StdoutLock, id: &Value, params: &Value) {
+        if self.script == "view-health-final-read"
+            && let Some(turn) = self.last_turn.clone()
+        {
+            let session_id = self.session_id.clone().unwrap_or_default();
+            // Wire-order gate: loss is emitted while view/page is outstanding,
+            // before releasing a readable private terminal reply on this pipe.
+            // The host's source.gap ACK gates the final actor health check.
+            self.emit(
+                stdout,
+                "session/viewHealthChanged",
+                json!({
+                    "sessionId": session_id, "health": "unavailable",
+                    "noneReason": "projectionUnavailable",
+                }),
+            );
+            stdout.flush().expect("health push before final read reply");
+            self.reply(
+                stdout,
+                id,
+                json!({"events": [
+                {"method":"item/completed", "params": {
+                    "sessionId": session_id, "viewCursor":"private-message",
+                    "item": {"itemId":"private-result", "kind":"agentMessage", "revision":2,
+                        "status":"completed", "turnId":turn, "text":"Private historical reply."}
+                }},
+                {"method":"turn/completed", "params": {
+                    "sessionId":session_id, "turnId":turn, "terminal":"completed",
+                    "viewCursor":"private-terminal"
+                }}
+            ], "nextCursor":null}),
+            );
+            return;
+        }
+        let (events, next) = self.page_events(params);
+        self.reply(stdout, id, json!({"events": events, "nextCursor": next}));
     }
 
     fn page_events(&self, params: &Value) -> (Vec<Value>, Value) {
@@ -3259,6 +3349,242 @@ async fn control_tolerating_gaps(
         .expect("control deadline")
         .expect("control response channel")
         .expect("control responds")
+}
+
+async fn view_health_snapshot(scenario: &mut Scenario, command_id: &str) -> (Value, Vec<String>) {
+    let rx = scenario
+        .host
+        .begin_call(
+            "agent.snapshot",
+            json!({
+                "agent_id": scenario.agent_id, "generation": 1,
+                "command_id": command_id, "turn_id": null,
+            }),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let mut gaps = Vec::new();
+    let result = loop {
+        tokio::select! {
+            biased;
+            request = scenario.host.next_request() => {
+                assert_eq!(request.method, "source.gap", "readback must not publish a lifecycle or terminal batch");
+                assert_eq!(request.params["agent_id"], scenario.agent_id);
+                assert_eq!(request.params["generation"], 1);
+                gaps.push(request.params["reason"].as_str().unwrap_or_default().to_owned());
+                answer_source_gap(&mut scenario.host, &request).await;
+            }
+            result = &mut rx => break result,
+        }
+    };
+    (
+        result
+            .expect("snapshot deadline")
+            .expect("snapshot channel")
+            .expect("snapshot reply"),
+        gaps,
+    )
+}
+
+async fn scenario_view_health_idle_and_foreign_pushes() {
+    for (script, unavailable) in [
+        ("view-health-push", true),
+        ("view-health-foreign", false),
+        ("view-health-unknown", false),
+        ("view-health-excluded", false),
+        ("view-health-not-loaded", false),
+    ] {
+        let mut scenario = Scenario::start(script, muse_profile()).await;
+        let start = scenario.start_result["command_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (snapshot, gaps) = view_health_snapshot(&mut scenario, &start).await;
+        assert_eq!(gaps.len(), usize::from(unavailable), "{script}");
+        assert_eq!(snapshot["source_unknown"], unavailable, "{script}");
+        assert_eq!(snapshot["active_turn"], Value::Null);
+        assert_eq!(snapshot["last_turn"], Value::Null);
+        assert_eq!(snapshot["result_known"], false);
+        assert_ne!(snapshot["state"], "stopped", "notLoaded is never closure");
+        if unavailable {
+            assert_eq!(snapshot["state"], "unknown");
+        }
+        assert_eq!(scenario.report()["turn_starts"], 0);
+        finish_scenario(scenario, false).await;
+    }
+}
+
+async fn scenario_view_health_active_loss() {
+    for script in ["view-health-push", "view-health-pull"] {
+        let mut scenario = Scenario::start(script, muse_profile()).await;
+        let agent_id = scenario.agent_id.clone();
+        let (command, turn, events) =
+            send_parked(&mut scenario.host, &agent_id, 1, "single input", 0).await;
+        assert_eq!(
+            events
+                .iter()
+                .map(|(kind, _)| kind.as_str())
+                .collect::<Vec<_>>(),
+            ["turn.started"]
+        );
+        let (snapshot, gaps) = view_health_snapshot(&mut scenario, &command).await;
+        assert_eq!(gaps.len(), 1);
+        assert!(gaps[0].contains("projectionUnavailable"));
+        assert_eq!(snapshot["state"], "unknown");
+        assert_eq!(snapshot["source_unknown"], true);
+        assert_eq!(snapshot["active_turn"], turn);
+        assert_eq!(snapshot["last_turn"], Value::Null);
+        assert_eq!(snapshot["result_known"], false);
+        // The fake's next read would say excluded. A prior loss stays latched;
+        // the private read cannot repair/replay the live source or complete it.
+        let (again, more_gaps) = view_health_snapshot(&mut scenario, &command).await;
+        assert!(more_gaps.is_empty());
+        assert_eq!(again["state"], "unknown");
+        assert_eq!(again["active_turn"], turn);
+        stop_agent(&mut scenario.host, &agent_id, 1, false).await;
+        let report = scenario.report();
+        assert_eq!(report["turn_starts"], 1);
+        assert_eq!(report["session_resumes"], 0);
+        assert_eq!(report["counts"]["session/read"], 1);
+        scenario
+            .host
+            .call("shutdown", json!({}))
+            .await
+            .expect("shutdown");
+        scenario.host.shutdown_child().await;
+    }
+}
+
+async fn scenario_resume_view_unavailable() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (resume_from, source_state) = retained_resume_subject(&agent_id);
+    let (pending, rx) = Scenario::setup_start(
+        "resume-view-health",
+        muse_profile(),
+        agent_id.clone(),
+        2,
+        resume_from,
+        source_state,
+    )
+    .await;
+    let mut attempt = pending.finish_expecting_error(rx, "unknown").await;
+    attempt.retry("unknown").await;
+    stop_agent(&mut attempt.host, &agent_id, 2, false).await;
+    let report = attempt.report();
+    assert_eq!(report["session_resumes"], 1);
+    assert_eq!(report["turn_starts"], 0);
+    assert_eq!(report["set_models"], 0);
+    assert_eq!(
+        report["counts"]
+            .get("session/setReasoningEffort")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        0
+    );
+    attempt
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    attempt.host.shutdown_child().await;
+}
+
+async fn scenario_resume_buffered_health_behind_orphan() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (resume_from, source_state) = retained_resume_subject(&agent_id);
+    let (pending, rx) = Scenario::setup_start(
+        "resume-buffered-health",
+        muse_profile(),
+        agent_id.clone(),
+        2,
+        resume_from,
+        source_state,
+    )
+    .await;
+    // Any session.ready batch is a failure here. The gap must be committed
+    // despite the earlier request remaining deferred without a current turn.
+    let mut attempt = pending.finish_expecting_error(rx, "unknown").await;
+    let start_id = attempt.params["command_id"].as_str().unwrap().to_owned();
+    let snapshot = attempt
+        .host
+        .call(
+            "agent.snapshot",
+            json!({
+                "agent_id": agent_id, "generation": 2, "command_id": start_id, "turn_id": null,
+            }),
+        )
+        .await
+        .expect("unknown resumed snapshot");
+    assert_eq!(snapshot["state"], "unknown");
+    assert_eq!(snapshot["source_unknown"], true);
+    assert_eq!(snapshot["native_ref"], RETAINED_SESSION);
+    assert_eq!(snapshot["command_id"], start_id);
+    assert_eq!(snapshot["active_turn"], Value::Null);
+    assert_eq!(snapshot["last_turn"], Value::Null);
+    assert_eq!(snapshot["result_known"], false);
+    attempt.retry("unknown").await;
+    stop_agent(&mut attempt.host, &agent_id, 2, false).await;
+    let report = attempt.report();
+    assert_eq!(report["session_resumes"], 1);
+    assert_eq!(report["turn_starts"], 0);
+    assert_eq!(
+        report["receipts"], 0,
+        "the deferred orphan was not answered"
+    );
+    assert_eq!(report["decides"], 0);
+    assert_eq!(report["answers"], 0);
+    attempt
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    attempt.host.shutdown_child().await;
+}
+
+async fn scenario_view_health_during_final_read() {
+    let mut scenario = Scenario::start("view-health-final-read", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+    let (command, turn, events) =
+        send_parked(&mut scenario.host, &agent_id, 1, "single input", 0).await;
+    assert_eq!(
+        events
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["turn.started"]
+    );
+    let (snapshot, gaps) = view_health_snapshot(&mut scenario, &command).await;
+    assert_eq!(
+        gaps.len(),
+        1,
+        "loss must commit before the snapshot response"
+    );
+    assert!(gaps[0].contains("projectionUnavailable"));
+    assert_eq!(snapshot["state"], "unknown");
+    assert_eq!(snapshot["source_unknown"], true);
+    assert_eq!(snapshot["command_id"], command);
+    assert_eq!(snapshot["active_turn"], turn);
+    assert_eq!(
+        snapshot["last_turn"],
+        Value::Null,
+        "private history cannot complete the turn"
+    );
+    assert_eq!(snapshot["result_known"], false);
+    stop_agent(&mut scenario.host, &agent_id, 1, false).await;
+    let report = scenario.report();
+    assert_eq!(report["turn_starts"], 1);
+    assert_eq!(report["session_resumes"], 0);
+    assert_eq!(report["counts"]["session/read"], 1);
+    assert_eq!(
+        report["counts"]["view/page"], 2,
+        "effort readback plus the gated final read"
+    );
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
 }
 
 async fn scenario_launch_send_snapshot_stop() {

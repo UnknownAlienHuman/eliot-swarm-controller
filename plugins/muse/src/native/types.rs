@@ -264,6 +264,7 @@ pub struct NativeSessionReadParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeSessionReadResult {
+    pub history: NativeSessionHistory,
     pub session: NativeSession,
     pub view_cursor: String,
 }
@@ -284,12 +285,103 @@ pub struct NativeSessionResumeParams {
 }
 
 /// The served-history envelope shared by `session/resume`, `session/fork`
-/// and `session/read` (SS2.5.2). Only the served mode is modelled: whatever
-/// the server served, this path never republishes retained items.
+/// and `session/read` (SS2.5.2). Retain the served mode and its typed none
+/// reason; this path never republishes retained items.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeSessionHistory {
     pub mode: String,
+    #[serde(default)]
+    pub none_reason: Option<NativeHistoryNoneReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NativeHistoryNoneReason {
+    Excluded,
+    CursorSuffix,
+    HistoryBudget,
+    ProjectionUnavailable,
+    ProjectionReadLimit,
+    #[serde(other)]
+    Unknown,
+}
+
+impl NativeHistoryNoneReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Excluded => "excluded",
+            Self::CursorSuffix => "cursorSuffix",
+            Self::HistoryBudget => "historyBudget",
+            Self::ProjectionUnavailable => "projectionUnavailable",
+            Self::ProjectionReadLimit => "projectionReadLimit",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl NativeSessionHistory {
+    /// Explicit exclusions/coverage limits do not establish a broken live
+    /// view. Missing or unknown noneReason cannot establish healthy readback.
+    pub fn unavailable_reason(&self) -> Option<NativeHistoryNoneReason> {
+        if self.mode != "none" {
+            return None;
+        }
+        match self.none_reason {
+            Some(
+                NativeHistoryNoneReason::Excluded
+                | NativeHistoryNoneReason::CursorSuffix
+                | NativeHistoryNoneReason::HistoryBudget,
+            ) => None,
+            reason => Some(reason.unwrap_or(NativeHistoryNoneReason::Unknown)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod view_health_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn history_exclusions_and_unavailable_reasons_are_distinct() {
+        for (reason, expected) in [
+            ("excluded", false),
+            ("cursorSuffix", false),
+            ("historyBudget", false),
+            ("projectionUnavailable", true),
+            ("projectionReadLimit", true),
+            ("futureReason", true),
+        ] {
+            let history: NativeSessionHistory = serde_json::from_value(json!({
+                "mode": "none", "noneReason": reason,
+            }))
+            .unwrap();
+            assert_eq!(history.unavailable_reason().is_some(), expected, "{reason}");
+        }
+        let missing: NativeSessionHistory = serde_json::from_value(json!({"mode":"none"})).unwrap();
+        assert_eq!(
+            missing.unavailable_reason(),
+            Some(NativeHistoryNoneReason::Unknown)
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSessionViewHealthChangedNotification {
+    pub session_id: String,
+    pub health: NativeViewHealth,
+    #[serde(default)]
+    pub none_reason: Option<NativeHistoryNoneReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NativeViewHealth {
+    Unavailable,
+    #[serde(other)]
+    Unknown,
 }
 
 /// `session/resume` result (SS2.5.2). `pendingRequests` is the late-joiner

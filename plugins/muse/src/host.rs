@@ -651,6 +651,21 @@ impl MusePlugin {
                     ));
                 }
             };
+            // Resume does not emit session/started. Bind only this verified
+            // response identity before readiness, including early health pushes
+            // queued behind requests belonging to the retained generation.
+            session.session_id = Some(resumed.session.session_id.clone());
+            if let Err(error) = session
+                .events
+                .view_readback(
+                    resumed.session.session_id.clone(),
+                    resumed.history.unavailable_reason(),
+                )
+                .await
+            {
+                self.session = Some(session);
+                return Err(error);
+            }
             // Late-joiner pointers are pulled after readiness (below): the
             // full payloads arrive as re-issued server-to-client requests
             // right after this response, and the pull covers any re-issue the
@@ -998,7 +1013,21 @@ impl MusePlugin {
                     match read_owned_session(&session.native_client, &native_session.session_id)
                         .await
                     {
-                        Ok(reread) => reread,
+                        Ok(reread) => {
+                            if let Some(reason) = reread.history.unavailable_reason() {
+                                let loss = session
+                                    .events
+                                    .view_readback(reread.session.session_id.clone(), Some(reason))
+                                    .await;
+                                self.session = Some(session);
+                                loss?;
+                                return Err(Error::new(
+                                    "unknown",
+                                    "Muse settings readback view is unavailable",
+                                ));
+                            }
+                            reread.session
+                        }
                         Err(error) => {
                             let error = discard_failed_start(&mut session, error).await;
                             return Err(self.retain_failed_start(&params, error));
@@ -1862,57 +1891,14 @@ impl MusePlugin {
         else {
             return unknown_snapshot(&params, "Muse session identity was not acknowledged");
         };
-        let readback = match read_owned_session(&session.native_client, session_id).await {
-            Ok(readback) => readback,
-            Err(_) => {
-                return unknown_snapshot(
-                    &params,
-                    "Muse session/read did not prove the exact owned session",
-                );
-            }
-        };
-        let native_state = session_state(&readback);
-        if session.command_inputs.contains_key(&params.command_id) && turn_id.is_none() {
-            return unknown_snapshot(&params, "Muse command has no exact native turn association");
+        if event_status.view_unavailable {
+            return view_unknown_snapshot(
+                session,
+                &params,
+                "Muse native observation remains unresolved",
+            );
         }
-        let last_turn = if let Some(turn_id) = turn_id.as_deref() {
-            match read_owned_turn(
-                &session.native_client,
-                session_id,
-                turn_id,
-                &params.command_id,
-                readback.active_turn_id.as_deref(),
-                &session.secrets,
-            )
-            .await
-            {
-                Ok(Some(facts)) => Some(facts),
-                _ => {
-                    return unknown_snapshot(
-                        &params,
-                        "Muse readback did not prove the exact requested turn",
-                    );
-                }
-            }
-        } else {
-            None
-        };
-        let result_known = last_turn
-            .as_ref()
-            .is_some_and(|turn| turn.final_text.is_some());
-        Ok(json!({
-            "agent_id": params.agent_id,
-            "generation": params.generation,
-            "command_id": params.command_id,
-            "state": native_state,
-            "native_scope": session.native_scope,
-            "native_ref": session_id,
-            "active_turn": last_turn.as_ref().filter(|turn| !turn.terminal).map(|turn| turn.turn_id.clone()),
-            "last_turn": last_turn,
-            "batch_unknown": event_status.batch_unknown,
-            "source_unknown": event_status.source_unknown,
-            "result_known": result_known,
-        }))
+        read_live_snapshot(session, &params, session_id, turn_id).await
     }
 
     async fn stop(&mut self, raw: &Value) -> Result<Value> {
@@ -2058,7 +2044,105 @@ async fn discover_model(
         })
 }
 
-async fn read_owned_session(client: &NativeClient, session_id: &str) -> Result<NativeSession> {
+async fn read_live_snapshot(
+    session: &AgentSession,
+    params: &AgentSnapshotParams,
+    session_id: &str,
+    turn_id: Option<String>,
+) -> Result<Value> {
+    let readback = match read_owned_session(&session.native_client, session_id).await {
+        Ok(readback) => readback,
+        Err(_) => {
+            return view_unknown_snapshot(
+                session,
+                params,
+                "Muse session/read did not prove the exact owned session",
+            );
+        }
+    };
+    if let Some(reason) = readback.history.unavailable_reason() {
+        let _ = session
+            .events
+            .view_readback(session_id.to_owned(), Some(reason))
+            .await;
+        return view_unknown_snapshot(session, params, "Muse native view readback is unavailable");
+    }
+    if session.command_inputs.contains_key(&params.command_id) && turn_id.is_none() {
+        return unknown_snapshot(params, "Muse command has no exact native turn association");
+    }
+    let turn_readback = if let Some(turn_id) = turn_id.as_deref() {
+        Some(
+            read_owned_turn(
+                &session.native_client,
+                session_id,
+                turn_id,
+                &params.command_id,
+                readback.session.active_turn_id.as_deref(),
+                &session.secrets,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+
+    // This is the final serialization point, after every native await. The
+    // actor drains queued health pushes first and returns its current status;
+    // never assemble a result from the pre-read watch snapshot.
+    let event_status = match session
+        .events
+        .view_readback(session_id.to_owned(), None)
+        .await
+    {
+        Ok(status) => status,
+        Err(_) => {
+            return view_unknown_snapshot(
+                session,
+                params,
+                "Muse native observation remains unresolved after readback",
+            );
+        }
+    };
+    let last_turn = match turn_readback {
+        None => None,
+        Some(Ok(Some(facts))) => Some(facts),
+        _ => {
+            return unknown_snapshot(
+                params,
+                "Muse readback did not prove the exact requested turn",
+            );
+        }
+    };
+    let result_known = last_turn
+        .as_ref()
+        .is_some_and(|turn| turn.final_text.is_some());
+    Ok(json!({
+        "agent_id": params.agent_id, "generation": params.generation,
+        "command_id": params.command_id, "state": session_state(&readback.session),
+        "native_scope": session.native_scope, "native_ref": session_id,
+        "active_turn": last_turn.as_ref().filter(|turn| !turn.terminal).map(|turn| turn.turn_id.clone()),
+        "last_turn": last_turn, "batch_unknown": event_status.batch_unknown,
+        "source_unknown": event_status.source_unknown, "result_known": result_known,
+    }))
+}
+
+fn view_unknown_snapshot(
+    session: &AgentSession,
+    params: &AgentSnapshotParams,
+    reason: &str,
+) -> Result<Value> {
+    let mut snapshot = unknown_snapshot(params, reason)?;
+    snapshot["native_scope"] = json!(session.native_scope);
+    snapshot["native_ref"] = json!(session.session_id);
+    snapshot["active_turn"] = json!(session.events.status().active_turn_id);
+    snapshot["batch_unknown"] = json!(session.events.status().batch_unknown);
+    Ok(snapshot)
+}
+
+async fn read_owned_session(
+    client: &NativeClient,
+    session_id: &str,
+) -> Result<NativeSessionReadResult> {
     let response: NativeSessionReadResult = serde_json::from_value(
         client
             .call(
@@ -2081,7 +2165,7 @@ async fn read_owned_session(client: &NativeClient, session_id: &str) -> Result<N
             "Muse session/read returned another native session",
         ));
     }
-    Ok(response.session)
+    Ok(response)
 }
 
 /// One backward `view/page` fetch, newest records first. Every durable-view
@@ -2148,7 +2232,14 @@ async fn verify_resume_preflight(
     session_id: &str,
     retained_turn: Option<&str>,
 ) -> Result<()> {
-    let session = read_owned_session(client, session_id).await?;
+    let readback = read_owned_session(client, session_id).await?;
+    if let Some(reason) = readback.history.unavailable_reason() {
+        return Err(Error::new(
+            "native_readback",
+            format!("Muse retained view is unavailable ({})", reason.label()),
+        ));
+    }
+    let session = readback.session;
     // The newest turn lives at the view head, so one backward page proves
     // it; the retained no-turn case needs no scan because the session turn
     // counter proves absence exactly.
