@@ -1999,8 +1999,7 @@ impl EventProcessor {
         let mut first_error = None;
         if self.child_early_lost.remove(child_thread)
             && let Some(state) = self.child_states.get_mut(child_thread)
-        {
-            if let Err(error) = state
+            && let Err(error) = state
                 .record_gap(
                     &mut self.sink,
                     &self.host,
@@ -2008,10 +2007,9 @@ impl EventProcessor {
                     "Codex child early events were lost before registration",
                 )
                 .await
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
         if let Err(error) = self.flush_child_buffer(child_thread).await
             && first_error.is_none()
