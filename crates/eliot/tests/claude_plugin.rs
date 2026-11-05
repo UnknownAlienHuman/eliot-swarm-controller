@@ -251,6 +251,24 @@ fn main() {
             scenario_stray_permission_ask_gets_explicit_deny,
         )
         .await;
+        run_scenario(
+            "duplicate permission id denied and original fenced",
+            OwnedChildren::default(),
+            scenario_duplicate_permission_id_denied_and_original_fenced,
+        )
+        .await;
+        run_scenario(
+            "pending overflow denied without opening",
+            OwnedChildren::default(),
+            scenario_pending_overflow_denied_without_opening,
+        )
+        .await;
+        run_scenario(
+            "repeated dropped id never rewritten nor retried",
+            OwnedChildren::default(),
+            scenario_repeated_dropped_id_never_rewritten_nor_retried,
+        )
+        .await;
     });
     println!("claude_plugin: all scenarios passed");
 }
@@ -604,6 +622,26 @@ impl FakeClaude {
             "result": body.get("response").cloned().unwrap_or(Value::Null),
         }));
         self.write_report();
+        if self.script == "overflow-repeat-asks"
+            && body
+                .get("response")
+                .and_then(|result| result.get("behavior"))
+                .and_then(Value::as_str)
+                == Some("allow")
+        {
+            // A slot freed; the dropped seventeenth repeats anyway. Still
+            // fenced: never a second deny nor an open. The turn stays parked.
+            self.emit_permission_request_with(
+                stdout,
+                "fake-perm-17",
+                "Bash",
+                "fake-tooluse-17",
+                json!({"command": "ls /tmp"}),
+            );
+            stdout.flush().expect("fixture stdout");
+            self.write_report();
+            return;
+        }
         if matches!(self.script.as_str(), "approve" | "approve-secret" | "deny") {
             // The decided turn runs to its terminal once the reply
             // lands, like the CLI continuing past the prompt.
@@ -692,27 +730,7 @@ impl FakeClaude {
             );
             return;
         }
-        if matches!(
-            self.script.as_str(),
-            "approve" | "approve-secret" | "deny" | "drop-reply"
-        ) {
-            // Park the turn on its permission ask: the terminal only
-            // follows the decision (or never, for the dropped reply).
-            self.emit_permission_request(stdout);
-            if self.script == "drop-reply" {
-                stdout.flush().expect("fixture stdout");
-                self.exit = Some("scripted-drop".to_owned());
-                self.write_report();
-                std::process::exit(0);
-            }
-            return;
-        }
-        if self.script == "request-close" {
-            // The turn ends with its ask unanswered: opened, then the
-            // terminal with no decision in between.
-            self.emit_permission_request(stdout);
-            self.emit_assistant(stdout, "fake reply with an open ask. ");
-            self.emit_turn_result(stdout, "completed");
+        if self.handle_parked_permission_scripts(stdout) {
             return;
         }
         let texts: Vec<String> = match self.script.as_str() {
@@ -741,6 +759,87 @@ impl FakeClaude {
         }
     }
 
+    /// Parked permission scripts: the turn stays open on its asks. True when
+    /// this script was handled and the caller must return without a terminal.
+    fn handle_parked_permission_scripts(&mut self, stdout: &mut std::io::StdoutLock) -> bool {
+        if matches!(
+            self.script.as_str(),
+            "approve" | "approve-secret" | "deny" | "drop-reply"
+        ) {
+            // Park the turn on its permission ask: the terminal only
+            // follows the decision (or never, for the dropped reply).
+            self.emit_permission_request(stdout);
+            if self.script == "drop-reply" {
+                stdout.flush().expect("fixture stdout");
+                self.exit = Some("scripted-drop".to_owned());
+                self.write_report();
+                std::process::exit(0);
+            }
+            return true;
+        }
+        if self.script == "request-close" {
+            // The turn ends with its ask unanswered: opened, then the
+            // terminal with no decision in between.
+            self.emit_permission_request(stdout);
+            self.emit_assistant(stdout, "fake reply with an open ask. ");
+            self.emit_turn_result(stdout, "completed");
+            return true;
+        }
+        if self.script == "duplicate-ask" {
+            // One open ask, then the same native id with another ask: an
+            // explicit deny plus a gap, and the retained original is fenced
+            // uncertain (native holds one callback per id; which ask the deny
+            // consumed is UNKNOWN, never claimed). The turn stays parked.
+            self.emit_permission_request(stdout);
+            self.emit_permission_request_with(
+                stdout,
+                "fake-perm-1",
+                "Write",
+                "fake-tooluse-2",
+                json!({"path": "/tmp/other"}),
+            );
+            return true;
+        }
+        if self.script == "overflow-asks" {
+            // Sixteen opens fill the retained bound; the seventeenth gets an
+            // explicit deny plus a gap, never an open. The turn stays parked.
+            for i in 1..=17 {
+                self.emit_permission_request_with(
+                    stdout,
+                    &format!("fake-perm-{i}"),
+                    "Bash",
+                    &format!("fake-tooluse-{i}"),
+                    json!({"command": "ls /tmp"}),
+                );
+            }
+            return true;
+        }
+        if self.script == "overflow-repeat-asks" {
+            // Like overflow-asks, plus an immediate repeat of the dropped
+            // seventeenth: the repeat never causes a second deny nor an open.
+            // A further repeat follows the first approval (see control
+            // responses), still fenced even though a slot freed.
+            for i in 1..=17 {
+                self.emit_permission_request_with(
+                    stdout,
+                    &format!("fake-perm-{i}"),
+                    "Bash",
+                    &format!("fake-tooluse-{i}"),
+                    json!({"command": "ls /tmp"}),
+                );
+            }
+            self.emit_permission_request_with(
+                stdout,
+                "fake-perm-17",
+                "Bash",
+                "fake-tooluse-17",
+                json!({"command": "ls /tmp"}),
+            );
+            return true;
+        }
+        false
+    }
+
     /// The owned session: `--resume` continues the retained id, otherwise
     /// the minted `--session-id`.
     fn session_id(&self) -> String {
@@ -758,15 +857,32 @@ impl FakeClaude {
         } else {
             json!({"command": "ls /tmp"})
         };
+        self.emit_permission_request_with(
+            stdout,
+            "fake-perm-1",
+            "Bash",
+            "fake-tooluse-1",
+            input,
+        );
+    }
+
+    fn emit_permission_request_with(
+        &self,
+        stdout: &mut std::io::StdoutLock,
+        request_id: &str,
+        tool_name: &str,
+        tool_use_id: &str,
+        input: Value,
+    ) {
         self.emit(
             stdout,
             json!({
                 "type": "control_request",
-                "request_id": "fake-perm-1",
+                "request_id": request_id,
                 "request": {
                     "subtype": "can_use_tool",
-                    "tool_name": "Bash",
-                    "tool_use_id": "fake-tooluse-1",
+                    "tool_name": tool_name,
+                    "tool_use_id": tool_use_id,
                     "input": input,
                 },
             }),
@@ -3927,5 +4043,256 @@ async fn scenario_stray_permission_ask_gets_explicit_deny(owned: OwnedChildren) 
         .call("shutdown", json!({}))
         .await
         .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_duplicate_permission_id_denied_and_original_fenced(owned: OwnedChildren) {
+    // Same native id with another ask: one explicit deny plus a gap. Native
+    // holds a single callback per id, so which ask the deny consumed is
+    // UNKNOWN (never claimed) and the retained original is fenced uncertain:
+    // late approves stay unknown with no second write and no resolution.
+    let mut scenario = Scenario::start("duplicate-ask", claude_profile(), &owned).await;
+    let agent_id = scenario.agent_id.clone();
+    let (_, turn_id, opened) =
+        send_until_permission_asked(&mut scenario.host, &agent_id, 1, "list files").await;
+    assert_eq!(
+        opened.get("request_id").and_then(Value::as_str),
+        Some("fake-perm-1")
+    );
+    assert_eq!(
+        opened["details"].get("tool_name").and_then(Value::as_str),
+        Some("Bash")
+    );
+    let gap = scenario.host.next_request().await;
+    assert_eq!(gap.method, "source.gap");
+    let reason = gap
+        .params
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        reason.contains("reused its native request id"),
+        "duplicate gaps: {reason}"
+    );
+    let gap_id = gap
+        .params
+        .get("gap_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    scenario
+        .host
+        .respond(&gap.id, json!({"gap_id": gap_id, "seq": scenario.host.next_seq}))
+        .await;
+    scenario.host.next_seq += 1;
+    for verb in ["approve", "deny"] {
+        let (reply, collected, _) = reply_for_permission(
+            &mut scenario.host,
+            &agent_id,
+            1,
+            verb,
+            json!({}),
+            "fake-perm-1",
+            &turn_id,
+        )
+        .await;
+        assert_eq!(
+            reply.get("state").and_then(Value::as_str),
+            Some("unknown"),
+            "{verb} after a conflicting deny stays unknown"
+        );
+        assert!(
+            reply.get("reason").and_then(Value::as_str).unwrap_or_default().contains("unresolved"),
+            "unknown keeps its reason: {reply:?}"
+        );
+        assert!(collected.is_empty(), "fenced reply commits nothing");
+    }
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
+    scenario.assert_cli_exit("stdin-eof");
+    let report = scenario.report();
+    let replies = report
+        .get("permission_replies")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        replies.as_slice(),
+        &[json!({
+            "request_id": "fake-perm-1",
+            "subtype": "success",
+            "result": {"behavior": "deny", "message": "Eliot denied this tool call."},
+        })]
+    );
+    assert_eq!(report.get("user_inputs").and_then(Value::as_u64), Some(1));
+    assert_eq!(
+        report.get("controls").and_then(|c| c.get("initialize")).and_then(Value::as_u64),
+        Some(1)
+    );
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_pending_overflow_denied_without_opening(owned: OwnedChildren) {
+    // Sixteen asks open; the seventeenth gets an explicit deny plus a gap and
+    // never opens. The retained sixteen still decide; the overflow id rejects.
+    let mut scenario = Scenario::start("overflow-asks", claude_profile(), &owned).await;
+    let agent_id = scenario.agent_id.clone();
+    let (_, turn_id, first) =
+        send_until_permission_asked(&mut scenario.host, &agent_id, 1, "list files").await;
+    let mut opened: Vec<String> = vec![
+        first.get("request_id").and_then(Value::as_str).unwrap_or_default().to_owned(),
+    ];
+    let mut gap_reason: Option<String> = None;
+    while opened.len() < 16 || gap_reason.is_none() {
+        let request = scenario.host.next_request().await;
+        match request.method.as_str() {
+            "events.put" => {
+                let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                assert_eq!(events.len(), 1, "one native record per batch");
+                assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("request.opened"));
+                let data = events[0].get("data").cloned().unwrap_or(Value::Null);
+                opened.push(data.get("request_id").and_then(Value::as_str).unwrap_or_default().to_owned());
+                let first_seq = scenario.host.next_seq;
+                scenario.host.next_seq += 1;
+                scenario.host.respond(&request.id, json!({
+                    "first_seq": first_seq, "last_seq": first_seq,
+                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                })).await;
+            }
+            "source.gap" => {
+                gap_reason = Some(request.params.get("reason").and_then(Value::as_str).unwrap_or_default().to_owned());
+                let gap_id = request.params.get("gap_id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                scenario.host.respond(&request.id, json!({"gap_id": gap_id, "seq": scenario.host.next_seq})).await;
+                scenario.host.next_seq += 1;
+            }
+            other => panic!("unexpected host request: {other}"),
+        }
+    }
+    let expected: Vec<String> = (1..=16).map(|i| format!("fake-perm-{i}")).collect();
+    assert_eq!(opened, expected);
+    assert!(gap_reason.unwrap_or_default().contains("pending native request bound was exceeded"));
+    let (rejected, collected, _) = reply_for_permission(
+        &mut scenario.host, &agent_id, 1, "deny", json!({}), "fake-perm-17", &turn_id,
+    )
+    .await;
+    assert_eq!(rejected.get("state").and_then(Value::as_str), Some("rejected"));
+    assert_eq!(
+        rejected.get("reason").and_then(Value::as_str),
+        Some("Claude request is no longer pending")
+    );
+    assert!(collected.is_empty(), "overflow id was never opened");
+    let (reply, collected, reply_id) = reply_for_permission(
+        &mut scenario.host, &agent_id, 1, "approve", json!({}), "fake-perm-1", &turn_id,
+    )
+    .await;
+    assert_eq!(reply.get("state").and_then(Value::as_str), Some("applied"));
+    assert_eq!(collected.first().map(|(kind, _)| kind.as_str()), Some("request.resolved"));
+    assert_eq!(
+        collected[0].1.get("command_id").and_then(Value::as_str),
+        Some(reply_id.as_str())
+    );
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
+    scenario.assert_cli_exit("stdin-eof");
+    let report = scenario.report();
+    let replies = report.get("permission_replies").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert_eq!(
+        replies.as_slice(),
+        &[
+            json!({
+                "request_id": "fake-perm-17",
+                "subtype": "success",
+                "result": {"behavior": "deny", "message": "Eliot denied this tool call."},
+            }),
+            json!({
+                "request_id": "fake-perm-1",
+                "subtype": "success",
+                "result": {"behavior": "allow", "updatedInput": {"command": "ls /tmp"}},
+            }),
+        ]
+    );
+    assert_eq!(report.get("user_inputs").and_then(Value::as_u64), Some(1));
+    scenario.host.call("shutdown", json!({})).await.expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_repeated_dropped_id_never_rewritten_nor_retried(owned: OwnedChildren) {
+    // The dropped seventeenth repeats immediately (still full) and again
+    // after a slot frees: never a second deny, never an admission. Unknown
+    // is never rewritten known.
+    let mut scenario = Scenario::start("overflow-repeat-asks", claude_profile(), &owned).await;
+    let agent_id = scenario.agent_id.clone();
+    let (_, turn_id, first) =
+        send_until_permission_asked(&mut scenario.host, &agent_id, 1, "list files").await;
+    let mut opened: Vec<String> = vec![
+        first.get("request_id").and_then(Value::as_str).unwrap_or_default().to_owned(),
+    ];
+    let mut gap_reason: Option<String> = None;
+    while opened.len() < 16 || gap_reason.is_none() {
+        let request = scenario.host.next_request().await;
+        match request.method.as_str() {
+            "events.put" => {
+                let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                assert_eq!(events.len(), 1, "one native record per batch");
+                assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("request.opened"));
+                let data = events[0].get("data").cloned().unwrap_or(Value::Null);
+                opened.push(data.get("request_id").and_then(Value::as_str).unwrap_or_default().to_owned());
+                let first_seq = scenario.host.next_seq;
+                scenario.host.next_seq += 1;
+                scenario.host.respond(&request.id, json!({
+                    "first_seq": first_seq, "last_seq": first_seq,
+                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                })).await;
+            }
+            "source.gap" => {
+                gap_reason = Some(request.params.get("reason").and_then(Value::as_str).unwrap_or_default().to_owned());
+                let gap_id = request.params.get("gap_id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                scenario.host.respond(&request.id, json!({"gap_id": gap_id, "seq": scenario.host.next_seq})).await;
+                scenario.host.next_seq += 1;
+            }
+            other => panic!("unexpected host request: {other}"),
+        }
+    }
+    let expected: Vec<String> = (1..=16).map(|i| format!("fake-perm-{i}")).collect();
+    assert_eq!(opened, expected);
+    assert!(gap_reason.unwrap_or_default().contains("pending native request bound was exceeded"));
+    let (rejected, collected, _) = reply_for_permission(
+        &mut scenario.host, &agent_id, 1, "deny", json!({}), "fake-perm-17", &turn_id,
+    )
+    .await;
+    assert_eq!(rejected.get("state").and_then(Value::as_str), Some("rejected"));
+    assert!(collected.is_empty(), "dropped id was never opened");
+    let (reply, collected, _) = reply_for_permission(
+        &mut scenario.host, &agent_id, 1, "approve", json!({}), "fake-perm-1", &turn_id,
+    )
+    .await;
+    assert_eq!(reply.get("state").and_then(Value::as_str), Some("applied"));
+    assert_eq!(collected.first().map(|(kind, _)| kind.as_str()), Some("request.resolved"));
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
+    scenario.assert_cli_exit("stdin-eof");
+    let report = scenario.report();
+    let replies = report.get("permission_replies").and_then(Value::as_array).cloned().unwrap_or_default();
+    let denies_17 = replies.iter().filter(|r| r.get("request_id").and_then(Value::as_str) == Some("fake-perm-17")).count();
+    assert_eq!(denies_17, 1, "exactly one deny for the dropped id: {replies:?}");
+    assert_eq!(
+        replies.as_slice(),
+        &[
+            json!({
+                "request_id": "fake-perm-17",
+                "subtype": "success",
+                "result": {"behavior": "deny", "message": "Eliot denied this tool call."},
+            }),
+            json!({
+                "request_id": "fake-perm-1",
+                "subtype": "success",
+                "result": {"behavior": "allow", "updatedInput": {"command": "ls /tmp"}},
+            }),
+        ]
+    );
+    assert_eq!(report.get("user_inputs").and_then(Value::as_u64), Some(1));
+    scenario.host.call("shutdown", json!({})).await.expect("shutdown");
     scenario.host.shutdown_child().await;
 }

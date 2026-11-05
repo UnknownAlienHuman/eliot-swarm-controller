@@ -9,7 +9,7 @@ use eliot_plugin::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
@@ -153,6 +153,7 @@ struct EventProcessor {
     gap_number: u64,
     pending_turn: Option<PendingTurn>,
     pending_requests: HashMap<String, PendingNativeRequest>,
+    deny_uncertain: HashSet<String>,
     message_seq: u64,
     accept_frames: bool,
     planned_stop: bool,
@@ -514,6 +515,7 @@ impl EventProcessor {
             gap_number: 0,
             pending_turn: None,
             pending_requests: HashMap::new(),
+            deny_uncertain: HashSet::new(),
             message_seq: 0,
             accept_frames: true,
             planned_stop: false,
@@ -956,18 +958,34 @@ impl EventProcessor {
             .await
     }
 
-    /// Deny a permission ask that has no exact active turn to bind to.
+    /// Deny one dropped `can_use_tool` ask with its exact native request id.
     /// The CLI unblocks on the explicit deny; the uncommitted ask is still a
     /// stream gap (recorded by the caller). Best-effort before readiness or
     /// after stop, when no client or live session remains.
-    async fn deny_stray_request(&self, request_id: &str) {
-        let Some(native) = self.native.as_ref() else {
+    ///
+    /// Native 2.1.278 stdin resolves one callback per request_id (get then
+    /// delete; offsets 217456597/217458203, SHA
+    /// 006ea5c8638f67f10a5ae66bb232fd267c9f6af294e3f03f4cfcf1fd3f2cced8):
+    /// no separate conflicting-duplicate addressee. Uncertainty is persisted
+    /// BEFORE the possible write; a fenced ID never causes a second deny nor
+    /// an admission, and the source gap is NOT proof the deny was received.
+    /// Only a proven non-dispatch lifts the fence; Ok and unknown both keep
+    /// it for this turn. IDs only, bounded by the retained-request bound.
+    async fn deny_stray_request(&mut self, request_id: &str) {
+        if self.deny_uncertain.contains(request_id) {
+            return;
+        }
+        if self.deny_uncertain.len() >= MAX_PENDING_REQUESTS {
+            return;
+        }
+        let Some(native) = self.native.clone() else {
             return;
         };
         if self.status.session_id.is_none() || self.status.stopped {
             return;
         }
-        let _ = native
+        self.deny_uncertain.insert(request_id.to_owned());
+        let result = native
             .respond_control(
                 request_id,
                 PermissionResult::Deny {
@@ -976,6 +994,51 @@ impl EventProcessor {
                 Instant::now() + EVENT_DEADLINE,
             )
             .await;
+        if let Err(error) = result
+            && matches!(
+                error.code.as_str(),
+                "native_not_dispatched" | "frame_too_large" | "native_encode"
+            )
+        {
+            self.deny_uncertain.remove(request_id);
+        }
+    }
+
+    /// Handle an ask whose native ID is already retained. Identical repeats
+    /// stay a no-op (no second IO, no new gap), even if fenced. A conflicting
+    /// repeat fences the retained original as uncertain (our deny consumes
+    /// the single native callback; original vs replacement is UNKNOWN, never
+    /// claimed) and gaps; an already-fenced ID never causes a second deny.
+    /// Some when retained (caller returns), None when new.
+    async fn handle_retained_duplicate(
+        &mut self,
+        request_id: &str,
+        body: &CanUseToolBody,
+    ) -> Option<Result<()>> {
+        let existing = self.pending_requests.get(request_id)?;
+        let same = existing.tool_name == body.tool_name
+            && existing.tool_use_id == body.tool_use_id
+            && Some(&existing.input) == body.input.as_ref();
+        if same {
+            return Some(Ok(()));
+        }
+        if self.deny_uncertain.contains(request_id) {
+            if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                entry.reply_state = NativeReplyState::Unknown;
+            }
+            return Some(
+                self.record_gap("Claude permission ask reused a fenced native request id")
+                    .await,
+            );
+        }
+        self.deny_stray_request(request_id).await;
+        if let Some(entry) = self.pending_requests.get_mut(request_id) {
+            entry.reply_state = NativeReplyState::Unknown;
+        }
+        Some(
+            self.record_gap("Claude permission ask reused its native request id")
+                .await,
+        )
     }
 
     /// One CLI `control_request`: only the `can_use_tool` permission ask is
@@ -1020,20 +1083,16 @@ impl EventProcessor {
                 "Claude can_use_tool omitted its tool name or input",
             ));
         }
-        // A re-issued open is idempotent when it repeats the retained ask;
-        // the same native id with another ask is an integrity gap.
-        if let Some(existing) = self.pending_requests.get(request_id) {
-            let same = existing.tool_name == body.tool_name
-                && existing.tool_use_id == body.tool_use_id
-                && Some(&existing.input) == body.input.as_ref();
-            if same {
-                return Ok(());
-            }
+        if let Some(result) = self.handle_retained_duplicate(request_id, &body).await {
+            return result;
+        }
+        if self.deny_uncertain.contains(request_id) {
             return self
-                .record_gap("Claude permission ask reused its native request id")
+                .record_gap("Claude permission ask reused a fenced native request id")
                 .await;
         }
         if self.pending_requests.len() >= MAX_PENDING_REQUESTS {
+            self.deny_stray_request(request_id).await;
             return self
                 .record_gap("Claude pending native request bound was exceeded")
                 .await;
@@ -1062,6 +1121,7 @@ impl EventProcessor {
             "details": details,
         });
         if serde_json::to_vec(&data).map_or(usize::MAX, |bytes| bytes.len()) > MAX_EVENT_BYTES {
+            self.deny_stray_request(request_id).await;
             return self
                 .record_gap("Claude normalized request exceeded the persisted-event bound")
                 .await;
@@ -1069,6 +1129,7 @@ impl EventProcessor {
         let native_id = match request_event_id(request_id, "request.opened", "claude", "Claude") {
             Ok(native_id) => native_id,
             Err(_) => {
+                self.deny_stray_request(request_id).await;
                 return self
                     .record_gap("Claude native request event identity exceeded its bound")
                     .await;
@@ -1295,6 +1356,7 @@ impl EventProcessor {
         // Unanswered asks die with their turn: close them before the terminal
         // commit, without a command binding.
         self.close_pending_requests(Some(&turn_id)).await?;
+        self.deny_uncertain.clear();
         if self
             .status
             .last_turn
@@ -1410,6 +1472,7 @@ impl EventProcessor {
         // The stopped session consumes no more asks: close every retained one
         // before `session.ended`.
         self.close_pending_requests(None).await?;
+        self.deny_uncertain.clear();
         let native_id = format!(
             "claude:{}:session.ended",
             self.status.session_id.as_deref().unwrap_or("unresolved")
