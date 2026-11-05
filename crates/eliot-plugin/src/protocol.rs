@@ -223,7 +223,7 @@ pub struct InitializeParams {
     pub config: Value,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentCommandParams {
     pub agent_id: String,
     pub generation: i64,
@@ -235,6 +235,8 @@ pub struct AgentCommandParams {
     pub turn_id: Option<String>,
     #[serde(default)]
     pub request_id: Option<String>,
+    #[serde(default)]
+    pub dispatch_seq: Option<i64>,
 }
 
 #[derive(Deserialize)]

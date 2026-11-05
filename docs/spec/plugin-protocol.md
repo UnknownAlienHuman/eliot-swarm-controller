@@ -86,7 +86,7 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 | --- | --- | --- |
 | `initialize` | protocol, frozen plugin config, private instance directory | return actual manifest |
 | `agent.start` | agent/generation, profile, workspace, target environment, note, source plan/state, optional resume subject/linked initial input | establish session; input/result settle separately |
-| `agent.command` | agent/generation, command id, verb/args, exact turn/request where required | applied/rejected/failed/unknown, native mechanism and application point |
+| `agent.command` | agent/generation, command id, verb/args, exact turn/request where required, optional dispatch_seq | applied/rejected/failed/unknown, native mechanism and application point |
 | `agent.stop` | agent/generation, command id, force | success means the bound controlled session/generation ended, not merely that observation detached |
 | `agent.snapshot` | controlled command/turn binding, or exact subject plus `observation` page query | bounded readback; private history never acknowledges controlled effects |
 | `agent.attach` | exact subject, generation, observe/control, profile/environment, source plan/cursors | attach only to that subject; otherwise not found/unsupported |
@@ -121,6 +121,15 @@ preflight cannot include runtime secrets/environment or later source readback. T
 must check the complete encoded request, including its actual id and NDJSON newline,
 after filling those fields and before enqueueing the request. Admission preflight is
 not proof that the completed runtime frame fits.
+
+`eliot_plugin::AgentCommandParams` carries optional `dispatch_seq` (positive integer).
+When present, it binds the exact committed `command.dispatched` Event sequence in
+Store for that command execution. Missing or null decodes as `None` for compatibility;
+existing adapters ignore it. The host checks the complete encoded `agent.command` request,
+including its actual id, arguments, optional sequence and NDJSON newline, against the 1 MiB
+frame bound before enqueueing. Retained command retry retains the original committed sequence
+rather than allocating a fresh sequence; initial send linked to launch/resume follows
+ordinary send dispatch.
 
 `features.discover` defaults to false. A discovery instance initializes independently
 of an Agent and has no authority to call `events.put`, `process.put` or other durable

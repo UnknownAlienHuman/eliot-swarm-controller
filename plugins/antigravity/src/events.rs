@@ -15,6 +15,9 @@ use crate::native::{AgyFrame, ResultRecord, StepUpdate};
 pub(crate) const FAMILIES: &[&str] = &["session", "turn", "message", "tool"];
 pub(crate) type Shared = Arc<Mutex<State>>;
 
+#[cfg(test)]
+type CapturedEvents = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+
 #[derive(Clone, Serialize)]
 pub(crate) struct TurnFacts {
     pub command_id: String,
@@ -51,6 +54,8 @@ pub(crate) struct State {
     pub stopped: bool,
     pub last_turn: Option<TurnFacts>,
     pub usage: Option<crate::native::Usage>,
+    #[cfg(test)]
+    pub(crate) test_recorder: Option<CapturedEvents>,
 }
 
 impl State {
@@ -82,6 +87,8 @@ impl State {
             stopped: false,
             last_turn: None,
             usage: None,
+            #[cfg(test)]
+            test_recorder: None,
         }
     }
 
@@ -200,9 +207,11 @@ impl State {
         if step.step_type == "system_message" {
             return Ok(());
         }
-        self.associate().await?;
         match step.step_type.as_str() {
-            "user_input" | "agent_response" => Ok(()),
+            "user_input" | "agent_response" => {
+                self.associate().await?;
+                Ok(())
+            }
             "tool" => self.tool(step).await,
             _ => Err(self.unsupported_step_error(&step)),
         }
@@ -249,6 +258,7 @@ impl State {
             .tool_name
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| Error::new("native_protocol", "Antigravity tool name is absent"))?;
+        self.associate().await?;
         let pending = self
             .pending
             .as_ref()
@@ -290,8 +300,17 @@ impl State {
             .as_ref()
             .ok_or_else(|| Error::new("unknown", "Antigravity turn is absent"))?;
         let (command, turn) = (pending.command.clone(), pending.turn.clone());
+        let failed = result.status != "SUCCESS";
         let text = self.policy.redact_text(&result.response);
-        if !text.is_empty() {
+        let mut data = json!({"command_id": command, "turn_id": turn,
+            "status": status, "native_status": result.status, "denied_actions": result.denied_actions,
+            "usage": result.usage, "num_turns": result.num_turns,
+            "finished_reason": result.finished_reason});
+        self.policy.redact_values(&mut data);
+        attach_native_error(&mut data, result.error.as_deref(), &self.policy);
+        attach_final_text(&mut data, &text, failed, &self.policy);
+        let text_omitted = failed && data.get("final_text").is_none();
+        if !text.is_empty() && !text_omitted {
             self.commit(
                 "message.completed",
                 &turn,
@@ -302,23 +321,21 @@ impl State {
             )
             .await?;
         }
-        let mut data = json!({"command_id": command, "turn_id": turn,
-            "status": status, "native_status": result.status, "denied_actions": result.denied_actions,
-            "usage": result.usage, "num_turns": result.num_turns,
-            "finished_reason": result.finished_reason});
-        self.policy.redact_values(&mut data);
-        attach_native_error(&mut data, result.error.as_deref(), &self.policy);
-        attach_final_text(&mut data, &text, result.status != "SUCCESS", &self.policy);
-        self.commit("turn.completed", &turn, "completed", data)
+        self.commit("turn.completed", &turn, "completed", data.clone())
             .await?;
         if result.usage.is_some() {
             self.usage = result.usage; // Replace; never add cumulative results.
         }
+        let final_text = data
+            .get("final_text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
         self.last_turn = Some(TurnFacts {
             command_id: command,
             turn_id: turn,
             status: status.to_owned(),
-            final_text: text,
+            final_text,
             terminal: true,
         });
         self.pending = None;
@@ -348,6 +365,11 @@ impl State {
             ));
         }
         let id = event_id(&self.conversation, turn, item, kind, "agy", "Antigravity")?;
+        #[cfg(test)]
+        if let Some(recorder) = &self.test_recorder {
+            recorder.lock().unwrap().push((kind.to_owned(), data));
+            return Ok(());
+        }
         self.source().commit_event(kind, id, data).await
     }
 
@@ -413,4 +435,181 @@ pub(crate) fn spawn(
                 .await;
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_plugin::Peer;
+
+    fn test_state() -> State {
+        let peer = Peer::stdio();
+        State::new(
+            peer.client(),
+            "test-credential".to_owned(),
+            "test-agent".to_owned(),
+            1,
+            SecretPolicy::default(),
+            "conv-1".to_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn unknown_step_leaves_input_ack_unknown() {
+        let mut state = test_state();
+        let mut reply_rx = state
+            .prepare("cmd-1".to_owned(), "turn-1".to_owned())
+            .expect("prepared input");
+        let step = StepUpdate {
+            conversation_id: "conv-1".to_owned(),
+            step_index: 1,
+            state: "RUNNING".to_owned(),
+            step_type: "unknown_future_step".to_owned(),
+            tool_name: None,
+            tool_info: None,
+        };
+        let error = state
+            .step(step)
+            .await
+            .expect_err("unknown step type rejects");
+        assert_eq!(error.code, "native_protocol");
+        assert!(!state.pending.as_ref().unwrap().associated);
+        assert!(state.pending.as_ref().unwrap().reply.is_some());
+
+        state.writes_blocked = true;
+        state.lose(&error.message).await;
+        let ack = reply_rx.try_recv().expect("reply received");
+        assert_eq!(ack.expect_err("no ACK on unknown step").code, "unknown");
+    }
+
+    #[tokio::test]
+    async fn system_message_stays_before_association() {
+        let mut state = test_state();
+        let step = StepUpdate {
+            conversation_id: "conv-1".to_owned(),
+            step_index: 0,
+            state: "RUNNING".to_owned(),
+            step_type: "system_message".to_owned(),
+            tool_name: None,
+            tool_info: None,
+        };
+        state.step(step).await.expect("system message ignored");
+        assert!(state.pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_failed_terminal_omits_message_and_continues_lane() {
+        let recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut state = test_state();
+        state.test_recorder = Some(Arc::clone(&recorder));
+        let mut reply_rx = state
+            .prepare("cmd-1".to_owned(), "turn-1".to_owned())
+            .expect("prepared input");
+
+        let oversize_response = "E".repeat(80 * 1024);
+        let result = ResultRecord {
+            conversation_id: "conv-1".to_owned(),
+            status: "ERROR".to_owned(),
+            response: oversize_response,
+            error: Some("process failed with error".to_owned()),
+            finished_reason: Some("error".to_owned()),
+            num_turns: Some(1),
+            usage: None,
+            denied_actions: Vec::new(),
+        };
+
+        state
+            .complete(result)
+            .await
+            .expect("oversized failed terminal settles without bound error");
+
+        let ack = reply_rx.try_recv().expect("ack received");
+        assert!(ack.is_ok());
+
+        assert!(state.pending.is_none());
+        assert_eq!(state.active_turn(), None);
+        assert!(state.failure.is_none());
+        assert!(!state.source_unknown);
+        let last_turn = state.last_turn.as_ref().expect("last turn facts recorded");
+        assert_eq!(last_turn.status, "failed");
+        assert_eq!(last_turn.final_text, "");
+        assert!(last_turn.terminal);
+
+        let commits = recorder.lock().unwrap().clone();
+        let kinds: Vec<&str> = commits.iter().map(|(kind, _)| kind.as_str()).collect();
+        assert_eq!(kinds, vec!["turn.started", "turn.completed"]);
+
+        let turn_completed = &commits[1].1;
+        assert_eq!(
+            turn_completed.get("final_text_unavailable"),
+            Some(&Value::String("event_budget".to_owned()))
+        );
+        assert!(turn_completed.get("final_text").is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_success_preserves_bound_failure() {
+        let recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut state = test_state();
+        state.test_recorder = Some(Arc::clone(&recorder));
+        let _reply_rx = state
+            .prepare("cmd-1".to_owned(), "turn-1".to_owned())
+            .expect("prepared input");
+
+        let oversize_response = "S".repeat(80 * 1024);
+        let result = ResultRecord {
+            conversation_id: "conv-1".to_owned(),
+            status: "SUCCESS".to_owned(),
+            response: oversize_response,
+            error: None,
+            finished_reason: Some("stop".to_owned()),
+            num_turns: Some(1),
+            usage: None,
+            denied_actions: Vec::new(),
+        };
+
+        let error = state
+            .complete(result)
+            .await
+            .expect_err("oversized success must fail bound");
+        assert_eq!(error.code, "frame_too_large");
+    }
+
+    #[tokio::test]
+    async fn small_failed_terminal_retains_message_and_final_text() {
+        let recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut state = test_state();
+        state.test_recorder = Some(Arc::clone(&recorder));
+        let _reply_rx = state
+            .prepare("cmd-1".to_owned(), "turn-1".to_owned())
+            .expect("prepared input");
+
+        let result = ResultRecord {
+            conversation_id: "conv-1".to_owned(),
+            status: "ERROR".to_owned(),
+            response: "syntax error on line 42".to_owned(),
+            error: Some("syntax error".to_owned()),
+            finished_reason: Some("error".to_owned()),
+            num_turns: Some(1),
+            usage: None,
+            denied_actions: Vec::new(),
+        };
+
+        state
+            .complete(result)
+            .await
+            .expect("small failed terminal completes");
+        let commits = recorder.lock().unwrap().clone();
+        let kinds: Vec<&str> = commits.iter().map(|(kind, _)| kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["turn.started", "message.completed", "turn.completed"]
+        );
+        let turn_completed = &commits[2].1;
+        assert_eq!(
+            turn_completed.get("final_text"),
+            Some(&Value::String("syntax error on line 42".to_owned()))
+        );
+        assert!(turn_completed.get("final_text_unavailable").is_none());
+    }
 }

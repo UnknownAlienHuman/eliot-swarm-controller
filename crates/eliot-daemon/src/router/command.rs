@@ -109,7 +109,7 @@ impl Router {
         else {
             return;
         };
-        let Some(dispatched) = self
+        let Some((dispatched, dispatch_seq)) = self
             .dispatch_and_wait_for_effect(
                 &id,
                 &mut receiver,
@@ -126,6 +126,7 @@ impl Router {
             prepared.git_fetch_registration,
             prepared.resume_source_state,
             linked_id,
+            dispatch_seq,
         )
         .await;
     }
@@ -414,8 +415,8 @@ impl Router {
         receiver: &mut broadcast::Receiver<Event>,
         command: &Command,
         launch_binding: &Option<(Agent, NativeStoreBinding)>,
-    ) -> Option<Command> {
-        let dispatched = loop {
+    ) -> Option<(Command, i64)> {
+        let (dispatched, dispatch_seq) = loop {
             let change = {
                 let mut store = self.inner.store.lock().await;
                 let dispatched = match launch_binding {
@@ -470,7 +471,16 @@ impl Router {
                     self.signal_progress();
                     return None;
                 }
-                Ok(change) => break change.value,
+                Ok(change) => {
+                    let seq = match capture_dispatch_seq(&change.value, &change.events) {
+                        Some(seq) => seq,
+                        None => {
+                            self.signal_progress();
+                            return None;
+                        }
+                    };
+                    break (change.value, seq);
+                }
                 Err(error) => {
                     self.settle_dispatch_error(id, &error, change.1, launch_binding.is_some())
                         .await;
@@ -485,7 +495,7 @@ impl Router {
             self.signal_progress();
             return None;
         }
-        Some(dispatched)
+        Some((dispatched, dispatch_seq))
     }
 
     /// Wait for one bus event that can release a queued dispatch: provider
@@ -542,6 +552,7 @@ impl Router {
         git_fetch_registration: Option<ProjectRegistrationView>,
         resume_source_state: Option<Value>,
         linked_id: Option<String>,
+        dispatch_seq: i64,
     ) {
         if dispatched.verb == "run" {
             self.execute_run_command(dispatched).await;
@@ -578,9 +589,13 @@ impl Router {
                     .await;
                 true
             }
-            "send" => self.execute_send_command(id, &agent, dispatched).await,
+            "send" => {
+                self.execute_send_command(id, &agent, dispatched, Some(dispatch_seq))
+                    .await
+            }
             "steer" | "interrupt" | "approve" | "deny" | "answer" => {
-                self.execute_control_command(id, &agent, dispatched).await
+                self.execute_control_command(id, &agent, dispatched, Some(dispatch_seq))
+                    .await
             }
             "stop" => self.execute_stop_command(id, &agent, dispatched).await,
             "detach" => {
@@ -732,11 +747,17 @@ impl Router {
     /// Send one turn through the owned plugin and settle its outcome,
     /// requiring a committed turn association for an applied send. Returns
     /// whether the caller must send the trailing progress signal.
-    async fn execute_send_command(&self, id: &str, agent: &Agent, dispatched: Command) -> bool {
+    async fn execute_send_command(
+        &self,
+        id: &str,
+        agent: &Agent,
+        dispatched: Command,
+        dispatch_seq: Option<i64>,
+    ) -> bool {
         let response = self
             .inner
             .plugin_host
-            .command(agent, dispatched.clone())
+            .command(agent, dispatched.clone(), dispatch_seq)
             .await;
         match response {
             Ok(value) => {
@@ -802,11 +823,17 @@ impl Router {
     /// Run one native control (steer, interrupt, or a request reply) through
     /// the owned plugin and settle its outcome. Returns whether the caller
     /// must send the trailing progress signal.
-    async fn execute_control_command(&self, id: &str, agent: &Agent, dispatched: Command) -> bool {
+    async fn execute_control_command(
+        &self,
+        id: &str,
+        agent: &Agent,
+        dispatched: Command,
+        dispatch_seq: Option<i64>,
+    ) -> bool {
         match self
             .inner
             .plugin_host
-            .command(agent, dispatched.clone())
+            .command(agent, dispatched.clone(), dispatch_seq)
             .await
         {
             Ok(mut value) => {
@@ -1410,10 +1437,32 @@ fn unknown_cause(error: &Error) -> String {
     }
 }
 
+/// Capture the exact one positive matching `command.dispatched` event sequence
+/// from the committed dispatch change events for this command. If missing,
+/// non-positive, or ambiguous, fails closed by returning `None`.
+fn capture_dispatch_seq(command: &Command, events: &[Event]) -> Option<i64> {
+    let mut matched_seq: Option<i64> = None;
+    for event in events {
+        if event.seq > 0
+            && event.kind == "command.dispatched"
+            && event.agent == command.target
+            && event.generation == command.generation
+            && event.data.get("command_id").and_then(Value::as_str) == Some(&command.id)
+            && event.data.get("verb").and_then(Value::as_str) == Some(&command.verb)
+        {
+            if matched_seq.is_some() {
+                return None;
+            }
+            matched_seq = Some(event.seq);
+        }
+    }
+    matched_seq
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Command, validate_retained_resume_agent};
-    use eliot_core::{Agent, AgentState, CommandState};
+    use super::{Command, capture_dispatch_seq, validate_retained_resume_agent};
+    use eliot_core::{Agent, AgentState, CommandState, Event};
     use serde_json::json;
 
     fn resume_command(agent_id: &str) -> Command {
@@ -1474,5 +1523,209 @@ mod tests {
                 .code,
             "unsupported"
         );
+    }
+
+    fn test_event(
+        seq: i64,
+        kind: &str,
+        agent: Option<&str>,
+        generation: Option<i64>,
+        command_id: &str,
+        verb: &str,
+    ) -> Event {
+        Event {
+            seq,
+            ts: 100,
+            kind: kind.to_owned(),
+            agent: agent.map(ToOwned::to_owned),
+            subject: None,
+            generation,
+            source: "daemon".to_owned(),
+            native_id: None,
+            data: json!({"command_id": command_id, "verb": verb}),
+            cause: None,
+        }
+    }
+
+    fn test_command(
+        id: &str,
+        verb: &str,
+        target: Option<&str>,
+        generation: Option<i64>,
+    ) -> Command {
+        Command {
+            id: id.to_owned(),
+            principal: "owner".to_owned(),
+            method: "command.submit".to_owned(),
+            verb: verb.to_owned(),
+            target: target.map(ToOwned::to_owned),
+            selector: None,
+            expected_generation: generation,
+            generation,
+            args: json!({}),
+            state: CommandState::Dispatched,
+            turn_id: None,
+            request_id: None,
+            outcome: None,
+            created_at: 0,
+            updated_at: 0,
+            probe: false,
+        }
+    }
+
+    #[test]
+    fn capture_dispatch_seq_selects_exact_committed_event() {
+        let cmd = test_command("cmd-1", "send", Some("agent-1"), Some(1));
+        let events = vec![
+            test_event(
+                10,
+                "turn.started",
+                Some("agent-1"),
+                Some(1),
+                "cmd-0",
+                "send",
+            ),
+            test_event(
+                11,
+                "command.dispatched",
+                Some("agent-2"),
+                Some(1),
+                "cmd-other",
+                "send",
+            ),
+            test_event(
+                12,
+                "command.dispatched",
+                Some("agent-1"),
+                Some(2),
+                "cmd-1",
+                "send",
+            ),
+            test_event(
+                13,
+                "command.dispatched",
+                Some("agent-1"),
+                Some(1),
+                "cmd-1",
+                "stop",
+            ),
+            test_event(
+                14,
+                "command.dispatched",
+                Some("agent-1"),
+                Some(1),
+                "cmd-different",
+                "send",
+            ),
+            test_event(
+                15,
+                "command.dispatched",
+                Some("agent-1"),
+                Some(1),
+                "cmd-1",
+                "send",
+            ),
+            test_event(
+                16,
+                "turn.completed",
+                Some("agent-1"),
+                Some(1),
+                "cmd-1",
+                "send",
+            ),
+        ];
+        assert_eq!(
+            capture_dispatch_seq(&cmd, &events),
+            Some(15),
+            "exact matching event sequence is extracted from committed change events"
+        );
+    }
+
+    #[test]
+    fn capture_dispatch_seq_fails_closed_when_missing_or_ambiguous() {
+        let cmd = test_command("cmd-1", "send", Some("agent-1"), Some(1));
+
+        // Missing matching event -> None
+        let empty_events = vec![];
+        assert_eq!(capture_dispatch_seq(&cmd, &empty_events), None);
+
+        let unrelated_events = vec![test_event(
+            1,
+            "command.dispatched",
+            Some("agent-1"),
+            Some(1),
+            "cmd-2",
+            "send",
+        )];
+        assert_eq!(capture_dispatch_seq(&cmd, &unrelated_events), None);
+
+        // Non-positive sequence -> None
+        let zero_seq = vec![test_event(
+            0,
+            "command.dispatched",
+            Some("agent-1"),
+            Some(1),
+            "cmd-1",
+            "send",
+        )];
+        assert_eq!(capture_dispatch_seq(&cmd, &zero_seq), None);
+
+        let neg_seq = vec![test_event(
+            -1,
+            "command.dispatched",
+            Some("agent-1"),
+            Some(1),
+            "cmd-1",
+            "send",
+        )];
+        assert_eq!(capture_dispatch_seq(&cmd, &neg_seq), None);
+
+        // Ambiguous matching events (> 1) -> None (fail closed)
+        let ambiguous_events = vec![
+            test_event(
+                21,
+                "command.dispatched",
+                Some("agent-1"),
+                Some(1),
+                "cmd-1",
+                "send",
+            ),
+            test_event(
+                22,
+                "command.dispatched",
+                Some("agent-1"),
+                Some(1),
+                "cmd-1",
+                "send",
+            ),
+        ];
+        assert_eq!(
+            capture_dispatch_seq(&cmd, &ambiguous_events),
+            None,
+            "ambiguous matching events fail closed without native IO"
+        );
+    }
+
+    #[test]
+    fn capture_dispatch_seq_retained_retry_never_allocates_fresh_seq() {
+        let cmd = test_command("cmd-retry", "send", Some("agent-1"), Some(1));
+        let original_event = test_event(
+            55,
+            "command.dispatched",
+            Some("agent-1"),
+            Some(1),
+            "cmd-retry",
+            "send",
+        );
+        let events = vec![original_event];
+
+        // First dispatch / capture
+        let seq1 = capture_dispatch_seq(&cmd, &events);
+        assert_eq!(seq1, Some(55));
+
+        // Retained retry evaluation against the committed events must retain exact seq, never a fresh seq
+        let seq2 = capture_dispatch_seq(&cmd, &events);
+        assert_eq!(seq2, seq1);
+        assert_eq!(seq2, Some(55));
     }
 }

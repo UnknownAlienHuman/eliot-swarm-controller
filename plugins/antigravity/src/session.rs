@@ -1,6 +1,6 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-use eliot_core::{Error, Result};
+use eliot_core::{Error, Result, canonical_json_sha256};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, MAX_TEXT_BYTES,
     PeerClient,
@@ -21,10 +21,44 @@ use crate::{
     profile::Plan,
 };
 
-struct Sent {
-    text: String,
+struct RetainedCommand {
+    seq: i64,
+    command_id: String,
+    payload_sha256: [u8; 32],
     turn: String,
     outcome: Result<Value>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HistoryDecision<'a> {
+    RetainedOutcome(&'a Result<Value>),
+    Conflict,
+    EvictedHistory,
+    Advance,
+}
+
+fn check_history<'a>(
+    retained: &'a Option<RetainedCommand>,
+    highwater_seq: i64,
+    seq: i64,
+    command_id: &str,
+    payload_sha256: [u8; 32],
+) -> HistoryDecision<'a> {
+    if let Some(retained) = retained {
+        if retained.seq == seq
+            && retained.command_id == command_id
+            && retained.payload_sha256 == payload_sha256
+        {
+            return HistoryDecision::RetainedOutcome(&retained.outcome);
+        }
+        if retained.seq == seq || retained.command_id == command_id {
+            return HistoryDecision::Conflict;
+        }
+    }
+    if seq <= highwater_seq {
+        return HistoryDecision::EvictedHistory;
+    }
+    HistoryDecision::Advance
 }
 
 pub(crate) struct Session {
@@ -38,7 +72,8 @@ pub(crate) struct Session {
     stream: watch::Receiver<StreamState>,
     task: Option<JoinHandle<()>>,
     ready: bool,
-    sent: HashMap<String, Sent>,
+    highwater_seq: i64,
+    retained: Option<RetainedCommand>,
     stop: Option<(String, bool, Result<Value>)>,
 }
 
@@ -75,7 +110,8 @@ impl Session {
             stream,
             task: None,
             ready: false,
-            sent: HashMap::new(),
+            highwater_seq: 0,
+            retained: None,
             stop: None,
         })
     }
@@ -182,15 +218,6 @@ impl Session {
                 "Antigravity input exceeds the text bound",
             ));
         }
-        if let Some(previous) = self.sent.get(&params.command_id) {
-            if previous.text != text {
-                return Err(Error::new(
-                    "source_integrity",
-                    "Antigravity command id was reused with different input",
-                ));
-            }
-            return previous.outcome.clone();
-        }
         if params.command_id == self.start_command
             || self.stop.as_ref().is_some_and(|s| s.0 == params.command_id)
         {
@@ -198,6 +225,43 @@ impl Session {
                 "source_integrity",
                 "Antigravity command id belongs to another operation",
             ));
+        }
+        let seq = match params.dispatch_seq {
+            Some(seq) if seq > 0 => seq,
+            _ => {
+                return Err(Error::new(
+                    "invalid",
+                    "Antigravity send requires a positive dispatch sequence",
+                ));
+            }
+        };
+        let payload_sha256 = canonical_json_sha256(&params.args).map_err(|_| {
+            Error::new(
+                "invalid",
+                "Antigravity command arguments cannot be canonicalized",
+            )
+        })?;
+        match check_history(
+            &self.retained,
+            self.highwater_seq,
+            seq,
+            &params.command_id,
+            payload_sha256,
+        ) {
+            HistoryDecision::RetainedOutcome(outcome) => return outcome.clone(),
+            HistoryDecision::Conflict => {
+                return Err(Error::new(
+                    "source_integrity",
+                    "Antigravity command binding conflicts with retained record",
+                ));
+            }
+            HistoryDecision::EvictedHistory => {
+                return Err(Error::new(
+                    "unknown",
+                    "Antigravity command private history is unavailable",
+                ));
+            }
+            HistoryDecision::Advance => {}
         }
         if !self.ready {
             return Err(Error::new(
@@ -212,18 +276,18 @@ impl Session {
             .lock()
             .await
             .prepare(params.command_id.clone(), turn.clone())?;
+        self.highwater_seq = seq;
         let unknown = Err(Error::new(
             "unknown",
             "Antigravity input may have applied and will not be resent",
         ));
-        self.sent.insert(
-            params.command_id.clone(),
-            Sent {
-                text: text.into(),
-                turn: turn.clone(),
-                outcome: unknown.clone(),
-            },
-        );
+        self.retained = Some(RetainedCommand {
+            seq,
+            command_id: params.command_id.clone(),
+            payload_sha256,
+            turn: turn.clone(),
+            outcome: unknown.clone(),
+        });
         let result = match self
             .native
             .writer()
@@ -243,25 +307,28 @@ impl Session {
             }
             Err(error) => Err(self.native.diagnostic_error(error.with_code("unknown"))),
         };
-        if let Some(sent) = self.sent.get_mut(&params.command_id) {
-            sent.outcome = result.clone();
+        if let Some(retained) = self.retained.as_mut().filter(|r| r.seq == seq) {
+            retained.outcome = result.clone();
         }
         result
     }
 
     pub async fn snapshot(&self, params: AgentSnapshotParams) -> Result<Value> {
         let state = self.state.lock().await;
-        let sent = self.sent.get(&params.command_id);
+        let retained = self
+            .retained
+            .as_ref()
+            .filter(|r| r.command_id == params.command_id);
         let stop = self.stop.as_ref().is_some_and(|s| s.0 == params.command_id);
-        if params.command_id != self.start_command && sent.is_none() && !stop {
+        if params.command_id != self.start_command && retained.is_none() && !stop {
             return unknown_snapshot(&params, "Antigravity command identity is not retained");
         }
         let turn = params
             .turn_id
             .as_deref()
-            .or_else(|| sent.map(|s| s.turn.as_str()));
+            .or_else(|| retained.map(|r| r.turn.as_str()));
         if let Some(turn) = turn
-            && (sent.is_none_or(|sent| sent.turn != turn)
+            && (retained.is_none_or(|r| r.turn != turn)
                 || !(state.active_turn() == Some(turn)
                     || state
                         .last_turn
@@ -307,7 +374,12 @@ impl Session {
             }
             return result.clone();
         }
-        if params.command_id == self.start_command || self.sent.contains_key(&params.command_id) {
+        if params.command_id == self.start_command
+            || self
+                .retained
+                .as_ref()
+                .is_some_and(|r| r.command_id == params.command_id)
+        {
             return Err(Error::new(
                 "source_integrity",
                 "Antigravity command id belongs to another operation",
@@ -346,5 +418,113 @@ impl Session {
         }
         self.ready = false;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn command_history_tracking_and_conflicts() {
+        let payload = json!({"text": "hello world"});
+        let payload_sha256 = canonical_json_sha256(&payload).unwrap();
+        let outcome: Result<Value> = Ok(json!({"state": "applied", "turn_id": "turn-1"}));
+
+        let retained = Some(RetainedCommand {
+            seq: 10,
+            command_id: "cmd-1".to_owned(),
+            payload_sha256,
+            turn: "turn-1".to_owned(),
+            outcome: outcome.clone(),
+        });
+
+        // Exact match
+        let decision = check_history(&retained, 10, 10, "cmd-1", payload_sha256);
+        match decision {
+            HistoryDecision::RetainedOutcome(out) => {
+                assert_eq!(out.as_ref().unwrap()["state"], "applied");
+            }
+            _ => panic!("expected exact retained outcome"),
+        }
+
+        // Conflict: same seq, different command_id
+        let decision = check_history(&retained, 10, 10, "cmd-diff", payload_sha256);
+        assert!(matches!(decision, HistoryDecision::Conflict));
+
+        // Conflict: same command_id, different seq
+        let decision = check_history(&retained, 10, 15, "cmd-1", payload_sha256);
+        assert!(matches!(decision, HistoryDecision::Conflict));
+
+        // Conflict: same seq and command_id, different payload
+        let other_payload = json!({"text": "tampered"});
+        let other_sha256 = canonical_json_sha256(&other_payload).unwrap();
+        let decision = check_history(&retained, 10, 10, "cmd-1", other_sha256);
+        assert!(matches!(decision, HistoryDecision::Conflict));
+
+        // Evicted history: seq <= highwater_seq (not retained)
+        let decision = check_history(&retained, 10, 5, "cmd-old", other_sha256);
+        assert!(matches!(decision, HistoryDecision::EvictedHistory));
+
+        // Advance: higher seq > highwater_seq
+        let decision = check_history(&retained, 10, 20, "cmd-new", other_sha256);
+        assert!(matches!(decision, HistoryDecision::Advance));
+    }
+
+    #[test]
+    fn thousands_of_commands_keep_constant_memory_and_evict_old() {
+        let mut highwater_seq = 0;
+        let mut retained: Option<RetainedCommand> = None;
+
+        for i in 1..=2000 {
+            let seq = i * 10;
+            let cmd_id = format!("cmd-{seq}");
+            let payload = json!({"text": format!("prompt {seq}")});
+            let payload_sha256 = canonical_json_sha256(&payload).unwrap();
+
+            let decision = check_history(&retained, highwater_seq, seq, &cmd_id, payload_sha256);
+            assert!(matches!(decision, HistoryDecision::Advance));
+
+            highwater_seq = seq;
+            retained = Some(RetainedCommand {
+                seq,
+                command_id: cmd_id,
+                payload_sha256,
+                turn: format!("turn-{seq}"),
+                outcome: Ok(json!({"state": "applied"})),
+            });
+        }
+
+        assert_eq!(retained.as_ref().unwrap().seq, 20_000);
+        assert_eq!(retained.as_ref().unwrap().command_id, "cmd-20000");
+
+        let old_payload = json!({"text": "prompt 10"});
+        let old_sha256 = canonical_json_sha256(&old_payload).unwrap();
+        let decision = check_history(&retained, highwater_seq, 10, "cmd-10", old_sha256);
+        assert!(matches!(decision, HistoryDecision::EvictedHistory));
+    }
+
+    #[test]
+    fn lost_write_unknown_returns_same_outcome_without_retry() {
+        let payload = json!({"text": "lost prompt"});
+        let payload_sha256 = canonical_json_sha256(&payload).unwrap();
+        let unknown_outcome: Result<Value> = Err(Error::new("unknown", "input may have applied"));
+
+        let retained = Some(RetainedCommand {
+            seq: 42,
+            command_id: "cmd-lost".to_owned(),
+            payload_sha256,
+            turn: "turn-lost".to_owned(),
+            outcome: unknown_outcome,
+        });
+
+        let decision = check_history(&retained, 42, 42, "cmd-lost", payload_sha256);
+        match decision {
+            HistoryDecision::RetainedOutcome(Err(err)) => {
+                assert_eq!(err.code, "unknown");
+            }
+            _ => panic!("expected retained unknown error outcome"),
+        }
     }
 }
