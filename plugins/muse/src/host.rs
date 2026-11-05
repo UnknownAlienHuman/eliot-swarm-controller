@@ -513,6 +513,14 @@ impl MusePlugin {
                     ),
                 )
                 .await;
+                if session.phase == SessionPhase::Unknown {
+                    let message = format!(
+                        "{}; owned session host cleanup is unconfirmed; no session/resume or input was sent",
+                        error.message
+                    );
+                    self.session = Some(session);
+                    return Err(error.with_code("unknown").with_message(message));
+                }
                 return Err(self.retain_failed_start(&params, error));
             }
             session.session_id = Some(subject.native_ref.clone());

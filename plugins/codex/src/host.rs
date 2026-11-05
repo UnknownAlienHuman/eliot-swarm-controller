@@ -719,31 +719,12 @@ impl CodexPlugin {
             Ok((effort, scope)) => (effort, scope),
             Err(error) => {
                 let error = discard_failed_start(&mut session, error).await;
-                if session.phase == SessionPhase::Unknown {
-                    self.session = Some(session);
-                    return Err(unconfirmed_pre_dispatch_error(
-                        error,
-                        "owned app-server cleanup is unconfirmed; no thread or input was sent",
-                    ));
-                }
-                // Residual unknown from any missed read path becomes deterministic
-                // after confirmed cleanup; no thread/resume/input was dispatched.
-                let error = if error.code == "unknown" {
-                    let message = format!(
-                        "Codex pre-dispatch metadata read failed before thread dispatch: {}",
-                        error.message
-                    );
-                    pre_dispatch_read_error(error, "profile_error", &message)
-                } else {
-                    error
-                };
-                self.failed_start = Some(FailedStart {
-                    agent_id: params.agent_id,
-                    generation: params.generation,
-                    command_id: params.command_id,
-                    error: error.clone(),
-                });
-                return Err(error);
+                return Err(self.settle_pre_dispatch_outcome(
+                    session,
+                    &params,
+                    error,
+                    "owned app-server cleanup is unconfirmed; no thread or input was sent",
+                ));
             }
         };
         session.selected_effort = selected_effort.clone();
@@ -759,13 +740,12 @@ impl CodexPlugin {
                     ),
                 )
                 .await;
-                self.failed_start = Some(FailedStart {
-                    agent_id: params.agent_id,
-                    generation: params.generation,
-                    command_id: params.command_id,
-                    error: error.clone(),
-                });
-                return Err(error);
+                return Err(self.settle_pre_dispatch_outcome(
+                    session,
+                    &params,
+                    error,
+                    "owned app-server cleanup is unconfirmed; no thread/resume or input was sent",
+                ));
             }
             session.thread_id = Some(subject.native_ref.clone());
             if let Err(error) = verify_resume_preflight(
@@ -782,20 +762,12 @@ impl CodexPlugin {
                 // Only prerequisite reads ran; native thread effects were not dispatched.
                 let error = pre_dispatch_read_error(error, "native_readback", &message);
                 let error = discard_failed_start(&mut session, error).await;
-                if session.phase == SessionPhase::Unknown {
-                    self.session = Some(session);
-                    return Err(unconfirmed_pre_dispatch_error(
-                        error,
-                        "owned app-server cleanup is unconfirmed; no thread/resume or input was sent",
-                    ));
-                }
-                self.failed_start = Some(FailedStart {
-                    agent_id: params.agent_id,
-                    generation: params.generation,
-                    command_id: params.command_id,
-                    error: error.clone(),
-                });
-                return Err(error);
+                return Err(self.settle_pre_dispatch_outcome(
+                    session,
+                    &params,
+                    error,
+                    "owned app-server cleanup is unconfirmed; no thread/resume or input was sent",
+                ));
             }
         }
 
@@ -1012,6 +984,45 @@ impl CodexPlugin {
         session.start_result = Some(result.clone());
         self.session = Some(session);
         Ok(result)
+    }
+
+    /// Settle a pre-effect start failure after `discard_failed_start`.
+    /// `session` is the owned post-discard session (phase Stopped or Unknown).
+    /// Unconfirmed cleanup retains the controller with unknown; confirmed
+    /// cleanup caches the deterministic error for exact replay (residual
+    /// unknown from a missed read path becomes deterministic profile_error).
+    /// No thread/resume/input was dispatched. Returns the error for `start`.
+    fn settle_pre_dispatch_outcome(
+        &mut self,
+        session: AgentSession,
+        params: &AgentStartParams,
+        error: Error,
+        unconfirmed_context: &str,
+    ) -> Error {
+        if session.phase == SessionPhase::Unknown {
+            let error = unconfirmed_pre_dispatch_error(error, unconfirmed_context);
+            self.session = Some(session);
+            error
+        } else {
+            // Residual unknown from any missed read path becomes deterministic
+            // after confirmed cleanup; callers classify their known reads beforehand.
+            let error = if error.code == "unknown" {
+                let message = format!(
+                    "Codex pre-dispatch metadata read failed before thread dispatch: {}",
+                    error.message
+                );
+                pre_dispatch_read_error(error, "profile_error", &message)
+            } else {
+                error
+            };
+            self.failed_start = Some(FailedStart {
+                agent_id: params.agent_id.clone(),
+                generation: params.generation,
+                command_id: params.command_id.clone(),
+                error: error.clone(),
+            });
+            error
+        }
     }
 
     async fn initialize_native(
@@ -2654,13 +2665,19 @@ fn codex_manifest() -> PluginManifest {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodexPlugin, CodexRoute, FailedStart, Initialized, NativeLaunch, codex_manifest,
-        contextual_error, frozen_store_binding, pre_dispatch_read_error, target_environment,
-        unconfirmed_pre_dispatch_error, validate_resume_preflight,
+        AgentSession, CodexPlugin, CodexRoute, FailedStart, Initialized, NativeLaunch,
+        NativeProcess, SessionPhase, codex_manifest, contextual_error, frozen_store_binding,
+        pre_dispatch_read_error, target_environment, unconfirmed_pre_dispatch_error,
+        validate_resume_preflight,
     };
     use eliot_core::{Error, SecretPolicy, StderrSnapshot, StderrSource};
+    use eliot_plugin::AgentStartParams;
     use serde_json::json;
-    use std::{ffi::OsString, path::PathBuf};
+    use std::{
+        collections::{HashMap, HashSet},
+        ffi::OsString,
+        path::PathBuf,
+    };
 
     #[test]
     fn store_metadata_policy_excludes_selector_names_not_colliding_credentials() {
@@ -3055,5 +3072,119 @@ mod tests {
             "Codex thread/start outcome is unresolved; it will not be repeated",
         );
         assert!(retry.message.contains("will not be repeated"));
+    }
+
+    #[tokio::test]
+    async fn scope_mismatch_unconfirmed_retains_session_for_unknown_replay() {
+        // Exercises the actual production retention boundary with a real
+        // Unknown-phase owned session. Phase Unknown simulates post-discard
+        // unconfirmed cleanup; forcing real terminate failure would require an
+        // unkillable child (forbidden). Starts with plugin.session=None so the
+        // test fails if the boundary does not retain.
+        // The writer task pends unwritten; settle and replay return before any
+        // peer use, spawn, or native call beyond the initial fixture spawn.
+        let peer = eliot_plugin::Peer::stdio();
+        let client = peer.client();
+        // Own test binary with --list as harmless already-exiting child; settle
+        // and replay perform zero native I/O so protocol state is irrelevant.
+        // No new env flags, foreign processes, or unkillable fixtures.
+        let launch = NativeLaunch {
+            program: std::env::current_exe().expect("test exe").into_os_string(),
+            args: [OsString::from("--list")].to_vec(),
+            cwd: std::env::current_dir().expect("cwd"),
+            environment: Vec::new(),
+        };
+        let mut native = NativeProcess::spawn(launch, SecretPolicy::new(Vec::<String>::new()))
+            .await
+            .expect("spawn fixture");
+        let frames = native.take_frames().expect("frames");
+        let stream = native.stream_state();
+        let native_client = native.client();
+        let events = crate::events::spawn(
+            frames,
+            stream,
+            native_client.clone(),
+            client.clone(),
+            crate::events::EventConfig {
+                credential: "test-cred".to_owned(),
+                agent_id: "a1".to_owned(),
+                generation: 1,
+                secrets: Vec::new(),
+            },
+        );
+        let session = AgentSession {
+            agent_id: "a1".to_owned(),
+            generation: 1,
+            start_command_id: "cmd-1".to_owned(),
+            start_result: None,
+            phase: SessionPhase::Unknown,
+            thread_id: None,
+            native_scope: String::new(),
+            requested_model: "test-model".to_owned(),
+            selected_effort: String::new(),
+            collaboration_mode: None,
+            secrets: Vec::new(),
+            native,
+            native_client,
+            events,
+            command_inputs: HashMap::new(),
+            command_turns: HashMap::new(),
+            unknown_commands: HashSet::new(),
+            rejected_commands: HashSet::new(),
+            control_commands: HashMap::new(),
+            stop_command_id: None,
+        };
+        let mut plugin = CodexPlugin::default();
+        assert!(plugin.session.is_none());
+        assert!(plugin.failed_start.is_none());
+        let start_params = AgentStartParams::new("a1", 1, "cmd-1");
+        let scope_error = Error::new(
+            "profile_error",
+            "Codex resume subject is outside the authenticated native scope",
+        );
+        // Production boundary used by the scope-mismatch caller: must retain
+        // the controller and return unknown for unconfirmed cleanup.
+        let settled = plugin.settle_pre_dispatch_outcome(
+            session,
+            &start_params,
+            scope_error,
+            "owned app-server cleanup is unconfirmed; no thread/resume or input was sent",
+        );
+        assert_eq!(settled.code, "unknown");
+        assert!(settled.message.contains("cleanup is unconfirmed"));
+        assert!(settled.message.contains("no thread/resume"));
+        assert!(plugin.session.is_some(), "controller retained");
+        assert!(
+            plugin
+                .session
+                .as_ref()
+                .is_some_and(|s| s.phase == SessionPhase::Unknown),
+            "unconfirmed custody stays Unknown"
+        );
+        assert!(
+            plugin.failed_start.is_none(),
+            "unconfirmed never caches failed_start"
+        );
+        assert!(
+            plugin
+                .session
+                .as_ref()
+                .is_some_and(|s| s.thread_id.is_none())
+        );
+        // Same-start replay from the retained controller with zero new native
+        // I/O: no initialized state installed, fixed retention message proves
+        // no new spawn, native call, or peer use.
+        let params = json!({"agent_id": "a1", "generation": 1, "command_id": "cmd-1"});
+        let replayed = plugin
+            .start(&params, &client)
+            .await
+            .expect_err("Unknown session replays unknown");
+        assert_eq!(replayed.code, "unknown");
+        assert!(replayed.message.contains("will not be repeated"));
+        assert!(
+            plugin.session.is_some(),
+            "controller still retained after replay"
+        );
+        assert!(plugin.failed_start.is_none());
     }
 }
