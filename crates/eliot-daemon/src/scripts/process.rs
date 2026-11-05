@@ -1348,6 +1348,18 @@ mod tests {
             return;
         };
         match mode.as_str() {
+            "goal-nonzero" | "goal-pass" => {
+                let input = io::read_to_string(io::stdin()).expect("read Goal round context");
+                let context: serde_json::Value =
+                    serde_json::from_str(&input).expect("Goal round context JSON");
+                assert!(context["agent"].is_string());
+                assert!(context["generation"].is_i64());
+                assert!(context["revision"].is_i64());
+                assert!(context["round_key"].is_string());
+                println!("fixture-goal-check:{input}");
+                io::stdout().flush().expect("flush Goal check stdout");
+                std::process::exit(if mode == "goal-nonzero" { 7 } else { 0 });
+            }
             "complete" => {
                 io::stdout()
                     .write_all(b"fixture-output")

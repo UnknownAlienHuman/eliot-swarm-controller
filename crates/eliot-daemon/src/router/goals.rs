@@ -792,7 +792,11 @@ async fn drive_goal_for_event(
 /// nothing.
 fn goal_check_result(outcome: ProcessOutcome, policy: &SecretPolicy) -> Result<GoalCheckResult> {
     match outcome {
-        ProcessOutcome::Completed(capture) => {
+        ProcessOutcome::Completed(capture)
+        | ProcessOutcome::Failed {
+            reason: ProcessFailure::Exit,
+            capture: Some(capture),
+        } => {
             if !custody_proven_for_capture(&capture) {
                 return Err(Error::new("unknown", "goal check custody is unproven"));
             }
@@ -999,8 +1003,8 @@ mod tests {
         crate::platform::CustodyGuarantee::Exact
     }
 
-    fn completed_outcome(code: i32, stdout: &[u8], complete: bool) -> ProcessOutcome {
-        ProcessOutcome::Completed(ProcessCapture {
+    fn check_capture(code: i32, stdout: &[u8], complete: bool) -> ProcessCapture {
+        ProcessCapture {
             stdout: stdout.to_vec(),
             stdout_complete: complete,
             stderr: StderrSnapshot {
@@ -1011,7 +1015,61 @@ mod tests {
             },
             status: exit_status(code),
             custody: goal_test_custody(),
-        })
+        }
+    }
+
+    fn completed_outcome(code: i32, stdout: &[u8], complete: bool) -> ProcessOutcome {
+        ProcessOutcome::Completed(check_capture(code, stdout, complete))
+    }
+
+    fn failed_exit_outcome(code: i32, stdout: &[u8], complete: bool) -> ProcessOutcome {
+        ProcessOutcome::Failed {
+            reason: ProcessFailure::Exit,
+            capture: Some(check_capture(code, stdout, complete)),
+        }
+    }
+
+    fn owned_check_definition(text: &str) -> Value {
+        let mut value = definition(text);
+        value["check"] = json!([
+            std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "--exact",
+            "scripts::process::tests::process_fixture",
+            "--nocapture",
+        ]);
+        value["check_cwd"] = json!(
+            std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+        value["check_timeout_ms"] = json!(5_000);
+        value
+    }
+
+    fn owned_failing_runner(
+        mut command: TokioCommand,
+        stdin: Vec<u8>,
+        timeout: Duration,
+        policy: Arc<SecretPolicy>,
+        cancellation: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>> {
+        command.env("ELIOT_PROCESS_TEST_FIXTURE", "goal-nonzero");
+        real_goal_check(command, stdin, timeout, policy, cancellation)
+    }
+
+    fn owned_passing_runner(
+        mut command: TokioCommand,
+        stdin: Vec<u8>,
+        timeout: Duration,
+        policy: Arc<SecretPolicy>,
+        cancellation: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>> {
+        command.env("ELIOT_PROCESS_TEST_FIXTURE", "goal-pass");
+        real_goal_check(command, stdin, timeout, policy, cancellation)
     }
 
     macro_rules! canned_runner {
@@ -1029,7 +1087,18 @@ mod tests {
     }
 
     canned_runner!(passing_runner, completed_outcome(0, b"all green", true));
-    canned_runner!(failing_runner, completed_outcome(1, b"red", true));
+    canned_runner!(failing_runner, failed_exit_outcome(1, b"red", true));
+    canned_runner!(
+        incomplete_failing_runner,
+        failed_exit_outcome(1, b"red", false)
+    );
+    canned_runner!(
+        missing_capture_runner,
+        ProcessOutcome::Failed {
+            reason: ProcessFailure::Exit,
+            capture: None,
+        }
+    );
     canned_runner!(
         unknown_runner,
         ProcessOutcome::Unknown {
@@ -1038,10 +1107,33 @@ mod tests {
         }
     );
     canned_runner!(
+        custody_unknown_runner,
+        ProcessOutcome::Unknown {
+            reason: crate::scripts::process::ProcessUncertainty::Custody,
+            quiescent: false,
+        }
+    );
+    #[cfg(unix)]
+    canned_runner!(unproven_capture_runner, {
+        let mut capture = check_capture(1, b"red", true);
+        capture.custody = crate::platform::CustodyGuarantee::Unknown;
+        ProcessOutcome::Failed {
+            reason: ProcessFailure::Exit,
+            capture: Some(capture),
+        }
+    });
+    canned_runner!(
         timeout_runner,
         ProcessOutcome::Failed {
             reason: crate::scripts::process::ProcessFailure::Timeout,
             capture: None,
+        }
+    );
+    canned_runner!(
+        timeout_capture_runner,
+        ProcessOutcome::Failed {
+            reason: ProcessFailure::Timeout,
+            capture: Some(check_capture(0, b"output before timeout", true)),
         }
     );
     canned_runner!(
@@ -1257,43 +1349,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_round_completes_on_a_passing_check() {
+    async fn goal_round_owned_passing_check_completes_without_send() {
         let router = router();
         let agent = ready_agent(&router, "goal-pass").await;
-        set_goal(&router, &agent, definition("keep green")).await;
+        set_goal(&router, &agent, owned_check_definition("keep green")).await;
         let key = high_water(&router).await;
+        let id = ulid::Ulid::new().to_string();
         let response = router
             .goal_round_with(
-                &json!({"id":ulid::Ulid::new().to_string(),"agent":agent,
+                &json!({"id":id,"agent":agent,
                     "mode":"eliot","idle_seq":key}),
                 &Principal::Owner,
-                passing_runner,
+                owned_passing_runner,
             )
             .await
             .unwrap();
         assert_eq!(response["outcome"], "completed");
         assert_eq!(response["view"]["status"], "completed");
+        assert_eq!(response["view"]["generation"], 1);
+        assert_eq!(response["view"]["revision"], 2);
         assert_eq!(response["view"]["counters"]["rounds"], 1);
+        assert_eq!(response["view"]["counters"]["last_exit_code"], 0);
         assert_eq!(response["view"]["last_round_key"], format!("idle:{key}"));
+        assert!(response["continuation"].is_null());
+        assert!(response["command_id"].is_null());
+        let observation = response["view"]["counters"]["last_observation"]
+            .as_str()
+            .unwrap();
+        assert!(observation.contains("fixture-goal-check:"));
+        assert!(observation.contains(&format!("\"round_key\":\"idle:{key}\"")));
+        assert!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .get_command(&id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
-    async fn goal_round_continues_with_one_ordinary_send() {
+    async fn goal_round_owned_nonzero_check_admits_one_bound_send() {
         let router = router();
         let agent = ready_agent(&router, "goal-continue").await;
-        set_goal(&router, &agent, definition("keep green")).await;
+        set_goal(&router, &agent, owned_check_definition("keep green")).await;
         let key = high_water(&router).await;
         let id = ulid::Ulid::new().to_string();
         let response = router
             .goal_round_with(
                 &json!({"id":id,"agent":agent,"mode":"eliot","idle_seq":key}),
                 &Principal::Owner,
-                failing_runner,
+                owned_failing_runner,
             )
             .await
             .unwrap();
         assert_eq!(response["outcome"], "continued");
+        assert_eq!(response["command_id"], id);
         assert_eq!(response["continuation"]["command_id"], id);
+        assert_eq!(response["view"]["generation"], 1);
+        assert_eq!(response["view"]["revision"], 2);
+        assert_eq!(response["view"]["counters"]["rounds"], 1);
+        assert_eq!(response["view"]["counters"]["last_exit_code"], 7);
+        assert_eq!(response["view"]["last_round_key"], format!("idle:{key}"));
+        assert!(response["view"]["round_marker"].is_null());
         let send = router
             .inner
             .store
@@ -1304,8 +1424,16 @@ mod tests {
             .unwrap();
         assert_eq!(send.verb, "send");
         assert_eq!(send.target.as_deref(), Some(agent.as_str()));
+        assert_eq!(send.expected_generation, Some(1));
+        assert_eq!(send.generation, Some(1));
         assert!(send.args["text"].as_str().unwrap().contains("keep green"));
-        assert!(send.args["text"].as_str().unwrap().contains("red"));
+        let text = send.args["text"].as_str().unwrap();
+        assert!(text.contains("fixture-goal-check:"));
+        assert!(text.contains(&format!("\"agent\":\"{agent}\"")));
+        assert!(text.contains("\"generation\":1"));
+        assert!(text.contains("\"revision\":1"));
+        assert!(text.contains(&format!("\"round_key\":\"idle:{key}\"")));
+        assert!(text.contains("exit 7"));
     }
 
     #[tokio::test]
@@ -1436,21 +1564,45 @@ mod tests {
         let router = router();
         // Each unknown outcome burns its round key, so each runner gets a
         // fresh Agent and Goal.
-        for (project, runner, code) in [
+        let cases = [
             ("goal-unknown", unknown_runner as GoalCheckRunner, "unknown"),
+            (
+                "goal-custody",
+                custody_unknown_runner as GoalCheckRunner,
+                "unknown",
+            ),
+            (
+                "goal-missing-capture",
+                missing_capture_runner as GoalCheckRunner,
+                "unknown",
+            ),
             ("goal-timeout", timeout_runner as GoalCheckRunner, "unknown"),
+            (
+                "goal-timeout-capture",
+                timeout_capture_runner as GoalCheckRunner,
+                "unknown",
+            ),
             (
                 "goal-cancelled",
                 cancelled_runner as GoalCheckRunner,
                 "unavailable",
             ),
-        ] {
+        ]
+        .into_iter();
+        #[cfg(unix)]
+        let cases = cases.chain(std::iter::once((
+            "goal-unproven-capture",
+            unproven_capture_runner as GoalCheckRunner,
+            "unknown",
+        )));
+        for (project, runner, code) in cases {
             let agent = ready_agent(&router, project).await;
             set_goal(&router, &agent, definition("keep green")).await;
             let key = high_water(&router).await;
+            let id = ulid::Ulid::new().to_string();
             let error = router
                 .goal_round_with(
-                    &json!({"id":ulid::Ulid::new().to_string(),"agent":agent,
+                    &json!({"id":id,"agent":agent,
                         "mode":"eliot","idle_seq":key}),
                     &Principal::Owner,
                     runner,
@@ -1458,6 +1610,16 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.code, code);
+            assert!(
+                router
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .get_command(&id)
+                    .unwrap()
+                    .is_none()
+            );
             let view = router
                 .inner
                 .store
@@ -1500,23 +1662,27 @@ mod tests {
             _: watch::Receiver<bool>,
         ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>> {
             Box::pin(async {
-                ProcessOutcome::Completed(ProcessCapture {
-                    stdout: b"partial".to_vec(),
-                    stdout_complete: true,
-                    stderr: StderrSnapshot {
-                        text: String::new(),
-                        truncated: false,
-                        eof: true,
-                        read_error: false,
-                    },
-                    status: std::process::ExitStatus::from_raw(9),
-                    custody: crate::platform::CustodyGuarantee::Degraded,
-                })
+                ProcessOutcome::Failed {
+                    reason: ProcessFailure::Exit,
+                    capture: Some(ProcessCapture {
+                        stdout: b"partial".to_vec(),
+                        stdout_complete: true,
+                        stderr: StderrSnapshot {
+                            text: String::new(),
+                            truncated: false,
+                            eof: true,
+                            read_error: false,
+                        },
+                        status: std::process::ExitStatus::from_raw(9),
+                        custody: crate::platform::CustodyGuarantee::Degraded,
+                    }),
+                }
             })
         }
+        let id = ulid::Ulid::new().to_string();
         let error = router
             .goal_round_with(
-                &json!({"id":ulid::Ulid::new().to_string(),"agent":agent,
+                &json!({"id":id,"agent":agent,
                     "mode":"eliot","idle_seq":key}),
                 &Principal::Owner,
                 signal_runner,
@@ -1524,6 +1690,16 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, "unknown");
+        assert!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .get_command(&id)
+                .unwrap()
+                .is_none()
+        );
         let view = router
             .inner
             .store
@@ -2201,6 +2377,51 @@ mod tests {
             .goal_round_probe(&agent, "eliot", GoalRoundKey::Idle(key), now_ms())
             .unwrap_err();
         assert_eq!(error.code, "stale_round");
+    }
+
+    #[tokio::test]
+    async fn goal_round_incomplete_failed_check_does_not_prove_no_progress() {
+        let router = router();
+        let agent = ready_agent(&router, "goal-incomplete-progress").await;
+        set_goal(
+            &router,
+            &agent,
+            json!({
+                "text": "keep green",
+                "check": ["check-goal"],
+                "max_rounds": 6,
+                "max_without_progress": 1,
+            }),
+        )
+        .await;
+        let key = high_water(&router).await;
+        let first_id = ulid::Ulid::new().to_string();
+        let first = router
+            .goal_round_with(
+                &json!({"id":first_id,"agent":agent,"mode":"eliot","idle_seq":key}),
+                &Principal::Owner,
+                failing_runner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first["outcome"], "continued");
+        complete_send(&router, &agent, &first_id, "turn-incomplete-progress").await;
+        let key = high_water(&router).await;
+        let second_id = ulid::Ulid::new().to_string();
+        let second = router
+            .goal_round_with(
+                &json!({"id":second_id,"agent":agent,"mode":"eliot","idle_seq":key}),
+                &Principal::Owner,
+                incomplete_failing_runner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second["outcome"], "continued");
+        assert_eq!(second["continuation"]["command_id"], second_id);
+        assert_eq!(second["view"]["status"], "active");
+        assert_eq!(second["view"]["counters"]["rounds"], 2);
+        assert_eq!(second["view"]["counters"]["consecutive_same_output"], 0);
+        assert_eq!(second["view"]["last_round_key"], format!("idle:{key}"));
     }
 
     #[tokio::test]
