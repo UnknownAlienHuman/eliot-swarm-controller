@@ -211,7 +211,7 @@ impl FakeCodex {
                 self.reply(
                     stdout,
                     id,
-                    json!({"turn": {"id": "turn-p1", "status": "inProgress"}}),
+                    json!({"turn": {"id": "turn-p1", "items": [], "status": "inProgress"}}),
                 );
                 stdout.flush().expect("flush turn/start reply");
                 self.run_scenario_wire(stdout);
@@ -235,7 +235,7 @@ impl FakeCodex {
             "turn/started",
             json!({
                 "threadId": "th-parent",
-                "turn": {"id": "turn-p1", "status": "inProgress"},
+                "turn": {"id": "turn-p1", "items": [], "status": "inProgress"},
             }),
         );
         self.emit(
@@ -244,11 +244,15 @@ impl FakeCodex {
             json!({
                 "threadId": "th-parent",
                 "turnId": "turn-p1",
+                "startedAtMs": 1_000,
                 "item": {
                     "type": "collabAgentToolCall",
                     "id": "spawn-c1",
                     "tool": "spawnAgent",
                     "status": "inProgress",
+                    "senderThreadId": "th-parent",
+                    "receiverThreadIds": [],
+                    "agentsStates": {},
                 },
             }),
         );
@@ -257,7 +261,7 @@ impl FakeCodex {
             "turn/started",
             json!({
                 "threadId": "th-child-1",
-                "turn": {"id": "turn-c1", "status": "inProgress"},
+                "turn": {"id": "turn-c1", "items": [], "status": "inProgress"},
             }),
         );
     }
@@ -269,12 +273,15 @@ impl FakeCodex {
             json!({
                 "threadId": "th-parent",
                 "turnId": "turn-p1",
+                "completedAtMs": 1_000,
                 "item": {
                     "type": "collabAgentToolCall",
                     "id": "spawn-c1",
                     "tool": "spawnAgent",
                     "status": "completed",
+                    "senderThreadId": "th-parent",
                     "receiverThreadIds": ["th-child-1"],
+                    "agentsStates": {},
                 },
             }),
         );
@@ -285,7 +292,6 @@ impl FakeCodex {
                     "subAgent": {
                         "thread_spawn": {
                             "parent_thread_id": "th-parent",
-                            "call_id": "spawn-c1",
                             "depth": 1,
                         }
                     }
@@ -301,11 +307,15 @@ impl FakeCodex {
             json!({
                 "threadId": "th-child-1",
                 "turnId": "turn-c1",
+                "startedAtMs": 1_000,
                 "item": {
                     "type": "collabAgentToolCall",
                     "id": "spawn-nested",
                     "tool": "spawnAgent",
                     "status": "inProgress",
+                    "senderThreadId": "th-child-1",
+                    "receiverThreadIds": [],
+                    "agentsStates": {},
                 },
             }),
         );
@@ -319,7 +329,6 @@ impl FakeCodex {
                         "subAgent": {
                             "thread_spawn": {
                                 "parent_thread_id": "th-child-1",
-                                "call_id": "spawn-nested",
                                 "depth": 2,
                             }
                         }
@@ -333,12 +342,15 @@ impl FakeCodex {
             json!({
                 "threadId": "th-child-1",
                 "turnId": "turn-c1",
+                "completedAtMs": 1_000,
                 "item": {
                     "type": "collabAgentToolCall",
                     "id": "spawn-nested",
                     "tool": "spawnAgent",
                     "status": "completed",
+                    "senderThreadId": "th-child-1",
                     "receiverThreadIds": ["th-child-nested"],
+                    "agentsStates": {},
                 },
             }),
         );
@@ -347,7 +359,7 @@ impl FakeCodex {
             "turn/started",
             json!({
                 "threadId": "th-child-nested",
-                "turn": {"id": "turn-nested-1", "status": "inProgress"},
+                "turn": {"id": "turn-nested-1", "items": [], "status": "inProgress"},
             }),
         );
     }
@@ -359,11 +371,15 @@ impl FakeCodex {
             json!({
                 "threadId": "th-parent",
                 "turnId": "turn-p1",
+                "startedAtMs": 1_000,
                 "item": {
                     "type": "collabAgentToolCall",
                     "id": "spawn-c2",
                     "tool": "spawnAgent",
                     "status": "inProgress",
+                    "senderThreadId": "th-parent",
+                    "receiverThreadIds": [],
+                    "agentsStates": {},
                 },
             }),
         );
@@ -373,12 +389,15 @@ impl FakeCodex {
             json!({
                 "threadId": "th-parent",
                 "turnId": "turn-p1",
+                "completedAtMs": 1_000,
                 "item": {
                     "type": "collabAgentToolCall",
                     "id": "spawn-c2",
                     "tool": "spawnAgent",
                     "status": "completed",
+                    "senderThreadId": "th-parent",
                     "receiverThreadIds": ["th-child-2"],
+                    "agentsStates": {},
                 },
             }),
         );
@@ -392,7 +411,6 @@ impl FakeCodex {
                         "subAgent": {
                             "thread_spawn": {
                                 "parent_thread_id": "th-parent",
-                                "call_id": "spawn-c2",
                                 "depth": 1,
                             }
                         }
@@ -410,7 +428,6 @@ impl FakeCodex {
                         "subAgent": {
                             "thread_spawn": {
                                 "parent_thread_id": "th-unknown-parent",
-                                "call_id": "spawn-conflict",
                                 "depth": 1,
                             }
                         }
@@ -425,7 +442,12 @@ impl FakeCodex {
             stdout,
             &json!(888),
             "item/commandExecution/requestApproval",
-            json!({"threadId": "th-child-1", "turnId": "turn-c1"}),
+            json!({
+                "threadId": "th-child-1",
+                "turnId": "turn-c1",
+                "itemId": "cmd-c1",
+                "startedAtMs": 1_000,
+            }),
         );
         stdout.flush().expect("flush child request 888");
 
@@ -435,6 +457,7 @@ impl FakeCodex {
             json!({
                 "threadId": "th-parent",
                 "turnId": "turn-p1",
+                "completedAtMs": 1_000,
                 "item": {
                     "type": "agentMessage",
                     "id": "msg-p1",
@@ -445,7 +468,10 @@ impl FakeCodex {
         self.emit(
             stdout,
             "turn/completed",
-            json!({"threadId": "th-parent", "turn": {"id": "turn-p1", "status": "completed"}}),
+            json!({
+                "threadId": "th-parent",
+                "turn": {"id": "turn-p1", "items": [], "status": "completed"},
+            }),
         );
         stdout.flush().expect("flush parent completion");
 
@@ -456,6 +482,7 @@ impl FakeCodex {
             json!({
                 "threadId": "th-child-1",
                 "turnId": "turn-c1",
+                "completedAtMs": 1_000,
                 "item": {
                     "type": "agentMessage",
                     "id": "msg-c1",
@@ -466,7 +493,10 @@ impl FakeCodex {
         self.emit(
             stdout,
             "turn/completed",
-            json!({"threadId": "th-child-1", "turn": {"id": "turn-c1", "status": "completed"}}),
+            json!({
+                "threadId": "th-child-1",
+                "turn": {"id": "turn-c1", "items": [], "status": "completed"},
+            }),
         );
         self.emit(
             stdout,
@@ -474,6 +504,7 @@ impl FakeCodex {
             json!({
                 "threadId": "th-child-nested",
                 "turnId": "turn-nested-1",
+                "completedAtMs": 1_000,
                 "item": {
                     "type": "agentMessage",
                     "id": "msg-nested-1",
@@ -484,7 +515,10 @@ impl FakeCodex {
         self.emit(
             stdout,
             "turn/completed",
-            json!({"threadId": "th-child-nested", "turn": {"id": "turn-nested-1", "status": "completed"}}),
+            json!({
+                "threadId": "th-child-nested",
+                "turn": {"id": "turn-nested-1", "items": [], "status": "completed"},
+            }),
         );
         stdout.flush().expect("flush child completions");
     }

@@ -174,7 +174,7 @@ mod tests {
         let decoded: ChildRegistration =
             serde_json::from_value(params["registration"].clone()).expect("decode");
         assert_eq!(decoded, reg);
-        let value: Value = serde_json::to_value(&test_ack(&reg)).expect("ack encode");
+        let value: Value = serde_json::to_value(test_ack(&reg)).expect("ack encode");
         let round: ChildRegistrationAck = serde_json::from_value(value).expect("ack decode");
         reg.validate_ack(&round).expect("round trip");
     }

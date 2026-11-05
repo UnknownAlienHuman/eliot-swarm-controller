@@ -1,7 +1,7 @@
 use crate::native_child::{
     ChildBinding, binding_from_ack, build_registration, is_admission_rejection, register_child,
 };
-use eliot_core::{Error, ProviderRestriction, Result, SecretPolicy};
+use eliot_core::{ChildRegistration, Error, ProviderRestriction, Result, SecretPolicy};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     protocol::MAX_COMMAND_ID_BYTES,
@@ -178,6 +178,7 @@ struct EventProcessor {
     child_buffer_bytes: usize,
     child_unknown: HashSet<String>,
     child_early_lost: HashSet<String>,
+    child_pending: HashMap<String, ChildRegistration>,
     children: ChildThreads,
 }
 
@@ -329,9 +330,9 @@ impl ChildThreads {
     ) -> std::result::Result<(), &'static str> {
         self.pending_spawns.remove(item_id);
         for receiver in receivers {
+            self.confirm(owned, receiver)?;
             self.spawn_items
                 .insert(receiver.clone(), item_id.to_owned());
-            self.confirm(owned, receiver)?;
         }
         if self.pending_spawns.is_empty() {
             return self.settle();
@@ -352,6 +353,10 @@ impl ChildThreads {
 
     fn is_bound(&self, thread: &str) -> bool {
         self.bound.contains(thread)
+    }
+
+    fn is_unconfirmed(&self, thread: &str) -> bool {
+        self.unconfirmed.contains(thread)
     }
 
     fn parent_of(&self, thread: &str) -> Option<String> {
@@ -500,6 +505,7 @@ impl EventProcessor {
             child_buffer_bytes: 0,
             child_unknown: HashSet::new(),
             child_early_lost: HashSet::new(),
+            child_pending: HashMap::new(),
             children: ChildThreads::default(),
         }
     }
@@ -644,9 +650,7 @@ impl EventProcessor {
                 if !self.planned_stop && self.loss_reason.is_none() {
                     self.defer_gap("Codex native event reader closed");
                 }
-                if let Err(reason) = self.children.settle() {
-                    self.defer_gap(reason);
-                }
+                self.settle_child_tracking();
                 self.report_gap_if_queue_empty(true).await;
                 self.finish_pending_end_stop().await;
             }
@@ -666,6 +670,26 @@ impl EventProcessor {
             && let Some(reason) = self.loss_reason
         {
             let _ = self.record_gap(reason).await;
+        }
+    }
+
+    fn settle_child_tracking(&mut self) {
+        if let Err(reason) = self.children.settle() {
+            self.defer_gap(reason);
+        }
+        self.collect_orphan_child_state();
+        if !self.child_pending.is_empty() {
+            self.defer_gap("Codex child registration acknowledgement is unresolved");
+            let abandoned: Vec<String> = self.child_pending.keys().cloned().collect();
+            for id in abandoned {
+                self.child_pending.remove(&id);
+                self.release_child_buffer(&id);
+                self.child_early_lost.remove(&id);
+                if self.children.is_bound(&id) && self.child_unknown.len() < MAX_CHILD_THREADS {
+                    self.child_unknown.insert(id);
+                }
+            }
+            self.collect_orphan_child_state();
         }
     }
 
@@ -702,38 +726,52 @@ impl EventProcessor {
         let Some(owned) = self.status.thread_id.clone() else {
             return Ok(());
         };
-        let outcome = if completed {
-            for receiver in &receivers {
+        if !completed {
+            return match self.children.spawn_started(item_id) {
+                Ok(()) => Ok(()),
+                Err(reason) => self.record_gap(reason).await,
+            };
+        }
+        let outcome = self.children.spawn_completed(&owned, &item_id, &receivers);
+        for receiver in &receivers {
+            if self.children.is_bound(receiver) {
                 self.children
                     .parents
                     .insert(receiver.clone(), owned.clone());
-                self.children
-                    .spawn_items
-                    .insert(receiver.clone(), item_id.clone());
             }
-            self.children.spawn_completed(&owned, &item_id, &receivers)
-        } else {
-            self.children.spawn_started(item_id)
-        };
-        match outcome {
-            Ok(()) => {
-                if completed {
-                    let mut first_error = None;
-                    for receiver in receivers {
-                        if let Err(error) = self.ensure_child_registered(&receiver).await
-                            && first_error.is_none()
-                        {
-                            first_error = Some(error);
-                        }
-                    }
-                    if let Some(error) = first_error {
-                        return Err(error);
-                    }
-                }
-                Ok(())
-            }
-            Err(reason) => self.record_gap(reason).await,
         }
+        self.collect_orphan_child_state();
+        match outcome {
+            Ok(()) => self.ensure_receivers_registered(&receivers).await,
+            Err(reason) => {
+                let confirmed: Vec<String> = receivers
+                    .iter()
+                    .filter(|receiver| self.children.is_bound(receiver))
+                    .cloned()
+                    .collect();
+                let ensure_error = self.ensure_receivers_registered(&confirmed).await.err();
+                let gap_result = self.record_gap(reason).await;
+                if let Some(error) = ensure_error {
+                    return Err(error);
+                }
+                gap_result
+            }
+        }
+    }
+
+    async fn ensure_receivers_registered(&mut self, receivers: &[String]) -> Result<()> {
+        let mut first_error = None;
+        for receiver in receivers {
+            if let Err(error) = self.ensure_child_registered(receiver).await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// A child request stays unsupported; it is never forwarded to control.
@@ -1510,9 +1548,7 @@ impl EventProcessor {
                 .record_gap("Codex terminal notification did not match the exact active turn")
                 .await;
         }
-        if let Err(reason) = self.children.settle() {
-            self.defer_gap(reason);
-        }
+        self.settle_child_tracking();
         if notification.turn.status == NativeTurnStatus::InProgress {
             return self
                 .record_gap("Codex turn/completed carried a nonterminal inProgress status")
@@ -1590,23 +1626,26 @@ impl EventProcessor {
         {
             let parent = params.get("thread").and_then(spawned_parent_thread);
             if parent.is_some_and(|parent| self.children.is_parent(&owned, parent)) {
-                let parent = parent.unwrap();
-                self.children
-                    .parents
-                    .insert(thread_id.to_owned(), parent.to_owned());
-                if let Some(spawn_item) = params.get("thread").and_then(spawned_item_id) {
-                    self.children
-                        .spawn_items
-                        .insert(thread_id.to_owned(), spawn_item.to_owned());
-                } else if self.children.pending_spawns.len() == 1 {
-                    if let Some(spawn_item) = self.children.pending_spawns.iter().next().cloned() {
-                        self.children
-                            .spawn_items
-                            .insert(thread_id.to_owned(), spawn_item);
-                    }
-                }
+                let parent = parent.unwrap().to_owned();
+                let spawn_item = params
+                    .get("thread")
+                    .and_then(spawned_item_id)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        if self.children.pending_spawns.len() == 1 {
+                            self.children.pending_spawns.iter().next().cloned()
+                        } else {
+                            None
+                        }
+                    });
                 if let Err(reason) = self.children.confirm(&owned, thread_id) {
                     return self.record_gap(reason).await;
+                }
+                self.children.parents.insert(thread_id.to_owned(), parent);
+                if let Some(spawn_item) = spawn_item {
+                    self.children
+                        .spawn_items
+                        .insert(thread_id.to_owned(), spawn_item);
                 }
                 return self.ensure_child_registered(thread_id).await;
             }
@@ -1693,8 +1732,11 @@ impl EventProcessor {
                             .record_gap(&mut self.sink, &self.host, &self.credential, &reason)
                             .await;
                     }
+                } else if self.child_pending.contains_key(&child_thread) {
+                    // Uncertain ACK retained for idempotent retry; no tombstone, no gap yet.
+                } else if self.child_unknown.contains(&child_thread) {
+                    // Known terminal rejection already gapped; no duplicate gap.
                 } else {
-                    self.child_unknown.insert(child_thread);
                     let reason = format!(
                         "Codex child thread/started could not be normalized ({})",
                         error.code
@@ -1702,6 +1744,14 @@ impl EventProcessor {
                     let _ = self.record_gap(&reason).await;
                 }
             }
+            return;
+        }
+        if !self.child_states.contains_key(&child_thread)
+            && !self.children.is_bound(&child_thread)
+            && !self.children.is_unconfirmed(&child_thread)
+            && !self.child_pending.contains_key(&child_thread)
+            && !self.child_unknown.contains(&child_thread)
+        {
             return;
         }
         let committed = self
@@ -1716,6 +1766,11 @@ impl EventProcessor {
             .get(&child_thread)
             .is_some_and(|state| state.ready_committed);
         if !is_ready {
+            if let Some(state) = self.child_states.get(&child_thread)
+                && state.writes_blocked
+            {
+                return;
+            }
             self.buffer_child_frame(
                 &child_thread,
                 BufferedNativeFrame::Notification {
@@ -1728,26 +1783,37 @@ impl EventProcessor {
         if let Err(error) = self
             .process_child_notification(&child_thread, method, params)
             .await
+            && let Some(state) = self.child_states.get_mut(&child_thread)
         {
-            if let Some(state) = self.child_states.get_mut(&child_thread) {
-                state.source_unknown = true;
-                if state.failure.is_none() {
-                    state.failure = Some(error.message);
-                }
-                if !state.gap_reported && !state.writes_blocked {
-                    let reason = format!(
-                        "Codex child {method} notification could not be normalized ({})",
-                        error.code
-                    );
-                    let _ = state
-                        .record_gap(&mut self.sink, &self.host, &self.credential, &reason)
-                        .await;
-                }
+            state.source_unknown = true;
+            if state.failure.is_none() {
+                state.failure = Some(error.message);
+            }
+            if !state.gap_reported && !state.writes_blocked {
+                let reason = format!(
+                    "Codex child {method} notification could not be normalized ({})",
+                    error.code
+                );
+                let _ = state
+                    .record_gap(&mut self.sink, &self.host, &self.credential, &reason)
+                    .await;
             }
         }
     }
 
     fn buffer_child_frame(&mut self, child_thread: &str, frame: BufferedNativeFrame) {
+        if !self.child_buffers.contains_key(child_thread)
+            && self.child_buffers.len() >= MAX_CHILD_THREADS
+        {
+            self.collect_orphan_child_state();
+            let proven = self.children.is_bound(child_thread)
+                || self.child_states.contains_key(child_thread)
+                || self.child_pending.contains_key(child_thread);
+            if !proven && self.child_buffers.len() >= MAX_CHILD_THREADS {
+                self.defer_gap("Codex child observation exceeded its bound");
+                return;
+            }
+        }
         let size = child_frame_size(&frame);
         let queue = self
             .child_buffers
@@ -1759,11 +1825,53 @@ impl EventProcessor {
             let discarded: usize = queue.iter().map(child_frame_size).sum();
             queue.clear();
             self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(discarded);
-            self.child_early_lost.insert(child_thread.to_owned());
+            let trackable = self.children.is_bound(child_thread)
+                || self.children.is_unconfirmed(child_thread)
+                || self.child_states.contains_key(child_thread)
+                || self.child_pending.contains_key(child_thread);
+            if trackable {
+                self.child_early_lost.insert(child_thread.to_owned());
+            } else {
+                self.defer_gap("Codex child observation exceeded its bound");
+            }
             return;
         }
         self.child_buffer_bytes = self.child_buffer_bytes.saturating_add(size);
         queue.push_back(frame);
+    }
+
+    fn collect_orphan_child_state(&mut self) {
+        let orphans: Vec<String> = self
+            .child_buffers
+            .keys()
+            .chain(self.child_early_lost.iter())
+            .chain(self.child_unknown.iter())
+            .chain(self.child_pending.keys())
+            .filter(|id| {
+                !self.child_states.contains_key(id.as_str())
+                    && !self.children.is_bound(id)
+                    && !self.children.is_unconfirmed(id)
+                    && !self.child_pending.contains_key(id.as_str())
+            })
+            .cloned()
+            .collect();
+        for id in orphans {
+            if self.child_states.contains_key(&id)
+                || self.children.is_bound(&id)
+                || self.children.is_unconfirmed(&id)
+                || self.child_pending.contains_key(&id)
+            {
+                continue;
+            }
+            if let Some(queue) = self.child_buffers.remove(&id) {
+                let discarded: usize = queue.iter().map(child_frame_size).sum();
+                self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(discarded);
+            }
+            self.child_early_lost.remove(&id);
+            if !self.children.is_bound(&id) {
+                self.child_unknown.remove(&id);
+            }
+        }
     }
 
     async fn ensure_child_registered(&mut self, child_thread: &str) -> Result<()> {
@@ -1771,8 +1879,30 @@ impl EventProcessor {
             return Ok(());
         }
         if self.child_unknown.contains(child_thread) {
-            return Ok(());
+            return Err(Error::new(
+                "not_allowed",
+                "Codex child registration was rejected",
+            ));
         }
+        if let Some(retained) = self.child_pending.get(child_thread).cloned() {
+            return self.register_pending_child(child_thread, retained).await;
+        }
+        let registration = self.child_registration_for(child_thread)?;
+        if self.child_pending.len() >= MAX_CHILD_THREADS {
+            self.record_gap("Codex pending child registrations exceeded their bound")
+                .await?;
+            return Err(Error::new(
+                "unknown",
+                "Codex child registration is unresolved",
+            ));
+        }
+        self.child_pending
+            .insert(child_thread.to_owned(), registration.clone());
+        self.register_pending_child(child_thread, registration)
+            .await
+    }
+
+    fn child_registration_for(&mut self, child_thread: &str) -> Result<ChildRegistration> {
         let owned = self
             .status
             .thread_id
@@ -1801,36 +1931,50 @@ impl EventProcessor {
             .children
             .spawn_item_of(child_thread)
             .unwrap_or_else(|| format!("spawn-{child_thread}"));
-        let registration = build_registration(
+        Ok(build_registration(
             &spawn_item,
             &parent_id,
             parent_generation,
             &parent_native_ref,
             &self.native_scope,
             child_thread,
-        );
+        ))
+    }
+
+    async fn register_pending_child(
+        &mut self,
+        child_thread: &str,
+        registration: ChildRegistration,
+    ) -> Result<()> {
         let ack = match register_child(&self.host, &self.credential, registration.clone()).await {
             Ok(ack) => ack,
-            Err(error) => {
-                if is_admission_rejection(&error) {
-                    self.child_unknown.insert(child_thread.to_owned());
-                    if let Some(queue) = self.child_buffers.remove(child_thread) {
-                        let discarded: usize = queue.iter().map(child_frame_size).sum();
-                        self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(discarded);
-                    }
-                    self.child_early_lost.remove(child_thread);
-                    return Ok(());
-                }
+            Err(error) if is_admission_rejection(&error) => {
+                self.child_pending.remove(child_thread);
+                self.release_child_buffer(child_thread);
+                self.child_early_lost.remove(child_thread);
                 self.child_unknown.insert(child_thread.to_owned());
+                self.record_gap("Codex child registration was rejected")
+                    .await?;
                 return Err(error);
             }
+            Err(error) => {
+                return Err(Error::new(
+                    error.code.as_str(),
+                    format!(
+                        "Codex child registration acknowledgement is unresolved: {}",
+                        error.message
+                    ),
+                ));
+            }
         };
+        self.child_pending.remove(child_thread);
         let binding = binding_from_ack(registration, &ack);
         self.child_bindings
             .insert(child_thread.to_owned(), binding.clone());
         let mut child_state = ChildState::new(binding);
         let native_id = format!("codex:{child_thread}:session.ready");
-        child_state
+        let native_scope = self.native_scope.clone();
+        if let Err(error) = child_state
             .commit_event(
                 &mut self.sink,
                 &self.host,
@@ -1838,33 +1982,60 @@ impl EventProcessor {
                 "session.ready",
                 native_id,
                 json!({
-                    "native_scope": self.native_scope,
+                    "native_scope": native_scope,
                     "native_ref": child_thread,
                 }),
             )
-            .await?;
+            .await
+        {
+            self.child_states
+                .insert(child_thread.to_owned(), child_state);
+            self.release_child_buffer(child_thread);
+            return Err(error);
+        }
         child_state.ready_committed = true;
         self.child_states
             .insert(child_thread.to_owned(), child_state);
+        let mut first_error = None;
         if self.child_early_lost.remove(child_thread)
             && let Some(state) = self.child_states.get_mut(child_thread)
         {
-            let _ = state
+            if let Err(error) = state
                 .record_gap(
                     &mut self.sink,
                     &self.host,
                     &self.credential,
                     "Codex child early events were lost before registration",
                 )
-                .await;
+                .await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
-        self.flush_child_buffer(child_thread).await
+        if let Err(error) = self.flush_child_buffer(child_thread).await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn release_child_buffer(&mut self, child_thread: &str) {
+        if let Some(queue) = self.child_buffers.remove(child_thread) {
+            let discarded: usize = queue.iter().map(child_frame_size).sum();
+            self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(discarded);
+        }
     }
 
     async fn flush_child_buffer(&mut self, child_thread: &str) -> Result<()> {
         let Some(mut queue) = self.child_buffers.remove(child_thread) else {
             return Ok(());
         };
+        let mut first_unresolved = None;
         while let Some(frame) = queue.pop_front() {
             let size = child_frame_size(&frame);
             self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(size);
@@ -1876,17 +2047,26 @@ impl EventProcessor {
                         && let Some(state) = self.child_states.get_mut(child_thread)
                     {
                         state.source_unknown = true;
+                        let code = error.code.clone();
                         if state.failure.is_none() {
                             state.failure = Some(error.message);
                         }
                         if !state.gap_reported && !state.writes_blocked {
                             let reason = format!(
-                                "Codex child {method} notification could not be normalized ({})",
-                                error.code
+                                "Codex child {method} notification could not be normalized ({code})",
                             );
-                            let _ = state
+                            if let Err(gap_error) = state
                                 .record_gap(&mut self.sink, &self.host, &self.credential, &reason)
-                                .await;
+                                .await
+                                && first_unresolved.is_none()
+                            {
+                                first_unresolved = Some(gap_error);
+                            }
+                        } else if state.writes_blocked && first_unresolved.is_none() {
+                            first_unresolved = Some(Error::new(
+                                "unknown",
+                                "Codex child acknowledgement is unresolved",
+                            ));
                         }
                     }
                 }
@@ -1894,6 +2074,9 @@ impl EventProcessor {
                     self.reject_child_request(id, &method, &params).await;
                 }
             }
+        }
+        if let Some(error) = first_unresolved {
+            return Err(error);
         }
         Ok(())
     }
@@ -2087,46 +2270,62 @@ impl EventProcessor {
         let Some((item_id, receivers)) = spawn_call(item) else {
             return Ok(());
         };
-        let outcome = if completed {
-            for receiver in &receivers {
+        if !completed {
+            return match self.children.spawn_started(item_id) {
+                Ok(()) => Ok(()),
+                Err(reason) => self.record_child_spawn_gap(parent_thread, reason).await,
+            };
+        }
+        let owned = self.status.thread_id.as_deref().unwrap_or(parent_thread);
+        let outcome = self.children.spawn_completed(owned, &item_id, &receivers);
+        for receiver in &receivers {
+            if self.children.is_bound(receiver) {
                 self.children
                     .parents
                     .insert(receiver.clone(), parent_thread.to_owned());
-                self.children
-                    .spawn_items
-                    .insert(receiver.clone(), item_id.clone());
             }
-            let owned = self.status.thread_id.as_deref().unwrap_or(parent_thread);
-            self.children.spawn_completed(owned, &item_id, &receivers)
-        } else {
-            self.children.spawn_started(item_id)
-        };
+        }
+        self.collect_orphan_child_state();
         match outcome {
-            Ok(()) => {
-                if completed {
-                    let mut first_error = None;
-                    for receiver in receivers {
-                        if let Err(error) = Box::pin(self.ensure_child_registered(&receiver)).await
-                            && first_error.is_none()
-                        {
-                            first_error = Some(error);
-                        }
-                    }
-                    if let Some(error) = first_error {
-                        return Err(error);
-                    }
-                }
-                Ok(())
-            }
+            Ok(()) => self.ensure_nested_receivers(&receivers).await,
             Err(reason) => {
-                if let Some(state) = self.child_states.get_mut(parent_thread) {
-                    state
-                        .record_gap(&mut self.sink, &self.host, &self.credential, reason)
-                        .await
-                } else {
-                    self.record_gap(reason).await
+                let confirmed: Vec<String> = receivers
+                    .iter()
+                    .filter(|receiver| self.children.is_bound(receiver))
+                    .cloned()
+                    .collect();
+                let ensure_error = self.ensure_nested_receivers(&confirmed).await.err();
+                let gap_result = self.record_child_spawn_gap(parent_thread, reason).await;
+                if let Some(error) = ensure_error {
+                    return Err(error);
                 }
+                gap_result
             }
+        }
+    }
+
+    async fn ensure_nested_receivers(&mut self, receivers: &[String]) -> Result<()> {
+        let mut first_error = None;
+        for receiver in receivers {
+            if let Err(error) = Box::pin(self.ensure_child_registered(receiver)).await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn record_child_spawn_gap(&mut self, parent_thread: &str, reason: &str) -> Result<()> {
+        if let Some(state) = self.child_states.get_mut(parent_thread) {
+            state
+                .record_gap(&mut self.sink, &self.host, &self.credential, reason)
+                .await
+        } else {
+            self.record_gap(reason).await
         }
     }
     fn stream_source(&mut self) -> StreamSource<'_> {
@@ -2897,6 +3096,11 @@ mod tests {
     #[tokio::test]
     async fn child_buffer_overflow_releases_bytes_without_suppressing_identity() {
         let (_native, mut processor) = child_test_processor().await;
+        processor
+            .children
+            .spawn_started("call-1".to_owned())
+            .expect("spawn window");
+        assert_eq!(processor.children.take_frame("child-1"), Ok(true));
         for _ in 0..EARLY_EVENT_LIMIT {
             processor.buffer_child_frame(
                 "child-1",
@@ -2964,10 +3168,11 @@ mod tests {
         });
         processor.child_buffer_bytes = queue.iter().map(child_frame_size).sum();
         processor.child_buffers.insert("child-1".to_owned(), queue);
-        processor
+        let error = processor
             .flush_child_buffer("child-1")
             .await
-            .expect("flush settles every frame");
+            .expect_err("unresolved child gap must propagate, not report success");
+        assert_eq!(error.code, "unknown");
         let state = processor
             .child_states
             .get("child-1")
@@ -2985,5 +3190,76 @@ mod tests {
         );
         assert!(!processor.child_buffers.contains_key("child-1"));
         assert_eq!(processor.child_buffer_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn child_registration_same_binding_for_idempotent_retry() {
+        let (_native, mut processor) = child_test_processor().await;
+        processor.status.thread_id = Some("owned".to_owned());
+        processor.native_scope = "codex:test".to_owned();
+        processor.children.confirm("owned", "child-1").unwrap();
+        processor
+            .children
+            .parents
+            .insert("child-1".to_owned(), "owned".to_owned());
+        processor
+            .children
+            .spawn_items
+            .insert("child-1".to_owned(), "call-1".to_owned());
+        let first = processor.child_registration_for("child-1").unwrap();
+        let second = processor.child_registration_for("child-1").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.registration_id, "codex:spawn:call-1:child-1");
+        assert_eq!(first.parent_id, "a1");
+        assert_eq!(first.parent_generation, 1);
+        processor.child_unknown.insert("child-1".to_owned());
+        let error = processor
+            .ensure_child_registered("child-1")
+            .await
+            .expect_err("rejected must not report success");
+        assert_eq!(error.code, "not_allowed");
+        assert!(!processor.child_states.contains_key("child-1"));
+    }
+
+    #[tokio::test]
+    async fn child_orphan_collection_bounds_rejected_unconfirmed() {
+        let (_native, mut processor) = child_test_processor().await;
+        processor.status.thread_id = Some("owned".to_owned());
+        processor
+            .children
+            .spawn_started("call-1".to_owned())
+            .unwrap();
+        for index in 0..MAX_CHILD_THREADS {
+            let thread = format!("t{index}");
+            assert_eq!(processor.children.take_frame(&thread), Ok(true));
+            processor.buffer_child_frame(
+                &thread,
+                BufferedNativeFrame::Notification {
+                    method: "turn/started".to_owned(),
+                    params: json!({"threadId": thread}),
+                },
+            );
+        }
+        assert_eq!(processor.child_buffers.len(), MAX_CHILD_THREADS);
+        assert!(processor.children.take_frame("t-rejected").is_err());
+        let rejected_params = json!({"threadId": "t-rejected"});
+        assert!(processor.take_child_frame(&rejected_params));
+        processor
+            .handle_child_notification("turn/started", rejected_params)
+            .await;
+        assert!(!processor.child_buffers.contains_key("t-rejected"));
+        assert!(!processor.child_unknown.contains("t-rejected"));
+        assert!(!processor.child_early_lost.contains("t-rejected"));
+        assert!(!processor.child_pending.contains_key("t-rejected"));
+        processor.children.confirm("owned", "t0").unwrap();
+        processor.settle_child_tracking();
+        assert!(processor.loss_reason.is_some(), "loss is explicit gap");
+        assert!(
+            processor.child_buffers.contains_key("t0"),
+            "proven child row is preserved"
+        );
+        assert!(!processor.child_buffers.contains_key("t1"));
+        assert!(!processor.child_buffers.contains_key("t-rejected"));
+        assert!(processor.child_buffers.len() <= MAX_CHILD_THREADS);
     }
 }

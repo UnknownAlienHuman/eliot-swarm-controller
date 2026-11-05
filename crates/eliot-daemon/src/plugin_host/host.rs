@@ -1665,8 +1665,7 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                                     &bus,
                                     &state,
                                     batch,
-                                    &agent_id,
-                                    generation,
+                                    (&agent_id, generation),
                                     &source_credentials,
                                     request_deadline,
                                 )

@@ -54,18 +54,18 @@ pub(super) async fn put_child_batch(
     bus: &Bus,
     state: &Weak<super::HostState>,
     mut batch: SourceBatch,
-    producer: &str,
-    producer_generation: i64,
+    producer: (&str, i64),
     secrets: &[String],
     until: Instant,
 ) -> Result<Value> {
+    let (producer_id, producer_generation) = producer;
     super::redact_source_batch(&mut batch, secrets)?;
     let child_id = batch.agent_id.clone();
     let child_generation = batch.generation;
     let mut store = timeout_at(until, store.lock()).await.map_err(|_| {
         super::late_batch_error(state, &child_id, child_generation, "store_lock_deadline")
     })?;
-    let result = store.put_native_child_batch(producer, producer_generation, batch, now_ms());
+    let result = store.put_native_child_batch(producer_id, producer_generation, batch, now_ms());
     match result {
         Ok(commit) => {
             bus.publish(&commit.events);
