@@ -4362,6 +4362,12 @@ mod tests {
         let (host, key, start_id) = source_exit_fixture("codex");
         let (current, sources, token, before) = {
             let mut store = host.state.store.lock().await;
+            crate::test_support::install_live_owned_process_source(
+                &mut store,
+                &key.id,
+                key.generation,
+                now_ms(),
+            );
             for (kind, data) in [
                 (
                     "session.ready",
@@ -4391,6 +4397,14 @@ mod tests {
                     store
                         .settle(&start_id, eliot_core::CommandState::Applied, None, now_ms())
                         .unwrap();
+                }
+                if kind == "session.ended" {
+                    crate::test_support::simulate_owned_process_exit_proof(
+                        &mut store,
+                        &key.id,
+                        key.generation,
+                        now_ms(),
+                    );
                 }
             }
             let resume_id = Ulid::new().to_string();

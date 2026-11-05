@@ -19,6 +19,8 @@ mod restart_capacity;
 mod router;
 pub(crate) mod scripts;
 mod setup;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod workspace_git;
 mod workspaces;
 

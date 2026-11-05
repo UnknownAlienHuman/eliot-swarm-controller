@@ -934,12 +934,12 @@ mod tests {
             .await
             .expect("A claims in generation 1");
 
-        // Prove the old custody closed with a terminal native fact, then
-        // resume through the Store: the generation-1 claim is never
-        // presented for generation 2.
+        // Prove the old custody closed with a terminal native fact and owned
+        // exit evidence, then resume: generation-1's claim is not reused.
         let now = now_ms();
         let store_handle = std::sync::Arc::clone(&router.inner.store);
         let mut store = store_handle.lock().await;
+        crate::test_support::install_live_owned_process_source(&mut store, &a, 1, now);
         store
             .put_batch(
                 SourceBatch {
@@ -958,6 +958,7 @@ mod tests {
                 now,
             )
             .expect("commit terminal session fact");
+        crate::test_support::simulate_owned_process_exit_proof(&mut store, &a, 1, now);
         let resume_id = ulid::Ulid::new().to_string();
         store
             .submit(

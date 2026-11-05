@@ -1108,6 +1108,7 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
             store
                 .settle(&launch_id, CommandState::Applied, None, now_ms())
                 .unwrap();
+            crate::test_support::install_live_owned_process_source(&mut store, &agent, 1, now_ms());
             let stale_event_seq = store
                 .read_events(0, 1_000, None)
                 .unwrap()
@@ -1121,6 +1122,7 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
                 .seq;
 
             read_fixture_event(&mut store, &agent, "session.ended", json!({}));
+            crate::test_support::simulate_owned_process_exit_proof(&mut store, &agent, 1, now_ms());
             let resume_id = ulid::Ulid::new().to_string();
             let mut resume = SubmitCommand::new(resume_id.clone(), "resume");
             resume.target = Some(agent.clone());

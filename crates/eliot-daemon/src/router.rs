@@ -7168,7 +7168,9 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             store
                 .settle(&launch_id, CommandState::Applied, None, now_ms())
                 .unwrap();
+            crate::test_support::install_live_owned_process_source(&mut store, &agent, 1, now_ms());
             read_fixture_event(&mut store, &agent, "session.ended", json!({}));
+            crate::test_support::simulate_owned_process_exit_proof(&mut store, &agent, 1, now_ms());
             let previous_workspace = store
                 .get_workspace(&agent)
                 .unwrap()
@@ -7413,7 +7415,9 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             store
                 .settle(&launch_id, CommandState::Applied, None, now_ms())
                 .unwrap();
+            crate::test_support::install_live_owned_process_source(&mut store, &agent, 1, now_ms());
             read_fixture_event(&mut store, &agent, "session.ended", json!({}));
+            crate::test_support::simulate_owned_process_exit_proof(&mut store, &agent, 1, now_ms());
             let stopped_agent = store.get_agent(&agent).unwrap().unwrap();
             assert!(stopped_agent.is_terminal());
             let ready_workspace = store
@@ -7639,7 +7643,9 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             store
                 .settle(&launch_id, CommandState::Applied, None, now_ms())
                 .unwrap();
+            crate::test_support::install_live_owned_process_source(&mut store, &agent, 1, now_ms());
             read_fixture_event(&mut store, &agent, "session.ended", json!({}));
+            crate::test_support::simulate_owned_process_exit_proof(&mut store, &agent, 1, now_ms());
 
             let resume_id = ulid::Ulid::new().to_string();
             let mut resume = SubmitCommand::new(resume_id.clone(), "resume");
@@ -8365,6 +8371,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             store
                 .settle(&launch_id, CommandState::Applied, None, now_ms())
                 .unwrap();
+            crate::test_support::install_live_owned_process_source(&mut store, &agent, 1, now_ms());
             let state = store.ensure_rule_state("owner", &input, now_ms()).unwrap();
 
             let mut stop = SubmitCommand::new(&stop_id, "stop");
@@ -8381,6 +8388,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             store
                 .settle(&stop_id, CommandState::Applied, None, now_ms())
                 .unwrap();
+            crate::test_support::simulate_owned_process_exit_proof(&mut store, &agent, 1, now_ms());
             let event = store
                 .read_events(0, 1_000, None)
                 .unwrap()
@@ -9673,6 +9681,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .target
             .unwrap();
         store.dispatch(&launch_id, now_ms()).unwrap();
+        crate::test_support::install_live_owned_process_source(store, &agent, 1, now_ms());
         read_fixture_event(
             store,
             &agent,
@@ -9687,6 +9696,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .settle(&launch_id, CommandState::Applied, None, now_ms())
             .unwrap();
         read_fixture_event(store, &agent, "session.ended", json!({}));
+        crate::test_support::simulate_owned_process_exit_proof(store, &agent, 1, now_ms());
         agent
     }
 
@@ -10226,7 +10236,9 @@ do = [{ action = "stop", target = "${event.agent}", expected_generation = "${eve
                 "turn.completed",
                 json!({"command_id":send_id, "turn_id":"turn-1", "status":"completed"}),
             );
+            crate::test_support::install_live_owned_process_source(&mut store, &agent, 1, now_ms());
             read_fixture_event(&mut store, &agent, "session.ended", json!({}));
+            crate::test_support::simulate_owned_process_exit_proof(&mut store, &agent, 1, now_ms());
             let resume_id = ulid::Ulid::new().to_string();
             store
                 .submit(
