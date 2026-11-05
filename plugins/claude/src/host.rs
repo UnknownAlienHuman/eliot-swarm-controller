@@ -393,24 +393,40 @@ impl ClaudePlugin {
 
     /// Settle a start whose native process the host would not register. No
     /// session or input was sent; if the owned CLI's cleanup is unconfirmed
-    /// the session is kept unknown instead of dropped.
+    /// the session is kept unknown instead of dropped. The event consumer
+    /// stays alive through termination+drain (suppressed, so no readiness or
+    /// input can commit), then closes: closing first drops the frame queue
+    /// and a late trailing record overflows even with a confirmed child exit.
     async fn fail_unregistered_start(
         &mut self,
         mut session: AgentSession,
         params: &AgentStartParams,
         error: Error,
     ) -> Error {
-        session.events.close().await;
-        if session
+        let begin_error = session.events.begin_stop().await.err();
+        let exit_error = session
             .native
-            .terminate(true, Instant::now() + RPC_TIMEOUT)
+            .terminate(false, Instant::now() + RPC_TIMEOUT)
             .await
-            .is_err()
-        {
+            .err();
+        let drain_error = session
+            .native
+            .await_output_drained(Instant::now() + RPC_TIMEOUT)
+            .await
+            .err();
+        session.events.close().await;
+        if begin_error.is_some() || exit_error.is_some() || drain_error.is_some() {
+            let (stage, cleanup) = if let Some(cleanup) = begin_error {
+                ("begin_stop", cleanup)
+            } else if let Some(cleanup) = exit_error {
+                ("terminate", cleanup)
+            } else {
+                ("drain", drain_error.expect("drain failure"))
+            };
             self.session = Some(session);
             let message = format!(
-                "{}; owned CLI cleanup is unconfirmed; no session or input was sent",
-                error.message
+                "{}; owned CLI cleanup is unconfirmed at {} ({}): {}; no session or input was sent",
+                error.message, stage, cleanup.code, cleanup.message
             );
             return contextual_error(error, "unknown", message);
         }
@@ -426,25 +442,42 @@ impl ClaudePlugin {
 
     /// Discard a failed start and retain its error for replays. A start
     /// whose cleanup is unconfirmed is `unknown`: the session is kept
-    /// instead of dropped (like `fail_unregistered_start`).
+    /// instead of dropped (like `fail_unregistered_start`). The event
+    /// consumer stays alive through termination+drain (suppressed, so no
+    /// readiness or input can commit), then closes. PR284's exact CI cause
+    /// was dropped by `.is_err()`, so the close-before-drain race is
+    /// source-proven but exact CI causality is not fully proven.
     async fn reject_start(
         &mut self,
         mut session: AgentSession,
         params: &AgentStartParams,
         error: Error,
     ) -> Error {
-        session.events.close().await;
-        if session
+        let begin_error = session.events.begin_stop().await.err();
+        let exit_error = session
             .native
-            .terminate(true, Instant::now() + RPC_TIMEOUT)
+            .terminate(false, Instant::now() + RPC_TIMEOUT)
             .await
-            .is_err()
-        {
+            .err();
+        let drain_error = session
+            .native
+            .await_output_drained(Instant::now() + RPC_TIMEOUT)
+            .await
+            .err();
+        session.events.close().await;
+        if begin_error.is_some() || exit_error.is_some() || drain_error.is_some() {
+            let (stage, cleanup) = if let Some(cleanup) = begin_error {
+                ("begin_stop", cleanup)
+            } else if let Some(cleanup) = exit_error {
+                ("terminate", cleanup)
+            } else {
+                ("drain", drain_error.expect("drain failure"))
+            };
             session.phase = SessionPhase::Unknown;
             self.session = Some(session);
             let message = format!(
-                "{}; owned CLI cleanup is unconfirmed; session.ready was never committed",
-                error.message
+                "{}; owned CLI cleanup is unconfirmed at {} ({}): {}; session.ready was never committed",
+                error.message, stage, cleanup.code, cleanup.message
             );
             return contextual_error(error, "unknown", message);
         }
@@ -1391,10 +1424,12 @@ async fn realign_resumed_settings(
 }
 
 fn setter_error(error: Error, subtype: &str) -> Error {
+    // Definite local non-admission: the control write provably never
+    // reached the CLI, so the start is rejected, never a profile verdict.
     if native_no_write(&error.code) {
         contextual_error(
             error,
-            "profile_error",
+            "rejected",
             format!("Claude {subtype} was not dispatched"),
         )
     } else {
@@ -1506,7 +1541,8 @@ fn target_environment(
 
 #[cfg(test)]
 mod tests {
-    use super::{claude_manifest, claude_scope, new_uuid};
+    use super::{claude_manifest, claude_scope, new_uuid, setter_error};
+    use eliot_core::Error;
     use eliot_plugin::session::{parse_resume_subject, validate_source_plan};
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, HashSet};
@@ -1750,6 +1786,23 @@ mod tests {
             json!("turn-1"),
         ] {
             assert_eq!(validate(current_turn).unwrap_err().code, "unknown");
+        }
+    }
+
+    #[test]
+    fn setter_non_admission_is_rejected_and_loss_stays_unknown() {
+        for code in ["busy", "frame_too_large", "native_not_dispatched"] {
+            let error = setter_error(Error::new(code, "write never sent"), "set_model");
+            assert_eq!(error.code, "rejected", "code={code}");
+            assert!(
+                error.message.contains("set_model"),
+                "message={}",
+                error.message
+            );
+        }
+        for code in ["unknown", "native_rejected", "internal"] {
+            let error = setter_error(Error::new(code, "outcome lost"), "initialize");
+            assert_eq!(error.code, "unknown", "code={code}");
         }
     }
 }
