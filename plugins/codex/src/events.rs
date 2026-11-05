@@ -1,3 +1,6 @@
+use crate::native_child::{
+    ChildBinding, binding_from_ack, build_registration, is_admission_rejection, register_child,
+};
 use eliot_core::{Error, ProviderRestriction, Result, SecretPolicy};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
@@ -63,6 +66,7 @@ pub(crate) struct EventConfig {
     pub agent_id: String,
     pub generation: i64,
     pub secrets: Vec<String>,
+    pub native_scope: String,
 }
 
 pub(crate) struct EventHandle {
@@ -167,7 +171,97 @@ struct EventProcessor {
     writes_blocked: bool,
     gap_reported: bool,
     final_text: Option<String>,
+    native_scope: String,
+    child_bindings: HashMap<String, ChildBinding>,
+    child_states: HashMap<String, ChildState>,
+    child_buffers: HashMap<String, VecDeque<BufferedNativeFrame>>,
+    child_buffer_bytes: usize,
+    child_unknown: HashSet<String>,
     children: ChildThreads,
+}
+
+struct ChildState {
+    binding: ChildBinding,
+    writes_blocked: bool,
+    gap_reported: bool,
+    gap_number: u64,
+    source_unknown: bool,
+    batch_unknown: bool,
+    failure: Option<String>,
+    final_text: Option<String>,
+    active_turn_id: Option<String>,
+    ready_committed: bool,
+}
+
+impl ChildState {
+    fn new(binding: ChildBinding) -> Self {
+        Self {
+            binding,
+            writes_blocked: false,
+            gap_reported: false,
+            gap_number: 0,
+            source_unknown: false,
+            batch_unknown: false,
+            failure: None,
+            final_text: None,
+            active_turn_id: None,
+            ready_committed: false,
+        }
+    }
+
+    async fn commit_event(
+        &mut self,
+        sink: &mut CommitSink,
+        host: &PeerClient,
+        credential: &str,
+        kind: &str,
+        native_id: String,
+        data: Value,
+    ) -> Result<()> {
+        let mut source = StreamSource {
+            sink,
+            host,
+            credential,
+            agent_id: &self.binding.agent_id,
+            generation: self.binding.agent_generation,
+            harness: "Codex",
+            id_prefix: "codex",
+            families: &eliot_core::NATIVE_CHILD_FAMILIES,
+            writes_blocked: &mut self.writes_blocked,
+            gap_reported: &mut self.gap_reported,
+            gap_number: &mut self.gap_number,
+            source_unknown: &mut self.source_unknown,
+            batch_unknown: &mut self.batch_unknown,
+            failure: &mut self.failure,
+        };
+        source.commit_event(kind, native_id, data).await
+    }
+
+    async fn record_gap(
+        &mut self,
+        sink: &mut CommitSink,
+        host: &PeerClient,
+        credential: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let mut source = StreamSource {
+            sink,
+            host,
+            credential,
+            agent_id: &self.binding.agent_id,
+            generation: self.binding.agent_generation,
+            harness: "Codex",
+            id_prefix: "codex",
+            families: &eliot_core::NATIVE_CHILD_FAMILIES,
+            writes_blocked: &mut self.writes_blocked,
+            gap_reported: &mut self.gap_reported,
+            gap_number: &mut self.gap_number,
+            source_unknown: &mut self.source_unknown,
+            batch_unknown: &mut self.batch_unknown,
+            failure: &mut self.failure,
+        };
+        source.record_gap(reason).await
+    }
 }
 
 /// Native subagent threads of the owned thread. Their frames are not this
@@ -180,12 +274,14 @@ struct ChildThreads {
     confirmed: HashSet<String>,
     pending_spawns: HashSet<String>,
     unconfirmed: HashSet<String>,
+    bound: HashSet<String>,
+    parents: HashMap<String, String>,
+    spawn_items: HashMap<String, String>,
 }
 
 impl ChildThreads {
-    /// Whether a frame of `thread` (never the owned thread) belongs to a child.
     fn take_frame(&mut self, thread: &str) -> std::result::Result<bool, &'static str> {
-        if self.confirmed.contains(thread) {
+        if self.confirmed.contains(thread) || self.bound.contains(thread) {
             return Ok(true);
         }
         if self.pending_spawns.is_empty() {
@@ -199,7 +295,7 @@ impl ChildThreads {
     }
 
     fn is_parent(&self, owned: &str, parent: &str) -> bool {
-        parent == owned || self.confirmed.contains(parent)
+        parent == owned || self.confirmed.contains(parent) || self.bound.contains(parent)
     }
 
     fn confirm(&mut self, owned: &str, thread: &str) -> std::result::Result<(), &'static str> {
@@ -211,6 +307,7 @@ impl ChildThreads {
             return Err("Codex announced more native child threads than are tracked");
         }
         self.confirmed.insert(thread.to_owned());
+        self.bound.insert(thread.to_owned());
         Ok(())
     }
 
@@ -231,6 +328,8 @@ impl ChildThreads {
     ) -> std::result::Result<(), &'static str> {
         self.pending_spawns.remove(item_id);
         for receiver in receivers {
+            self.spawn_items
+                .insert(receiver.clone(), item_id.to_owned());
             self.confirm(owned, receiver)?;
         }
         if self.pending_spawns.is_empty() {
@@ -248,6 +347,18 @@ impl ChildThreads {
         }
         self.unconfirmed.clear();
         Err("Codex sent frames from a thread no spawn announced")
+    }
+
+    fn is_bound(&self, thread: &str) -> bool {
+        self.bound.contains(thread)
+    }
+
+    fn parent_of(&self, thread: &str) -> Option<String> {
+        self.parents.get(thread).cloned()
+    }
+
+    fn spawn_item_of(&self, thread: &str) -> Option<String> {
+        self.spawn_items.get(thread).cloned()
     }
 }
 
@@ -381,6 +492,12 @@ impl EventProcessor {
             writes_blocked: false,
             gap_reported: false,
             final_text: None,
+            native_scope: config.native_scope.clone(),
+            child_bindings: HashMap::new(),
+            child_states: HashMap::new(),
+            child_buffers: HashMap::new(),
+            child_buffer_bytes: 0,
+            child_unknown: HashSet::new(),
             children: ChildThreads::default(),
         }
     }
@@ -491,8 +608,7 @@ impl EventProcessor {
             }
             Some(NativeFrame::Notification { method, params }) => {
                 if self.take_child_frame(&params) {
-                    // Child-thread lifecycle is not attributed to the parent
-                    // generation; L5.3 native child discovery surfaces it.
+                    self.handle_child_notification(&method, params).await;
                     return;
                 }
                 if self.should_buffer(&method, &params) {
@@ -551,8 +667,7 @@ impl EventProcessor {
         }
     }
 
-    /// A frame of a confirmed child, or of an unannounced thread while a spawn
-    /// is in flight, is not this generation's lifecycle.
+    /// Whether this frame is a native-child frame (bounded/unconfirmed/confirmed).
     fn take_child_frame(&mut self, params: &Value) -> bool {
         let Some(thread) = frame_thread_id(params) else {
             return false;
@@ -565,6 +680,9 @@ impl EventProcessor {
         {
             return false;
         }
+        if self.children.is_bound(thread) || self.child_states.contains_key(thread) {
+            return true;
+        }
         match self.children.take_frame(thread) {
             Ok(taken) => taken,
             Err(reason) => {
@@ -574,8 +692,7 @@ impl EventProcessor {
         }
     }
 
-    /// Track the owned thread's `spawnAgent` calls; a completed spawn confirms
-    /// its `receiverThreadIds`.
+    /// Track spawnAgent calls; completed receivers register before facts publish.
     async fn observe_spawn(&mut self, item: &Value, completed: bool) -> Result<()> {
         let Some((item_id, receivers)) = spawn_call(item) else {
             return Ok(());
@@ -584,18 +701,32 @@ impl EventProcessor {
             return Ok(());
         };
         let outcome = if completed {
+            for receiver in &receivers {
+                self.children
+                    .parents
+                    .insert(receiver.clone(), owned.clone());
+                self.children
+                    .spawn_items
+                    .insert(receiver.clone(), item_id.clone());
+            }
             self.children.spawn_completed(&owned, &item_id, &receivers)
         } else {
             self.children.spawn_started(item_id)
         };
         match outcome {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if completed {
+                    for receiver in receivers {
+                        let _ = self.ensure_child_registered(&receiver).await;
+                    }
+                }
+                Ok(())
+            }
             Err(reason) => self.record_gap(reason).await,
         }
     }
 
-    /// A child thread's request has no Eliot principal to answer it yet; reject
-    /// it as unsupported instead of leaving the child waiting.
+    /// A child request stays unsupported; it is never forwarded to control.
     async fn reject_child_request(&mut self, id: Value, method: &str, params: &Value) {
         let rejected = self
             .native
@@ -681,6 +812,7 @@ impl EventProcessor {
                 "Codex event source acknowledgement is unresolved",
             ));
         }
+        self.native_scope = native_scope.clone();
         self.status.thread_id = Some(thread_id.clone());
         let native_id = format!("codex:{thread_id}:session.ready");
         self.commit_event(
@@ -770,8 +902,13 @@ impl EventProcessor {
                 | BufferedNativeFrame::Request { params, .. } => self.take_child_frame(params),
             };
             if child {
-                if let BufferedNativeFrame::Request { id, method, params } = frame.frame {
-                    self.reject_child_request(id, &method, &params).await;
+                match frame.frame {
+                    BufferedNativeFrame::Request { id, method, params } => {
+                        self.reject_child_request(id, &method, &params).await;
+                    }
+                    BufferedNativeFrame::Notification { method, params } => {
+                        self.handle_child_notification(&method, params).await;
+                    }
                 }
                 continue;
             }
@@ -1443,10 +1580,25 @@ impl EventProcessor {
         {
             let parent = params.get("thread").and_then(spawned_parent_thread);
             if parent.is_some_and(|parent| self.children.is_parent(&owned, parent)) {
-                return match self.children.confirm(&owned, thread_id) {
-                    Ok(()) => Ok(()),
-                    Err(reason) => self.record_gap(reason).await,
-                };
+                let parent = parent.unwrap();
+                self.children
+                    .parents
+                    .insert(thread_id.to_owned(), parent.to_owned());
+                if let Some(spawn_item) = params.get("thread").and_then(spawned_item_id) {
+                    self.children
+                        .spawn_items
+                        .insert(thread_id.to_owned(), spawn_item.to_owned());
+                } else if self.children.pending_spawns.len() == 1 {
+                    if let Some(spawn_item) = self.children.pending_spawns.iter().next().cloned() {
+                        self.children
+                            .spawn_items
+                            .insert(thread_id.to_owned(), spawn_item);
+                    }
+                }
+                if let Err(reason) = self.children.confirm(&owned, thread_id) {
+                    return self.record_gap(reason).await;
+                }
+                return self.ensure_child_registered(thread_id).await;
             }
             return self
                 .record_gap("Codex app-server announced a second thread in one Agent generation")
@@ -1511,7 +1663,417 @@ impl EventProcessor {
         self.stream_source().record_gap(reason).await
     }
 
-    /// The shared stream-commit half of this processor.
+    async fn handle_child_notification(&mut self, method: &str, params: Value) {
+        let Some(child_thread) = frame_thread_id(&params).map(str::to_owned) else {
+            return;
+        };
+        if self.child_unknown.contains(&child_thread) {
+            return;
+        }
+        if method == "thread/started" {
+            let _ = self.observe_thread_started(&params).await;
+            return;
+        }
+        let is_ready = self
+            .child_states
+            .get(&child_thread)
+            .is_some_and(|state| state.ready_committed);
+        if !is_ready {
+            self.buffer_child_frame(
+                &child_thread,
+                BufferedNativeFrame::Notification {
+                    method: method.to_owned(),
+                    params,
+                },
+            );
+            return;
+        }
+        if let Err(error) = self
+            .process_child_notification(&child_thread, method, params)
+            .await
+        {
+            if let Some(state) = self.child_states.get_mut(&child_thread) {
+                state.source_unknown = true;
+                if state.failure.is_none() {
+                    state.failure = Some(error.message);
+                }
+                if !state.gap_reported && !state.writes_blocked {
+                    let reason = format!(
+                        "Codex child {method} notification could not be normalized ({})",
+                        error.code
+                    );
+                    let _ = state
+                        .record_gap(&mut self.sink, &self.host, &self.credential, &reason)
+                        .await;
+                }
+            }
+        }
+    }
+
+    fn buffer_child_frame(&mut self, child_thread: &str, frame: BufferedNativeFrame) {
+        let size = match &frame {
+            BufferedNativeFrame::Notification { method, params } => {
+                serde_json::to_vec(&json!({"method": method, "params": params}))
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(256)
+            }
+            BufferedNativeFrame::Request { id, method, params } => {
+                serde_json::to_vec(&json!({"id": id, "method": method, "params": params}))
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(256)
+            }
+        };
+        let queue = self
+            .child_buffers
+            .entry(child_thread.to_owned())
+            .or_default();
+        if queue.len() >= EARLY_EVENT_LIMIT
+            || self.child_buffer_bytes.saturating_add(size) > EARLY_EVENT_BYTES
+        {
+            queue.clear();
+            self.child_unknown.insert(child_thread.to_owned());
+            return;
+        }
+        self.child_buffer_bytes = self.child_buffer_bytes.saturating_add(size);
+        queue.push_back(frame);
+    }
+
+    async fn ensure_child_registered(&mut self, child_thread: &str) -> Result<()> {
+        if self.child_states.contains_key(child_thread) {
+            return Ok(());
+        }
+        if self.child_unknown.contains(child_thread) {
+            return Ok(());
+        }
+        let owned = self
+            .status
+            .thread_id
+            .clone()
+            .ok_or_else(|| Error::new("bad_state", "Codex producer thread is not ready"))?;
+        let parent_thread = self
+            .children
+            .parent_of(child_thread)
+            .unwrap_or_else(|| owned.clone());
+        let (parent_id, parent_generation, parent_native_ref) = if parent_thread == owned {
+            (self.agent_id.clone(), self.generation, owned)
+        } else {
+            let parent_state = self.child_states.get(&parent_thread).ok_or_else(|| {
+                Error::new(
+                    "bad_state",
+                    "Codex nested child parent is not registered yet",
+                )
+            })?;
+            (
+                parent_state.binding.agent_id.clone(),
+                parent_state.binding.agent_generation,
+                parent_thread,
+            )
+        };
+        let spawn_item = self
+            .children
+            .spawn_item_of(child_thread)
+            .unwrap_or_else(|| format!("spawn-{child_thread}"));
+        let registration = build_registration(
+            &spawn_item,
+            &parent_id,
+            parent_generation,
+            &parent_native_ref,
+            &self.native_scope,
+            child_thread,
+        );
+        let ack = match register_child(&self.host, &self.credential, registration.clone()).await {
+            Ok(ack) => ack,
+            Err(error) => {
+                if is_admission_rejection(&error) {
+                    self.child_unknown.insert(child_thread.to_owned());
+                    self.child_buffers.remove(child_thread);
+                    return Ok(());
+                }
+                self.child_unknown.insert(child_thread.to_owned());
+                return Err(error);
+            }
+        };
+        let binding = binding_from_ack(registration, &ack);
+        self.child_bindings
+            .insert(child_thread.to_owned(), binding.clone());
+        let mut child_state = ChildState::new(binding);
+        let native_id = format!("codex:{child_thread}:session.ready");
+        child_state
+            .commit_event(
+                &mut self.sink,
+                &self.host,
+                &self.credential,
+                "session.ready",
+                native_id,
+                json!({
+                    "native_scope": self.native_scope,
+                    "native_ref": child_thread,
+                }),
+            )
+            .await?;
+        child_state.ready_committed = true;
+        self.child_states
+            .insert(child_thread.to_owned(), child_state);
+        self.flush_child_buffer(child_thread).await
+    }
+
+    async fn flush_child_buffer(&mut self, child_thread: &str) -> Result<()> {
+        let Some(mut queue) = self.child_buffers.remove(child_thread) else {
+            return Ok(());
+        };
+        while let Some(frame) = queue.pop_front() {
+            let size = match &frame {
+                BufferedNativeFrame::Notification { method, params } => {
+                    serde_json::to_vec(&json!({"method": method, "params": params}))
+                        .map(|bytes| bytes.len())
+                        .unwrap_or(256)
+                }
+                BufferedNativeFrame::Request { id, method, params } => {
+                    serde_json::to_vec(&json!({"id": id, "method": method, "params": params}))
+                        .map(|bytes| bytes.len())
+                        .unwrap_or(256)
+                }
+            };
+            self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(size);
+            match frame {
+                BufferedNativeFrame::Notification { method, params } => {
+                    self.process_child_notification(child_thread, &method, params)
+                        .await?;
+                }
+                BufferedNativeFrame::Request { id, method, params } => {
+                    self.reject_child_request(id, &method, &params).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_child_notification(
+        &mut self,
+        child_thread: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<()> {
+        match method {
+            "turn/started" => {
+                let turn_id = params
+                    .get("turn")
+                    .and_then(|turn| turn.get("id"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or_else(|| {
+                        Error::new(
+                            "native_protocol",
+                            "Codex child turn/started omitted turn id",
+                        )
+                    })?;
+                let state = self
+                    .child_states
+                    .get_mut(child_thread)
+                    .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
+                state.active_turn_id = Some(turn_id.to_owned());
+                state.final_text = None;
+                let native_id = event_id(child_thread, turn_id, turn_id, "turn.started")?;
+                state
+                    .commit_event(
+                        &mut self.sink,
+                        &self.host,
+                        &self.credential,
+                        "turn.started",
+                        native_id,
+                        json!({"turn_id": turn_id}),
+                    )
+                    .await?;
+            }
+            "item/started" => {
+                let raw_item = params.get("item").cloned().unwrap_or(Value::Null);
+                self.observe_child_spawn(child_thread, &raw_item, false)
+                    .await?;
+            }
+            "item/completed" => {
+                let raw_item = params.get("item").cloned().unwrap_or(Value::Null);
+                self.observe_child_spawn(child_thread, &raw_item, true)
+                    .await?;
+                let item_type = raw_item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if item_type == "agentMessage" {
+                    self.complete_child_message(child_thread, &raw_item, &params)
+                        .await?;
+                }
+            }
+            "turn/completed" => {
+                self.complete_child_turn(child_thread, params).await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn complete_child_message(
+        &mut self,
+        child_thread: &str,
+        item: &Value,
+        params: &Value,
+    ) -> Result<()> {
+        let item_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "native_protocol",
+                    "Codex child agentMessage omitted item id",
+                )
+            })?;
+        let text = item.get("text").and_then(Value::as_str).ok_or_else(|| {
+            Error::new("native_protocol", "Codex child agentMessage omitted text")
+        })?;
+        let policy = SecretPolicy::new(self.secrets.iter().cloned());
+        let text = policy.redact_text(text);
+        let turn_id = params
+            .get("turnId")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                self.child_states
+                    .get(child_thread)
+                    .and_then(|state| state.active_turn_id.as_deref())
+            })
+            .unwrap_or_default();
+        let mut data = json!({
+            "turn_id": turn_id,
+            "text": text,
+        });
+        if let Some(phase) = item.get("phase").and_then(Value::as_str) {
+            data["phase"] = Value::String(phase.to_owned());
+        }
+        let encoded_len = match serde_json::to_vec(&data) {
+            Ok(bytes) => bytes.len(),
+            Err(_) => usize::MAX,
+        };
+        let state = self
+            .child_states
+            .get_mut(child_thread)
+            .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
+        if encoded_len > MAX_EVENT_BYTES {
+            return state
+                .record_gap(
+                    &mut self.sink,
+                    &self.host,
+                    &self.credential,
+                    "Codex child completed message exceeded persisted-event bound",
+                )
+                .await;
+        }
+        let native_id = event_id(child_thread, turn_id, item_id, "message.completed")?;
+        state
+            .commit_event(
+                &mut self.sink,
+                &self.host,
+                &self.credential,
+                "message.completed",
+                native_id,
+                data,
+            )
+            .await
+    }
+
+    async fn complete_child_turn(&mut self, child_thread: &str, params: Value) -> Result<()> {
+        let notification: NativeTurnCompletedNotification = serde_json::from_value(params)
+            .map_err(|_| {
+                Error::new(
+                    "native_protocol",
+                    "Codex child turn/completed schema mismatch",
+                )
+            })?;
+        let state = self
+            .child_states
+            .get_mut(child_thread)
+            .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
+        if notification.turn.status == NativeTurnStatus::InProgress {
+            return state
+                .record_gap(
+                    &mut self.sink,
+                    &self.host,
+                    &self.credential,
+                    "Codex child turn/completed carried nonterminal inProgress status",
+                )
+                .await;
+        }
+        let status_text = turn_status(&notification.turn.status);
+        let mut data = json!({
+            "turn_id": notification.turn.id,
+            "status": status_text,
+        });
+        let policy = SecretPolicy::new(self.secrets.iter().cloned());
+        if let Some(text) = state.final_text.take() {
+            attach_final_text(&mut data, &text, &notification.turn.status, &policy);
+        }
+        attach_native_error(&mut data, notification.turn.error.as_ref(), &policy);
+        let native_id = event_id(
+            child_thread,
+            &notification.turn.id,
+            &notification.turn.id,
+            "turn.completed",
+        )?;
+        state
+            .commit_event(
+                &mut self.sink,
+                &self.host,
+                &self.credential,
+                "turn.completed",
+                native_id,
+                data,
+            )
+            .await?;
+        state.active_turn_id = None;
+        Ok(())
+    }
+
+    async fn observe_child_spawn(
+        &mut self,
+        parent_thread: &str,
+        item: &Value,
+        completed: bool,
+    ) -> Result<()> {
+        let Some((item_id, receivers)) = spawn_call(item) else {
+            return Ok(());
+        };
+        let outcome = if completed {
+            for receiver in &receivers {
+                self.children
+                    .parents
+                    .insert(receiver.clone(), parent_thread.to_owned());
+                self.children
+                    .spawn_items
+                    .insert(receiver.clone(), item_id.clone());
+            }
+            let owned = self.status.thread_id.as_deref().unwrap_or(parent_thread);
+            self.children.spawn_completed(owned, &item_id, &receivers)
+        } else {
+            self.children.spawn_started(item_id)
+        };
+        match outcome {
+            Ok(()) => {
+                if completed {
+                    for receiver in receivers {
+                        let _ = self.ensure_child_registered(&receiver).await;
+                    }
+                }
+                Ok(())
+            }
+            Err(reason) => {
+                if let Some(state) = self.child_states.get_mut(parent_thread) {
+                    state
+                        .record_gap(&mut self.sink, &self.host, &self.credential, reason)
+                        .await
+                } else {
+                    self.record_gap(reason).await
+                }
+            }
+        }
+    }
     fn stream_source(&mut self) -> StreamSource<'_> {
         StreamSource {
             sink: &mut self.sink,
@@ -1605,9 +2167,23 @@ fn spawn_call(item: &Value) -> Option<(String, Vec<String>)> {
 }
 
 /// The thread a native frame belongs to: `threadId` on notifications and
-/// server requests.
+/// server requests, or `thread.id` on thread notifications.
 fn frame_thread_id(params: &Value) -> Option<&str> {
-    params.get("threadId").and_then(Value::as_str)
+    params.get("threadId").and_then(Value::as_str).or_else(|| {
+        params
+            .get("thread")
+            .and_then(|thread| thread.get("id"))
+            .and_then(Value::as_str)
+    })
+}
+
+fn spawned_item_id(thread: &Value) -> Option<&str> {
+    let spawn = thread.get("source")?.get("subAgent")?.get("thread_spawn")?;
+    spawn
+        .get("call_id")
+        .or_else(|| spawn.get("item_id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
 }
 
 /// The parent of a subagent thread, from the installed 0.161 `Thread.source`
@@ -1805,7 +2381,10 @@ mod tests {
             frame_thread_id(&json!({"threadId": "child"})),
             Some("child")
         );
-        assert_eq!(frame_thread_id(&json!({"thread": {"id": "child"}})), None);
+        assert_eq!(
+            frame_thread_id(&json!({"thread": {"id": "child"}})),
+            Some("child")
+        );
     }
 
     #[test]

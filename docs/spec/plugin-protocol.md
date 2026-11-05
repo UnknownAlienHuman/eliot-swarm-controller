@@ -205,7 +205,7 @@ inventing completion or issuing another start.
 | `source.gap` | stable gap id, owned families, reason and optional from/to cursor; commits one gap boundary |
 | `source.handoff` | `SourceHandoff` request; atomically returns `SourceHandoffAck` after commit |
 | `process.put` | credential, agent_id, generation, pid, role; returns the OS-verified `ProcessRecord`, not plugin-authoritative process lifecycle |
-| `child` | registration id, parent/generation, exact child subject and optional identity request; canonical child row/source plan |
+| `child` | `ChildParams { credential, registration }` with `ChildRegistration` (registration id, parent/generation, exact child subject); canonical child row/source plan |
 
 For an observe-only caller, an open `observe` row created during attach dispatch does
 not grant publication. Private `source.state` derives `observer_ready` only from an

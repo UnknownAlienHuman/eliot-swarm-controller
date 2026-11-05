@@ -16,6 +16,7 @@ mod canonical;
 mod command;
 mod diagnostics;
 mod ids;
+mod native_child;
 mod native_store;
 mod routing;
 mod secrets;
@@ -32,6 +33,7 @@ pub use diagnostics::{
     bound_stderr_diagnostics,
 };
 pub use ids::parse_agent_id;
+pub use native_child::{ChildRegistration, ChildRegistrationAck, NATIVE_CHILD_FAMILIES};
 pub use native_store::NativeStoreBinding;
 pub use routing::{
     CapacityScope, ProviderHold, ProviderHoldState, ProviderRestriction, ProviderRestrictionKind,

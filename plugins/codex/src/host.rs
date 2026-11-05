@@ -640,6 +640,7 @@ impl CodexPlugin {
                 agent_id: params.agent_id.clone(),
                 generation: params.generation,
                 secrets: secrets.clone(),
+                native_scope: String::new(),
             },
         );
         let mut session = AgentSession {
@@ -2652,7 +2653,7 @@ fn codex_manifest() -> PluginManifest {
             discover: true,
             observe: true,
             start_requires_input: false,
-            native_children: false,
+            native_children: true,
         },
         sources: BTreeMap::from([
             ("controlled".to_owned(), controlled),
@@ -3110,6 +3111,7 @@ mod tests {
                 agent_id: "a1".to_owned(),
                 generation: 1,
                 secrets: Vec::new(),
+                native_scope: String::new(),
             },
         );
         let session = AgentSession {

@@ -172,7 +172,7 @@ impl Store {
     /// Commit one source-loss boundary and its retained acknowledgement.
     pub fn record_source_gap(&mut self, gap: SourceGap, now: i64) -> Result<Change<SourceGapAck>> {
         self.ensure_writer_healthy()?;
-        let result = self.record_source_gap_inner(gap, None, now);
+        let result = self.record_source_gap_inner(gap, None, None, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -184,7 +184,21 @@ impl Store {
         now: i64,
     ) -> Result<Change<SourceGapAck>> {
         self.ensure_writer_healthy()?;
-        let result = self.record_source_gap_inner(gap, Some(expected_subject), now);
+        let result = self.record_source_gap_inner(gap, Some(expected_subject), None, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn record_native_child_source_gap(
+        &mut self,
+        producer: &str,
+        producer_generation: i64,
+        gap: SourceGap,
+        now: i64,
+    ) -> Result<Change<SourceGapAck>> {
+        self.ensure_writer_healthy()?;
+        let result =
+            self.record_source_gap_inner(gap, None, Some((producer, producer_generation)), now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -193,6 +207,7 @@ impl Store {
         &mut self,
         gap: SourceGap,
         expected_subject: Option<(&str, &str)>,
+        native_producer: Option<(&str, i64)>,
         now: i64,
     ) -> Result<Change<SourceGapAck>> {
         require_nonempty(&gap.gap_id, "gap_id")?;
@@ -248,7 +263,17 @@ impl Store {
             .map_err(sql_error)?;
         let agent = load_agent_by_num(&tx, agent_num)?
             .ok_or_else(|| Error::new("not_found", "source gap Agent was not found"))?;
-        if let Some(subject) = expected_subject {
+        if let Some((producer, generation)) = native_producer {
+            native_children::require_grant(
+                &tx,
+                producer,
+                generation,
+                &agent,
+                gap.generation,
+                &gap.source,
+            )?;
+            native_children::require_families(&families)?;
+        } else if let Some(subject) = expected_subject {
             observer::require_live_subject(&tx, &agent, gap.generation, subject)?;
             observer_live::require_transcript_families(&tx, &agent, &gap.source, &families)?;
         } else if !matches!(
@@ -366,7 +391,7 @@ impl Store {
     /// command/turn facts, source cursor, and last-batch acknowledgement.
     pub fn put_batch(&mut self, batch: SourceBatch, now: i64) -> Result<BatchCommit> {
         self.ensure_writer_healthy()?;
-        let result = self.put_batch_inner(batch, None, now);
+        let result = self.put_batch_inner(batch, None, None, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -378,7 +403,20 @@ impl Store {
         now: i64,
     ) -> Result<BatchCommit> {
         self.ensure_writer_healthy()?;
-        let result = self.put_batch_inner(batch, Some(expected_subject), now);
+        let result = self.put_batch_inner(batch, Some(expected_subject), None, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn put_native_child_batch(
+        &mut self,
+        producer: &str,
+        producer_generation: i64,
+        batch: SourceBatch,
+        now: i64,
+    ) -> Result<BatchCommit> {
+        self.ensure_writer_healthy()?;
+        let result = self.put_batch_inner(batch, None, Some((producer, producer_generation)), now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -387,8 +425,10 @@ impl Store {
         &mut self,
         batch: SourceBatch,
         expected_subject: Option<(&str, &str)>,
+        native_producer: Option<(&str, i64)>,
         now: i64,
     ) -> Result<BatchCommit> {
+        let observed = expected_subject.is_some() || native_producer.is_some();
         require_nonempty(&batch.batch_id, "batch_id")?;
         require_nonempty(&batch.source, "source")?;
         if batch.events.is_empty() {
@@ -442,7 +482,35 @@ impl Store {
                 format!("Agent {} was not found", batch.agent_id),
             )
         })?;
-        if let Some(subject) = expected_subject {
+        if let Some((producer, generation)) = native_producer {
+            native_children::require_grant(
+                &tx,
+                producer,
+                generation,
+                &projection,
+                batch.generation,
+                &batch.source,
+            )?;
+            let families = batch
+                .events
+                .iter()
+                .map(|event| family_for_kind(&event.kind).map(str::to_owned))
+                .collect::<Result<Vec<_>>>()?;
+            native_children::require_families(&families)?;
+            for event in &batch.events {
+                if event.kind == "session.ready"
+                    && (event.data.get("native_scope").and_then(Value::as_str)
+                        != projection.native_scope.as_deref()
+                        || event.data.get("native_ref").and_then(Value::as_str)
+                            != projection.native_ref.as_deref())
+                {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "native child readiness named another subject",
+                    ));
+                }
+            }
+        } else if let Some(subject) = expected_subject {
             observer::require_live_subject(&tx, &projection, batch.generation, subject)?;
             let families = batch
                 .events
@@ -450,6 +518,10 @@ impl Store {
                 .map(|event| family_for_kind(&event.kind).map(str::to_owned))
                 .collect::<Result<Vec<_>>>()?;
             observer_live::require_transcript_families(&tx, &projection, &batch.source, &families)?;
+        } else {
+            observer::require_controlled(&projection)?;
+        }
+        if observed {
             for event in &batch.events {
                 if !event.data.is_object()
                     || ["command_id", "cause", "request_id"]
@@ -462,8 +534,6 @@ impl Store {
                     ));
                 }
             }
-        } else {
-            observer::require_controlled(&projection)?;
         }
         if projection.generation != batch.generation {
             return Err(Error::new(
@@ -550,7 +620,7 @@ impl Store {
         let mut command_events = Vec::new();
         let mut provider_events = Vec::new();
         for (index, native_event) in batch.events.iter().enumerate() {
-            if expected_subject.is_none() {
+            if !observed {
                 validate_resume_ready_subject_tx(
                     &tx,
                     &projection,
@@ -559,7 +629,7 @@ impl Store {
                     native_event,
                 )?;
             }
-            let (next, effects) = if expected_subject.is_some() {
+            let (next, effects) = if observed {
                 observer_live::persist_turn_fact(&tx, &projection, native_event)?;
                 (projection.clone(), Vec::new())
             } else {
@@ -567,7 +637,7 @@ impl Store {
             };
             let family = family_for_kind(&native_event.kind)?;
             let event_digest = canonical::digest(&native_event.semantic_value())?;
-            let cause = if expected_subject.is_none() {
+            let cause = if !observed {
                 verified_native_event_cause_tx(
                     &tx,
                     &projection,
@@ -632,7 +702,7 @@ impl Store {
                     params![agent_num, batch.generation],
                 ));
             }
-            if expected_subject.is_none() {
+            if !observed {
                 update_agent_projection(&tx, &next)?;
                 if native_event.kind == "session.ended" && next.is_terminal() {
                     capacity::release_proven_generation_tx(&tx, agent_num, batch.generation)?;

@@ -1,5 +1,6 @@
 use super::{PluginClient, PluginConnection};
 mod discovery;
+mod native_children;
 mod observation;
 mod reader;
 mod source_handoff;
@@ -1505,13 +1506,19 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                 | "source.health"
                 | "source.state"
                 | "process.put"
+                | "child"
         ) {
             Err(Error::new(
                 "unsupported",
-                "plugin host only accepts events.put, source.gap, source.handoff, source.health, source.state, and process.put",
+                "plugin host only accepts events.put, source.gap, source.handoff, source.health, source.state, process.put, and child",
             ))
         } else {
             let mut params = request.params;
+            let child_wire = if method == "child" {
+                Some(params.clone())
+            } else {
+                None
+            };
             let credential = params
                 .as_object_mut()
                 .and_then(|object| object.remove("credential"))
@@ -1644,12 +1651,28 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                                 },
                             }
                         }
-                        Ok(_) => Err(late_batch_error(
-                            &state,
-                            &agent_id,
-                            generation,
-                            "source_generation_mismatch",
-                        )),
+                        Ok(batch) => {
+                            if observation.is_some() {
+                                Err(late_batch_error(
+                                    &state,
+                                    &agent_id,
+                                    generation,
+                                    "source_generation_mismatch",
+                                ))
+                            } else {
+                                native_children::put_child_batch(
+                                    &store,
+                                    &bus,
+                                    &state,
+                                    batch,
+                                    &agent_id,
+                                    generation,
+                                    &source_credentials,
+                                    request_deadline,
+                                )
+                                .await
+                            }
+                        }
                         Err(_) => Err(late_batch_error(
                             &state,
                             &agent_id,
@@ -1658,15 +1681,36 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                         )),
                     },
                     "source.gap" => {
-                        record_source_gap(
-                            &store,
-                            &bus,
-                            params,
-                            binding,
-                            &source_credentials,
-                            request_deadline,
-                        )
-                        .await
+                        let is_producer = params.get("agent_id").and_then(Value::as_str)
+                            == Some(agent_id.as_str())
+                            && params.get("generation").and_then(Value::as_i64) == Some(generation);
+                        if is_producer {
+                            record_source_gap(
+                                &store,
+                                &bus,
+                                params,
+                                binding,
+                                &source_credentials,
+                                request_deadline,
+                            )
+                            .await
+                        } else if observation.is_some() {
+                            Err(Error::new(
+                                "not_allowed",
+                                "source.gap binding does not match this Agent generation",
+                            ))
+                        } else {
+                            native_children::record_child_gap(
+                                &store,
+                                &bus,
+                                params,
+                                &agent_id,
+                                generation,
+                                &source_credentials,
+                                request_deadline,
+                            )
+                            .await
+                        }
                     }
                     "source.handoff" => {
                         source_handoff::record_source_handoff(
@@ -1690,29 +1734,79 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                         )
                         .await
                     }
-                    "source.state" => match source_state_binding(&params, &agent_id, generation) {
-                        Ok(source_name) => match timeout_at(request_deadline, store.lock()).await {
-                            Ok(store) => {
-                                match store.read_source_state(&agent_id, generation, &source_name) {
-                                    Ok(mut source_state) => {
-                                        crate::redaction::redact_value(
-                                            &mut source_state,
-                                            &source_credentials,
-                                        );
-                                        Ok(source_state)
-                                    }
-                                    Err(error) => {
-                                        Err(redact_native_error(error, &source_credentials))
+                    "source.state" => {
+                        let is_producer = params.get("agent_id").and_then(Value::as_str)
+                            == Some(agent_id.as_str())
+                            && params.get("generation").and_then(Value::as_i64) == Some(generation);
+                        if is_producer {
+                            match source_state_binding(&params, &agent_id, generation) {
+                                Ok(source_name) => {
+                                    match timeout_at(request_deadline, store.lock()).await {
+                                        Ok(store) => {
+                                            match store.read_source_state(
+                                                &agent_id,
+                                                generation,
+                                                &source_name,
+                                            ) {
+                                                Ok(mut source_state) => {
+                                                    crate::redaction::redact_value(
+                                                        &mut source_state,
+                                                        &source_credentials,
+                                                    );
+                                                    Ok(source_state)
+                                                }
+                                                Err(error) => Err(redact_native_error(
+                                                    error,
+                                                    &source_credentials,
+                                                )),
+                                            }
+                                        }
+                                        Err(_) => Err(Error::new(
+                                            "busy",
+                                            "Store lock deadline elapsed for source.state",
+                                        )),
                                     }
                                 }
+                                Err(error) => Err(error),
                             }
-                            Err(_) => Err(Error::new(
-                                "busy",
-                                "Store lock deadline elapsed for source.state",
-                            )),
-                        },
-                        Err(error) => Err(error),
-                    },
+                        } else if observation.is_some() {
+                            Err(Error::new(
+                                "not_allowed",
+                                "source.state is outside this plugin's Agent binding",
+                            ))
+                        } else {
+                            native_children::read_child_state(
+                                &store,
+                                &params,
+                                &agent_id,
+                                generation,
+                                &source_credentials,
+                                request_deadline,
+                            )
+                            .await
+                        }
+                    }
+                    "child" => {
+                        let wire = child_wire.unwrap_or(Value::Null);
+                        drop(params);
+                        if observation.is_some() {
+                            Err(Error::new(
+                                "not_allowed",
+                                "observer callbacks cannot register native children",
+                            ))
+                        } else {
+                            native_children::register_child(
+                                &store,
+                                &bus,
+                                wire,
+                                &agent_id,
+                                generation,
+                                &source_credentials,
+                                request_deadline,
+                            )
+                            .await
+                        }
+                    }
                     _ => Err(Error::new(
                         "unsupported",
                         "plugin request method is not implemented",
@@ -2120,7 +2214,7 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         || verbs.iter().any(|verb| !implemented_verbs.contains(verb))
         || !manifest.child_verbs.is_empty()
         || manifest.features.start_requires_input
-        || manifest.features.native_children
+        || (manifest.features.native_children && harness != "codex")
     {
         return Err(unsupported_manifest());
     }
@@ -2553,6 +2647,18 @@ async fn settle_drained_source_exit(
             // drain were proven above. Closing a source alone never frees capacity.
             let events = store.record_owned_control_exit(&key.id, key.generation, now_ms())?;
             state.bus.publish(&events);
+            drop(store);
+            if native_children::is_codex_producer(&state.store, &key.id).await? {
+                native_children::mark_children_unavailable(
+                    &state.store,
+                    &state.bus,
+                    &key.id,
+                    key.generation,
+                    reason,
+                    reader_closed,
+                )
+                .await?;
+            }
             return Ok(());
         }
         let state = state
@@ -2576,6 +2682,17 @@ async fn settle_drained_source_exit(
             )?
         };
         state.bus.publish(&events);
+        if native_children::is_codex_producer(&state.store, &key.id).await? {
+            native_children::mark_children_unavailable(
+                &state.store,
+                &state.bus,
+                &key.id,
+                key.generation,
+                reason,
+                reader_closed,
+            )
+            .await?;
+        }
         Ok(())
     }
     .await;
