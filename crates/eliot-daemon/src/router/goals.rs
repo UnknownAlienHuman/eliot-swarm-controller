@@ -1367,7 +1367,7 @@ mod tests {
         assert_eq!(response["outcome"], "completed");
         assert_eq!(response["view"]["status"], "completed");
         assert_eq!(response["view"]["generation"], 1);
-        assert_eq!(response["view"]["revision"], 1);
+        assert_eq!(response["view"]["revision"], 2);
         assert_eq!(response["view"]["counters"]["rounds"], 1);
         assert_eq!(response["view"]["counters"]["last_exit_code"], 0);
         assert_eq!(response["view"]["last_round_key"], format!("idle:{key}"));
@@ -1409,7 +1409,7 @@ mod tests {
         assert_eq!(response["command_id"], id);
         assert_eq!(response["continuation"]["command_id"], id);
         assert_eq!(response["view"]["generation"], 1);
-        assert_eq!(response["view"]["revision"], 1);
+        assert_eq!(response["view"]["revision"], 2);
         assert_eq!(response["view"]["counters"]["rounds"], 1);
         assert_eq!(response["view"]["counters"]["last_exit_code"], 7);
         assert_eq!(response["view"]["last_round_key"], format!("idle:{key}"));
