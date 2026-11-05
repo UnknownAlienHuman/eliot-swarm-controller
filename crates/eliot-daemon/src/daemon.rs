@@ -27,7 +27,7 @@ use tokio::{
 use tokio_util::codec::{Framed, LinesCodec};
 use ulid::Ulid;
 
-const MAX_RPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_RPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CLIENTS: usize = 128;
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(35);
 

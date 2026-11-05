@@ -42,6 +42,8 @@ owning specs; do not reproduce them in every page. Existing IDs remain stable fo
 | D-35 | Parent/child command rows represent linked input, selector expansion and ordered rule actions. | No link/run subsystem. Retain a referenced set; prune children then parent in one transaction, never expose partial fanout history. |
 | D-36 | Optional automated Git wrappers use isolated transport configuration and frozen OIDs. | Mutable branch/rewrite settings must not retarget admitted pushes. No generic pull or interception of a harness's own Git. [Automation](spec/automation.md#git-actions) |
 
+| D-37 | Use official `rmcp` 3.9.0 for the stdio server (`server` + `transport-io`); keep `client` + `transport-child-process` dev-only. | SDK transport only; management authority and semantics stay in the existing authenticated API. [API](spec/api.md#mcp-stdio-server) |
+
 ## Defaults
 
 Direct Codex first; configured native model only. Optional vendors do not block the

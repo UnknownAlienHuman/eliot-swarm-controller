@@ -26,6 +26,7 @@ use eliot_core::{
     },
 };
 use serde_json::{Value, json};
+mod mcp;
 #[cfg(not(windows))]
 use std::process::{Command as ProcessCommand, Stdio};
 use std::{
@@ -92,6 +93,9 @@ enum CliCommand {
     Daemon(DaemonArgs),
     /// Read daemon state without starting a daemon.
     Status,
+    /// Serve one generic { method, params } MCP tool over stdio.
+    #[command(name = "mcp")]
+    McpStdio,
     /// Inspect provider holds or clear one with owner corrective evidence.
     Provider {
         #[command(subcommand)]
@@ -781,6 +785,10 @@ impl Failure {
         Self::new(5, "wait timed out; the admitted command was not cancelled")
     }
 
+    fn new_from_message(message: String) -> Self {
+        Self::new(1, message)
+    }
+
     fn from_command(exit_code: u8, message: impl Into<String>, command: &CoreCommand) -> Self {
         let mut failure = Self::new(exit_code, message);
         if let Some(value) = command
@@ -949,6 +957,18 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                     Ok(0)
                 }
             }
+        }
+        CliCommand::McpStdio => {
+            if json_output {
+                return Err(Failure::new(
+                    2,
+                    "--json is not valid with mcp stdio; stdout carries MCP protocol only",
+                ));
+            }
+            mcp::run_stdio(data_dir)
+                .await
+                .map_err(Failure::new_from_message)?;
+            Ok(0)
         }
         CliCommand::Status => {
             read_and_print!(
