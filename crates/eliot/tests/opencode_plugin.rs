@@ -3443,7 +3443,9 @@ async fn scenario_unknown_stop_with_committed_end_closes_owned_family(owned: Own
         ]))
         .expect("typed second stop");
     fixture.wait_command(&second_stop.command_id, "applied");
-    fixture.stop(false);
+    // Keep the original Unknown Stop as the intentional drain blocker; force
+    // shutdown only cleans daemon-owned resources, not its semantic outcome.
+    fixture.stop(true);
 }
 
 async fn scenario_invalid_profile_rejected_before_spawn(owned: OwnedChildren) {
