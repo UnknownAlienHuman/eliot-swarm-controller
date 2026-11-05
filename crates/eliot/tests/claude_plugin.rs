@@ -4866,11 +4866,10 @@ async fn cross_harness_setup(
     let rule = "[[rule]]\nid = \"claude-cross-harness-echo\"\non = { event = \"turn.completed\", match = { \"subject.harness\" = \"claude\" } }\ndo = [{ action = \"send\", target = \"${event.agent}\", expected_generation = \"${event.generation}\", text = \"rule-send-echo\" }]\n";
     std::fs::write(fixture.data.join("rules").join("claude-echo.toml"), rule)
         .expect("write owner rule");
-    let report_arg = report.to_string_lossy().into_owned();
-    fixture.start_with_env(&[
-        ("ELIOT_FAKE_CLAUDE_SCRIPT", "ok"),
-        ("ELIOT_FAKE_CLAUDE_REPORT", report_arg.as_str()),
-    ]);
+    fixture
+        .env("ELIOT_FAKE_CLAUDE_SCRIPT", "ok")
+        .env("ELIOT_FAKE_CLAUDE_REPORT", &report);
+    fixture.start();
     owned.set_report(report.clone()).await;
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let state = loop {
