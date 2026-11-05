@@ -485,6 +485,17 @@ impl Fixture {
                     Some(_) => "other",
                     None => "missing",
                 };
+                let quiescence_class = match outcome
+                    .and_then(|outcome| outcome.get("quiescence_class"))
+                    .and_then(Value::as_str)
+                {
+                    Some("platform_io") => "platform_io",
+                    Some("process_custody_unknown") => "process_custody_unknown",
+                    Some("timeout") => "timeout",
+                    Some("other") => "other",
+                    Some(_) => "other",
+                    None => "none",
+                };
                 let generation = command["generation"].as_i64();
                 let (event_snapshot_available, dispatch_seen, ready_seen_at_command_generation) =
                     match self.events_if_available() {
@@ -508,7 +519,7 @@ impl Fixture {
                         None => (false, false, false),
                     };
                 panic!(
-                    "unexpected command state {state_class}; generation={generation:?}; workspace_pre_dispatch={workspace_pre_dispatch}; error_code_class={error_code_class}; event_snapshot_available={event_snapshot_available}; dispatch_seen={dispatch_seen}; ready_seen_at_command_generation={ready_seen_at_command_generation}; private outcome deliberately omitted"
+                    "unexpected command state {state_class}; generation={generation:?}; workspace_pre_dispatch={workspace_pre_dispatch}; error_code_class={error_code_class}; quiescence_class={quiescence_class}; event_snapshot_available={event_snapshot_available}; dispatch_seen={dispatch_seen}; ready_seen_at_command_generation={ready_seen_at_command_generation}; private outcome deliberately omitted"
                 );
             }
             assert!(
