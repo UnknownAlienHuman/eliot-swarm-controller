@@ -4592,9 +4592,20 @@ async fn scenario_unknown_owner_reply_conflict_no_second_io(owned: OwnedChildren
         .expect("uncertain snapshot");
     assert_eq!(snapshot["state"], "unknown");
     assert_eq!(snapshot["last_turn"], Value::Null);
+    let shutdown_error = scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect_err("an uncertain batch must not fabricate session.ended");
+    let shutdown_error: eliot_plugin::RpcError = serde_json::from_str(&shutdown_error)
+        .expect("shutdown returns a structured JSON-RPC error");
     assert_eq!(
-        scenario.host.call("shutdown", json!({})).await,
-        Err("unknown".to_owned()),
+        shutdown_error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str),
+        Some("unknown"),
         "an uncertain batch must not fabricate session.ended"
     );
     scenario.host.shutdown_child().await;
