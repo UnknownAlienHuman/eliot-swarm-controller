@@ -83,7 +83,7 @@ enum Control {
     ViewReadback {
         session_id: String,
         reason: Option<NativeHistoryNoneReason>,
-        reply: oneshot::Sender<Result<()>>,
+        reply: oneshot::Sender<Result<EventStatus>>,
     },
     Ready {
         native_scope: String,
@@ -225,7 +225,7 @@ impl EventHandle {
         &self,
         session_id: String,
         reason: Option<NativeHistoryNoneReason>,
-    ) -> Result<()> {
+    ) -> Result<EventStatus> {
         self.send(|reply| Control::ViewReadback {
             session_id,
             reason,
@@ -345,7 +345,10 @@ impl EventHandle {
         self.status.borrow().clone()
     }
 
-    async fn send(&self, build: impl FnOnce(oneshot::Sender<Result<()>>) -> Control) -> Result<()> {
+    async fn send<T>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<Result<T>>) -> Control,
+    ) -> Result<T> {
         let (reply, response) = oneshot::channel();
         timeout_at(
             Instant::now() + EVENT_DEADLINE,
@@ -407,10 +410,14 @@ impl EventProcessor {
                 reason,
                 reply,
             } => {
-                let result = if let Some(reason) = reason {
-                    self.view_unavailable(&session_id, reason).await
-                } else {
-                    Ok(())
+                let result = self.bind_view_session(&session_id);
+                let result = match result {
+                    Ok(()) => self.flush_buffered_health().await,
+                    Err(error) => Err(error),
+                };
+                let result = match (result, reason) {
+                    (Ok(()), Some(reason)) => self.view_unavailable(&session_id, reason).await,
+                    (result, _) => result,
                 };
                 let result = result.and_then(|()| {
                     if self.status.session_id.as_deref() != Some(session_id.as_str())
@@ -421,7 +428,7 @@ impl EventProcessor {
                             "Muse native observation is unresolved",
                         ))
                     } else {
-                        Ok(())
+                        Ok(self.status.clone())
                     }
                 });
                 let _ = reply.send(result);
@@ -668,6 +675,13 @@ impl EventProcessor {
             ));
         }
         self.status.session_id = Some(session_id.clone());
+        self.flush_buffered_health().await?;
+        if self.status.view_unavailable {
+            return Err(Error::new(
+                "unknown",
+                "Muse native view is unavailable before readiness",
+            ));
+        }
         let native_id = format!("muse:{session_id}:session.ready");
         self.commit_event(
             "session.ready",
@@ -735,6 +749,7 @@ impl EventProcessor {
     }
 
     async fn flush_buffer(&mut self) -> Result<()> {
+        self.flush_buffered_health().await?;
         while let Some(frame) = self.buffer.pop_front() {
             self.buffer_bytes = self.buffer_bytes.saturating_sub(frame.size);
             let should_buffer = match &frame.frame {
@@ -750,32 +765,62 @@ impl EventProcessor {
                     .saturating_add(self.buffer.front().map_or(0, |item| item.size));
                 break;
             }
-            let result = match frame.frame {
-                BufferedNativeFrame::Notification { method, params } => {
-                    self.process_notification(method, params).await
-                }
-                BufferedNativeFrame::Request { id, method, params } => {
-                    self.process_request(id, method, params).await
-                }
-            };
-            if let Err(error) = result {
-                self.status.source_unknown = true;
-                if !self.gap_reported && !self.writes_blocked {
-                    let _ = self
-                        .record_gap("Buffered Muse native frame could not be normalized")
-                        .await;
-                }
-                if self.status.failure.is_none() {
-                    self.status.failure = Some(error.message);
-                }
-                return Err(Error::new(
-                    "unknown",
-                    "Buffered Muse event outcome is unresolved",
-                ));
-            }
+            self.process_buffered_frame(frame.frame).await?;
             if self.writes_blocked {
                 break;
             }
+        }
+        Ok(())
+    }
+
+    /// Session health is independent of turn association. Keep every request
+    /// and other deferred frame in its original order, including on errors.
+    async fn flush_buffered_health(&mut self) -> Result<()> {
+        if self.status.session_id.is_none() {
+            return Ok(());
+        }
+        while let Some(index) = self.buffer.iter().position(|frame| {
+            matches!(
+                &frame.frame, BufferedNativeFrame::Notification { method, .. }
+                    if method == "session/viewHealthChanged"
+            )
+        }) {
+            let frame = self
+                .buffer
+                .remove(index)
+                .ok_or_else(|| Error::new("internal", "Muse buffered health frame disappeared"))?;
+            self.buffer_bytes = self.buffer_bytes.saturating_sub(frame.size);
+            self.process_buffered_frame(frame.frame).await?;
+            if self.writes_blocked {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_buffered_frame(&mut self, frame: BufferedNativeFrame) -> Result<()> {
+        let result = match frame {
+            BufferedNativeFrame::Notification { method, params } => {
+                self.process_notification(method, params).await
+            }
+            BufferedNativeFrame::Request { id, method, params } => {
+                self.process_request(id, method, params).await
+            }
+        };
+        if let Err(error) = result {
+            self.status.source_unknown = true;
+            if !self.gap_reported && !self.writes_blocked {
+                let _ = self
+                    .record_gap("Buffered Muse native frame could not be normalized")
+                    .await;
+            }
+            if self.status.failure.is_none() {
+                self.status.failure = Some(error.message);
+            }
+            return Err(Error::new(
+                "unknown",
+                "Buffered Muse event outcome is unresolved",
+            ));
         }
         Ok(())
     }
@@ -1811,11 +1856,7 @@ impl EventProcessor {
             .await
     }
 
-    async fn view_unavailable(
-        &mut self,
-        session_id: &str,
-        reason: NativeHistoryNoneReason,
-    ) -> Result<()> {
+    fn bind_view_session(&mut self, session_id: &str) -> Result<()> {
         if session_id.trim().is_empty()
             || self
                 .status
@@ -1831,6 +1872,15 @@ impl EventProcessor {
         // Pull callers already validated the native response against the owned
         // resume/read subject. This binds identity, never readiness or a turn.
         self.status.session_id = Some(session_id.to_owned());
+        Ok(())
+    }
+
+    async fn view_unavailable(
+        &mut self,
+        session_id: &str,
+        reason: NativeHistoryNoneReason,
+    ) -> Result<()> {
+        self.bind_view_session(session_id)?;
         self.status.source_unknown = true;
         self.status.view_unavailable = true;
         if self.gap_reported || self.writes_blocked {
