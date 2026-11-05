@@ -872,6 +872,304 @@ fn old_producer_cleanup_does_not_touch_new_generation_children_or_active_binding
     );
 }
 
+fn seed_restart_recovery_children(
+    path: &Path,
+) -> (String, String, String, String) {
+    let mut store = Store::open(path).unwrap();
+    let root = producer(&mut store, "root");
+    let running = register(&mut store, &root, request(&root, "root", "running"));
+    let partial = register(&mut store, &root, request(&root, "root", "partial"));
+    let completed = register(&mut store, &root, request(&root, "root", "completed"));
+
+    store
+        .put_native_child_batch(
+            &root,
+            1,
+            batch(
+                &running.agent.id,
+                "running-turn",
+                vec![event(
+                    "turn.started",
+                    "running-start",
+                    json!({"turn_id":"running-turn", "started_at":NOW + 10}),
+                )],
+            ),
+            NOW + 10,
+        )
+        .unwrap();
+    store
+        .put_native_child_batch(
+            &root,
+            1,
+            batch(
+                &partial.agent.id,
+                "partial-turn",
+                vec![
+                    event(
+                        "turn.started",
+                        "partial-start",
+                        json!({"turn_id":"partial-turn", "started_at":NOW + 11}),
+                    ),
+                    event(
+                        "message.completed",
+                        "partial-message",
+                        json!({"turn_id":"partial-turn", "phase":"final_answer", "text":"partial answer"}),
+                    ),
+                ],
+            ),
+            NOW + 11,
+        )
+        .unwrap();
+    store
+        .put_native_child_batch(
+            &root,
+            1,
+            batch(
+                &completed.agent.id,
+                "completed-turn",
+                vec![
+                    event(
+                        "turn.started",
+                        "completed-start",
+                        json!({"turn_id":"completed-turn", "started_at":NOW + 12}),
+                    ),
+                    event(
+                        "turn.completed",
+                        "completed-end",
+                        json!({"turn_id":"completed-turn", "status":"completed", "started_at":NOW + 12, "completed_at":NOW + 13, "final_text":"finished answer"}),
+                    ),
+                ],
+            ),
+            NOW + 13,
+        )
+        .unwrap();
+
+    (
+        root,
+        running.agent.id,
+        partial.agent.id,
+        completed.agent.id,
+    )
+}
+
+fn recover_and_assert_child_turns(
+    store: &mut Store,
+    running_id: &str,
+    partial_id: &str,
+    completed_id: &str,
+) -> Turn {
+    let running_before = store
+        .get_turn(running_id, 1, "running-turn")
+        .unwrap()
+        .unwrap();
+    let partial_before = store
+        .get_turn(partial_id, 1, "partial-turn")
+        .unwrap()
+        .unwrap();
+    let completed_before = store
+        .get_turn(completed_id, 1, "completed-turn")
+        .unwrap()
+        .unwrap();
+    assert_eq!(running_before.state, TurnState::Running);
+    assert_eq!(running_before.started_at, Some(NOW + 10));
+    assert_eq!(partial_before.state, TurnState::Running);
+    assert_eq!(partial_before.started_at, Some(NOW + 11));
+    assert_eq!(partial_before.final_text.as_deref(), Some("partial answer"));
+    assert_eq!(completed_before.state, TurnState::Completed);
+    assert_eq!(completed_before.started_at, Some(NOW + 12));
+    assert_eq!(completed_before.completed_at, Some(NOW + 13));
+
+    let recovered = store.recover_on_restart(NOW + 50).unwrap();
+    assert_eq!(
+        recovered
+            .iter()
+            .filter(|event| event.kind == "turn.unknown")
+            .count(),
+        2
+    );
+    assert!(recovered.iter().all(|event| event.kind != "turn.completed"));
+    let running_after = store
+        .get_turn(running_id, 1, "running-turn")
+        .unwrap()
+        .unwrap();
+    let partial_after = store
+        .get_turn(partial_id, 1, "partial-turn")
+        .unwrap()
+        .unwrap();
+    assert_eq!(running_after.state, TurnState::Unknown);
+    assert_eq!(running_after.started_at, running_before.started_at);
+    assert_eq!(running_after.completed_at, running_before.completed_at);
+    assert_eq!(partial_after.state, TurnState::Unknown);
+    assert_eq!(partial_after.started_at, partial_before.started_at);
+    assert_eq!(partial_after.completed_at, partial_before.completed_at);
+    assert_eq!(partial_after.final_text, partial_before.final_text);
+    assert_eq!(
+        store
+            .get_turn(completed_id, 1, "completed-turn")
+            .unwrap()
+            .unwrap(),
+        completed_before
+    );
+    completed_before
+}
+
+fn assert_restart_retained_generation(store: &Store, root: &str) {
+    let retained = store.restart_retained_generations(None).unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(
+        (retained[0].agent.as_str(), retained[0].generation),
+        (root, 1)
+    );
+    assert!(retained[0].named_custody);
+    assert!(retained[0].processes.is_empty());
+}
+
+fn release_restart_custody(store: &mut Store, root: &str) {
+    // This process-free SQLite fixture simulates the caller's explicit closure
+    // proof; it does not qualify real OS custody.
+    let released = store
+        .release_restart_closed_generation(root, 1, "windows_job_closed", false, NOW + 51)
+        .unwrap();
+    assert!(released.iter().any(|event| event.kind == "capacity.released"));
+    assert!(store.restart_retained_generations(None).unwrap().is_empty());
+}
+
+fn assert_recovery_is_idempotent(store: &mut Store) {
+    let high_water = store.high_water().unwrap();
+    assert!(store.recover_on_restart(NOW + 51).unwrap().is_empty());
+    assert_eq!(store.high_water().unwrap(), high_water);
+}
+
+fn resume_recovered_producer(store: &mut Store, root: &str) {
+    let mut resume = SubmitCommand::new(
+        Ulid::from_parts((NOW + 52) as u64, 900).to_string(),
+        "resume",
+    );
+    resume.target = Some(root.to_owned());
+    resume.expected_generation = Some(1);
+    let resume_id = resume.id.clone();
+    store.submit("owner", resume, NOW + 52).unwrap();
+    store.dispatch(&resume_id, NOW + 53).unwrap();
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "root-resume-ready".to_owned(),
+                agent_id: root.to_owned(),
+                generation: 2,
+                source: INITIAL_SOURCE.to_owned(),
+                cursor: Some("root-resume-ready".to_owned()),
+                events: vec![event(
+                    "session.ready",
+                    "root-resume-ready",
+                    json!({"command_id":resume_id, "native_scope":SCOPE, "native_ref":"root"}),
+                )],
+            },
+            NOW + 54,
+        )
+        .unwrap();
+    store
+        .settle(&resume_id, CommandState::Applied, None, NOW + 54)
+        .unwrap();
+
+    let resumed = store.get_agent(root).unwrap().unwrap();
+    assert_eq!(resumed.generation, 2);
+    assert_eq!(resumed.state, AgentState::Idle);
+    assert_eq!(resumed.native_scope.as_deref(), Some(SCOPE));
+    assert_eq!(resumed.native_ref.as_deref(), Some("root"));
+    let source = store.read_source_state(root, 2, INITIAL_SOURCE).unwrap();
+    assert_eq!(source["state"], "open");
+    assert_eq!(source["health"], "ok");
+}
+
+fn assert_stale_cleanup_preserves_fresh_child(
+    store: &mut Store,
+    root: &str,
+    old_children: [&str; 3],
+    completed_before: &Turn,
+) {
+    let mut fresh_request = request(root, "root", "fresh");
+    fresh_request.parent_generation = 2;
+    let fresh = store
+        .register_native_child(root, 2, fresh_request, NOW + 56)
+        .unwrap()
+        .value;
+    store
+        .put_native_child_batch(
+            root,
+            2,
+            batch(
+                &fresh.agent.id,
+                "fresh-active",
+                vec![event(
+                    "turn.started",
+                    "fresh-active-start",
+                    json!({"turn_id":"fresh-active", "started_at":NOW + 54}),
+                )],
+            ),
+            NOW + 57,
+        )
+        .unwrap();
+    let fresh_source_before = store
+        .read_source_state(&fresh.agent.id, 1, "stream")
+        .unwrap();
+    let fresh_turn_before = store
+        .get_turn(&fresh.agent.id, 1, "fresh-active")
+        .unwrap()
+        .unwrap();
+
+    let stale_cleanup = store
+        .mark_native_children_unavailable(root, 1, "retired_reader_closed", true, NOW + 58)
+        .unwrap();
+    assert!(!stale_cleanup.is_empty());
+    assert!(stale_cleanup.iter().all(|event| {
+        event
+            .agent
+            .as_deref()
+            .is_some_and(|agent| old_children.contains(&agent))
+    }));
+    assert_eq!(
+        store
+            .read_source_state(&fresh.agent.id, 1, "stream")
+            .unwrap(),
+        fresh_source_before
+    );
+    assert_eq!(
+        store
+            .get_turn(&fresh.agent.id, 1, "fresh-active")
+            .unwrap()
+            .unwrap(),
+        fresh_turn_before
+    );
+    assert_eq!(
+        store
+            .get_turn(old_children[2], 1, "completed-turn")
+            .unwrap()
+            .unwrap(),
+        *completed_before
+    );
+}
+
+#[test]
+fn restart_recovery_preserves_child_turns_after_disk_reopen_and_scopes_stale_cleanup() {
+    let path = std::env::temp_dir().join(format!("eliot-native-child-recovery-{}", Ulid::new()));
+    let (root, running_id, partial_id, completed_id) = seed_restart_recovery_children(&path);
+    let mut store = Store::open(&path).unwrap();
+    let completed_before =
+        recover_and_assert_child_turns(&mut store, &running_id, &partial_id, &completed_id);
+    assert_restart_retained_generation(&store, &root);
+    release_restart_custody(&mut store, &root);
+    assert_recovery_is_idempotent(&mut store);
+    resume_recovered_producer(&mut store, &root);
+    assert_stale_cleanup_preserves_fresh_child(
+        &mut store,
+        &root,
+        [&running_id, &partial_id, &completed_id],
+        &completed_before,
+    );
+    drop(store);
+    std::fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn unavailable_children_roll_back_gap_turns_and_health_together() {
     let mut store = store();

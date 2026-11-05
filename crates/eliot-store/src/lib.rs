@@ -793,6 +793,7 @@ impl Store {
 
         let mut events = Vec::new();
         recover_workspaces(&tx, now, &mut events)?;
+        Self::recover_lost_native_children_tx(&tx, now, &mut events)?;
         for (command_id, target, generation) in dispatched_commands {
             let outcome = json!({"reason": "daemon_restart"});
             update_command_state(
