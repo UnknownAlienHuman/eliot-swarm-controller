@@ -949,7 +949,7 @@ fn parent_turn_completion_does_not_retire_child_observation() {
                 vec![event(
                     "turn.started",
                     "parent-turn-start",
-                    json!({"turn_id":"parent-turn", "command_id":command_id}),
+                    json!({"turn_id":"parent-turn", "command_id": &command_id}),
                 )],
             ),
             NOW + 3,
@@ -963,7 +963,7 @@ fn parent_turn_completion_does_not_retire_child_observation() {
                 vec![event(
                     "turn.completed",
                     "parent-turn-complete",
-                    json!({"turn_id":"parent-turn", "status":"completed"}),
+                    json!({"turn_id":"parent-turn", "command_id": command_id, "status":"completed"}),
                 )],
             ),
             NOW + 4,
