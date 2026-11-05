@@ -263,6 +263,12 @@ impl Session {
             }
             HistoryDecision::Advance => {}
         }
+        if self.native.process_exit_observed() {
+            return Err(Error::new(
+                "unknown",
+                "Antigravity process exited; new input was not dispatched",
+            ));
+        }
         if !self.ready {
             return Err(Error::new(
                 "unknown",
@@ -315,6 +321,7 @@ impl Session {
 
     pub async fn snapshot(&self, params: AgentSnapshotParams) -> Result<Value> {
         let state = self.state.lock().await;
+        let process_exited = self.native.process_exit_observed();
         let retained = self
             .retained
             .as_ref()
@@ -347,7 +354,7 @@ impl Session {
         let result_known = last.is_some_and(|last| last.terminal);
         let status = if state.stopped {
             "stopped"
-        } else if state.source_unknown || !self.ready {
+        } else if state.source_unknown || process_exited || !self.ready {
             "unknown"
         } else if state.active_turn().is_some() {
             "busy"
@@ -359,6 +366,9 @@ impl Session {
             "state": status, "native_scope": self.scope, "native_ref": state.conversation,
             "active_turn": if state.stopped { None } else { state.active_turn() }, "last_turn": last,
             "source_unknown": state.source_unknown, "batch_unknown": state.batch_unknown,
+            "source_health_stale": state.source_health_stale,
+            "source_health_unknown": state.source_health_unknown,
+            "process_exited": process_exited,
             "result_known": result_known, "usage": state.usage,
             "diagnostics": self.native.diagnostic_error(Error::new("unknown", "")).diagnostics}),
         )
