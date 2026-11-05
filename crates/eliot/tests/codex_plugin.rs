@@ -651,6 +651,13 @@ pass_env = [
 
     verify_events_and_report(&fixture, &report_path, &root_agent_id, &child_1_id);
 
+    let stopped = fixture.json(&["stop", &root_agent_id]);
+    fixture.wait_command(
+        stopped["command_id"].as_str().expect("stop command"),
+        "applied",
+    );
+    assert_eq!(fixture.json(&["show", &root_agent_id])["state"], "stopped");
+
     fixture.stop(false);
 }
 
