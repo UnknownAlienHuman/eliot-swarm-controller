@@ -256,7 +256,7 @@ Codex or for unrelated adapters.
 - [ ] **L6.4 Selected optional adapters.** Add only those explicitly selected for the
       release; record the selection here. Unselected adapters stay absent.
       Muse Code selected by the owner 2026-11-03; Antigravity selected 2026-11-04.
-      Remainder: Muse native children; Antigravity launch/send/stop/resume.
+      Remainder: Muse native children/workflow observation.
 
 **Feature-complete local scope:** core, Codex, monitoring/workspaces, automation,
 coordination and the selected adapters. Do not hold this milestone for an unused vendor

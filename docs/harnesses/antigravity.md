@@ -29,8 +29,9 @@ A `step_update` with `step_type = "system_message"` or a no-content `checkpoint`
 is bookkeeping metadata, including when idle, resuming, or mid-turn. Validate its
 conversation before handling it, and handle it without input association. It does
 not acknowledge input, create a turn, append assistant text or complete a turn.
-Any unproved semantic payload or unknown step type still produces an explicit gap
-with bounded, redacted structural diagnostics.
+A checkpoint carrying modeled tool payload ([`StepUpdate` DTO](../../plugins/antigravity/src/native/types.rs))
+or unknown step type still produces an explicit gap with bounded, redacted structural
+diagnostics.
 
 ## Native mapping
 
