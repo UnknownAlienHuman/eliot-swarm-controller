@@ -83,16 +83,16 @@ is still required to confirm effective posture.
 
 ## Workflow children (native, observe-only)
 
-One connected observer over the actual `workflow` item wire (wave3b recorded
-wire, 2026-11-05, Muse Code 1.4.0, bundle fingerprint
-`sha256:36466f63…0d3d7f`, plus the installed `WorkflowChild` schema in the
-probe receipt). One native `host.agent` child is one Eliot Agent per canonical
-key `K(parentSessionId, workflowRunId, childId, attempt)` — the
-plugin-owned `WorkflowChildKey` builds the collision-free canonical opaque
-`native_ref`, registration id, and turn key (stable across revisions; the
-shared core carries only the harness-generic registration RPC). The wire
-carries no session or turn id on the child itself, so the ONE normalized
-Eliot turn key is synthesized and is explicitly NOT an MSP turn id.
+The Muse plugin observes actual `workflow` item revisions through the existing
+[`NativeWorkflowItemNotification` and `NativeWorkflowChild` DTOs](../../plugins/muse/src/native/types.rs)
+and tracks each child with [`WorkflowChildKey`](../../plugins/muse/src/workflow_child.rs)
+under `K(parentSessionId, workflowRunId, childId, attempt)`. The key retains
+`attempt` as the exact signed SDK wire integer. One native `host.agent` child
+is one Eliot Agent per canonical key — the key builds the collision-free
+canonical opaque `native_ref`, registration id, and turn key (stable across
+revisions; the shared core carries only the harness-generic registration
+RPC). The wire carries no session or turn id on the child itself, so the ONE
+normalized Eliot turn key is synthesized and is explicitly NOT an MSP turn id.
 
 Turn-only coverage (`turn` family): `scheduled` registers the observe-only
 tokenless child (Agent `Unknown`, no principal, no control verbs) through the
@@ -108,11 +108,10 @@ null on the wire), and `resultRef`/`message` history composites are
 unsupported — no fact is ever synthesized from them, and public history
 composites stay with the shared-boundary owner for dispatch.
 
-Workflow revisions route ahead of active-parent-turn buffering: the actual
-wire schedules the child AFTER the parent `turn/completed`, and parent
-completion keeps child tracking. Each key preserves its
-ParentSession/run/child/attempt binding plus the latest actual wire
-revision/status/sourceRange.
+Workflow child revisions route independently of active-parent-turn buffering,
+and child tracking continues after the parent turn completes. Each key
+preserves its ParentSession/run/child/attempt binding plus the latest actual
+wire revision/status/sourceRange.
 Terminal stream loss unknowns open children (with a child gap when a turn
 started) and keeps already-completed ones; transient view gaps self-heal
 because every revision re-emits the full child list, so tracking continues.
