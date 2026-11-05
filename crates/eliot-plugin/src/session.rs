@@ -934,7 +934,7 @@ impl StreamSource<'_> {
         &mut self,
         retained: &mut Option<SourceGap>,
         attempted: &SourceGap,
-        result: &Result<Value, Error>,
+        result: &Result<Value>,
     ) -> bool {
         if retained.as_ref() != Some(attempted) {
             return false;

@@ -1776,7 +1776,7 @@ impl EventProcessor {
         &mut self,
         child_thread: &str,
         attempted: &SourceGap,
-        result: &Result<Value, Error>,
+        result: &Result<Value>,
     ) -> bool {
         let Some(state) = self.child_states.get_mut(child_thread) else {
             return false;
@@ -2572,7 +2572,7 @@ impl EventProcessor {
 struct GapAttempt {
     child_thread: String,
     gap: SourceGap,
-    future: Pin<Box<dyn Future<Output = Result<Value, Error>> + Send>>,
+    future: Pin<Box<dyn Future<Output = Result<Value>> + Send>>,
 }
 
 async fn run(
@@ -2633,7 +2633,12 @@ async fn run(
                     });
                 }
             }
-            result = &mut gap_in_flight.as_mut().unwrap().future, if gap_pending => {
+            result = async {
+                match gap_in_flight.as_mut() {
+                    Some(attempt) => attempt.future.as_mut().await,
+                    None => std::future::pending().await,
+                }
+            }, if gap_pending => {
                 let attempt = gap_in_flight.take().expect("guarded by gap_pending");
                 processor.apply_gap_attempt(&attempt.child_thread, &attempt.gap, &result);
             }
@@ -4044,10 +4049,13 @@ mod tests {
 
             // 1. Last child frame's gap: host replies busy immediately.
             line.clear();
-            host_reader
-                .read_line(&mut line)
-                .await
-                .expect("read first child gap request");
+            timeout_at(
+                Instant::now() + EVENT_DEADLINE,
+                host_reader.read_line(&mut line),
+            )
+            .await
+            .expect("host read first child gap within deadline")
+            .expect("read first child gap request");
             let req1: RpcRequest = serde_json::from_str(&line).expect("decode req1");
             recorded_rpc.push((req1.method.clone(), req1.params.clone()));
             assert_eq!(req1.method, "source.gap");
@@ -4069,10 +4077,13 @@ mod tests {
             // 2. Owned retry (no extra child frame): SAME gap_id/body.
             // Held: no ACK until the parent control is served.
             line.clear();
-            host_reader
-                .read_line(&mut line)
-                .await
-                .expect("read independently retried child gap");
+            timeout_at(
+                Instant::now() + EVENT_DEADLINE,
+                host_reader.read_line(&mut line),
+            )
+            .await
+            .expect("host read retried child gap within deadline")
+            .expect("read independently retried child gap");
             let req2: RpcRequest = serde_json::from_str(&line).expect("decode req2");
             assert_eq!(req2.method, "source.gap");
             assert_eq!(
@@ -4085,7 +4096,10 @@ mod tests {
             );
             recorded_rpc.push((req2.method.clone(), req2.params.clone()));
             held_tx.send(()).expect("signal gap held");
-            ack_rx.await.expect("wait for parent-served signal");
+            timeout_at(Instant::now() + EVENT_DEADLINE, ack_rx)
+                .await
+                .expect("ack signal within deadline")
+                .expect("wait for parent-served signal");
             let gap_ack = json!({
                 "jsonrpc": "2.0",
                 "id": req2.id,
@@ -4103,10 +4117,13 @@ mod tests {
             // before drain). Any concurrent second gap attempt while held
             // would arrive here instead and fail the method assertion.
             line.clear();
-            host_reader
-                .read_line(&mut line)
-                .await
-                .expect("read turn-after fact");
+            timeout_at(
+                Instant::now() + EVENT_DEADLINE,
+                host_reader.read_line(&mut line),
+            )
+            .await
+            .expect("host read turn-after fact within deadline")
+            .expect("read turn-after fact");
             let req3: RpcRequest = serde_json::from_str(&line).expect("decode req3");
             assert_eq!(req3.method, "events.put");
             assert_eq!(req3.params["agent_id"], "a2");
@@ -4135,6 +4152,21 @@ mod tests {
 
         let mut status_rx = status_rx;
         let driver = async {
+            // Initial state: no pending gaps (Option::None). Serves parent control.
+            let (initial_tx, initial_rx) = oneshot::channel();
+            control_tx
+                .send(Control::BeginStop { reply: initial_tx })
+                .await
+                .expect("send initial BeginStop");
+            let initial_reply = timeout_at(Instant::now() + EVENT_DEADLINE, initial_rx)
+                .await
+                .expect("initial control within bounded deadline")
+                .expect("parent control served with no pending gaps");
+            assert!(
+                initial_reply.is_ok(),
+                "BeginStop stays responsive before gaps"
+            );
+
             // Last child frame: normalization failure, gap busy. No more
             // child frames until after settle (retry is independent).
             frames_tx
@@ -4144,7 +4176,10 @@ mod tests {
                 })
                 .await
                 .expect("send last child frame");
-            held_rx.await.expect("retry started without extra frame");
+            timeout_at(Instant::now() + EVENT_DEADLINE, held_rx)
+                .await
+                .expect("held signal within bounded deadline")
+                .expect("retry started without extra frame");
 
             // Parent control served WHILE the metadata ACK is held.
             let (reply_tx, reply_rx) = oneshot::channel();
@@ -4152,8 +4187,9 @@ mod tests {
                 .send(Control::BeginStop { reply: reply_tx })
                 .await
                 .expect("send parent BeginStop");
-            let reply = reply_rx
+            let reply = timeout_at(Instant::now() + EVENT_DEADLINE, reply_rx)
                 .await
+                .expect("held control within bounded deadline")
                 .expect("parent control served while ACK held");
             assert!(reply.is_ok(), "BeginStop stays responsive");
             let held_status = status_rx.borrow_and_update().clone();
@@ -4170,10 +4206,27 @@ mod tests {
             // Now let the held ACK settle the child, then wait for the
             // loop iteration that applies it (status send follows apply).
             ack_tx.send(()).expect("release held ACK");
-            status_rx
-                .changed()
+            timeout_at(Instant::now() + EVENT_DEADLINE, status_rx.changed())
                 .await
+                .expect("status change within bounded deadline")
                 .expect("settle applied before drain");
+
+            // After canonical ACK settlement: gap_in_flight is None again; serves parent control again.
+            let (after_ack_tx, after_ack_rx) = oneshot::channel();
+            control_tx
+                .send(Control::BeginStop {
+                    reply: after_ack_tx,
+                })
+                .await
+                .expect("send parent BeginStop after ACK");
+            let after_ack_reply = timeout_at(Instant::now() + EVENT_DEADLINE, after_ack_rx)
+                .await
+                .expect("after-ack control within bounded deadline")
+                .expect("parent control served again after ACK/Option::None");
+            assert!(
+                after_ack_reply.is_ok(),
+                "BeginStop stays responsive after settlement"
+            );
 
             // Subsequent frame commits (proving writes unblocked) before
             // the producer drains (frames still open, stream Open).
@@ -4184,7 +4237,10 @@ mod tests {
                 })
                 .await
                 .expect("send turn-after frame");
-            fact_rx.await.expect("turn-after committed");
+            timeout_at(Instant::now() + EVENT_DEADLINE, fact_rx)
+                .await
+                .expect("fact signal within bounded deadline")
+                .expect("turn-after committed");
 
             let last_status = status_rx.borrow().clone();
             assert!(!last_status.source_unknown);
@@ -4196,7 +4252,10 @@ mod tests {
                 .send(Control::Close { reply: close_tx })
                 .await
                 .expect("send Close");
-            close_rx.await.expect("Close reply");
+            timeout_at(Instant::now() + EVENT_DEADLINE, close_rx)
+                .await
+                .expect("close within bounded deadline")
+                .expect("Close reply");
             last_status
         };
 
