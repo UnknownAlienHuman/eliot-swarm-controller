@@ -203,12 +203,19 @@ impl ReaderTransport {
         harness: &str,
         until: Instant,
     ) -> Result<PluginManifest> {
-        let value = self.client.call("initialize", json!({
-            "protocol": "eliot-plugin/1", "credential": self.credential,
-            "instance_dir": self.instance_dir.to_string_lossy(),
-            "store_root": self.store_root.to_string_lossy(),
-            "config": {"harness": harness},
-        }), until).await?;
+        let value = self
+            .client
+            .call(
+                "initialize",
+                json!({
+                    "protocol": "eliot-plugin/1", "credential": self.credential,
+                    "instance_dir": self.instance_dir.to_string_lossy(),
+                    "store_root": self.store_root.to_string_lossy(),
+                    "config": {"harness": harness},
+                }),
+                until,
+            )
+            .await?;
         let manifest: PluginManifest = serde_json::from_value(value)
             .map_err(|_| Error::new("unsupported", "invalid reader manifest"))?;
         if manifest.protocol != "eliot-plugin/1" || manifest.name != harness || !manifest.available

@@ -336,9 +336,7 @@ fn stable_store_dir(store_root: &Path, agent_id: &str) -> Result<PathBuf> {
             "OpenCode Agent id cannot name a stable session store",
         ));
     }
-    Ok(store_root
-        .join(format!("opencode-{agent_id}"))
-        .join("data"))
+    Ok(store_root.join(format!("opencode-{agent_id}")).join("data"))
 }
 
 /// Our config document path must appear among the effective documents:
