@@ -1800,6 +1800,7 @@ mod tests {
                 [agent_num],
             )
             .unwrap();
+        crate::tests::install_live_custody_observations(&mut store, &agent, 1, old + 2);
         store
             .put_batch(
                 SourceBatch {
@@ -1832,6 +1833,7 @@ mod tests {
                 old + 5,
             )
             .unwrap();
+        crate::tests::simulate_normal_stop_proof(&mut store, &agent, 1, old + 5);
         let resume_id = ulid_at(old + 6, 9);
         let mut resume = SubmitCommand::new(resume_id.clone(), "resume");
         resume.target = Some(agent.clone());

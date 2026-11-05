@@ -1513,6 +1513,7 @@ mod tests {
         store
             .record_source_handoff(handoff(&agent, &["session", "turn", "message"]), now + 1)
             .unwrap();
+        crate::tests::install_live_custody_observations(&mut store, &agent, 1, now + 1);
         store
             .put_batch(
                 SourceBatch {
@@ -1530,6 +1531,12 @@ mod tests {
                 },
                 now + 2,
             )
+            .unwrap();
+        crate::tests::simulate_normal_stop_proof(&mut store, &agent, 1, now + 2);
+        // The retiring-reader assertion below requires every generation-1
+        // row stale; retire the fixture OS row alongside the natives.
+        store
+            .set_process_source_status(&agent, 1, "stale", true, now + 2)
             .unwrap();
         let resume_id = Ulid::new().to_string();
         store

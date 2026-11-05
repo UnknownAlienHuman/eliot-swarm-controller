@@ -543,7 +543,14 @@ fn retained_ready_resume_unknown_without_git_marker_does_not_fence_fetch() {
     let mut store = open_store();
     let registration = register_repository(&mut store, now);
     let resume_workspace = ready_workspace(&mut store, &registration, "resume", now + 10);
+    crate::tests::install_live_custody_observations(
+        &mut store,
+        &resume_workspace.agent,
+        1,
+        now + 10,
+    );
     end_session(&mut store, &resume_workspace, now + 30);
+    crate::tests::simulate_normal_stop_proof(&mut store, &resume_workspace.agent, 1, now + 30);
 
     let resume_id = Ulid::new().to_string();
     let mut resume = SubmitCommand::new(resume_id.clone(), "resume");

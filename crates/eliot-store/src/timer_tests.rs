@@ -347,6 +347,7 @@ fn ready_agent_with_workspace(
 
 fn end_timer_agent(store: &mut Store, agent: &str, now: i64) {
     let generation = store.get_agent(agent).unwrap().unwrap().generation;
+    crate::tests::install_live_custody_observations(store, agent, generation, now);
     let native_id = format!("timer-resume-ended-{agent}");
     store
         .put_batch(
@@ -366,6 +367,7 @@ fn end_timer_agent(store: &mut Store, agent: &str, now: i64) {
             now,
         )
         .unwrap();
+    crate::tests::simulate_normal_stop_proof(store, agent, generation, now);
 }
 
 fn apply_timer_resume(

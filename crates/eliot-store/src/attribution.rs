@@ -741,8 +741,10 @@ mod tests {
     }
 
     fn resume_agent(store: &mut Store, agent: &str, now: i64) {
-        // A terminal native fact proves the old custody closed, so the
-        // resume admits instead of blocking on its retained reservation.
+        // The terminal fact alone keeps the reservation: install the live
+        // custody observations first, then prove the owned exit after the
+        // End so the resume admits instead of blocking on retention.
+        crate::tests::install_live_custody_observations(store, agent, 1, now);
         store
             .put_batch(
                 SourceBatch {
@@ -761,6 +763,7 @@ mod tests {
                 now,
             )
             .expect("commit terminal session fact");
+        crate::tests::simulate_normal_stop_proof(store, agent, 1, now);
         let resume_id = Ulid::new().to_string();
         store
             .submit(
