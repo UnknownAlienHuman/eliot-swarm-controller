@@ -292,8 +292,8 @@ impl ChildState {
 #[derive(Default)]
 struct ChildThreads {
     confirmed: HashSet<String>,
-    pending_spawns: HashSet<String>,
-    unconfirmed: HashSet<String>,
+    pending_spawns: HashMap<String, HashSet<String>>,
+    unconfirmed: HashMap<String, Option<String>>,
     bound: HashSet<String>,
     parents: HashMap<String, String>,
     spawn_items: HashMap<String, String>,
@@ -304,14 +304,58 @@ impl ChildThreads {
         if self.confirmed.contains(thread) || self.bound.contains(thread) {
             return Ok(true);
         }
-        if self.pending_spawns.is_empty() {
+        if !self.has_any_window() {
             return Ok(false);
         }
-        if self.unconfirmed.len() >= MAX_CHILD_THREADS && !self.unconfirmed.contains(thread) {
+        if self.unconfirmed.len() >= MAX_CHILD_THREADS && !self.unconfirmed.contains_key(thread) {
             return Err("Codex sent frames from more unannounced threads than are tracked");
         }
-        self.unconfirmed.insert(thread.to_owned());
+        self.unconfirmed.insert(thread.to_owned(), None);
         Ok(true)
+    }
+    fn has_any_window(&self) -> bool {
+        self.has_pending()
+    }
+    fn has_pending(&self) -> bool {
+        self.pending_spawns.values().any(|items| !items.is_empty())
+    }
+    fn pending_count(&self) -> usize {
+        self.pending_spawns.values().map(HashSet::len).sum()
+    }
+    fn pending_items<'a>(&'a self, producer: &'a str) -> Vec<&'a String> {
+        self.pending_spawns
+            .get(producer)
+            .map(|items| items.iter().collect::<Vec<_>>())
+            .unwrap_or_default()
+    }
+    fn producers(&self) -> Vec<String> {
+        self.pending_spawns
+            .iter()
+            .filter(|(_, items)| !items.is_empty())
+            .map(|(producer, _)| producer.clone())
+            .collect()
+    }
+    fn settle_all(&mut self) -> std::result::Result<(), &'static str> {
+        let producers = self.producers();
+        if producers.is_empty() && self.unconfirmed.is_empty() {
+            return Ok(());
+        }
+        if producers.is_empty() {
+            self.unconfirmed.clear();
+            return Err("Codex sent frames from a thread no spawn announced");
+        }
+        let mut error = None;
+        for producer in &producers {
+            if let Err(reason) = self.settle(producer)
+                && error.is_none()
+            {
+                error = Some(reason);
+            }
+        }
+        match error {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
     }
 
     fn is_parent(&self, owned: &str, parent: &str) -> bool {
@@ -331,42 +375,68 @@ impl ChildThreads {
         Ok(())
     }
 
-    fn spawn_started(&mut self, item_id: String) -> std::result::Result<(), &'static str> {
-        if self.pending_spawns.len() >= MAX_CHILD_THREADS && !self.pending_spawns.contains(&item_id)
-        {
+    fn spawn_started(
+        &mut self,
+        producer: &str,
+        item_id: String,
+    ) -> std::result::Result<(), &'static str> {
+        let known = self
+            .pending_spawns
+            .get(producer)
+            .is_some_and(|items| items.contains(&item_id));
+        if self.pending_count() >= MAX_CHILD_THREADS && !known {
             return Err("Codex had more native spawns in flight than are tracked");
         }
-        self.pending_spawns.insert(item_id);
+        self.pending_spawns
+            .entry(producer.to_owned())
+            .or_default()
+            .insert(item_id);
         Ok(())
     }
 
     fn spawn_completed(
         &mut self,
+        producer: &str,
         owned: &str,
         item_id: &str,
         receivers: &[String],
     ) -> std::result::Result<(), &'static str> {
-        self.pending_spawns.remove(item_id);
+        if let Some(items) = self.pending_spawns.get_mut(producer) {
+            items.remove(item_id);
+        }
         for receiver in receivers {
             self.confirm(owned, receiver)?;
             self.spawn_items
                 .insert(receiver.clone(), item_id.to_owned());
         }
-        if self.pending_spawns.is_empty() {
-            return self.settle();
+        let items = self.pending_spawns.get(producer);
+        if items.is_none_or(|items| items.is_empty()) {
+            return self.settle(producer);
         }
         Ok(())
     }
 
-    /// No spawn can confirm a thread any more (last spawn done, turn ended or
-    /// stream closed): an unconfirmed thread was never a child.
-    fn settle(&mut self) -> std::result::Result<(), &'static str> {
-        self.pending_spawns.clear();
-        if self.unconfirmed.is_empty() {
+    fn settle(&mut self, producer: &str) -> std::result::Result<(), &'static str> {
+        self.settle_with_retain(producer, false)
+    }
+
+    fn settle_with_retain(
+        &mut self,
+        producer: &str,
+        retain_unattributed: bool,
+    ) -> std::result::Result<(), &'static str> {
+        self.pending_spawns.remove(producer);
+        if retain_unattributed {
             return Ok(());
         }
-        self.unconfirmed.clear();
-        Err("Codex sent frames from a thread no spawn announced")
+        if self.producers().is_empty() {
+            let count = self.unconfirmed.len();
+            self.unconfirmed.clear();
+            if count > 0 {
+                return Err("Codex sent frames from a thread no spawn announced");
+            }
+        }
+        Ok(())
     }
 
     fn is_bound(&self, thread: &str) -> bool {
@@ -374,7 +444,11 @@ impl ChildThreads {
     }
 
     fn is_unconfirmed(&self, thread: &str) -> bool {
-        self.unconfirmed.contains(thread)
+        self.unconfirmed.contains_key(thread)
+    }
+
+    fn has_spawn_window(&self) -> bool {
+        self.has_pending()
     }
 
     fn parent_of(&self, thread: &str) -> Option<String> {
@@ -693,15 +767,35 @@ impl EventProcessor {
     }
 
     fn settle_spawn_window(&mut self) {
-        if let Err(reason) = self.children.settle() {
+        self.settle_spawn_window_for(self.status.thread_id.clone().unwrap_or_default().as_str());
+    }
+
+    fn retain_unattributed_excluding(&self, excluding: &str) -> bool {
+        self.child_states
+            .iter()
+            .any(|(thread, state)| thread != excluding && state.active_turn_id.is_some())
+    }
+
+    fn settle_spawn_window_for(&mut self, producer: &str) {
+        let retain = self.retain_unattributed_excluding(producer);
+        if let Err(reason) = self.children.settle_with_retain(producer, retain) {
             self.defer_gap(reason);
         }
         self.collect_orphan_child_state();
     }
 
     fn settle_child_tracking(&mut self) {
-        if let Err(reason) = self.children.settle() {
-            self.defer_gap(reason);
+        let producers: Vec<String> = self.children.producers();
+        if producers.is_empty() {
+            if let Err(reason) = self.children.settle_all() {
+                self.defer_gap(reason);
+            }
+        } else {
+            for producer in &producers {
+                if let Err(reason) = self.children.settle(producer) {
+                    self.defer_gap(reason);
+                }
+            }
         }
         self.collect_orphan_child_state();
         if !self.child_pending.is_empty() {
@@ -753,12 +847,14 @@ impl EventProcessor {
             return Ok(());
         };
         if !completed {
-            return match self.children.spawn_started(item_id) {
+            return match self.children.spawn_started(&owned, item_id) {
                 Ok(()) => Ok(()),
                 Err(reason) => self.record_gap(reason).await,
             };
         }
-        let outcome = self.children.spawn_completed(&owned, &item_id, &receivers);
+        let outcome = self
+            .children
+            .spawn_completed(&owned, &owned, &item_id, &receivers);
         for receiver in &receivers {
             if self.children.is_bound(receiver) {
                 self.children
@@ -1658,8 +1754,13 @@ impl EventProcessor {
                     .and_then(spawned_item_id)
                     .map(str::to_owned)
                     .or_else(|| {
-                        if self.children.pending_spawns.len() == 1 {
-                            self.children.pending_spawns.iter().next().cloned()
+                        let producers = self.children.producers();
+                        if producers.len() == 1 {
+                            self.children
+                                .pending_items(producers[0].as_str())
+                                .into_iter()
+                                .next()
+                                .cloned()
                         } else {
                             None
                         }
@@ -2437,6 +2538,7 @@ impl EventProcessor {
                     "Codex child turn/completed schema mismatch",
                 )
             })?;
+        self.settle_spawn_window_for(child_thread);
         let host = self.host.clone();
         let credential = self.credential.clone();
         let sink = &mut self.sink;
@@ -2487,13 +2589,15 @@ impl EventProcessor {
             return Ok(());
         };
         if !completed {
-            return match self.children.spawn_started(item_id) {
+            return match self.children.spawn_started(parent_thread, item_id) {
                 Ok(()) => Ok(()),
                 Err(reason) => self.record_child_spawn_gap(parent_thread, reason).await,
             };
         }
         let owned = self.status.thread_id.as_deref().unwrap_or(parent_thread);
-        let outcome = self.children.spawn_completed(owned, &item_id, &receivers);
+        let outcome = self
+            .children
+            .spawn_completed(parent_thread, owned, &item_id, &receivers);
         for receiver in &receivers {
             if self.children.is_bound(receiver) {
                 self.children
@@ -2934,19 +3038,23 @@ mod tests {
         // No spawn in flight: an unknown thread is not taken (caller gaps it).
         assert_eq!(children.take_frame("x"), Ok(false));
 
-        children.spawn_started("call-1".to_owned()).unwrap();
-        children.spawn_started("call-2".to_owned()).unwrap();
+        children
+            .spawn_started("owned", "call-1".to_owned())
+            .unwrap();
+        children
+            .spawn_started("owned", "call-2".to_owned())
+            .unwrap();
         assert_eq!(children.take_frame("child-1"), Ok(true));
         assert_eq!(children.take_frame("child-2"), Ok(true));
         // The first spawn confirms its receiver; the second is still pending.
         assert_eq!(
-            children.spawn_completed("owned", "call-1", &["child-1".to_owned()]),
+            children.spawn_completed("owned", "owned", "call-1", &["child-1".to_owned()]),
             Ok(())
         );
         assert_eq!(children.take_frame("child-1"), Ok(true));
         // child-2 was never named by a spawn: the last completion gaps it.
         assert_eq!(
-            children.spawn_completed("owned", "call-2", &[]),
+            children.spawn_completed("owned", "owned", "call-2", &[]),
             Err("Codex sent frames from a thread no spawn announced")
         );
         assert_eq!(children.take_frame("child-2"), Ok(false));
@@ -2957,14 +3065,14 @@ mod tests {
     #[test]
     fn child_threads_settle_a_stuck_spawn_and_refuse_the_owned_thread() {
         let mut children = ChildThreads::default();
-        children.spawn_started("call".to_owned()).unwrap();
-        assert_eq!(children.settle(), Ok(()));
+        children.spawn_started("owned", "call".to_owned()).unwrap();
+        assert_eq!(children.settle("owned"), Ok(()));
         assert_eq!(children.take_frame("late"), Ok(false));
 
-        children.spawn_started("call".to_owned()).unwrap();
+        children.spawn_started("owned", "call".to_owned()).unwrap();
         assert_eq!(children.take_frame("orphan"), Ok(true));
         assert_eq!(
-            children.settle(),
+            children.settle("owned"),
             Err("Codex sent frames from a thread no spawn announced")
         );
         assert_eq!(
@@ -2976,7 +3084,7 @@ mod tests {
     #[test]
     fn child_threads_are_bounded() {
         let mut children = ChildThreads::default();
-        children.spawn_started("call".to_owned()).unwrap();
+        children.spawn_started("owned", "call".to_owned()).unwrap();
         for index in 0..MAX_CHILD_THREADS {
             assert_eq!(children.take_frame(&format!("t{index}")), Ok(true));
         }
@@ -2987,9 +3095,15 @@ mod tests {
         }
         assert!(children.confirm("owned", "c-extra").is_err());
         for index in 1..MAX_CHILD_THREADS {
-            children.spawn_started(format!("call-{index}")).unwrap();
+            children
+                .spawn_started("owned", format!("call-{index}"))
+                .unwrap();
         }
-        assert!(children.spawn_started("call-extra".to_owned()).is_err());
+        assert!(
+            children
+                .spawn_started("owned", "call-extra".to_owned())
+                .is_err()
+        );
     }
 
     #[test]
@@ -3354,9 +3468,10 @@ mod tests {
     #[tokio::test]
     async fn child_buffer_overflow_releases_bytes_without_suppressing_identity() {
         let (_native, mut processor) = child_test_processor().await;
+        processor.status.thread_id = Some("owned".to_owned());
         processor
             .children
-            .spawn_started("call-1".to_owned())
+            .spawn_started("owned", "call-1".to_owned())
             .expect("spawn window");
         assert_eq!(processor.children.take_frame("child-1"), Ok(true));
         for _ in 0..EARLY_EVENT_LIMIT {
@@ -3443,7 +3558,11 @@ mod tests {
                 .is_some_and(|failure| failure.contains("omitted turn id"))
         );
         assert!(
-            processor.children.pending_spawns.contains("call-nested"),
+            processor
+                .children
+                .pending_spawns
+                .get("child-1")
+                .is_some_and(|items| items.contains("call-nested")),
             "remainder is processed, not dropped"
         );
         assert!(!processor.child_buffers.contains_key("child-1"));
@@ -4386,7 +4505,7 @@ mod tests {
         processor.status.thread_id = Some("owned".to_owned());
         processor
             .children
-            .spawn_started("call-1".to_owned())
+            .spawn_started("owned", "call-1".to_owned())
             .unwrap();
         for index in 0..MAX_CHILD_THREADS {
             let thread = format!("t{index}");
@@ -4420,5 +4539,155 @@ mod tests {
         assert!(!processor.child_buffers.contains_key("t1"));
         assert!(!processor.child_buffers.contains_key("t-rejected"));
         assert!(processor.child_buffers.len() <= MAX_CHILD_THREADS);
+    }
+
+    #[test]
+    fn child_window_settle_is_producer_scoped() {
+        let mut children = ChildThreads::default();
+        children
+            .spawn_started("owned", "call-root".to_owned())
+            .unwrap();
+        children
+            .spawn_started("child-a", "call-nested".to_owned())
+            .unwrap();
+        assert_eq!(children.take_frame("child-b"), Ok(true));
+        assert_eq!(children.settle("owned"), Ok(()));
+        assert!(children.is_unconfirmed("child-b"));
+        assert!(children.has_spawn_window());
+        assert_eq!(
+            children.spawn_completed("child-a", "owned", "call-nested", &["child-b".to_owned()]),
+            Ok(())
+        );
+        assert!(children.is_bound("child-b"));
+        assert!(!children.has_spawn_window());
+    }
+
+    #[tokio::test]
+    async fn nested_spawn_survives_root_completion() {
+        let (_native, mut processor) = child_test_processor().await;
+        processor.status.thread_id = Some("root".to_owned());
+        processor.status.active_turn_id = Some("turn-r".to_owned());
+        processor.status.active_command_id = Some("cmd-r".to_owned());
+        processor.native_scope = "codex:test".to_owned();
+        processor.children.confirm("root", "a").unwrap();
+        processor.agent_id = "a1".to_owned();
+        processor.generation = 1;
+        let reg_a = build_registration("call-a", "a1", 1, "root", "codex:test", "a");
+        let mut state_a = ChildState::new(ChildBinding {
+            registration: reg_a,
+            agent_id: "a2".to_owned(),
+            agent_generation: 1,
+            native_ref: "a".to_owned(),
+        });
+        state_a.ready_committed = true;
+        state_a.active_turn_id = Some("turn-a".to_owned());
+        processor.child_states.insert("a".to_owned(), state_a);
+        processor
+            .children
+            .parents
+            .insert("a".to_owned(), "root".to_owned());
+        processor
+            .children
+            .spawn_items
+            .insert("a".to_owned(), "call-a".to_owned());
+        processor
+            .children
+            .spawn_started("root", "call-root".to_owned())
+            .unwrap();
+        assert_eq!(processor.children.take_frame("b"), Ok(true));
+        processor.buffer_child_frame(
+            "b",
+            BufferedNativeFrame::Notification {
+                method: "turn/started".to_owned(),
+                params: json!({"threadId": "b", "turn": {"id": "turn-b"}}),
+            },
+        );
+        processor.writes_blocked = true;
+        let params = json!({
+            "threadId": "root",
+            "turn": {"id": "turn-r", "items": [], "status": "completed"},
+        });
+        let _ = processor.complete_turn(params).await;
+        assert!(processor.children.is_unconfirmed("b"));
+        assert!(processor.child_buffers.contains_key("b"));
+        assert!(!processor.child_early_lost.contains("b"));
+        processor
+            .children
+            .spawn_started("a", "call-b".to_owned())
+            .unwrap();
+        processor.writes_blocked = false;
+        processor.children.confirm("root", "b").unwrap();
+        processor
+            .children
+            .parents
+            .insert("b".to_owned(), "a".to_owned());
+        processor
+            .children
+            .spawn_items
+            .insert("b".to_owned(), "call-b".to_owned());
+        let reg_b = processor.child_registration_for("b").unwrap();
+        assert_eq!(reg_b.parent_id, "a2");
+        assert_eq!(reg_b.parent_native_ref, "a");
+        assert_eq!(reg_b.native_ref, "b");
+        if let Some(state) = processor.child_states.get_mut("a") {
+            state.active_turn_id = None;
+        }
+        processor.settle_spawn_window_for("a");
+        assert!(processor.children.is_bound("b"));
+    }
+
+    #[tokio::test]
+    async fn nested_spawn_survives_root_completion_when_a_writes_blocked() {
+        let (_native, mut processor) = child_test_processor().await;
+        processor.status.thread_id = Some("root".to_owned());
+        processor.status.active_turn_id = Some("turn-r".to_owned());
+        processor.status.active_command_id = Some("cmd-r".to_owned());
+        processor.native_scope = "codex:test".to_owned();
+        processor.children.confirm("root", "a").unwrap();
+        processor.agent_id = "a1".to_owned();
+        processor.generation = 1;
+        let reg_a = build_registration("call-a", "a1", 1, "root", "codex:test", "a");
+        let mut state_a = ChildState::new(ChildBinding {
+            registration: reg_a,
+            agent_id: "a2".to_owned(),
+            agent_generation: 1,
+            native_ref: "a".to_owned(),
+        });
+        state_a.active_turn_id = Some("turn-a".to_owned());
+        state_a.writes_blocked = true;
+        processor.child_states.insert("a".to_owned(), state_a);
+        processor
+            .children
+            .parents
+            .insert("a".to_owned(), "root".to_owned());
+        processor
+            .children
+            .spawn_items
+            .insert("a".to_owned(), "call-a".to_owned());
+        processor
+            .children
+            .spawn_started("root", "call-root".to_owned())
+            .unwrap();
+        assert_eq!(processor.children.take_frame("b"), Ok(true));
+        processor.buffer_child_frame(
+            "b",
+            BufferedNativeFrame::Notification {
+                method: "turn/started".to_owned(),
+                params: json!({"threadId": "b", "turn": {"id": "turn-b"}}),
+            },
+        );
+        processor.writes_blocked = true;
+        let params = json!({
+            "threadId": "root",
+            "turn": {"id": "turn-r", "items": [], "status": "completed"},
+        });
+        let _ = processor.complete_turn(params).await;
+        assert!(processor.children.is_unconfirmed("b"));
+        assert!(processor.child_buffers.contains_key("b"));
+        assert!(!processor.child_early_lost.contains("b"));
+        processor
+            .children
+            .spawn_started("a", "call-b".to_owned())
+            .unwrap();
     }
 }
