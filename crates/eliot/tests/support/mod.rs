@@ -22,6 +22,24 @@ const MAX_ERROR_SNIPPET_CHARS: usize = 240;
 static CURRENTLY_STARTING_DAEMONS_PER_PROCESS: AtomicUsize = AtomicUsize::new(0);
 static PEAK_STARTING_DAEMONS_PER_PROCESS: AtomicUsize = AtomicUsize::new(0);
 
+pub const AMBIENT_IDENTITY_ENV_KEYS: &[&str] = &[
+    "ELIOT_AGENT_ID",
+    "ELIOT_AGENT_GENERATION",
+    "ELIOT_AGENT_TOKEN",
+    "ELIOT_OWNER_ID",
+    "ELIOT_OWNER_TOKEN",
+    "ELIOT_OWNER_CREDENTIAL",
+    "ELIOT_RUN_COMMAND_ID",
+    "ELIOT_RUN_TOKEN",
+];
+
+pub fn scrub_ambient_identity(command: &mut Command) -> &mut Command {
+    for &key in AMBIENT_IDENTITY_ENV_KEYS {
+        command.env_remove(key);
+    }
+    command
+}
+
 struct DaemonStartGuard;
 
 impl DaemonStartGuard {
@@ -277,6 +295,7 @@ pub fn run(command: Command) -> Reply {
 
 pub fn cli(data: &Path, args: &[&str]) -> Reply {
     let mut command = Command::new(CLI);
+    scrub_ambient_identity(&mut command);
     command.args([
         OsStr::new("--data-dir"),
         data.as_os_str(),
@@ -318,6 +337,7 @@ impl Fixture {
         let mut data_argument = self.data.as_os_str().to_os_string();
         data_argument.push(std::path::MAIN_SEPARATOR_STR);
         let mut command = Command::new(CLI);
+        scrub_ambient_identity(&mut command);
         command
             .arg("--data-dir")
             .arg(data_argument)
