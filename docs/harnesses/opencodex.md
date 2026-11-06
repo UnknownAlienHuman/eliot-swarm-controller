@@ -31,7 +31,11 @@ max_live = 8
 If api_key_env is set, the selected profile must explicitly allow that variable name in
 pass_env. Its value remains runtime-only and is not used for readiness.
 
-The profile explicitly selects this proxy and may name an account. The frozen snapshot
+The profile explicitly selects this proxy and may name an account. Reasoning
+effort is optional on this route: a profile that omits `effort` preserves the
+provider/native default by omitting the native effort wire fields, and the
+effective native readback is reported separately; Eliot never fabricates a
+`medium`/`xhigh` value for an omitted effort. The frozen snapshot
 captures the selected names, optional shared Core `RouteBinding`, and configured
 `CapacityScope` values. The canonical Core DTOs own their field catalog. `None` means
 unlimited; `max_live = 0` disables that configured scope. These local workload limits

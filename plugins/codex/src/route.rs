@@ -216,18 +216,25 @@ impl CodexRoute {
         }
     }
 
-    pub(super) fn explicit_effort(&self, effort: Option<&str>) -> Result<String> {
+    /// Carry the profile effort as an option: an omitted effort preserves the
+    /// provider/native default by omitting the native wire field entirely.
+    /// A present effort is validated for shape only on this route; effort
+    /// support is enforced by the provider, not fabricated here.
+    pub(super) fn optional_effort(&self, effort: Option<&str>) -> Result<Option<String>> {
         if self.requires_chatgpt() {
             return Err(route_error(
                 "direct route effort requires its advertised-model check",
             ));
         }
-        effort
-            .filter(|effort| !effort.trim().is_empty() && !effort.chars().any(char::is_control))
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                route_error("named Responses routes require an explicit nonempty reasoning effort")
-            })
+        match effort {
+            None => Ok(None),
+            Some(effort) if !effort.trim().is_empty() && !effort.chars().any(char::is_control) => {
+                Ok(Some(effort.to_owned()))
+            }
+            Some(_) => Err(route_error(
+                "named Responses route effort must be a non-empty reasoning effort",
+            )),
+        }
     }
 }
 
@@ -439,14 +446,14 @@ mod tests {
     }
 
     #[test]
-    fn named_route_requires_explicit_effort_and_rejects_hidden_authentication() {
+    fn named_route_keeps_explicit_effort_optional() {
         let route = named(None);
         assert_eq!(
-            route.explicit_effort(Some("custom-effort")).unwrap(),
-            "custom-effort"
+            route.optional_effort(Some("custom-effort")).unwrap(),
+            Some("custom-effort".to_owned())
         );
-        assert!(route.explicit_effort(None).is_err());
-        assert!(route.explicit_effort(Some(" \n ")).is_err());
+        assert_eq!(route.optional_effort(None).unwrap(), None);
+        assert!(route.optional_effort(Some(" \n ")).is_err());
         route.verify_config(&named_config(None), &[]).unwrap();
 
         for field in [
