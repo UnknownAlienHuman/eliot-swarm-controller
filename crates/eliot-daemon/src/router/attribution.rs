@@ -774,10 +774,10 @@ mod tests {
         );
 
         // Free both holders' notice gates before replaying: without this
-        // the shared cooldown would suppress a second notify on its own
-        // and the replay assertion below would pass even with the router's
-        // replay guard removed. With the gates free, only the guard — no
-        // events, no notify — keeps the send count at two.
+        // the open notice command would suppress a second notify on its
+        // own and the replay assertion below would pass even with the
+        // router's replay guard removed. With the gates free, only the
+        // guard — no events, no notify — keeps the send count at two.
         for holder in [&a, &b] {
             let open = store
                 .notice_state(holder)

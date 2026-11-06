@@ -1,7 +1,8 @@
 # Muse Code
 
-Optional L6 adapter, implemented when selected. Use the official MSP SDK/transport in
-one per-Agent plugin and Muse host; do not make Muse a dependency of the first Codex path.
+Implemented and selected L6 adapter (selected by the owner 2026-11-03, roadmap L6.4).
+Use the official MSP SDK/transport in one per-Agent plugin and Muse host;
+do not make Muse a dependency of the first Codex path.
 
 Source: [meta-models/muse-code-sdk](https://github.com/meta-models/muse-code-sdk).
 Inherited 2026-10-25 notes refer to MSP v1 / Muse 1.4. Verify installed host/SDK pairing,
