@@ -72,7 +72,9 @@ FIFO. The claimed `send` carries an explicit structured `notice_kind`
 wrongly typed or other value is invalid, with no inferred default, while
 normal sends never inspect it. Mail revalidates the busy, pending and
 unknown gates at admission via its open-notice identity; the Store never
-parses notice text. Deferred mail re-offers on idle through the same
+parses notice text. Internal `notice_kind` remains Store admission metadata
+and is stripped at daemon dispatch, so vendor plugins receive only text arguments.
+Deferred mail re-offers on idle through the same
 atomic claim; no cooldown is spent while deferred. A claim preserves the
 prior `last_notice_at` (0 until first presentation), a failed admission
 clears only the open claim, restart recovery clears only commandless

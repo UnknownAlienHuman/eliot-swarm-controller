@@ -2121,14 +2121,15 @@ fn record_plugin_error(
 }
 
 fn plugin_command_args(command: &Command) -> Result<Value> {
-    if !command.args.is_object() {
-        return Err(Error::new(
-            "invalid",
-            "plugin command args must be an object",
-        ));
-    }
+    let mut args = command
+        .args
+        .as_object()
+        .cloned()
+        .ok_or_else(|| Error::new("invalid", "plugin command args must be an object"))?;
     match command.verb.as_str() {
-        "send" => {}
+        "send" => {
+            args.remove("notice_kind");
+        }
         "steer" | "interrupt" => {
             command.turn_id.as_ref().ok_or_else(|| {
                 Error::new("stale_generation", "turn control has no captured turn id")
@@ -2150,7 +2151,7 @@ fn plugin_command_args(command: &Command) -> Result<Value> {
             ));
         }
     }
-    Ok(command.args.clone())
+    Ok(Value::Object(args))
 }
 
 fn validate_agent_command_result(value: Value, verb: &str) -> Result<Value> {
