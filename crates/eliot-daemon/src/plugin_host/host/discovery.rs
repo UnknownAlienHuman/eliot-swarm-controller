@@ -71,6 +71,7 @@ impl PluginHost {
         profile: Value,
         native_scope: Option<String>,
         cursor: Option<String>,
+        archived: bool,
         limit: usize,
     ) -> Result<Value> {
         if !(1..=1_000).contains(&limit) {
@@ -105,7 +106,15 @@ impl PluginHost {
         let (reply, response) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let completion = host
-                .read_subject_page(profile, environment, native_scope, cursor, limit, stop_rx)
+                .read_subject_page(
+                    profile,
+                    environment,
+                    native_scope,
+                    cursor,
+                    archived,
+                    limit,
+                    stop_rx,
+                )
                 .await;
             host.finish_metadata_reader(&id, done_tx, completion.cleanup);
             let _ = reply.send(completion.result);
@@ -303,6 +312,7 @@ impl PluginHost {
         environment: Value,
         native_scope: Option<String>,
         cursor: Option<String>,
+        archived: bool,
         limit: usize,
         mut stop: watch::Receiver<Option<Instant>>,
     ) -> MetadataRead<Value> {
@@ -355,7 +365,8 @@ impl PluginHost {
                     "discover",
                     json!({
                         "profile": profile, "target_environment": environment,
-                        "native_scope": native_scope, "cursor": cursor, "limit": limit,
+                        "native_scope": native_scope, "cursor": cursor,
+                        "archived": archived, "limit": limit,
                     }),
                     until,
                 )

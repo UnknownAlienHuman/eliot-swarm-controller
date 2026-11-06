@@ -1906,7 +1906,13 @@ impl Router {
         let raw = self
             .inner
             .plugin_host
-            .discover(profile, request.native_scope, request.cursor, request.limit)
+            .discover(
+                profile,
+                request.native_scope,
+                request.cursor,
+                request.archived,
+                request.limit,
+            )
             .await?;
         let page: DiscoverPage = serde_json::from_value(raw).map_err(|_| {
             Error::new(

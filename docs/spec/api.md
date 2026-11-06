@@ -557,18 +557,24 @@ nonemptiness after trimming but are preserved as supplied. For `agent.discover`,
 `agent.history`, the same applies to optional `generation`, `turn_id` and `cursor`.
 Wrong types are `invalid`. `limit` defaults to 100 only when omitted and must be an
 integer from 1 through 1,000; explicit `null`, wrong types and out-of-range values are
-`invalid`. Unknown request fields are `invalid`.
+`invalid`. Optional `archived` defaults to `false` when omitted; a non-boolean value is
+`invalid`. `archived:true` is an explicit caller selection of archived native subjects;
+the default selects nonarchived subjects. Unknown request fields are `invalid`.
 
 Discovery scope is limited to 512 bytes and rejects control characters. Its cursor is
 limited to 16 KiB and rejects control characters. Pass that opaque cursor unchanged; it
 is bound to the selected profile, target environment, verified native store, scope,
-method, fixed native-list filters, ordering and page size. Changed store selection
+method, fixed native-list filters (including `archived`), ordering and page size. Changed store selection
 rejects before listing subjects. Unverified selection is an explicit error.
 `coverage.complete` means this paged enumeration
 has reached its native end, not that it is a consistent snapshot or a live subscription.
+For Codex it covers only the subjects the SDK query returns — for archived selection,
+retained archives — not all raw database or history rows and not a capacity proof.
 Codex coverage is `state_db_only`; it never scans/repairs rollout storage to fill the
-list. The current Codex query selects nonarchived threads and fixes the page size in
-its cursor binding. Subject timestamps are milliseconds since the Unix epoch; native
+list. The Codex query selects archived threads only when `archived:true` is explicit
+and nonarchived threads by default, and fixes the page size in its cursor binding;
+a cursor from one selection never continues the other. Archived discovery returns
+the same bounded metadata only and performs no unarchive, resume or control operation. Subject timestamps are milliseconds since the Unix epoch; native
 seconds are converted before projection. Session previews, prompts and transcripts are
 excluded. Native `notLoaded` is reported as unknown: a separate reader cannot prove
 another process's session stopped.
@@ -850,7 +856,7 @@ swarm timer show ID [--project PROJECT] | run ID [--project PROJECT]
 swarm goal set A --text TEXT --check CMD [ARGS...] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--max-turns N] [--max-rounds N] [--max-without-progress N] [--cadence-ms MS]
 swarm goal show|pause|clear|resume A [--mode eliot|native] [--reason R]
 swarm goal round A (--idle-seq SEQ | --slot N) [--mode eliot|native]
-swarm discover --profile P [--harness H] [--scope S] [--cursor C] [--limit N]
+swarm discover --profile P [--harness H] [--scope S] [--cursor C] [--archived] [--limit N]
 swarm attach --profile P --harness H --scope S --ref R [--project LABEL]
 swarm history A --view subject|turns|items [--source native|rollout] [--turn-id ID] [--cursor C] [--limit N]
 swarm detach A [--generation N]

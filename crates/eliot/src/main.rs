@@ -131,6 +131,8 @@ enum CliCommand {
         scope: Option<String>,
         #[arg(long, value_name = "CURSOR")]
         cursor: Option<String>,
+        #[arg(long)]
+        archived: bool,
         #[command(flatten)]
         page: PageArgs,
     },
@@ -1285,6 +1287,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             harness,
             scope,
             cursor,
+            archived,
             page: PageArgs { limit },
         } => {
             validate_limit(limit)?;
@@ -1293,6 +1296,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 harness,
                 native_scope: scope,
                 cursor,
+                archived,
                 limit,
             };
             read_and_print!("agent.discover", params, DiscoverPage)

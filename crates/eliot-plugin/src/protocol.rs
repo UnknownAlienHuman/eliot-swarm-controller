@@ -164,6 +164,8 @@ pub struct DiscoverParams {
     pub native_scope: Option<String>,
     #[serde(default)]
     pub cursor: Option<String>,
+    #[serde(default)]
+    pub archived: bool,
     pub limit: usize,
 }
 

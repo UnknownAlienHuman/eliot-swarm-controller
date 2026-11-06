@@ -20,9 +20,9 @@ status.
 `show AGENT` includes the same observation view. Missing or stale counters are null,
 and process activity never counts as model progress.
 
-`discover --profile PROFILE [--scope SCOPE] [--cursor CURSOR] [--limit N]` reads a
+`discover --profile PROFILE [--scope SCOPE] [--cursor CURSOR] [--archived] [--limit N]` reads a
 bounded native session metadata page through the selected profile. It creates no
-Agent and sends no prompt. Codex enumeration is state-DB-only; previews and transcripts
+Agent and sends no prompt; `--archived` explicitly selects archived Codex subjects. Codex enumeration is state-DB-only; previews and transcripts
 are excluded, and reader-local `notLoaded` remains unknown. Pass `next_cursor` unchanged
 to continue; `coverage.complete` reports enumeration exhaustion, not live coverage.
 `processes AGENT --scope workspace` selects the managed preparation's target generation,
