@@ -80,10 +80,10 @@ missed watcher notifications. Already admitted commands retain their original in
 ### Retention and bounded backlog
 
 The [Core retention contract](core.md#retention) makes enabled current/retiring cursors
-pin the events they still need; disabled rules pin nothing. Physical event/command
-pruning remains a separate unchecked roadmap increment. The implemented backlog policy
-bounds rule work and releases retention pins; it does not itself delete history.
-Daemon startup validates `automation.max_event_backlog` before readiness. The
+pin the events they still need; disabled rules pin nothing.
+Physical retention is implemented by bounded Store cleanup during daemon maintenance.
+The implemented backlog policy bounds rule work and releases retention pins; it does not
+itself delete history. Daemon startup validates `automation.max_event_backlog` before readiness. The
 rule worker reloads it during startup and each two-second reconciliation, applying the
 current value to both global and registered-project rule lanes. An invalid runtime reload
 reports a bounded diagnostic and retains the last valid value; an invalid initial value
@@ -91,7 +91,7 @@ prevents startup. When high-water exceeds the oldest enabled current/retiring cu
 more than the configured limit, atomically record the skipped range, advance to captured
 high-water, clear retirement and pause the rule with `backlog_exceeded`. Existing
 commands continue. Explicit catch-up fails `history_gap`
-when its requested history has already been pruned. Once pruning is connected, a lagging
+when its requested history has already been pruned. A lagging
 rule cannot pin expired storage indefinitely. Rate-limit windows longer than
 command retention count only retained history.
 
