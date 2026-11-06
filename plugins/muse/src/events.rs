@@ -1109,12 +1109,9 @@ impl EventProcessor {
             if matches!(
                 prior,
                 NativeReplyState::Available | NativeReplyState::Written
-            ) {
-                let gap_before = self.gap_snapshot();
-                self.commit_offer_update(&refreshed).await?;
-                if self.gap_snapshot() != gap_before {
-                    return Ok(());
-                }
+            ) && !self.commit_offer_update(&refreshed).await?
+            {
+                return Ok(());
             }
             if let (Some(seq), Some(approval_id)) = (
                 refreshed.details.get("offer_seq").and_then(Value::as_i64),
@@ -1310,13 +1307,6 @@ impl EventProcessor {
             diag.resolved_decisive = true;
         }
         self.frame_decide_proof
-    }
-
-    /// Snapshot of the gap/blocked latches, used to tell a real persistence
-    /// success from a gap recorded in its place (`commit_offer_update`
-    /// returns `Ok` when it records a gap instead of persisting).
-    fn gap_snapshot(&self) -> (bool, bool) {
-        (self.gap_reported, self.writes_blocked)
     }
 
     /// Record non-terminal offer proof from an owning path: only with
@@ -1690,9 +1680,7 @@ impl EventProcessor {
                     // proof (terminal proof already removed the entry and
                     // persisted its resolution in the owning path). A
                     // failed or gapped persistence is never Applied.
-                    let gap_before = self.gap_snapshot();
-                    let persisted = self.commit_offer_update(&refreshed).await.is_ok()
-                        && self.gap_snapshot() == gap_before;
+                    let persisted = matches!(self.commit_offer_update(&refreshed).await, Ok(true));
                     if !persisted {
                         if let Some(entry) = self.pending_requests.get_mut(request_id) {
                             entry.reply_state = NativeReplyState::Unknown;
@@ -2269,6 +2257,14 @@ impl EventProcessor {
                 .record_gap("Muse approval resolution did not match a retained open")
                 .await;
         }
+        // The wire turn must name the exact retained turn before anything
+        // is committed, removed, or recorded as proof: a resolution for
+        // another turn never qualifies and never mutates this entry.
+        if notification.turn_id != entry.request.turn_id {
+            return self
+                .record_gap("Muse approval resolution named another turn")
+                .await;
+        }
         let turn_id = entry.request.turn_id.clone();
         // `request.resolved` binds the exact dispatched Eliot reply: an
         // acked decide, or a Writing/Unknown one the resolution itself names
@@ -2331,7 +2327,7 @@ impl EventProcessor {
         // foreign-decider resolution is decisive without being Applied.
         self.note_decide_resolved(
             notification.session_id.as_str(),
-            turn_id.as_str(),
+            notification.turn_id.as_str(),
             native_id,
             notification.decided_by_command_id.as_deref(),
             bound_to_ours,
@@ -2415,12 +2411,9 @@ impl EventProcessor {
         if matches!(
             prior,
             NativeReplyState::Available | NativeReplyState::Written
-        ) {
-            let gap_before = self.gap_snapshot();
-            self.commit_offer_update(&refreshed).await?;
-            if self.gap_snapshot() != gap_before {
-                return Ok(());
-            }
+        ) && !self.commit_offer_update(&refreshed).await?
+        {
+            return Ok(());
         }
         if let Some(seq) = refreshed.details.get("offer_seq").and_then(Value::as_i64) {
             self.note_decide_offer_proof(
@@ -2974,30 +2967,36 @@ impl EventProcessor {
             .await
     }
 
-    async fn commit_offer_update(&mut self, refreshed: &CorePending) -> Result<()> {
+    /// Persist a refreshed offer. Returns `Ok(true)` only after the actual
+    /// required `request.opened` commit succeeded. `Ok(false)` means the
+    /// call was handled but nothing was persisted (a gap was recorded, or
+    /// an oversized envelope was deferred); `Err` means the commit or gap
+    /// acknowledgement itself is unknown. Callers that need persistence
+    /// proof must require `Ok(true)` — never infer it from gap latches.
+    async fn commit_offer_update(&mut self, refreshed: &CorePending) -> Result<bool> {
         let Some(command_id) = self.status.active_command_id.clone() else {
-            return self
-                .record_gap("Muse refreshed offer arrived with no active command")
-                .await;
+            self.record_gap("Muse refreshed offer arrived with no active command")
+                .await?;
+            return Ok(false);
         };
         let (Some(seq), Some(cursor)) = (
             refreshed.details.get("offer_seq").and_then(Value::as_i64),
             refreshed.details.get("view_cursor").and_then(Value::as_str),
         ) else {
-            return self
-                .record_gap("Muse refreshed offer omitted its identity")
-                .await;
+            self.record_gap("Muse refreshed offer omitted its identity")
+                .await?;
+            return Ok(false);
         };
         if cursor.trim().is_empty() {
-            return self
-                .record_gap("Muse refreshed offer omitted its identity")
-                .await;
+            self.record_gap("Muse refreshed offer omitted its identity")
+                .await?;
+            return Ok(false);
         }
         let native_id = format!("muse-o:{}:s{seq}:{cursor}", refreshed.id);
         if native_id.len() > MAX_COMMAND_ID_BYTES {
-            return self
-                .record_gap("Muse refreshed offer identity exceeded its bound")
-                .await;
+            self.record_gap("Muse refreshed offer identity exceeded its bound")
+                .await?;
+            return Ok(false);
         }
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
         let data = json!({
@@ -3009,9 +3008,10 @@ impl EventProcessor {
         });
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
             self.defer_gap("Muse refreshed offer exceeded the persisted-event bound");
-            return Ok(());
+            return Ok(false);
         }
-        self.commit_event("request.opened", native_id, data).await
+        self.commit_event("request.opened", native_id, data).await?;
+        Ok(true)
     }
 
     fn bind_view_session(&mut self, session_id: &str) -> Result<()> {

@@ -74,7 +74,13 @@ advanced past the decided requirement that the owning path validated (for
 `approval/request`, the full request validation, so an offer the owning path
 rejects, such as one with no choices, never qualifies) and persisted. A
 rejected frame, a gap, or a failed persistence never qualifies, and no
-pre-parse of a frame counts as proof. Changed offers without admission,
+pre-parse of a frame counts as proof. Persistence is explicit: the offer
+helper reports success only after its actual commit, so a deferred or
+gapped offer (including an oversized envelope) never qualifies and the
+old Store offer is never treated as fresh. A terminal resolution must
+also name the exact retained turn on the wire: a resolution naming
+another turn is gapped before any commit, removal, or proof, and never
+mutates the retained entry. Changed offers without admission,
 absent requests, final text, and artifacts alone never qualify; missing or
 mismatched deciders, stream end, and deadline expiry stay unknown. An
 admitted-but-unproven decide stays Unknown with both the Core command id and
