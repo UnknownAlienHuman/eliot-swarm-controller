@@ -2528,6 +2528,27 @@ fn build_target_environment(data_root: &Path, agent: &Agent, agent_token: &str) 
     let controller_dir = executable
         .parent()
         .ok_or_else(|| Error::new("platform_io", "Eliot executable has no parent directory"))?;
+    // Native shells split PATH without quote awareness (Windows PowerShell
+    // ignores the quotes join_paths emits), so a separator in the controller
+    // directory can never resolve bare `swarm`. Reject before native spawn
+    // instead of silently resolving a legacy binary. DataRoot is unaffected:
+    // only the controller parent actually placed in PATH is gated.
+    #[cfg(windows)]
+    let separator_present = controller_dir
+        .as_os_str()
+        .as_encoded_bytes()
+        .contains(&b';');
+    #[cfg(not(windows))]
+    let separator_present = controller_dir
+        .as_os_str()
+        .as_encoded_bytes()
+        .contains(&b':');
+    if separator_present {
+        return Err(Error::new(
+            "unsupported",
+            "controller directory path cannot be represented in native PATH",
+        ));
+    }
     #[cfg(windows)]
     let existing_path = environment
         .iter()
