@@ -1885,7 +1885,8 @@ impl Router {
                 "daemon is shutting down and rejects new discovery",
             ));
         }
-        let profile = crate::config::resolve_profile(&self.inner.data_root, &request.profile)?;
+        let mut profile = crate::config::resolve_profile(&self.inner.data_root, &request.profile)?;
+        crate::config::capture_native_store_inputs(&mut profile, |name| std::env::var_os(name))?;
         if request
             .harness
             .as_deref()
