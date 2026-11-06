@@ -241,6 +241,14 @@ impl Router {
             let _ = store.notice_release(recipient, &notice_id);
         }
     }
+
+    /// Re-offer a deferred mail wake after the recipient idles. The shared
+    /// Store gate revalidates unread, generation and every suppression at
+    /// claim time, so idle events without mail are harmless no-ops and no
+    /// cooldown is spent unless a wake is actually claimed.
+    pub(super) async fn reoffer_mail_notice(&self, recipient: &str) {
+        self.offer_notice(recipient, NoticePending::Mail).await;
+    }
 }
 
 #[cfg(test)]

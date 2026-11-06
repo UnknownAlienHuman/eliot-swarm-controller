@@ -61,7 +61,10 @@ provider hold, pending request, current unknown gate and drain suppress new wake
 A busy or waiting recipient also suppresses a new mail wake: an ordinary queued
 `send` cannot notify mid-turn anyway, so the wake is deferred (skipped, not
 queued) rather than dispatched after the inbox was already read and acked.
-A recipient with no live plugin owner for a dispatched generation stays queue-only.
+Deferred mail re-offers when the recipient idles, through the same atomic
+claim, which revalidates unread and every gate; no cooldown is spent while
+deferred. A recipient with no live plugin owner for a dispatched generation
+stays queue-only.
 
 Without independent recipient identity, route only a generic notice to a live routed
 parent/manager, otherwise stay queue-only. Parent notifications follow the same policy.

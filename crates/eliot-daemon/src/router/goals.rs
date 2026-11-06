@@ -662,6 +662,20 @@ fn spawn_auto_round(
     let Some(agent) = event.agent.clone() else {
         return;
     };
+    // Deferred mail wakes re-offer on every idle event through the shared
+    // Store claim, independent of Goal rounds, caps and follow-ups.
+    if event.generation.is_some()
+        && event
+            .subject
+            .as_ref()
+            .is_some_and(|subject| subject.state == AgentState::Idle)
+    {
+        let mail_router = router.clone();
+        let mail_agent = agent.clone();
+        tokio::spawn(async move {
+            mail_router.reoffer_mail_notice(&mail_agent).await;
+        });
+    }
     if let Some(running) = in_flight.get(&agent) {
         let newer = event.seq > running.seq
             && pending
