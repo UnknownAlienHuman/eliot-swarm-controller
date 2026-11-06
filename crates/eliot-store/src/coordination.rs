@@ -1224,7 +1224,7 @@ mod tests {
                     target: None,
                     selector: None,
                     verb: "launch".to_owned(),
-                    args: json!({"project":project, "workspace":"synthetic-workspace"}),
+                    args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}}),
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,

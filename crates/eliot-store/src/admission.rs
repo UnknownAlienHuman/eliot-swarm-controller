@@ -384,25 +384,17 @@ pub(super) fn submit_tx(
                 Some(parent) => parent.project.clone(),
                 None => required_string(&request.args, "project")?,
             };
-            let harness = if request.args.get("harness").is_none() {
-                "fake".to_owned()
-            } else {
-                required_string(&request.args, "harness")?
-            };
+            let harness = required_string(&request.args, "harness")?;
             if !matches!(
                 harness.as_str(),
-                "fake" | "codex" | "muse" | "claude" | "opencode" | "antigravity"
+                "codex" | "muse" | "claude" | "opencode" | "antigravity"
             ) {
                 return Err(Error::new(
                     "unsupported",
                     format!("unsupported launch harness {harness}"),
                 ));
             }
-            let profile = if request.args.get("profile").is_none() && harness == "fake" {
-                "fake".to_owned()
-            } else {
-                required_string(&request.args, "profile")?
-            };
+            let profile = required_string(&request.args, "profile")?;
             let profile_snapshot = match request.args.get("profile_snapshot") {
                 Some(Value::Object(_)) => request.args["profile_snapshot"].clone(),
                 Some(_) => {
@@ -411,7 +403,6 @@ pub(super) fn submit_tx(
                         "args.profile_snapshot must be a JSON object",
                     ));
                 }
-                None if harness == "fake" => json!({}),
                 None => {
                     return Err(Error::new(
                         "invalid",
@@ -634,11 +625,11 @@ pub(super) fn submit_tx(
             }
             if !matches!(
                 agent.harness.as_str(),
-                "codex" | "fake" | "muse" | "claude" | "opencode" | "antigravity"
+                "codex" | "muse" | "claude" | "opencode" | "antigravity"
             ) {
                 return Err(Error::new(
                     "unsupported",
-                    "resume is only supported for Codex, Muse, Claude, OpenCode, Antigravity, or Fake Agents with a retained native subject",
+                    "resume is only supported for Codex, Muse, Claude, OpenCode, or Antigravity Agents with a retained native subject",
                 ));
             }
             if let Some(expected) = request.expected_generation

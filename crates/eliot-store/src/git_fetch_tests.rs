@@ -191,6 +191,9 @@ fn owner_and_project_event_and_timer_actions_admit_the_same_targetless_command()
     launch.args = json!({
         "project": repository,
         "workspace": registered.checkout.clone(),
+        "harness": "fake",
+        "profile": "fake",
+        "profile_snapshot": {},
     });
     launch.expected_generation = Some(0);
     let launch = store.submit("owner", launch, now + 1).unwrap();

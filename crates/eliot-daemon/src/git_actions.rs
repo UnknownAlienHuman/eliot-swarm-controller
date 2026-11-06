@@ -2345,9 +2345,12 @@ mod tests {
             fs::write(
                 data_root.join("config.toml"),
                 format!(
-                    "[projects.{PROJECT}]\n\
+                    "[profiles.fixture]\n\
+                     harness = \"codex\"\n\
+                     model = \"fixture-model\"\n\
+                     [projects.{PROJECT}]\n\
                      path = {path}\n\
-                     profiles = [\"fake\"]\n\
+                     profiles = [\"fixture\"]\n\
                      actions = [\"git.fetch\"]\n\
                      run_env = []\n\
                      [projects.{PROJECT}.git]\n\
@@ -2359,7 +2362,7 @@ mod tests {
                 id: PROJECT.to_owned(),
                 checkout: canonical_checkout,
                 repo_common_dir,
-                profiles: vec!["fake".to_owned()],
+                profiles: vec!["fixture".to_owned()],
                 actions: vec!["git.fetch".to_owned()],
                 interpreters: Default::default(),
                 run_env: Vec::new(),

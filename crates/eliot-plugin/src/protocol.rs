@@ -152,48 +152,6 @@ pub struct ManifestFeatures {
     pub observe: bool,
 }
 
-pub fn fake_manifest() -> PluginManifest {
-    let controlled = BTreeMap::from([
-        ("message".to_owned(), "stream".to_owned()),
-        ("session".to_owned(), "stream".to_owned()),
-        ("turn".to_owned(), "stream".to_owned()),
-    ]);
-    PluginManifest {
-        name: "fake".to_owned(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-        protocol: "eliot-plugin/1".to_owned(),
-        harness_version: "fake-1".to_owned(),
-        available: true,
-        mode: "per_agent".to_owned(),
-        verbs: vec![
-            "launch".to_owned(),
-            "resume".to_owned(),
-            "send".to_owned(),
-            "stop".to_owned(),
-            "interrupt".to_owned(),
-        ],
-        child_verbs: Vec::new(),
-        features: ManifestFeatures {
-            start_requires_input: false,
-            native_children: false,
-            discover: true,
-            observe: true,
-        },
-        sources: BTreeMap::from([
-            ("controlled".to_owned(), controlled),
-            (
-                "observed".to_owned(),
-                BTreeMap::from([
-                    ("message".to_owned(), "native_read".to_owned()),
-                    ("session".to_owned(), "native_read".to_owned()),
-                    ("turn".to_owned(), "native_read".to_owned()),
-                ]),
-            ),
-        ]),
-        proxy: "none".to_owned(),
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileStoreParams {

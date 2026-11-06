@@ -745,11 +745,7 @@ mod tests {
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
         let command_id = Ulid::new().to_string();
-        let profile = if harness == "fake" {
-            "fake"
-        } else {
-            "synthetic-codex"
-        };
+        let profile = format!("synthetic-{harness}");
         let admitted = store.submit("owner", SubmitCommand {
             id: command_id.clone(), target: None, selector: None, verb: "launch".to_owned(),
             args: json!({"project":"synthetic-handoff", "harness":harness, "profile":profile,
@@ -792,10 +788,10 @@ mod tests {
         }
     }
 
-    fn handoff_all_fake_families(agent: &str) -> SourceHandoff {
+    fn handoff_all_native_families(agent: &str) -> SourceHandoff {
         handoff(
             agent,
-            crate::source_families_for_harness("fake").expect("Fake source plan"),
+            crate::source_families_for_harness("muse").expect("Native source plan"),
         )
     }
 
@@ -851,7 +847,7 @@ mod tests {
 
     #[test]
     fn cursor_handoff_keeps_predecessor_open_and_readback_settles_lost_reply() {
-        let (mut store, agent, now) = fixture("fake");
+        let (mut store, agent, now) = fixture("muse");
         store.ensure_process_source(&agent, 1, now).unwrap();
         let before = store.get_agent(&agent).unwrap().unwrap();
         let request = handoff(&agent, &["message"]);
@@ -913,7 +909,7 @@ mod tests {
 
     #[test]
     fn gap_and_named_owners_commit_before_the_handoff_ack() {
-        let (mut store, agent, now) = fixture("fake");
+        let (mut store, agent, now) = fixture("muse");
         let request = with_gap(handoff(&agent, &["turn", "message"]));
         let committed = store
             .record_source_handoff(request.clone(), now + 1)
@@ -946,7 +942,7 @@ mod tests {
 
     #[test]
     fn cursor_advance_does_not_reauthorize_a_retained_handoff() {
-        let (mut store, agent, now) = fixture("fake");
+        let (mut store, agent, now) = fixture("muse");
         let request = handoff(&agent, &["message"]);
         let ack = store
             .record_source_handoff(request.clone(), now + 1)
@@ -977,7 +973,7 @@ mod tests {
 
     #[test]
     fn invalid_or_mixed_handoffs_leave_events_sources_and_owners_unchanged() {
-        let (mut store, agent, now) = fixture("fake");
+        let (mut store, agent, now) = fixture("muse");
         let original = handoff(&agent, &["message"]);
         let mut requests = Vec::new();
         let mut bad = original.clone();
@@ -1041,7 +1037,7 @@ mod tests {
 
     #[test]
     fn successor_cannot_publish_before_transfer_and_eof_closes_native_sources_only() {
-        let (mut store, agent, now) = fixture("fake");
+        let (mut store, agent, now) = fixture("muse");
         store.ensure_process_source(&agent, 1, now).unwrap();
         let command = admit_send(&mut store, &agent, now + 1);
         let batch = turn_batch(&agent, "transcript", &command);
@@ -1051,7 +1047,7 @@ mod tests {
             "source_integrity"
         );
         assert_eq!(store.high_water().unwrap(), high_water);
-        let request = handoff_all_fake_families(&agent);
+        let request = handoff_all_native_families(&agent);
         let ack = store
             .record_source_handoff(request.clone(), now + 2)
             .unwrap()
@@ -1098,7 +1094,7 @@ mod tests {
 
     #[test]
     fn existing_closed_successor_and_terminal_agent_are_not_reopened() {
-        let (mut store, agent, now) = fixture("fake");
+        let (mut store, agent, now) = fixture("muse");
         store.connection.execute(
             "INSERT INTO source_state(agent,generation,source,state,health,updated_at) VALUES (?1,1,'transcript','closed','ok',?2)",
             params![parse_agent_id(&agent).unwrap(), now],
@@ -1128,7 +1124,7 @@ mod tests {
 
     #[test]
     fn persistence_failure_rolls_back_gap_successor_owners_and_ack() {
-        let (mut store, agent, now) = fixture("fake");
+        let (mut store, agent, now) = fixture("muse");
         let before = store.read_source_state(&agent, 1, "stream").unwrap();
         let high_water = store.high_water().unwrap();
         store.connection.execute_batch(
@@ -1201,11 +1197,11 @@ mod tests {
     fn native_exit_gaps_group_current_owners_and_never_gap_a_zero_family_predecessor() {
         for families in [
             vec!["message"],
-            crate::source_families_for_harness("fake")
-                .expect("Fake source plan")
+            crate::source_families_for_harness("muse")
+                .expect("Native source plan")
                 .to_vec(),
         ] {
-            let (mut store, agent, now) = fixture("fake");
+            let (mut store, agent, now) = fixture("muse");
             store
                 .record_source_handoff(handoff(&agent, &families), now + 1)
                 .unwrap();
@@ -1256,7 +1252,7 @@ mod tests {
 
     #[test]
     fn all_native_exit_gaps_roll_back_if_one_source_cannot_commit() {
-        let (mut store, agent, now) = fixture("fake");
+        let (mut store, agent, now) = fixture("muse");
         store
             .record_source_handoff(handoff(&agent, &["message"]), now + 1)
             .unwrap();
@@ -1284,7 +1280,7 @@ mod tests {
 
     #[test]
     fn native_exit_gaps_preserve_current_generation_and_terminal_fact_fences() {
-        let (mut store, agent, now) = fixture("fake");
+        let (mut store, agent, now) = fixture("muse");
         let high_water = store.high_water().unwrap();
         assert_eq!(
             store
@@ -1309,7 +1305,7 @@ mod tests {
 
     #[test]
     fn existing_open_successor_is_reused_and_only_latest_handoff_is_retained() {
-        let (mut store, agent, now) = fixture("fake");
+        let (mut store, agent, now) = fixture("muse");
         let first = handoff(&agent, &["message"]);
         store.record_source_handoff(first.clone(), now + 1).unwrap();
         let second = handoff(&agent, &["turn"]);
@@ -1334,7 +1330,7 @@ mod tests {
 
     #[test]
     fn unimplemented_and_daemon_families_keep_distinct_admission_errors() {
-        let (mut store, agent, now) = fixture("fake");
+        let (mut store, agent, now) = fixture("muse");
         for (family, code) in [
             ("child", "unsupported"),
             ("goal", "unsupported"),
@@ -1359,10 +1355,10 @@ mod tests {
 
     #[test]
     fn reader_unavailability_gaps_and_stales_without_claiming_reader_or_session_exit() {
-        let (mut store, agent, now) = fixture("fake");
+        let (mut store, agent, now) = fixture("muse");
         store.ensure_process_source(&agent, 1, now).unwrap();
         store
-            .record_source_handoff(with_gap(handoff_all_fake_families(&agent)), now + 1)
+            .record_source_handoff(with_gap(handoff_all_native_families(&agent)), now + 1)
             .unwrap();
         let command = admit_send(&mut store, &agent, now + 2);
         store
@@ -1466,9 +1462,9 @@ mod tests {
 
     #[test]
     fn confirmed_terminal_fact_suppresses_gap_but_not_unavailable_source_metadata() {
-        let (mut store, agent, now) = fixture("fake");
+        let (mut store, agent, now) = fixture("muse");
         store
-            .record_source_handoff(handoff_all_fake_families(&agent), now + 1)
+            .record_source_handoff(handoff_all_native_families(&agent), now + 1)
             .unwrap();
         store
             .put_batch(
@@ -1582,7 +1578,7 @@ mod tests {
 
     #[test]
     fn unavailable_metadata_failure_rolls_back_gap_health_and_lifecycle_together() {
-        let (mut store, agent, now) = fixture("fake");
+        let (mut store, agent, now) = fixture("muse");
         store
             .record_source_handoff(handoff(&agent, &["message"]), now + 1)
             .unwrap();

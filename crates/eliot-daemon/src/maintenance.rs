@@ -178,6 +178,9 @@ mod tests {
             launch.args = json!({
                 "project": format!("retention-tick-project-{index}"),
                 "workspace": format!("retention-tick-workspace-{index}"),
+                "harness": "codex",
+                "profile": "fixture",
+                "profile_snapshot": {},
             });
             launch.expected_generation = Some(0);
             let id = launch.id.clone();
@@ -340,6 +343,9 @@ mod tests {
                 launch.args = json!({
                     "project": format!("retention-project-{index}"),
                     "workspace": format!("retention-workspace-{index}"),
+                    "harness": "codex",
+                    "profile": "fixture",
+                    "profile_snapshot": {},
                 });
                 launch.expected_generation = Some(0);
                 store.submit("owner", launch, admitted_at).unwrap();
@@ -412,6 +418,9 @@ mod tests {
             launch.args = json!({
                 "project": "mail-retention-project",
                 "workspace": "mail-retention-workspace",
+                "harness": "codex",
+                "profile": "fixture",
+                "profile_snapshot": {},
             });
             launch.expected_generation = Some(0);
             let agent = store
@@ -524,6 +533,9 @@ mod tests {
             launch.args = json!({
                 "project": "mail-budget-project",
                 "workspace": "mail-budget-workspace",
+                "harness": "codex",
+                "profile": "fixture",
+                "profile_snapshot": {},
             });
             launch.expected_generation = Some(0);
             let agent = store
@@ -592,6 +604,9 @@ mod tests {
             launch.args = json!({
                 "project": "retention-disabled-project",
                 "workspace": "retention-disabled-workspace",
+                "harness": "codex",
+                "profile": "fixture",
+                "profile_snapshot": {},
             });
             launch.expected_generation = Some(0);
             let launch_id = launch.id.clone();

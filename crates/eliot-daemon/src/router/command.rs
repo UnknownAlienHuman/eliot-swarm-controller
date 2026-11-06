@@ -1494,9 +1494,9 @@ mod tests {
     }
 
     #[test]
-    fn resume_capture_admits_connected_harnesses_next_to_fake() {
+    fn resume_capture_admits_connected_harnesses() {
         let resume = resume_command("a7");
-        for harness in ["fake", "muse", "claude", "opencode"] {
+        for harness in ["muse", "claude", "opencode"] {
             let agent = retained_agent(harness);
             assert_eq!(
                 validate_retained_resume_agent(&agent, &resume).unwrap(),

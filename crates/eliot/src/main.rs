@@ -718,7 +718,6 @@ enum WorktreeCommand {
 
 #[derive(Subcommand)]
 enum PluginCommand {
-    Fake,
     /// Internal Codex plugin entry point (hidden until L2.2 caller).
     #[command(hide = true)]
     Codex,
@@ -1990,12 +1989,6 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             run_claim_command(&data_dir, json_output, id, command).await
         }
         CliCommand::Plugin { command } => match command {
-            PluginCommand::Fake => {
-                eliot_plugin::run_fake()
-                    .await
-                    .map_err(|error| Failure::new(1, error.to_string()))?;
-                Ok(0)
-            }
             PluginCommand::Codex => {
                 eliot_plugin_codex::run_codex()
                     .await

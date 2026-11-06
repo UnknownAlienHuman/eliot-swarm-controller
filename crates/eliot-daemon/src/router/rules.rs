@@ -732,7 +732,7 @@ impl Router {
 mod tests {
     use super::super::auth::authorize_command;
     use super::super::tests::{
-        read_fixture_event, result_fixture, router, router_with_data_root, stopped_fake_agent,
+        read_fixture_event, result_fixture, router, router_with_data_root, stopped_agent,
     };
     use super::super::{PreparedSubmission, Principal};
     use crate::common::now_ms;
@@ -1714,7 +1714,7 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
         let now = now_ms();
         let agent = {
             let mut store = router.inner.store.lock().await;
-            stopped_fake_agent(&mut store, "manual-timer-resume-replay")
+            stopped_agent(&mut store, "manual-timer-resume-replay")
         };
         let rule_value = json!({
             "id":RULE_ID,
