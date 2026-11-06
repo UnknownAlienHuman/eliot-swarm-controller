@@ -26,7 +26,7 @@ use crate::native_transport::{
 };
 use std::sync::Arc;
 
-pub use crate::native_transport::{NativeLaunch, StreamState};
+pub use crate::native_transport::{NativeLaunch, NativeStreamFault, StreamState};
 
 const MAX_PENDING_CALLS: usize = 16;
 

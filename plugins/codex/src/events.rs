@@ -693,7 +693,7 @@ impl EventProcessor {
                 self.defer_gap("Codex app-server event queue overflowed");
                 self.transport_loss = true;
             }
-            StreamState::Malformed => {
+            StreamState::Malformed(_) => {
                 self.defer_gap("Codex app-server stream contained an invalid frame");
                 self.transport_loss = true;
             }

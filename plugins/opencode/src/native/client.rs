@@ -8,7 +8,7 @@
 //! would be a second native write) and never follows redirects.
 
 use eliot_core::{Error, Result};
-use eliot_plugin::native_stdio::StreamState;
+use eliot_plugin::native_stdio::{NativeStreamFault, StreamState};
 use reqwest::{Client, redirect, retry};
 use tokio::{
     sync::{mpsc, watch},
@@ -784,7 +784,7 @@ async fn pump_sse(
         };
         for frame in parser.feed(&chunk) {
             if frame == SseFrame::Malformed {
-                let _ = stream.send(StreamState::Malformed);
+                let _ = stream.send(StreamState::Malformed(NativeStreamFault::Unclassified));
                 return;
             }
             // Backpressure, never loss: a slow event task holds this pump
