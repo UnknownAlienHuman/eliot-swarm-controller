@@ -741,8 +741,11 @@ pub struct NativeApprovalDecideResult {
 }
 
 /// `approval/resolved` params: the first durable terminal decision. Only the
-/// binding fields are modelled; the decision itself has no Eliot channel
-/// (`request.resolved` carries no details by Store contract).
+/// binding fields are modelled, plus the optional native id of the decide
+/// command that resolved it: when a reply RPC outcome stays ambiguous, an
+/// exact `decidedByCommandId` match against the captured outstanding decide
+/// proves this generation's write applied. The decision itself has no Eliot
+/// channel (`request.resolved` carries no details by Store contract).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeApprovalResolvedNotification {
@@ -750,6 +753,8 @@ pub struct NativeApprovalResolvedNotification {
     pub session_id: String,
     pub turn_id: String,
     pub view_cursor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by_command_id: Option<String>,
 }
 
 /// `approval/updated` params: the refreshed pending view plus one change.

@@ -25,15 +25,15 @@ use self::workflow_child::{
     muse_child_key, register_child, should_bypass_parent_buffer, start_event_data,
 };
 use crate::native::{
-    NativeClient, NativeFrame, StreamState,
+    NativeClient, NativeFrame, StreamState, native_error_code,
     requests::{
         CorePending, describe_request, is_newer_approval_requirement, refresh_offer_from_raw,
         reply_for, same_approval_offer,
     },
     types::{
-        NativeApprovalDecideResult, NativeApprovalResolvedNotification,
-        NativeApprovalUpdatedNotification, NativeHistoryNoneReason,
-        NativeItemCompletedNotification, NativeItemStartedNotification,
+        NativeApprovalDecideResult, NativeApprovalRequestParams,
+        NativeApprovalResolvedNotification, NativeApprovalUpdatedNotification,
+        NativeHistoryNoneReason, NativeItemCompletedNotification, NativeItemStartedNotification,
         NativeSessionClosedNotification, NativeSessionStartedNotification,
         NativeSessionViewHealthChangedNotification, NativeTurnCompletedNotification,
         NativeTurnError, NativeTurnStartedNotification, NativeTurnTerminal,
@@ -148,9 +148,89 @@ enum NativeReplyState {
 struct PendingNativeRequest {
     request: CorePending,
     reply_command_id: Option<String>,
+    /// Native `commandId` of the outstanding reply while Writing, retained
+    /// while its outcome stays Unknown so a later `approval/resolved` can
+    /// prove (via `decidedByCommandId`) that this exact decide applied.
+    /// Cleared on every path that leaves Writing/Written/Unknown behind.
+    reply_native_command_id: Option<String>,
     reply_state: NativeReplyState,
     /// Observation counter at the last stream update of this entry.
     observed_at: u64,
+}
+
+/// Exact binding captured when an `approval/decide` is written, used to
+/// qualify the control result against authoritative view frames. Generation
+/// rides on the live turn: the captured turn is active at send time, and
+/// only frames naming this exact session, turn, and approval can qualify.
+struct DecideCapture {
+    session_id: String,
+    turn_id: String,
+    approval_id: String,
+    decided_seq: i64,
+    native_command_id: String,
+}
+
+/// Whitelisted view diagnostics for a decide qualification: whether a
+/// terminal resolution for this exact decide was observed, and whether it
+/// carried a decider id that matched ours. Booleans only, never payload.
+#[derive(Default)]
+struct DecideViewDiag {
+    resolved_seen: bool,
+    decider_present: bool,
+    decider_match: bool,
+    resolved_decisive: bool,
+}
+
+/// Exact decider proof: the resolution names this generation's outstanding
+/// decide command id, non-empty on both sides. Anything else — missing,
+/// blank, or another decider — proves nothing about our write.
+fn resolved_decider_matches(decided_by: Option<&str>, ours: &str) -> bool {
+    !ours.trim().is_empty() && decided_by.is_some_and(|id| !id.trim().is_empty() && id == ours)
+}
+
+/// How the decide RPC settled before view qualification: a clean admission
+/// ack still needs view proof, while an ambiguous outcome additionally
+/// carries the RPC error code and the reason to keep if unproven.
+enum DecideRpcOutcome<'a> {
+    Admitted,
+    Ambiguous {
+        error_code: Option<i64>,
+        unproven_reason: &'a str,
+    },
+}
+
+/// One decide awaiting view qualification: the exact sent binding plus the
+/// control identities the result is settled under.
+struct DecideQualification<'a> {
+    command_id: &'a str,
+    request_id: &'a str,
+    turn_id: &'a str,
+    capture: &'a DecideCapture,
+    deadline: Instant,
+    rpc: DecideRpcOutcome<'a>,
+}
+
+/// Attach the whitelisted decide diagnostics to a control outcome: the
+/// numeric native error code when the RPC itself errored, and the
+/// resolved-decider booleans when a terminal resolution was observed.
+/// Nothing else is ever attached: no raw errors, payloads, or ids.
+fn with_decide_diag(mut outcome: Value, error_code: Option<i64>, diag: &DecideViewDiag) -> Value {
+    if let Some(fields) = outcome.as_object_mut() {
+        if let Some(code) = error_code {
+            fields.insert("native_error_code".to_owned(), Value::from(code));
+        }
+        if diag.resolved_seen {
+            fields.insert(
+                "resolved_decider_present".to_owned(),
+                Value::from(diag.decider_present),
+            );
+            fields.insert(
+                "resolved_decider_match".to_owned(),
+                Value::from(diag.decider_match),
+            );
+        }
+    }
+    outcome
 }
 
 #[derive(Clone)]
@@ -429,7 +509,11 @@ impl EventProcessor {
         self.status.observation
     }
 
-    async fn handle_control(&mut self, control: Control) -> bool {
+    async fn handle_control(
+        &mut self,
+        frames: &mut mpsc::Receiver<NativeFrame>,
+        control: Control,
+    ) -> bool {
         match control {
             Control::ViewReadback {
                 session_id,
@@ -488,7 +572,7 @@ impl EventProcessor {
                 reply,
             } => {
                 let result = self
-                    .reply_request(&command_id, &request_id, &turn_id, &verb, &args)
+                    .reply_request(frames, &command_id, &request_id, &turn_id, &verb, &args)
                     .await;
                 let _ = reply.send(result);
                 true
@@ -991,6 +1075,7 @@ impl EventProcessor {
                     if existing.reply_state == NativeReplyState::Written {
                         existing.reply_state = NativeReplyState::Available;
                         existing.reply_command_id = None;
+                        existing.reply_native_command_id = None;
                     }
                     Some(existing.request.clone())
                 }
@@ -1053,6 +1138,7 @@ impl EventProcessor {
             PendingNativeRequest {
                 request,
                 reply_command_id: None,
+                reply_native_command_id: None,
                 reply_state: NativeReplyState::Available,
                 observed_at: observed,
             },
@@ -1085,8 +1171,137 @@ impl EventProcessor {
         Ok(())
     }
 
+    /// Pump live native frames through the existing frame path while an
+    /// `approval/decide` control result stays unqualified, watching for the
+    /// authoritative view proof of this exact decide: a terminal resolution
+    /// naming our native command id, or — only after a clean admission ack —
+    /// an offer that advanced past our decided requirement. Every drained
+    /// frame is processed normally in arrival order; nothing is dropped.
+    /// Returns true once the decide is proven applied. The single absolute
+    /// deadline (captured before the write, never renewed) and stream EOF
+    /// both end the wait unproven.
+    async fn pump_decide_proof(
+        &mut self,
+        frames: &mut mpsc::Receiver<NativeFrame>,
+        capture: &DecideCapture,
+        deadline: Instant,
+        admission_proven: bool,
+        diag: &mut DecideViewDiag,
+    ) -> bool {
+        loop {
+            while Instant::now() < deadline {
+                let Ok(frame) = frames.try_recv() else {
+                    break;
+                };
+                if self.observe_decide_frame(&frame, capture, admission_proven, diag) {
+                    self.handle_frame(Some(frame)).await;
+                    self.report_gap_if_queue_empty(frames.is_empty()).await;
+                    return true;
+                }
+                self.handle_frame(Some(frame)).await;
+                self.report_gap_if_queue_empty(frames.is_empty()).await;
+                if diag.resolved_decisive {
+                    return false;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            match timeout_at(deadline, frames.recv()).await {
+                Ok(Some(frame)) => {
+                    if self.observe_decide_frame(&frame, capture, admission_proven, diag) {
+                        self.handle_frame(Some(frame)).await;
+                        self.report_gap_if_queue_empty(frames.is_empty()).await;
+                        return true;
+                    }
+                    self.handle_frame(Some(frame)).await;
+                    self.report_gap_if_queue_empty(frames.is_empty()).await;
+                    if diag.resolved_decisive {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// Inspect one live frame for this decide's authoritative proof without
+    /// consuming it. True only for exact proof: a terminal resolution naming
+    /// our native command id, or — with admission already proven — an offer
+    /// advanced past our decided requirement. A terminal resolution that
+    /// does not name us is decisive the other way (recorded, never applied).
+    fn observe_decide_frame(
+        &self,
+        frame: &NativeFrame,
+        capture: &DecideCapture,
+        admission_proven: bool,
+        diag: &mut DecideViewDiag,
+    ) -> bool {
+        match frame {
+            NativeFrame::Notification { method, params } if method == "approval/resolved" => {
+                let Ok(resolved) =
+                    serde_json::from_value::<NativeApprovalResolvedNotification>(params.clone())
+                else {
+                    return false;
+                };
+                if resolved.session_id != capture.session_id
+                    || resolved.turn_id != capture.turn_id
+                    || resolved.approval_id != capture.approval_id
+                {
+                    return false;
+                }
+                diag.resolved_seen = true;
+                diag.decider_present = resolved
+                    .decided_by_command_id
+                    .as_deref()
+                    .is_some_and(|id| !id.trim().is_empty());
+                diag.decider_match = resolved_decider_matches(
+                    resolved.decided_by_command_id.as_deref(),
+                    &capture.native_command_id,
+                );
+                diag.resolved_decisive = true;
+                diag.decider_match
+            }
+            NativeFrame::Notification { method, params } if method == "approval/updated" => {
+                if !admission_proven {
+                    return false;
+                }
+                let Ok(updated) =
+                    serde_json::from_value::<NativeApprovalUpdatedNotification>(params.clone())
+                else {
+                    return false;
+                };
+                if updated.session_id != capture.session_id
+                    || updated.approval_id != capture.approval_id
+                {
+                    return false;
+                }
+                updated.current_requirement_id.source_index > capture.decided_seq
+            }
+            NativeFrame::Request { method, params, .. } if method == "approval/request" => {
+                if !admission_proven {
+                    return false;
+                }
+                let Ok(request) =
+                    serde_json::from_value::<NativeApprovalRequestParams>(params.clone())
+                else {
+                    return false;
+                };
+                if request.session_id != capture.session_id
+                    || request.turn_id != capture.turn_id
+                    || request.approval_id != capture.approval_id
+                {
+                    return false;
+                }
+                request.current_requirement_id.source_index > capture.decided_seq
+            }
+            _ => false,
+        }
+    }
+
     async fn reply_request(
         &mut self,
+        frames: &mut mpsc::Receiver<NativeFrame>,
         command_id: &str,
         request_id: &str,
         turn_id: &str,
@@ -1159,13 +1374,43 @@ impl EventProcessor {
                     .and_then(Value::as_i64)
             })
             .flatten();
+        let is_decide = reply.method == "approval/decide";
+        // View qualification needs the exact sent binding. It is read from
+        // the same validated values the reply was built from, so it cannot
+        // be missing; anything else leaves the request available pre-write.
+        let capture: Option<DecideCapture> = if !is_decide {
+            None
+        } else {
+            let (Some(approval_id), Some(sent_session), Some(seq)) = (
+                params.get("approvalId").and_then(Value::as_str),
+                params.get("sessionId").and_then(Value::as_str),
+                decided_offer_seq,
+            ) else {
+                return Ok(rejected_control(
+                    "Muse request reply binding could not be captured",
+                ));
+            };
+            Some(DecideCapture {
+                session_id: sent_session.to_owned(),
+                turn_id: turn_id.to_owned(),
+                approval_id: approval_id.to_owned(),
+                decided_seq: seq,
+                native_command_id: native_command_id.clone(),
+            })
+        };
         let request = entry.request.clone();
         entry.reply_state = NativeReplyState::Writing;
-        let acknowledged = match self
-            .native
-            .call(reply.method, params, Instant::now() + EVENT_DEADLINE)
-            .await
-        {
+        entry.reply_native_command_id = Some(native_command_id.clone());
+        if is_decide {
+            // The view-wait below may resolve while this RPC is outstanding;
+            // the outstanding Eliot command must already be recorded so the
+            // resolution can bind it.
+            entry.reply_command_id = Some(command_id.to_owned());
+        }
+        // ONE absolute deadline, captured before the write and carried
+        // through the RPC and the view wait alike: never renewed.
+        let deadline = Instant::now() + EVENT_DEADLINE;
+        let acknowledged = match self.native.call(reply.method, params, deadline).await {
             Ok(ack) => ack,
             Err(error) if native_no_write(&error.code) || error.code == "native_rejected" => {
                 // Proven not admitted (transport never wrote, or a
@@ -1174,23 +1419,56 @@ impl EventProcessor {
                 if let Some(entry) = self.pending_requests.get_mut(request_id) {
                     entry.reply_state = NativeReplyState::Available;
                     entry.reply_command_id = None;
+                    entry.reply_native_command_id = None;
                 }
                 return Ok(rejected_control("Muse request reply was not admitted"));
             }
-            Err(_) => {
-                if let Some(entry) = self.pending_requests.get_mut(request_id) {
-                    entry.reply_state = NativeReplyState::Unknown;
-                    entry.reply_command_id = Some(command_id.to_owned());
+            Err(error) => {
+                let error_code = native_error_code(&error);
+                if !is_decide {
+                    if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                        entry.reply_state = NativeReplyState::Unknown;
+                        entry.reply_command_id = Some(command_id.to_owned());
+                    }
+                    return Ok(unknown_control(
+                        "Muse request reply may have been dispatched; it will not be repeated",
+                    ));
                 }
-                return Ok(unknown_control(
-                    "Muse request reply may have been dispatched; it will not be repeated",
-                ));
+                let Some(capture) = capture else {
+                    if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                        entry.reply_state = NativeReplyState::Unknown;
+                        entry.reply_command_id = Some(command_id.to_owned());
+                    }
+                    let _ = self
+                        .record_gap("Muse decide binding could not be captured")
+                        .await;
+                    return Ok(unknown_control(
+                        "Muse request reply binding is unresolved and will not be repeated",
+                    ));
+                };
+                return self
+                    .qualify_decide(
+                        frames,
+                        DecideQualification {
+                            command_id,
+                            request_id,
+                            turn_id,
+                            capture: &capture,
+                            deadline,
+                            rpc: DecideRpcOutcome::Ambiguous {
+                                error_code,
+                                unproven_reason:
+                                    "Muse request reply may have been dispatched; it will not be repeated",
+                            },
+                        },
+                    )
+                    .await;
             }
         };
         // Admission proves nothing by itself (the ack echoes the command
         // id, not the decision): the ack must echo the exact submitted
         // command id, the acceptance status, and the exact decided request
-        // id. A malformed ack leaves the write unknown.
+        // id.
         let acked = match reply.method {
             "approval/decide" => serde_json::from_value::<NativeApprovalDecideResult>(acknowledged)
                 .ok()
@@ -1216,29 +1494,170 @@ impl EventProcessor {
                         && ack.user_input_id == expected_native_id
                 }),
         };
-        if !acked {
+        if !is_decide {
+            if !acked {
+                if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                    entry.reply_state = NativeReplyState::Unknown;
+                    entry.reply_command_id = Some(command_id.to_owned());
+                }
+                return Ok(unknown_control(
+                    "Muse request reply did not acknowledge the exact submitted command",
+                ));
+            }
+            if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                entry.reply_state = NativeReplyState::Written;
+                entry.reply_command_id = Some(command_id.to_owned());
+                entry.reply_native_command_id = None;
+            }
+            return Ok(json!({
+                "state": "applied",
+                "command_id": command_id,
+                "request_id": request.id,
+                "turn_id": request.turn_id,
+            }));
+        }
+        let Some(capture) = capture else {
             if let Some(entry) = self.pending_requests.get_mut(request_id) {
                 entry.reply_state = NativeReplyState::Unknown;
                 entry.reply_command_id = Some(command_id.to_owned());
             }
+            let _ = self
+                .record_gap("Muse decide binding could not be captured")
+                .await;
             return Ok(unknown_control(
-                "Muse request reply did not acknowledge the exact submitted command",
+                "Muse request reply binding is unresolved and will not be repeated",
             ));
+        };
+        // A decide is Applied only on authoritative view proof, never from
+        // the admission ack alone; a malformed ack qualifies like an
+        // ambiguous RPC error (a resolution naming our decide still proves
+        // the write applied).
+        if acked {
+            self.qualify_decide(
+                frames,
+                DecideQualification {
+                    command_id,
+                    request_id,
+                    turn_id,
+                    capture: &capture,
+                    deadline,
+                    rpc: DecideRpcOutcome::Admitted,
+                },
+            )
+            .await
+        } else {
+            self.qualify_decide(
+                frames,
+                DecideQualification {
+                    command_id,
+                    request_id,
+                    turn_id,
+                    capture: &capture,
+                    deadline,
+                    rpc: DecideRpcOutcome::Ambiguous {
+                        error_code: None,
+                        unproven_reason:
+                            "Muse request reply did not acknowledge the exact submitted command",
+                    },
+                },
+            )
+            .await
         }
-        if let Some(entry) = self.pending_requests.get_mut(request_id) {
-            entry.reply_state = NativeReplyState::Written;
-            entry.reply_command_id = Some(command_id.to_owned());
+    }
+
+    /// Settle one written decide against the authoritative view stream: pump
+    /// live frames through the existing frame path until this exact decide is
+    /// proven applied, proven otherwise decided, the stream ends, or the
+    /// single carried deadline expires. Proven terminal proof removed the
+    /// entry via the pumped resolution; proven nonterminal proof only
+    /// refreshed it, so the stage is consumed here (mirroring the update
+    /// reset, which cannot fire while Writing) and the consumed offer is
+    /// persisted for the owner projection and the stage gate. Unproven
+    /// outcomes stay honest: an admitted-but-unproven write stays recorded
+    /// as decided so a late view still settles it, and an ambiguous write
+    /// stays fenced unknown. Never resends.
+    async fn qualify_decide(
+        &mut self,
+        frames: &mut mpsc::Receiver<NativeFrame>,
+        qualification: DecideQualification<'_>,
+    ) -> Result<Value> {
+        let DecideQualification {
+            command_id,
+            request_id,
+            turn_id,
+            capture,
+            deadline,
+            rpc,
+        } = qualification;
+        let admission_proven = matches!(rpc, DecideRpcOutcome::Admitted);
+        let mut diag = DecideViewDiag::default();
+        let proven = self
+            .pump_decide_proof(frames, capture, deadline, admission_proven, &mut diag)
+            .await;
+        if proven {
+            if let Some(entry) = self.pending_requests.get(request_id) {
+                let refreshed = entry.request.clone();
+                let live_turn =
+                    self.status.active_turn_id.as_deref() == Some(refreshed.turn_id.as_str());
+                if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                    entry.reply_state = NativeReplyState::Available;
+                    entry.reply_command_id = None;
+                    entry.reply_native_command_id = None;
+                }
+                if live_turn {
+                    // The pumped update could not persist while Writing; the
+                    // proof is recorded regardless, and a persist failure gaps
+                    // loudly instead of failing the proven control result.
+                    if self.commit_offer_update(&refreshed).await.is_err() {
+                        let _ = self
+                            .record_gap("Muse consumed offer update was not persisted")
+                            .await;
+                    }
+                }
+            }
+            let outcome = json!({
+                "state": "applied",
+                "command_id": command_id,
+                "request_id": request_id,
+                "turn_id": turn_id,
+                "decided_offer_seq": capture.decided_seq,
+            });
+            let error_code = match rpc {
+                DecideRpcOutcome::Admitted => None,
+                DecideRpcOutcome::Ambiguous { error_code, .. } => error_code,
+            };
+            return Ok(with_decide_diag(outcome, error_code, &diag));
         }
-        let mut outcome = json!({
-            "state": "applied",
-            "command_id": command_id,
-            "request_id": request.id,
-            "turn_id": request.turn_id,
-        });
-        if let (Some(seq), Some(fields)) = (decided_offer_seq, outcome.as_object_mut()) {
-            fields.insert("decided_offer_seq".to_owned(), Value::from(seq));
+        match rpc {
+            DecideRpcOutcome::Admitted => {
+                if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                    entry.reply_state = NativeReplyState::Written;
+                    entry.reply_command_id = Some(command_id.to_owned());
+                    entry.reply_native_command_id = None;
+                }
+                Ok(with_decide_diag(
+                    unknown_control(
+                        "Muse request reply was admitted but its decision is unproven; it will not be repeated",
+                    ),
+                    None,
+                    &diag,
+                ))
+            }
+            DecideRpcOutcome::Ambiguous {
+                error_code,
+                unproven_reason,
+            } => {
+                if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                    entry.reply_state = NativeReplyState::Unknown;
+                    entry.reply_command_id = Some(command_id.to_owned());
+                }
+                Ok(with_decide_diag(
+                    unknown_control(unproven_reason),
+                    error_code,
+                    &diag,
+                ))
+            }
         }
-        Ok(outcome)
     }
 
     /// Adopt pulled snapshot entries. Entries that bind to the live turn are
@@ -1344,6 +1763,7 @@ impl EventProcessor {
             PendingNativeRequest {
                 request: entry,
                 reply_command_id: None,
+                reply_native_command_id: None,
                 reply_state: NativeReplyState::Available,
                 observed_at: observed,
             },
@@ -1743,9 +2163,24 @@ impl EventProcessor {
                 .await;
         }
         let turn_id = entry.request.turn_id.clone();
-        // `request.resolved` binds the exact dispatched Eliot reply; anything
-        // else (policy/judge/timeout, or a reply this generation never wrote)
-        // closes without a command binding.
+        // `request.resolved` binds the exact dispatched Eliot reply: an
+        // acked decide, or an ambiguous one the resolution itself names via
+        // `decidedByCommandId` (resolved-before-qualifying-ACK order). Anything
+        // else (policy/judge/timeout, another decider, an unnamed resolution,
+        // or a reply this generation never wrote) closes without a binding.
+        // Writing is reachable here only from inside the decide view-wait,
+        // which pumps frames while its own RPC is outstanding; anywhere else
+        // the sequential loop keeps Writing and resolution apart.
+        let proven_ours = matches!(
+            entry.reply_state,
+            NativeReplyState::Writing | NativeReplyState::Unknown
+        ) && entry.reply_command_id.is_some()
+            && entry
+                .reply_native_command_id
+                .as_deref()
+                .is_some_and(|ours| {
+                    resolved_decider_matches(notification.decided_by_command_id.as_deref(), ours)
+                });
         let (kind, data) = match (entry.reply_state, entry.reply_command_id.as_ref()) {
             (NativeReplyState::Written, Some(command_id)) => (
                 "request.resolved",
@@ -1755,6 +2190,18 @@ impl EventProcessor {
                     "turn_id": turn_id,
                 }),
             ),
+            (NativeReplyState::Writing | NativeReplyState::Unknown, Some(command_id))
+                if proven_ours =>
+            {
+                (
+                    "request.resolved",
+                    json!({
+                        "command_id": command_id,
+                        "request_id": request_id,
+                        "turn_id": turn_id,
+                    }),
+                )
+            }
             _ => (
                 "request.closed",
                 json!({
@@ -1833,6 +2280,7 @@ impl EventProcessor {
                 if entry.reply_state == NativeReplyState::Written {
                     entry.reply_state = NativeReplyState::Available;
                     entry.reply_command_id = None;
+                    entry.reply_native_command_id = None;
                 }
                 Some(entry.request.clone())
             }
@@ -2529,7 +2977,7 @@ async fn run(
             control = controls.recv() => {
                 match control {
                     Some(control) => {
-                        if !processor.handle_control(control).await {
+                        if !processor.handle_control(&mut frames, control).await {
                             break;
                         }
                         // Associate flushes buffered frames inline and request

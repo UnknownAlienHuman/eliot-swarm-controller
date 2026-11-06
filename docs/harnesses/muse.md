@@ -64,7 +64,16 @@ index) replaces the in-memory offer, is persisted under the exact pending id wit
 normalized `offer_seq`, and resets a consumed reply so the next stage can be
 decided; each Applied approval outcome records `decided_offer_seq`, and the next
 explicit choice is admitted only once the persisted current offer is fresh past
-it. Duplicates and stale offers change nothing; unknown stays fenced. Only
+it. Duplicates and stale offers change nothing; unknown stays fenced. A decide
+control result is qualified against the authoritative view stream before it is
+returned, within the single absolute deadline captured before the write (never
+renewed): Applied only with exact proof — a terminal resolution naming this
+generation's native decide id, or, after a clean admission ack, an offer
+advanced past the decided requirement. Changed offers without admission,
+absent requests, final text, and artifacts alone never qualify; missing or
+mismatched deciders, stream end, and deadline expiry stay unknown. Outcomes
+carry only whitelisted diagnostics: the numeric native error code and the
+resolved-decider present/match booleans. Only
 schema-documented pre-admission/validation errors prove rejection (anything else is
 unknown, never resubmitted). Approve and deny take an optional `choice_id` and
 optional `feedback` where the choice accepts it; answer takes `answers` mapping

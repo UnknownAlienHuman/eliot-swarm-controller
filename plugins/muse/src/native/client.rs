@@ -23,6 +23,23 @@ use tokio::time::Instant;
 #[derive(Clone, Debug)]
 pub(crate) struct MuseStdioConfig;
 
+impl MuseStdioConfig {
+    const NATIVE_ERROR_PREFIX: &'static str = "Muse request error ";
+    const NATIVE_ERROR_SUFFIX: &'static str = " left its write outcome uncertain";
+}
+
+/// The numeric native JSON-RPC error code carried by an uncertain-call error,
+/// when the error is a native error response (transport failures and timeouts
+/// carry none). Integers only: the native message itself is never surfaced.
+pub(crate) fn native_error_code(error: &Error) -> Option<i64> {
+    error
+        .message
+        .strip_prefix(MuseStdioConfig::NATIVE_ERROR_PREFIX)?
+        .strip_suffix(MuseStdioConfig::NATIVE_ERROR_SUFFIX)?
+        .parse()
+        .ok()
+}
+
 impl NativeStdioConfig for MuseStdioConfig {
     const SERVER: &'static str = "Muse session host";
     const SHORT: &'static str = "Muse";
@@ -39,8 +56,10 @@ impl NativeStdioConfig for MuseStdioConfig {
             Err(Error::new(
                 "unknown",
                 format!(
-                    "Muse request error {} left its write outcome uncertain",
-                    error.code
+                    "{}{}{}",
+                    MuseStdioConfig::NATIVE_ERROR_PREFIX,
+                    error.code,
+                    MuseStdioConfig::NATIVE_ERROR_SUFFIX,
                 ),
             ))
         }
