@@ -402,8 +402,10 @@ complete, and includes
 `final_text_unavailable:"event_budget"` when representable. `Turn.final_text = None`
 means the public final text is unavailable; full native text remains private history.
 `Turn.usage = None` likewise means native token usage is unavailable. A present usage
-names its native attribution in `scope`/`message_id` with nullable token members;
-message scope is never a turn or session total.
+carries nullable token members with `scope`/`message_id` attribution when the harness
+reports it; null attribution means the native scope is unknown. Message scope is never
+a turn or session total, and a populated native total must not be assumed a per-turn or
+per-call total when scope is unknown.
 
 Required IDs must be strings whose trimmed value is nonempty. Validation does not trim,
 normalize or impose a new length limit on them. `turn.get` requires a nonnegative integer
