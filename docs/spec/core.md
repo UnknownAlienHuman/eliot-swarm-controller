@@ -165,6 +165,13 @@ False is omitted from serialization so legacy request bytes and digests remain u
 True is valid only for SEND and is not added to native text or arguments. The Store
 persists the intent in the new command column with default 0.
 
+A non-empty `model` field reported by a native `assistant` message in the `message.completed`
+event updates only `Agent.effective.model` within that event's handler, after existing
+live-turn and generation bindings are verified. All other effective fields, the requested
+profile alias, and control state remain unchanged. Missing or null native model stays
+unobserved. A reported model change does not create generation, authorization or control
+gaps.
+
 ## Events and authoritative sources
 
 ```text

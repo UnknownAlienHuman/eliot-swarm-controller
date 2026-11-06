@@ -572,11 +572,13 @@ impl ClaudePlugin {
                 }
             }
         }
-        // The CLI never reads the active model back (note 47): membership in
-        // `models[]` above is the only proof, so `effective.model` stays null
-        // and the requested id travels under `requested`. Requested vs
-        // effective permission mode is reported, never forced: launching with
-        // `manual` reads back `default` on the installed CLI.
+        // The CLI never reads the active model back in initialize (note 47):
+        // membership in `models[]` above is the only proof, so
+        // `effective.model` stays null at readiness and the requested id
+        // travels under `requested`. It is populated later only by a model
+        // reported on an actual native assistant record (message.completed).
+        // Requested vs effective permission mode is reported, never forced:
+        // launching with `manual` reads back `default` on the installed CLI.
         Ok((
             session,
             json!({

@@ -922,6 +922,19 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             let command_id = required_text(event, "command_id")?;
             let turn_id = required_text(event, "turn_id")?;
             let text = required_text(event, "text")?;
+            if let Some(model) = optional_observed_model(event)? {
+                match &mut next.effective {
+                    Some(Value::Object(effective)) => {
+                        effective.insert("model".to_owned(), Value::String(model));
+                    }
+                    None => {
+                        let mut effective = serde_json::Map::new();
+                        effective.insert("model".to_owned(), Value::String(model));
+                        next.effective = Some(Value::Object(effective));
+                    }
+                    Some(_) => {}
+                }
+            }
             effects.push(Effect::MessageCompleted {
                 command_id,
                 turn_id,
@@ -1123,6 +1136,18 @@ fn required_text(event: &NativeEvent, field: &str) -> Result<String> {
                 format!("{} requires non-empty string field {field}", event.kind),
             )
         })
+}
+
+fn optional_observed_model(event: &NativeEvent) -> Result<Option<String>> {
+    match event.data.get("model") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(Error::new(
+            "invalid",
+            format!("{} field model must be a string", event.kind),
+        )),
+    }
 }
 
 fn optional_text(event: &NativeEvent, field: &str) -> Result<Option<String>> {
