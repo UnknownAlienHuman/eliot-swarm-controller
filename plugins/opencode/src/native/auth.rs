@@ -582,7 +582,10 @@ async fn import_once(
 /// only when the child's exit was actually reaped. `kill_on_drop` remains
 /// the backstop if this future is itself cancelled.
 async fn kill_and_reap(child: &mut Child) -> bool {
-    let _ = child.kill().await;
+    // `start_kill` signals only; `kill` would already wait unboundedly for
+    // exit (tokio 1.54.1 `Child::kill` awaits `wait`), so the single bounded
+    // wait below is the only blocking call in cleanup.
+    let _ = child.start_kill();
     timeout(KILL_GRACE, child.wait())
         .await
         .is_ok_and(|wait| wait.is_ok())
