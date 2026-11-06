@@ -1,7 +1,7 @@
 #[path = "workflow_child.rs"]
 mod workflow_child;
 
-use eliot_core::{Error, ProviderRestriction, Result, SecretPolicy};
+use eliot_core::{Error, ProviderRestriction, Result, SecretPolicy, SourceHealthUpdate};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     protocol::MAX_COMMAND_ID_BYTES,
@@ -274,6 +274,12 @@ struct EventProcessor {
     pending_end_stop: Option<oneshot::Sender<Result<()>>>,
     writes_blocked: bool,
     gap_reported: bool,
+    /// The native transport itself was lost (queue overflow, unplanned close,
+    /// malformed frame, unplanned reader end): facts may be missing, so the
+    /// source is marked `stale` once drained, alongside any recorded gap.
+    transport_loss: bool,
+    /// The one accompanying `stale` update was attempted (never replayed).
+    source_health_attempted: bool,
     final_text: Option<String>,
     pending_requests: HashMap<String, PendingNativeRequest>,
     /// Native approval/user-input id to public pending id.
@@ -501,6 +507,8 @@ impl EventProcessor {
             pending_end_stop: None,
             writes_blocked: false,
             gap_reported: false,
+            transport_loss: false,
+            source_health_attempted: false,
             final_text: None,
             pending_requests: HashMap::new(),
             native_index: HashMap::new(),
@@ -652,13 +660,20 @@ impl EventProcessor {
             StreamState::Closed => {
                 if !self.planned_stop {
                     self.defer_gap("Muse session host event stream closed");
+                    self.transport_loss = true;
                 }
             }
-            StreamState::Overflow => self.defer_gap("Muse session host event queue overflowed"),
-            StreamState::Malformed(fault) => self.defer_gap(format!(
-                "Muse session host stream contained an invalid frame ({})",
-                fault.label()
-            )),
+            StreamState::Overflow => {
+                self.defer_gap("Muse session host event queue overflowed");
+                self.transport_loss = true;
+            }
+            StreamState::Malformed(fault) => {
+                self.defer_gap(format!(
+                    "Muse session host stream contained an invalid frame ({})",
+                    fault.label()
+                ));
+                self.transport_loss = true;
+            }
             StreamState::Open => {}
         }
     }
@@ -717,6 +732,9 @@ impl EventProcessor {
                 if !self.planned_stop && self.loss_reason.is_none() {
                     self.defer_gap("Muse native event reader closed");
                 }
+                if !self.planned_stop {
+                    self.transport_loss = true;
+                }
                 self.settle_workflow_children().await;
                 self.report_gap_if_queue_empty(true).await;
                 self.finish_pending_end_stop().await;
@@ -736,7 +754,19 @@ impl EventProcessor {
             && !self.writes_blocked
             && let Some(reason) = self.loss_reason.clone()
         {
-            let _ = self.record_gap(&reason).await;
+            let health_deadline = Instant::now() + EVENT_DEADLINE;
+            let _ = self
+                .stream_source()
+                .record_gap_until(&reason, health_deadline)
+                .await;
+            if self.transport_loss {
+                self.mark_source_stale(health_deadline).await;
+            }
+            return;
+        }
+        if queue_empty && self.transport_loss {
+            self.mark_source_stale(Instant::now() + EVENT_DEADLINE)
+                .await;
         }
     }
 
@@ -3042,14 +3072,72 @@ impl EventProcessor {
         self.bind_view_session(session_id)?;
         self.status.source_unknown = true;
         self.status.view_unavailable = true;
-        if self.gap_reported || self.writes_blocked {
-            return Ok(());
+        let health_deadline = Instant::now() + EVENT_DEADLINE;
+        let gap_result = if !self.gap_reported && !self.writes_blocked {
+            self.stream_source()
+                .record_gap_until(
+                    &format!("Muse native view is unavailable ({})", reason.label()),
+                    health_deadline,
+                )
+                .await
+        } else {
+            Ok(())
+        };
+        self.mark_source_stale(health_deadline).await;
+        gap_result
+    }
+
+    /// One explicit `stale` health update for a degraded or lost native stream/view,
+    /// through the existing `source.health` mechanism. Attempted once and settled
+    /// through `source.state` readback on an uncertain acknowledgement; never replayed.
+    async fn mark_source_stale(&mut self, deadline: Instant) {
+        if self.source_health_attempted {
+            return;
         }
-        self.record_gap(&format!(
-            "Muse native view is unavailable ({})",
-            reason.label()
-        ))
-        .await
+        self.source_health_attempted = true;
+        let update =
+            SourceHealthUpdate::new(self.agent_id.clone(), self.generation, "stream", "stale");
+        let Ok(mut request) = serde_json::to_value(&update) else {
+            self.status.source_unknown = true;
+            return;
+        };
+        if update.validate().is_err() {
+            self.status.source_unknown = true;
+            return;
+        }
+        request["credential"] = json!(self.credential);
+        let acknowledgement = self.host.call("source.health", request, deadline).await;
+        if acknowledgement.as_ref().is_ok_and(|value| {
+            serde_json::from_value::<SourceHealthUpdate>(value.clone())
+                .is_ok_and(|ack| ack == update)
+        }) {
+            return;
+        }
+
+        // A lost health acknowledgement is settled by readback, never by replay.
+        let readback = self
+            .host
+            .call(
+                "source.state",
+                json!({
+                    "credential": self.credential,
+                    "agent_id": self.agent_id,
+                    "generation": self.generation,
+                    "source": "stream",
+                }),
+                deadline,
+            )
+            .await;
+        let confirmed = readback.as_ref().is_ok_and(|state| {
+            state.get("agent_id").and_then(Value::as_str) == Some(self.agent_id.as_str())
+                && state.get("generation").and_then(Value::as_i64) == Some(self.generation)
+                && state.get("source").and_then(Value::as_str) == Some("stream")
+                && state.get("state").and_then(Value::as_str) == Some("open")
+                && state.get("health").and_then(Value::as_str) == Some("stale")
+        });
+        if !confirmed {
+            self.status.source_unknown = true;
+        }
     }
 
     async fn record_gap(&mut self, reason: &str) -> Result<()> {
