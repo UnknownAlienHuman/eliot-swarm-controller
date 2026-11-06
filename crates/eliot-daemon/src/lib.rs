@@ -22,7 +22,9 @@ mod setup;
 mod workspace_git;
 mod workspaces;
 
-pub use daemon::{client_call, client_call_typed, client_call_with_owner_credential, run};
+pub use daemon::{
+    MAX_RPC_FRAME_BYTES, client_call, client_call_typed, client_call_with_owner_credential, run,
+};
 
 /// Start this executable's background daemon without inheriting caller handles.
 #[cfg(windows)]

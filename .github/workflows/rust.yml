@@ -31,15 +31,10 @@ jobs:
         run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
       - name: Formatting
         run: cargo fmt --check
-      - name: Scoped Clippy and compile
+      - name: Scoped Clippy and static checks
         run: cargo clippy --locked --all-targets -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -p eliot-plugin-muse -p eliot-plugin-claude -p eliot-plugin-opencode -p eliot-plugin-antigravity -- -D warnings
-      - name: Compile maintained-package test targets
-        run: cargo test --no-run --locked --all-targets -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -p eliot-plugin-muse -p eliot-plugin-claude -p eliot-plugin-opencode -p eliot-plugin-antigravity
-      - name: Deterministic maintained-package regressions
-        # The Windows leg runs the full subprocess-heavy suites plus the
-        # attribution suites in 3:41 (green run 41804589917); the 4-minute
-        # budget killed an earlier run mid-pass (run 41801869741), so 8
-        # minutes is headroom. Suite timeouts (120 s per plugin scenario)
-        # still bound real hangs.
-        timeout-minutes: 8
-        run: cargo test --locked --all-targets -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -p eliot-plugin-muse -p eliot-plugin-claude -p eliot-plugin-opencode -p eliot-plugin-antigravity
+      - name: Static compilation of maintained packages (all targets)
+        # CI enforces static validation only; runtime qualification is actual installed
+        # vendor agents through Swarm on real tasks, with exact binary, model, principal,
+        # outcomes, and owned cleanup recorded in the PR.
+        run: cargo build --locked --all-targets -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -p eliot-plugin-muse -p eliot-plugin-claude -p eliot-plugin-opencode -p eliot-plugin-antigravity

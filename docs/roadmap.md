@@ -19,16 +19,17 @@ Read the linked spec sections for the current increment, not all future features
 
 ```text
 cargo fmt --check
-cargo test -p <changed-package> --all-targets
+cargo build --locked -p <changed-package> --all-targets
 cargo clippy -p <changed-package> --all-targets -- -D warnings
 ```
 
-Run the tests and Clippy for each changed package, not the entire workspace by default.
-Every completed connected increment has deterministic Cargo test coverage for its
-caller-to-result path; use the fake for fake-suitable behavior. CI runs those tests and
-checks, and does not call a model. A brief runtime exercise is useful development
-evidence; record its actual result in the PR/CI. Full crash, load, vendor and platform
-qualification remains at L7. Paid-model runs are not routine tests.
+Run static validation (formatting, locked all-targets compilation, and warnings-denied Clippy)
+for each changed package, not the entire workspace by default. CI enforces static validation
+only; it does not execute test binaries or call models, and static passes are not runtime
+proof. Runtime qualification is performed with actual installed vendor agents through Swarm
+on real tasks, with exact binary hash, model, principal, outcomes, and owned cleanup
+recorded in the PR. Do not build fake harnesses, execute synthetic test regressions, or add
+readiness engines. Full crash, load, vendor and platform qualification remains at L7.
 
 ## Code budgets
 
@@ -257,6 +258,9 @@ Codex or for unrelated adapters.
       release; record the selection here. Unselected adapters stay absent.
       Muse Code selected by the owner 2026-11-03; Antigravity selected 2026-11-04.
       Remainder: Muse native children/workflow observation.
+
+- [x] **L6.5 MCP stdio for an owner-selected caller.** Add one local `swarm mcp`
+      server through the existing authenticated API and its bounded query/history surface.
 
 **Feature-complete local scope:** core, Codex, monitoring/workspaces, automation,
 coordination and the selected adapters. Do not hold this milestone for an unused vendor

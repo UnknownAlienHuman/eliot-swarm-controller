@@ -47,6 +47,33 @@ Windows starts that independent process without inheriting caller handles, so ca
 CLI stdout/stderr reach EOF while the daemon remains alive. Its own private IPC and
 owned plugin/workspace custody establish subsequent authority.
 
+### MCP stdio server
+
+`swarm mcp` is one local stdio server and never starts the daemon. It exposes exactly one
+tool, `swarm`, with required `method` (non-empty string) and `params` (object), and
+forwards each call through [`eliot_daemon::client_call`](../../crates/eliot-daemon/src/daemon.rs)
+to the existing authenticated local API. It reuses existing methods and DTOs; it adds no
+management-method catalogue.
+
+Clients configure the stdio server using their native project-scoped configuration, such as
+an Antigravity workspace plugin (`.agents/plugins/eliot-swarm/plugin.json` + `mcp_config.json`).
+Principal resolution stays in `client_call` and follows
+[Transport and principal identity](#transport-and-principal-identity). Partial or conflicting
+inherited Agent/Run/Owner identity fails closed; the server never downgrades to Owner.
+MCP arguments cannot supply or override authentication. Credentials are never included
+in tool arguments, results, diagnostics or logs.
+
+The caller supplies and retains the mutation ULID in `params` before a write. A retry
+must carry the same id, principal, method and semantic payload; a different binding is
+`id_conflict`, and an expired id is `id_expired`. Unknown outcomes keep the existing exact
+readback/resolution contract. The server does not mint or rewrite ids, automatically
+retry uncertain calls, or treat cancellation as rollback.
+
+The stdio transport MUST bound each frame to [`MAX_RPC_FRAME_BYTES`](../../crates/eliot-daemon/src/daemon.rs)
+(4 MiB) using [`BoundedLineWriter`](../../crates/eliot/src/mcp/bounded_io.rs). Forwarded RPC data and list/history
+results retain the existing API frame, pagination and encoded-response bounds. `--json`
+is invalid with this command: stdout is MCP protocol only; diagnostics go to stderr.
+
 ## Mutation ids
 
 External writes carry a ULID generated/printed before send. Bind it to principal,
