@@ -71,7 +71,7 @@ The complete selected local product must demonstrate on the owner's Windows mach
    Two Agents exchange mail, CAS a variable and identify a working area with `who`.
 4. Rules/timers/scripts and bounded Goals operate unattended without replaying uncertain
    prompts/pushes/setup. Crash recovery exposes unknown outcomes until exact settlement.
-5. Retention and representative 10,000-fake-Agent load remain bounded and responsive;
+5. Retention and representative 10,000-Agent load remain bounded and responsive;
    Windows force-stop verifies its owned Job, and Unix reports its actual weaker custody.
 
 These are final qualification goals, not conditions that must all be implemented before

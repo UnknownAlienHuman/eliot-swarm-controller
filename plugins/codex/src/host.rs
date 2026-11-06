@@ -24,9 +24,9 @@ use eliot_plugin::{
     protocol::{MAX_CREDENTIAL_BYTES, ProfileStoreParams},
     session::{
         decode, is_passed_env, is_secret_name, known_command, native_no_write, not_initialized,
-        paths_equal, register_native_process, rejected_control,
-        target_environment as shared_target_environment, unknown_control, unknown_snapshot,
-        validate_binding, validate_identity, validate_source_plan,
+        optional_profile_text, parse_resume_subject, paths_equal, register_native_process,
+        rejected_control, target_environment as shared_target_environment, unknown_control,
+        unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
     },
 };
 use serde_json::{Value, json};
@@ -50,7 +50,6 @@ const TURN_PAGE_SIZE: u32 = 1000;
 const MAX_TURN_PAGES: usize = 16;
 const ITEM_PAGE_SIZE: u32 = 1000;
 const MAX_ITEM_PAGES: usize = 16;
-const MAX_CONTROL_COMMANDS: usize = 32;
 
 #[derive(Default)]
 struct CodexPlugin {
@@ -127,12 +126,6 @@ struct NativeStartContext<'a> {
     route: &'a CodexRoute,
     store: &'a NativeStoreBinding,
     metadata_secrets: &'a [String],
-}
-
-struct ResumeSubject {
-    native_scope: String,
-    native_ref: String,
-    retained_turn: Option<String>,
 }
 
 pub(crate) async fn run() -> Result<()> {
@@ -511,6 +504,7 @@ impl CodexPlugin {
                     params.source_state.as_ref(),
                     &params.agent_id,
                     params.generation,
+                    "Codex",
                 )
             })
             .transpose()
@@ -546,9 +540,9 @@ impl CodexPlugin {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| Error::new("profile_error", "Codex profile requires an exact model id"))?
             .to_owned();
-        let requested_effort = optional_profile_text(profile, "effort")?;
+        let requested_effort = optional_profile_text(profile, "effort", "Codex")?;
         let collaboration_mode =
-            match optional_profile_text(profile, "collaboration_mode")?.as_deref() {
+            match optional_profile_text(profile, "collaboration_mode", "Codex")?.as_deref() {
                 None => None,
                 Some("default") => Some(NativeCollaborationModeKind::Default),
                 Some("plan") => Some(NativeCollaborationModeKind::Plan),
@@ -574,7 +568,7 @@ impl CodexPlugin {
             ));
         }
         let sandbox_mode = native_sandbox_mode(&permissions)?;
-        let approval_policy = optional_profile_text(profile, "approval_policy")?
+        let approval_policy = optional_profile_text(profile, "approval_policy", "Codex")?
             .unwrap_or_else(|| "never".to_owned());
         if !matches!(approval_policy.as_str(), "never" | "on-request") {
             return Err(Error::new(
@@ -1295,12 +1289,6 @@ impl CodexPlugin {
             return Err(Error::new("busy", "Codex already has an active turn"));
         }
         let command_id = params.command_id.clone();
-        if session.command_inputs.len() >= 32 {
-            return Err(Error::new(
-                "unsupported",
-                "Codex L2.1 per-generation command history bound has been reached",
-            ));
-        }
         session
             .command_inputs
             .insert(command_id.clone(), text.to_owned());
@@ -2261,11 +2249,6 @@ fn control_replay(
             }
         }));
     }
-    if session.control_commands.len() >= MAX_CONTROL_COMMANDS {
-        return Ok(Some(rejected_control(
-            "Codex L2.2 per-generation control history bound has been reached",
-        )));
-    }
     session.control_commands.insert(
         params.command_id.clone(),
         ControlCommand {
@@ -2283,138 +2266,6 @@ fn settle_control(session: &mut AgentSession, command_id: &str, outcome: Control
     if let Some(command) = session.control_commands.get_mut(command_id) {
         command.outcome = outcome;
     }
-}
-
-fn parse_resume_subject(
-    resume: &Value,
-    source_state: Option<&Value>,
-    agent_id: &str,
-    generation: i64,
-) -> Result<ResumeSubject> {
-    let resume = resume
-        .as_object()
-        .ok_or_else(|| Error::new("invalid", "Codex resume_from must be an object"))?;
-    if resume.len() != 2
-        || !resume.contains_key("native_scope")
-        || !resume.contains_key("native_ref")
-    {
-        return Err(Error::new(
-            "invalid",
-            "Codex resume_from must contain only native_scope and native_ref",
-        ));
-    }
-    let native_scope = resume
-        .get("native_scope")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| Error::new("invalid", "Codex resume_from requires native_scope"))?
-        .to_owned();
-    let native_ref = resume
-        .get("native_ref")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| Error::new("invalid", "Codex resume_from requires native_ref"))?
-        .to_owned();
-    let source_state = source_state
-        .and_then(Value::as_object)
-        .ok_or_else(|| Error::new("unknown", "Codex resume requires retained native readback"))?;
-    let retained_generation = source_state
-        .get("retained_generation")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| {
-            Error::new(
-                "unknown",
-                "Codex resume readback omitted its retained generation",
-            )
-        })?;
-    if retained_generation.checked_add(1) != Some(generation) {
-        return Err(Error::new(
-            "stale_generation",
-            "Codex resume generation does not follow the retained source generation",
-        ));
-    }
-    let retained_source = source_state
-        .get("retained_source")
-        .and_then(Value::as_object)
-        .ok_or_else(|| Error::new("unknown", "Codex resume omitted retained source state"))?;
-    if retained_source.get("agent_id").and_then(Value::as_str) != Some(agent_id)
-        || retained_source.get("generation").and_then(Value::as_i64) != Some(retained_generation)
-        || retained_source.get("source").and_then(Value::as_str) != Some("stream")
-    {
-        return Err(Error::new(
-            "stale_generation",
-            "Codex resume source state does not match the retained Agent generation",
-        ));
-    }
-    let families = retained_source
-        .get("families")
-        .and_then(Value::as_array)
-        .ok_or_else(|| Error::new("unknown", "Codex resume source state omitted its families"))?;
-    if ["session", "turn", "message", "tool", "request"]
-        .iter()
-        .any(|family| !families.iter().any(|value| value.as_str() == Some(family)))
-    {
-        return Err(Error::new(
-            "unknown",
-            "Codex retained source did not own the required event families",
-        ));
-    }
-    let current_turn = source_state
-        .get("current_turn")
-        .ok_or_else(|| Error::new("unknown", "Codex resume readback omitted current_turn"))?;
-    let retained_turn = match current_turn {
-        Value::Null => None,
-        Value::Object(turn) => {
-            if !["state", "status", "started_at", "completed_at"]
-                .iter()
-                .all(|field| turn.contains_key(*field))
-                || !matches!(
-                    turn.get("state").and_then(Value::as_str),
-                    Some("running" | "completed" | "unknown")
-                )
-                || !matches!(
-                    turn.get("status"),
-                    Some(value) if value.is_null() || value.as_str().is_some()
-                )
-                || !matches!(
-                    turn.get("started_at"),
-                    Some(value) if value.is_null() || value.as_i64().is_some()
-                )
-                || !matches!(
-                    turn.get("completed_at"),
-                    Some(value) if value.is_null() || value.as_i64().is_some()
-                )
-            {
-                return Err(Error::new(
-                    "unknown",
-                    "Codex resume current_turn summary is incomplete",
-                ));
-            }
-            Some(
-                turn.get("turn_id")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| {
-                        Error::new(
-                            "unknown",
-                            "Codex resume current_turn omitted its exact turn id",
-                        )
-                    })?
-                    .to_owned(),
-            )
-        }
-        _ => {
-            return Err(Error::new(
-                "unknown",
-                "Codex resume current_turn readback is malformed",
-            ));
-        }
-    };
-    Ok(ResumeSubject {
-        native_scope,
-        native_ref,
-        retained_turn,
-    })
 }
 
 async fn verify_resume_preflight(
@@ -2509,13 +2360,7 @@ fn terminal_turn_status(status: &str) -> bool {
 
 /// Shared error re-coding, kept under the local path for the sibling
 /// modules that reach it through this host.
-pub(crate) fn contextual_error(
-    error: Error,
-    code: impl Into<String>,
-    message: impl Into<String>,
-) -> Error {
-    eliot_plugin::session::contextual_error(error, code, message)
-}
+pub(crate) use eliot_plugin::session::contextual_error;
 
 /// Recode a pre-dispatch read failure to its deterministic code after proven
 /// no native effect. Only prerequisite reads ran; no thread/resume/input was
@@ -2534,20 +2379,6 @@ fn pre_dispatch_read_error(error: Error, code: &str, message: &str) -> Error {
 fn unconfirmed_pre_dispatch_error(error: Error, context: &str) -> Error {
     let message = format!("{}; {context}", error.message);
     error.with_code("unknown").with_message(message)
-}
-
-fn optional_profile_text(
-    profile: &serde_json::Map<String, Value>,
-    key: &str,
-) -> Result<Option<String>> {
-    match profile.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
-        Some(_) => Err(Error::new(
-            "profile_error",
-            format!("Codex profile field {key} must be a non-empty string"),
-        )),
-    }
 }
 
 fn target_environment(

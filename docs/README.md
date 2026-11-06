@@ -19,8 +19,6 @@ contract is not a requirement to implement every feature in the first layer.
 | [configuration](spec/configuration.md) | Profiles, environment, routes and services |
 | [harnesses](harnesses/README.md) | Native capability notes; Codex first |
 | [donors](reference/donors.md) | Dependency/extract/pattern map with source and target paths |
-| [v1 lessons](reference/lessons-v1.md) | Historical failure evidence, not additional implementation gates |
-| [research](reference/research.md) | Background evidence, not a required reading queue |
 
 The first usable milestone is direct Codex/Luna after core/bus. Automation, communication
 and other harnesses follow. Update the page that owns a changed contract; do not create

@@ -4,7 +4,7 @@
 //! through the shared script/process custody outside the Store lock, then
 //! commits one outcome only if generation, revision and round still match.
 //! Unknown check outcomes commit nothing and never authorize replay.
-use super::{Principal, Router, contains_known_secret_including_keys, require_owner};
+use super::{Principal, Router, coordination::decode_coordination_request, require_owner};
 use crate::{
     common::now_ms,
     scripts::process::{ProcessCapture, ProcessFailure, ProcessOutcome, run_owned_process},
@@ -70,16 +70,7 @@ where
     T: DeserializeOwned,
 {
     require_owner(principal)?;
-    if contains_known_secret_including_keys(params, secrets) {
-        return Err(Error::new(
-            "secret_in_payload",
-            format!("{method} request contains a known credential"),
-        ));
-    }
-    let request: T = serde_json::from_value(params.clone())
-        .map_err(|_| Error::new("invalid", format!("{method} params are invalid")))?;
-    validate(&request)?;
-    Ok(request)
+    decode_coordination_request(params, secrets, method, validate)
 }
 
 fn require_eliot_mode(mode: GoalMode) -> Result<()> {

@@ -14552,16 +14552,14 @@ fn mail_wake_notice_coalesces_to_one_generic_command() {
         }
     }
     assert_eq!(notices.len(), 2, "one coalesced notice per mailbox");
-    assert!(
-        notices
-            .iter()
-            .any(|(target, text)| target == &a && text == "1 unread messages; run swarm inbox")
-    );
-    assert!(
-        notices
-            .iter()
-            .any(|(target, text)| target == &b && text == "1 unread messages; run swarm inbox")
-    );
+    assert!(notices.iter().any(|(target, text)| {
+        target == &a
+            && text == "1 unread messages; run swarm inbox, then ack processed delivery IDs"
+    }));
+    assert!(notices.iter().any(|(target, text)| {
+        target == &b
+            && text == "1 unread messages; run swarm inbox, then ack processed delivery IDs"
+    }));
     for agent in [&a, &b] {
         let stop = fixture.json(&["stop", agent]);
         fixture.wait_command(

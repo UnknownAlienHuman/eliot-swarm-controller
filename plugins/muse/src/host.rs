@@ -45,7 +45,6 @@ use tokio::{sync::mpsc, time::Instant};
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const VIEW_PAGE_SIZE: i64 = 1000;
 const MAX_VIEW_PAGES: usize = 4;
-const MAX_CONTROL_COMMANDS: usize = 32;
 
 #[derive(Default)]
 struct MusePlugin {
@@ -1327,12 +1326,6 @@ impl MusePlugin {
             return Err(Error::new("busy", "Muse already has an active turn"));
         }
         let command_id = params.command_id.clone();
-        if session.command_inputs.len() >= 32 {
-            return Err(Error::new(
-                "unsupported",
-                "Muse L6.4 per-generation command history bound has been reached",
-            ));
-        }
         session
             .command_inputs
             .insert(command_id.clone(), text.to_owned());
@@ -2604,11 +2597,6 @@ fn control_replay(
             }
         }));
     }
-    if session.control_commands.len() >= MAX_CONTROL_COMMANDS {
-        return Ok(Some(rejected_control(
-            "Muse L6.4 per-generation control history bound has been reached",
-        )));
-    }
     session.control_commands.insert(
         params.command_id.clone(),
         ControlCommand {
@@ -2639,13 +2627,7 @@ fn abandon_control(session: &mut AgentSession, command_id: &str) {
 
 /// Shared contextual error, kept under the local path for the
 /// `native::client` test that pins `crate::host::contextual_error`.
-pub(crate) fn contextual_error(
-    error: Error,
-    code: impl Into<String>,
-    message: impl Into<String>,
-) -> Error {
-    eliot_plugin::session::contextual_error(error, code, message)
-}
+pub(crate) use eliot_plugin::session::contextual_error;
 
 pub(crate) fn muse_scope(muse_home: &str) -> String {
     let mut hash = 0xcbf29ce484222325u64;

@@ -26,7 +26,6 @@ use tokio::{sync::mpsc, time::Instant};
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-const MAX_COMMANDS_PER_GENERATION: usize = 32;
 const RESUME_DRAIN_ROUNDS: usize = 20;
 const RESUME_DRAIN_BEAT: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -1315,12 +1314,6 @@ impl OpenCodePlugin {
             return Err(Error::new("busy", "OpenCode already has an active turn"));
         }
         let command_id = params.command_id.clone();
-        if session.command_inputs.len() >= MAX_COMMANDS_PER_GENERATION {
-            return Err(Error::new(
-                "unsupported",
-                "OpenCode L6.2 per-generation command history bound has been reached",
-            ));
-        }
         session
             .command_inputs
             .insert(command_id.clone(), text.to_owned());
@@ -1680,14 +1673,6 @@ impl OpenCodePlugin {
             return Err(Error::new(
                 "not_found",
                 "OpenCode reply requires the exact request id",
-            ));
-        }
-        if session.command_inputs.len() + session.control_bindings.len()
-            >= MAX_COMMANDS_PER_GENERATION
-        {
-            return Err(Error::new(
-                "unsupported",
-                "OpenCode L6.2 per-generation command history bound has been reached",
             ));
         }
         session.control_bindings.insert(

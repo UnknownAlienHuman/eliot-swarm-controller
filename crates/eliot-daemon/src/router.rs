@@ -406,12 +406,8 @@ impl Router {
     }
 
     pub(crate) fn note_events(&self, events: &[Event]) {
-        self.note_committed_events(events);
-        self.signal_progress();
-    }
-
-    pub(crate) fn note_committed_events(&self, events: &[Event]) {
         self.note_unknown(events);
+        self.signal_progress();
     }
 
     fn signal_progress(&self) {
@@ -465,7 +461,6 @@ impl Router {
             self.publish_locked(&admission.events);
             admission
         };
-        self.note_unknown(&admission.events);
         if admission.command.state == CommandState::Unknown {
             self.inner
                 .unknown_commands
@@ -541,7 +536,6 @@ impl Router {
                 return Err(error);
             }
         };
-        self.note_unknown(&admission.events);
         if admission.command.state == CommandState::Unknown {
             self.inner
                 .unknown_commands
@@ -2981,7 +2975,6 @@ impl Router {
     ) -> Option<Command> {
         match result {
             Ok(change) => {
-                self.note_unknown(&change.events);
                 if change.value.state.is_terminal() {
                     self.clear_unknown_id(id);
                     if let (Some(agent), Some(generation)) =
@@ -3023,7 +3016,7 @@ impl Router {
         self.note_unknown(events);
     }
 
-    fn note_unknown(&self, events: &[Event]) {
+    pub(crate) fn note_unknown(&self, events: &[Event]) {
         let mut unknown = self.inner.unknown_commands.lock_recover();
         let mut causes = self.inner.unknown_causes.lock_recover();
         for event in events {

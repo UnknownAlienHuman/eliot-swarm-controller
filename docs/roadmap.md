@@ -9,41 +9,13 @@ The owner's 2026-10-27 clarification puts automation and coordination on the fir
 working harness before expanding the adapter catalogue. Requirements are unchanged.
 This page owns stage numbers; harness pages describe capabilities, not another schedule.
 
-Each checkbox is a useful increment, not a mandatory separate PR. Use one PR per coherent
-increment; combine closely coupled checkboxes when they form one reviewable change. One
-manager owns its branch/worktree and PR, never pushes directly to `main`, and integrates
-and merges only after scoped checks and independent review. Tick only implemented behavior.
-Read the linked spec sections for the current increment, not all future features.
-
-## Implementation gate
-
-```text
-cargo fmt --check
-cargo build --locked -p <changed-package> --all-targets
-cargo clippy -p <changed-package> --all-targets -- -D warnings
-```
-
-Run static validation (formatting, locked all-targets compilation, and warnings-denied Clippy)
-for each changed package, not the entire workspace by default. CI enforces static validation
-only; it does not execute test binaries or call models, and static passes are not runtime
-proof. Runtime qualification is performed with actual installed vendor agents through Swarm
-on real tasks, with exact binary hash, model, principal, outcomes, and owned cleanup
-recorded in the PR. Do not build fake harnesses, execute synthetic test regressions, or add
-readiness engines. Full crash, load, vendor and platform qualification remains at L7.
-
-## Code budgets
-
-There is no blocking line-count quota, `budgets.toml` gate or required `just loc` system.
-Review complexity by current callers and responsibility. Do not split crates to satisfy
-an arbitrary line limit. The target architecture is a ceiling on concepts, not a demand
-to create every crate/table immediately. Keep test/check evidence in PRs and CI, not in
-per-task report packets or another status registry.
+Each checkbox is a useful increment; tick only implemented behavior.
+See AGENTS.md for the work loop.
 
 ## Repairs to implemented paths
 
 **Next:** the remaining current-path repairs below. Checked layers record
 delivered increments, not full crash/load qualification.
-Use the existing Store/router and small internal modules. Keep evidence in the PR/CI.
 
 - [x] **Restart capacity recovery.** Reconcile exact prior-generation custody and release
       or transfer the reservation under the [capacity contract](spec/configuration.md#accounts-and-configured-capacity).
@@ -278,15 +250,15 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       history. Keep open/unknown work and current projections; no full rewrite, forced
       unknown resolution or separate cleanup ledger.
 - [ ] Core/Store/API/reducer and event replay, including retention and non-reused ids.
-- [ ] CLI fake E2E, exact generations/turns/requests, queue ordering and unknown outcomes.
+- [ ] CLI E2E on the real harness, exact generations/turns/requests, queue ordering and unknown outcomes.
 - [ ] Crash at admission, native effect, event commit, reply and source-drain boundaries;
       verify no repeated prompt/setup/script/push and no false terminal result.
-- [ ] Common plugin conformance, sanitized recordings and compact live runs for the
+- [ ] Live runs for the
       selected harnesses/routes. Verify effective model/account/permissions.
 - [ ] Rules/timers/hot reload, Goal limits, mail/ack, CAS, hierarchy and Git recovery.
 - [ ] Windows Job/handles/paths; supported Linux behavior and honest degraded custody;
       private IPC, credentials, resource bounds and adopted-service isolation.
-- [ ] Retention/WAL/backpressure and representative load. The 10,000-fake-Agent,
+- [ ] Retention/WAL/backpressure and representative load. The 10,000-Agent,
       2,000-events/s owner run is a release capacity check, not a prerequisite to L2.
 
 Fix the root cause and keep focused regressions. No runtime readiness claim until the
