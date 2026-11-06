@@ -251,7 +251,7 @@ Codex or for unrelated adapters.
 - [x] **L6.2 OpenCode.** Select one installed API. Shared mode only if per-session
       attribution/environment/stop are supported; otherwise per-Agent server.
       Steer, inject, detach and fork/background stay unconnected.
-- [ ] **L6.3 Cross-harness use.** Reuse L4/L5 rules/mail against the added plugins.
+- [x] **L6.3 Cross-harness use.** Reuse L4/L5 rules/mail against the added plugins.
       Add hooks, shared mode, native children or MCP only when a concrete caller needs
       the capability. Missing semantics reject; no compatibility executor.
 - [x] **L6.4 Selected optional adapters.** Add only those explicitly selected for the
