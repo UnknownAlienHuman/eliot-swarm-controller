@@ -2527,9 +2527,7 @@ fn build_target_environment(data_root: &Path, agent: &Agent, agent_token: &str) 
         .map_err(|error| Error::new("platform_io", format!("locate Eliot executable: {error}")))?;
     let controller_dir = executable
         .parent()
-        .ok_or_else(|| Error::new("platform_io", "Eliot executable has no parent directory"))?
-        .to_str()
-        .ok_or_else(|| Error::new("invalid", "controller directory path is not UTF-8"))?;
+        .ok_or_else(|| Error::new("platform_io", "Eliot executable has no parent directory"))?;
     #[cfg(windows)]
     let existing_path = environment
         .iter()
@@ -2537,11 +2535,19 @@ fn build_target_environment(data_root: &Path, agent: &Agent, agent_token: &str) 
         .and_then(|(_, value)| value.as_str());
     #[cfg(not(windows))]
     let existing_path = environment.get("PATH").and_then(Value::as_str);
-    let separator = if cfg!(windows) { ';' } else { ':' };
-    let path_value = match existing_path.filter(|path| !path.is_empty()) {
-        Some(existing) => format!("{controller_dir}{separator}{existing}"),
-        None => controller_dir.to_owned(),
-    };
+    let mut entries = vec![controller_dir.to_owned()];
+    if let Some(existing) = existing_path.filter(|path| !path.is_empty()) {
+        entries.extend(std::env::split_paths(existing));
+    }
+    let path_value = std::env::join_paths(entries)
+        .map_err(|_| {
+            Error::new(
+                "invalid",
+                "controller directory path cannot be represented in PATH",
+            )
+        })?
+        .into_string()
+        .map_err(|_| Error::new("invalid", "managed target PATH is not valid Unicode"))?;
     insert_environment(&mut environment, "PATH", path_value);
     Ok(Value::Object(environment))
 }
