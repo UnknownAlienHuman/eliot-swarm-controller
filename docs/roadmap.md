@@ -29,11 +29,6 @@ delivered increments, not full crash/load qualification.
       uncertain custody/readback/CAS must not be treated as definite failure.
       Completion: the next same-repository mutation can run after a failed transfer;
       genuinely unknown work remains fenced.
-- [ ] **Diagnose CI failures.** Separate the Linux timer-fetch `unknown` case from the
-      Windows daemon-readiness, event-firing and command-readback failures. The test helper
-      now preserves fixed Git stage codes; capture bounded process/IPC readiness and
-      progress facts for the other cases. Establish each cause before changing deadlines,
-      concurrency or checks. A green rerun alone does not explain an earlier failure.
 - [x] **Unknown-outcome readback/resolution.** Connect exact readback and constrained owner
       resolution under the [API contract](spec/api.md#input-turn-and-unknown-gates), including
       a send with a lost native turn association. Release only the resolved command/turn
