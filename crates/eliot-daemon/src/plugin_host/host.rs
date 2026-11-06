@@ -1033,15 +1033,22 @@ async fn cleanup_startup(
     pending_failure: &mut Option<PendingFailure>,
 ) {
     let exited = terminate_child(child, &actor.monitoring, &actor.agent).await;
-    if let Err(error) = settle_owned_source_exit(
+    // `settle_owned_source_exit` returns Ok only after positive custody exit,
+    // completed reader drain, and the committed exit gap (see
+    // `settle_drained_source_exit`). This failed-start path never enters the
+    // actor loop, so settle the generation lost here: `mark_lost` is a no-op
+    // for terminal or stale generations and fences further dispatch.
+    let settled = settle_owned_source_exit(
         &actor.state,
         &actor.key,
         Some(event_task),
         exited,
         "plugin_startup_exit",
     )
-    .await
-    {
+    .await;
+    if settled.is_ok() {
+        mark_lost_state(&actor.state, &actor.key).await;
+    } else if let Err(error) = settled {
         pending_failure.get_or_insert(PendingFailure {
             reply: None,
             error,
