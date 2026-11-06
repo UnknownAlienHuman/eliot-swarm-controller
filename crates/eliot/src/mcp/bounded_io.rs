@@ -108,14 +108,6 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for BoundedLineWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::task::Wake;
-
-    struct NoopWaker;
-
-    impl Wake for NoopWaker {
-        fn wake(self: Arc<Self>) {}
-    }
 
     struct Capture {
         max_chunk: usize,
@@ -194,8 +186,8 @@ mod tests {
         w: &mut BoundedLineWriter<W>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let waker = std::task::Waker::from(Arc::new(NoopWaker));
-        let mut cx = Context::from_waker(&waker);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
         Pin::new(w).poll_write(&mut cx, buf)
     }
 
@@ -225,8 +217,8 @@ mod tests {
     #[test]
     fn vectored_partial_counts_actual_bytes_and_oversize_is_not_forwarded() {
         let mut w = BoundedLineWriter::new(Capture::new(3), 4);
-        let waker = std::task::Waker::from(Arc::new(NoopWaker));
-        let mut cx = Context::from_waker(&waker);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
         let slices = [IoSlice::new(b"ab"), IoSlice::new(b"c\n")];
         assert!(matches!(
             Pin::new(&mut w).poll_write_vectored(&mut cx, &slices),
