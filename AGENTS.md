@@ -16,19 +16,20 @@ runtime or tooling. Select the next unchecked increment in the roadmap.
    **pattern**. Use existing code where it fits; do not import the donor's application.
 3. Implement a connected caller-to-result path. Add only the schema, commands and
    modules used by that path. Unsupported later features return `unsupported`.
-4. Run `cargo fmt --check`, `cargo test -p <changed-package> --all-targets`, and
+4. Run `cargo fmt --check`, `cargo build --locked -p <changed-package> --all-targets`, and
    `cargo clippy -p <changed-package> --all-targets -- -D warnings`. Repeat for other
    changed packages only. This works for library-only and binary-only packages; no
    unconditional `--lib`.
-5. Every completed connected increment needs deterministic Cargo test coverage for its
-   caller-to-result path; use the fake for fake-suitable behavior. Exercise the changed
-   path briefly when its runtime is available. Full crash, load, vendor and platform
-   qualification belongs to L7. CI does not call a model, and paid-model runs are not
-   routine tests. Add a focused regression for a concrete defect; do not build a test
-   framework as a detour.
-6. Tick completed work and record the actual tests and checks in the PR/CI. Roadmap
-   checkboxes are the only project status list; do not add permanent test/readiness
-   reports. Do not claim a runtime property from compilation or source review alone.
+5. Runtime qualification uses actual installed vendor agents through Swarm on real tasks,
+   not synthetic/fake execution, test harness loops, or test edits. CI enforces static
+   validation only (formatting, warnings-denied Clippy, locked all-targets compilation);
+   it does not execute tests, call models, or provide runtime proof. Do not build test
+   frameworks or fake harnesses as detours. Record the exact binary hash, model, principal,
+   outcomes, and owned cleanup in the PR.
+6. Tick completed work and record the actual static checks and real runtime evidence in
+   the PR. Roadmap checkboxes are the only project status list; do not add permanent
+   test/readiness reports or a readiness engine. Do not claim a runtime property from
+   compilation or source review alone.
 
 ## Keep the implementation small
 
