@@ -389,9 +389,7 @@ live state; ordinary command admission rejects a stale value. In either context,
 ordinary command has no turn/request binding. Store advances that same Agent to `N+1` only
 if it is stopped, failed or lost, has no active turn, and has a retained subject resumable by
 its harness. No replacement Agent is created. Native Codex resume keeps its pinned native
-binding and uses normal native readback. (The former tinyFake verifier used only a synthetic retained
-subject for deterministic transport exercise; completed history — removed; it made no native L2 qualification claim and
-never substituted for Codex.) Subject grammar remains plugin-owned. Resume keeps the retained
+binding and uses normal native readback. Subject grammar remains plugin-owned. Resume keeps the retained
 subject, profile and workspace, replays no old input, and accepts no profile, workspace,
 worktree, base, setup, model, effort or permission override.
 
