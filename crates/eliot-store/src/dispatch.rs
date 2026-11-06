@@ -248,15 +248,8 @@ impl Store {
                         "resume no longer targets the captured terminal Agent generation",
                     ));
                 }
-                if !matches!(
-                    agent.harness.as_str(),
-                    "codex" | "fake" | "muse" | "claude" | "opencode" | "antigravity"
-                ) {
-                    return Err(Error::new(
-                        "unsupported",
-                        "resume is only supported for Codex, Muse, Claude, OpenCode, Antigravity, or Fake Agents",
-                    ));
-                }
+                // Harness support was proven at admission and the harness is
+                // frozen; only generation, state and pending work are rechecked.
                 if has_pending_resume_tx(&tx, agent_num, old_generation, id)? {
                     return Err(Error::new(
                         "bad_state",
@@ -567,12 +560,8 @@ impl Store {
                         "control command targets a stale Agent generation",
                     ));
                 }
-                if !supports_control_verb(&agent.harness, &command.command.verb) {
-                    return Err(Error::new(
-                        "unsupported",
-                        "control command is not supported by this harness",
-                    ));
-                }
+                // Harness/verb support was proven at admission and both are
+                // frozen; only generation, state, turn and request are rechecked.
                 if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
                     return Err(Error::new(
                         "bad_state",

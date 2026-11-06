@@ -8,8 +8,11 @@ and advisory claims reuse the existing API/router/Store; no second scheduler.
 Principals are owner, current `agent:<id>#<generation>` and scoped automation. Missing/
 revoked identity rejects. An Agent's frozen profile `control` (self/tree/project,
 default self) governs its commands and reads: self reaches only itself, tree reaches
-its own subtree, project reaches its project label; the owner is unrestricted. Agents
-and project rules access their project coordination. Only owner/global automation writes
+its own subtree, project reaches its project label; the owner is unrestricted. A
+current Agent may queue addressed mail to any existing Agent regardless of project
+label or worktree; mail is communication only and does not grant command control.
+Project rules access project coordination; vars, claims and control remain as defined
+below. Only owner/global automation writes
 global vars. Children cannot widen parental authority. A native child without isolated
 environment has no independent Eliot principal; calls from its parent environment are
 attributed to that parent and this limitation is shown.
@@ -53,7 +56,7 @@ commands and report their actual application point. Presented is not read or und
 
 With `wake_on_mail=true` (read from the recipient's frozen profile snapshot,
 default true), a routed recipient may receive one generic coalesced notice
-per minute, with at most one open notice command: `N unread messages; run swarm inbox`.
+per minute, with at most one open notice command: `N unread messages; run swarm inbox, then ack processed delivery IDs`.
 The notice is an ordinary owner `send` bound to the recipient's current
 generation and carrying only the unread count at claim time. It never contains
 the body or marks it read. Unknown notice is not blindly retried;

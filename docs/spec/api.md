@@ -690,9 +690,10 @@ See [coordination](coordination.md#mailbox) for bounds and presentation policy.
 `mail.send` queues one message to 1–100 concrete Agents in a single bounded
 transaction, snapshotting each recipient's current generation; unknown ids
 never create Agents. Only `queue` mode is connected; `send`, `steer` and
-`inject` presentation modes return `unsupported`. The owner may mail any
-Agent; an Agent principal may mail only Agents in its own project, and its
-generation must still be current. A reply names the exact delivery being
+`inject` presentation modes return `unsupported`. A current Agent may queue
+addressed mail to any existing Agent, regardless of project label or worktree;
+mail is communication only and does not grant command control over the
+recipient. Its generation must still be current. A reply names the exact delivery being
 answered and addresses only the original participants; the sender must be
 one of them unless it is the owner. Mail text is at most 32 KiB and, like
 every other coordination payload, rejects known credentials with
@@ -726,7 +727,7 @@ increments the version, records `set_by`, and emits `var.changed`.
 
 A routed recipient with `wake_on_mail` (profile snapshot, default true) may
 receive one generic coalesced wake per minute with at most one open notice
-command per recipient across mail and claims: `N unread messages; run swarm inbox`.
+command per recipient across mail and claims: `N unread messages; run swarm inbox, then ack processed delivery IDs`.
 The notice never contains
 the body, is sent through the ordinary owner `send` path bound to the
 recipient's current generation, and is skipped — never retried — while a

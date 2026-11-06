@@ -1185,7 +1185,6 @@ impl Router {
         };
         match result {
             Ok(change) => {
-                self.note_unknown(&change.events);
                 let command = change.value;
                 self.signal_progress();
                 Some(command)
@@ -1214,7 +1213,6 @@ impl Router {
         };
         match result {
             Ok(change) => {
-                self.note_unknown(&change.events);
                 let command = change.value;
                 self.signal_progress();
                 Some(command)

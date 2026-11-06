@@ -26,7 +26,6 @@ use std::{
 use tokio::{sync::mpsc, time::Instant};
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const MAX_COMMAND_HISTORY: usize = 32;
 
 #[derive(Default)]
 struct ClaudePlugin {
@@ -1186,8 +1185,8 @@ fn replay_send(session: &AgentSession, command_id: &str, text: &str) -> Option<R
     )))
 }
 
-/// Pre-dispatch gates for a fresh send: a failed event source, an already
-/// active turn, and the per-generation command history bound.
+/// Pre-dispatch gates for a fresh send: a failed event source and an already
+/// active turn.
 fn check_send_ready(session: &AgentSession) -> Result<()> {
     let event_status = session.events.status();
     if let Some(reason) = event_status.failure {
@@ -1195,12 +1194,6 @@ fn check_send_ready(session: &AgentSession) -> Result<()> {
     }
     if event_status.active_turn_id.is_some() {
         return Err(Error::new("busy", "Claude already has an active turn"));
-    }
-    if session.command_inputs.len() >= MAX_COMMAND_HISTORY {
-        return Err(Error::new(
-            "unsupported",
-            "Claude L6.1 per-generation command history bound has been reached",
-        ));
     }
     Ok(())
 }

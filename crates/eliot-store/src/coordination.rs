@@ -503,23 +503,22 @@ impl Store {
             ));
         }
         let sender = parse_sender(principal, "mail")?;
-        let sender_agent = match &sender {
-            Sender::Owner => None,
-            Sender::Agent {
-                num, generation, ..
-            } => {
-                let agent = load_agent_by_num(&self.connection, *num)?.ok_or_else(|| {
-                    Error::new("stale_generation", "sender generation is no longer current")
-                })?;
-                if agent.generation != *generation {
-                    return Err(Error::new(
-                        "stale_generation",
-                        "sender generation is no longer current",
-                    ));
-                }
-                Some(agent)
+        // Sender generation must be current; queue mail carries no
+        // project-scope authority beyond that.
+        if let Sender::Agent {
+            num, generation, ..
+        } = &sender
+        {
+            let agent = load_agent_by_num(&self.connection, *num)?.ok_or_else(|| {
+                Error::new("stale_generation", "sender generation is no longer current")
+            })?;
+            if agent.generation != *generation {
+                return Err(Error::new(
+                    "stale_generation",
+                    "sender generation is no longer current",
+                ));
             }
-        };
+        }
         let semantic_payload = json!({
             "to": request.to,
             "mode": request.mode.as_str(),
@@ -570,15 +569,6 @@ impl Store {
             let agent = load_agent_by_num(&tx, num)?.ok_or_else(|| {
                 Error::new("not_found", format!("Agent {recipient} was not found"))
             })?;
-            if sender_agent
-                .as_ref()
-                .is_some_and(|sender| agent.project != sender.project)
-            {
-                return Err(Error::new(
-                    "not_allowed",
-                    "Agents mail only their own project",
-                ));
-            }
             recipients.push(agent);
         }
         if let Some(reply) = request.reply_to_delivery.as_deref() {
@@ -1607,7 +1597,7 @@ mod tests {
     }
 
     #[test]
-    fn mail_send_rejects_unknown_recipients_and_foreign_projects() {
+    fn mail_send_rejects_unknown_recipients_and_stale_senders() {
         let mut store = store();
         let now = now_ms();
         let a = ready_agent(&mut store, "app", now);
@@ -1623,16 +1613,6 @@ mod tests {
         assert_eq!(error.code, "not_found");
         assert_eq!(store.list_agents(None, 100).unwrap().len(), before);
 
-        let b = ready_agent(&mut store, "other", now);
-        let error = store
-            .mail_send(
-                &agent_principal(&a),
-                &send_request(vec![b.clone()], "cross"),
-                MailLimits::default(),
-                now,
-            )
-            .unwrap_err();
-        assert_eq!(error.code, "not_allowed");
         let error = store
             .mail_send(
                 &format!("agent:{a}:9"),

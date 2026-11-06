@@ -360,11 +360,6 @@ pub(super) fn snapshot_selector_members(
     Ok(members)
 }
 
-/// Derived child row identity for one expansion member.
-pub(super) fn selector_child_command_id(parent_id: &str, member: &Agent) -> String {
-    selector_child_id(parent_id, &member.id)
-}
-
 /// Admit one validated selector expansion: one concrete child per snapshotted
 /// member with the ordinary per-target gates, then the Store-only applied
 /// parent. Any live-member failure rejects the whole expansion with nothing
@@ -395,7 +390,7 @@ pub(super) fn admit_selector_expansion(
             continue;
         }
         observer::require_controlled(member)?;
-        let child_id = selector_child_command_id(&request.id, member);
+        let child_id = selector_child_id(&request.id, &member.id);
         let mut member_request = SubmitCommand::new(child_id.clone(), request.verb.clone());
         member_request.target = Some(member.id.clone());
         member_request.args = request.args.clone();

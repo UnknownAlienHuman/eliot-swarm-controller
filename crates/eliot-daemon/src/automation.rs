@@ -1057,7 +1057,7 @@ pub(crate) async fn run_global_rules(
             }
             received = events.recv() => match received {
                 Ok(event) => {
-                    router.note_committed_events(std::slice::from_ref(&event));
+                    router.note_unknown(std::slice::from_ref(&event));
                     recover_rule_children = true;
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {

@@ -50,7 +50,9 @@ fn wake_enabled(snapshot: &Value) -> bool {
 
 fn notice_text(kind: NoticeKind, count: i64) -> String {
     match kind {
-        NoticeKind::Mail => format!("{count} unread messages; run swarm inbox"),
+        NoticeKind::Mail => {
+            format!("{count} unread messages; run swarm inbox, then ack processed delivery IDs")
+        }
         NoticeKind::Claim if count == 1 => "1 overlapping work claim; run swarm who".to_owned(),
         NoticeKind::Claim => format!("{count} overlapping work claims; run swarm who"),
     }
@@ -503,24 +505,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mail_authority_scopes_mailboxes_projects_and_secrets() {
+    async fn mail_authority_scopes_mailboxes_modes_and_secrets() {
         let router = router();
         let a = ready_agent(&router, "app").await;
         let b = ready_agent(&router, "other").await;
-
-        let error = router
-            .mail_send(
-                &json!({
-                    "id": ulid::Ulid::new().to_string(),
-                    "to": [b],
-                    "mode": "queue",
-                    "text": "cross-project",
-                }),
-                &agent_principal(&a),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, "not_allowed");
 
         let error = router
             .mail_inbox(&json!({"agent": b}), &agent_principal(&a))

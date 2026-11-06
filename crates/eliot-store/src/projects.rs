@@ -227,7 +227,7 @@ pub(super) fn validate_git_fetch_intent_tx(
     principal: &str,
     frozen: &core::api::FrozenGitFetch,
 ) -> Result<core::api::ProjectRegistrationView> {
-    frozen.validate()?;
+    // Syntax was validated at decode; this checks live registration state only.
     let project_id = if principal == "owner" {
         None
     } else {
@@ -351,20 +351,15 @@ pub(super) fn validate_project_command_dispatch_tx(
         .as_deref()
         .and_then(|encoded| serde_json::from_str::<ProjectCommandBinding>(encoded).ok())
         .ok_or_else(|| Error::new("not_allowed", "project command has no valid frozen binding"))?;
-    if binding.registration_revision
-        != load_project_registration(tx, &project_id)?
-            .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?
-            .view
-            .revision
-    {
+    let registration = load_project_registration(tx, &project_id)?
+        .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?
+        .view;
+    if binding.registration_revision != registration.revision {
         return Err(Error::new(
             "not_allowed",
             "project registration changed after command admission",
         ));
     }
-    let registration = load_project_registration(tx, &project_id)?
-        .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?
-        .view;
     if command.command.verb == "launch" {
         validate_project_launch_args(&registration, &command.command.args)?;
     }

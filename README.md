@@ -145,13 +145,7 @@ local owner credential automatically; no owner token argument is needed.
 
 ## Build and check
 
-The repository pins Rust 1.99.1 with rustfmt and Clippy. From the repository root:
-
-```text
-cargo +1.99.1 fmt --check
-cargo +1.99.1 test --locked -p eliot --all-targets
-cargo +1.99.1 clippy --locked -p eliot --all-targets -- -D warnings
-cargo +1.99.1 build --locked -p eliot
-```
+See AGENTS.md ## Work loop for scoped static checks (pinned Rust 1.99.1 with
+rustfmt and Clippy).
 
 The v1 implementation remains archived on `archive/v1-final`; do not restore its runtime.
