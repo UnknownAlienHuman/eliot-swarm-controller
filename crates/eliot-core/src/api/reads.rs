@@ -554,6 +554,7 @@ mod tests {
             final_text: None,
             started_at: None,
             completed_at: None,
+            usage: None,
         };
         serde_json::to_value(AgentResultResponse {
             agent: "a1".to_owned(),

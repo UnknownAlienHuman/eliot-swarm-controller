@@ -99,6 +99,7 @@ pub(super) fn persist_turn_fact(
         final_text: None,
         started_at: None,
         completed_at: None,
+        usage: None,
     });
     match event.kind.as_str() {
         "turn.started" => {
@@ -165,6 +166,7 @@ pub(super) fn persist_turn_fact(
                 final_text: turn.final_text.as_deref(),
                 started_at: turn.started_at,
                 completed_at: turn.completed_at,
+                usage: None,
             },
         )?;
     } else {

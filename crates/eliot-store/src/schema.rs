@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 26;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 27;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -659,6 +659,18 @@ impl Store {
                      PRIMARY KEY(parent, parent_generation, registration_id)
                  );
                  INSERT INTO schema_migrations(version) VALUES (26);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 27 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE turns ADD COLUMN usage TEXT;
+                 INSERT INTO schema_migrations(version) VALUES (27);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

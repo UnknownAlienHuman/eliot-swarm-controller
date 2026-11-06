@@ -391,7 +391,8 @@ reads `not_found` for absent ids, whether pruned or never issued.
 
 These are read-only lookups using the canonical read DTOs and Core `Command`, `Turn`
 and `Agent` models. IDs never pass through a mutation call and cannot submit or replay
-work. Richer command/usage/resolution metadata remains deferred. `agent.result` requires
+work. Richer command/resolution metadata remains deferred; turn usage is connected where
+the harness reports it. `agent.result` requires
 an array of turn objects and an object for Agent metadata, not positional records.
 
 For every failed terminal turn, with or without a structured provider restriction, status
@@ -400,6 +401,11 @@ budget. The event omits oversized final text rather than exposing a truncated st
 complete, and includes
 `final_text_unavailable:"event_budget"` when representable. `Turn.final_text = None`
 means the public final text is unavailable; full native text remains private history.
+`Turn.usage = None` likewise means native token usage is unavailable. A present usage
+carries nullable token members with `scope`/`message_id` attribution when the harness
+reports it; null attribution means the native scope is unknown. Message scope is never
+a turn or session total, and a populated native total must not be assumed a per-turn or
+per-call total when scope is unknown.
 
 Required IDs must be strings whose trimmed value is nonempty. Validation does not trim,
 normalize or impose a new length limit on them. `turn.get` requires a nonnegative integer
@@ -467,7 +473,8 @@ association and gains no invented one — including a send whose native turn
 association was lost, which resolves without creating a turn. The outcome
 carries `resolution_source=owner`, as does the emitted `command.resolved`
 event; no `command.applied`/`command.failed` receipt is emitted.
-Future turn-result metadata retains the planned `command_ids` and `usage` fields.
+Future turn-result metadata retains the planned `command_ids` field; `usage` is
+connected and stays null on owner-resolved turns without native usage.
 
 `turn.resolve {id, agent, generation, turn_id, status: completed|failed|interrupted,
 reason}` requires the turn to be stored `unknown`; running and terminal turns

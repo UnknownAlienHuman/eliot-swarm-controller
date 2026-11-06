@@ -572,6 +572,34 @@ pub struct Turn {
     pub final_text: Option<String>,
     pub started_at: Option<i64>,
     pub completed_at: Option<i64>,
+    #[serde(default)]
+    pub usage: Option<TurnUsage>,
+}
+
+/// Native token usage attributed to one terminal turn. Every member is
+/// nullable: absent native data stays null, never zero. `scope` names the
+/// native attribution (`message` for the final assistant message of the
+/// bound turn); unknown fields are ignored so harnesses decode forward.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TurnUsage {
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub input_tokens: Option<i64>,
+    #[serde(default)]
+    pub output_tokens: Option<i64>,
+    #[serde(default)]
+    pub reasoning_tokens: Option<i64>,
+    #[serde(default)]
+    pub thinking_tokens: Option<i64>,
+    #[serde(default)]
+    pub cache_read_tokens: Option<i64>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<i64>,
+    #[serde(default)]
+    pub total_tokens: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -734,6 +762,8 @@ pub enum Effect {
         state: TurnState,
         status: Option<String>,
         final_text: Option<String>,
+        #[serde(default)]
+        usage: Option<TurnUsage>,
         completed_at: i64,
     },
 }
@@ -1005,6 +1035,7 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             let turn_id = required_text(event, "turn_id")?;
             let status = required_text(event, "status")?;
             let final_text = optional_text(event, "final_text")?;
+            let usage = optional_usage(event)?;
             next.state = AgentState::Idle;
             next.active_turn = None;
             next.pending.clear();
@@ -1014,6 +1045,7 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 state: TurnState::Completed,
                 status: Some(status),
                 final_text,
+                usage,
                 completed_at: now,
             });
         }
@@ -1037,6 +1069,7 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                     state: TurnState::Unknown,
                     status: None,
                     final_text: None,
+                    usage: None,
                     completed_at: now,
                 });
             }
@@ -1099,6 +1132,24 @@ fn optional_text(event: &NativeEvent, field: &str) -> Result<Option<String>> {
         Some(_) => Err(Error::new(
             "invalid",
             format!("{} field {field} must be a string", event.kind),
+        )),
+    }
+}
+
+fn optional_usage(event: &NativeEvent) -> Result<Option<TurnUsage>> {
+    match event.data.get("usage") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(_)) => {
+            serde_json::from_value(event.data["usage"].clone()).map_err(|_| {
+                Error::new(
+                    "invalid",
+                    format!("{} field usage must be a usage object", event.kind),
+                )
+            })
+        }
+        Some(_) => Err(Error::new(
+            "invalid",
+            format!("{} field usage must be a usage object", event.kind),
         )),
     }
 }
