@@ -231,7 +231,7 @@ Read [coordination](spec/coordination.md). Use two Codex Agents initially.
       `history_gap`).
 - [x] **L5.2 Work attribution.** `who` reads L3 Git/edit projections; claims are
       advisory. No second ownership database or file-lock promise.
-- [ ] **L5.3 Hierarchy.** Controller-launched children and tree selectors, then native
+- [x] **L5.3 Hierarchy.** Controller-launched children and tree selectors, then native
       child discovery/control where supported. An existing child is never hidden by a
       fanout limit. Parent completion is not child completion.
 
@@ -254,10 +254,9 @@ Codex or for unrelated adapters.
 - [ ] **L6.3 Cross-harness use.** Reuse L4/L5 rules/mail against the added plugins.
       Add hooks, shared mode, native children or MCP only when a concrete caller needs
       the capability. Missing semantics reject; no compatibility executor.
-- [ ] **L6.4 Selected optional adapters.** Add only those explicitly selected for the
+- [x] **L6.4 Selected optional adapters.** Add only those explicitly selected for the
       release; record the selection here. Unselected adapters stay absent.
       Muse Code selected by the owner 2026-11-03; Antigravity selected 2026-11-04.
-      Remainder: Muse native children/workflow observation.
 
 - [x] **L6.5 MCP stdio for an owner-selected caller.** Add one local `swarm mcp`
       server through the existing authenticated API and its bounded query/history surface.
