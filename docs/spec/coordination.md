@@ -61,13 +61,26 @@ The notice is an ordinary owner `send` bound to the recipient's current
 generation and carrying only the unread count at claim time. It never contains
 the body or marks it read. Unknown notice is not blindly retried;
 provider hold, pending request, current unknown gate and drain suppress new wake.
-A busy or waiting recipient also suppresses a new mail wake: an ordinary queued
-`send` cannot notify mid-turn anyway, so the wake is deferred (skipped, not
-queued) rather than dispatched after the inbox was already read and acked.
-Deferred mail re-offers when the recipient idles, through the same atomic
-claim, which revalidates unread and every gate; no cooldown is spent while
-deferred. A recipient with no live plugin owner for a dispatched generation
-stays queue-only.
+A busy, waiting or input-pending mail recipient suppresses a new mail wake:
+a current-generation `send` already accepted, queued, dispatched or unknown
+but not yet `turn.started` still reads idle in that gap, so the wake is
+deferred (skipped, not queued) rather than dispatched after the inbox was
+already read and acked. Claim-conflict notices keep their prior busy policy
+and still queue; only mail notices defer, ordinary user sends still queue
+FIFO. The claimed `send` carries an explicit structured `notice_kind`
+(`mail` or `claim` only); a send naming the open notice with a missing,
+wrongly typed or other value is invalid, with no inferred default, while
+normal sends never inspect it. Mail revalidates the busy, pending and
+unknown gates at admission via its open-notice identity; the Store never
+parses notice text. Deferred mail re-offers on idle through the same
+atomic claim; no cooldown is spent while deferred. A claim preserves the
+prior `last_notice_at` (0 until first presentation), a failed admission
+clears only the open claim, restart recovery clears only commandless
+open claims, command retention clears only the open reference of the
+exact completed notice it deletes, and the shared cooldown
+runs from actual presentation (`turn.started` stamps `last_notice_at`).
+A recipient with no live plugin owner for a dispatched generation stays
+queue-only.
 
 Without independent recipient identity, route only a generic notice to a live routed
 parent/manager, otherwise stay queue-only. Parent notifications follow the same policy.

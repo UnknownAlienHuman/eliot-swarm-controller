@@ -105,6 +105,41 @@ pub(super) fn admit_send_member(
             "args": request.args,
         }),
     )?;
+    // Open-notice sends must carry explicit `notice_kind` mail/claim (no
+    // default); mail then defers on busy/pending/unknown input. Claim
+    // notices keep prior queuing; other sends skip this check entirely.
+    let open_notice: Option<String> = tx
+        .query_row(
+            "SELECT open_notice_command FROM mail_notices WHERE recipient = ?1",
+            params![agent_num],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .flatten();
+    if open_notice.as_deref() == Some(request.id.as_str()) {
+        let notice_kind = request
+            .args
+            .get("notice_kind")
+            .and_then(Value::as_str)
+            .filter(|kind| matches!(*kind, "mail" | "claim"))
+            .ok_or_else(|| {
+                Error::new(
+                    "invalid",
+                    "notice send requires an explicit notice_kind of mail or claim",
+                )
+            })?;
+        if notice_kind == "mail"
+            && (matches!(agent.state, AgentState::Busy | AgentState::Waiting)
+                || has_pending_send_input(tx, agent_num, agent.generation)?
+                || has_unknown_gate(tx, agent_num)?)
+        {
+            return Err(Error::new(
+                "suppressed",
+                "notice deferred while recipient input is pending",
+            ));
+        }
+    }
     let ready = send_gate_open(tx, agent_num, agent.generation)?
         && earliest_pending_send(tx, agent_num, agent.generation)?.is_none();
     let state = if ready {

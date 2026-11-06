@@ -13,12 +13,12 @@
 
 use super::{
     Change, Error, MAX_EVENT_BYTES, Result, Store, canonical, command_binding, commit_transaction,
-    decode_json, encode_json, enforce_page_bytes, history_expired, insert_daemon_event,
-    load_agent_by_num, load_command_record, provider_holds, sql_error, turn_state_name,
-    validate_id_age, write_binding,
+    decode_json, encode_json, enforce_page_bytes, has_pending_send_input, has_unknown_gate,
+    history_expired, insert_daemon_event, load_agent_by_num, load_command_record, provider_holds,
+    sql_error, validate_id_age, write_binding,
 };
 use eliot_core::{
-    Agent, AgentState, CommandState, TurnState,
+    Agent, AgentState, CommandState,
     api::{
         MAIL_NOTICE_COOLDOWN_MS, MailAckRequest, MailAckResponse, MailDelivery,
         MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailLimits, MailMode,
@@ -283,13 +283,13 @@ impl Store {
         Ok(response)
     }
 
-    /// Atomically claim one generic notice for a recipient, or suppress it.
-    /// Suppression (cooldown, an open or unknown notice command, an unknown
-    /// command or turn, a pending request, a provider hold, a busy or waiting
-    /// mail recipient, or nothing pending) returns `Ok(None)` and records
-    /// nothing. The gate is shared: a mail wake and a claim-conflict notice
-    /// for the same recipient coalesce into one cooldown and one open notice
-    /// command.
+    /// Atomically claim one generic notice, or suppress it (cooldown from
+    /// actual presentation, open/unknown notice command, unknown command
+    /// or turn, pending request, provider hold, busy/waiting/input-pending
+    /// mail recipient, or nothing pending) returning `Ok(None)` and
+    /// recording nothing. A claim preserves the prior presentation time
+    /// (0 until first presentation); mail wakes and claim conflicts share
+    /// one cooldown and one open notice command.
     pub fn notice_claim(
         &mut self,
         recipient: &str,
@@ -324,9 +324,9 @@ impl Store {
     }
 
     /// Release a claimed notice whose notice command was never admitted, so a
-    /// failed `send` does not consume the notice cooldown. Only clears when
-    /// the stored open command still names this notice; a newer claim is
-    /// never disturbed.
+    /// failed `send` does not consume the notice cooldown. Only clears the
+    /// open claim when it still names this notice; a newer claim is never
+    /// disturbed and the prior presentation time is preserved.
     pub fn notice_release(&mut self, recipient: &str, notice_command: &str) -> Result<()> {
         self.ensure_writer_healthy()?;
         let result = self.notice_release_inner(recipient, notice_command);
@@ -991,13 +991,14 @@ impl Store {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(None);
         }
+        // Claims spend no cooldown: new rows start at 0, conflicts keep
+        // the prior presentation time (stamped only at `turn.started`).
         db!(tx.execute(
             "INSERT INTO mail_notices(recipient, last_notice_at, open_notice_command)
-             VALUES (?1, ?2, ?3)
+             VALUES (?1, 0, ?2)
              ON CONFLICT(recipient) DO UPDATE SET
-                 last_notice_at = excluded.last_notice_at,
                  open_notice_command = excluded.open_notice_command",
-            params![num, now, notice_command],
+            params![num, notice_command],
         ));
         commit_transaction(tx, &self.write_faulted)?;
         Ok(Some(NoticeClaim {
@@ -1014,7 +1015,8 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         db!(tx.execute(
-            "DELETE FROM mail_notices WHERE recipient = ?1 AND open_notice_command = ?2",
+            "UPDATE mail_notices SET open_notice_command = NULL
+             WHERE recipient = ?1 AND open_notice_command = ?2",
             params![num, notice_command],
         ));
         commit_transaction(tx, &self.write_faulted)?;
@@ -1045,12 +1047,10 @@ fn notice_pending_count_tx(
     }
 }
 
-/// Whether the shared suppression gates skip this notice: the cooldown, an
-/// open or unknown notice command, an unknown command or turn, a pending
-/// request, a provider hold, or a busy or waiting mail recipient. A
-/// suppression records nothing. Mail defers while busy because an ordinary
-/// queued send cannot notify mid-turn anyway; claim notices keep their
-/// existing gates.
+/// Shared suppression gates: cooldown from actual presentation, open
+/// notice command, unknown command/turn, pending request, provider hold,
+/// or busy/waiting/input-pending mail recipient. Suppression records
+/// nothing; mail defers on busy/pending/unknown input, claims still queue.
 fn notice_suppressed_tx(
     tx: &Transaction<'_>,
     num: i64,
@@ -1059,7 +1059,8 @@ fn notice_suppressed_tx(
     now: i64,
 ) -> Result<bool> {
     if pending.kind() == NoticeKind::Mail
-        && matches!(agent.state, AgentState::Busy | AgentState::Waiting)
+        && (matches!(agent.state, AgentState::Busy | AgentState::Waiting)
+            || has_pending_send_input(tx, num, agent.generation)?)
     {
         return Ok(true);
     }
@@ -1078,7 +1079,9 @@ fn notice_suppressed_tx(
         return Ok(true);
     }
     if let Some((_, Some(open))) = notice.as_ref() {
-        let blocking = load_command_record(tx, open)?.is_some_and(|record| {
+        // Claimed-but-unadmitted open coalesces; restart recovery clears
+        // commandless orphans, so a missing record here is live, not stale.
+        let blocking = load_command_record(tx, open)?.is_none_or(|record| {
             matches!(
                 record.state,
                 CommandState::Accepted
@@ -1091,28 +1094,7 @@ fn notice_suppressed_tx(
             return Ok(true);
         }
     }
-    let unknown_command: bool = tx
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM commands WHERE target = ?1 AND state = 'unknown'
-             )",
-            params![num],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)?;
-    if unknown_command {
-        return Ok(true);
-    }
-    let unknown_turn: bool = tx
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM turns WHERE agent = ?1 AND state = ?2
-             )",
-            params![num, turn_state_name(TurnState::Unknown)],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)?;
-    if unknown_turn {
+    if has_unknown_gate(tx, num)? {
         return Ok(true);
     }
     let pending_request: bool = tx
@@ -2594,7 +2576,8 @@ mod tests {
         assert_eq!(claim.count, 1);
         assert_eq!(claim.generation, 1);
         let state = store.notice_state(&a).unwrap().expect("notice state");
-        assert_eq!(state.last_notice_at, now);
+        // A claim spends no cooldown: no presentation has happened yet.
+        assert_eq!(state.last_notice_at, 0);
         assert_eq!(state.open_notice_command.as_deref(), Some(notice.as_str()));
         // The cooldown suppresses an immediate second wake.
         assert_eq!(
@@ -2613,7 +2596,7 @@ mod tests {
         let mut send = SubmitCommand::new(notice.clone(), "send");
         send.target = Some(a.clone());
         send.expected_generation = Some(1);
-        send.args = json!({"text": "1 unread messages; run swarm inbox"});
+        send.args = json!({"text": "1 unread messages; run swarm inbox", "notice_kind": "mail"});
         store.submit("owner", send, now).expect("admit notice");
         assert_eq!(
             store
@@ -2771,7 +2754,11 @@ mod tests {
         store
             .notice_release(&a, &first)
             .expect("release failed claim");
-        assert_eq!(store.notice_state(&a).unwrap(), None);
+        // Release clears only the open claim; the row (with its zero
+        // presentation time) remains so no cooldown is spent.
+        let released = store.notice_state(&a).unwrap().expect("row remains");
+        assert_eq!(released.open_notice_command, None);
+        assert_eq!(released.last_notice_at, 0);
         // An immediate retry can claim again.
         let second = Ulid::new().to_string();
         store
@@ -2827,7 +2814,7 @@ mod tests {
         let mut send = SubmitCommand::new(notice.clone(), "send");
         send.target = Some(a.clone());
         send.expected_generation = Some(1);
-        send.args = json!({"text": "1 unread messages; run swarm inbox"});
+        send.args = json!({"text": "1 unread messages; run swarm inbox", "notice_kind": "mail"});
         let admitted = store.submit("owner", send, now).expect("admit notice send");
         assert_eq!(admitted.command.state, CommandState::Queued);
         // The cooldown stands: a second wake is suppressed by the open command.

@@ -182,11 +182,13 @@ impl Router {
 
     /// Offer one generic notice to a routed recipient through the shared
     /// Store gate. Every gate — the per-kind routing pre-check, no live
-    /// plugin owner, the Store's atomic claim, or the ordinary send
-    /// admission (provider hold, drain, unknown gates) — skips the notice;
-    /// a skipped notice never fails the admitted write. When the claimed
-    /// `send` is not admitted, the claim is released so the failure does
-    /// not consume the notice cooldown.
+    /// plugin owner, the Store's atomic claim (mail-only busy/waiting plus
+    /// pending send input), or the ordinary send admission (provider hold,
+    /// drain, unknown gates, plus final mail-only busy/pending
+    /// revalidation via structured kind) — skips the notice; a skipped
+    /// notice never fails the admitted write. When the claimed `send` is
+    /// not admitted, the claim is released so the failure does not consume
+    /// the notice cooldown, which otherwise runs from native presentation.
     pub(super) async fn offer_notice(&self, recipient: &str, pending: NoticePending) {
         let agent = {
             let store = self.inner.store.lock().await;
@@ -231,12 +233,16 @@ impl Router {
         let Some(claim) = claim else {
             return;
         };
+        let notice_kind = match claim.kind {
+            NoticeKind::Mail => "mail",
+            NoticeKind::Claim => "claim",
+        };
         let params = json!({
             "id": notice_id,
             "target": recipient,
             "verb": "send",
             "expected_generation": claim.generation,
-            "args": {"text": notice_text(claim.kind, claim.count)},
+            "args": {"text": notice_text(claim.kind, claim.count), "notice_kind": notice_kind},
         });
         if self.submit(&params, &Principal::Owner).await.is_err() {
             let mut store = self.inner.store.lock().await;
