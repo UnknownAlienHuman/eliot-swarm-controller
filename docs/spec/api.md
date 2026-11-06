@@ -55,6 +55,8 @@ forwards each call through [`eliot_daemon::client_call`](../../crates/eliot-daem
 to the existing authenticated local API. It reuses existing methods and DTOs; it adds no
 management-method catalogue.
 
+Clients configure the stdio server using their native project-scoped configuration, such as
+an Antigravity workspace plugin (`.agents/plugins/eliot-swarm/plugin.json` + `mcp_config.json`).
 Principal resolution stays in `client_call` and follows
 [Transport and principal identity](#transport-and-principal-identity). Partial or conflicting
 inherited Agent/Run/Owner identity fails closed; the server never downgrades to Owner.
@@ -67,7 +69,8 @@ must carry the same id, principal, method and semantic payload; a different bind
 readback/resolution contract. The server does not mint or rewrite ids, automatically
 retry uncertain calls, or treat cancellation as rollback.
 
-The stdio transport MUST bound each frame to 4 MiB. Forwarded RPC data and list/history
+The stdio transport MUST bound each frame to [`MAX_RPC_FRAME_BYTES`](../../crates/eliot-daemon/src/daemon.rs)
+(4 MiB) using [`BoundedLineWriter`](../../crates/eliot/src/mcp/bounded_io.rs). Forwarded RPC data and list/history
 results retain the existing API frame, pagination and encoded-response bounds. `--json`
 is invalid with this command: stdout is MCP protocol only; diagnostics go to stderr.
 

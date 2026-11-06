@@ -258,7 +258,7 @@ Codex or for unrelated adapters.
       Muse Code selected by the owner 2026-11-03; Antigravity selected 2026-11-04.
       Remainder: Muse native children/workflow observation.
 
-- [ ] **L6.5 MCP stdio for an owner-selected caller.** Add one local `swarm mcp`
+- [x] **L6.5 MCP stdio for an owner-selected caller.** Add one local `swarm mcp`
       server through the existing authenticated API and its bounded query/history surface.
 
 **Feature-complete local scope:** core, Codex, monitoring/workspaces, automation,

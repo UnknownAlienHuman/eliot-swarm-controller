@@ -65,6 +65,25 @@ native history poll. Loss means an explicit gap. Do not replay conversation hist
 infer success from silence/process exit; drain buffered stdout first. Unknown input/result
 is not retried.
 
+## Project MCP consumption
+
+A managed Antigravity workspace discovers Eliot Swarm via its native project plugin path:
+`.agents/plugins/eliot-swarm/plugin.json` and `mcp_config.json`. The configuration declares
+a stdio MCP server invoking `swarm --data-dir <PATH> mcp`.
+
+Antigravity invokes the server over stdio via `call_mcp_tool`. The server exposes exactly one
+generic tool, `swarm`, accepting `{ method, params }`. The stdio child inherits caller identity
+from the process environment (`ELIOT_AGENT_ID`, `ELIOT_AGENT_GENERATION`, `ELIOT_AGENT_TOKEN`),
+which [`eliot_daemon::client_call`](../../crates/eliot-daemon/src/daemon.rs) validates against the
+running daemon. Partial, conflicting, or revoked managed identity fails closed; an unmanaged
+owner caller uses the existing owner credential path. Administrative methods (such as `daemon.status`)
+are rejected with `not_allowed` for managed Agent callers.
+
+Mutations require caller-supplied ULIDs in `params`; the server adds no auto-generated identifiers,
+automatic retries, defaults, or speculative rollbacks. Output frames and stdio line writes are
+strictly bounded to [`MAX_RPC_FRAME_BYTES`](../../crates/eliot-daemon/src/daemon.rs) (4 MiB) via
+[`BoundedLineWriter`](../../crates/eliot/src/mcp/bounded_io.rs).
+
 ## Permissions and final checks
 
 Use explicit native permission settings and effective init facts. No documented provider
