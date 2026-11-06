@@ -278,6 +278,7 @@ impl Router {
                 request.mode.as_str(),
                 key,
                 probe.view.revision,
+                probe.spent_by_goal_continuation,
                 now_ms(),
             )?
         };
@@ -285,12 +286,17 @@ impl Router {
             .turn_count
             .saturating_sub(probe.view.counters.turns_at_set);
         // A turn budget spent outside any round blocks without running the
-        // check. Round and no-progress budgets are decided after the check.
+        // check. A budget spent solely by this Goal's own last admitted
+        // continuation still gets its final check: success completes even
+        // on a spent budget, and a failure blocks at the postcheck below,
+        // admitting no further continuation. Round and no-progress budgets
+        // are decided after the check.
         if probe
             .view
             .definition
             .max_turns
             .is_some_and(|max| turns_used >= max)
+            && !probe.spent_by_goal_continuation
         {
             return self
                 .commit_goal_block(&request, &probe, key, claim_seq, "turn_limit")

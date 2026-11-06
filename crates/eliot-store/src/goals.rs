@@ -21,6 +21,11 @@ pub struct GoalRoundProbe {
     pub unknown_commands: i64,
     pub max_seq: i64,
     pub turn_count: i64,
+    /// True when the turn budget was spent solely by this Goal's own last
+    /// admitted continuation (exactly one turn since the last round commit,
+    /// and it is that continuation's completed turn). Only then may a
+    /// spent-budget round still run its final check.
+    pub spent_by_goal_continuation: bool,
     pub workspace: Option<String>,
 }
 
@@ -116,6 +121,13 @@ struct GoalStatePersist {
     /// start with none; idle rounds never touch it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_committed_slot: Option<i64>,
+    /// Command id of the Goal continuation admitted by the most recent
+    /// `Continued` round commit, until a later round consumes it. Private
+    /// and never shown in a view: the probe resolves it to that command's
+    /// completed turn so a budget spent by the Goal's own continuation
+    /// does not skip the final check. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_continuation_command_id: Option<String>,
 }
 
 struct GoalRow {
@@ -277,6 +289,16 @@ impl Store {
                 require_slot_due(&row, slot, now)?;
             }
         }
+        let turn_count = count_turns(&self.connection, agent_num, agent_row.generation)?;
+        let spent_by_goal_continuation = goal_continuation_spent_budget(
+            &self.connection,
+            agent_num,
+            row.generation,
+            row.state.counters.turns_at_set,
+            row.state.counters.turns_used,
+            row.state.last_continuation_command_id.as_deref(),
+            turn_count,
+        )?;
         let view = self.goal_view(row)?;
         let probe = GoalRoundProbe {
             agent_state: agent_row.state,
@@ -300,7 +322,8 @@ impl Store {
                 true,
             )?,
             max_seq: max_agent_seq(&self.connection, agent_num, agent_row.generation)?,
-            turn_count: count_turns(&self.connection, agent_num, agent_row.generation)?,
+            turn_count,
+            spent_by_goal_continuation,
             workspace: agent_row.workspace.clone(),
             view,
         };
@@ -308,22 +331,32 @@ impl Store {
     }
 
     /// Commit the durable in-flight marker for one round, re-validating the
-    /// whole probe (Goal binding, single flight, idle gates, round key) in
-    /// the same Immediate transaction. A second claim while a marker is
-    /// running is refused without running anything. Every claim resolves
-    /// exactly once: the final commit consumes its marker, anything else
-    /// (unknown check, interference, crash) leaves it `unknown` and burns
-    /// the key.
+    /// whole probe (Goal binding, single flight, idle gates, round key, and
+    /// the spent-budget qualification) in the same Immediate transaction.
+    /// `expected_spent_by_goal_continuation` is the probe's qualification;
+    /// if the live one differs the claim is refused as stale without
+    /// inserting a marker. A second claim while a marker is running is
+    /// refused without running anything. Every claim resolves exactly once:
+    /// the final commit consumes its marker, anything else (unknown check,
+    /// interference, crash) leaves it `unknown` and burns the key.
     pub fn goal_claim_round(
         &mut self,
         agent: &str,
         mode: &str,
         key: GoalRoundKey,
         expected_revision: i64,
+        expected_spent_by_goal_continuation: bool,
         now: i64,
     ) -> Result<i64> {
         self.ensure_writer_healthy()?;
-        let result = self.goal_claim_round_inner(agent, mode, key, expected_revision, now);
+        let result = self.goal_claim_round_inner(
+            agent,
+            mode,
+            key,
+            expected_revision,
+            expected_spent_by_goal_continuation,
+            now,
+        );
         self.fault_on_persistence_error(&result);
         result
     }
@@ -423,6 +456,7 @@ impl Store {
                 },
                 cadence_anchor_ms: definition.cadence_ms.map(|_| now),
                 last_committed_slot: None,
+                last_continuation_command_id: None,
             };
             let tx = self
                 .connection
@@ -457,6 +491,7 @@ impl Store {
             },
             cadence_anchor_ms: definition.cadence_ms.map(|_| now),
             last_committed_slot: None,
+            last_continuation_command_id: None,
         };
         let tx = self
             .connection
@@ -554,6 +589,7 @@ impl Store {
             counters: row.state.counters,
             cadence_anchor_ms: row.state.cadence_anchor_ms,
             last_committed_slot: row.state.last_committed_slot,
+            last_continuation_command_id: None,
         };
         db!(tx.execute(
             "UPDATE goals SET revision = ?1, state = ?2, updated_at = ?3
@@ -646,6 +682,7 @@ impl Store {
             counters: row.state.counters.clone(),
             cadence_anchor_ms: row.state.cadence_anchor_ms,
             last_committed_slot: row.state.last_committed_slot,
+            last_continuation_command_id: row.state.last_continuation_command_id.clone(),
         };
         let state_text = encode_json(&state)?;
         db!(tx.execute(
@@ -672,6 +709,7 @@ impl Store {
         mode: &str,
         key: GoalRoundKey,
         expected_revision: i64,
+        expected_spent: bool,
         now: i64,
     ) -> Result<i64> {
         require_eliot_mode(mode)?;
@@ -701,6 +739,7 @@ impl Store {
                     counters: row.state.counters.clone(),
                     cadence_anchor_ms: row.state.cadence_anchor_ms,
                     last_committed_slot: row.state.last_committed_slot,
+                    last_continuation_command_id: row.state.last_continuation_command_id.clone(),
                 };
                 db!(tx.execute(
                     "UPDATE goals SET revision = ?1, state = ?2, updated_at = ?3
@@ -788,6 +827,25 @@ impl Store {
         }
         if count_agent_commands(&tx, agent_num, row.generation, false)? > 0 {
             return Err(Error::new("busy", "Agent has open commands"));
+        }
+        // Re-validate the exact spent-budget binding in this transaction:
+        // a probe whose qualification went stale before the claim (a turn
+        // ran after the probe) must not act. Refusing inserts no marker,
+        // so the round key stays usable with a fresh probe.
+        let live_spent = goal_continuation_spent_budget(
+            &tx,
+            agent_num,
+            row.generation,
+            row.state.counters.turns_at_set,
+            row.state.counters.turns_used,
+            row.state.last_continuation_command_id.as_deref(),
+            count_turns_tx(&tx, agent_num, row.generation)?,
+        )?;
+        if live_spent != expected_spent {
+            return Err(Error::new(
+                "stale_round",
+                "goal turn budget state changed since the probe",
+            ));
         }
         let claim_seq = max_agent_seq_tx(&tx, agent_num, row.generation)?;
         match key {
@@ -1054,12 +1112,24 @@ impl Store {
         match &outcome {
             GoalCommitOutcome::Completed => {
                 state.status = GoalStatus::Completed;
+                state.last_continuation_command_id = None;
             }
             GoalCommitOutcome::Blocked { reason } => {
                 state.status = GoalStatus::Blocked;
                 state.blocked_reason = Some(reason.clone());
+                state.last_continuation_command_id = None;
             }
-            GoalCommitOutcome::Continued { .. } => {}
+            // Only a newly admitted continuation binds: an idempotent
+            // readback of an older command (same round id at a fresh key)
+            // must never grant the owned-continuation proof.
+            GoalCommitOutcome::Continued { command_id } => {
+                state.last_continuation_command_id =
+                    if admission.as_ref().is_some_and(|admission| admission.is_new) {
+                        Some(command_id.clone())
+                    } else {
+                        None
+                    };
+            }
         }
         state.counters = counters;
         if let GoalRoundKey::Slot(slot) = commit.round_key {
@@ -1103,6 +1173,78 @@ impl Store {
             admission,
         })
     }
+}
+
+/// One continuation command row as the probe reads it. Only the fields
+/// that bind it to this Goal's Agent, generation and completed turn.
+struct ContinuationCommand {
+    target: Option<i64>,
+    generation: Option<i64>,
+    turn_id: Option<String>,
+    state: String,
+    verb: String,
+}
+
+/// Whether the goal's turn budget was spent solely by its own last
+/// admitted continuation. Qualifies only when exactly one turn ran since
+/// the last round commit (the stored `turns_used` is that commit's live
+/// count) and that turn is the pending continuation's completed turn,
+/// resolved through its durable command id — two bounded point lookups,
+/// never an event scan. Anything else (no binding, another turn after
+/// the continuation, an unfinished or unknown turn) does not qualify.
+fn goal_continuation_spent_budget(
+    connection: &Connection,
+    agent_num: i64,
+    generation: i64,
+    turns_at_set: i64,
+    stored_turns_used: i64,
+    continuation_command_id: Option<&str>,
+    turn_count: i64,
+) -> Result<bool> {
+    let Some(command_id) = continuation_command_id else {
+        return Ok(false);
+    };
+    if turn_count.saturating_sub(turns_at_set) != stored_turns_used.saturating_add(1) {
+        return Ok(false);
+    }
+    let command: Option<ContinuationCommand> = connection
+        .query_row(
+            "SELECT target, generation, turn_id, state, verb FROM commands WHERE id = ?1",
+            params![command_id],
+            |row| {
+                Ok(ContinuationCommand {
+                    target: row.get(0)?,
+                    generation: row.get(1)?,
+                    turn_id: row.get(2)?,
+                    state: row.get(3)?,
+                    verb: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some(command) = command else {
+        return Ok(false);
+    };
+    if command.target != Some(agent_num) || command.state != "applied" || command.verb != "send" {
+        return Ok(false);
+    }
+    // A missing command generation is not an exact binding.
+    if command.generation != Some(generation) {
+        return Ok(false);
+    }
+    let Some(turn_id) = command.turn_id else {
+        return Ok(false);
+    };
+    let turn_state: Option<String> = connection
+        .query_row(
+            "SELECT state FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
+            params![agent_num, generation, turn_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    Ok(turn_state.as_deref() == Some("completed"))
 }
 
 /// Decide a failed check against the frozen limits. Success always
