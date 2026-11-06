@@ -964,11 +964,16 @@ impl EventProcessor {
             let observed = self.observe();
             if let Some(existing) = self.pending_requests.get_mut(&request_id) {
                 existing.observed_at = observed;
-                if !same && refresh_offer_from_raw(&mut existing.request.details, &params).is_err()
-                {
-                    return self
-                        .record_gap("Muse re-issued approval omitted its refreshed offer")
-                        .await;
+                if !same {
+                    if refresh_offer_from_raw(&mut existing.request.details, &params).is_err() {
+                        return self
+                            .record_gap("Muse re-issued approval omitted its refreshed offer")
+                            .await;
+                    }
+                    if existing.reply_state == NativeReplyState::Written {
+                        existing.reply_state = NativeReplyState::Available;
+                        existing.reply_command_id = None;
+                    }
                 }
             }
             if let Some(native_id) = orphan_request_id(&method, &params) {
