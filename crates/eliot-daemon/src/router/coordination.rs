@@ -10,7 +10,7 @@
 use super::{Principal, Router, contains_known_secret_including_keys, principal_name};
 use crate::common::now_ms;
 use eliot_core::{
-    Error, Result,
+    AgentState, Error, Result,
     api::{
         MailAckRequest, MailDelivery, MailInboxRequest, MailInboxResponse, MailReadRequest,
         MailSendRequest, MailSendResponse, VarGetRequest, VarGetResponse, VarSetRequest,
@@ -194,10 +194,16 @@ impl Router {
             }
         };
         // Generation 0 never dispatched: no live generation is routed yet.
-        // Mail honors the recipient's wake flag; claims stop at terminal
-        // state instead, since a terminal holder's claims already released.
+        // Mail honors the recipient's wake flag and defers while busy or
+        // waiting, since an ordinary queued send cannot notify mid-turn
+        // anyway; claims stop at terminal state instead, since a terminal
+        // holder's claims already released.
         match pending.kind() {
-            NoticeKind::Mail if !wake_enabled(&agent.profile_snapshot) || agent.generation < 1 => {
+            NoticeKind::Mail
+                if !wake_enabled(&agent.profile_snapshot)
+                    || agent.generation < 1
+                    || matches!(agent.state, AgentState::Busy | AgentState::Waiting) =>
+            {
                 return;
             }
             NoticeKind::Claim if agent.state.is_terminal() || agent.generation < 1 => {
@@ -234,6 +240,14 @@ impl Router {
             let mut store = self.inner.store.lock().await;
             let _ = store.notice_release(recipient, &notice_id);
         }
+    }
+
+    /// Re-offer a deferred mail wake after the recipient idles. The shared
+    /// Store gate revalidates unread, generation and every suppression at
+    /// claim time, so idle events without mail are harmless no-ops and no
+    /// cooldown is spent unless a wake is actually claimed.
+    pub(super) async fn reoffer_mail_notice(&self, recipient: &str) {
+        self.offer_notice(recipient, NoticePending::Mail).await;
     }
 }
 

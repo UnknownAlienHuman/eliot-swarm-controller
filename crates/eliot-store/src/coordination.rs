@@ -18,7 +18,7 @@ use super::{
     validate_id_age, write_binding,
 };
 use eliot_core::{
-    Agent, CommandState, TurnState,
+    Agent, AgentState, CommandState, TurnState,
     api::{
         MAIL_NOTICE_COOLDOWN_MS, MailAckRequest, MailAckResponse, MailDelivery,
         MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailLimits, MailMode,
@@ -285,10 +285,11 @@ impl Store {
 
     /// Atomically claim one generic notice for a recipient, or suppress it.
     /// Suppression (cooldown, an open or unknown notice command, an unknown
-    /// command or turn, a pending request, a provider hold, or nothing
-    /// pending) returns `Ok(None)` and records nothing. The gate is shared:
-    /// a mail wake and a claim-conflict notice for the same recipient
-    /// coalesce into one cooldown and one open notice command.
+    /// command or turn, a pending request, a provider hold, a busy or waiting
+    /// mail recipient, or nothing pending) returns `Ok(None)` and records
+    /// nothing. The gate is shared: a mail wake and a claim-conflict notice
+    /// for the same recipient coalesce into one cooldown and one open notice
+    /// command.
     pub fn notice_claim(
         &mut self,
         recipient: &str,
@@ -996,7 +997,7 @@ impl Store {
                 return Ok(None);
             }
         };
-        if notice_suppressed_tx(&tx, num, &agent, now)? {
+        if notice_suppressed_tx(&tx, num, &agent, pending, now)? {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(None);
         }
@@ -1056,8 +1057,22 @@ fn notice_pending_count_tx(
 
 /// Whether the shared suppression gates skip this notice: the cooldown, an
 /// open or unknown notice command, an unknown command or turn, a pending
-/// request, or a provider hold. A suppression records nothing.
-fn notice_suppressed_tx(tx: &Transaction<'_>, num: i64, agent: &Agent, now: i64) -> Result<bool> {
+/// request, a provider hold, or a busy or waiting mail recipient. A
+/// suppression records nothing. Mail defers while busy because an ordinary
+/// queued send cannot notify mid-turn anyway; claim notices keep their
+/// existing gates.
+fn notice_suppressed_tx(
+    tx: &Transaction<'_>,
+    num: i64,
+    agent: &Agent,
+    pending: NoticePending,
+    now: i64,
+) -> Result<bool> {
+    if pending.kind() == NoticeKind::Mail
+        && matches!(agent.state, AgentState::Busy | AgentState::Waiting)
+    {
+        return Ok(true);
+    }
     let notice: Option<(i64, Option<String>)> = tx
         .query_row(
             "SELECT last_notice_at, open_notice_command FROM mail_notices WHERE recipient = ?1",
