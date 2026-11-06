@@ -288,7 +288,7 @@ impl PluginHost {
         }
         if !matches!(
             agent.harness.as_str(),
-            "fake" | "codex" | "muse" | "claude" | "opencode" | "antigravity"
+            "codex" | "muse" | "claude" | "opencode" | "antigravity"
         ) || agent.generation <= 0
         {
             return Err(Error::new(
@@ -2257,7 +2257,7 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
 
     if !matches!(
         harness,
-        "fake" | "codex" | "muse" | "claude" | "opencode" | "antigravity"
+        "codex" | "muse" | "claude" | "opencode" | "antigravity"
     ) {
         return Err(unsupported_manifest());
     }
@@ -2285,7 +2285,7 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         .get("controlled")
         .ok_or_else(unsupported_manifest)?;
     let tool_expected = harness == "codex" || harness == "antigravity";
-    let request_expected = matches!(harness, "fake" | "codex" | "muse" | "claude" | "opencode");
+    let request_expected = matches!(harness, "codex" | "muse" | "claude" | "opencode");
     let expected_count = expected_families.len()
         + if tool_expected { 1 } else { 0 }
         + if request_expected { 1 } else { 0 };
@@ -2397,29 +2397,31 @@ fn build_process_environment_with(
     mut lookup: impl FnMut(&str) -> Option<OsString>,
 ) -> Result<Map<String, Value>> {
     let captured = match profile.get("pass_env_values") {
-        None => None, // Legacy snapshots retain their established mutable lookup.
-        Some(value) => {
-            let values = value
-                .as_object()
-                .filter(|values| {
-                    values.len() == 2
-                        && values
-                            .values()
-                            .all(|value| value.is_null() || value.is_string())
-                        && ["CODEX_HOME", "CODEX_SQLITE_HOME"]
-                            .into_iter()
-                            .all(|selector| {
-                                values
-                                    .keys()
-                                    .filter(|name| {
-                                        crate::config::native_store_selector(name) == Some(selector)
-                                    })
-                                    .count()
-                                    == 1
-                            })
-                })
-                .ok_or_else(|| Error::new("invalid", "frozen native store inputs are malformed"))?;
-            Some(values)
+        Some(value) => value
+            .as_object()
+            .filter(|values| {
+                values.len() == 2
+                    && values
+                        .values()
+                        .all(|value| value.is_null() || value.is_string())
+                    && ["CODEX_HOME", "CODEX_SQLITE_HOME"]
+                        .into_iter()
+                        .all(|selector| {
+                            values
+                                .keys()
+                                .filter(|name| {
+                                    crate::config::native_store_selector(name) == Some(selector)
+                                })
+                                .count()
+                                == 1
+                        })
+            })
+            .ok_or_else(|| Error::new("invalid", "frozen native store inputs are malformed"))?,
+        None => {
+            return Err(Error::new(
+                "invalid",
+                "frozen native store inputs are malformed",
+            ));
         }
     };
     let mut environment = Map::new();
@@ -2465,9 +2467,7 @@ fn build_process_environment_with(
                     "frozen profile pass_env cannot override Eliot Agent identity variables",
                 ));
             }
-            if let Some(selector) = crate::config::native_store_selector(name)
-                && let Some(captured) = captured
-            {
+            if let Some(selector) = crate::config::native_store_selector(name) {
                 let value = captured
                     .iter()
                     .find_map(|(name, value)| {
@@ -3058,11 +3058,54 @@ mod tests {
         );
     }
 
+    fn test_manifest(name: &str, harness_version: &str) -> PluginManifest {
+        use std::collections::BTreeMap;
+        let controlled = BTreeMap::from([
+            ("message".to_owned(), "stream".to_owned()),
+            ("session".to_owned(), "stream".to_owned()),
+            ("turn".to_owned(), "stream".to_owned()),
+        ]);
+        PluginManifest {
+            name: name.to_owned(),
+            version: "test".to_owned(),
+            protocol: "eliot-plugin/1".to_owned(),
+            harness_version: harness_version.to_owned(),
+            available: true,
+            mode: "per_agent".to_owned(),
+            verbs: vec![
+                "launch".to_owned(),
+                "resume".to_owned(),
+                "send".to_owned(),
+                "stop".to_owned(),
+                "interrupt".to_owned(),
+            ],
+            child_verbs: Vec::new(),
+            features: eliot_plugin::protocol::ManifestFeatures {
+                start_requires_input: false,
+                native_children: false,
+                discover: true,
+                observe: true,
+            },
+            sources: BTreeMap::from([
+                ("controlled".to_owned(), controlled),
+                (
+                    "observed".to_owned(),
+                    BTreeMap::from([
+                        ("message".to_owned(), "native_read".to_owned()),
+                        ("session".to_owned(), "native_read".to_owned()),
+                        ("turn".to_owned(), "native_read".to_owned()),
+                    ]),
+                ),
+            ]),
+            proxy: "none".to_owned(),
+        }
+    }
+
     #[test]
     fn route_binding_requires_the_existing_responses_manifest_capability() {
         let direct = json!({"harness":"codex"});
         let routed = json!({"harness":"codex", "route_binding":{"name":"opencodex"}});
-        let mut manifest = eliot_plugin::protocol::fake_manifest();
+        let mut manifest = test_manifest("codex", "0.161.0");
 
         require_proxy_capability(&direct, &manifest).unwrap();
         assert_eq!(
@@ -3077,50 +3120,13 @@ mod tests {
     }
 
     #[test]
-    fn controlled_fake_manifest_requires_exact_request_stream_family() {
-        let mut fake = eliot_plugin::protocol::fake_manifest();
-        assert_eq!(
-            manifest_source_plan(&fake, "fake").unwrap_err().code,
-            "unsupported"
-        );
-        fake.sources
+    fn controlled_codex_manifest_allows_tool_stream_family() {
+        let mut codex = test_manifest("codex", "0.161.0");
+        codex
+            .sources
             .get_mut("controlled")
-            .expect("Fake controlled sources")
+            .expect("Codex controlled sources")
             .insert("request".to_owned(), "stream".to_owned());
-
-        let plan = manifest_source_plan(&fake, "fake").expect("Fake request stream is supported");
-        assert_eq!(plan.as_object().unwrap().len(), 4);
-        for family in ["message", "request", "session", "turn"] {
-            assert_eq!(plan[family], "stream");
-        }
-
-        let mut wrong_mechanism = fake.clone();
-        wrong_mechanism
-            .sources
-            .get_mut("controlled")
-            .unwrap()
-            .insert("request".to_owned(), "native_read".to_owned());
-        assert_eq!(
-            manifest_source_plan(&wrong_mechanism, "fake")
-                .unwrap_err()
-                .code,
-            "unsupported"
-        );
-
-        let mut extra_tool = fake.clone();
-        extra_tool
-            .sources
-            .get_mut("controlled")
-            .unwrap()
-            .insert("tool".to_owned(), "stream".to_owned());
-        assert_eq!(
-            manifest_source_plan(&extra_tool, "fake").unwrap_err().code,
-            "unsupported"
-        );
-
-        let mut codex = fake.clone();
-        codex.name = "codex".to_owned();
-        codex.harness_version = "0.161.0".to_owned();
         codex
             .sources
             .get_mut("controlled")
@@ -3146,9 +3152,7 @@ mod tests {
 
     #[test]
     fn controlled_opencode_manifest_requires_request_stream_family() {
-        let mut opencode = eliot_plugin::protocol::fake_manifest();
-        opencode.name = "opencode".to_owned();
-        opencode.harness_version = "2.0.32".to_owned();
+        let mut opencode = test_manifest("opencode", "2.0.32");
         // Without the request family the PR2 plugin contract refuses.
         assert_eq!(
             manifest_source_plan(&opencode, "opencode")
@@ -3246,7 +3250,7 @@ mod tests {
     }
 
     #[test]
-    fn native_store_inputs_malformed_capture_is_not_legacy() {
+    fn native_store_inputs_malformed_capture_is_rejected() {
         for capture in [
             Value::Null,
             json!([]),
@@ -3265,18 +3269,11 @@ mod tests {
                 "invalid"
             );
         }
-        let legacy = json!({"pass_env":["CODEX_HOME"]});
-        let environment = build_process_environment_with(&legacy, |name| {
-            (name == "CODEX_HOME").then(|| OsString::from("current-legacy-home"))
-        })
-        .unwrap();
-        assert_eq!(environment["CODEX_HOME"], "current-legacy-home");
-        assert!(legacy.get("pass_env_values").is_none());
     }
 
     #[test]
     fn windows_baseline_forwards_systemdrive_and_programdata() {
-        let profile = json!({});
+        let profile = json!({"pass_env_values": {"CODEX_HOME": null, "CODEX_SQLITE_HOME": null}});
         let environment = build_process_environment_with(&profile, |name| match name {
             "SystemDrive" => Some(OsString::from("C:")),
             "ProgramData" => Some(OsString::from("C:\\ProgramData")),
@@ -3896,7 +3893,7 @@ mod tests {
                     target: None,
                     selector: None,
                     verb: "attach".to_owned(),
-                    args: json!({"profile":"observer-fixture", "harness":"fake", "mode":"observe",
+                    args: json!({"profile":"observer-fixture", "harness":"codex", "mode":"observe",
                 "native_scope":"fixture-scope", "native_ref":"fixture-ref", "profile_snapshot":{}}),
                     expected_generation: Some(0),
                     expected_turn_id: None,
@@ -4247,7 +4244,7 @@ mod tests {
     fn source_exit_fixture(harness: &str) -> (PluginHost, AgentKey, String) {
         let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
         let start_id = Ulid::new().to_string();
-        let profile = if harness == "fake" { "fake" } else { "fixture" };
+        let profile = "fixture";
         let agent = store
             .submit(
                 "owner",
@@ -4300,7 +4297,7 @@ mod tests {
 
     #[tokio::test]
     async fn owned_source_exit_tracks_reader_independently_of_custody() {
-        let (host, key, start_id) = source_exit_fixture("fake");
+        let (host, key, start_id) = source_exit_fixture("codex");
         let before = host.state.store.lock().await.high_water().unwrap();
         let error = settle_drained_source_exit(
             &Arc::downgrade(&host.state),
@@ -4566,7 +4563,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_pre_io_full_and_closed_queues_are_rejected_without_admission() {
-        let (host, key, start_id) = source_exit_fixture("fake");
+        let (host, key, start_id) = source_exit_fixture("codex");
         let command = {
             let mut store = host.state.store.lock().await;
             store
@@ -4758,7 +4755,7 @@ mod tests {
                     target: None,
                     selector: None,
                     verb: "launch".to_owned(),
-                    args: json!({"project": project, "workspace": workspace}),
+                    args: json!({"project": project, "workspace": workspace, "harness": "codex", "profile": "fixture", "profile_snapshot": {}}),
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
@@ -4780,7 +4777,7 @@ mod tests {
         let agent_id = submitted.target.clone().unwrap();
         let store = Arc::new(AsyncMutex::new(store));
         let host = instance_test_host(data_root.clone(), store);
-        let mut agent = Agent::new(&agent_id, "snapshot-absent", "fake", "fake", 0);
+        let mut agent = Agent::new(&agent_id, "snapshot-absent", "codex", "fixture", 0);
         agent.generation = 1;
 
         let error = host
@@ -4806,7 +4803,7 @@ mod tests {
         let agent_id = submitted.target.clone().unwrap();
         let store = Arc::new(AsyncMutex::new(store));
         let host = instance_test_host(data_root.clone(), store);
-        let mut agent = Agent::new(&agent_id, "precreate", "fake", "fake", 0);
+        let mut agent = Agent::new(&agent_id, "precreate", "codex", "fixture", 0);
         agent.generation = 1;
         agent.workspace = Some(workspace.clone());
 
@@ -4841,7 +4838,7 @@ mod tests {
         store.dispatch(&submitted.id, now_ms()).unwrap();
         let store = Arc::new(AsyncMutex::new(store));
         let host = instance_test_host(data_root.clone(), store);
-        let mut agent = Agent::new(&agent_id, "prespawn", "fake", "fake", 0);
+        let mut agent = Agent::new(&agent_id, "prespawn", "codex", "fixture", 0);
         agent.generation = 1;
         agent.workspace = Some(workspace.clone());
 

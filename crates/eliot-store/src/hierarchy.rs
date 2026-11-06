@@ -509,7 +509,7 @@ mod tests {
     }
 
     fn launch_request(project: &str, parent: Option<&str>) -> SubmitCommand {
-        let mut args = json!({"project":project, "workspace":"synthetic-workspace"});
+        let mut args = json!({"project":project, "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}});
         if let Some(parent) = parent {
             args["parent"] = json!(parent);
         }
@@ -551,7 +551,7 @@ mod tests {
                     target: None,
                     selector: None,
                     verb: "launch".to_owned(),
-                    args: json!({"project":project, "workspace":"synthetic-workspace"}),
+                    args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}}),
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,

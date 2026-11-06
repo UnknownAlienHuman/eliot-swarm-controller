@@ -309,6 +309,7 @@ fn ready_agent_with_workspace(
         "harness": "fake",
         "profile": profile,
         "workspace": workspace,
+        "profile_snapshot": {},
     });
     launch.expected_generation = Some(0);
     let admission = store.submit("owner", launch, now).unwrap();

@@ -38,6 +38,19 @@ applying the same policy to code and ID values. It omits `Error.message`, reques
 parameters and environment values. A record failure is diagnostic loss only; it cannot
 change command settlement, source acknowledgement or process cleanup.
 
+## Native profiles (all five adapters)
+
+The current product has five native adapters: Codex, Claude, OpenCode, Muse
+and Antigravity. Each profile selects one `harness` explicitly with an exact
+`cmd` and `model`; there is no default profile, no builtin fake profile, and
+no automatic harness/model/route/account fallback. The harness pages
+([Codex](../harnesses/codex.md), [Claude](../harnesses/claude-code.md),
+[OpenCode](../harnesses/opencode.md), [Muse](../harnesses/muse.md),
+[Antigravity](../harnesses/antigravity.md)) own their native mappings.
+[The example config](../../config/controller.example.toml) shows explicit
+Codex, Muse and Claude profiles; OpenCode and Antigravity follow the same
+explicit-profile shape with their own harness-specific fields.
+
 ## First profile
 
 ```toml
@@ -131,8 +144,9 @@ native-store selector inputs. It adds `ELIOT_AGENT_ID` and target
 through `pass_env`; nested Eliot calls therefore see incomplete Agent credentials and
 cannot silently fall back to owner authority. Stdin is closed and stdout/stderr piped.
 
-Profiles also accept `scratch = ["target/", "node_modules/"]`, the defaults shared by
-the builtin fake profile. `scratch = []` disables all scratch deletion. Up to 64 bounded
+Profiles also accept `scratch`; when omitted it defaults to
+`["target/", "node_modules/"]` for every native profile. There is no builtin
+fake profile supplying defaults. `scratch = []` disables all scratch deletion. Up to 64 bounded
 relative directory entries are normalized to `/` separators and a trailing `/`; absolute
 paths, dot traversal and alternate streams are rejected lexically. Execution must
 recheck containment and symlink/reparse safety. Removal may delete only untracked or
@@ -358,12 +372,12 @@ uses these captured inputs instead of looking them up again. This selector captu
 leaves other `pass_env` resolution unchanged.
 
 Retained mutation IDs hydrate their stored snapshot before any new capture. Admitted
-selector inputs are neither rewritten nor backfilled: an absent capture is a legacy
-snapshot, distinct from captured null/unset. Existing legacy environment construction
-may retain its established execution-time `pass_env` lookup; that compatibility does
-not authorize ambient native-store selection. A recovered accepted controlled Codex
-launch without captured selector inputs refuses before native control. The controller
-neither backfills those inputs nor reselects the store from ambient selectors. Resume
+selector inputs are frozen at admission and are neither rewritten nor backfilled:
+an absent capture is a legacy snapshot, distinct from captured null/unset. A
+recovered accepted controlled Codex launch without captured selector inputs
+refuses before native control. The controller never performs an execution-time
+`pass_env` lookup for native-store selection, never backfills those inputs, and
+never reselects the store from ambient selectors. Resume
 requires the retained effective `native_store_binding` and verifies it before native
 control. Capture proves only the supplied inputs, not the effective native home,
 database root or scope; native configuration can affect selection.
@@ -486,8 +500,9 @@ plugin exit and drained its reader (a stop or lost transition closes sources
 without a drain). The host record and the OS closure arrive in either order;
 each re-checks the proof and the later one releases.
 Uncertain starts retain their reservation across daemon replacement. These limits describe Eliot's admitted workload,
-not vendor entitlements, account permissions or provider quotas. Fake profiles may use
-named profile/account caps; Fake does not acquire a proxy route.
+not vendor entitlements, account permissions or provider quotas. Named native
+profiles may use named profile/account caps; a profile acquires a proxy route
+only when it explicitly selects one.
 
 Restart recovery reconciles reservations that a daemon replacement leaves behind. After
 `recover_on_restart` and before IPC bind, the daemon reads every `lost` or

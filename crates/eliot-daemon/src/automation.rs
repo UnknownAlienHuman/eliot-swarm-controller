@@ -2073,6 +2073,9 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             launch.args = json!({
                 "project": format!("backlog-event-{index}"),
                 "workspace": format!("backlog-workspace-{index}"),
+                "harness": "codex",
+                "profile": "fixture",
+                "profile_snapshot": {},
             });
             launch.expected_generation = Some(0);
             store
@@ -2155,6 +2158,9 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             request.args = json!({
                 "project": project,
                 "workspace": format!("reload-{project}"),
+                "harness": "codex",
+                "profile": "fixture",
+                "profile_snapshot": {},
             });
             request.expected_generation = Some(0);
             request
@@ -2358,9 +2364,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .join(", ");
             let mut source = format!(
                 concat!(
+                    "[profiles.fixture]\n",
+                    "harness = \"codex\"\n",
+                    "model = \"fixture-model\"\n",
                     "[projects.script-catch-up]\n",
                     "path = {checkout:?}\n",
-                    "profiles = [\"fake\"]\n",
+                    "profiles = [\"fixture\"]\n",
                     "actions = [{actions}]\n",
                     "run_env = [\"CI\"]\n\n",
                     "[projects.script-catch-up.interpreters.pwsh]\n",
@@ -2693,6 +2702,11 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
         let root = std::env::temp_dir().join(format!("eliot-rule-launch-{}", ulid::Ulid::new()));
         let data_root = root.join("owner-data");
         std::fs::create_dir_all(&data_root).unwrap();
+        std::fs::write(
+            data_root.join("config.toml"),
+            "[profiles.fixture]\nharness = \"codex\"\nmodel = \"fixture-model\"\n",
+        )
+        .unwrap();
         let workspace = std::env::current_dir()
             .unwrap()
             .canonicalize()
@@ -2712,7 +2726,7 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
             "id":"launch-on-session-end",
             "enabled":true,
             "on":{"event":"session.ended"},
-            "do":[{"action":"launch", "profile":"fake", "workspace":workspace,
+            "do":[{"action":"launch", "profile":"fixture", "workspace":workspace,
                 "text":"Review ${data.status}"}],
         });
         let input = eliot_store::RuleDefinitionInput {
@@ -2730,9 +2744,9 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
             seed.args = serde_json::json!({
                 "project":workspace,
                 "workspace":workspace,
-                "harness":"fake",
-                "profile":"fake",
-                "profile_snapshot":{"harness":"fake"},
+                "harness":"codex",
+                "profile":"fixture",
+                "profile_snapshot":{"harness":"codex"},
             });
             let agent = store
                 .submit("owner", seed, now_ms())
@@ -2796,7 +2810,7 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
 
         let workspace_literal = serde_json::to_string(&workspace).unwrap();
         let source = format!(
-            "[[rule]]\nid = 'launch-on-session-end'\non = {{ event = 'session.ended' }}\ndo = [{{ action = 'launch', profile = 'fake', workspace = {workspace_literal}, text = 'Review ${{data.status}}' }}]\n"
+            "[[rule]]\nid = 'launch-on-session-end'\non = {{ event = 'session.ended' }}\ndo = [{{ action = 'launch', profile = 'fixture', workspace = {workspace_literal}, text = 'Review ${{data.status}}' }}]\n"
         );
         let definition = definition::load(Cursor::new(source.as_bytes()))
             .unwrap()
@@ -2812,7 +2826,7 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
         assert_eq!(prepared.request.expected_generation, Some(0));
         assert_eq!(prepared.request.args["workspace"], workspace);
         assert_eq!(prepared.request.args["project"], workspace);
-        assert_eq!(prepared.request.args["profile"], "fake");
+        assert_eq!(prepared.request.args["profile"], "fixture");
         assert_eq!(prepared.request.args["text"], "Review complete");
 
         let firing = store

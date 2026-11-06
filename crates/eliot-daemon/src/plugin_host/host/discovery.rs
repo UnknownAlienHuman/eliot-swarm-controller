@@ -86,7 +86,7 @@ impl PluginHost {
         }
         if !matches!(
             profile.get("harness").and_then(Value::as_str),
-            Some("fake" | "codex")
+            Some("codex")
         ) {
             return Err(Error::new(
                 "unsupported",

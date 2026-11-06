@@ -1738,7 +1738,7 @@ mod tests {
         let id = ulid::Ulid::from_parts(1000, 1).to_string();
         let mut request = eliot_core::SubmitCommand::new(id, "launch");
         request.args = serde_json::json!({
-            "project":"source-health", "workspace":"synthetic-workspace", "harness":"fake",
+            "project":"source-health", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fixture", "profile_snapshot":{},
         });
         let command_id = request.id.clone();
         let agent = store
@@ -1949,7 +1949,7 @@ mod tests {
         .to_string();
         let mut request = eliot_core::SubmitCommand::new(id, "launch");
         request.args = serde_json::json!({
-            "project": project, "workspace": project, "harness": "fake",
+            "project": project, "workspace": project, "harness": "codex", "profile": "fixture", "profile_snapshot": {},
         });
         let command_id = request.id.clone();
         let agent_id = {

@@ -4,8 +4,13 @@ Eliot is a local Rust controller for coding-agent harnesses.
 
 ## Current slice
 
-The CLI and daemon connect to the Store, event bus, builtin `fake` harness, and
-Codex app-server through `plugins/codex`.
+The CLI and daemon connect to the Store, event bus, and the five native
+adapters — Codex (`plugins/codex`), Claude (`plugins/claude`), OpenCode
+(`plugins/opencode`), Muse (`plugins/muse`), and Antigravity
+(`plugins/antigravity`). Every launch names an explicit profile; there is no
+builtin fake profile, default profile, or automatic harness/model fallback.
+Native-store selectors are frozen into the profile snapshot at admission and
+never reselected from ambient state.
 
 Requests carrying `grantRoot` are unsupported. [Roadmap](docs/roadmap.md) owns milestone
 status.
@@ -68,7 +73,7 @@ $workspace = 'PATH_TO_EXISTING_WORKSPACE'
 $dataDir = 'PATH_TO_PRIVATE_ELIOT_DATA_DIR'
 & $swarm --data-dir $dataDir daemon
 & $swarm --data-dir $dataDir status
-& $swarm --data-dir $dataDir launch --profile fake --workspace $workspace 'hello-one' --wait
+& $swarm --data-dir $dataDir launch --profile codex-luna --workspace $workspace 'hello-one' --wait
 & $swarm --data-dir $dataDir ls
 $agent = 'AGENT_ID_FROM_OUTPUT'
 & $swarm --data-dir $dataDir send $agent 'hello-two' --wait
@@ -82,7 +87,12 @@ $agent = 'AGENT_ID_FROM_OUTPUT'
 On Unix, the built binary is `./target/debug/eliot`; pass the same `--data-dir` to each
 invocation.
 
-`launch` requires a named profile and an existing workspace; `fake` is builtin.
+`launch` requires a named explicit profile for one of the five native
+adapters and an existing workspace. Profiles are defined in
+`<data_dir>/config.toml` (see [the example](config/controller.example.toml));
+the profile supplies the harness, exact model and native executable. A missing
+or wrong-harness profile fails explicitly — Eliot never substitutes a fake or
+another model, route or account.
 `send --wait` and `launch ... --wait` follow the exact
 turn to its terminal result. The bounded wait is 30 seconds by default; use
 `--timeout-seconds N` to change it. A timeout does not cancel the admitted command.

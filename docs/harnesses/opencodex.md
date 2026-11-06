@@ -35,8 +35,8 @@ The profile explicitly selects this proxy and may name an account. The frozen sn
 captures the selected names, optional shared Core `RouteBinding`, and configured
 `CapacityScope` values. The canonical Core DTOs own their field catalog. `None` means
 unlimited; `max_live = 0` disables that configured scope. These local workload limits
-do not describe OpenCodex account entitlement or vendor quota. Named Fake profiles may
-exercise profile/account caps, but Fake has no proxy route.
+do not describe OpenCodex account entitlement or vendor quota. Named native profiles may
+exercise profile/account caps; only an explicitly proxy-selected profile acquires a proxy route.
 
 ## Codex wiring and limits
 

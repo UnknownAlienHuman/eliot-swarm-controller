@@ -3314,7 +3314,6 @@ fn install_stream_source_plan(
 
 fn source_families_for_harness(harness: &str) -> Result<&'static [&'static str]> {
     match harness {
-        "fake" => Ok(&["session", "turn", "message", "request"]),
         "codex" => Ok(&["session", "turn", "message", "tool", "request"]),
         "muse" => Ok(&["session", "turn", "message", "request"]),
         "claude" => Ok(&["session", "turn", "message", "request"]),
@@ -3611,7 +3610,7 @@ fn command_cause_for_turn_tx(
 
 fn supports_control_verb(harness: &str, verb: &str) -> bool {
     harness == "codex"
-        || (matches!(harness, "fake" | "muse")
+        || (harness == "muse"
             && matches!(verb, "interrupt" | "steer" | "approve" | "deny" | "answer"))
         || (harness == "opencode" && matches!(verb, "approve" | "deny" | "answer" | "interrupt"))
         || (harness == "claude" && matches!(verb, "interrupt" | "approve" | "deny"))

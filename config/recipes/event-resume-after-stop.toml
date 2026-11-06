@@ -9,8 +9,7 @@
 # generation with the text below as its linked first input. Verify with:
 #   swarm rule show resume-after-known-stop
 #
-# CI runs this exact file against the Fake profile (harness swapped to
-# "fake", stop id substituted, nothing else changed).
+# This uses the native Codex profile. CI never runs it against a fake profile.
 
 [[rule]]
 id = "resume-after-known-stop"

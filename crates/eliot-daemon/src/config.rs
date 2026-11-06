@@ -30,7 +30,6 @@ const MAX_AUTH_INTEGRATION_LEN: usize = 128;
 const MAX_CMD_LEN: usize = 1024;
 const MAX_ENV_NAME_LEN: usize = 256;
 const MAX_PASS_ENV_ENTRIES: usize = 64;
-const FAKE_PROFILE: &str = "fake";
 const APPROVAL_POLICY_NEVER: &str = "never";
 const APPROVAL_POLICY_ON_REQUEST: &str = "on-request";
 const PERMISSION_READ_ONLY: &str = "read-only";
@@ -415,19 +414,8 @@ pub(crate) fn load_project_registration_config(
             "config.toml: profiles: profile count exceeds 256 entries",
         ));
     }
-    if config.profiles.contains_key(FAKE_PROFILE) {
-        return Err(core::Error::new(
-            "profile_error",
-            "config.toml: profiles.fake: builtin profile cannot be overridden",
-        ));
-    }
 
-    let global_profiles: HashSet<&str> = config
-        .profiles
-        .keys()
-        .map(String::as_str)
-        .chain(std::iter::once(FAKE_PROFILE))
-        .collect();
+    let global_profiles: HashSet<&str> = config.profiles.keys().map(String::as_str).collect();
     let route_credential_env_names = configured_route_credential_env_names(&config.proxies);
     let mut projects = Vec::with_capacity(config.projects.len());
     for (id, spanned) in &config.projects {
@@ -789,14 +777,10 @@ fn has_git_remote_helper_delimiter(endpoint: &str) -> bool {
 pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Value> {
     validate_profile_name(name)?;
     let Some((config, source)) = read_config(data_root)? else {
-        return if name == FAKE_PROFILE {
-            Ok(fake_snapshot())
-        } else {
-            Err(core::Error::new(
-                "profile_error",
-                format!("config.toml: profiles.{name}: profile not found"),
-            ))
-        };
+        return Err(core::Error::new(
+            "profile_error",
+            format!("config.toml: profiles.{name}: profile not found"),
+        ));
     };
     if config.profiles.len() > MAX_PROFILES {
         return Err(core::Error::new(
@@ -836,18 +820,6 @@ pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Valu
                 "profile_error",
             ));
         }
-    }
-    if let Some(fake) = config.profiles.get(FAKE_PROFILE) {
-        return Err(config_error_at(
-            &source,
-            fake.span().start,
-            "profiles.fake",
-            "builtin profile cannot be overridden",
-            "profile_error",
-        ));
-    }
-    if name == FAKE_PROFILE {
-        return Ok(fake_snapshot());
     }
     let entry = config.profiles.get(name).ok_or_else(|| {
         core::Error::new(
@@ -921,21 +893,6 @@ pub(crate) fn load_mail_config(data_root: &Path) -> core::Result<MailConfig> {
     config.mail.validate()
 }
 
-fn fake_snapshot() -> Value {
-    let mut snapshot = fake_profile_snapshot();
-    snapshot["capacity_scopes"] = json!([{"scope":"profile:fake", "max_live":null}]);
-    snapshot
-}
-fn fake_profile_snapshot() -> Value {
-    json!({
-        "harness": "fake",
-        "permissions": PERMISSION_WORKSPACE_WRITE,
-        "approval_policy": APPROVAL_POLICY_NEVER,
-        "control": "self",
-        "pass_env": [],
-        "scratch": default_scratch(),
-    })
-}
 fn snapshot_from_entry(
     name: &str,
     entry: &ProfileEntry,
@@ -943,34 +900,6 @@ fn snapshot_from_entry(
     source: &str,
 ) -> core::Result<Value> {
     let harness = entry.harness.trim();
-    if harness == FAKE_PROFILE {
-        if entry.proxy.is_some()
-            || entry.cmd.is_some()
-            || entry.model.is_some()
-            || entry.effort.is_some()
-            || entry.collaboration_mode.is_some()
-            || entry.permissions.is_some()
-            || entry.approval_policy.is_some()
-            || entry.control.is_some()
-            || entry.approval.is_some()
-            || entry.mode.is_some()
-            || entry.dangerously_skip_permissions.is_some()
-            || entry.auth_integration.is_some()
-            || entry.pass_env.is_some()
-            || !entry.setup.is_empty()
-            || entry.scratch != default_scratch()
-        {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                "harness",
-                "named fake profiles accept only account and capacity settings",
-                "profile_error",
-            ));
-        }
-        return Ok(fake_profile_snapshot());
-    }
     if harness != "codex"
         && harness != "muse"
         && harness != "claude"
@@ -2453,7 +2382,8 @@ mod tests {
 
         let project_path = format!("{:?}", fixture.root.to_string_lossy());
         fixture.write(&format!(
-            "[projects.sample]\npath = {project_path}\nprofiles = ['fake']\nactions = ['stop']\n\
+            "[profiles.fixture]\nharness = \"codex\"\nmodel = \"fixture-model\"\n\
+             [projects.sample]\npath = {project_path}\nprofiles = ['fixture']\nactions = ['stop']\n\
              [automation]\nmax_event_backlog = 4096\n"
         ));
         assert_eq!(
@@ -2468,7 +2398,7 @@ mod tests {
             vec![ProjectRegistrationConfig {
                 id: "sample".to_owned(),
                 path: fixture.root.to_string_lossy().into_owned(),
-                profiles: vec!["fake".to_owned()],
+                profiles: vec!["fixture".to_owned()],
                 actions: vec!["stop".to_owned()],
                 git: None,
                 interpreters: BTreeMap::new(),
@@ -2599,14 +2529,6 @@ mod tests {
         let error = resolve_profile(&fixture.root, "fleet").unwrap_err();
         assert_eq!(error.code, "profile_error");
         assert!(error.message.contains("control"), "{}", error.message);
-        fixture.write("[profiles.named-fake]\nharness = \"fake\"\ncontrol = \"tree\"\n");
-        let error = resolve_profile(&fixture.root, "named-fake").unwrap_err();
-        assert_eq!(error.code, "profile_error");
-        let snapshot = resolve_profile(&fixture.root, "fake").unwrap();
-        assert_eq!(
-            snapshot.get("control").and_then(Value::as_str),
-            Some("self")
-        );
     }
 
     #[test]
@@ -2708,9 +2630,12 @@ mod tests {
             .into_owned();
         fixture.write(&format!(
             concat!(
+                "[profiles.fixture]\n",
+                "harness = \"codex\"\n",
+                "model = \"fixture-model\"\n",
                 "[projects.sample]\n",
                 "path = {project_path}\n",
-                "profiles = ['fake']\n",
+                "profiles = ['fixture']\n",
                 "actions = ['git.fetch']\n",
                 "[projects.sample.git]\n",
                 "fetch_remotes = {{ origin = {remote:?}, ",
@@ -2797,7 +2722,7 @@ mod tests {
         let fixture = AutomationConfigFixture::new();
         let project_path = format!("{:?}", fixture.root.to_string_lossy());
         fixture.write(&format!(
-            "[projects.sample]\npath = {project_path}\nprofiles = ['fake']\nactions = ['steer']\n"
+            "[profiles.fixture]\nharness = \"codex\"\nmodel = \"fixture-model\"\n[projects.sample]\npath = {project_path}\nprofiles = ['fixture']\nactions = ['steer']\n"
         ));
 
         let configured = load_project_registration_config(&fixture.root).unwrap();
@@ -2805,7 +2730,7 @@ mod tests {
         assert_eq!(configured[0].actions, vec!["steer"]);
 
         fixture.write(&format!(
-            "[projects.sample]\npath = {project_path}\nprofiles = ['fake']\nactions = ['send']\n"
+            "[profiles.fixture]\nharness = \"codex\"\nmodel = \"fixture-model\"\n[projects.sample]\npath = {project_path}\nprofiles = ['fixture']\nactions = ['send']\n"
         ));
         let without_steer = load_project_registration_config(&fixture.root).unwrap();
         assert_eq!(without_steer[0].actions, vec!["send"]);
@@ -2818,7 +2743,7 @@ mod tests {
 
         for action in ["approve", "deny", "answer"] {
             fixture.write(&format!(
-                "[projects.sample]\npath = {project_path}\nprofiles = ['fake']\nactions = ['{action}']\n"
+                "[profiles.fixture]\nharness = \"codex\"\nmodel = \"fixture-model\"\n[projects.sample]\npath = {project_path}\nprofiles = ['fixture']\nactions = ['{action}']\n"
             ));
             let configured = load_project_registration_config(&fixture.root).unwrap();
             assert_eq!(configured.len(), 1);
@@ -2831,16 +2756,16 @@ mod tests {
         let fixture = AutomationConfigFixture::new();
         let project_path = format!("{:?}", fixture.root.to_string_lossy());
         fixture.write(&format!(
-            "[projects.sample]\npath = {project_path}\nprofiles = ['fake']\nactions = ['launch']\n"
+            "[profiles.fixture]\nharness = \"codex\"\nmodel = \"fixture-model\"\n[projects.sample]\npath = {project_path}\nprofiles = ['fixture']\nactions = ['launch']\n"
         ));
 
         let configured = load_project_registration_config(&fixture.root).unwrap();
         assert_eq!(configured.len(), 1);
-        assert_eq!(configured[0].profiles, vec!["fake"]);
+        assert_eq!(configured[0].profiles, vec!["fixture"]);
         assert_eq!(configured[0].actions, vec!["launch"]);
 
         fixture.write(&format!(
-            "[projects.sample]\npath = {project_path}\nprofiles = ['fake']\nactions = ['resume', 'send']\n"
+            "[profiles.fixture]\nharness = \"codex\"\nmodel = \"fixture-model\"\n[projects.sample]\npath = {project_path}\nprofiles = ['fixture']\nactions = ['resume', 'send']\n"
         ));
         let with_resume = load_project_registration_config(&fixture.root).unwrap();
         assert_eq!(
@@ -2849,7 +2774,7 @@ mod tests {
         );
 
         fixture.write(&format!(
-            "[projects.sample]\npath = {project_path}\nprofiles = ['fake']\nactions = ['send']\n"
+            "[profiles.fixture]\nharness = \"codex\"\nmodel = \"fixture-model\"\n[projects.sample]\npath = {project_path}\nprofiles = ['fixture']\nactions = ['send']\n"
         ));
         let without_launch = load_project_registration_config(&fixture.root).unwrap();
         assert_eq!(without_launch[0].actions, vec!["send"]);
@@ -3297,42 +3222,6 @@ base_url_for.codex = "http://127.0.0.1:10300/v1"
         let direct = resolve_text_profile(direct, "direct").unwrap();
         assert!(direct.get("effort").is_none());
         assert!(direct.get("route_binding").is_none());
-    }
-
-    #[test]
-    fn l34_fake_profiles_allow_only_caps_and_account_selection() {
-        let source = r#"
-[profiles.fake-small]
-harness = "fake"
-account = "shared"
-max_live = 0
-[accounts.shared]
-max_live = 3
-"#;
-        let snapshot = resolve_text_profile(source, "fake-small").unwrap();
-        assert_eq!(snapshot["harness"], "fake");
-        assert_eq!(snapshot["account"], "shared");
-        assert!(snapshot.get("model").is_none());
-        assert!(snapshot.get("route_binding").is_none());
-        assert_eq!(
-            snapshot["capacity_scopes"],
-            json!([
-                {"scope":"profile:fake-small", "max_live":0},
-                {"scope":"account:shared", "max_live":3}
-            ])
-        );
-
-        for source in [
-            "[profiles.fake-proxy]\nharness='fake'\nproxy='opencodex'\n",
-            "[profiles.fake-cmd]\nharness='fake'\ncmd='codex'\n",
-            "[profiles.fake-model]\nharness='fake'\nmodel='some-model'\n",
-        ] {
-            let config: FileConfig = toml::from_str(source).unwrap();
-            let (name, entry) = config.profiles.iter().next().unwrap();
-            assert!(
-                snapshot_from_entry(name, entry.get_ref(), entry.span().start, source).is_err()
-            );
-        }
     }
 
     #[test]

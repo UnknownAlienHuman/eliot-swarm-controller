@@ -32,7 +32,7 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
                 target: None,
                 selector: None,
                 verb: "launch".to_owned(),
-                args: json!({"project":project, "workspace":"synthetic-workspace"}),
+                args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}}),
                 expected_generation: Some(0),
                 expected_turn_id: None,
                 request_id: None,
@@ -68,11 +68,7 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
 }
 
 #[test]
-fn initial_source_families_match_fake_and_codex_harness_boundaries() {
-    assert_eq!(
-        super::source_families_for_harness("fake").unwrap(),
-        &["session", "turn", "message", "request"][..]
-    );
+fn initial_source_families_match_native_harness_boundaries() {
     assert_eq!(
         super::source_families_for_harness("codex").unwrap(),
         &["session", "turn", "message", "tool", "request"][..]
@@ -3367,7 +3363,7 @@ fn send_association_emits_applied_once_with_native_batch_ack() {
                 target: None,
                 selector: None,
                 verb: "launch".to_owned(),
-                args: json!({"project":"send-event", "workspace":"synthetic-workspace"}),
+                args: json!({"project":"send-event", "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}}),
                 expected_generation: Some(0),
                 expected_turn_id: None,
                 request_id: None,
@@ -5178,8 +5174,7 @@ fn provider_probe_claim_survives_reopen_and_exact_success_clears_hold() {
         let count_before_launch = store.agent_count().unwrap();
         let launch_id = Ulid::new().to_string();
         let mut launch = SubmitCommand::new(launch_id, "launch");
-        launch.args =
-            json!({"project":"provider-held-launch", "workspace":"synthetic-held-launch"});
+        launch.args = json!({"project":"provider-held-launch", "workspace":"synthetic-held-launch", "harness":"fake", "profile":"fake", "profile_snapshot":{}});
         launch.expected_generation = Some(0);
         assert_eq!(
             store.submit("owner", launch, now + 9).unwrap_err().code,
@@ -8388,7 +8383,7 @@ fn event_subject_is_persisted_at_write_time_without_changing_native_data_digest(
     let project = "event-subject-snapshot";
     let launch_id = Ulid::new().to_string();
     let mut request = SubmitCommand::new(launch_id.clone(), "launch");
-    request.args = json!({"project":project, "workspace":"synthetic-workspace"});
+    request.args = json!({"project":project, "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}});
     request.expected_generation = Some(0);
     let admission = store.submit("owner", request, now).unwrap();
     let agent = admission.command.target.clone().unwrap();

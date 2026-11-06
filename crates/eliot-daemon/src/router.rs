@@ -1885,7 +1885,8 @@ impl Router {
                 "daemon is shutting down and rejects new discovery",
             ));
         }
-        let profile = crate::config::resolve_profile(&self.inner.data_root, &request.profile)?;
+        let mut profile = crate::config::resolve_profile(&self.inner.data_root, &request.profile)?;
+        crate::config::capture_native_store_inputs(&mut profile, |name| std::env::var_os(name))?;
         if request
             .harness
             .as_deref()
@@ -3658,7 +3659,7 @@ fn validate_retained_resume_agent(agent: &Agent, command: &Command) -> Result<i6
                 ));
             }
         }
-        "fake" | "muse" | "claude" | "opencode" | "antigravity" => {
+        "muse" | "claude" | "opencode" | "antigravity" => {
             if agent.profile_snapshot.get("native_store_binding").is_some() {
                 return Err(Error::new(
                     "source_integrity",
@@ -4007,7 +4008,7 @@ fn install_frozen_profile(
 ) -> Result<()> {
     if !matches!(
         harness,
-        "fake" | "codex" | "muse" | "claude" | "opencode" | "antigravity"
+        "codex" | "muse" | "claude" | "opencode" | "antigravity"
     ) {
         return Err(Error::new(
             "unsupported",
@@ -4686,34 +4687,37 @@ mod tests {
     }
 
     #[test]
-    fn resume_capture_preserves_codex_binding_and_accepts_only_owned_fake_subjects() {
-        let mut fake = Agent::new("a7", "descriptive-project", "fake", "fake", 10);
-        fake.generation = 2;
-        fake.state = eliot_core::AgentState::Stopped;
-        fake.native_scope = Some("fake-scope-a7".to_owned());
-        fake.native_ref = Some("fake-subject-a7".to_owned());
+    fn resume_capture_preserves_codex_binding_and_accepts_only_owned_subjects() {
+        let mut agent = Agent::new("a7", "descriptive-project", "muse", "fixture", 10);
+        agent.generation = 2;
+        agent.state = eliot_core::AgentState::Stopped;
+        agent.native_scope = Some("muse-scope-a7".to_owned());
+        agent.native_ref = Some("muse-subject-a7".to_owned());
         let mut resume = command_with_state("resume-fixture", "resume", CommandState::Accepted);
-        resume.target = Some(fake.id.clone());
+        resume.target = Some(agent.id.clone());
         resume.expected_generation = Some(2);
         resume.generation = Some(2);
-        assert_eq!(validate_retained_resume_agent(&fake, &resume).unwrap(), 2);
+        assert_eq!(validate_retained_resume_agent(&agent, &resume).unwrap(), 2);
 
         let mut ordinary = resume.clone();
         ordinary.expected_generation = None;
-        assert_eq!(validate_retained_resume_agent(&fake, &ordinary).unwrap(), 2);
+        assert_eq!(
+            validate_retained_resume_agent(&agent, &ordinary).unwrap(),
+            2
+        );
         let mut queued = ordinary.clone();
         queued.state = CommandState::Queued;
-        assert_eq!(validate_retained_resume_agent(&fake, &queued).unwrap(), 2);
+        assert_eq!(validate_retained_resume_agent(&agent, &queued).unwrap(), 2);
         let mut missing_stored_generation = resume.clone();
         missing_stored_generation.generation = None;
         assert_eq!(
-            validate_retained_resume_agent(&fake, &missing_stored_generation)
+            validate_retained_resume_agent(&agent, &missing_stored_generation)
                 .unwrap_err()
                 .code,
             "stale_generation"
         );
 
-        let mut observed = fake.clone();
+        let mut observed = agent.clone();
         observed.observe_only = true;
         assert_eq!(
             validate_retained_resume_agent(&observed, &resume)
@@ -4721,7 +4725,7 @@ mod tests {
                 .code,
             "not_allowed"
         );
-        let mut unknown_agent = fake.clone();
+        let mut unknown_agent = agent.clone();
         unknown_agent.state = AgentState::Unknown;
         assert_eq!(
             validate_retained_resume_agent(&unknown_agent, &resume)
@@ -4732,12 +4736,12 @@ mod tests {
         let mut unknown_resume = resume.clone();
         unknown_resume.state = CommandState::Unknown;
         assert_eq!(
-            validate_retained_resume_agent(&fake, &unknown_resume)
+            validate_retained_resume_agent(&agent, &unknown_resume)
                 .unwrap_err()
                 .code,
             "bad_state"
         );
-        let mut nonterminal = fake.clone();
+        let mut nonterminal = agent.clone();
         nonterminal.state = eliot_core::AgentState::Busy;
         assert_eq!(
             validate_retained_resume_agent(&nonterminal, &resume)
@@ -4746,7 +4750,7 @@ mod tests {
             "bad_state"
         );
 
-        let mut codex = fake.clone();
+        let mut codex = agent.clone();
         codex.harness = "codex".to_owned();
         codex.profile = "codex-luna".to_owned();
         codex.native_scope = Some("codex-scope-a7".to_owned());
@@ -4830,8 +4834,8 @@ mod tests {
             "project":checkout,
             "workspace":checkout,
             "worktree":workspace_input.requested_branch,
-            "harness":"fake",
-            "profile":"fake",
+            "harness":"codex",
+            "profile":"fixture",
             "profile_snapshot":{},
         });
         {
@@ -5389,40 +5393,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
     }
 
     #[tokio::test]
-    async fn native_store_binding_fake_launch_skips_metadata_resolution() {
-        let router = router();
-        let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
-        request.args = json!({"project":"legacy-fake", "workspace":"missing-synthetic-workspace"});
-        {
-            let mut store = router.inner.store.lock().await;
-            store.submit("owner", request.clone(), now_ms()).unwrap();
-        }
-        router
-            .clone()
-            .process_command_inner(request.id.clone(), None)
-            .await;
-        let store = router.inner.store.lock().await;
-        let command = store.get_command(&request.id).unwrap().unwrap();
-        // Fake reaches its existing start validation; no metadata process is
-        // spawned for a synthetic/nonexistent workspace or legacy snapshot.
-        assert_eq!(command.state, CommandState::Unknown);
-        assert_eq!(command.outcome.unwrap()["code"], "invalid");
-        assert!(
-            store
-                .read_events(0, 1000, None)
-                .unwrap()
-                .iter()
-                .any(|event| event.kind == "command.dispatched"
-                    && event.data["command_id"] == request.id)
-        );
-        let agent = store
-            .get_agent(command.target.as_deref().unwrap())
-            .unwrap()
-            .unwrap();
-        assert!(agent.profile_snapshot.get("native_store_binding").is_none());
-    }
-
-    #[tokio::test]
     async fn native_store_inputs_retained_hydration_survives_store_reopen() {
         let root = std::env::temp_dir().join(format!("eliot-store-inputs-{}", ulid::Ulid::new()));
         std::fs::create_dir(&root).unwrap();
@@ -5615,7 +5585,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                     target: None,
                     selector: None,
                     verb: "launch".to_owned(),
-                    args: json!({"project":"typed-events", "workspace":"synthetic-workspace"}),
+                    args: json!({"project":"typed-events", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fixture", "profile_snapshot":{}}),
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
@@ -6445,7 +6415,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                     target: None,
                     selector: None,
                     verb: "launch".to_owned(),
-                    args: json!({"project":"provider-held", "workspace":"synthetic-workspace"}),
+                    args: json!({"project":"provider-held", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fixture", "profile_snapshot":{}}),
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
@@ -7040,7 +7010,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let router = router();
         let (agent, stop_id, resume_id, linked_id, dispatch_error) = {
             let mut store = router.inner.store.lock().await;
-            let agent = stopped_fake_agent(&mut store, "resume-stop-dispatch-race");
+            let agent = stopped_agent(&mut store, "resume-stop-dispatch-race");
 
             let stop_id = ulid::Ulid::new().to_string();
             let mut stop = SubmitCommand::new(stop_id.clone(), "stop");
@@ -7132,9 +7102,9 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 "project":checkout,
                 "workspace":worktree,
                 "worktree":branch,
-                "harness":"fake",
-                "profile":"fake",
-                "profile_snapshot":{"harness":"fake"},
+                "harness":"codex",
+                "profile":"fixture",
+                "profile_snapshot":{"harness":"codex"},
             });
             let accepted = store
                 .submit_with_workspace("owner", launch, input.clone(), now_ms())
@@ -7316,9 +7286,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             data_root.join("config.toml"),
             format!(
                 concat!(
+                    "[profiles.fixture]\n",
+                    "harness = \"codex\"\n",
+                    "model = \"fixture-model\"\n",
                     "[projects.{PROJECT_ID}]\n",
                     "path = {checkout:?}\n",
-                    "profiles = [\"fake\"]\n",
+                    "profiles = [\"fixture\"]\n",
                     "actions = [\"resume\", \"send\"]\n",
                 ),
                 PROJECT_ID = PROJECT_ID,
@@ -7334,7 +7307,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             checkout: checkout.clone(),
             repo_common_dir: repo_common_dir.clone(),
             git: None,
-            profiles: vec!["fake".to_owned()],
+            profiles: vec!["fixture".to_owned()],
             actions: vec!["resume".to_owned(), "send".to_owned()],
             interpreters: std::collections::BTreeMap::new(),
             run_env: Vec::new(),
@@ -7379,9 +7352,9 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 "project":checkout,
                 "workspace":worktree,
                 "worktree":branch,
-                "harness":"fake",
-                "profile":"fake",
-                "profile_snapshot":{"harness":"fake"},
+                "harness":"codex",
+                "profile":"fixture",
+                "profile_snapshot":{"harness":"codex"},
             });
             let accepted = store
                 .submit_with_workspace("owner", launch, input.clone(), now_ms())
@@ -7607,9 +7580,9 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 "project":checkout,
                 "workspace":worktree,
                 "worktree":branch,
-                "harness":"fake",
-                "profile":"fake",
-                "profile_snapshot":{"harness":"fake"},
+                "harness":"codex",
+                "profile":"fixture",
+                "profile_snapshot":{"harness":"codex"},
             });
             let accepted = store
                 .submit_with_workspace("owner", launch, input.clone(), now_ms())
@@ -9585,7 +9558,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             let mut store = router.inner.store.lock().await;
             let agent = store.submit("owner", SubmitCommand {
                 id:attach_id.clone(), target:None, selector:None, verb:"attach".to_owned(),
-                args:json!({"profile":"fixture", "harness":"fake", "mode":"observe",
+                args:json!({"profile":"fixture", "harness":"codex", "mode":"observe",
                     "native_scope":"fixture-scope", "native_ref":"fixture-ref", "profile_snapshot":{}}),
                 expected_generation:Some(0), expected_turn_id:None, request_id:None, probe:false,
             }, now_ms()).unwrap().command.target.unwrap();
@@ -9845,7 +9818,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .unwrap();
     }
 
-    pub(super) fn stopped_fake_agent(store: &mut eliot_store::Store, project: &str) -> String {
+    pub(super) fn stopped_agent(store: &mut eliot_store::Store, project: &str) -> String {
         let workspace = std::env::temp_dir()
             .canonicalize()
             .unwrap()
@@ -9857,9 +9830,9 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         launch.args = json!({
             "project":project,
             "workspace":workspace,
-            "harness":"fake",
-            "profile":"fake",
-            "profile_snapshot":{"harness":"fake"},
+            "harness":"codex",
+            "profile":"fixture",
+            "profile_snapshot":{"harness":"codex"},
         });
         let agent = store
             .submit("owner", launch, now_ms())
@@ -9875,8 +9848,8 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             "session.ready",
             json!({
                 "command_id":launch_id,
-                "native_scope":format!("fake:synthetic:scope:{agent}"),
-                "native_ref":format!("fake:synthetic:session:{agent}"),
+                "native_scope":format!("codex:synthetic:scope:{agent}"),
+                "native_ref":format!("codex:synthetic:session:{agent}"),
             }),
         );
         store

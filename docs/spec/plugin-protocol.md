@@ -8,7 +8,8 @@ share wire types, not vendor SDK types or the daemon's implementation.
 
 L1/L2 implement `initialize`, `agent.start`, `agent.command`, `agent.stop`,
 `agent.snapshot`, `shutdown` and durable `events.put` for one per-Agent source. Start
-with the actual fake/Codex verbs. The manifest advertises only implemented capabilities.
+with the verbs of the five native adapters (Codex, Claude, OpenCode, Muse,
+Antigravity). The manifest advertises only implemented capabilities.
 
 The first L3 process caller adds private `process.put` for the Codex app-server child.
 It registers a process with the host monitor, without adding a native stream family.
@@ -71,8 +72,8 @@ An initial plugin may declare:
 }
 ```
 
-`proxy` remains a string capability. "none" remains valid for this L1/L2 example,
-Fake, and direct Codex. A controlled Codex profile with an adopted Responses route
+`proxy` remains a string capability. "none" remains valid for direct native
+adapters (for example direct Codex). A controlled Codex profile with an adopted Responses route
 advertises "responses" to declare per-Agent route-configuration support. This does not
 claim provider authentication or inference success and does not add a flag or enum.
 
@@ -283,8 +284,9 @@ of the predecessor's `last_store_seq`. For a gap-backed handoff, `0 < gap_seq < 
 
 `source` is the expected predecessor. `families` is a unique nonempty set; order is not
 significant, and Store sorts it before hashing the canonical operation and forming the
-ACK. Store rechecks the selected harness subset: Fake supports `session`, `turn` and
-`message`; Codex supports those plus `tool` and `request`. Handoff transfer for
+ACK. Store rechecks the selected harness subset: Codex supports `session`,
+`turn`, `message`, `tool` and `request`; each other native adapter advertises
+only the families its implemented handlers support. Handoff transfer for
 `child`, `goal` and `usage` stays `unsupported`. Native-child observation is
 implemented separately through the shared
 [`ChildParams`](../../crates/eliot-plugin/src/protocol.rs) /
@@ -320,8 +322,8 @@ rows. The predecessor lifecycle is unchanged, including when it owns zero famili
 
 Commit any new gap boundary, successor-open fact, owner transfer, `source.handoff` event
 and predecessor `last_handoff_digest`/`last_handoff` acknowledgement in that transaction.
-Publish the committed events and return `SourceHandoffAck` only after commit. Stage A's
-connected caller is the controlled Fake source; it verifies the handoff through
+Publish the committed events and return `SourceHandoffAck` only after commit. The
+connected caller is a native adapter source; it verifies the handoff through
 `source.state` before switching to successor facts. Private history cannot be handed
 off or published by this caller. The separate Codex observe-only live grant is limited
 to `turn`, `message` and `tool`, with `observe` to `transcript` and mechanism
@@ -336,8 +338,8 @@ first handoff, and all current generation owner/mechanism rows.
 idempotent normalization step. It rejects known secrets in immutable fields before
 mutation and redacts only `gap.reason`; the canonical digest includes the full prepared
 request, including the redacted reason. Each caller prepares before sending, freezes that
-value, and reuses it for `source.state` proof. Host uses the same prepare path; Fake uses
-its scoped known-secret policy before first send. Callers must not assume Host-only secret
+value, and reuses it for `source.state` proof. Host uses the same prepare path.
+Callers must not assume Host-only secret
 knowledge: if normalized request/digest agreement cannot be proven, the result is
 `unknown`. After a lost reply, accept only a matching digest/ACK, current successor
 owners and the same cursor or gap boundary. If any owner or boundary advanced, or the
@@ -427,7 +429,7 @@ Add hooks only for a missing native fact/decision. Config is session-scoped; dec
 bind exact generation/request/deadline. Timeout uses the safe native default; late
 approval is discarded, not queued. Hooks do not duplicate the authoritative stream.
 
-The initial Fake echoes turns and emits request callbacks over this same transport.
-Add crash/child/recovery steps with their real caller. Record/replay and common
+Native adapters echo turns and emit request callbacks over this same transport
+through their real implementations. Add crash/child/recovery steps with their real caller. Record/replay and common
 conformance are completed in L7, not a separate framework blocking L2. CI never calls a
-model.
+model and never runs synthetic/fake executions.

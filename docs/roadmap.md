@@ -80,7 +80,7 @@ delivered increments, not full crash/load qualification.
       help/version smoke commands on Windows/Ubuntu. No empty framework crates or
       test platform.
 
-## L1 — Core, Store, bus and one fake command path
+## L1 — Core, Store, bus and first command path (completed)
 
 Read [core](spec/core.md), [API](spec/api.md) and the minimal profile in
 [plugin protocol](spec/plugin-protocol.md#first-harness-subset).
@@ -94,12 +94,13 @@ Donors: the **L1–L2 implementation map** in [donors](reference/donors.md).
       and command readback. One explicit global profile; no project overlay system yet.
 - [x] **L1.3 Plugin path.** Per-Agent process, framing/deadlines/custody, one fixed
       authoritative stream, commit acknowledgement, generation/turn binding and unknown
-      input gate. Add a tiny fake that emits ready, echo turn and terminal result.
-      Stop/restart must not resend an uncertain input.
+      input gate. (L1 bootstrap used a temporary fake emitting ready/echo/terminal
+      result; completed history — removed; current adapters are the five native
+      adapters with explicit profiles. Stop/restart must not resend an uncertain input.)
 
-**Result:** CLI → router/Store → fake → event bus → CLI works. The fake is a transport
-exercise, not a simulator product. Add its approval/crash/input-created-session features
-only when a real integration needs them.
+**Result (completed history):** CLI → router/Store → temporary fake → event bus → CLI
+worked. The fake was a transport exercise, not a simulator product, and is no longer a
+runtime dependency.
 
 **Not in L1:** shared plugin pools, source handoff, discovery/control takeover, native
 children, hooks, Goals, selectors, mail, rule revisions, scripts, worktree setup, proxy

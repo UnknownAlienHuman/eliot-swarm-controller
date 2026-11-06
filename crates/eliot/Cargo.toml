@@ -37,11 +37,6 @@ name = "codex_plugin"
 path = "tests/codex_plugin.rs"
 harness = false
 
-[[test]]
-name = "mcp_stdio"
-path = "tests/mcp_stdio.rs"
-harness = false
-
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
 

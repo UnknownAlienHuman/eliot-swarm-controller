@@ -13,8 +13,8 @@ bounded daemon diagnostics.
 
 ```toml
 [[rule]]
-id = "reply-on-fake-result"
-on = { event = "turn.completed", match = { "subject.harness" = "fake" } }
+id = "reply-on-codex-result"
+on = { event = "turn.completed", match = { "subject.harness" = "codex" } }
 do = [{ action = "send", target = "${event.agent}", expected_generation = "${event.generation}", text = "rule-send-echo" }]
 limit = { max = 3, per = "agent", window = "1h" }
 ```
@@ -317,8 +317,8 @@ The `launch` action submits the existing ordinary launch command with flat field
 ```toml
 [[rule]]
 id = "launch-on-result"
-on = { event = "turn.completed", match = { "subject.harness" = "fake" } }
-do = [{ action = "launch", profile = "fake", workspace = "/work/eliot", text = "Review ${data.status}" }]
+on = { event = "turn.completed", match = { "subject.harness" = "codex" } }
+do = [{ action = "launch", profile = "codex-luna", workspace = "/work/eliot", text = "Review ${data.status}" }]
 ```
 
 `profile` is a nonempty literal profile name and `workspace` is a nonempty literal path
@@ -389,9 +389,9 @@ live state; ordinary command admission rejects a stale value. In either context,
 ordinary command has no turn/request binding. Store advances that same Agent to `N+1` only
 if it is stopped, failed or lost, has no active turn, and has a retained subject resumable by
 its harness. No replacement Agent is created. Native Codex resume keeps its pinned native
-binding and uses normal native readback. The tinyFake verifier uses only a synthetic retained
-subject for deterministic transport exercise; it makes no native L2 qualification claim and
-never substitutes for Codex. Subject grammar remains plugin-owned. Resume keeps the retained
+binding and uses normal native readback. (The former tinyFake verifier used only a synthetic retained
+subject for deterministic transport exercise; completed history — removed; it made no native L2 qualification claim and
+never substituted for Codex.) Subject grammar remains plugin-owned. Resume keeps the retained
 subject, profile and workspace, replays no old input, and accepts no profile, workspace,
 worktree, base, setup, model, effort or permission override.
 

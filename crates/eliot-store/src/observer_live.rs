@@ -329,8 +329,8 @@ mod tests {
     }
 
     fn attach_args() -> Value {
-        json!({"mode":"observe","profile":"fake","harness":"fake","native_scope":SUBJECT.0,
-            "native_ref":SUBJECT.1,"profile_snapshot":{"harness":"fake"}})
+        json!({"mode":"observe","profile":"fixture","harness":"codex","native_scope":SUBJECT.0,
+            "native_ref":SUBJECT.1,"profile_snapshot":{"harness":"codex"}})
     }
 
     fn attached(store: &mut Store, agent: &str, command: &str, generation: i64, now: i64) {
@@ -378,7 +378,7 @@ mod tests {
                     target: None,
                     selector: None,
                     verb: "launch".to_owned(),
-                    args: json!({"project":"controlled-health","harness":"fake","profile":"fake",
+                    args: json!({"project":"controlled-health","harness":"codex","profile":"fixture",
                         "profile_snapshot":{},"workspace":"controlled-health-workspace"}),
                     expected_generation: Some(0),
                     expected_turn_id: None,

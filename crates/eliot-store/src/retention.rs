@@ -1253,6 +1253,9 @@ mod tests {
         request.args = json!({
             "project": "retention-project",
             "workspace": "retention-workspace",
+            "harness": "fake",
+            "profile": "fake",
+            "profile_snapshot": {},
         });
         request.expected_generation = Some(0);
         let admission = store
@@ -1277,6 +1280,9 @@ mod tests {
         fresh.args = json!({
             "project": "retention-project",
             "workspace": "retention-workspace",
+            "harness": "fake",
+            "profile": "fake",
+            "profile_snapshot": {},
         });
         fresh.expected_generation = Some(0);
         let admission = store.submit("owner", fresh.clone(), NOW).unwrap();
@@ -1474,6 +1480,9 @@ mod tests {
         launch.args = json!({
             "project": project,
             "workspace": "retention-workspace",
+            "harness": "fake",
+            "profile": "fake",
+            "profile_snapshot": {},
         });
         launch.expected_generation = Some(0);
         let admission = store.submit("owner", launch, now).unwrap();

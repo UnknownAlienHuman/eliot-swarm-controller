@@ -7,7 +7,6 @@ const SOURCE: &str = "observe";
 fn observed_families(harness: &str) -> Result<&'static [&'static str]> {
     match harness {
         "codex" => Ok(&["session", "turn", "message", "tool"]),
-        "fake" => Ok(&["session", "turn", "message"]),
         _ => Err(Error::new(
             "unsupported",
             "harness has no implemented observer reader",
@@ -139,7 +138,6 @@ pub(super) fn require_reader_source(
 
 pub(super) fn live_families(harness: &str) -> Result<&'static [&'static str]> {
     match harness {
-        "fake" => Ok(&["turn", "message"]),
         "codex" => Ok(&["turn", "message", "tool"]),
         _ => Err(Error::new(
             "unsupported",

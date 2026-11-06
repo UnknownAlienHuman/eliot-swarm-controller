@@ -140,9 +140,9 @@ required. Keep the model choice in the profile, outside core types and tests.
 ## Recipes
 
 Three copy-pasteable Codex-profile recipes live in
-[`config/recipes/`](../../config/recipes/). Each rule file or goal command is Fake-tested in CI
-verbatim with the Fake profile; the timer test also substitutes a local checkout
-and fetch endpoint for the example registration.
+[`config/recipes/`](../../config/recipes/). Each rule file or goal command is written for a
+native Codex profile; the timer example uses the local checkout and fetch endpoint from
+the example registration. CI never runs these against a fake profile.
 
 ### 1. Hourly `git.fetch` of a registered project
 
