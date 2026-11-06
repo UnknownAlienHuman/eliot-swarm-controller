@@ -506,8 +506,9 @@ null to mean no probe claim; a mismatch or unresolved probe cannot be cleared. S
 [Core API DTOs](../../crates/eliot-core/src/api/provider.rs) rather than duplicating
 their field list.
 
-A provider scope comes from the frozen route, selected account, or profile, in that
-order; Eliot never guesses a vendor account. A held scope rejects new launch/send before
+A provider scope comes from the frozen explicitly selected account, otherwise the
+exact profile; a shared adopted proxy is only a capacity scope, never a provider
+hold scope. Eliot never guesses a vendor account. A held scope rejects new launch/send before
 native I/O and is rechecked when queued work dispatches. Launch with linked input and
 resume with new text are gated as sends. Plain resume, reads, request replies, interrupt
 and stop remain available. At initial admission, `provider_held` rejects before binding

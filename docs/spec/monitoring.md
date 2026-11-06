@@ -406,9 +406,13 @@ never counts as no progress. No temporary index, `git add`, `write-tree` or obje
 
 Provider holds are durable local coordination state. Their view and restriction shapes
 are the shared Core [`ProviderHold` and `ProviderRestriction` DTOs](../../crates/eliot-core/src/routing.rs);
-keep the serialized field catalog in Core. Derive scope only from the frozen profile snapshot: selected
-proxy name first, otherwise configured account name, otherwise profile name. Never infer
-a vendor account from credentials, endpoint responses or model metadata.
+keep the serialized field catalog in Core. Derive scope only from the frozen profile snapshot: explicitly
+selected account name first, otherwise exact profile name. A shared adopted proxy is a
+capacity scope only, never a provider-hold scope: a per-turn restriction proves only
+the admitted account/profile restriction, not that the whole proxy service is held.
+Never infer a vendor account from credentials, endpoint responses or model metadata.
+Existing `proxy:*` hold rows remain query-visible as historical scopes; no migration
+or clearing is implied.
 
 Create or update a hold only from a structured restriction attached to the exact
 generation- and turn-bound controlled `turn.completed`. Generic failure, native error
