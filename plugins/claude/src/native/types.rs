@@ -148,6 +148,17 @@ pub(crate) struct ResultRecord {
     pub session_id: Option<String>,
 }
 
+/// Extract the model reported by an `assistant` record's message.
+/// Only a non-empty string scalar is observed; missing/null is unobserved.
+pub(crate) fn assistant_model(record: &Value) -> Option<String> {
+    record
+        .get("message")
+        .and_then(|message| message.get("model"))
+        .and_then(Value::as_str)
+        .filter(|model| !model.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
 /// Extract concatenated text from an `assistant` record's content blocks.
 pub(crate) fn assistant_text(record: &Value) -> String {
     let mut out = String::new();

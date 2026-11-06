@@ -17,7 +17,10 @@ use tokio::{
 
 use crate::native::{
     ClaudeClient, ClaudeFrame,
-    types::{CanUseToolBody, CommandLifecycle, PermissionResult, ResultRecord, assistant_text},
+    types::{
+        CanUseToolBody, CommandLifecycle, PermissionResult, ResultRecord, assistant_model,
+        assistant_text,
+    },
 };
 
 const CONTROL_QUEUE: usize = 16;
@@ -937,13 +940,17 @@ impl EventProcessor {
         if text.is_empty() {
             return Ok(());
         }
+        let observed_model = assistant_model(record);
         let text = SecretPolicy::new(self.secrets.iter().cloned()).redact_text(&text);
         let command_id = self.status.active_command_id.as_deref().unwrap_or_default();
-        let data = json!({
+        let mut data = json!({
             "command_id": command_id,
             "turn_id": turn_id,
             "text": text.clone(),
         });
+        if let Some(model) = observed_model {
+            data["model"] = Value::String(model);
+        }
         if serde_json::to_vec(&data).map_or(usize::MAX, |bytes| bytes.len()) > MAX_EVENT_BYTES {
             return self
                 .record_gap("Claude completed message exceeded the persisted-event bound")
