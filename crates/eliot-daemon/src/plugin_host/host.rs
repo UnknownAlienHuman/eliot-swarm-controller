@@ -356,7 +356,8 @@ impl PluginHost {
                     )
                 })?
         };
-        let target_environment = build_target_environment(&agent, &agent_token)?;
+        let target_environment =
+            build_target_environment(&self.state.data_root, &agent, &agent_token)?;
         let (instance_dir, credential) = self.create_instance_dir(&key)?;
         let source_credentials = source_secret_snapshot(
             &agent.profile_snapshot,
@@ -2494,7 +2495,7 @@ fn build_process_environment_with(
     Ok(environment)
 }
 
-fn build_target_environment(agent: &Agent, agent_token: &str) -> Result<Value> {
+fn build_target_environment(data_root: &Path, agent: &Agent, agent_token: &str) -> Result<Value> {
     if agent.harness == "codex"
         && !agent
             .profile_snapshot
@@ -2507,6 +2508,10 @@ fn build_target_environment(agent: &Agent, agent_token: &str) -> Result<Value> {
         ));
     }
     let mut environment = build_process_environment(&agent.profile_snapshot)?;
+    let home = data_root
+        .to_str()
+        .ok_or_else(|| Error::new("invalid", "data directory path is not UTF-8"))?;
+    insert_environment(&mut environment, "ELIOT_HOME", home.to_owned());
     insert_environment(&mut environment, "ELIOT_AGENT_ID", agent.id.clone());
     insert_environment(
         &mut environment,

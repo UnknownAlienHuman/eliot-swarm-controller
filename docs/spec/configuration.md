@@ -438,6 +438,8 @@ Build the native environment from OS baseline, admitted nonsecret `pass_env` val
 literal nonsecret `env`, named secrets resolved in memory, then Eliot identity/Git/PATH.
 `secret_env` is a subset of `pass_env`; those values are never persisted. Missing named
 required values fail clearly. Windows keys compare case-insensitively.
+The managed Agent target environment sets `ELIOT_HOME` to the owned data directory,
+overriding ambient/profile, alongside `ELIOT_AGENT_ID`/`ELIOT_AGENT_GENERATION`/`ELIOT_AGENT_TOKEN`.
 An adopted route stores only the optional client-key environment-variable name; the
 profile must explicitly allow that name in pass_env. Its value is resolved at runtime
 and is not sent with the unauthenticated readiness request.
