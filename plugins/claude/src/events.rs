@@ -1541,7 +1541,7 @@ impl EventProcessor {
                         .await;
                 }
             }
-            StreamState::Closed | StreamState::Malformed => {
+            StreamState::Closed | StreamState::Malformed(_) => {
                 // Settlement happens in `note_frames_drained` once the
                 // buffered tail is processed.
             }

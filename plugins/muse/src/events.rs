@@ -655,9 +655,10 @@ impl EventProcessor {
                 }
             }
             StreamState::Overflow => self.defer_gap("Muse session host event queue overflowed"),
-            StreamState::Malformed => {
-                self.defer_gap("Muse session host stream contained an invalid frame")
-            }
+            StreamState::Malformed(fault) => self.defer_gap(format!(
+                "Muse session host stream contained an invalid frame ({})",
+                fault.label()
+            )),
             StreamState::Open => {}
         }
     }

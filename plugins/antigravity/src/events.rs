@@ -494,7 +494,7 @@ pub(crate) fn spawn(
         let mut state = state.lock().await;
         if matches!(
             *stream.borrow(),
-            StreamState::Overflow | StreamState::Malformed
+            StreamState::Overflow | StreamState::Malformed(_)
         ) {
             state.lose("Antigravity output was incomplete").await;
         } else if !state.stopping {

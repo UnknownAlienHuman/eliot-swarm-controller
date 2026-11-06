@@ -57,7 +57,35 @@ pub enum StreamState {
     Open,
     Overflow,
     Closed,
-    Malformed,
+    Malformed(NativeStreamFault),
+}
+
+/// Bounded, nonsecret cause of a StreamState::Malformed transition.
+/// Fixed classes only: no frame bytes, bodies, or credentials cross here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeStreamFault {
+    /// Framed-line codec failure or oversize past the transport bound.
+    Frame,
+    /// A framed line was not valid JSON.
+    Json,
+    /// A parsed record did not match its protocol envelope.
+    Envelope,
+    /// Stdout stayed open past the post-exit drain deadline.
+    Drain,
+    /// A malformed record without a finer proven kind.
+    Unclassified,
+}
+
+impl NativeStreamFault {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Frame => "invalid_or_oversized",
+            Self::Json => "invalid_json",
+            Self::Envelope => "invalid_envelope",
+            Self::Drain => "exit_drain",
+            Self::Unclassified => "unclassified",
+        }
+    }
 }
 
 /// One owned native child: process waiter, stdin writer queue, stdout-reader
@@ -709,7 +737,7 @@ fn finish_exit_drain_deadline(
         pending.fail_all(error.clone());
         return Err(error);
     }
-    stream.send_replace(StreamState::Malformed);
+    stream.send_replace(StreamState::Malformed(NativeStreamFault::Drain));
     pending.fail_all(Error::new(
         "unknown",
         format!("{server} stdout remained open after its process exit drain deadline"),
@@ -799,6 +827,7 @@ where
                 return Err(mark_stream_malformed(
                     stream,
                     pending,
+                    NativeStreamFault::Frame,
                     &format!("{server} stream ended on an invalid or oversized frame"),
                 ));
             }
@@ -809,6 +838,7 @@ where
                 return Err(mark_stream_malformed(
                     stream,
                     pending,
+                    NativeStreamFault::Json,
                     &format!("{server} stream contained invalid JSON"),
                 ));
             }
@@ -827,7 +857,12 @@ where
                 pending.route(&key, result);
             }
             PumpAction::Malformed(message) => {
-                return Err(mark_stream_malformed(stream, pending, &message));
+                return Err(mark_stream_malformed(
+                    stream,
+                    pending,
+                    NativeStreamFault::Envelope,
+                    &message,
+                ));
             }
             PumpAction::Skip => {}
         }
@@ -854,9 +889,10 @@ where
 fn mark_stream_malformed(
     stream: watch::Sender<StreamState>,
     pending: PendingCalls,
+    fault: NativeStreamFault,
     message: &str,
 ) -> Error {
-    stream.send_replace(StreamState::Malformed);
+    stream.send_replace(StreamState::Malformed(fault));
     let error = Error::new("unknown", message);
     pending.fail_all(error.clone());
     error

@@ -566,7 +566,7 @@ impl EventProcessor {
                 }
             }
             StreamState::Overflow => self.defer_gap("OpenCode event queue overflowed"),
-            StreamState::Malformed => {
+            StreamState::Malformed(_) => {
                 self.defer_gap("OpenCode event stream contained an invalid envelope")
             }
             StreamState::Open => {}
