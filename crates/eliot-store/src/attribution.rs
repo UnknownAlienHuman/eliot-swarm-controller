@@ -1424,8 +1424,9 @@ mod tests {
             )
             .expect("queue mail");
 
-        // A mail wake consumes the shared cooldown: an immediate claim
-        // conflict for the same recipient is suppressed, and vice versa.
+        // The open mail notice coalesces: an immediate claim conflict
+        // for the same recipient is suppressed, and vice versa. Claims
+        // spend no cooldown; the open notice command blocks.
         let mail_notice = Ulid::new().to_string();
         let claim = store
             .notice_claim(&a, &mail_notice, NoticePending::Mail, now)
@@ -1442,8 +1443,8 @@ mod tests {
             .expect("cross-kind suppression");
         assert_eq!(suppressed, None);
 
-        // After the cooldown the open mail command still blocks the claim
-        // notice: at most one open notice command per recipient.
+        // After the cooldown window the open mail command still blocks
+        // the claim notice: at most one open notice command per recipient.
         let mut send = SubmitCommand::new(mail_notice.clone(), "send");
         send.target = Some(a.clone());
         send.expected_generation = Some(1);
