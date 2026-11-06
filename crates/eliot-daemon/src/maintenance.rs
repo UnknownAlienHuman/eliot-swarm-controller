@@ -59,6 +59,12 @@ pub(crate) async fn run(
         // instead of leaving eligible backlog until the next hourly wake.
         // Only retention repeats here; the config reload above stays hourly.
         loop {
+            // Shutdown is checked at the top of every epoch, so a signal
+            // arriving during the inter-epoch yield below still stops the
+            // wake before another deletion epoch runs.
+            if shutdown.has_changed().is_err() || *shutdown.borrow() {
+                return Ok(());
+            }
             let epoch_start = std::time::Instant::now();
             let report = match run_once(&store, &config.retention, now_ms()).await {
                 Ok(report) => report,
@@ -97,9 +103,6 @@ pub(crate) async fn run(
                 || epoch_start.elapsed() >= RETENTION_TICK_TIME_BUDGET;
             if rows == 0 || !exhausted {
                 break;
-            }
-            if shutdown.has_changed().is_err() || *shutdown.borrow() {
-                return Ok(());
             }
             tokio::task::yield_now().await;
         }
