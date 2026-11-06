@@ -42,6 +42,16 @@ pub trait NativeStdioConfig: Clone + Send + Sync + 'static {
     const ID_PREFIX: &'static str;
     /// Map a native JSON-RPC response error to a call outcome.
     fn map_response_error(error: NativeJsonRpcErrorBody) -> Result<Value>;
+
+    /// Whether the host semantically consumes a native notification method.
+    /// A well-formed notification with any other method is dropped at the pump
+    /// (Skip) before the bounded queue, exactly as if the event task ignored it.
+    /// Server requests and responses are never filtered. The default keeps every
+    /// notification (previous behavior).
+    fn consumes_notification(method: &str) -> bool {
+        let _ = method;
+        true
+    }
 }
 
 pub enum NativeFrame {
@@ -447,6 +457,9 @@ fn classify_jsonrpc_frame<C: NativeStdioConfig>(value: Value) -> PumpAction<Nati
                 ));
             }
         };
+        if !C::consumes_notification(&notification.method) {
+            return PumpAction::Skip;
+        }
         PumpAction::Emit(NativeFrame::Notification {
             method: notification.method,
             params: notification.params.unwrap_or_else(empty_object),

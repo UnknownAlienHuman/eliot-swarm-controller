@@ -1437,7 +1437,6 @@ impl CodexPlugin {
         }
         if session.phase != SessionPhase::Ready
             || session.events.status().active_turn_id.as_deref() != Some(turn_id)
-            || session.events.status().source_unknown
         {
             let result = rejected_control("Codex steer does not match a healthy active turn");
             settle_control(
