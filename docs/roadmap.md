@@ -242,9 +242,9 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       by daemon maintenance. Implement event-prefix pruning and atomic command/child
       cleanup under the [Core retention contract](spec/core.md#retention), including the
       rule history floor, replay/idempotency window and source recovery dependencies.
-      Current bounded queries and rule backlog handling do not delete event/command
-      history. Keep open/unknown work and current projections; no full rewrite, forced
-      unknown resolution or separate cleanup ledger.
+      Daemon maintenance deletes expired history via bounded Store pruning;
+      queries/backlog handling alone do not. Keep open/unknown work and current
+      projections; no full rewrite, forced unknown resolution or separate cleanup ledger.
 - [ ] Core/Store/API/reducer and event replay, including retention and non-reused ids.
 - [ ] CLI E2E on the real harness, exact generations/turns/requests, queue ordering and unknown outcomes.
 - [ ] Crash at admission, native effect, event commit, reply and source-drain boundaries;
