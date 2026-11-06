@@ -150,6 +150,19 @@ pub enum PumpAction<Frame> {
     Skip,
 }
 
+/// How the pump delivers emitted frames when the bounded queue is full.
+/// JSON-RPC callers select [`PumpMode::LossyOverflow`] so reply routing stays
+/// nonblocking; only the stream-json caller with no RPC replies selects
+/// [`PumpMode::LosslessBackpressure`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PumpMode {
+    /// `try_send`; on a full queue latch overflow and drop later emits.
+    LossyOverflow,
+    /// Wait for queue space holding at most one frame, respecting receiver
+    /// closure and the existing exit-drain deadline.
+    LosslessBackpressure,
+}
+
 /// Read one retained process exit. The waiter publishes `Some(status)`
 /// then drops its sender; Tokio reports closure even when that final
 /// value is retained, so a closed channel is reread and only a still-
@@ -688,11 +701,15 @@ pub fn encode_frame(server: &'static str, message: &impl Serialize) -> Result<St
 /// watch and the reader task handed back for drain ownership. Both protocol
 /// layers (JSON-RPC and stream-json) use this so the wiring exists exactly
 /// once; each builds its own client over the returned writer/pending pair.
+/// The caller selects the pump mode explicitly: JSON-RPC keeps
+/// [`PumpMode::LossyOverflow`], only the reply-less stream-json caller
+/// selects [`PumpMode::LosslessBackpressure`].
 pub async fn spawn_pumped<Frame, Classify>(
     launch: NativeLaunch,
     policy: SecretPolicy,
     labels: NativeLabels,
     id_prefix: &'static str,
+    mode: PumpMode,
     classify: Classify,
 ) -> Result<(
     NativeChild,
@@ -716,6 +733,7 @@ where
         pending.clone(),
         labels.server,
         process_exit,
+        mode,
         classify,
     ));
     transport.set_output_reader(output_reader);
@@ -746,10 +764,57 @@ fn finish_exit_drain_deadline(
     Ok(())
 }
 
+enum HeldSend {
+    Sent,
+    Closed,
+    DeadlineOverflow,
+}
+
+/// Wait for queue space for one held frame. Respects receiver closure and
+/// the existing exit-drain deadline; never touches the line reader.
+async fn send_held_frame<Frame>(
+    frames: &mpsc::Sender<Frame>,
+    frame: Frame,
+    exit_deadline: &mut Option<Instant>,
+    process_exit: &mut watch::Receiver<Option<ProcessExit>>,
+) -> HeldSend {
+    let mut send = Box::pin(frames.send(frame));
+    loop {
+        match *exit_deadline {
+            Some(deadline) => {
+                if Instant::now() >= deadline {
+                    return HeldSend::DeadlineOverflow;
+                }
+                tokio::select! {
+                    result = &mut send => {
+                        return if result.is_err() { HeldSend::Closed } else { HeldSend::Sent };
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        return HeldSend::DeadlineOverflow;
+                    }
+                }
+            }
+            None => {
+                tokio::select! {
+                    result = &mut send => {
+                        return if result.is_err() { HeldSend::Closed } else { HeldSend::Sent };
+                    }
+                    _ = process_exit.changed() => {
+                        *exit_deadline = Some(process_exit.borrow().as_ref().map(|exit| {
+                            exit.observed_at + NATIVE_EXIT_DRAIN
+                        }).unwrap_or_else(|| Instant::now() + NATIVE_EXIT_DRAIN));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Bounded stdout line pump: length-checked NDJSON lines, protocol
 /// classification of each parsed record, one overflow gap, and a bounded
 /// post-exit drain before any loss conclusion. The classifier owns every
 /// protocol decision; the pump owns every transport decision.
+#[allow(clippy::too_many_arguments)]
 async fn pump_framed_lines<Frame, Classify>(
     stdout: ChildStdout,
     frames: mpsc::Sender<Frame>,
@@ -757,6 +822,7 @@ async fn pump_framed_lines<Frame, Classify>(
     pending: PendingCalls,
     server: &'static str,
     mut process_exit: watch::Receiver<Option<ProcessExit>>,
+    mode: PumpMode,
     mut classify: Classify,
 ) -> Result<()>
 where
@@ -843,14 +909,28 @@ where
                 ));
             }
         };
+        let mut receiver_closed = false;
         match classify(value) {
             PumpAction::Emit(frame) => {
                 if overflowed {
                     continue;
                 }
-                if frames.try_send(frame).is_err() {
-                    overflowed = true;
-                    stream.send_replace(StreamState::Overflow);
+                match mode {
+                    PumpMode::LossyOverflow => {
+                        if frames.try_send(frame).is_err() {
+                            overflowed = true;
+                            stream.send_replace(StreamState::Overflow);
+                        }
+                    }
+                    PumpMode::LosslessBackpressure => {
+                        match send_held_frame(&frames, frame, &mut exit_deadline, &mut process_exit)
+                            .await
+                        {
+                            HeldSend::Sent => {}
+                            HeldSend::Closed => receiver_closed = true,
+                            HeldSend::DeadlineOverflow => overflowed = true,
+                        }
+                    }
                 }
             }
             PumpAction::Route { key, result } => {
@@ -865,6 +945,11 @@ where
                 ));
             }
             PumpAction::Skip => {}
+        }
+        if receiver_closed {
+            // The frame consumer is gone; stop like EOF so pending calls
+            // fail honestly below instead of waiting forever.
+            break;
         }
     }
 

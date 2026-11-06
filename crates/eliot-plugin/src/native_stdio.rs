@@ -22,7 +22,8 @@ use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
 
 use crate::StderrView;
 use crate::native_transport::{
-    NativeChild, NativeLabels, NativeWriter, PendingCalls, PumpAction, encode_frame, spawn_pumped,
+    NativeChild, NativeLabels, NativeWriter, PendingCalls, PumpAction, PumpMode, encode_frame,
+    spawn_pumped,
 };
 use std::sync::Arc;
 
@@ -158,11 +159,14 @@ impl<C: NativeStdioConfig> StdioProcess<C> {
             short: C::SHORT,
             server: C::SERVER,
         };
+        // JSON-RPC: keep nonblocking routing; a pending reply must never
+        // wait behind a saturated emit queue.
         let (transport, pending, frame_rx, stream_rx) = spawn_pumped(
             launch,
             policy.clone(),
             labels,
             C::ID_PREFIX,
+            PumpMode::LossyOverflow,
             classify_jsonrpc_frame::<C>,
         )
         .await?;
