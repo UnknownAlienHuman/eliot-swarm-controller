@@ -4,9 +4,11 @@ use super::{
     AgentKey, PluginHost, build_process_environment, metadata_secret_snapshot, redact_native_error,
     require_proxy_capability, signal_progress,
 };
-use eliot_core::{Error, NativeStoreBinding, Result, SecretPolicy, StderrSource};
+use eliot_core::{
+    Error, NativeStoreBinding, Result, SecretPolicy, StderrSource, api::DiscoverPage,
+};
 use eliot_plugin::protocol::ProfileStoreParams;
-use eliot_plugin::{DiscoverPage, sync::LockExt};
+use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},

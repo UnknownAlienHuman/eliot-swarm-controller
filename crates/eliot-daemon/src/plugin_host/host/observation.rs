@@ -4,8 +4,11 @@ use super::{
     build_process_environment, redact_native_error, signal_progress,
 };
 use crate::common::now_ms;
-use eliot_core::{Agent, Command, CommandState, Error, Result, StderrSource};
-use eliot_plugin::{ObservationPage, ObservationQuery, sync::LockExt};
+use eliot_core::{
+    Agent, Command, CommandState, Error, Result, StderrSource,
+    api::{MAX_OBSERVATION_PAGE_BYTES, ObservationPage, ObservationQuery},
+};
+use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
@@ -773,7 +776,7 @@ fn safe_value(mut value: Value, secrets: &[String]) -> Result<Value> {
     if serde_json::to_vec(&value)
         .map_err(|_| Error::new("internal", "cannot encode observer result"))?
         .len()
-        > eliot_plugin::MAX_OBSERVATION_PAGE_BYTES
+        > MAX_OBSERVATION_PAGE_BYTES
     {
         return Err(Error::new(
             "frame_too_large",

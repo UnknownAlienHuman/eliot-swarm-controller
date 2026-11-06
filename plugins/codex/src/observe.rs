@@ -15,11 +15,14 @@ use crate::{
         types::{NativeHistoryItemsResponse, NativeObservedThreadReadResponse},
     },
 };
-use eliot_core::{BatchAck, Error, NativeEvent, Result, SecretPolicy};
+use eliot_core::{
+    BatchAck, Error, NativeEvent, Result, SecretPolicy,
+    api::{
+        MAX_OBSERVATION_CURSOR_BYTES, MAX_OBSERVATION_PAGE_BYTES, ObservationPage, ObservationQuery,
+    },
+};
 use eliot_plugin::{
-    MAX_OBSERVATION_PAGE_BYTES, ObservationPage, ObservationQuery, ObserverAttachParams,
-    ObserverDetachParams, ObserverSnapshotParams, PeerClient,
-    protocol::MAX_OBSERVATION_CURSOR_BYTES,
+    ObserverAttachParams, ObserverDetachParams, ObserverSnapshotParams, PeerClient,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

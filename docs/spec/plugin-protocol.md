@@ -168,8 +168,7 @@ Discovery and observation pages use the shared harness-neutral `DiscoverPage` an
 `DiscoverCoverage`, `DiscoverPage`, `ObservationQuery` and `ObservationPage` from its
 API module, along with `MAX_DISCOVER_PAGE_ENTRIES`, `MAX_DISCOVER_PAGE_BYTES`,
 `MAX_OBSERVATION_PAGE_ENTRIES`, `MAX_OBSERVATION_PAGE_BYTES` and
-`MAX_OBSERVATION_CURSOR_BYTES`. The plugin crate retains its existing public re-exports
-for compatibility.
+`MAX_OBSERVATION_CURSOR_BYTES`.
 
 `ObservationPage.entries` remains a list of opaque JSON values and `coverage` an opaque
 JSON object; shared layers enforce page bindings, bounds and existing secret redaction
