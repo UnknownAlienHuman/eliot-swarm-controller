@@ -772,6 +772,9 @@ enum HeldSend {
 
 /// Wait for queue space for one held frame. Respects receiver closure and
 /// the existing exit-drain deadline; never touches the line reader.
+/// Immediate delivery is attempted first (ready-tail semantics: a frame
+/// that fits the queue is never dropped for an expired deadline); the
+/// deadline applies only once the queue would block.
 async fn send_held_frame<Frame>(
     frames: &mpsc::Sender<Frame>,
     frame: Frame,
@@ -779,6 +782,13 @@ async fn send_held_frame<Frame>(
     process_exit: &mut watch::Receiver<Option<ProcessExit>>,
 ) -> HeldSend {
     let mut send = Box::pin(frames.send(frame));
+    if let Some(result) = send.as_mut().now_or_never() {
+        return if result.is_err() {
+            HeldSend::Closed
+        } else {
+            HeldSend::Sent
+        };
+    }
     loop {
         match *exit_deadline {
             Some(deadline) => {
