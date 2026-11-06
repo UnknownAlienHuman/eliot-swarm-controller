@@ -2,11 +2,14 @@
 //! This is deliberately not a session executor or a general rollout discovery API.
 
 use crate::discovery::fingerprint;
-use eliot_core::{Error, NativeEvent, Result, SecretPolicy};
-use eliot_plugin::{
-    FileIdentity, MAX_OBSERVATION_CURSOR_BYTES, MAX_OBSERVATION_PAGE_BYTES,
-    MAX_OBSERVATION_PAGE_ENTRIES, ObservationQuery, file_final_path, file_identity,
+use eliot_core::{
+    Error, NativeEvent, Result, SecretPolicy,
+    api::{
+        MAX_OBSERVATION_CURSOR_BYTES, MAX_OBSERVATION_PAGE_BYTES, MAX_OBSERVATION_PAGE_ENTRIES,
+        ObservationQuery,
+    },
 };
+use eliot_plugin::{FileIdentity, file_final_path, file_identity};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

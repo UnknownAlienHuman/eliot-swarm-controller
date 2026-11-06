@@ -6,13 +6,10 @@
 
 use eliot_core::{
     BatchAck, Error, NativeEvent, Result, SecretPolicy, SourceBatch, SourceGap, SourceGapAck,
-    SourceHandoff, SourceHandoffAck, SourceHandoffGap, SourceHealthUpdate, canonical_json_sha256,
-    parse_agent_id,
+    SourceHandoff, SourceHandoffAck, SourceHandoffGap, SourceHealthUpdate,
+    api::MAX_OBSERVATION_CURSOR_BYTES, canonical_json_sha256, parse_agent_id,
 };
-use eliot_plugin::{
-    CommitSink, ObserverAttachParams, PeerClient,
-    protocol::{MAX_CREDENTIAL_BYTES, MAX_OBSERVATION_CURSOR_BYTES},
-};
+use eliot_plugin::{CommitSink, ObserverAttachParams, PeerClient, protocol::MAX_CREDENTIAL_BYTES};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 use tokio::time::{Instant, sleep_until};

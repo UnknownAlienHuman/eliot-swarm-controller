@@ -2,11 +2,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-pub use eliot_core::api::{
-    DiscoverCoverage, DiscoverPage, DiscoverSubject, MAX_DISCOVER_PAGE_BYTES,
-    MAX_DISCOVER_PAGE_ENTRIES, MAX_OBSERVATION_CURSOR_BYTES, MAX_OBSERVATION_PAGE_BYTES,
-    MAX_OBSERVATION_PAGE_ENTRIES, ObservationPage, ObservationQuery,
-};
 pub use eliot_core::limits::{
     MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES, MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES,
 };
@@ -241,7 +236,7 @@ pub struct ObserverSnapshotParams {
     pub generation: i64,
     pub native_scope: String,
     pub native_ref: String,
-    pub observation: ObservationQuery,
+    pub observation: eliot_core::api::ObservationQuery,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

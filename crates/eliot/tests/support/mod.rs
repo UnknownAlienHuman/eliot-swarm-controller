@@ -116,36 +116,6 @@ fn daemon_info_snippet(data: &Path) -> String {
         Err(_) => "unparseable".to_owned(),
     }
 }
-// Exact controller codes only; arbitrary outcome text stays out of CI logs.
-const GIT_FETCH_ERROR_CODES: &[&str] = &[
-    "git_fetch_cancelled_before_cas",
-    "git_fetch_cancelled_before_cas_unknown",
-    "git_fetch_cas_family_quiescence_unknown",
-    "git_fetch_cas_refused",
-    "git_fetch_cas_spawn_or_wait_unknown",
-    "git_fetch_family_quiescence_unknown",
-    "git_fetch_helper_changed_after_transfer",
-    "git_fetch_interrupted_before_cas",
-    "git_fetch_interrupted_readback_unknown",
-    "git_fetch_private_ref_readback_unknown",
-    "git_fetch_private_view_preparation_failed",
-    "git_fetch_readback_config_or_authority_changed",
-    "git_fetch_registered_object_readback_failed",
-    "git_fetch_registered_object_readback_target_unknown",
-    "git_fetch_registered_object_verification_unavailable",
-    "git_fetch_registered_object_verification_unknown",
-    "git_fetch_registered_object_verifier_quiescence_unknown",
-    "git_fetch_registration_changed_after_transfer",
-    "git_fetch_remote_config_changed",
-    "git_fetch_result_binding_invalid",
-    "git_fetch_source_moved_or_failed",
-    "git_fetch_spawn_or_wait_unknown",
-    "git_fetch_target_after_failed_transfer_unknown",
-    "git_fetch_tracking_readback_not_proven",
-    "git_fetch_tracking_ref_changed_before_cas",
-    "git_fetch_tracking_ref_unreadable_before_cas",
-    "git_fetch_transport_config_changed",
-];
 
 pub struct Captured {
     pub child: Child,
@@ -172,16 +142,7 @@ fn capture(pipe: impl Read + Send + 'static) -> Receiver<io::Result<String>> {
 }
 
 impl Captured {
-    pub fn spawn(command: Command) -> Self {
-        Self::spawn_with_stdout(command, None)
-    }
-
-    #[allow(dead_code)] // Used by another integration target; support is compiled per target.
-    pub fn spawn_stdout_file(command: Command, path: &Path) -> Self {
-        Self::spawn_with_stdout(command, Some(path))
-    }
-
-    fn spawn_with_stdout(mut command: Command, path: Option<&Path>) -> Self {
+    pub fn spawn(mut command: Command) -> Self {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -189,10 +150,7 @@ impl Captured {
         }
         let mut child = command
             .stdin(Stdio::null())
-            .stdout(match path {
-                Some(path) => Stdio::from(fs::File::create(path).expect("create test stdout file")),
-                None => Stdio::piped(),
-            })
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("start test-owned process");
@@ -267,7 +225,7 @@ impl Reply {
 }
 
 pub fn run(command: Command) -> Reply {
-    // Fake-only fixture argv, bounded and without inherited environment values.
+    // Bounded CLI argv for failure context, without inherited environment values.
     let args: Vec<_> = command
         .get_args()
         .take(32)
@@ -330,13 +288,6 @@ impl Fixture {
             retain_data: false,
             starts: 0,
         }
-    }
-
-    #[allow(dead_code)] // Used by another integration target; support is compiled per target.
-    pub fn env(&mut self, key: impl AsRef<OsStr>, val: impl AsRef<OsStr>) -> &mut Self {
-        self.daemon_env
-            .push((key.as_ref().to_os_string(), val.as_ref().to_os_string()));
-        self
     }
 
     pub fn start(&mut self) {
@@ -426,112 +377,6 @@ impl Fixture {
         cli(&self.data, args).json()
     }
 
-    #[track_caller]
-    pub fn wait_command(&self, id: &str, expected: &str) -> Value {
-        let started = Instant::now();
-        let deadline = started + WAIT;
-        let mut polls = 0u32;
-        loop {
-            let command = self.json(&["cmd", "show", id]);
-            let state = command["state"].as_str();
-            polls += 1;
-            // Run tests use "terminal" to inspect any retained outcome, including unknown.
-            let any_outcome = expected == "terminal"
-                && matches!(
-                    state,
-                    Some("applied" | "rejected" | "failed" | "unknown" | "cancelled")
-                );
-            if state == Some(expected) || any_outcome {
-                return command;
-            }
-            if !matches!(state, Some("accepted" | "queued" | "dispatched")) {
-                let outcome = command.get("outcome").and_then(Value::as_object);
-                let workspace_pre_dispatch = outcome.is_some_and(|outcome| {
-                    matches!(
-                        outcome.get("stage").and_then(Value::as_str),
-                        Some("workspace" | "workspace_resume_rejected")
-                    ) && outcome.get("native_dispatched").and_then(Value::as_bool) == Some(false)
-                });
-                let error_code_class = match outcome
-                    .and_then(|outcome| outcome.get("code"))
-                    .and_then(Value::as_str)
-                {
-                    Some("bad_state") => "bad_state",
-                    Some("native_not_dispatched") => "native_not_dispatched",
-                    Some("not_allowed") => "not_allowed",
-                    Some("process_custody_unknown") => "process_custody_unknown",
-                    Some("profile_error") => "profile_error",
-                    Some("source_generation_mismatch") => "source_generation_mismatch",
-                    Some("source_integrity") => "source_integrity",
-                    Some("stale_generation") => "stale_generation",
-                    Some("store_lock_deadline") => "store_lock_deadline",
-                    Some("timeout") => "timeout",
-                    Some("unknown") => "unknown",
-                    Some("unavailable") => "unavailable",
-                    Some("unsupported") => "unsupported",
-                    Some(code) if GIT_FETCH_ERROR_CODES.contains(&code) => code,
-                    Some(_) => "other",
-                    None => "none",
-                };
-                let state_class = match state {
-                    Some("accepted") => "accepted",
-                    Some("queued") => "queued",
-                    Some("dispatched") => "dispatched",
-                    Some("applied") => "applied",
-                    Some("rejected") => "rejected",
-                    Some("failed") => "failed",
-                    Some("unknown") => "unknown",
-                    Some("cancelled") => "cancelled",
-                    Some(_) => "other",
-                    None => "missing",
-                };
-                let quiescence_class = match outcome
-                    .and_then(|outcome| outcome.get("quiescence_class"))
-                    .and_then(Value::as_str)
-                {
-                    Some("platform_io") => "platform_io",
-                    Some("process_custody_unknown") => "process_custody_unknown",
-                    Some("timeout") => "timeout",
-                    Some("other") => "other",
-                    Some(_) => "other",
-                    None => "none",
-                };
-                let generation = command["generation"].as_i64();
-                let (event_snapshot_available, dispatch_seen, ready_seen_at_command_generation) =
-                    match self.events_if_available() {
-                        Some(events) => {
-                            let dispatch_seen = events.iter().any(|event| {
-                                event["kind"] == "command.dispatched"
-                                    && event["data"]["command_id"] == id
-                            });
-                            let ready_seen = command["target"]
-                                .as_str()
-                                .zip(generation)
-                                .is_some_and(|(agent, generation)| {
-                                    events.iter().any(|event| {
-                                        event["kind"] == "session.ready"
-                                            && event["agent"] == agent
-                                            && event["generation"] == generation
-                                    })
-                                });
-                            (true, dispatch_seen, ready_seen)
-                        }
-                        None => (false, false, false),
-                    };
-                panic!(
-                    "unexpected command state {state_class}; generation={generation:?}; workspace_pre_dispatch={workspace_pre_dispatch}; error_code_class={error_code_class}; quiescence_class={quiescence_class}; event_snapshot_available={event_snapshot_available}; dispatch_seen={dispatch_seen}; ready_seen_at_command_generation={ready_seen_at_command_generation}; private outcome deliberately omitted"
-                );
-            }
-            assert!(
-                Instant::now() < deadline,
-                "command readback deadline after {polls} polls in {:?}; last_state={}; private outcome deliberately omitted",
-                started.elapsed(),
-                state.unwrap_or("missing"),
-            );
-            thread::sleep(Duration::from_millis(25));
-        }
-    }
-
     pub fn events(&self) -> Vec<Value> {
         let mut after = 0;
         let mut events = Vec::new();
@@ -558,39 +403,6 @@ impl Fixture {
         panic!("fixture events exceeded eight bounded pages");
     }
 
-    fn events_if_available(&self) -> Option<Vec<Value>> {
-        let mut after = 0;
-        let mut events = Vec::new();
-        let mut end = None;
-        for _ in 0..8 {
-            let after_arg = after.to_string();
-            let reply = cli(
-                &self.data,
-                &["events", "--since", &after_arg, "--limit", "1000"],
-            );
-            if !reply.status.success() {
-                return None;
-            }
-            let page: Value = serde_json::from_str(&reply.stdout).ok()?;
-            let page_high_water = page["high_water"].as_i64()?;
-            let high_water = *end.get_or_insert(page_high_water);
-            for event in page["events"].as_array()? {
-                if event["seq"].as_i64()? <= high_water {
-                    events.push(event.clone());
-                }
-            }
-            let next = page["next"].as_i64()?;
-            if next >= high_water {
-                return Some(events);
-            }
-            if next <= after {
-                return None;
-            }
-            after = next;
-        }
-        None
-    }
-
     pub fn stop(&mut self, force: bool) {
         assert!(self.daemon.is_some());
         let stop = cli(
@@ -603,15 +415,6 @@ impl Fixture {
             stop.stderr
         );
         self.finish_shutdown();
-    }
-
-    /// End the owned daemon without a shutdown request, as a crash would.
-    #[allow(dead_code)] // Used by another integration target; support is compiled per target.
-    pub fn kill_daemon(&mut self) {
-        let daemon = self.daemon.as_mut().expect("running owned daemon");
-        daemon.child.kill().expect("kill owned daemon");
-        daemon.wait(WAIT).expect("killed daemon exit deadline");
-        self.daemon = None;
     }
 
     /// A shutdown acknowledgement is not exit evidence. Wait on this fixture's
@@ -628,43 +431,6 @@ impl Fixture {
         let (_, stderr) = daemon.output(Duration::from_secs(2));
         assert!(!stderr.contains("panicked"), "daemon panic: {stderr}");
         self.daemon = None;
-    }
-
-    pub fn git(&self, args: &[&str]) -> Reply {
-        let mut command = Command::new("git");
-        command.current_dir(&self.workspace);
-        for (name, _) in std::env::vars_os() {
-            if name
-                .to_string_lossy()
-                .to_ascii_uppercase()
-                .starts_with("GIT_")
-            {
-                command.env_remove(name);
-            }
-        }
-        let hooks = self.root.join("hooks");
-        fs::create_dir_all(&hooks).expect("empty fixture hooks directory");
-        command
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            )
-            .env("GIT_TERMINAL_PROMPT", "0");
-        command.args([
-            "-c",
-            &format!("core.hooksPath={}", hooks.display()),
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "user.name=EliotTest",
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "commit.gpgSign=false",
-        ]);
-        command.args(args);
-        run(command)
     }
 }
 

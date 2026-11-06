@@ -13,11 +13,15 @@ use crate::{
         },
     },
 };
-use eliot_core::{Error, NativeStoreBinding, Result, SecretPolicy, canonical_json_sha256};
-use eliot_plugin::{
-    DiscoverCoverage, DiscoverPage, DiscoverParams, DiscoverSubject, MAX_DISCOVER_PAGE_BYTES,
-    MAX_DISCOVER_PAGE_ENTRIES, MAX_EVENT_BYTES,
+use eliot_core::{
+    Error, NativeStoreBinding, Result, SecretPolicy,
+    api::{
+        DiscoverCoverage, DiscoverPage, DiscoverSubject, MAX_DISCOVER_PAGE_BYTES,
+        MAX_DISCOVER_PAGE_ENTRIES,
+    },
+    canonical_json_sha256,
 };
+use eliot_plugin::{DiscoverParams, MAX_EVENT_BYTES};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
