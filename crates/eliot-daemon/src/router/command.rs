@@ -886,6 +886,13 @@ impl Router {
                 return false;
             }
         }
+        if let Some(summary) = self
+            .terminal_stop_noop_summary(id, agent, &dispatched)
+            .await
+        {
+            let _ = self.settle(id, CommandState::Applied, Some(summary)).await;
+            return true;
+        }
         let force = dispatched
             .args
             .get("force")
@@ -914,6 +921,66 @@ impl Router {
             }
         }
         true
+    }
+
+    /// Applied no-op summary for an already-terminal generation with verified
+    /// no owned runtime. Returns `None` when native stop must still run, so
+    /// exact member/generation binding and honest Unknown handling are kept.
+    async fn terminal_stop_noop_summary(
+        &self,
+        id: &str,
+        agent: &Agent,
+        dispatched: &Command,
+    ) -> Option<Value> {
+        if dispatched.verb != "stop"
+            || dispatched.id != id
+            || dispatched.target.as_deref() != Some(agent.id.as_str())
+            || dispatched.generation != Some(agent.generation)
+            || dispatched.state != CommandState::Dispatched
+            || !agent.is_terminal()
+            || agent.active_turn.is_some()
+            || !agent.pending.is_empty()
+            || agent.observe_only
+        {
+            return None;
+        }
+        if self
+            .inner
+            .plugin_host
+            .controls_generation(&agent.id, agent.generation)
+        {
+            return None;
+        }
+        let store = self.inner.store.lock().await;
+        let current = match store.get_agent(&agent.id) {
+            Ok(Some(current)) => current,
+            _ => return None,
+        };
+        if Some(current.generation) != dispatched.generation
+            || current.generation != agent.generation
+            || !current.is_terminal()
+            || current.active_turn.is_some()
+            || !current.pending.is_empty()
+            || current.observe_only
+        {
+            return None;
+        }
+        match store.get_command(id) {
+            Ok(Some(command))
+                if command.verb == "stop"
+                    && command.state == CommandState::Dispatched
+                    && command.target.as_deref() == Some(agent.id.as_str())
+                    && command.generation == Some(agent.generation) => {}
+            _ => return None,
+        }
+        match store.has_owned_exit_and_reader_drain(&agent.id, agent.generation) {
+            Ok(true) => {}
+            _ => return None,
+        }
+        Some(json!({
+            "state": "applied",
+            "already_terminal": true,
+        }))
     }
 
     /// Detach an observer through the owned plugin and settle the validated

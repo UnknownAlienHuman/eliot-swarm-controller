@@ -38,6 +38,13 @@ impl Store {
             .map_err(sql_error)
     }
 
+    /// Authoritative owned-exit proof: physical exit plus the plugin host's
+    /// drain record. Closed source rows alone are not closure.
+    pub fn has_owned_exit_and_reader_drain(&self, agent: &str, generation: i64) -> Result<bool> {
+        let agent_num = parse_agent_id(agent)?;
+        has_owned_exit_and_reader_drain_tx(&self.connection, agent_num, generation)
+    }
+
     /// One page, ordered by Agent, of lost or stopped generations that still
     /// hold their reservation (a forced stop records no `session.ended`). Call it
     /// at startup before any new generation can start.
@@ -587,26 +594,27 @@ fn has_rejected_dispatched_start_tx(
 
 /// Live release proof: physical exit plus the plugin host's drain record.
 fn has_owned_exit_and_reader_drain_tx(
-    tx: &Transaction<'_>,
+    connection: &Connection,
     agent: i64,
     generation: i64,
 ) -> Result<bool> {
-    if !has_physical_exit_tx(tx, agent, generation)? {
+    if !has_physical_exit_tx(connection, agent, generation)? {
         return Ok(false);
     }
-    tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM owned_exits WHERE agent = ?1 AND generation = ?2)",
-        params![agent, generation],
-        |row| row.get(0),
-    )
-    .map_err(sql_error)
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM owned_exits WHERE agent = ?1 AND generation = ?2)",
+            params![agent, generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
 }
 
 // Physical exit facts, shared by the reservation migration (which predates the
 // drain record) and live release, so neither treats source closure alone as
 // custody proof.
-fn has_physical_exit_tx(tx: &Transaction<'_>, agent: i64, generation: i64) -> Result<bool> {
-    let os_closed: bool = tx
+fn has_physical_exit_tx(connection: &Connection, agent: i64, generation: i64) -> Result<bool> {
+    let os_closed: bool = connection
         .query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM source_state
@@ -616,7 +624,7 @@ fn has_physical_exit_tx(tx: &Transaction<'_>, agent: i64, generation: i64) -> Re
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    let (native_sources, open_native_sources): (i64, i64) = tx
+    let (native_sources, open_native_sources): (i64, i64) = connection
         .query_row(
             "SELECT COUNT(*), COALESCE(SUM(state = 'open'), 0)
              FROM source_state
@@ -627,7 +635,7 @@ fn has_physical_exit_tx(tx: &Transaction<'_>, agent: i64, generation: i64) -> Re
         )
         .map_err(sql_error)?;
     let owner = format!("agent:{}#{}", format_agent_id(agent), generation);
-    let (processes, exited_processes, exited_plugins): (i64, i64, i64) = tx
+    let (processes, exited_processes, exited_plugins): (i64, i64, i64) = connection
         .query_row(
             "SELECT COUNT(*), COALESCE(SUM(state = 'exited'), 0),
                     COALESCE(SUM(role IN ('plugin', 'harness') AND state = 'exited'), 0)
