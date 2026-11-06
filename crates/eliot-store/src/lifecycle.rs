@@ -726,6 +726,7 @@ fn mark_lost_turn_unknown_tx(
                     final_text: None,
                     started_at: None,
                     completed_at: Some(now),
+                    usage: None,
                 },
             )?;
         }

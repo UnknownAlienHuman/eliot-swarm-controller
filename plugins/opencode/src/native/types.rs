@@ -285,6 +285,46 @@ pub struct AssistantMessage {
     pub content: Vec<AssistantContent>,
     #[serde(default)]
     pub finish: Option<String>,
+    /// Installed `tokens` (`TokenUsage.Info`): per-message token usage.
+    /// Optional on the wire; any unusable value decodes as absent so usage
+    /// metadata can never break the terminal readback.
+    #[serde(default, deserialize_with = "deserialize_optional_tokens")]
+    pub tokens: Option<AssistantTokens>,
+}
+
+/// Installed `TokenUsage.Info` subset: `{input, output, reasoning, cache}`.
+/// Every member is optional locally so partial native data stays decodable;
+/// unavailable members project as null, never zero.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantTokens {
+    #[serde(default)]
+    pub input: Option<i64>,
+    #[serde(default)]
+    pub output: Option<i64>,
+    #[serde(default)]
+    pub reasoning: Option<i64>,
+    #[serde(default)]
+    pub cache: Option<AssistantTokenCache>,
+}
+
+/// Installed `TokenUsage.Info.cache`: `{read, write}`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantTokenCache {
+    #[serde(default)]
+    pub read: Option<i64>,
+    #[serde(default)]
+    pub write: Option<i64>,
+}
+
+fn deserialize_optional_tokens<'de, D>(deserializer: D) -> Result<Option<AssistantTokens>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<AssistantTokens>::deserialize(deserializer)
+        .ok()
+        .flatten())
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

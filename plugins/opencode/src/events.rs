@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use eliot_core::{Error, Result, SecretPolicy};
+use eliot_core::{Error, Result, SecretPolicy, TurnUsage};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     native_stdio::StreamState,
@@ -31,10 +31,10 @@ use crate::native::{
     },
     sse::SseFrame,
     types::{
-        AgentSelectedData, AssistantContent, ExecutionEventData, FormCancelledData,
-        FormCreatedData, FormRepliedData, InboxEventData, Message, ModelSelectedData,
-        PermissionAskedData, PermissionRepliedData, SessionLifecycleData, SseEnvelope,
-        StructuredError,
+        AgentSelectedData, AssistantContent, AssistantTokens, ExecutionEventData,
+        FormCancelledData, FormCreatedData, FormRepliedData, InboxEventData, Message,
+        ModelSelectedData, PermissionAskedData, PermissionRepliedData, SessionLifecycleData,
+        SseEnvelope, StructuredError,
     },
 };
 
@@ -1194,6 +1194,7 @@ impl EventProcessor {
             native_error.map(|error| error.message.as_str()),
             &secrets,
         );
+        data["usage"] = serde_json::to_value(&readback.usage).unwrap_or(Value::Null);
         let native_id = event_id(
             &terminal.session_id,
             &turn_id,
@@ -1222,8 +1223,10 @@ impl EventProcessor {
     /// Terminal readback: page the newest-first message list (bounded) and
     /// find our user message plus the newest `idle` message after it. Final
     /// text is the concatenated assistant text parts strictly between the
-    /// two, in ascending time order. Anything else (missing user message,
-    /// missing idle, contradictory outcome) is a gap, never an inference.
+    /// two, in ascending time order. Usage is the final assistant message's
+    /// native token usage in that same window, attributed at message scope.
+    /// Anything else (missing user message, missing idle, contradictory
+    /// outcome) is a gap, never an inference.
     async fn read_terminal_messages(&self, session_id: &str) -> Result<TerminalReadback> {
         let inbox_id = self
             .open_inbox_id
@@ -1233,6 +1236,7 @@ impl EventProcessor {
         let mut user_position: Option<usize> = None;
         let mut idle: Option<(String, String, Option<StructuredError>)> = None;
         let mut texts: Vec<(i64, String, String)> = Vec::new();
+        let mut usages: HashMap<String, (i64, Option<AssistantTokens>)> = HashMap::new();
         let mut scanned: Vec<Message> = Vec::new();
         for _ in 0..MAX_MESSAGE_PAGES {
             let page = self
@@ -1263,6 +1267,12 @@ impl EventProcessor {
                                 ));
                             }
                         }
+                        // A repeated message id replaces its usage; repeated
+                        // observations are never summed.
+                        usages.insert(
+                            assistant.id.clone(),
+                            (assistant.time.created, assistant.tokens.clone()),
+                        );
                     }
                     Message::Idle(idle_message) if idle.is_none() && user_position.is_none() => {
                         // Newest-first: the first idle seen before our
@@ -1334,6 +1344,7 @@ impl EventProcessor {
             } else {
                 Some(final_text)
             },
+            usage: final_message_usage(&usages, user_created),
         })
     }
 
@@ -1890,6 +1901,34 @@ struct TerminalReadback {
     outcome: String,
     idle_error: Option<StructuredError>,
     final_text: Option<String>,
+    usage: Option<TurnUsage>,
+}
+
+/// The newest assistant message strictly after our input contributes its
+/// native token usage at message scope. No assistant message, or no native
+/// tokens on it, means unavailable usage — never an earlier message's
+/// usage, never a sum, never zero.
+fn final_message_usage(
+    usages: &HashMap<String, (i64, Option<AssistantTokens>)>,
+    user_created: i64,
+) -> Option<TurnUsage> {
+    let (id, (_, tokens)) = usages
+        .iter()
+        .filter(|(_, (created, _))| *created > user_created)
+        .max_by(|(left_id, (left, _)), (right_id, (right, _))| {
+            (left, left_id).cmp(&(right, right_id))
+        })?;
+    tokens.as_ref().map(|tokens| TurnUsage {
+        scope: Some("message".to_owned()),
+        message_id: Some(id.clone()),
+        input_tokens: tokens.input,
+        output_tokens: tokens.output,
+        reasoning_tokens: tokens.reasoning,
+        thinking_tokens: None,
+        cache_read_tokens: tokens.cache.as_ref().and_then(|cache| cache.read),
+        cache_write_tokens: tokens.cache.as_ref().and_then(|cache| cache.write),
+        total_tokens: None,
+    })
 }
 
 async fn run(

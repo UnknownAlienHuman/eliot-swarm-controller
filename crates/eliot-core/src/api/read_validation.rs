@@ -171,6 +171,7 @@ mod tests {
             final_text: None,
             started_at: Some(0),
             completed_at: None,
+            usage: None,
         }
     }
 

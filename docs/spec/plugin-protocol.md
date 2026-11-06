@@ -383,7 +383,9 @@ event in the same transaction as the source batch that proves it. An exact dupli
 batch/readback does not publish another `command.applied`. The event means the input was
 associated with its exact turn; it is not the turn's terminal result. Final text precedes
 the terminal turn; process exit or silence is not a turn result. Cumulative usage replaces
-its prior scope value rather than being summed.
+its prior scope value rather than being summed. OpenCode attributes its final assistant
+message's native token usage to the bound turn's terminal event at message scope; a
+repeated message id replaces, and the value is never presented as a turn or session total.
 
 On a failed terminal event, preserve its exact command/turn binding, status and structured
 provider restriction before optional final text. The following final-text budget rule

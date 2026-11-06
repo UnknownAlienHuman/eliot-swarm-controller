@@ -78,6 +78,7 @@ pub(super) fn persist_effects(
                 state,
                 status,
                 final_text,
+                usage,
                 completed_at,
             } => {
                 persist_turn_terminal(
@@ -87,6 +88,7 @@ pub(super) fn persist_effects(
                     *state,
                     status.as_deref(),
                     final_text.as_deref(),
+                    usage.as_ref(),
                     *completed_at,
                 )?;
                 if command_id.is_some() {
@@ -155,6 +157,7 @@ fn persist_turn_associated(
             final_text: None,
             started_at: Some(now),
             completed_at: None,
+            usage: None,
         },
     )?;
     let outcome = json!({"turn_id": turn_id});
@@ -494,6 +497,7 @@ fn persist_message_completed(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_turn_terminal(
     scope: EffectScope<'_, '_>,
     command_id: Option<&str>,
@@ -501,6 +505,7 @@ fn persist_turn_terminal(
     state: TurnState,
     status: Option<&str>,
     final_text: Option<&str>,
+    usage: Option<&TurnUsage>,
     completed_at: i64,
 ) -> Result<()> {
     let EffectScope {
@@ -533,16 +538,19 @@ fn persist_turn_terminal(
             ));
         }
     }
+    let usage = usage.map(encode_json).transpose()?;
     let changed = tx
         .execute(
             "UPDATE turns SET state = ?1, status = COALESCE(?2, status),
-                              final_text = COALESCE(?3, final_text), completed_at = ?4
-             WHERE agent = ?5 AND generation = ?6 AND turn_id = ?7",
+                              final_text = COALESCE(?3, final_text), completed_at = ?4,
+                              usage = COALESCE(?5, usage)
+             WHERE agent = ?6 AND generation = ?7 AND turn_id = ?8",
             params![
                 turn_state_name(state),
                 status,
                 final_text,
                 completed_at,
+                usage,
                 agent_num,
                 generation,
                 turn_id,

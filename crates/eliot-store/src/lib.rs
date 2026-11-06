@@ -32,7 +32,7 @@ use eliot_core::{
     Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage,
     GitSnapshot, NativeEvent, NativeStoreBinding, PendingRequest, ProcessIdentity, ProcessRecord,
     ProcessSnapshot, ProcessState, SourceBatch, SourceGap, SourceGapAck, SubmitCommand, Turn,
-    TurnState, WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase,
+    TurnState, TurnUsage, WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase,
     WorkspacePreparation, WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupArg,
     WorkspaceSetupOutcome, parse_agent_id,
 };
@@ -658,7 +658,7 @@ impl Store {
             .connection
             .prepare(
                 "SELECT agent, generation, turn_id, state, status, final_text,
-                        started_at, completed_at
+                        started_at, completed_at, usage
                  FROM turns WHERE agent = ?1 AND generation = ?2
                  ORDER BY COALESCE(started_at, completed_at, 0) DESC, turn_id DESC
                  LIMIT ?3",
@@ -2059,6 +2059,7 @@ struct TurnRecord {
     final_text: Option<String>,
     started_at: Option<i64>,
     completed_at: Option<i64>,
+    usage: Option<String>,
 }
 
 struct SourceStateRecord {
@@ -2254,6 +2255,7 @@ struct TurnInsert<'a> {
     final_text: Option<&'a str>,
     started_at: Option<i64>,
     completed_at: Option<i64>,
+    usage: Option<&'a str>,
 }
 
 fn agent_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
@@ -3172,10 +3174,12 @@ fn turn_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord>
         final_text: row.get(5)?,
         started_at: row.get(6)?,
         completed_at: row.get(7)?,
+        usage: row.get(8)?,
     })
 }
 
 fn turn_from_record(record: TurnRecord) -> Result<Turn> {
+    let usage = record.usage.as_deref().map(decode_turn_usage).transpose()?;
     Ok(Turn {
         agent: format_agent_id(record.agent),
         generation: record.generation,
@@ -3185,7 +3189,13 @@ fn turn_from_record(record: TurnRecord) -> Result<Turn> {
         final_text: record.final_text,
         started_at: record.started_at,
         completed_at: record.completed_at,
+        usage,
     })
+}
+
+fn decode_turn_usage(value: &str) -> Result<TurnUsage> {
+    serde_json::from_str(value)
+        .map_err(|error| Error::new("internal", format!("invalid stored turn usage: {error}")))
 }
 
 fn load_turn(
@@ -3197,7 +3207,7 @@ fn load_turn(
     let record = connection
         .query_row(
             "SELECT agent, generation, turn_id, state, status, final_text,
-                    started_at, completed_at
+                    started_at, completed_at, usage
              FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
             params![agent, generation, turn_id],
             turn_record_from_row,
@@ -3210,8 +3220,8 @@ fn load_turn(
 fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
     db!(tx.execute(
         "INSERT INTO turns(agent, generation, turn_id, state, status, final_text,
-                           started_at, completed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                           started_at, completed_at, usage)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             turn.agent,
             turn.generation,
@@ -3221,6 +3231,7 @@ fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
             turn.final_text,
             turn.started_at,
             turn.completed_at,
+            turn.usage,
         ],
     ));
     Ok(())

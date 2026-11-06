@@ -497,7 +497,11 @@ CREATE TABLE git_workspaces (
 );
 ```
 
-`agents.pending` is the serialized pending-request projection; `pending_requests` stores
+`turns.usage` is the nullable serialized `TurnUsage` attributed at terminal time from
+`turn.completed` `data.usage`: `scope` names the native attribution (`message` for one
+assistant message with its `message_id`), token members stay null when unavailable, and
+a present value replaces rather than sums. `agents.pending` is the serialized
+pending-request projection; `pending_requests` stores
 indexed request lifecycle rows. These are separate current Store structures, not
 interchangeable schemas. `git_workspaces` stores the workspace Git-head cache. The
 `last_handoff_digest`/`last_handoff` pair retains only the latest canonical handoff
