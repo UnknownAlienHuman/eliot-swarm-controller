@@ -440,6 +440,8 @@ literal nonsecret `env`, named secrets resolved in memory, then Eliot identity/G
 required values fail clearly. Windows keys compare case-insensitively.
 The managed Agent target environment sets `ELIOT_HOME` to the owned data directory,
 overriding ambient/profile, alongside `ELIOT_AGENT_ID`/`ELIOT_AGENT_GENERATION`/`ELIOT_AGENT_TOKEN`.
+It prepends the active controller executable's parent directory to `PATH`, preserving the
+native baseline entries, so bare `swarm` resolves to the current controller before ambient/legacy bins.
 An adopted route stores only the optional client-key environment-variable name; the
 profile must explicitly allow that name in pass_env. Its value is resolved at runtime
 and is not sent with the unauthenticated readiness request.
