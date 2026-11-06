@@ -1,4 +1,8 @@
 # Copy to <Eliot data directory>/config.toml. This does not replace Codex config.
+# The five native adapters are Codex, Claude, OpenCode, Muse and Antigravity.
+# Every profile is explicit: one harness, one native executable, one exact model.
+# There is no builtin fake profile and no default/fallback profile. Captured
+# native-store selectors are frozen at admission and never reselected.
 # The first Codex integration uses the installed executable and existing ChatGPT login.
 # Select an exact model and an effort supported by the native model/list response.
 
@@ -37,3 +41,22 @@ harness = "claude"
 cmd = "C:/Users/test/.local/bin/claude.exe"
 model = "claude-opus-4-6"
 # approval = "plan"
+
+# OpenCode (per-Agent `serve`). Point cmd at the installed native executable,
+# not a wrapper. model is the exact provider/model-id string; auth_integration
+# is the frozen nonsecret selector naming the one native integration whose
+# credential is transferred into the isolated store (no owner global auth edit).
+[profiles.opencode-openrouter]
+harness = "opencode"
+cmd = "C:/Tools/OpenCode/opencode.exe"
+model = "openrouter/stealth/crouton-alpha"
+auth_integration = "openrouter"
+
+# Antigravity. Point cmd at the installed native executable. mode is one of
+# plan, auto or accept-edits; effort/approval/collaboration/permissions presets
+# are rejected by this adapter.
+[profiles.antigravity]
+harness = "antigravity"
+cmd = "C:/Tools/Antigravity/antigravity.exe"
+model = "antigravity-model"
+# mode = "auto"

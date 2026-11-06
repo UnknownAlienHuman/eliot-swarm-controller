@@ -59,5 +59,9 @@ record the source in the code/PR, and verify toolchain compatibility. This is a 
 import check, not a gate on every operation or PR. Pattern-only sources are not copied.
 
 The complete API/spec is the target contract, not permission to build everything before
-Codex works. First deliver core/bus with a tiny fake, then direct Codex/Luna; automation,
-mail and additional harnesses come afterward in the order defined by the roadmap.
+Codex works. Completed history: L1 bootstrapped the command path with a
+temporary fake harness; L2 replaced it with direct Codex/Luna. The current
+product uses the five native adapters (Codex, Claude, OpenCode, Muse,
+Antigravity) with explicit profiles and frozen captured selectors. Do not
+restore the fake path or any synthetic runtime. Automation, mail and
+additional harnesses follow in the order defined by the roadmap.

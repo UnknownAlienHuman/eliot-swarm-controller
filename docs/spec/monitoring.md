@@ -383,7 +383,7 @@ refs and objects were unchanged. Removing the fixture traps produced complete di
 status, still without attribution. Restart recovered the commit made while the daemon
 was down. A native `note.txt` edit retained its original cause timestamp; generation-1
 attribution survived immediate stop/resume to generation 2 with no additional turn.
-It remained queryable after terminal settlement, then a live fake's complete clean scan
+It remained queryable after terminal settlement, then a native adapter's complete clean scan
 removed it after explicit restoration. All exercise Agents stopped and owned daemons
 exited. The Windows leaf-process regression passed 1/1: the fenced parent ran, while an
 existing absolute child executable ran in the ordinary-custody control and was blocked
@@ -422,7 +422,7 @@ when their typed `httpStatusCode` is 429: `httpConnectionFailed`,
 `responseStreamConnectionFailed`, `responseStreamDisconnected`, and
 `responseTooManyFailedAttempts`. A bare HTTP status is not enough; only these exact
 typed variants with `httpStatusCode:429` map to rate-limit. `ModelRemoved` remains a
-valid structured Core restriction kind exercised by the Fake policy fixture, but the
+valid structured Core restriction kind, but the
 Codex 0.161 classifier does not infer it from an unrecognized native variant, HTTP 404
 or message text.
 

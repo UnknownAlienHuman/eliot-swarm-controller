@@ -4,6 +4,6 @@
 # the next idle event; no manual `goal round` is needed. `git --version` is a
 # portable exit-0 placeholder: replace it with your project's check command,
 # which must exit 0 when the goal holds. Verify with: goal show AGENT
-# CI runs this exact command against the Fake profile (agent launched with
-# the Fake profile instead of codex-luna, nothing else changed).
+# The agent must be launched with a native adapter profile (for example codex-luna).
+# CI never runs this against a fake profile.
 goal set AGENT --text keep-green --max-rounds 5 --check git --version

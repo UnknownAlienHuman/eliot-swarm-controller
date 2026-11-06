@@ -63,15 +63,18 @@ adding forwarding traits. Retain authority, generation, idempotency and source c
 their owning boundaries. Canonical payload/ACK digests and credential hashes serve those
 contracts; file size alone is not a reason to remove them or add another integrity layer.
 
-The fake uses the same protocol as Codex. It is initially an echo/turn process, not a
-large simulator. Create crates as their callers arrive; this table is the eventual map,
+All five native adapters (Codex, Claude, OpenCode, Muse, Antigravity) use the
+same protocol. Create crates as their callers arrive; this table is the eventual map,
 not six empty crates required for `--version`.
 
 ## First useful slice
 
-L1 delivers local CLI → Store/router → fixed-source fake → bus/result. L2 replaces
-only the fake with a per-Agent Codex app-server and adds native controls/readback. It
-uses an existing workspace and account, with Luna selected explicitly when available.
+Completed history: L1 delivered local CLI → Store/router → temporary fake →
+bus/result. L2 replaced that fake with a per-Agent Codex app-server and added
+native controls/readback. It uses an existing workspace and account, with Luna
+selected explicitly when available. Current code has no fake runtime: the
+five native adapters each use an explicit profile and frozen captured
+selectors.
 
 L3 adds monitoring/worktrees and the optional OpenCodex route. L4 adds automation on
 Codex; L5 adds communication between two Codex Agents; L6 adds other harnesses. Neither

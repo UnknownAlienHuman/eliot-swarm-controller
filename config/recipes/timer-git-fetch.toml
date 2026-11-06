@@ -16,8 +16,7 @@
 #   swarm timer show refresh-origin-main
 #   swarm timer run refresh-origin-main   # immediate manual firing, same action
 #
-# CI runs this exact rule file against the Fake profile; its registration swaps
-# the profile, the checkout path and the fetch endpoint for a local test remote.
+# This uses the native Codex profile. CI never runs it against a fake profile.
 
 [[rule]]
 id = "refresh-origin-main"
