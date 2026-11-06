@@ -30,9 +30,13 @@ slash only (see below).
 ## Authentication
 
 Before `serve`, the plugin transfers only the selected canonical credential
-into the isolated native store the server will use. The canonical `auth list`
-must show the selector exactly once with exactly one credential; anything else
-refuses without fallback, and never all integrations are exported. The selected
+into the isolated native store the server will use. `auth_integration` matches
+by exact equality against a native integration's id OR display name; the
+installed selector `openrouter` names ID `openrouter` (display name
+`OpenRouter`). The canonical `auth list` must show precisely one matched
+integration with `connections.len() == 1`; zero matches, several matches, or
+any other connection count refuses without fallback, and never all
+integrations are exported. The selected
 document moves opaquely, in memory only, from canonical `auth export
 <selector> --standalone` into isolated `auth import --standalone` under the
 exact per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME` roots the server receives
