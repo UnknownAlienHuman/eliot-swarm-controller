@@ -1,13 +1,51 @@
 # OpenCode
 
-L6 adapter. Select one installed HTTP/SSE API generation from its OpenAPI document
-(`GET /doc` where supported); do not mix generations after a 404. Source:
-[anomalyco/opencode](https://github.com/anomalyco/opencode). Existing notes were checked
-2026-10-25/26; installed behavior remains to be recorded during implementation.
+L6 adapter for the installed OpenCode 2.0.32. Select one installed HTTP/SSE API
+generation from its OpenAPI document (`GET /doc` where supported); do not mix
+generations after a 404. Source:
+[anomalyco/opencode](https://github.com/anomalyco/opencode).
 
 Waku's [service](https://github.com/egoist/waku/blob/main/crates/waku-core/src/opencode_service.rs)
 and `driver/opencode.rs` are pattern-only references: subscribe before create, exact
 session routing, adopted service ownership and reconnect by readback. No GPL code copying.
+
+## Working profile
+
+The working Eliot Swarm profile for the installed OpenCode 2.0.32 is:
+
+```toml
+[profiles.opencode-openrouter]
+harness = "opencode"
+cmd = "<explicit native opencode executable>"
+model = "openrouter/stealth/crouton-alpha"
+auth_integration = "openrouter"
+```
+
+`auth_integration` is required by the plugin at start, not optional: it is the
+frozen nonsecret selector naming the one native integration whose canonical
+credential is prepared before `serve`. `cmd` is the explicit native executable
+(no script wrapper, no PATH default). The model string is split at its first
+slash only (see below).
+
+## Authentication
+
+Before `serve`, the plugin transfers only the selected canonical credential
+into the isolated native store the server will use. The canonical `auth list`
+must show the selector exactly once with exactly one credential; anything else
+refuses without fallback, and never all integrations are exported. The selected
+document moves opaquely, in memory only, from canonical `auth export
+<selector> --standalone` into isolated `auth import --standalone` under the
+exact per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME` roots the server receives
+(`native/auth.rs`, `native/server.rs`). The owner global auth store is never
+modified: no login, switch, global flag, hand-copied `auth.json`, or edit of
+owner global settings.
+
+On explicit resume, the isolated `auth list` is read first and a correctly
+present selection is reused without re-import; an ambiguous isolated state
+refuses. If an import outcome cannot be proven, it settles to success only
+after the original child is proven exited and an isolated-list readback proves
+the selected state; otherwise it stays `unknown`, no automatic retry is made,
+and no server is started.
 
 ## Native identity and process mode
 
@@ -38,7 +76,7 @@ Catalogue preflight may retry only before any session/input may have been admitt
 
 | Eliot operation | Mechanism / settlement |
 | --- | --- |
-| launch | installed `POST /api/session` with the workspace directory, no input; per-Agent `serve` on loopback with a generated `OPENCODE_PASSWORD` and per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`; before `serve`, the frozen nonsecret `auth_integration` selector's canonical credential moves opaquely into the isolated store (the selection must hold exactly one credential, never all integrations; explicit resume reuses a correctly present one; an unknown import settles only by proven child exit plus native `auth list` readback, never by retry); exact session/model/directory echo required before Eliot `session.ready` |
+| launch | installed `POST /api/session` with the workspace directory, no input; per-Agent `serve` on loopback with a generated `OPENCODE_PASSWORD` and per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`; before `serve`, the frozen nonsecret `auth_integration` selector's canonical credential transfers opaquely into the isolated store as described under [Authentication](#authentication), with no modification of owner global auth; exact session/model/directory echo required before Eliot `session.ready` |
 | send | installed `POST /api/session/{id}/prompt`; the 200 inbox id is intermediate, applied needs the exact input-to-execution association on SSE (`session.inbox.enqueued`/`delivered` plus `session.execution.started`; turn id is the exact `started` event id) |
 | steer | exact-current-execution method only; queueing another prompt is not steer |
 | inject | verified safe point or explicit next-send prepend |
