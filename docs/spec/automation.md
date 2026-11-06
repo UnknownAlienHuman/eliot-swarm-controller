@@ -811,7 +811,12 @@ pending requests, every open harness source healthy (`daemon`/`os`/`git`/
 `workspace_process` monitors stay advisory), no unknown command, no open
 command, and the key is fresh — an idle key names an idle event of that
 Agent generation and is still its latest, a slot key names a due slot. A
-turn budget already spent outside any round blocks without running the check.
+turn budget already spent outside any round blocks without running the check. A
+budget spent solely by the Goal's own last admitted continuation is not outside
+any round: that round still runs its final check, and the postcheck budgets
+decide (success completes even on the spent budget; a failed check admits no
+further continuation and is decided under the existing postcheck ordering:
+round budget, then turn limit, then no progress).
 
 Before the check runs, the round claims a durable single-flight marker for
 `(agent,generation,mode,revision,round_key,round_key_kind)` in the same

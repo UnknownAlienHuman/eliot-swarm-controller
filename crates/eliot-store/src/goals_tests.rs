@@ -172,8 +172,18 @@ fn failed_check(digest: &str) -> GoalCheckResult {
 }
 
 fn claim(store: &mut Store, agent: &str, revision: i64, key: i64, now: i64) {
+    let probe = store
+        .goal_round_probe(agent, "eliot", GoalRoundKey::Idle(key), now)
+        .expect("probe before claim");
     store
-        .goal_claim_round(agent, "eliot", GoalRoundKey::Idle(key), revision, now)
+        .goal_claim_round(
+            agent,
+            "eliot",
+            GoalRoundKey::Idle(key),
+            revision,
+            probe.spent_by_goal_continuation,
+            now,
+        )
         .expect("claim round");
 }
 
@@ -826,6 +836,7 @@ fn goal_commit_refuses_revision_and_event_drift() {
                 "eliot",
                 GoalRoundKey::Idle(key),
                 current.revision,
+                false,
                 now + 4
             )
             .unwrap_err()
@@ -1191,6 +1202,7 @@ fn goal_claim_refuses_a_second_round_while_one_is_in_flight() {
                     "eliot",
                     GoalRoundKey::Idle(other),
                     view.revision,
+                    false,
                     now + 2
                 )
                 .unwrap_err()
@@ -1240,6 +1252,7 @@ fn goal_claim_refuses_a_second_round_while_one_is_in_flight() {
                 "eliot",
                 GoalRoundKey::Idle(key),
                 view.revision,
+                false,
                 now + 4
             )
             .unwrap_err()
@@ -1549,6 +1562,7 @@ fn goal_round_key_must_name_a_generation_event() {
                 "eliot",
                 GoalRoundKey::Idle(0),
                 view.revision,
+                false,
                 now + 1
             )
             .unwrap_err()
@@ -1668,6 +1682,7 @@ fn goal_burned_key_survives_pause_and_resume() {
                 "eliot",
                 GoalRoundKey::Idle(key),
                 resumed.revision,
+                false,
                 now + 3
             )
             .unwrap_err()
@@ -1823,7 +1838,7 @@ fn goal_slot_round_trip_continues_then_completes() {
         .unwrap();
     assert_eq!(set.cadence_anchor_ms, Some(base));
     let first_due = base + MIN_GOAL_CADENCE_MS;
-    store
+    let probe = store
         .goal_round_probe(&agent, "eliot", GoalRoundKey::Slot(1), first_due)
         .expect("first slot probes when due");
     let claim_seq = store
@@ -1832,6 +1847,7 @@ fn goal_slot_round_trip_continues_then_completes() {
             "eliot",
             GoalRoundKey::Slot(1),
             set.revision,
+            probe.spent_by_goal_continuation,
             first_due,
         )
         .expect("claim first slot");
@@ -1862,7 +1878,7 @@ fn goal_slot_round_trip_continues_then_completes() {
     };
     complete_send(&mut store, &agent, &send_id, "turn-slot-1", first_due + 1);
     let second_due = base + 2 * MIN_GOAL_CADENCE_MS;
-    store
+    let probe = store
         .goal_round_probe(&agent, "eliot", GoalRoundKey::Slot(2), second_due)
         .expect("second slot probes when due");
     let claim_seq = store
@@ -1871,6 +1887,7 @@ fn goal_slot_round_trip_continues_then_completes() {
             "eliot",
             GoalRoundKey::Slot(2),
             first.view.revision,
+            probe.spent_by_goal_continuation,
             second_due,
         )
         .expect("claim second slot");
@@ -1911,7 +1928,7 @@ fn goal_slot_keys_validate_form_range_and_due() {
         );
         assert_eq!(
             store
-                .goal_claim_round(&agent, "eliot", key, set.revision, base)
+                .goal_claim_round(&agent, "eliot", key, set.revision, false, base)
                 .unwrap_err()
                 .code,
             "invalid"
@@ -1926,7 +1943,14 @@ fn goal_slot_keys_validate_form_range_and_due() {
     );
     assert_eq!(
         store
-            .goal_claim_round(&agent, "eliot", GoalRoundKey::Slot(9), set.revision, base)
+            .goal_claim_round(
+                &agent,
+                "eliot",
+                GoalRoundKey::Slot(9),
+                set.revision,
+                false,
+                base
+            )
             .unwrap_err()
             .code,
         "stale_round"
@@ -1942,7 +1966,14 @@ fn goal_slot_keys_validate_form_range_and_due() {
     );
     assert_eq!(
         store
-            .goal_claim_round(&agent, "eliot", GoalRoundKey::Idle(key), set.revision, base)
+            .goal_claim_round(
+                &agent,
+                "eliot",
+                GoalRoundKey::Idle(key),
+                set.revision,
+                false,
+                base
+            )
             .unwrap_err()
             .code,
         "bad_state"
@@ -1976,7 +2007,14 @@ fn goal_slot_burn_ignores_revision_but_separates_forms() {
         .unwrap();
     let key = store.high_water().unwrap();
     let claim_seq = store
-        .goal_claim_round(&agent, "eliot", GoalRoundKey::Idle(key), set.revision, base)
+        .goal_claim_round(
+            &agent,
+            "eliot",
+            GoalRoundKey::Idle(key),
+            set.revision,
+            false,
+            base,
+        )
         .expect("claim idle key");
     assert_eq!(claim_seq, key);
     store
@@ -1996,7 +2034,7 @@ fn goal_slot_burn_ignores_revision_but_separates_forms() {
         .goal_set(&agent, "eliot", &cadenced_definition("green"), anchor)
         .unwrap();
     let due = anchor + key * MIN_GOAL_CADENCE_MS;
-    store
+    let probe = store
         .goal_round_probe(&agent, "eliot", GoalRoundKey::Slot(key), due)
         .expect("same number as a slot is not burned");
     store
@@ -2005,6 +2043,7 @@ fn goal_slot_burn_ignores_revision_but_separates_forms() {
             "eliot",
             GoalRoundKey::Slot(key),
             cadenced.revision,
+            probe.spent_by_goal_continuation,
             due,
         )
         .expect("claim slot");
@@ -2036,6 +2075,7 @@ fn goal_slot_burn_ignores_revision_but_separates_forms() {
                 "eliot",
                 GoalRoundKey::Slot(key),
                 resumed.revision,
+                false,
                 due + 3
             )
             .unwrap_err()
@@ -2058,7 +2098,14 @@ fn goal_slot_commit_refuses_events_during_the_check() {
         .unwrap();
     let due = base + MIN_GOAL_CADENCE_MS;
     let claim_seq = store
-        .goal_claim_round(&agent, "eliot", GoalRoundKey::Slot(1), set.revision, due)
+        .goal_claim_round(
+            &agent,
+            "eliot",
+            GoalRoundKey::Slot(1),
+            set.revision,
+            false,
+            due,
+        )
         .expect("claim slot");
     // A benign Git binding commits an Agent event without tripping any
     // gate; the slot commit still sees the high-water move.
@@ -2512,7 +2559,7 @@ fn goal_committed_slots_are_monotonic() {
         .goal_set(&agent, "eliot", &cadenced_definition("green"), base)
         .unwrap();
     let ninth_due = base + 9 * MIN_GOAL_CADENCE_MS;
-    store
+    let probe = store
         .goal_round_probe(&agent, "eliot", GoalRoundKey::Slot(9), ninth_due)
         .expect("slot 9 probes when due");
     let claim_seq = store
@@ -2521,6 +2568,7 @@ fn goal_committed_slots_are_monotonic() {
             "eliot",
             GoalRoundKey::Slot(9),
             set.revision,
+            probe.spent_by_goal_continuation,
             ninth_due,
         )
         .expect("claim slot 9");
@@ -2563,6 +2611,7 @@ fn goal_committed_slots_are_monotonic() {
                 "eliot",
                 GoalRoundKey::Slot(1),
                 committed.view.revision,
+                false,
                 ninth_due,
             )
             .unwrap_err()
@@ -2607,7 +2656,7 @@ fn goal_reopen_reads_idle_and_slot_markers_as_unknown() {
             idle_key,
             first_due,
         );
-        store
+        let probe = store
             .goal_round_probe(&slot_agent, "eliot", GoalRoundKey::Slot(1), first_due)
             .expect("probe first slot");
         store
@@ -2616,6 +2665,7 @@ fn goal_reopen_reads_idle_and_slot_markers_as_unknown() {
                 "eliot",
                 GoalRoundKey::Slot(1),
                 slot_view.revision,
+                probe.spent_by_goal_continuation,
                 first_due,
             )
             .expect("claim first slot");
@@ -2657,6 +2707,7 @@ fn goal_reopen_reads_idle_and_slot_markers_as_unknown() {
                     "eliot",
                     key,
                     revision,
+                    false,
                     base + MIN_GOAL_CADENCE_MS + 1
                 )
                 .unwrap_err()
@@ -2682,7 +2733,7 @@ fn goal_reopen_reads_idle_and_slot_markers_as_unknown() {
     claim(&mut store, &idle_agent, current.revision, fresh, base + 3);
     let second_due = base + 2 * MIN_GOAL_CADENCE_MS;
     let current_slot = store.goal_get(&slot_agent, "eliot").unwrap().unwrap();
-    store
+    let probe = store
         .goal_round_probe(&slot_agent, "eliot", GoalRoundKey::Slot(2), second_due)
         .expect("probe the fresh slot");
     store
@@ -2691,6 +2742,7 @@ fn goal_reopen_reads_idle_and_slot_markers_as_unknown() {
             "eliot",
             GoalRoundKey::Slot(2),
             current_slot.revision,
+            probe.spent_by_goal_continuation,
             second_due,
         )
         .expect("claim the fresh slot");

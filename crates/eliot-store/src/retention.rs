@@ -43,6 +43,7 @@ struct SubtreeMember {
     turn_bound: bool,
     workspace_ref: bool,
     probe_ref: bool,
+    goal_ref: bool,
 }
 
 impl Store {
@@ -239,6 +240,13 @@ impl Store {
                         OR EXISTS (
                             SELECT 1 FROM provider_holds h WHERE h.probe_command = m.id
                         )
+                        OR EXISTS (
+                            SELECT 1 FROM goals g
+                            WHERE g.agent = m.target AND g.mode = 'eliot'
+                              AND g.generation = m.generation
+                              AND json_extract(g.state, '$.status') IN ('active', 'paused')
+                              AND json_extract(g.state, '$.last_continuation_command_id') = m.id
+                        )
                  ),
                  oversize(root) AS (
                      SELECT s.root FROM old_sets s
@@ -281,6 +289,7 @@ impl Store {
                     || member.turn_bound
                     || member.workspace_ref
                     || member.probe_ref
+                    || member.goal_ref
             }) {
                 continue;
             }
@@ -494,7 +503,14 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
                           AND t.turn_id = c.turn_id AND t.state IN ('running', 'unknown')
                     ),
                     EXISTS(SELECT 1 FROM workspaces w WHERE w.start_command_id = c.id),
-                    EXISTS(SELECT 1 FROM provider_holds h WHERE h.probe_command = c.id)
+                    EXISTS(SELECT 1 FROM provider_holds h WHERE h.probe_command = c.id),
+                    EXISTS(
+                        SELECT 1 FROM goals g
+                        WHERE g.agent = c.target AND g.mode = 'eliot'
+                          AND g.generation = c.generation
+                          AND json_extract(g.state, '$.status') IN ('active', 'paused')
+                          AND json_extract(g.state, '$.last_continuation_command_id') = c.id
+                    )
              FROM subtree s JOIN commands c ON c.id = s.id
              LIMIT ?3",
         )
@@ -511,6 +527,7 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
                     turn_bound: row.get(4)?,
                     workspace_ref: row.get(5)?,
                     probe_ref: row.get(6)?,
+                    goal_ref: row.get(7)?,
                 })
             },
         )
