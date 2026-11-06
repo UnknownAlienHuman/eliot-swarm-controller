@@ -31,9 +31,9 @@ use crate::native::{
         reply_for, same_approval_offer,
     },
     types::{
-        NativeApprovalDecideResult, NativeApprovalRequestParams,
-        NativeApprovalResolvedNotification, NativeApprovalUpdatedNotification,
-        NativeHistoryNoneReason, NativeItemCompletedNotification, NativeItemStartedNotification,
+        NativeApprovalDecideResult, NativeApprovalResolvedNotification,
+        NativeApprovalUpdatedNotification, NativeHistoryNoneReason,
+        NativeItemCompletedNotification, NativeItemStartedNotification,
         NativeSessionClosedNotification, NativeSessionStartedNotification,
         NativeSessionViewHealthChangedNotification, NativeTurnCompletedNotification,
         NativeTurnError, NativeTurnStartedNotification, NativeTurnTerminal,
@@ -151,7 +151,9 @@ struct PendingNativeRequest {
     /// Native `commandId` of the outstanding reply while Writing, retained
     /// while its outcome stays Unknown so a later `approval/resolved` can
     /// prove (via `decidedByCommandId`) that this exact decide applied.
-    /// Cleared on every path that leaves Writing/Written/Unknown behind.
+    /// Retained on every Unknown outcome (admitted-unproven and ambiguous
+    /// alike); cleared only when the entry returns to Available or settles
+    /// as Written for a non-decide reply.
     reply_native_command_id: Option<String>,
     reply_state: NativeReplyState,
     /// Observation counter at the last stream update of this entry.
@@ -162,6 +164,7 @@ struct PendingNativeRequest {
 /// qualify the control result against authoritative view frames. Generation
 /// rides on the live turn: the captured turn is active at send time, and
 /// only frames naming this exact session, turn, and approval can qualify.
+#[derive(Clone)]
 struct DecideCapture {
     session_id: String,
     turn_id: String,
@@ -173,7 +176,7 @@ struct DecideCapture {
 /// Whitelisted view diagnostics for a decide qualification: whether a
 /// terminal resolution for this exact decide was observed, and whether it
 /// carried a decider id that matched ours. Booleans only, never payload.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct DecideViewDiag {
     resolved_seen: bool,
     decider_present: bool,
@@ -301,6 +304,16 @@ struct EventProcessor {
     /// eviction only re-gaps, never re-hides a proven tracked child.
     workflow_unknown: HashSet<WorkflowChildKey>,
     workflow_unknown_order: VecDeque<WorkflowChildKey>,
+    /// Active decide qualification while `pump_decide_proof` pumps frames.
+    /// Owning paths (`resolve_approval`, `refresh_approval`,
+    /// `process_request`) set the frame proof/diag fields below only after
+    /// their own successful validation and required persistence; the pump
+    /// reads them only after `handle_frame` returns. `None` outside a pump.
+    active_decide: Option<DecideCapture>,
+    active_decide_admission: bool,
+    frame_decide_proof: bool,
+    frame_decide_decisive: bool,
+    frame_decide_diag: DecideViewDiag,
 }
 
 struct StashedPending {
@@ -501,6 +514,11 @@ impl EventProcessor {
             workflow_children: HashMap::new(),
             workflow_unknown: HashSet::new(),
             workflow_unknown_order: VecDeque::new(),
+            active_decide: None,
+            active_decide_admission: false,
+            frame_decide_proof: false,
+            frame_decide_decisive: false,
+            frame_decide_diag: DecideViewDiag::default(),
         }
     }
 
@@ -970,6 +988,7 @@ impl EventProcessor {
             .active_turn_id
             .as_deref()
             .ok_or_else(|| Error::new("unknown", "Muse request has no associated turn"))?;
+        let session_id_owned = session_id.to_owned();
         let request = match describe_request(&method, &params, session_id, turn_id) {
             Ok(request) => request,
             Err(error) if error.code == "source_integrity" => {
@@ -1091,7 +1110,22 @@ impl EventProcessor {
                 prior,
                 NativeReplyState::Available | NativeReplyState::Written
             ) {
+                let gap_before = self.gap_snapshot();
                 self.commit_offer_update(&refreshed).await?;
+                if self.gap_snapshot() != gap_before {
+                    return Ok(());
+                }
+            }
+            if let (Some(seq), Some(approval_id)) = (
+                refreshed.details.get("offer_seq").and_then(Value::as_i64),
+                refreshed.details.get("approval_id").and_then(Value::as_str),
+            ) {
+                self.note_decide_offer_proof(
+                    session_id_owned.as_str(),
+                    refreshed.turn_id.as_str(),
+                    approval_id,
+                    seq,
+                );
             }
             if let Some(native_id) = orphan_request_id(&method, &params) {
                 self.expected_requests.remove(native_id.as_str());
@@ -1127,6 +1161,19 @@ impl EventProcessor {
             }
         };
         self.commit_event("request.opened", native_id, data).await?;
+        let open_proof: Option<(String, i64, String)> = if request.kind == "approval" {
+            match (
+                request.details.get("offer_seq").and_then(Value::as_i64),
+                request.details.get("approval_id").and_then(Value::as_str),
+            ) {
+                (Some(seq), Some(approval_id)) => {
+                    Some((request.turn_id.clone(), seq, approval_id.to_owned()))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let observed = self.observe();
         if let Some(native_id) = pending_native_id(&request) {
             self.native_index
@@ -1143,6 +1190,14 @@ impl EventProcessor {
                 observed_at: observed,
             },
         );
+        if let Some((open_turn, seq, approval_id)) = open_proof {
+            self.note_decide_offer_proof(
+                session_id_owned.as_str(),
+                open_turn.as_str(),
+                approval_id.as_str(),
+                seq,
+            );
+        }
         Ok(())
     }
 
@@ -1176,10 +1231,15 @@ impl EventProcessor {
     /// authoritative view proof of this exact decide: a terminal resolution
     /// naming our native command id, or — only after a clean admission ack —
     /// an offer that advanced past our decided requirement. Every drained
-    /// frame is processed normally in arrival order; nothing is dropped.
-    /// Returns true once the decide is proven applied. The single absolute
-    /// deadline (captured before the write, never renewed) and stream EOF
-    /// both end the wait unproven.
+    /// frame is processed normally in arrival order (`handle_frame` first);
+    /// nothing is dropped and no pre-parse of the frame is consulted.
+    /// Proof is recorded only by the owning paths (`resolve_approval`,
+    /// `refresh_approval`, `process_request`) after their own successful
+    /// validation and required persistence, and read only after that frame
+    /// has been handled. A rejected frame, a gap, or a failed persistence
+    /// therefore never counts as Applied. Returns true once the decide is
+    /// proven applied. The single absolute deadline (captured before the
+    /// write, never renewed) and stream EOF both end the wait unproven.
     async fn pump_decide_proof(
         &mut self,
         frames: &mut mpsc::Receiver<NativeFrame>,
@@ -1188,115 +1248,133 @@ impl EventProcessor {
         admission_proven: bool,
         diag: &mut DecideViewDiag,
     ) -> bool {
-        loop {
+        self.active_decide = Some(capture.clone());
+        self.active_decide_admission = admission_proven;
+        self.frame_decide_proof = false;
+        self.frame_decide_decisive = false;
+        self.frame_decide_diag = DecideViewDiag::default();
+        let proven = 'outer: loop {
             while Instant::now() < deadline {
                 let Ok(frame) = frames.try_recv() else {
                     break;
                 };
-                if self.observe_decide_frame(&frame, capture, admission_proven, diag) {
-                    self.handle_frame(Some(frame)).await;
-                    self.report_gap_if_queue_empty(frames.is_empty()).await;
-                    return true;
+                let frame_proven = self.pump_one_decide_frame(frames, frame, diag).await;
+                if frame_proven {
+                    break 'outer true;
                 }
-                self.handle_frame(Some(frame)).await;
-                self.report_gap_if_queue_empty(frames.is_empty()).await;
-                if diag.resolved_decisive {
-                    return false;
+                if self.frame_decide_decisive {
+                    break 'outer false;
                 }
             }
             if Instant::now() >= deadline {
-                return false;
+                break false;
             }
             match timeout_at(deadline, frames.recv()).await {
                 Ok(Some(frame)) => {
-                    if self.observe_decide_frame(&frame, capture, admission_proven, diag) {
-                        self.handle_frame(Some(frame)).await;
-                        self.report_gap_if_queue_empty(frames.is_empty()).await;
-                        return true;
+                    let frame_proven = self.pump_one_decide_frame(frames, frame, diag).await;
+                    if frame_proven {
+                        break true;
                     }
-                    self.handle_frame(Some(frame)).await;
-                    self.report_gap_if_queue_empty(frames.is_empty()).await;
-                    if diag.resolved_decisive {
-                        return false;
+                    if self.frame_decide_decisive {
+                        break false;
                     }
                 }
-                _ => return false,
+                _ => break false,
             }
+        };
+        self.active_decide = None;
+        self.active_decide_admission = false;
+        self.frame_decide_proof = false;
+        self.frame_decide_decisive = false;
+        proven
+    }
+
+    /// Handle one pumped frame in arrival order and merge any proof/diag
+    /// the owning path recorded for that exact frame. Returns true only
+    /// when the owning path proved this decide applied.
+    async fn pump_one_decide_frame(
+        &mut self,
+        frames: &mut mpsc::Receiver<NativeFrame>,
+        frame: NativeFrame,
+        diag: &mut DecideViewDiag,
+    ) -> bool {
+        self.frame_decide_proof = false;
+        self.frame_decide_decisive = false;
+        self.frame_decide_diag = DecideViewDiag::default();
+        self.handle_frame(Some(frame)).await;
+        self.report_gap_if_queue_empty(frames.is_empty()).await;
+        if self.frame_decide_diag.resolved_seen {
+            diag.resolved_seen = true;
+            diag.decider_present = self.frame_decide_diag.decider_present;
+            diag.decider_match = self.frame_decide_diag.decider_match;
+            diag.resolved_decisive = true;
+        }
+        self.frame_decide_proof
+    }
+
+    /// Snapshot of the gap/blocked latches, used to tell a real persistence
+    /// success from a gap recorded in its place (`commit_offer_update`
+    /// returns `Ok` when it records a gap instead of persisting).
+    fn gap_snapshot(&self) -> (bool, bool) {
+        (self.gap_reported, self.writes_blocked)
+    }
+
+    /// Record non-terminal offer proof from an owning path: only with
+    /// admission proven, on the exact captured session/turn/approval, and
+    /// only when the owning refreshed offer is strictly past the decided
+    /// requirement. Callers invoke this only after their own successful
+    /// validation (and, where they persist, successful persistence).
+    fn note_decide_offer_proof(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        approval_id: &str,
+        offer_seq: i64,
+    ) {
+        let Some(capture) = self.active_decide.clone() else {
+            return;
+        };
+        if !self.active_decide_admission {
+            return;
+        }
+        if capture.session_id != session_id
+            || capture.turn_id != turn_id
+            || capture.approval_id != approval_id
+        {
+            return;
+        }
+        if offer_seq > capture.decided_seq {
+            self.frame_decide_proof = true;
         }
     }
 
-    /// Inspect one live frame for this decide's authoritative proof without
-    /// consuming it. True only for exact proof: a terminal resolution naming
-    /// our native command id, or — with admission already proven — an offer
-    /// advanced past our decided requirement. A terminal resolution that
-    /// does not name us is decisive the other way (recorded, never applied).
-    fn observe_decide_frame(
-        &self,
-        frame: &NativeFrame,
-        capture: &DecideCapture,
-        admission_proven: bool,
-        diag: &mut DecideViewDiag,
-    ) -> bool {
-        match frame {
-            NativeFrame::Notification { method, params } if method == "approval/resolved" => {
-                let Ok(resolved) =
-                    serde_json::from_value::<NativeApprovalResolvedNotification>(params.clone())
-                else {
-                    return false;
-                };
-                if resolved.session_id != capture.session_id
-                    || resolved.turn_id != capture.turn_id
-                    || resolved.approval_id != capture.approval_id
-                {
-                    return false;
-                }
-                diag.resolved_seen = true;
-                diag.decider_present = resolved
-                    .decided_by_command_id
-                    .as_deref()
-                    .is_some_and(|id| !id.trim().is_empty());
-                diag.decider_match = resolved_decider_matches(
-                    resolved.decided_by_command_id.as_deref(),
-                    &capture.native_command_id,
-                );
-                diag.resolved_decisive = true;
-                diag.decider_match
-            }
-            NativeFrame::Notification { method, params } if method == "approval/updated" => {
-                if !admission_proven {
-                    return false;
-                }
-                let Ok(updated) =
-                    serde_json::from_value::<NativeApprovalUpdatedNotification>(params.clone())
-                else {
-                    return false;
-                };
-                if updated.session_id != capture.session_id
-                    || updated.approval_id != capture.approval_id
-                {
-                    return false;
-                }
-                updated.current_requirement_id.source_index > capture.decided_seq
-            }
-            NativeFrame::Request { method, params, .. } if method == "approval/request" => {
-                if !admission_proven {
-                    return false;
-                }
-                let Ok(request) =
-                    serde_json::from_value::<NativeApprovalRequestParams>(params.clone())
-                else {
-                    return false;
-                };
-                if request.session_id != capture.session_id
-                    || request.turn_id != capture.turn_id
-                    || request.approval_id != capture.approval_id
-                {
-                    return false;
-                }
-                request.current_requirement_id.source_index > capture.decided_seq
-            }
-            _ => false,
+    /// Record terminal-resolution proof/diag from `resolve_approval`, only
+    /// after its commit succeeded and the entry was removed. A resolution
+    /// that does not name our native decide id is decisive the other way.
+    fn note_decide_resolved(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        approval_id: &str,
+        decided_by: Option<&str>,
+        bound_to_ours: bool,
+    ) {
+        let Some(capture) = self.active_decide.clone() else {
+            return;
+        };
+        if capture.session_id != session_id
+            || capture.turn_id != turn_id
+            || capture.approval_id != approval_id
+        {
+            return;
         }
+        self.frame_decide_diag.resolved_seen = true;
+        self.frame_decide_diag.decider_present = decided_by.is_some_and(|id| !id.trim().is_empty());
+        self.frame_decide_diag.decider_match =
+            resolved_decider_matches(decided_by, &capture.native_command_id);
+        self.frame_decide_diag.resolved_decisive = true;
+        self.frame_decide_decisive = true;
+        self.frame_decide_proof = bound_to_ours && self.frame_decide_diag.decider_match;
     }
 
     async fn reply_request(
@@ -1572,10 +1650,14 @@ impl EventProcessor {
     /// entry via the pumped resolution; proven nonterminal proof only
     /// refreshed it, so the stage is consumed here (mirroring the update
     /// reset, which cannot fire while Writing) and the consumed offer is
-    /// persisted for the owner projection and the stage gate. Unproven
-    /// outcomes stay honest: an admitted-but-unproven write stays recorded
-    /// as decided so a late view still settles it, and an ambiguous write
-    /// stays fenced unknown. Never resends.
+    /// persisted for the owner projection and the stage gate; if that
+    /// required persistence fails or gaps, the result is Unknown, never
+    /// Applied. Unproven outcomes stay honest and fenced: an
+    /// admitted-but-unproven write stays Unknown with both the Core and
+    /// native bindings retained, so only a late resolution naming this
+    /// exact native decide id can bind it (otherwise it closes unbound);
+    /// an ambiguous write likewise stays fenced unknown. Never resends,
+    /// never rearms Unknown.
     async fn qualify_decide(
         &mut self,
         frames: &mut mpsc::Receiver<NativeFrame>,
@@ -1595,24 +1677,44 @@ impl EventProcessor {
             .pump_decide_proof(frames, capture, deadline, admission_proven, &mut diag)
             .await;
         if proven {
-            if let Some(entry) = self.pending_requests.get(request_id) {
-                let refreshed = entry.request.clone();
+            if let Some(refreshed) = self
+                .pending_requests
+                .get(request_id)
+                .map(|entry| entry.request.clone())
+            {
                 let live_turn =
                     self.status.active_turn_id.as_deref() == Some(refreshed.turn_id.as_str());
+                if live_turn {
+                    // The pumped update could not persist while Writing, so
+                    // this is the required persistence for non-terminal
+                    // proof (terminal proof already removed the entry and
+                    // persisted its resolution in the owning path). A
+                    // failed or gapped persistence is never Applied.
+                    let gap_before = self.gap_snapshot();
+                    let persisted = self.commit_offer_update(&refreshed).await.is_ok()
+                        && self.gap_snapshot() == gap_before;
+                    if !persisted {
+                        if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                            entry.reply_state = NativeReplyState::Unknown;
+                            entry.reply_command_id = Some(command_id.to_owned());
+                        }
+                        let error_code = match rpc {
+                            DecideRpcOutcome::Admitted => None,
+                            DecideRpcOutcome::Ambiguous { error_code, .. } => error_code,
+                        };
+                        return Ok(with_decide_diag(
+                            unknown_control(
+                                "Muse consumed offer update was not persisted; it will not be repeated",
+                            ),
+                            error_code,
+                            &diag,
+                        ));
+                    }
+                }
                 if let Some(entry) = self.pending_requests.get_mut(request_id) {
                     entry.reply_state = NativeReplyState::Available;
                     entry.reply_command_id = None;
                     entry.reply_native_command_id = None;
-                }
-                if live_turn {
-                    // The pumped update could not persist while Writing; the
-                    // proof is recorded regardless, and a persist failure gaps
-                    // loudly instead of failing the proven control result.
-                    if self.commit_offer_update(&refreshed).await.is_err() {
-                        let _ = self
-                            .record_gap("Muse consumed offer update was not persisted")
-                            .await;
-                    }
                 }
             }
             let outcome = json!({
@@ -1630,10 +1732,15 @@ impl EventProcessor {
         }
         match rpc {
             DecideRpcOutcome::Admitted => {
+                // Unproven after admission: stay Unknown with both the Core
+                // command id and the native decide id retained. Storing
+                // Written and clearing the native id would let a later
+                // missing/foreign `decidedByCommandId` bind this write at
+                // resolution time; Unknown requires exact late proof and
+                // otherwise closes unbound. Never replayed or rearmed.
                 if let Some(entry) = self.pending_requests.get_mut(request_id) {
-                    entry.reply_state = NativeReplyState::Written;
+                    entry.reply_state = NativeReplyState::Unknown;
                     entry.reply_command_id = Some(command_id.to_owned());
-                    entry.reply_native_command_id = None;
                 }
                 Ok(with_decide_diag(
                     unknown_control(
@@ -2164,8 +2271,9 @@ impl EventProcessor {
         }
         let turn_id = entry.request.turn_id.clone();
         // `request.resolved` binds the exact dispatched Eliot reply: an
-        // acked decide, or an ambiguous one the resolution itself names via
-        // `decidedByCommandId` (resolved-before-qualifying-ACK order). Anything
+        // acked decide, or a Writing/Unknown one the resolution itself names
+        // via `decidedByCommandId` (resolved-before-qualifying-ACK order,
+        // and late proof for an admitted-but-unproven Unknown). Anything
         // else (policy/judge/timeout, another decider, an unnamed resolution,
         // or a reply this generation never wrote) closes without a binding.
         // Writing is reachable here only from inside the decide view-wait,
@@ -2211,11 +2319,23 @@ impl EventProcessor {
             ),
         };
         let commit_id = request_event_id(&request_id, kind, "muse", "Muse")?;
+        let bound_to_ours = kind == "request.resolved";
         self.commit_event(kind, commit_id, data).await?;
         self.pending_requests.remove(&request_id);
         self.native_index.remove(native_id);
         self.observe();
         self.remember_resolved(native_id.to_owned());
+        // Terminal proof for an active decide is recorded only here, after
+        // the owning commit above succeeded. The helper additionally
+        // requires an exact decider match, so a bound-but-unnamed or
+        // foreign-decider resolution is decisive without being Applied.
+        self.note_decide_resolved(
+            notification.session_id.as_str(),
+            turn_id.as_str(),
+            native_id,
+            notification.decided_by_command_id.as_deref(),
+            bound_to_ours,
+        );
         Ok(())
     }
 
@@ -2296,7 +2416,19 @@ impl EventProcessor {
             prior,
             NativeReplyState::Available | NativeReplyState::Written
         ) {
+            let gap_before = self.gap_snapshot();
             self.commit_offer_update(&refreshed).await?;
+            if self.gap_snapshot() != gap_before {
+                return Ok(());
+            }
+        }
+        if let Some(seq) = refreshed.details.get("offer_seq").and_then(Value::as_i64) {
+            self.note_decide_offer_proof(
+                notification.session_id.as_str(),
+                refreshed.turn_id.as_str(),
+                native_id,
+                seq,
+            );
         }
         Ok(())
     }

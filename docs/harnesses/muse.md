@@ -61,17 +61,25 @@ with the exact ids, an offered choice, and the current requirement. Replies deci
 from the current offer, never a stale snapshot: a stale choice is rejected. A
 genuinely newer multi-stage requirement (same approval, strictly greater source
 index) replaces the in-memory offer, is persisted under the exact pending id with
-normalized `offer_seq`, and resets a consumed reply so the next stage can be
-decided; each Applied approval outcome records `decided_offer_seq`, and the next
+normalized `offer_seq`, and resets a consumed (Written) reply so the next stage can be
+decided; an Unknown reply is never reset nor rearmed. Each Applied approval outcome records `decided_offer_seq`, and the next
 explicit choice is admitted only once the persisted current offer is fresh past
 it. Duplicates and stale offers change nothing; unknown stays fenced. A decide
 control result is qualified against the authoritative view stream before it is
 returned, within the single absolute deadline captured before the write (never
-renewed): Applied only with exact proof — a terminal resolution naming this
+renewed): Applied only with exact proof derived from the owning path's
+successful validation and required persistence — a terminal resolution naming this
 generation's native decide id, or, after a clean admission ack, an offer
-advanced past the decided requirement. Changed offers without admission,
+advanced past the decided requirement that the owning path validated (for
+`approval/request`, the full request validation, so an offer the owning path
+rejects, such as one with no choices, never qualifies) and persisted. A
+rejected frame, a gap, or a failed persistence never qualifies, and no
+pre-parse of a frame counts as proof. Changed offers without admission,
 absent requests, final text, and artifacts alone never qualify; missing or
-mismatched deciders, stream end, and deadline expiry stay unknown. Outcomes
+mismatched deciders, stream end, and deadline expiry stay unknown. An
+admitted-but-unproven decide stays Unknown with both the Core command id and
+the native decide id retained: only a late resolution naming that exact native
+id binds it, otherwise it closes unbound, and it is never replayed. Outcomes
 carry only whitelisted diagnostics: the numeric native error code and the
 resolved-decider present/match booleans. Only
 schema-documented pre-admission/validation errors prove rejection (anything else is
