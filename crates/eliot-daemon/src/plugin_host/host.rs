@@ -1031,13 +1031,17 @@ async fn cleanup_startup(
     child: OwnedChild,
     event_task: &mut tokio::task::JoinHandle<()>,
     pending_failure: &mut Option<PendingFailure>,
+    proven_no_dispatch: bool,
 ) {
     let exited = terminate_child(child, &actor.monitoring, &actor.agent).await;
     // `settle_owned_source_exit` returns Ok only after positive custody exit,
     // completed reader drain, and the committed exit gap (see
     // `settle_drained_source_exit`). This failed-start path never enters the
     // actor loop, so settle the generation lost here: `mark_lost` is a no-op
-    // for terminal or stale generations and fences further dispatch.
+    // for terminal or stale generations and fences further dispatch. A
+    // proven `native_not_dispatched` refusal is excluded: inferring loss
+    // would turn the dispatched start command Unknown before the router
+    // classifies it, discarding the authoritative Rejected outcome.
     let settled = settle_owned_source_exit(
         &actor.state,
         &actor.key,
@@ -1046,7 +1050,7 @@ async fn cleanup_startup(
         "plugin_startup_exit",
     )
     .await;
-    if settled.is_ok() {
+    if settled.is_ok() && !proven_no_dispatch {
         mark_lost_state(&actor.state, &actor.key).await;
     } else if let Err(error) = settled {
         pending_failure.get_or_insert(PendingFailure {
@@ -1070,8 +1074,16 @@ async fn run_agent_inner(
     let source_plan = match initialize_agent(&actor, &client).await {
         Ok(source_plan) => source_plan,
         Err(error) => {
+            let proven_no_dispatch = error.code == "native_not_dispatched";
             let _ = started.send(Err(error));
-            cleanup_startup(&actor, child, &mut event_task, pending_failure).await;
+            cleanup_startup(
+                &actor,
+                child,
+                &mut event_task,
+                pending_failure,
+                proven_no_dispatch,
+            )
+            .await;
             return;
         }
     };
@@ -1108,9 +1120,17 @@ async fn run_agent_inner(
         Err(error) => {
             let error = redact_native_error(error, &actor.source_credentials);
             let uncertain = error.code == "unknown";
+            let proven_no_dispatch = error.code == "native_not_dispatched";
             let _ = started.send(Err(error));
             if !uncertain {
-                cleanup_startup(&actor, child, &mut event_task, pending_failure).await;
+                cleanup_startup(
+                    &actor,
+                    child,
+                    &mut event_task,
+                    pending_failure,
+                    proven_no_dispatch,
+                )
+                .await;
                 return;
             }
         }
