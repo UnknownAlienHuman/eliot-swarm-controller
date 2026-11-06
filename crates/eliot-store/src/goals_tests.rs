@@ -601,9 +601,11 @@ fn goal_generation_drift_pauses_on_probe() {
     store
         .goal_set(&agent, "eliot", &definition("green"), now)
         .unwrap();
+    crate::tests::install_live_custody_observations(&mut store, &agent, 1, now);
     store
         .put_batch(native_batch(&agent, 1, "session.ended", json!({})), now + 1)
         .expect("commit terminal session fact");
+    crate::tests::simulate_normal_stop_proof(&mut store, &agent, 1, now + 1);
     let resume = SubmitCommand {
         id: Ulid::new().to_string(),
         target: Some(agent.clone()),

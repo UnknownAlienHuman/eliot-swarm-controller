@@ -157,6 +157,7 @@ struct AgentActorConfig {
     agent: Agent,
     start_command: Command,
     instance_dir: String,
+    store_root: PathBuf,
     plugin_credential: String,
     target_environment: Value,
     source_credentials: Arc<[String]>,
@@ -492,6 +493,7 @@ impl PluginHost {
             agent: agent.clone(),
             start_command: command.clone(),
             instance_dir: instance_dir.to_string_lossy().into_owned(),
+            store_root: self.state.data_root.join("plugins"),
             plugin_credential: credential.clone(),
             target_environment,
             source_credentials: Arc::clone(&source_credentials),
@@ -981,6 +983,7 @@ async fn initialize_agent(actor: &AgentActorConfig, client: &PluginClient) -> Re
                 "protocol": "eliot-plugin/1",
                 "credential": actor.plugin_credential,
                 "instance_dir": actor.instance_dir,
+                "store_root": actor.store_root,
                 "config": {"harness": actor.agent.harness},
             }),
             deadline(),
@@ -1294,23 +1297,14 @@ async fn run_agent_inner(
                         match cooperative {
                             Ok(result) => {
                                 let guarantee = child.guarantee();
-                                let shutdown = if Instant::now() < deadlines.rpc_until {
-                                    client.call("shutdown", json!({}), deadlines.rpc_deadline(RPC_DEADLINE))
-                                        .await.and_then(validate_shutdown)
-                                } else {
-                                    Err(Error::new("unknown", "stop RPC deadline elapsed before shutdown"))
-                                };
-                                if shutdown.is_ok() {
-                                    let _ = client
-                                        .close_input((Instant::now() + STOP_GRACE).min(deadlines.custody_until))
-                                        .await;
-                                }
-                                let graceful = wait_stop_child(&mut child, &monitoring, &agent, deadlines.custody_until).await;
-                                let mut exited = graceful;
-                                if !exited {
-                                    let _ = child.terminate();
-                                    exited = wait_stop_child(&mut child, &monitoring, &agent, deadlines.custody_until).await;
-                                }
+                                let (graceful, exited) = shutdown_and_wait_child(
+                                    &client,
+                                    &mut child,
+                                    &monitoring,
+                                    &agent,
+                                    deadlines,
+                                )
+                                .await;
                                 if !exited {
                                     drop(child);
                                     let _ = settle_owned_source_exit(
@@ -1423,6 +1417,47 @@ async fn run_agent_inner(
                                         }),
                                         deadlines.rpc_deadline(STOP_GRACE),
                                     ).await;
+                                }
+                                if error.code == "unknown"
+                                    && has_committed_session_ended(&state, &key, deadlines.custody_until).await
+                                {
+                                    // Durable logical End is committed but the stop RPC
+                                    // outcome is unknown. Run the Applied physical
+                                    // sequence so the owning plugin/Job and descendants
+                                    // cannot leak, then return the ORIGINAL unknown:
+                                    // ack uncertainty is separate from physical closure
+                                    // and no Applied is invented.
+                                    let (_, exited) = shutdown_and_wait_child(
+                                        &client,
+                                        &mut child,
+                                        &monitoring,
+                                        &agent,
+                                        deadlines,
+                                    )
+                                    .await;
+                                    if !exited {
+                                        drop(child);
+                                        let _ = settle_owned_source_exit(
+                                            &state, &key, Some(&mut event_task), false,
+                                            "unknown_stop_exit_with_session_terminal",
+                                        ).await;
+                                        if let Some(state) = state.upgrade() {
+                                            fence_runtime_generation(&state, &key);
+                                        }
+                                        planned_exit = true;
+                                        let _ = reply.send(Err(error));
+                                        break;
+                                    }
+                                    let _ = settle_owned_source_exit(
+                                        &state, &key, Some(&mut event_task), true,
+                                        "unknown_stop_exit_with_session_terminal",
+                                    ).await;
+                                    if let Some(state) = state.upgrade() {
+                                        fence_runtime_generation(&state, &key);
+                                    }
+                                    planned_exit = true;
+                                    let _ = reply.send(Err(error));
+                                    break;
                                 }
                                 let _ = reply.send(Err(error));
                             }
@@ -2586,6 +2621,70 @@ async fn terminate_child(mut child: OwnedChild, monitoring: &Monitoring, agent: 
         child.terminate().is_ok() && wait_child(&mut child, STOP_GRACE, monitoring, agent).await;
     drop(child);
     exited
+}
+
+/// True when the Store's current controlled projection proves the captured
+/// generation ended normally: exact generation still current, state exactly
+/// Stopped (committed native session end or applied stop), controlled
+/// authority. Failed/Lost and advanced generations do not count; ack
+/// uncertainty stays separate from this durable logical-End readback.
+/// Terminal settlement revokes the token, so derived own_identity is always
+/// false here and is not checked.
+async fn has_committed_session_ended(
+    state: &Weak<HostState>,
+    key: &AgentKey,
+    until: Instant,
+) -> bool {
+    let Some(host) = state.upgrade() else {
+        return false;
+    };
+    let Ok(store) = timeout_at(until, host.store.lock()).await else {
+        return false;
+    };
+    match store.get_agent(&key.id) {
+        Ok(Some(agent)) => {
+            agent.generation == key.generation
+                && agent.state == eliot_core::AgentState::Stopped
+                && !agent.observe_only
+        }
+        _ => false,
+    }
+}
+
+/// Private shutdown, input close, then graceful wait with one
+/// terminate-and-wait fallback. Returns (graceful, exited); callers settle
+/// sources, fence, and reply. Shared by the Applied path and an ordinary
+/// Unknown stop whose captured generation has durable logical End.
+async fn shutdown_and_wait_child(
+    client: &PluginClient,
+    child: &mut OwnedChild,
+    monitoring: &Monitoring,
+    agent: &Agent,
+    deadlines: StopDeadlines,
+) -> (bool, bool) {
+    let shutdown = if Instant::now() < deadlines.rpc_until {
+        client
+            .call("shutdown", json!({}), deadlines.rpc_deadline(RPC_DEADLINE))
+            .await
+            .and_then(validate_shutdown)
+    } else {
+        Err(Error::new(
+            "unknown",
+            "stop RPC deadline elapsed before shutdown",
+        ))
+    };
+    if shutdown.is_ok() {
+        let _ = client
+            .close_input((Instant::now() + STOP_GRACE).min(deadlines.custody_until))
+            .await;
+    }
+    let graceful = wait_stop_child(child, monitoring, agent, deadlines.custody_until).await;
+    let mut exited = graceful;
+    if !exited {
+        let _ = child.terminate();
+        exited = wait_stop_child(child, monitoring, agent, deadlines.custody_until).await;
+    }
+    (graceful, exited)
 }
 
 fn custody_label(guarantee: crate::platform::CustodyGuarantee) -> &'static str {
@@ -4263,6 +4362,12 @@ mod tests {
         let (host, key, start_id) = source_exit_fixture("codex");
         let (current, sources, token, before) = {
             let mut store = host.state.store.lock().await;
+            crate::test_support::install_live_owned_process_source(
+                &mut store,
+                &key.id,
+                key.generation,
+                now_ms(),
+            );
             for (kind, data) in [
                 (
                     "session.ready",
@@ -4292,6 +4397,14 @@ mod tests {
                     store
                         .settle(&start_id, eliot_core::CommandState::Applied, None, now_ms())
                         .unwrap();
+                }
+                if kind == "session.ended" {
+                    crate::test_support::simulate_owned_process_exit_proof(
+                        &mut store,
+                        &key.id,
+                        key.generation,
+                        now_ms(),
+                    );
                 }
             }
             let resume_id = Ulid::new().to_string();

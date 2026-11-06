@@ -1649,6 +1649,7 @@ fn resolve_command_allows_launch_and_resume_only_as_failed() {
     assert_eq!(command_resolution_source(&store, &launch_id), None);
 
     let agent = ready_agent(&mut store, "resolve-resume-rule", now);
+    crate::tests::install_live_custody_observations(&mut store, &agent, 1, now);
     store
         .put_batch(native_batch(&agent, 1, "session.ended", json!({})), now)
         .expect("commit terminal session fact");
@@ -1671,6 +1672,7 @@ fn resolve_command_allows_launch_and_resume_only_as_failed() {
             [parse_agent_id(&agent).unwrap()],
         )
         .expect("retain a native subject for the stopped Agent");
+    crate::tests::simulate_normal_stop_proof(&mut store, &agent, 1, now);
     let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
     resume.target = Some(agent.clone());
     resume.expected_generation = Some(1);

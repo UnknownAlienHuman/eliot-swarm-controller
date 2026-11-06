@@ -3302,6 +3302,7 @@ mod tests {
         store
             .settle(&launch_id, CommandState::Applied, None, now + 3)
             .unwrap();
+        crate::tests::install_live_custody_observations(store, &agent, 1, now + 3);
         store
             .put_batch(
                 SourceBatch {
@@ -3320,6 +3321,7 @@ mod tests {
                 now + 4,
             )
             .unwrap();
+        crate::tests::simulate_normal_stop_proof(store, &agent, 1, now + 4);
         (agent, native_scope, native_ref)
     }
 

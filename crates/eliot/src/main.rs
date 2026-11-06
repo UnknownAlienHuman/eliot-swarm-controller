@@ -223,6 +223,10 @@ enum CliCommand {
         generation: GenerationArgs,
         #[arg(long, value_name = "REQUEST")]
         request: Option<String>,
+        #[arg(long, value_name = "CHOICE_ID")]
+        choice: Option<String>,
+        #[arg(long, value_name = "FEEDBACK")]
+        feedback: Option<String>,
     },
     /// Deny a pending native request.
     Deny {
@@ -232,6 +236,10 @@ enum CliCommand {
         generation: GenerationArgs,
         #[arg(long, value_name = "REQUEST")]
         request: Option<String>,
+        #[arg(long, value_name = "CHOICE_ID")]
+        choice: Option<String>,
+        #[arg(long, value_name = "FEEDBACK")]
+        feedback: Option<String>,
     },
     /// Answer a pending native question from a bounded JSON file.
     Answer {
@@ -1476,8 +1484,15 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             agent,
             generation: GenerationArgs { generation },
             request,
+            choice,
+            feedback,
         } => {
-            let mut params = submit_request(id, Some(agent), "approve", json!({}))?;
+            let mut params = submit_request(
+                id,
+                Some(agent),
+                "approve",
+                approval_reply_args(choice, feedback),
+            )?;
             params.expected_generation = generation;
             params.request_id = request;
             submit_and_print(&data_dir, &params, json_output).await
@@ -1486,8 +1501,15 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             agent,
             generation: GenerationArgs { generation },
             request,
+            choice,
+            feedback,
         } => {
-            let mut params = submit_request(id, Some(agent), "deny", json!({}))?;
+            let mut params = submit_request(
+                id,
+                Some(agent),
+                "deny",
+                approval_reply_args(choice, feedback),
+            )?;
             params.expected_generation = generation;
             params.request_id = request;
             submit_and_print(&data_dir, &params, json_output).await
@@ -2172,6 +2194,17 @@ fn submit_request(
     Ok(request)
 }
 
+fn approval_reply_args(choice: Option<String>, feedback: Option<String>) -> Value {
+    let mut args = serde_json::Map::new();
+    if let Some(choice) = choice {
+        args.insert("choice_id".to_owned(), Value::String(choice));
+    }
+    if let Some(feedback) = feedback {
+        args.insert("feedback".to_owned(), Value::String(feedback));
+    }
+    Value::Object(args)
+}
+
 async fn submit_command(
     data_dir: &Path,
     params: &SubmitCommand,
@@ -2476,5 +2509,46 @@ fn print_value(value: &Value, json_output: bool) {
         println!("{rendered}");
     } else {
         println!("{value}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_cli_parser_keeps_explicit_choice_and_feedback() {
+        for verb in ["approve", "deny"] {
+            let cli = Cli::try_parse_from([
+                "swarm",
+                verb,
+                "a7",
+                "--generation",
+                "3",
+                "--request",
+                "request-id",
+                "--choice",
+                "always",
+                "--feedback",
+                "trust it",
+            ])
+            .unwrap();
+            let Some(command) = cli.command else {
+                panic!("approve/deny command required");
+            };
+            let (choice, feedback) = match command {
+                CliCommand::Approve {
+                    choice, feedback, ..
+                } => (choice, feedback),
+                CliCommand::Deny {
+                    choice, feedback, ..
+                } => (choice, feedback),
+                _ => panic!("expected an approve or deny command"),
+            };
+            assert_eq!(
+                approval_reply_args(choice, feedback),
+                serde_json::json!({"choice_id": "always", "feedback": "trust it"})
+            );
+        }
     }
 }

@@ -1,7 +1,7 @@
 use crate::{
     events::{EventConfig, EventHandle, EventStatus, TurnFacts},
     native::{
-        HttpOutcome, OpenCodeHttp, OwnedServer, ServerLaunch,
+        AuthSetup, HttpOutcome, IntegrationSelector, OpenCodeHttp, OwnedServer, ServerLaunch,
         types::{InboxUser, ModelRef, SessionInfo},
     },
 };
@@ -12,8 +12,8 @@ use eliot_plugin::{
     session::{
         ResumeSubject, TargetEnvironment, contextual_error, decode, known_command, native_no_write,
         not_initialized, optional_profile_text, parse_resume_subject, paths_equal,
-        register_native_process, target_environment, unknown_snapshot, validate_binding,
-        validate_identity, validate_source_plan,
+        register_native_process, split_provider_model, target_environment, unknown_snapshot,
+        validate_binding, validate_identity, validate_source_plan,
     },
 };
 use serde_json::{Value, json};
@@ -25,6 +25,7 @@ use std::{
 use tokio::{sync::mpsc, time::Instant};
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 const MAX_COMMANDS_PER_GENERATION: usize = 32;
 const RESUME_DRAIN_ROUNDS: usize = 20;
 const RESUME_DRAIN_BEAT: std::time::Duration = std::time::Duration::from_millis(250);
@@ -39,6 +40,7 @@ struct OpenCodePlugin {
 struct Initialized {
     credential: String,
     instance_dir: String,
+    store_root: String,
 }
 
 struct FailedStart {
@@ -53,6 +55,42 @@ enum SessionPhase {
     Ready,
     Unknown,
     Stopped,
+}
+
+/// Static stop-stage class for one unknown error message. Safe by
+/// construction: a fixed literal, never a payload, native error, or secret.
+#[derive(Clone, Copy)]
+enum StopStage {
+    Begin,
+    Quiesce,
+    Retention,
+    Process,
+    EndAck,
+}
+
+impl StopStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Begin => "begin",
+            Self::Quiesce => "quiesce",
+            Self::Retention => "retention",
+            Self::Process => "process",
+            Self::EndAck => "end_ack",
+        }
+    }
+}
+
+fn note_stage(stage: &mut StopStage, next: StopStage) -> StopStage {
+    // This is a function call, so the compiler treats the stage value
+    // as read here; sequential semantic stages advance the same
+    // variable without a dead-assignment lint. The observable value at
+    // the final stage is the furthest semantic step reached.
+    *stage = next;
+    *stage
+}
+
+fn native_io_blocked(session: &AgentSession) -> bool {
+    session.resources_proved_closed || session.stop_end_ack_proved
 }
 
 struct AgentSession {
@@ -71,6 +109,8 @@ struct AgentSession {
     unknown_commands: HashSet<String>,
     rejected_commands: HashSet<String>,
     stop_command_id: Option<String>,
+    resources_proved_closed: bool,
+    stop_end_ack_proved: bool,
     control_bindings: HashMap<String, ControlBinding>,
     control_results: HashMap<String, Value>,
 }
@@ -87,7 +127,8 @@ struct ControlBinding {
 }
 
 /// A start request that passed admission: decoded params plus the validated
-/// frozen profile, workspace, child environment, and redaction secrets.
+/// frozen profile, workspace, child environment, selected native auth
+/// integration, and redaction secrets.
 struct ParsedStart {
     params: AgentStartParams,
     requested_model: String,
@@ -96,9 +137,11 @@ struct ParsedStart {
     workspace: PathBuf,
     program: OsString,
     environment: Vec<(OsString, OsString)>,
+    auth_selector: IntegrationSelector,
     secrets: Vec<String>,
     credential: String,
     instance_dir: String,
+    store_root: String,
     resume: Option<ResumeSubject>,
 }
 
@@ -236,19 +279,24 @@ impl OpenCodePlugin {
     fn initialize(&mut self, raw: &Value) -> Result<Value> {
         let params: InitializeParams =
             decode(raw, "OpenCode plugin initialize params are invalid")?;
+        let store_root = params.store_root.clone().unwrap_or_default();
         if params.protocol != "eliot-plugin/1"
             || params.instance_dir.trim().is_empty()
             || params.credential.trim().is_empty()
             || params.credential.len() > eliot_plugin::protocol::MAX_CREDENTIAL_BYTES
+            || params.store_root.is_none()
+            || !Path::new(&store_root).is_absolute()
+            || store_root.trim().is_empty()
         {
             return Err(Error::new(
                 "invalid",
-                "OpenCode plugin initialize requires protocol, private instance directory, and credential",
+                "OpenCode plugin initialize requires protocol, private instance directory, absolute store root, and credential",
             ));
         }
         if let Some(existing) = &self.initialized {
             if existing.credential != params.credential
                 || existing.instance_dir != params.instance_dir
+                || existing.store_root != store_root
             {
                 return Err(Error::new(
                     "bad_state",
@@ -259,6 +307,7 @@ impl OpenCodePlugin {
             self.initialized = Some(Initialized {
                 credential: params.credential,
                 instance_dir: params.instance_dir,
+                store_root,
             });
         }
         serde_json::to_value(opencode_manifest())
@@ -326,6 +375,7 @@ impl OpenCodePlugin {
             .transpose()?;
         let (requested_model, model_ref) = start_model_ref(profile)?;
         let requested_agent = optional_profile_text(profile, "agent", "OpenCode")?;
+        let auth_selector = start_auth_selector(profile)?;
         let (workspace, program) = start_paths(profile, &params)?;
         let TargetEnvironment {
             variables: environment,
@@ -344,9 +394,11 @@ impl OpenCodePlugin {
             workspace,
             program,
             environment,
+            auth_selector,
             secrets,
             credential: initialized.credential.clone(),
             instance_dir: initialized.instance_dir.clone(),
+            store_root: initialized.store_root.clone(),
             resume,
         })))
     }
@@ -438,11 +490,17 @@ impl OpenCodePlugin {
                 program: parsed.program.clone(),
                 workspace: parsed.workspace.clone(),
                 instance_dir: PathBuf::from(&parsed.instance_dir),
+                store_root: PathBuf::from(&parsed.store_root),
                 agent_id: parsed.params.agent_id.clone(),
                 environment: parsed.environment.clone(),
                 model: parsed.requested_model.clone(),
+                auth: AuthSetup {
+                    selector: parsed.auth_selector.clone(),
+                    reuse_existing: parsed.resume.is_some(),
+                },
             },
             &parsed.secrets,
+            Instant::now() + RPC_TIMEOUT,
         )
         .await
         {
@@ -489,6 +547,8 @@ impl OpenCodePlugin {
             unknown_commands: HashSet::new(),
             rejected_commands: HashSet::new(),
             stop_command_id: None,
+            resources_proved_closed: false,
+            stop_end_ack_proved: false,
             control_bindings: HashMap::new(),
             control_results: HashMap::new(),
         };
@@ -680,24 +740,27 @@ impl OpenCodePlugin {
             .await;
             return Err(self.retain_failed_start(&parsed.params, error));
         }
-        let retained = match Self::resume_read_retained(&session, &resume.native_ref).await {
-            Ok(retained) => retained,
-            Err(error) => return Err(self.fail_resume(&parsed, session, error).await),
-        };
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        let retained =
+            match Self::resume_read_retained(&session, &resume.native_ref, deadline).await {
+                Ok(retained) => retained,
+                Err(error) => return Err(self.fail_resume(&parsed, session, error).await),
+            };
         session.session_id = Some(retained.id.clone());
-        if let Err(error) = Self::resume_quiesce(&session, &retained.id).await {
+        if let Err(error) = Self::resume_quiesce(&session, &retained.id, deadline).await {
             return Err(self.stash_resume_unknown(session, error.message).await);
         }
-        if let Err(error) = Self::resume_verify_idle(&session, &retained.id).await {
+        if let Err(error) = Self::resume_verify_idle(&session, &retained.id, deadline).await {
             return Err(self.stash_resume_unknown(session, error.message).await);
         }
-        let effective = match Self::resume_configure(&parsed, &session, &retained.id).await {
-            Ok(effective) => effective,
-            Err(error) if error.code == "unknown" => {
-                return Err(self.stash_resume_unknown(session, error.message).await);
-            }
-            Err(error) => return Err(self.fail_resume(&parsed, session, error).await),
-        };
+        let effective =
+            match Self::resume_configure(&parsed, &session, &retained.id, deadline).await {
+                Ok(effective) => effective,
+                Err(error) if error.code == "unknown" => {
+                    return Err(self.stash_resume_unknown(session, error.message).await);
+                }
+                Err(error) => return Err(self.fail_resume(&parsed, session, error).await),
+            };
         if let Err(error) = session
             .events
             .resume_ready(
@@ -729,10 +792,13 @@ impl OpenCodePlugin {
     }
 
     /// Resume read: the retained session must still exist under its exact
-    /// id. Proven absence is `not_found` (a stopped generation deleted it —
-    /// there is nothing to resume); anything ambiguous is `unknown`.
-    async fn resume_read_retained(session: &AgentSession, native_ref: &str) -> Result<SessionInfo> {
-        let deadline = Instant::now() + RPC_TIMEOUT;
+    /// id. Proven absence is `not_found` (the retained session no longer exists
+    /// in the store — there is nothing to resume); anything ambiguous is `unknown`.
+    async fn resume_read_retained(
+        session: &AgentSession,
+        native_ref: &str,
+        deadline: Instant,
+    ) -> Result<SessionInfo> {
         let absent = session
             .http
             .session_absent(native_ref, deadline)
@@ -780,12 +846,12 @@ impl OpenCodePlugin {
     /// leg poll; anything else refuses the resume as unknown. The native
     /// idle proof is this interrupt plus the empty inbox/permission/form
     /// lists, not served history.
-    async fn resume_quiesce(session: &AgentSession, session_id: &str) -> Result<()> {
-        let interrupted = match session
-            .http
-            .interrupt(session_id, Instant::now() + RPC_TIMEOUT)
-            .await
-        {
+    async fn resume_quiesce(
+        session: &AgentSession,
+        session_id: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        let interrupted = match session.http.interrupt(session_id, deadline).await {
             Ok(interrupted) => interrupted,
             Err(outcome) => {
                 let reason = match outcome {
@@ -805,14 +871,10 @@ impl OpenCodePlugin {
         }
         for _ in 0..RESUME_DRAIN_ROUNDS {
             tokio::time::sleep(RESUME_DRAIN_BEAT).await;
-            if !Self::resume_legs_quiet(session, session_id).await? {
+            if !Self::resume_legs_quiet(session, session_id, deadline).await? {
                 continue;
             }
-            match session
-                .http
-                .interrupt(session_id, Instant::now() + RPC_TIMEOUT)
-                .await
-            {
+            match session.http.interrupt(session_id, deadline).await {
                 Ok(false) => return Ok(()),
                 Ok(true) => continue,
                 Err(outcome) => {
@@ -838,8 +900,13 @@ impl OpenCodePlugin {
     /// Resume idle legs: the inbox, permission and form lists must all be
     /// empty. Anything pending means a retained execution that this
     /// generation must not adopt.
-    async fn resume_verify_idle(session: &AgentSession, session_id: &str) -> Result<()> {
-        let (inbox, permissions, forms) = Self::resume_leg_counts(session, session_id).await?;
+    async fn resume_verify_idle(
+        session: &AgentSession,
+        session_id: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        let (inbox, permissions, forms) =
+            Self::resume_leg_counts(session, session_id, deadline).await?;
         if inbox > 0 {
             return Err(Error::new(
                 "unknown",
@@ -862,8 +929,13 @@ impl OpenCodePlugin {
     }
 
     /// Await-helper for the quiesce drain: all three legs quiet.
-    async fn resume_legs_quiet(session: &AgentSession, session_id: &str) -> Result<bool> {
-        let (inbox, permissions, forms) = Self::resume_leg_counts(session, session_id).await?;
+    async fn resume_legs_quiet(
+        session: &AgentSession,
+        session_id: &str,
+        deadline: Instant,
+    ) -> Result<bool> {
+        let (inbox, permissions, forms) =
+            Self::resume_leg_counts(session, session_id, deadline).await?;
         Ok(inbox == 0 && permissions == 0 && forms == 0)
     }
 
@@ -872,8 +944,8 @@ impl OpenCodePlugin {
     async fn resume_leg_counts(
         session: &AgentSession,
         session_id: &str,
+        deadline: Instant,
     ) -> Result<(usize, usize, usize)> {
-        let deadline = Instant::now() + RPC_TIMEOUT;
         let inbox = session
             .http
             .list_inbox(session_id, deadline)
@@ -924,8 +996,8 @@ impl OpenCodePlugin {
         parsed: &ParsedStart,
         session: &AgentSession,
         session_id: &str,
+        deadline: Instant,
     ) -> Result<Value> {
-        let deadline = Instant::now() + RPC_TIMEOUT;
         let current = session
             .http
             .get_session(session_id, deadline)
@@ -1154,7 +1226,7 @@ impl OpenCodePlugin {
             params.generation,
             "OpenCode",
         )?;
-        if session.phase != SessionPhase::Ready {
+        if session.phase != SessionPhase::Ready || native_io_blocked(session) {
             return Err(Error::new(
                 "unknown",
                 "OpenCode session or event source outcome is unresolved",
@@ -1365,7 +1437,7 @@ impl OpenCodePlugin {
             params.generation,
             "OpenCode",
         )?;
-        if session.phase != SessionPhase::Ready {
+        if session.phase != SessionPhase::Ready || native_io_blocked(session) {
             return Err(Error::new(
                 "unknown",
                 "OpenCode session or event source outcome is unresolved",
@@ -1504,7 +1576,7 @@ impl OpenCodePlugin {
             params.generation,
             "OpenCode",
         )?;
-        if session.phase != SessionPhase::Ready {
+        if session.phase != SessionPhase::Ready || native_io_blocked(session) {
             return Err(Error::new(
                 "unknown",
                 "OpenCode session or event source outcome is unresolved",
@@ -1678,6 +1750,15 @@ impl OpenCodePlugin {
         };
         if let Some(receipt) = Self::snapshot_stop_receipt(session, &params, &event_status) {
             return Ok(receipt);
+        }
+        if native_io_blocked(session) {
+            // Closed resources block new native I/O regardless of the last
+            // semantic phase; an Unknown-phase session with a proved exit
+            // never gets a readback/reply/interrupt write after closure.
+            return unknown_snapshot(
+                &params,
+                "OpenCode native resources are closed; native readback is unavailable",
+            );
         }
         let request = match Self::resolve_snapshot_request(session, &params, &event_status) {
             Ok(request) => request,
@@ -1882,7 +1963,10 @@ impl OpenCodePlugin {
 
     async fn shutdown(&mut self) -> Result<Value> {
         if let Some(session) = self.session.as_mut() {
-            if session.phase != SessionPhase::Stopped {
+            // Shutdown with proved resource closure ends the owned path
+            // without replaying native interrupt/GET or a blind End. An
+            // already-acked End is likewise never repeated.
+            if session.phase != SessionPhase::Stopped && !session.resources_proved_closed {
                 terminate_session(session, true).await?;
             }
             session.events.close().await;
@@ -1892,12 +1976,30 @@ impl OpenCodePlugin {
 
     async fn shutdown_owned(&mut self) {
         if let Some(session) = self.session.as_mut() {
-            if session.phase != SessionPhase::Stopped {
+            if session.phase != SessionPhase::Stopped && !session.resources_proved_closed {
                 let _ = terminate_session(session, true).await;
             }
             session.events.close().await;
         }
     }
+}
+
+/// The frozen profile auth selector: the one explicitly selected native
+/// integration (ID or name) whose canonical credential the pre-serve
+/// transfer prepares. Required and nonsecret; the capacity-only account
+/// field is never consulted for authentication.
+fn start_auth_selector(profile: &serde_json::Map<String, Value>) -> Result<IntegrationSelector> {
+    let raw = profile
+        .get("auth_integration")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "profile_error",
+                "OpenCode profile requires an explicit auth_integration selector",
+            )
+        })?;
+    IntegrationSelector::new(raw).map_err(|error| error.with_code("profile_error"))
 }
 
 /// The frozen profile model: an exact `provider/id` selection plus its
@@ -1917,7 +2019,7 @@ fn start_model_ref(profile: &serde_json::Map<String, Value>) -> Result<(String, 
     let model_ref = split_model(&requested_model).ok_or_else(|| {
         Error::new(
             "profile_error",
-            "OpenCode profile model must be provider/model",
+            "OpenCode profile model must be provider/model with non-empty slash segments and no variant suffix",
         )
     })?;
     Ok((requested_model, model_ref))
@@ -1959,34 +2061,74 @@ fn start_paths(
     Ok((workspace, program))
 }
 
-/// Stop proves the native session ended, then ends the owned server:
-/// `DELETE /api/session/{id}` (204 removed, 404 already gone) followed by
-/// a `GET` that must 404. Only the readback decides: proven absent
-/// applies, proven present never does, and an ambiguous readback is
-/// unknown.
+/// Stop quiesces the native session and ends the owned server while
+/// retaining the native session for resume. Ordinary stop never deletes
+/// the session; it quiesces any running execution with the same native
+/// interrupt the resume preflight uses, proves the exact session still
+/// exists by readback, then ends the owned server through generation
+/// process custody. Proven retained applies; proven absent or any
+/// ambiguous readback is unknown. Force ends the owned server without
+/// the quiesce wait and never touches another Agent.
 async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()> {
     let deadline = Instant::now() + RPC_TIMEOUT;
-    let begin = session.events.begin_stop().await;
-    let mut removed = begin.is_ok();
-    if removed && let Some(session_id) = session.session_id.clone() {
-        // Only a proven end state ends the generation. The close write
-        // always goes out, but only the readback decides: proven absent
-        // applies, proven present never does, an ambiguous readback is
-        // unknown.
-        let _ = session.http.delete_session(&session_id, deadline).await;
-        let absent = session.http.session_absent(&session_id, deadline).await;
-        removed = match absent {
-            Ok(true) => true,
-            Ok(false) | Err(_) => false,
-        };
+    // A semantic quiesce/retention failure never skips the bounded
+    // owned-resource cleanup below. The semantic error is preserved
+    // separately, then processed closure and End run without replaying
+    // the unknown effects above. Any error leaves phase Unknown.
+    let mut stage = StopStage::Begin;
+    let _ = note_stage(&mut stage, StopStage::Begin);
+    let mut semantic_error = false;
+    if session.events.begin_stop().await.is_err() {
+        semantic_error = true;
+    } else {
+        let _ = note_stage(&mut stage, StopStage::Quiesce);
+        if !force && let Some(session_id) = session.session_id.clone() {
+            if OpenCodePlugin::resume_quiesce(session, &session_id, deadline)
+                .await
+                .is_err()
+            {
+                semantic_error = true;
+            } else {
+                let _ = note_stage(&mut stage, StopStage::Retention);
+                let retained = match session.http.get_session(&session_id, deadline).await {
+                    Ok(info) => info.id == session_id,
+                    Err(_) => false,
+                };
+                if !retained {
+                    semantic_error = true;
+                }
+            }
+        }
     }
-    let process_exit = session.server.terminate(force, deadline).await;
-    let ended = session.events.end_stop().await;
-    if !removed || process_exit.is_err() || ended.is_err() {
+    let _ = note_stage(&mut stage, StopStage::Process);
+    let process_exit = session.server.terminate_leader(force, deadline).await;
+    if process_exit.is_ok() {
+        session.resources_proved_closed = true;
+    }
+    // End is attempted only when the process-exit proof binds closure.
+    let _ = note_stage(&mut stage, StopStage::EndAck);
+    let ended = if process_exit.is_ok() {
+        Some(session.events.end_stop().await)
+    } else {
+        None
+    };
+    if ended.as_ref().is_some_and(|result| result.is_ok()) {
+        session.stop_end_ack_proved = true;
+    }
+    if process_exit.is_ok() {
+        session.server.finish_diagnostics(deadline).await;
+    }
+    if semantic_error
+        || process_exit.is_err()
+        || ended.as_ref().is_none_or(|result| result.is_err())
+    {
         session.phase = SessionPhase::Unknown;
         return Err(Error::new(
             "unknown",
-            "OpenCode session close, server shutdown, or session.ended outcome is unknown",
+            format!(
+                "OpenCode stop outcome is unknown at stage {}",
+                stage.as_str()
+            ),
         ));
     }
     session.phase = SessionPhase::Stopped;
@@ -2007,12 +2149,9 @@ async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error
     session.server.diagnostic_error(error)
 }
 
-/// Installed model-id syntax is `providerID/id`, slashes included.
+/// The first slash separates `providerID`; the full remaining id stays intact.
 fn split_model(model: &str) -> Option<ModelRef> {
-    let (provider_id, id) = model.split_once('/')?;
-    if provider_id.trim().is_empty() || id.trim().is_empty() || id.contains('/') {
-        return None;
-    }
+    let (provider_id, id) = split_provider_model(model)?;
     Some(ModelRef {
         id: id.to_owned(),
         provider_id: provider_id.to_owned(),
@@ -2073,7 +2212,7 @@ fn opencode_manifest() -> PluginManifest {
 
 #[cfg(test)]
 mod tests {
-    use super::{opencode_manifest, opencode_scope, split_model};
+    use super::{opencode_manifest, opencode_scope, split_model, start_model_ref};
     use eliot_core::{AgentStartParams, Result};
     use eliot_plugin::session::{
         ResumeSubject, optional_profile_text, parse_resume_subject, validate_source_plan,
@@ -2145,8 +2284,52 @@ mod tests {
         let model = split_model("opencode/big-pickle").expect("slash form");
         assert_eq!(model.provider_id, "opencode");
         assert_eq!(model.id, "big-pickle");
-        for bad in ["", "noprovider", "/noid", "provider/", "a/b/c", "/"] {
+        for bad in ["", "noprovider", "/noid", "provider/", "a//b", "/"] {
             assert!(split_model(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn profile_model_preserves_nested_native_id_and_unmapped_variant_selection() {
+        let requested = "openrouter/stealth/crouton-alpha";
+        let profile = json!({"model":requested});
+        let (frozen, model) = start_model_ref(profile.as_object().unwrap()).unwrap();
+        assert_eq!(frozen, requested);
+        assert_eq!(model.provider_id, "openrouter");
+        assert_eq!(model.id, "stealth/crouton-alpha");
+        assert_eq!(model.variant, None);
+        assert_eq!(
+            serde_json::to_value(&model).unwrap(),
+            json!({"providerID":"openrouter", "id":"stealth/crouton-alpha"})
+        );
+        assert_eq!(format!("{}/{}", model.provider_id, model.id), requested);
+        for malformed in [
+            "",
+            "noprovider",
+            "/model",
+            "openrouter/",
+            "openrouter//model",
+            "openrouter/stealth/",
+            "openrouter/stealth//crouton-alpha",
+            "openrouter\\stealth\\crouton-alpha",
+            "openrouter/stealth\\crouton-alpha",
+            "open#router/model",
+            "openrouter/model#",
+            "openrouter/model#default",
+            "openrouter/model##default",
+            "openrouter/model\n",
+            "\topenrouter/model",
+            "openrouter/stealth/ model",
+            "openrouter/stealth/\0model",
+        ] {
+            let profile = json!({"model":malformed});
+            assert_eq!(
+                start_model_ref(profile.as_object().unwrap())
+                    .unwrap_err()
+                    .code,
+                "profile_error",
+                "{malformed:?}"
+            );
         }
     }
 

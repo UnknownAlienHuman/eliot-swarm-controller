@@ -13,6 +13,7 @@
 //! native-store selector inputs are captured before admission; all other values
 //! remain execution-time references and are never copied into the snapshot.
 use eliot_core as core;
+use eliot_plugin::session::split_provider_model;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -25,6 +26,7 @@ const MAX_PROFILES: usize = 256;
 const MAX_PROJECT_PATH_LEN: usize = 4096;
 const MAX_MODEL_LEN: usize = 256;
 const MAX_EFFORT_LEN: usize = 128;
+const MAX_AUTH_INTEGRATION_LEN: usize = 128;
 const MAX_CMD_LEN: usize = 1024;
 const MAX_ENV_NAME_LEN: usize = 256;
 const MAX_PASS_ENV_ENTRIES: usize = 64;
@@ -364,6 +366,8 @@ struct ProfileEntry {
     permissions: Option<String>,
     #[serde(default)]
     approval_policy: Option<String>,
+    #[serde(default)]
+    auth_integration: Option<String>,
     #[serde(default)]
     mode: Option<String>,
     #[serde(default)]
@@ -951,6 +955,7 @@ fn snapshot_from_entry(
             || entry.approval.is_some()
             || entry.mode.is_some()
             || entry.dangerously_skip_permissions.is_some()
+            || entry.auth_integration.is_some()
             || entry.pass_env.is_some()
             || !entry.setup.is_empty()
             || entry.scratch != default_scratch()
@@ -1073,6 +1078,16 @@ fn snapshot_from_entry(
             name,
             "mode",
             "mode and dangerously_skip_permissions have no Codex mapping",
+            "unsupported",
+        ));
+    }
+    if entry.auth_integration.is_some() {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "auth_integration",
+            "auth_integration has no Codex mapping",
             "unsupported",
         ));
     }
@@ -1346,6 +1361,16 @@ fn muse_snapshot_from_entry(
             "unsupported",
         ));
     }
+    if entry.auth_integration.is_some() {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "auth_integration",
+            "the Muse slice has no mapping for this preset",
+            "unsupported",
+        ));
+    }
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("muse".to_owned()));
@@ -1486,6 +1511,16 @@ fn claude_snapshot_from_entry(
             "unsupported",
         ));
     }
+    if entry.auth_integration.is_some() {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "auth_integration",
+            "the Claude slice has no mapping for this preset",
+            "unsupported",
+        ));
+    }
     let pass_env = match entry.pass_env.as_deref() {
         Some(names) => validate_pass_env(name, names, source, table_offset)?,
         None => Vec::new(),
@@ -1564,11 +1599,14 @@ fn claude_snapshot_from_entry(
 }
 
 /// Freeze an OpenCode profile. The L6.2 PR1 slice carries an explicit model
-/// id in the installed `provider/model` slash form and a required explicit
+/// id in the installed `provider/model` form (split at the first slash) and a required explicit
 /// native `cmd` (the Muse treatment: stop and process registration address
 /// the exact spawned PID, so `.cmd`/`.bat`/`.ps1` wrappers are rejected).
-/// Effort, approval, collaboration, permission and approval-policy presets
-/// have no OpenCode mapping and stay rejected until one lands.
+/// An optional nonsecret `auth_integration` names the one native integration
+/// whose canonical credential the pre-serve transfer prepares; the plugin
+/// requires it at admission. Effort, approval, collaboration, permission and
+/// approval-policy presets have no OpenCode mapping and stay rejected until
+/// one lands.
 fn opencode_snapshot_from_entry(
     name: &str,
     entry: &ProfileEntry,
@@ -1578,7 +1616,6 @@ fn opencode_snapshot_from_entry(
     let model = entry
         .model
         .as_deref()
-        .map(str::trim)
         .filter(|model| !model.is_empty())
         .ok_or_else(|| {
             profile_field_error(
@@ -1591,17 +1628,13 @@ fn opencode_snapshot_from_entry(
             )
         })?;
     validate_model(name, model, source, table_offset)?;
-    let slash = model.split('/').count() == 2
-        && !model.starts_with('/')
-        && !model.ends_with('/')
-        && !model.contains("//");
-    if !slash {
+    if split_provider_model(model).is_none() {
         return Err(profile_field_error(
             source,
             table_offset,
             name,
             "model",
-            "must be provider/model in the installed model-id syntax",
+            "must be provider/model with non-empty slash segments and no variant suffix",
             "profile_error",
         ));
     }
@@ -1640,10 +1673,33 @@ fn opencode_snapshot_from_entry(
             "unsupported",
         ));
     }
+    if let Some(selector) = entry.auth_integration.as_deref() {
+        let trimmed = selector.trim();
+        if trimmed.is_empty()
+            || trimmed.len() > MAX_AUTH_INTEGRATION_LEN
+            || trimmed.starts_with('-')
+            || trimmed.chars().any(|value| value.is_control())
+        {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                "auth_integration",
+                "must be a non-empty integration ID or name of at most 128 bytes with no control characters and no leading dash",
+                "profile_error",
+            ));
+        }
+    }
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("opencode".to_owned()));
     snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    if let Some(selector) = entry.auth_integration.as_deref() {
+        snapshot.insert(
+            "auth_integration".to_owned(),
+            Value::String(selector.trim().to_owned()),
+        );
+    }
     insert_control(
         &mut snapshot,
         name,
@@ -1728,6 +1784,16 @@ fn antigravity_snapshot_from_entry(
                 "unsupported",
             ));
         }
+    }
+    if entry.auth_integration.is_some() {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "auth_integration",
+            "the Antigravity slice has no mapping for this preset",
+            "unsupported",
+        ));
     }
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
@@ -3546,8 +3612,8 @@ pass_env = ["OPENAI_API_KEY"]
         let snapshot = resolve_text_profile(&source, "oc").unwrap();
         assert_eq!(snapshot["control"], "tree");
 
-        // The installed model-id syntax is provider/model, slashes included.
-        for model in ["big-pickle", "/big-pickle", "opencode/", "a/b/c", ""] {
+        // The first slash separates the provider; empty segments are invalid.
+        for model in ["big-pickle", "/big-pickle", "opencode/", "a//b", ""] {
             let source = format!(
                 "[profiles.oc]\nharness='opencode'\nmodel='{model}'\ncmd='C:/Tools/opencode.exe'\n"
             );
@@ -3579,6 +3645,43 @@ pass_env = ["OPENAI_API_KEY"]
         ] {
             let error = resolve_text_profile(source, "oc").expect_err("must reject");
             assert_eq!(error.code, "profile_error", "{source}");
+        }
+    }
+
+    #[test]
+    fn opencode_profile_keeps_nested_catalog_model_and_rejects_invalid_separators() {
+        let model = "openrouter/stealth/crouton-alpha";
+        let source = format!(
+            "[profiles.oc]\nharness='opencode'\nmodel='{model}'\ncmd='C:/Tools/opencode.exe'\n"
+        );
+        let snapshot = resolve_text_profile(&source, "oc").expect("exact native catalog model");
+        assert_eq!(snapshot["model"], model);
+        for model in [
+            "openrouter//crouton-alpha",
+            "openrouter/stealth//crouton-alpha",
+            "openrouter/stealth/",
+            "openrouter\\stealth\\crouton-alpha",
+            "openrouter/stealth\\crouton-alpha",
+            "open#router/stealth/crouton-alpha",
+            "openrouter/stealth/crouton-alpha#",
+            "openrouter/stealth/crouton-alpha#default",
+            "openrouter/stealth/crouton-alpha##default",
+            "openrouter/stealth/crouton-alpha\n",
+            "\topenrouter/stealth/crouton-alpha",
+            "openrouter/stealth/ crouton-alpha",
+            "openrouter/stealth/\0crouton-alpha",
+        ] {
+            let model_literal = serde_json::to_string(model).unwrap();
+            let source = format!(
+                "[profiles.oc]\nharness='opencode'\nmodel={model_literal}\ncmd='C:/Tools/opencode.exe'\n"
+            );
+            assert_eq!(
+                resolve_text_profile(&source, "oc")
+                    .expect_err("invalid or unmapped model syntax")
+                    .code,
+                "profile_error",
+                "{model:?}"
+            );
         }
     }
 

@@ -84,7 +84,7 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 
 | Method | Essential fields | Meaning |
 | --- | --- | --- |
-| `initialize` | protocol, frozen plugin config, private instance directory | return actual manifest |
+| `initialize` | protocol, frozen plugin config, private instance directory, optional `store_root` (required by OpenCode) | return actual manifest |
 | `agent.start` | agent/generation, profile, workspace, target environment, note, source plan/state, optional resume subject/linked initial input | establish session; input/result settle separately |
 | `agent.command` | agent/generation, command id, verb/args, exact turn/request where required, optional dispatch_seq | applied/rejected/failed/unknown, native mechanism and application point |
 | `agent.stop` | agent/generation, command id, force | success means the bound controlled session/generation ended, not merely that observation detached |

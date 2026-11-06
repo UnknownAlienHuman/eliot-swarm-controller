@@ -7,8 +7,8 @@ use eliot_core::api::{
 };
 use eliot_core::{
     AgentState, CommandState, EventCause, NativeEvent, NativeStoreBinding, ProcessIdentity,
-    ProcessRecord, ProviderHoldState, ProviderRestrictionKind, SourceBatch, SourceGap,
-    SubmitCommand, TurnState,
+    ProcessRecord, ProcessState, ProviderHoldState, ProviderRestrictionKind, SourceBatch,
+    SourceGap, SubmitCommand, TurnState,
 };
 use eliot_core::{
     WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparationInput,
@@ -497,6 +497,85 @@ fn ready_capacity_agent(store: &mut Store, project: &str, now: i64) -> (String, 
     (agent, launch_id)
 }
 
+/// Simulated owned-plugin identity for capacity fixtures: clearly synthetic,
+/// unique per (agent, generation) within a Store, and stable across the
+/// running-to-exited lifecycle of one generation so observations upsert
+/// instead of conflicting.
+fn simulated_plugin_identity(agent: &str, generation: i64) -> ProcessIdentity {
+    ProcessIdentity {
+        host_boot_id: format!("simulated-os-{agent}"),
+        pid: 81001,
+        start_time: u64::try_from(generation).expect("positive fixture generation"),
+    }
+}
+
+/// Install OS process ownership and the running owned-plugin observation
+/// while the generation is live. Fixture counterpart of daemon spawn plus
+/// monitor observation; must precede the terminal session fact because the
+/// live guard rejects installs on terminal generations.
+pub(crate) fn install_live_custody_observations(
+    store: &mut Store,
+    agent: &str,
+    generation: i64,
+    now: i64,
+) {
+    store
+        .ensure_process_source(agent, generation, now)
+        .expect("install OS process source while live");
+    store
+        .observe_processes(
+            agent,
+            generation,
+            &[ProcessRecord {
+                identity: simulated_plugin_identity(agent, generation),
+                owner: format!("agent:{agent}#{generation}"),
+                role: "plugin".to_owned(),
+                state: ProcessState::Running,
+                exit_code: None,
+                updated_at: now,
+            }],
+            now,
+        )
+        .expect("observe running owned plugin");
+}
+
+/// Complete the owned-exit proof after the terminal fact, in host order:
+/// the owned plugin's exit observation, native source drain/closure, OS
+/// source closure, then the owned-control-exit record that releases the
+/// reservation through the existing gate. Idempotent: already-closed
+/// sources are kept closed and recorded exits are kept, never reopened.
+pub(crate) fn simulate_normal_stop_proof(
+    store: &mut Store,
+    agent: &str,
+    generation: i64,
+    now: i64,
+) {
+    store
+        .observe_processes(
+            agent,
+            generation,
+            &[ProcessRecord {
+                identity: simulated_plugin_identity(agent, generation),
+                owner: format!("agent:{agent}#{generation}"),
+                role: "plugin".to_owned(),
+                state: ProcessState::Exited,
+                exit_code: Some(0),
+                updated_at: now,
+            }],
+            now,
+        )
+        .expect("observe owned plugin exit");
+    store
+        .close_native_sources(agent, generation, now)
+        .expect("close drained native sources");
+    store
+        .set_process_source_status(agent, generation, "ok", true, now)
+        .expect("close OS process source after exit");
+    store
+        .record_owned_control_exit(agent, generation, now)
+        .expect("record owned control exit proof");
+}
+
 #[test]
 fn project_command_binding_is_captured_and_revalidated_before_dispatch() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
@@ -814,6 +893,7 @@ fn project_stop_cannot_cancel_a_new_workspace_generation_after_dispatch_admissio
     store
         .settle(&launch_id, CommandState::Applied, None, now + 4)
         .expect("settle launch");
+    install_live_custody_observations(&mut store, &agent, 1, now + 4);
     store
         .put_batch(
             SourceBatch {
@@ -832,6 +912,7 @@ fn project_stop_cannot_cancel_a_new_workspace_generation_after_dispatch_admissio
             now + 5,
         )
         .expect("commit terminal session fact");
+    simulate_normal_stop_proof(&mut store, &agent, 1, now + 5);
     assert_eq!(
         store
             .get_agent(&agent)
@@ -1158,6 +1239,7 @@ fn history_project_rule_send_rejects_rebinding_old_event_to_current_generation()
         "no-match cursor writes are silent"
     );
 
+    install_live_custody_observations(&mut store, &agent, 1, now + 9);
     store
         .put_batch(
             SourceBatch {
@@ -1176,6 +1258,7 @@ fn history_project_rule_send_rejects_rebinding_old_event_to_current_generation()
             now + 10,
         )
         .expect("commit generation-1 terminal session fact");
+    simulate_normal_stop_proof(&mut store, &agent, 1, now + 10);
     let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
     resume.target = Some(agent.clone());
     resume.expected_generation = Some(1);
@@ -1335,6 +1418,7 @@ fn project_resume_rules_use_retained_binding_for_live_and_history_and_require_se
         .ensure_rule_state(&principal, &no_send_rule, now + 23)
         .expect("seed send-grant Project rule before its event");
 
+    install_live_custody_observations(&mut store, &live_agent, 1, now + 23);
     let live_ended = store
         .put_batch(
             SourceBatch {
@@ -1359,6 +1443,8 @@ fn project_resume_rules_use_retained_binding_for_live_and_history_and_require_se
         .find(|event| event.kind == "session.ended")
         .expect("persist live Project event")
         .seq;
+    simulate_normal_stop_proof(&mut store, &live_agent, 1, now + 24);
+    install_live_custody_observations(&mut store, &history_agent, 1, now + 24);
     let history_ended = store
         .put_batch(
             SourceBatch {
@@ -1383,6 +1469,7 @@ fn project_resume_rules_use_retained_binding_for_live_and_history_and_require_se
         .find(|event| event.kind == "session.ended")
         .expect("persist history Project event")
         .seq;
+    simulate_normal_stop_proof(&mut store, &history_agent, 1, now + 25);
     let history_state = store
         .ensure_rule_state(&principal, &history_rule, now + 26)
         .expect("seed history Project cursor after its captured events");
@@ -2829,6 +2916,7 @@ fn session_end_keeps_dispatched_stop_pending_until_exact_reply() {
         )
         .expect("admit stop");
     store.dispatch(&stop_id, now + 1).expect("dispatch stop");
+    install_live_custody_observations(&mut store, &agent, 1, now + 1);
 
     store
         .put_batch(
@@ -2848,6 +2936,7 @@ fn session_end_keeps_dispatched_stop_pending_until_exact_reply() {
             now + 2,
         )
         .expect("commit authoritative session end");
+    simulate_normal_stop_proof(&mut store, &agent, 1, now + 2);
 
     assert_eq!(
         store
@@ -2955,6 +3044,7 @@ fn resume_dispatch_rechecks_a_stop_that_becomes_dispatched_after_admission() {
             ],
         )
         .expect("retain a native subject for resume");
+    install_live_custody_observations(&mut store, &agent, 1, now);
     store
         .put_batch(
             SourceBatch {
@@ -2973,6 +3063,7 @@ fn resume_dispatch_rechecks_a_stop_that_becomes_dispatched_after_admission() {
             now + 1,
         )
         .expect("commit terminal session fact");
+    simulate_normal_stop_proof(&mut store, &agent, 1, now + 1);
 
     let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
     stop.target = Some(agent.clone());
@@ -5595,7 +5686,11 @@ fn native_store_binding_commits_without_changing_admitted_input_or_retry_binding
                 now + 3,
             )
             .unwrap();
+        if kind == "session.ready" {
+            install_live_custody_observations(&mut store, id, 1, now + 3);
+        }
     }
+    simulate_normal_stop_proof(&mut store, id, 1, now + 3);
     let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
     resume.target = Some(id.to_owned());
     resume.expected_generation = Some(1);
@@ -6317,6 +6412,9 @@ fn pending_plain_workspace_resume_reserves_next_generation_and_stale_exit_cannot
             now + 3,
         )
         .expect("commit terminal session fact");
+    store
+        .record_owned_control_exit(&agent, 1, now + 3)
+        .expect("record owned control exit proof");
     assert_eq!(capacity_generation(&store, &agent), None);
 
     let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
@@ -6381,6 +6479,7 @@ fn managed_workspace_resume_rejection_restores_ready_after_project_revocation() 
     store
         .upsert_project_registration("owner", &registration, now + 5)
         .expect("grant Project resume and linked input");
+    install_live_custody_observations(&mut store, &agent, 1, now + 5);
     store
         .put_batch(
             SourceBatch {
@@ -6399,6 +6498,7 @@ fn managed_workspace_resume_rejection_restores_ready_after_project_revocation() 
             now + 6,
         )
         .expect("commit retained terminal session fact");
+    simulate_normal_stop_proof(&mut store, &agent, 1, now + 6);
     let old_agent = store.get_agent(&agent).unwrap().unwrap();
     assert_eq!(old_agent.generation, 1);
     assert_eq!(old_agent.state, AgentState::Stopped);
@@ -6529,6 +6629,7 @@ fn managed_catch_up_resume_sibling_cancellation_restores_for_retry() {
         ready_managed_codex_agent(&mut store, checkout, "resume-sibling-second", now + 10);
     let first_prior_workspace = store.get_workspace(&first_agent).unwrap().unwrap();
     let second_prior_workspace = store.get_workspace(&second_agent).unwrap().unwrap();
+    install_live_custody_observations(&mut store, &first_agent, 1, now + 10);
     let first_end = store
         .put_batch(
             SourceBatch {
@@ -6553,6 +6654,8 @@ fn managed_catch_up_resume_sibling_cancellation_restores_for_retry() {
         .find(|event| event.kind == "session.ended")
         .expect("first terminal event")
         .seq;
+    simulate_normal_stop_proof(&mut store, &first_agent, 1, now + 20);
+    install_live_custody_observations(&mut store, &second_agent, 1, now + 20);
     let second_end = store
         .put_batch(
             SourceBatch {
@@ -6577,6 +6680,7 @@ fn managed_catch_up_resume_sibling_cancellation_restores_for_retry() {
         .find(|event| event.kind == "session.ended")
         .expect("second terminal event")
         .seq;
+    simulate_normal_stop_proof(&mut store, &second_agent, 1, now + 20);
     let state = store
         .ensure_rule_state("owner", &rule, now + 21)
         .expect("capture both history events");
@@ -6714,6 +6818,7 @@ fn ready_retained_resume_unknown_is_typed_and_dispatched_winner_is_refused() {
             "ready-resume-unknown-profile",
             now,
         );
+        install_live_custody_observations(&mut store, &agent, 1, now + 4);
         store
             .put_batch(
                 SourceBatch {
@@ -6732,6 +6837,7 @@ fn ready_retained_resume_unknown_is_typed_and_dispatched_winner_is_refused() {
                 now + 5,
             )
             .expect("commit retained terminal fact");
+        simulate_normal_stop_proof(&mut store, &agent, 1, now + 5);
         let old_agent = store.get_agent(&agent).unwrap().unwrap();
         let prior_workspace = store.get_workspace(&agent).unwrap().unwrap();
         let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
@@ -6827,6 +6933,7 @@ fn ready_retained_resume_unknown_is_typed_and_dispatched_winner_is_refused() {
             "resume-winner-dispatched-profile",
             now,
         );
+        install_live_custody_observations(&mut store, &agent, 1, now + 4);
         store
             .put_batch(
                 SourceBatch {
@@ -6845,6 +6952,7 @@ fn ready_retained_resume_unknown_is_typed_and_dispatched_winner_is_refused() {
                 now + 5,
             )
             .expect("commit retained terminal fact");
+        simulate_normal_stop_proof(&mut store, &agent, 1, now + 5);
         let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
         resume.target = Some(agent.clone());
         resume.expected_generation = Some(1);
@@ -6930,6 +7038,7 @@ fn confirmed_managed_resume_stop_restores_ready_and_allows_retry() {
         "resume-stop-confirmed-profile",
         now,
     );
+    install_live_custody_observations(&mut store, &agent, 1, now + 4);
     store
         .put_batch(
             SourceBatch {
@@ -6948,6 +7057,7 @@ fn confirmed_managed_resume_stop_restores_ready_and_allows_retry() {
             now + 5,
         )
         .expect("commit retained terminal fact");
+    simulate_normal_stop_proof(&mut store, &agent, 1, now + 5);
     let old_agent = store.get_agent(&agent).unwrap().unwrap();
     let prior_workspace = store.get_workspace(&agent).unwrap().unwrap();
 
@@ -7074,6 +7184,7 @@ fn managed_resume_sibling_waits_for_exact_workspace_stop_settlement() {
         ready_managed_codex_agent(&mut store, checkout, "resume-stop-first", now);
     let (second_agent, second_workspace_input) =
         ready_managed_codex_agent(&mut store, checkout, "resume-stop-second", now + 10);
+    install_live_custody_observations(&mut store, &first_agent, 1, now + 10);
     let first_end = store
         .put_batch(
             SourceBatch {
@@ -7098,6 +7209,8 @@ fn managed_resume_sibling_waits_for_exact_workspace_stop_settlement() {
         .find(|event| event.kind == "session.ended")
         .unwrap()
         .seq;
+    simulate_normal_stop_proof(&mut store, &first_agent, 1, now + 20);
+    install_live_custody_observations(&mut store, &second_agent, 1, now + 20);
     let second_end = store
         .put_batch(
             SourceBatch {
@@ -7122,6 +7235,7 @@ fn managed_resume_sibling_waits_for_exact_workspace_stop_settlement() {
         .find(|event| event.kind == "session.ended")
         .unwrap()
         .seq;
+    simulate_normal_stop_proof(&mut store, &second_agent, 1, now + 20);
     let second_old_agent = store.get_agent(&second_agent).unwrap().unwrap();
     let second_prior_workspace = store.get_workspace(&second_agent).unwrap().unwrap();
     let state = store
@@ -7258,6 +7372,7 @@ fn unknown_managed_resume_stop_preserves_marker_input_and_reservation() {
         "resume-stop-unknown-profile",
         now,
     );
+    install_live_custody_observations(&mut store, &agent, 1, now + 4);
     store
         .put_batch(
             SourceBatch {
@@ -7276,6 +7391,7 @@ fn unknown_managed_resume_stop_preserves_marker_input_and_reservation() {
             now + 5,
         )
         .expect("commit retained terminal fact");
+    simulate_normal_stop_proof(&mut store, &agent, 1, now + 5);
     let old_agent = store.get_agent(&agent).unwrap().unwrap();
     let prior_workspace = store.get_workspace(&agent).unwrap().unwrap();
     let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
@@ -7425,6 +7541,7 @@ fn managed_resume_withdrawal_refuses_uncertain_inputs_and_foreign_markers() {
         } else {
             None
         };
+        install_live_custody_observations(&mut store, &agent, 1, now + 5);
         store
             .put_batch(
                 SourceBatch {
@@ -7443,6 +7560,7 @@ fn managed_resume_withdrawal_refuses_uncertain_inputs_and_foreign_markers() {
                 now + 6,
             )
             .expect("commit terminal fact");
+        simulate_normal_stop_proof(&mut store, &agent, 1, now + 6);
         let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
         resume.target = Some(agent.clone());
         resume.expected_generation = Some(1);
@@ -7571,6 +7689,7 @@ fn exact_undispatched_resume_rejection_releases_only_its_next_generation_slot() 
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
     let (agent, _) = ready_capacity_agent(&mut store, "resume-withdrawal", now);
+    install_live_custody_observations(&mut store, &agent, 1, now);
     store
         .put_batch(
             SourceBatch {
@@ -7589,6 +7708,7 @@ fn exact_undispatched_resume_rejection_releases_only_its_next_generation_slot() 
             now + 1,
         )
         .expect("commit terminal session fact");
+    simulate_normal_stop_proof(&mut store, &agent, 1, now + 1);
     let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
     resume.target = Some(agent.clone());
     resume.expected_generation = Some(1);
@@ -7788,16 +7908,22 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
         .expect("insert terminal native fact");
         old.execute(
             "INSERT INTO source_state(agent, generation, source, state)
-             VALUES (5,1,'stream','closed'),
+             VALUES (4,1,'stream','closed'),
+                    (4,1,'os','closed'),
+                    (5,1,'stream','closed'),
                     (6,1,'stream','closed'),
-                    (6,1,'os','closed')",
+                    (6,1,'os','closed'),
+                    (10,1,'stream','closed'),
+                    (10,1,'os','closed')",
             [],
         )
         .expect("insert source facts");
         old.execute(
             "INSERT INTO processes(host_boot_id, pid, start_time, owner, role, state,
                  exit_code, updated_at)
-             VALUES ('boot',1,0,'agent:a6#1','plugin','exited',NULL,1)",
+             VALUES ('boot',1,0,'agent:a4#1','plugin','exited',NULL,1),
+                    ('boot',2,0,'agent:a6#1','plugin','exited',NULL,1),
+                    ('boot',3,0,'agent:a10#1','plugin','exited',NULL,1)",
             [],
         )
         .expect("insert owned process exit fact");
@@ -8117,6 +8243,142 @@ fn restart_reconciles_a_stopped_generation_that_kept_its_reservation() {
             .any(|event| event.kind == "capacity.released")
     );
     assert_eq!(capacity_generation(&store, &agent), None);
+}
+
+#[test]
+fn session_end_alone_retains_capacity_until_exact_owned_exit_proof_settles() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let (agent, _) = ready_capacity_agent(&mut store, "capacity-regression", now);
+    store
+        .ensure_process_source(&agent, 1, now + 1)
+        .expect("install OS process source");
+    assert_eq!(capacity_generation(&store, &agent), Some(1));
+
+    // End alone keeps reservation.
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "regression:ended".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                cursor: None,
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "regression:ended".to_owned(),
+                    data: json!({}),
+                }],
+            },
+            now + 2,
+        )
+        .expect("commit session ended");
+    assert_eq!(
+        store.get_agent(&agent).unwrap().unwrap().state,
+        AgentState::Stopped
+    );
+    assert_eq!(
+        capacity_generation(&store, &agent),
+        Some(1),
+        "session.ended alone must retain capacity reservation"
+    );
+    assert_eq!(
+        store
+            .submit(
+                "owner",
+                capacity_launch_request(
+                    "capacity-regression-blocked",
+                    "resume-profile",
+                    json!([{"scope":"profile:resume-profile","max_live":1}]),
+                ),
+                now + 3,
+            )
+            .unwrap_err()
+            .code,
+        "capacity_unavailable",
+        "configured capacity is still held by generation 1"
+    );
+
+    // Owned-exit proof without all source/process closure still keeps it.
+    assert!(
+        store
+            .record_owned_control_exit(&agent, 1, now + 4)
+            .expect("owned-exit proof before physical closure is accepted")
+            .is_empty(),
+        "unclosed physical facts must not emit capacity.released"
+    );
+    assert_eq!(
+        capacity_generation(&store, &agent),
+        Some(1),
+        "reservation remains held without physical process/source closure"
+    );
+
+    let process_owner = format!("agent:{agent}#1");
+    store
+        .connection
+        .execute(
+            "INSERT INTO processes(host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at)
+             VALUES ('capacity-regression-boot', 81099, 1, ?1, 'plugin', 'exited', 0, ?2)",
+            rusqlite::params![process_owner, now + 5],
+        )
+        .expect("persist exact exited process record");
+    assert_eq!(
+        capacity_generation(&store, &agent),
+        Some(1),
+        "reservation remains held while OS source is still open"
+    );
+
+    // Full exact proof releases it even if OS closure arrives later.
+    let events = store
+        .set_process_source_status(&agent, 1, "ok", true, now + 6)
+        .expect("late monitor closure of OS process source");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "capacity.released")
+            .count(),
+        1,
+        "late OS closure completes the proof and releases reservation: {events:?}"
+    );
+    assert_eq!(
+        capacity_generation(&store, &agent),
+        None,
+        "reservation is now released"
+    );
+
+    // Existing stale-generation isolation must remain.
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    store
+        .submit("owner", resume, now + 7)
+        .expect("admit resume for generation 2 into released capacity");
+    assert_eq!(capacity_generation(&store, &agent), Some(2));
+
+    assert!(
+        store
+            .record_owned_control_exit(&agent, 1, now + 8)
+            .expect("stale generation 1 exit proof is harmless")
+            .is_empty(),
+        "stale generation exit proof must emit nothing"
+    );
+    assert_eq!(
+        capacity_generation(&store, &agent),
+        Some(2),
+        "stale generation-1 exit cannot release generation-2 reservation"
+    );
+
+    let repeated_os = store
+        .set_process_source_status(&agent, 1, "ok", true, now + 9)
+        .expect("repeated stale os closure");
+    assert!(
+        repeated_os
+            .iter()
+            .all(|event| event.kind != "capacity.released"),
+        "stale OS closure cannot release generation-2 reservation"
+    );
+    assert_eq!(capacity_generation(&store, &agent), Some(2));
 }
 
 #[test]
@@ -8905,6 +9167,7 @@ fn ready_muse_agent(
 }
 
 fn end_muse_session(store: &mut Store, agent: &str, project: &str, now: i64) {
+    install_live_custody_observations(store, agent, 1, now);
     store
         .put_batch(
             SourceBatch {
@@ -8923,6 +9186,7 @@ fn end_muse_session(store: &mut Store, agent: &str, project: &str, now: i64) {
             now,
         )
         .expect("commit muse terminal session fact");
+    simulate_normal_stop_proof(store, agent, 1, now);
 }
 
 fn gen1_event_rows(store: &Store, agent: &str) -> i64 {
@@ -9608,6 +9872,7 @@ fn ready_opencode_agent(
 }
 
 fn end_opencode_session(store: &mut Store, agent: &str, project: &str, now: i64) {
+    install_live_custody_observations(store, agent, 1, now);
     store
         .put_batch(
             SourceBatch {
@@ -9626,6 +9891,7 @@ fn end_opencode_session(store: &mut Store, agent: &str, project: &str, now: i64)
             now,
         )
         .expect("commit opencode terminal session fact");
+    simulate_normal_stop_proof(store, agent, 1, now);
 }
 
 #[test]
@@ -9872,6 +10138,7 @@ fn ready_claude_agent(
 }
 
 fn end_claude_session(store: &mut Store, agent: &str, project: &str, now: i64) {
+    install_live_custody_observations(store, agent, 1, now);
     store
         .put_batch(
             SourceBatch {
@@ -9890,6 +10157,7 @@ fn end_claude_session(store: &mut Store, agent: &str, project: &str, now: i64) {
             now,
         )
         .expect("commit claude terminal session fact");
+    simulate_normal_stop_proof(store, agent, 1, now);
 }
 
 #[test]

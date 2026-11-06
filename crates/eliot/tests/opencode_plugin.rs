@@ -23,6 +23,9 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
+#[allow(dead_code)]
+mod support;
+
 const CLI: &str = env!("CARGO_BIN_EXE_swarm");
 const MODEL: &str = "test-provider/test-model";
 const OP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -37,6 +40,10 @@ const ORPHAN_GRACE: Duration = Duration::from_secs(5);
 const FAKE_MAX_LIFETIME: Duration = Duration::from_secs(180);
 
 fn main() {
+    if std::env::var("ELIOT_FAKE_OPENCODE_DESCENDANT").is_ok() {
+        fake_descendant_main();
+        return;
+    }
     if let Ok(script) = std::env::var("ELIOT_FAKE_OPENCODE_SCRIPT") {
         fake_server_main(&script);
         return;
@@ -85,8 +92,18 @@ async fn run_lifecycle_scenarios() {
     )
     .await;
     run_scenario(
-        "stop of a gone session applies",
-        scenario_stop_of_gone_session_applies,
+        "stop retains the session for resume (no DELETE)",
+        scenario_stop_retains_session_for_resume,
+    )
+    .await;
+    run_scenario(
+        "stop of a gone session is unknown",
+        scenario_stop_of_gone_session_is_unknown,
+    )
+    .await;
+    run_scenario(
+        "unknown stop with committed End closes the owned family before cap release",
+        scenario_unknown_stop_with_committed_end_closes_owned_family,
     )
     .await;
     run_scenario(
@@ -369,6 +386,7 @@ struct Script {
     assistant_text: Option<String>,
     error: Option<Value>,
     delete_status: u16,
+    readback_status: Option<u16>,
     drop_sse_on_prompt: bool,
     /// One ask bundle per prompt (1-based): `{permission?, form?}` emitted
     /// between the started and terminal envelopes of that prompt.
@@ -397,6 +415,10 @@ struct Script {
     interrupt_drop: bool,
     /// Installed agent ids for `GET /api/agent`.
     agents: Vec<String>,
+    /// Spawn one owned descendant at boot that outlives the server, so the
+    /// generation Job stays non-empty until the test ends exactly that PID
+    /// (read from `ELIOT_FAKE_OPENCODE_DESCENDANT_PID`).
+    descendant: bool,
 }
 
 impl Script {
@@ -428,6 +450,7 @@ impl Script {
                 error => Some(error),
             },
             delete_status: get("delete_status").as_u64().unwrap_or(204) as u16,
+            readback_status: get("readback_status").as_u64().map(|code| code as u16),
             drop_sse_on_prompt: get("drop_sse_on_prompt").as_bool().unwrap_or(false),
             asks: get("asks").as_array().cloned().unwrap_or_default(),
             manual_terminal: get("manual_terminal").as_bool().unwrap_or(false),
@@ -454,8 +477,18 @@ impl Script {
                         .collect()
                 })
                 .unwrap_or_else(|| vec!["build".to_owned(), "general".to_owned()]),
+            descendant: get("descendant").as_bool().unwrap_or(false),
         }
     }
+}
+
+/// Owned-descendant stand-in: a child of the fake server that outlives it.
+/// It holds no port or pipe and ignores every inherited variable; the
+/// backstop exit mirrors the server so a hard-cancelled run cannot orphan
+/// it for hours, while the daemon-level regression ends it by exact PID.
+fn fake_descendant_main() {
+    std::thread::sleep(FAKE_MAX_LIFETIME);
+    std::process::exit(3);
 }
 
 struct Fixture {
@@ -527,10 +560,31 @@ fn fake_server_main(script_raw: &str) {
             "has_password": true,
             "data_home": data_home,
             "port": port,
+            "server_pid": std::process::id(),
         }))
         .expect("report JSON"),
     )
     .expect("write fixture report");
+
+    if script.descendant {
+        let pid_path = PathBuf::from(
+            std::env::var("ELIOT_FAKE_OPENCODE_DESCENDANT_PID")
+                .expect("fixture descendant pid file"),
+        );
+        let self_exe = std::env::current_exe().expect("fixture executable");
+        let mut spawn = std::process::Command::new(self_exe);
+        spawn.env_remove("ELIOT_FAKE_OPENCODE_SCRIPT");
+        spawn.env("ELIOT_FAKE_OPENCODE_DESCENDANT", "1");
+        spawn.stdin(Stdio::null());
+        spawn.stdout(Stdio::null());
+        spawn.stderr(Stdio::null());
+        let mut child = spawn.spawn().expect("spawn owned descendant");
+        std::fs::write(&pid_path, child.id().to_string()).expect("write descendant pid");
+        // Reap the exact child off the fake server's startup path.
+        drop(std::thread::spawn(move || {
+            let _ = child.wait();
+        }));
+    }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -878,6 +932,11 @@ async fn session_read_route(
     query: Option<&str>,
 ) -> Routed {
     if method == "GET" && tail.is_empty() {
+        if let Some(status) = fixture.script.readback_status
+            && status != 200
+        {
+            return Some(Some((status, not_found(id))));
+        }
         let sessions = fixture.sessions.lock().await;
         let session = sessions.get(id).expect("fixture session");
         let mut info = json!({
@@ -2100,6 +2159,7 @@ impl Scenario {
                     "protocol": "eliot-plugin/1",
                     "credential": credential,
                     "instance_dir": root.join(instance).to_string_lossy(),
+                    "store_root": root.to_string_lossy(),
                     "config": {},
                 }),
             )
@@ -2712,8 +2772,8 @@ async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
     let committed = stop_agent(&mut scenario, 1, false).await;
     assert_eq!(kinds(&committed), ["session.ended"]);
 
-    // Exactly one prompt reached the server; stop closed the session
-    // (DELETE) and proved its absence (GET 404).
+    // Exactly one prompt reached the server; ordinary stop quiesced the
+    // session and proved it retained by readback without deleting it.
     let requests = scenario.requests();
     let prompts = requests
         .iter()
@@ -2727,7 +2787,8 @@ async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
         .count();
     assert_eq!(prompts, 1);
     let mut saw_delete = false;
-    let mut saw_get_after_delete = false;
+    let mut saw_interrupt = false;
+    let mut saw_get_after_interrupt = false;
     for entry in &requests {
         let method = entry
             .get("method")
@@ -2740,12 +2801,19 @@ async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
         if method == "DELETE" && path.starts_with("/api/session/") {
             saw_delete = true;
         }
-        if saw_delete && method == "GET" && path.starts_with("/api/session/") {
-            saw_get_after_delete = true;
+        if method == "POST" && path.ends_with("/interrupt") {
+            saw_interrupt = true;
+        }
+        if saw_interrupt && method == "GET" && path.starts_with("/api/session/") {
+            saw_get_after_interrupt = true;
         }
     }
-    assert!(saw_delete, "stop issues the native close");
-    assert!(saw_get_after_delete, "stop proves absence after the close");
+    assert!(!saw_delete, "ordinary stop does not DELETE the session");
+    assert!(saw_interrupt, "stop quiesces via native interrupt");
+    assert!(
+        saw_get_after_interrupt,
+        "stop proves session retention by readback after interrupt"
+    );
 
     let shutdown = scenario
         .host
@@ -2950,38 +3018,434 @@ async fn scenario_lost_prompt_reply_is_unknown_without_rewrite(owned: OwnedChild
         })
         .count();
     assert_eq!(prompts, 1, "exactly one prompt write");
-    // Shutdown ends the unstopped generation, so it commits session.ended.
-    let (outcome, committed) = scenario
-        .host
-        .pump_call(
-            "shutdown",
-            json!({}),
-            OP_TIMEOUT,
-            Quiesce::UntilKind("session.ended"),
-        )
-        .await;
-    assert_eq!(
-        outcome
-            .expect("shutdown")
-            .get("state")
-            .and_then(Value::as_str),
-        Some("shutdown")
-    );
+    // Stop the unstopped generation: with no live turn the retained
+    // session passes the retention readback, so this becomes a normal
+    // Applied stop with exactly one End.
+    let committed = stop_agent(&mut scenario, 1, false).await;
     assert_eq!(kinds(&committed), ["session.ended"]);
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
     scenario.host.shutdown_child().await;
 }
 
-async fn scenario_stop_of_gone_session_applies(owned: OwnedChildren) {
+async fn scenario_stop_of_gone_session_is_unknown(owned: OwnedChildren) {
     let mut scenario = Scenario::start(
-        &script(json!({ "delete_status": 404 })),
+        &script(json!({ "readback_status": 404 })),
         opencode_profile(),
         owned,
     )
     .await;
-    let committed = stop_agent(&mut scenario, 1, false).await;
-    assert_eq!(kinds(&committed), ["session.ended"]);
-    scenario.host.call("shutdown", json!({})).await.unwrap();
+    let stop_id = ulid::Ulid::new().to_string();
+    let agent_id = scenario.agent_id.clone();
+    let (outcome, committed) = scenario
+        .host
+        .pump_call(
+            "agent.stop",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": stop_id,
+                "force": false,
+            }),
+            OP_TIMEOUT,
+            Quiesce::SilenceNow,
+        )
+        .await;
+    let error = outcome.expect_err("stop of a gone session must be unknown");
+    assert!(
+        error.contains("unknown"),
+        "expected unknown readback error, got: {error}"
+    );
+    // Closure IS proved here (terminate succeeded on the fake): the
+    // retention failure is independent of control closure. exactly one
+    // matching session.ended is emitted; any unfinished turn stays
+    // unknown and produces no terminal result.
+    let ended: Vec<_> = committed
+        .iter()
+        .filter(|(kind, _)| kind == "session.ended")
+        .collect();
+    assert_eq!(
+        ended.len(),
+        1,
+        "closure-proved unknown stop emits exactly one session.ended: {committed:?}"
+    );
+    let requests = scenario.requests();
+    assert_eq!(
+        count_requests(&requests, "DELETE", "/session/"),
+        0,
+        "zero DELETE on gone session stop"
+    );
+    assert!(
+        count_requests(&requests, "POST", "/interrupt") >= 1,
+        "stop quiesces before readback"
+    );
+    let (retry_outcome, retry_committed) = scenario
+        .host
+        .pump_call(
+            "agent.stop",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": stop_id,
+                "force": false,
+            }),
+            OP_TIMEOUT,
+            Quiesce::SilenceNow,
+        )
+        .await;
+    let retry_err = retry_outcome.expect_err("retry settles unknown");
+    assert!(retry_err.contains("unknown"), "retry: {retry_err}");
+    assert!(
+        retry_committed.is_empty(),
+        "repeat of the same stop id emits no second session.ended and no new commits"
+    );
+    // shutdown/resource cleanup must not replay native interrupt/GET
+    // against the already-dead server just because stop is Unknown:
+    // closure+Ended are proven, so shutdown ends the generation without
+    // additional native I/O or a second Ended.
+    let before_cleanup = scenario.requests();
+    let interrupts_before = count_requests(&before_cleanup, "POST", "/interrupt");
+    let gets_before = count_requests(&before_cleanup, "GET", "/api/session/");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    let after_cleanup = scenario.requests();
+    assert_eq!(
+        count_requests(&after_cleanup, "POST", "/interrupt"),
+        interrupts_before,
+        "no replayed native interrupt during shutdown"
+    );
+    assert_eq!(
+        count_requests(&after_cleanup, "GET", "/api/session/"),
+        gets_before,
+        "no replayed native GET during shutdown"
+    );
     scenario.host.shutdown_child().await;
+}
+
+/// Daemon-level regression for the repaired ordinary Unknown Stop, through
+/// the real daemon/router/CLI: a retention readback failure makes `agent.stop`
+/// return Unknown while the server still closes and exactly one session.ended
+/// commits. A scripted owned descendant outlives the server so the generation
+/// Job stays non-empty until the test ends exactly that PID; the Host's own
+/// wait then proves the family empty and settles the owned exit. The stop
+/// stays Unknown (never Applied, never replayed), capacity stays fenced
+/// until that proof, and the existing owned-exit proof then releases it.
+/// The fence-before-proof window is exact only where family custody is
+/// exact: Unix custody stays degraded by design (leader exit proves control
+/// loss), so the pre-kill fence assertions are Windows-only.
+async fn scenario_unknown_stop_with_committed_end_closes_owned_family(owned: OwnedChildren) {
+    let mut fixture = support::Fixture::new("opencode unknown-stop owned-exit");
+    let log_path = fixture.root.join("requests.jsonl");
+    let report_path = fixture.root.join("report.json");
+    let descendant_pid_path = fixture.root.join("descendant.pid");
+    let script_text = script(json!({"readback_status": 404, "descendant": true})).to_string();
+    fixture
+        .env("ELIOT_FAKE_OPENCODE_SCRIPT", &script_text)
+        .env("ELIOT_FAKE_OPENCODE_LOG", &log_path)
+        .env("ELIOT_FAKE_OPENCODE_REPORT", &report_path)
+        .env("ELIOT_FAKE_OPENCODE_DESCENDANT_PID", &descendant_pid_path);
+    fixture.start();
+    let cmd = std::env::current_exe()
+        .expect("test executable")
+        .to_string_lossy()
+        .into_owned();
+    let config = format!(
+        "[profiles.opencode-cap]\nharness = \"opencode\"\nmodel = \"{}\"\ncmd = {}\npass_env = [\"ELIOT_FAKE_OPENCODE_SCRIPT\", \"ELIOT_FAKE_OPENCODE_LOG\", \"ELIOT_FAKE_OPENCODE_REPORT\", \"ELIOT_FAKE_OPENCODE_DESCENDANT_PID\"]\naccount = \"shared\"\n\n[profiles.fake-cap]\nharness = \"fake\"\naccount = \"shared\"\n\n[accounts.shared]\nmax_live = 1\n",
+        MODEL,
+        serde_json::to_string(&cmd).expect("cmd toml"),
+    );
+    std::fs::write(fixture.data.join("config.toml"), config).expect("write opencode profile");
+
+    let launch_id = ulid::Ulid::new().to_string();
+    let workspace = fixture.workspace.to_string_lossy().into_owned();
+    let launch: eliot_core::Command = serde_json::from_value(fixture.json(&[
+        "--id",
+        &launch_id,
+        "launch",
+        "--profile",
+        "opencode-cap",
+        "--workspace",
+        &workspace,
+    ]))
+    .expect("typed launch");
+    assert_eq!(launch.id, launch_id);
+    let agent = launch.target.clone().expect("launch agent");
+    let generation = launch.generation.expect("launch generation");
+
+    // Readiness is a live state, not a timer: the plugin retains its session
+    // before the ready snapshot reports idle.
+    let ready_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut last_state = String::new();
+    loop {
+        let reply = support::cli(&fixture.data, &["show", &agent]);
+        if reply.status.success() {
+            let shown: Value = serde_json::from_str(&reply.stdout).expect("show JSON");
+            last_state = shown["state"].as_str().unwrap_or_default().to_owned();
+            if last_state == "idle" {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < ready_deadline,
+            "agent ready deadline; last state: {last_state}"
+        );
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Both PIDs are written by the fake at server boot; recording them makes
+    // every exit path (timeout included) reap exactly these processes.
+    let pid_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let descendant_pid: u32 = loop {
+        if let Ok(text) = std::fs::read_to_string(&descendant_pid_path)
+            && let Ok(pid) = text.trim().parse()
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < pid_deadline,
+            "descendant pid deadline"
+        );
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        pid_is_live(descendant_pid),
+        "owned descendant must be live before stop"
+    );
+    owned.record(descendant_pid);
+    let server_pid = report_at(&fixture.root, "report.json")["server_pid"]
+        .as_u64()
+        .expect("server pid report") as u32;
+    assert!(
+        pid_is_live(server_pid),
+        "fake server must be live before stop"
+    );
+    owned.record(server_pid);
+
+    let stop_id = ulid::Ulid::new().to_string();
+    let gen_arg = generation.to_string();
+    let stopped: eliot_core::api::CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+        "--id",
+        &stop_id,
+        "stop",
+        &agent,
+        "--generation",
+        &gen_arg,
+    ]))
+    .expect("typed stop");
+    assert_eq!(stopped.command_id, stop_id);
+
+    // End commits while the stop is still in flight: on exact custody no
+    // exit path can settle the command while the owned descendant keeps
+    // the family non-empty.
+    let end_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let reply = support::cli(&fixture.data, &["show", &agent]);
+        if reply.status.success() {
+            let shown: Value = serde_json::from_str(&reply.stdout).expect("show JSON");
+            if shown["state"] == "stopped" {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < end_deadline,
+            "session end deadline"
+        );
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mid_requests = requests_at(&fixture.root, "requests.jsonl");
+    let mid_interrupts = count_requests(&mid_requests, "POST", "/interrupt");
+    let mid_gets = count_requests(&mid_requests, "GET", "/api/session/");
+    assert_eq!(
+        count_requests(&mid_requests, "DELETE", "/session/"),
+        0,
+        "ordinary stop never deletes the retained session"
+    );
+    assert_eq!(fixture.json(&["status"])["agents"], 1);
+
+    let blocked_id = ulid::Ulid::new().to_string();
+    let blocked_args = [
+        "--id",
+        blocked_id.as_str(),
+        "launch",
+        "--profile",
+        "fake-cap",
+        "--workspace",
+        workspace.as_str(),
+    ];
+    #[cfg(windows)]
+    {
+        // Fenced: the stop cannot settle, no release event fires, and a
+        // second admission on the full account scope rejects before
+        // admission without a command row or command event.
+        let in_flight = fixture.json(&["cmd", "show", &stop_id]);
+        assert_eq!(
+            in_flight["state"].as_str(),
+            Some("dispatched"),
+            "stop must still be in flight while the owned descendant lives: {in_flight}"
+        );
+        let released_before = fixture.events().iter().any(|event| {
+            event["kind"] == "capacity.released"
+                && event["agent"] == agent
+                && event["generation"] == generation
+        });
+        assert!(
+            !released_before,
+            "capacity must not release before owned-exit proof"
+        );
+        let blocked = support::cli(&fixture.data, &blocked_args);
+        assert_eq!(
+            blocked.status.code(),
+            Some(3),
+            "fenced cap must reject before admission"
+        );
+        assert!(
+            blocked.stderr.contains("capacity_unavailable"),
+            "fenced cap did not return capacity_unavailable"
+        );
+        let missing = support::cli(&fixture.data, &["cmd", "show", &blocked_id]);
+        assert_eq!(missing.status.code(), Some(1));
+        assert!(
+            missing.stderr.contains("not_found"),
+            "cap-rejected request unexpectedly has a command row"
+        );
+        assert!(
+            fixture
+                .events()
+                .iter()
+                .all(|event| event["data"]["command_id"] != blocked_id),
+            "unadmitted cap rejection wrote a command event"
+        );
+    }
+
+    // The test ends exactly the scripted descendant; the Host's own wait
+    // proves the family empty and settles the owned exit.
+    kill_exact_pid(descendant_pid);
+    let reaped_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if !pid_is_live(descendant_pid) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < reaped_deadline,
+            "descendant exit deadline"
+        );
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let settled = fixture.wait_command(&stop_id, "unknown");
+    assert_eq!(settled["state"].as_str(), Some("unknown"));
+    assert_eq!(
+        settled["outcome"]["code"].as_str(),
+        Some("unknown"),
+        "original StopUnknown must be preserved, never Applied: {settled}"
+    );
+    assert_eq!(
+        fixture.json(&["show", &agent])["state"].as_str(),
+        Some("stopped")
+    );
+    let ended = fixture
+        .events()
+        .iter()
+        .filter(|event| {
+            event["kind"] == "session.ended"
+                && event["agent"] == agent
+                && event["generation"] == generation
+        })
+        .count();
+    assert_eq!(ended, 1, "exactly one session.ended commits for the stop");
+
+    // Host cleanup and shutdown replay nothing native.
+    let end_requests = requests_at(&fixture.root, "requests.jsonl");
+    assert_eq!(
+        count_requests(&end_requests, "POST", "/interrupt"),
+        mid_interrupts,
+        "host cleanup replayed a native interrupt"
+    );
+    assert_eq!(
+        count_requests(&end_requests, "GET", "/api/session/"),
+        mid_gets,
+        "host cleanup replayed a native GET"
+    );
+    assert_eq!(
+        count_requests(&end_requests, "DELETE", "/session/"),
+        0,
+        "host cleanup deleted the retained session"
+    );
+
+    // The owning plugin and generation Job are provably closed.
+    let processes = fixture.json(&[
+        "processes",
+        &agent,
+        "--generation",
+        &gen_arg,
+        "--limit",
+        "1000",
+    ]);
+    let processes = processes["processes"]
+        .as_array()
+        .expect("stopped generation process page");
+    assert!(!processes.is_empty(), "owned process evidence missing");
+    assert!(
+        processes.iter().all(|process| process["state"] == "exited"),
+        "owned family was not closed before cap release: {processes:?}"
+    );
+
+    // Release: the same rejected id now admits on the freed account scope.
+    let release_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let second = loop {
+        let reply = support::cli(&fixture.data, &blocked_args);
+        if reply.status.success() {
+            break serde_json::from_str::<eliot_core::Command>(&reply.stdout)
+                .expect("typed second launch");
+        }
+        assert_eq!(reply.status.code(), Some(3));
+        assert!(reply.stderr.contains("capacity_unavailable"));
+        assert!(
+            std::time::Instant::now() < release_deadline,
+            "capacity release deadline"
+        );
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert_eq!(second.id, blocked_id);
+    let second_agent = second.target.clone().expect("second agent");
+    let second_generation = second.generation.expect("second generation");
+    assert!(
+        fixture.events().iter().any(|event| {
+            event["kind"] == "capacity.released"
+                && event["agent"] == agent
+                && event["generation"] == generation
+        }),
+        "owned-exit proof must emit capacity.released"
+    );
+
+    // Ordinary cleanup keeps a normal stop on the applied path.
+    let second_stop_id = ulid::Ulid::new().to_string();
+    let second_gen_arg = second_generation.to_string();
+    let second_stop: eliot_core::api::CommandSubmitResponse =
+        serde_json::from_value(fixture.json(&[
+            "--id",
+            &second_stop_id,
+            "stop",
+            &second_agent,
+            "--generation",
+            &second_gen_arg,
+        ]))
+        .expect("typed second stop");
+    fixture.wait_command(&second_stop.command_id, "applied");
+    // Keep the original Unknown Stop as the intentional drain blocker; force
+    // shutdown only cleans daemon-owned resources, not its semantic outcome.
+    fixture.stop(true);
 }
 
 async fn scenario_invalid_profile_rejected_before_spawn(owned: OwnedChildren) {
@@ -3028,6 +3492,7 @@ async fn scenario_invalid_profile_rejected_before_spawn(owned: OwnedChildren) {
                 "protocol": "eliot-plugin/1",
                 "credential": format!("credential-{}", ulid::Ulid::new()),
                 "instance_dir": root.join("instance").to_string_lossy(),
+                "store_root": root.to_string_lossy(),
                 "config": {},
             }),
         )
@@ -3385,7 +3850,8 @@ async fn scenario_resume_of_deleted_session_is_not_found(owned: OwnedChildren) {
     let (mut gen1, ready1) = pending.finish(rx).await;
     let (_, turn_id, _) = send_turn(&mut gen1, 1, "doomed work").await;
     let resume = resume_subject(&agent_id, &ready1, &turn_id);
-    // A clean stop deletes the native session: nothing remains to resume.
+    // Generation 1 stops cleanly, retaining its session. Generation 2
+    // starts against an unseeded store where that session is absent.
     stop_agent(&mut gen1, 1, false).await;
     gen1.host
         .call("shutdown", json!({}))
@@ -3892,8 +4358,12 @@ async fn scenario_stale_choice_rejected_without_write(owned: OwnedChildren) {
     drain_until(&mut scenario.host, "turn.completed").await;
     let requests = requests_at(&scenario.root, "requests.jsonl");
     assert_eq!(count_requests(&requests, "POST", "/reply"), 1);
+    // Ordinary cleanup here is Applied with exactly one End and no
+    // replay: the settled turn is idle, so this stop is the healthy path.
     let committed = stop_agent(&mut scenario, 1, false).await;
     assert_eq!(kinds(&committed), ["session.ended"]);
+    let requests_after = requests_at(&scenario.root, "requests.jsonl");
+    assert_eq!(count_requests(&requests_after, "POST", "/reply"), 1);
     scenario
         .host
         .call("shutdown", json!({}))
@@ -4021,8 +4491,75 @@ async fn scenario_lost_reply_is_unknown_without_rewrite(owned: OwnedChildren) {
     assert!(committed.is_empty());
     let requests = requests_at(&scenario.root, "requests.jsonl");
     assert_eq!(count_requests(&requests, "POST", "/reply"), 1);
-    let committed = stop_agent(&mut scenario, 1, false).await;
-    assert_eq!(kinds(&committed), ["session.ended"]);
+    // True lost-reply stop is Unknown, not Applied: the persistence drop
+    // returns None before the plugin removes the native permission, so
+    // the execution stays live. The stop interrupt does stop it, but the
+    // pending permission keeps the retained session non-idle, so the
+    // retention readback proves retained-but-non-idle => Unknown with
+    // one real interrupted terminal preserved before End. Asserting
+    // kinds == ["session.ended"] here would require an Applied outcome
+    // that this path cannot produce; the legitimate cleanup is Unknown
+    // with the interrupted terminal retained, never a fabricated Applied.
+    let stop_id = ulid::Ulid::new().to_string();
+    let agent_id = scenario.agent_id.clone();
+    let (outcome, committed) = scenario
+        .host
+        .pump_call(
+            "agent.stop",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": stop_id,
+                "force": false,
+            }),
+            OP_TIMEOUT,
+            Quiesce::SilenceNow,
+        )
+        .await;
+    let error = outcome.expect_err("lost-reply stop is unknown, not applied");
+    assert!(
+        error.contains("unknown"),
+        "lost-reply stop remains unknown, got: {error}"
+    );
+    // The interrupted terminal was already committed before End. The
+    // matrix names it as the real interrupted terminal preserved before
+    // End, so the committed status is "interrupted", not a fabricated
+    // completion. Ordering is asserted by position, not by a guessed
+    // exact list, because message.completed may legitimately precede
+    // the terminal. Exactly one End, terminal before it, no second
+    // reply write.
+    let ended_positions: Vec<usize> = committed
+        .iter()
+        .enumerate()
+        .filter(|(_, (kind, _))| kind == "session.ended")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(ended_positions.len(), 1, "exactly one End: {committed:?}");
+    let end_pos = ended_positions[0];
+    assert_eq!(end_pos, committed.len() - 1, "End is last: {committed:?}");
+    let terminals: Vec<&Value> = committed
+        .iter()
+        .take(end_pos)
+        .filter(|(kind, _)| kind == "turn.completed")
+        .map(|(_, data)| data)
+        .collect();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "one turn.completed before End: {committed:?}"
+    );
+    assert_eq!(
+        terminals[0].get("turn_id").and_then(Value::as_str),
+        Some(turn_id.as_str()),
+        "terminal names the live turn: {committed:?}"
+    );
+    assert_eq!(
+        terminals[0].get("status").and_then(Value::as_str),
+        Some("interrupted"),
+        "interrupted terminal status is interrupted, not completed: {committed:?}"
+    );
+    let requests_after = requests_at(&scenario.root, "requests.jsonl");
+    assert_eq!(count_requests(&requests_after, "POST", "/reply"), 1);
     scenario
         .host
         .call("shutdown", json!({}))
@@ -4344,4 +4881,111 @@ async fn scenario_request_details_commit_redacted(owned: OwnedChildren) {
         .await
         .expect("shutdown");
     scenario.host.shutdown_child().await;
+}
+
+async fn scenario_stop_retains_session_for_resume(owned: OwnedChildren) {
+    // Generation 1: launch and complete one turn, then ordinary stop.
+    let root: PathBuf = std::env::temp_dir().join(format!(
+        "eliot-opencode-stop-retain-{}",
+        ulid::Ulid::new().to_string().to_lowercase()
+    ));
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::create_dir_all(root.join("workspace")).unwrap();
+    let agent_id = ulid::Ulid::new().to_string();
+    let workspace = root.join("workspace").to_string_lossy().into_owned();
+    let (pending, rx) = Scenario::setup_start_in(
+        &root,
+        "instance",
+        "requests.jsonl",
+        "report.json",
+        &script(json!({})),
+        opencode_profile(),
+        agent_id.clone(),
+        1,
+        None,
+        None,
+        owned.clone(),
+    )
+    .await;
+    let (mut gen1, ready1) = pending.finish(rx).await;
+    let (_, turn_id, _) = send_turn(&mut gen1, 1, "retained work").await;
+    let retained_ref = ready1
+        .get("native_ref")
+        .and_then(Value::as_str)
+        .expect("retained ref")
+        .to_owned();
+    let retained_scope = ready1
+        .get("native_scope")
+        .and_then(Value::as_str)
+        .expect("retained scope")
+        .to_owned();
+    let home1 = report_at(&root, "report.json")["data_home"]
+        .as_str()
+        .expect("gen-1 data home")
+        .to_owned();
+    let resume = resume_subject(&agent_id, &ready1, &turn_id);
+    let committed = stop_agent(&mut gen1, 1, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    let req1 = requests_at(&root, "requests.jsonl");
+    assert_eq!(
+        count_requests(&req1, "DELETE", "/session/"),
+        0,
+        "ordinary stop must not DELETE the retained session"
+    );
+    assert!(
+        count_requests(&req1, "POST", "/interrupt") >= 1,
+        "stop quiesces via native interrupt"
+    );
+    gen1.host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    gen1.host.shutdown_child().await;
+    drop(gen1);
+    // Generation 2: resume against the persistent store reattaches the
+    // exact retained session identity across the stop.
+    let (pending, rx) = Scenario::setup_start_in(
+        &root,
+        "instance2",
+        "requests2.jsonl",
+        "report2.json",
+        &script(json!({
+            "seed_session": {
+                "id": retained_ref,
+                "model_id": "test-model",
+                "provider_id": "test-provider",
+                "directory": workspace,
+                "seq": 5,
+            }
+        })),
+        opencode_profile(),
+        agent_id.clone(),
+        2,
+        Some(resume),
+        None,
+        owned,
+    )
+    .await;
+    let (mut gen2, ready2) = pending.finish(rx).await;
+    assert_eq!(
+        ready2.get("native_ref").and_then(Value::as_str),
+        Some(retained_ref.as_str()),
+        "resume reattaches the exact session stop retained"
+    );
+    assert_eq!(
+        ready2.get("native_scope").and_then(Value::as_str),
+        Some(retained_scope.as_str())
+    );
+    let home2 = report_at(&root, "report2.json")["data_home"]
+        .as_str()
+        .expect("gen-2 data home")
+        .to_owned();
+    assert_eq!(home1, home2, "both generations serve the stable store");
+    let committed = stop_agent(&mut gen2, 2, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    gen2.host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    gen2.host.shutdown_child().await;
 }

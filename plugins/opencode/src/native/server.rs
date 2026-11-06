@@ -34,15 +34,15 @@ use tokio::{
     time::{Instant, sleep, timeout_at},
 };
 
-use crate::native::client::OpenCodeHttp;
+use crate::native::{AuthSetup, AuthTransfer, client::OpenCodeHttp, transfer_selected_integration};
 
 const READINESS_POLL: Duration = Duration::from_millis(250);
 
 /// The generated per-Agent config: the frozen profile model plus an
 /// explicitly empty MCP set. No permissions, providers, plugins or
-/// credentials: the Agent runs the server defaults, and provider keys can
-/// only arrive through the target environment the host passes on top of the
-/// daemon-allowlisted plugin environment the child inherits.
+/// credentials: the Agent runs the server defaults, and the selected native
+/// credential arrives through the pre-serve auth transfer into the isolated
+/// store, never through this document.
 fn agent_config_json(model: &str) -> String {
     serde_json::json!({
         "$schema": "https://opencode.ai/config.json",
@@ -56,9 +56,11 @@ pub struct ServerLaunch {
     pub program: OsString,
     pub workspace: PathBuf,
     pub instance_dir: PathBuf,
+    pub store_root: PathBuf,
     pub agent_id: String,
     pub environment: Vec<(OsString, OsString)>,
     pub model: String,
+    pub auth: AuthSetup,
 }
 
 /// A running owned server: its child, HTTP client, and addresses.
@@ -72,16 +74,22 @@ pub struct OwnedServer {
 }
 
 impl OwnedServer {
-    /// Write the per-generation config, reserve a loopback port, spawn the
+    /// Write the per-generation config, prepare the selected native
+    /// credential in the isolated store, reserve a loopback port, spawn the
     /// server on the per-Agent store, and wait for readiness. Any failure
     /// leaves no running child behind. The child inherits the
     /// daemon-allowlisted plugin environment plus the shared target
     /// environment the host built, the generated password, and the XDG
     /// roots — exactly like the Codex/Muse stdio servers, with no
     /// `env_clear` and no third allowlist.
-    pub async fn spawn(launch: ServerLaunch, secrets: &[String]) -> Result<Self> {
-        let config_dir = launch.instance_dir.join("config").join("opencode");
-        let data_dir = stable_store_dir(&launch.instance_dir, &launch.agent_id)?;
+    pub async fn spawn(
+        launch: ServerLaunch,
+        secrets: &[String],
+        auth_deadline: Instant,
+    ) -> Result<Self> {
+        let config_root = launch.instance_dir.join("config");
+        let config_dir = config_root.join("opencode");
+        let data_dir = stable_store_dir(&launch.store_root, &launch.agent_id)?;
         std::fs::create_dir_all(&config_dir).map_err(|error| {
             Error::new(
                 "native_spawn",
@@ -101,6 +109,24 @@ impl OwnedServer {
                 format!("OpenCode per-Agent config could not be written: {error}"),
             )
         })?;
+        // The isolated store sees no canonical credential, so the selected
+        // integration moves in before `serve` starts, under these exact
+        // XDG roots. A refused or ambiguous transfer fails the start with
+        // no server child; resume reuses a correctly present credential.
+        transfer_selected_integration(
+            &AuthTransfer {
+                program: &launch.program,
+                selector: &launch.auth.selector,
+                workspace: &launch.workspace,
+                export_environment: &[],
+                import_environment: &launch.environment,
+                isolated_config_home: &config_root,
+                isolated_data_home: &data_dir,
+                reuse_existing: launch.auth.reuse_existing,
+            },
+            auth_deadline,
+        )
+        .await?;
 
         // Reserve a loopback port, then hand it to the server. A transient
         // bind race resolves as a spawn/readiness failure with no process
@@ -140,7 +166,7 @@ impl OwnedServer {
             .current_dir(&launch.workspace)
             .envs(launch.environment)
             .env("OPENCODE_PASSWORD", &password)
-            .env("XDG_CONFIG_HOME", launch.instance_dir.join("config"))
+            .env("XDG_CONFIG_HOME", &config_root)
             .env("XDG_DATA_HOME", &data_dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -264,44 +290,62 @@ impl OwnedServer {
         error.with_stderr(eliot_core::StderrSource::Harness, self.stderr_snapshot())
     }
 
-    /// End the owned server. `serve` exposes no shutdown RPC, so both paths
-    /// end the process; the generation Job ends any grandchildren. The
-    /// native session is closed separately with `DELETE /api/session/{id}`
-    /// before this runs.
+    /// End the owned server after native session-control work. `serve` exposes
+    /// no shutdown RPC, so both paths end the process; the generation Job ends
+    /// any grandchildren. Ordinary Stop retains the native session.
     pub async fn terminate(&mut self, force: bool, deadline: Instant) -> Result<()> {
-        if let Some(_status) = self.child.try_wait().map_err(|error| {
-            Error::new(
-                "native_process",
-                format!("OpenCode serve exit readback failed: {error}"),
-            )
-        })? {
-            self.drain_pipes(deadline).await;
+        let exit = self.terminate_leader(force, deadline).await;
+        if exit.is_ok() {
+            self.finish_diagnostics(deadline).await;
+        }
+        exit
+    }
+
+    /// Prove the exact server leader exited without waiting for its diagnostic
+    /// pipe readers. Stop commits the native EndAck before finishing those pipes.
+    pub(crate) async fn terminate_leader(&mut self, force: bool, deadline: Instant) -> Result<()> {
+        if self
+            .child
+            .try_wait()
+            .map_err(|error| {
+                Error::new(
+                    "native_process",
+                    format!("OpenCode serve exit readback failed: {error}"),
+                )
+            })?
+            .is_some()
+        {
             return Ok(());
         }
         if !force {
             // No graceful RPC exists; a short grace lets an in-flight native
             // close settle before the process ends.
             let grace = (Instant::now() + Duration::from_secs(2)).min(deadline);
-            if timeout_at(grace, self.child.wait()).await.is_ok() {
-                self.drain_pipes(deadline).await;
+            if matches!(timeout_at(grace, self.child.wait()).await, Ok(Ok(_))) {
                 return Ok(());
             }
         }
-        timeout_at(deadline, self.child.kill())
-            .await
-            .map_err(|_| Error::new("unknown", "OpenCode serve termination outcome is unknown"))?
-            .map_err(|error| {
-                Error::new(
+        if let Err(error) = timeout_at(deadline, self.child.kill()).await {
+            // Kill outcome is ambiguous without the wait proof below.
+            if !matches!(timeout_at(deadline, self.child.wait()).await, Ok(Ok(_))) {
+                return Err(Error::new(
                     "unknown",
-                    format!("OpenCode serve termination failed: {error}"),
-                )
-            })?;
-        let _ = timeout_at(deadline, self.child.wait()).await;
-        self.drain_pipes(deadline).await;
+                    "OpenCode serve termination outcome is unknown",
+                ));
+            }
+            let _ = error;
+            return Ok(());
+        }
+        if !matches!(timeout_at(deadline, self.child.wait()).await, Ok(Ok(_))) {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode serve exit proof is unknown",
+            ));
+        }
         Ok(())
     }
 
-    async fn drain_pipes(&mut self, deadline: Instant) {
+    pub(crate) async fn finish_diagnostics(&mut self, deadline: Instant) {
         if let Some(stdout) = self.stdout.take() {
             let _ = stdout.finish(deadline).await;
         }
@@ -314,13 +358,16 @@ impl OwnedServer {
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The per-Agent session store: `opencode-{agent_id}/data` next to the
-/// plugin instance directories. The daemon creates every instance directory
-/// directly under `{data_root}/plugins`
-/// (`plugin_host/host.rs::create_instance_dir_with`), so the instance
-/// parent is that directory; a missing parent fails the start honestly
-/// instead of serving an unrelated store. The agent id allowlist keeps the
-/// derived segment a single safe path component (`a12`, ULIDs).
-fn stable_store_dir(instance_dir: &Path, agent_id: &str) -> Result<PathBuf> {
+/// host-owned `store_root` (the old `instance_dir` parent, `{data_root}/plugins`).
+/// The per-generation `instance_dir` does not affect this path. The agent id
+/// allowlist keeps the derived segment a single safe path component.
+fn stable_store_dir(store_root: &Path, agent_id: &str) -> Result<PathBuf> {
+    if !store_root.is_absolute() || store_root.as_os_str().is_empty() {
+        return Err(Error::new(
+            "invalid",
+            "OpenCode store root must be an absolute path",
+        ));
+    }
     if agent_id.is_empty()
         || agent_id.len() > 64
         || !agent_id
@@ -332,15 +379,7 @@ fn stable_store_dir(instance_dir: &Path, agent_id: &str) -> Result<PathBuf> {
             "OpenCode Agent id cannot name a stable session store",
         ));
     }
-    let plugins_dir = instance_dir.parent().ok_or_else(|| {
-        Error::new(
-            "invalid",
-            "OpenCode instance directory has no plugin parent",
-        )
-    })?;
-    Ok(plugins_dir
-        .join(format!("opencode-{agent_id}"))
-        .join("data"))
+    Ok(store_root.join(format!("opencode-{agent_id}")).join("data"))
 }
 
 /// Our config document path must appear among the effective documents:
@@ -376,31 +415,30 @@ mod tests {
 
     #[test]
     fn stable_store_is_per_agent_beside_the_instance_dirs() {
-        let instance = PathBuf::from("/eliot/plugins/a12-g1-01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        let store = stable_store_dir(&instance, "a12").expect("stable store");
-        assert_eq!(store, PathBuf::from("/eliot/plugins/opencode-a12/data"));
-        // A later generation of the same Agent serves the same store.
-        let instance2 = PathBuf::from("/eliot/plugins/a12-g2-01ARZ3NDEKTSV4RRFFQ69G5FAW");
-        assert_eq!(
-            stable_store_dir(&instance2, "a12").expect("stable store"),
-            store
-        );
+        // Platform-absolute root without I/O: `is_absolute` on Windows
+        // rejects root-relative `/eliot/plugins`, so build from temp_dir.
+        let store_root = std::env::temp_dir().join(format!("eliot-plugins-{}", std::process::id()));
+        let store = stable_store_dir(&store_root, "a12").expect("stable store");
+        assert_eq!(store, store_root.join("opencode-a12").join("data"));
         // Another Agent gets another store.
         assert_ne!(
-            stable_store_dir(&instance, "a13").expect("stable store"),
+            stable_store_dir(&store_root, "a13").expect("stable store"),
             store
         );
         // Uppercase ULID agent ids (the plugin-test shape) are safe too.
         assert!(
-            stable_store_dir(&instance, "01ARZ3NDEKTSV4RRFFQ69G5FAV").is_ok(),
+            stable_store_dir(&store_root, "01ARZ3NDEKTSV4RRFFQ69G5FAV").is_ok(),
             "ULID agent id"
         );
         for bad in ["", "a/12", "a\\12", "..", "a 12", &"a".repeat(65)] {
             assert!(
-                stable_store_dir(&instance, bad).is_err(),
+                stable_store_dir(&store_root, bad).is_err(),
                 "unsafe agent id {bad:?}"
             );
         }
+        // Malformed (relative/empty) store roots are rejected before I/O.
+        assert!(stable_store_dir(Path::new("plugins"), "a12").is_err());
+        assert!(stable_store_dir(Path::new(""), "a12").is_err());
     }
 
     #[test]
