@@ -190,6 +190,13 @@ struct EventProcessor {
     child_pending: HashMap<String, ChildRegistration>,
     children: ChildThreads,
     gap_last_served: Option<String>,
+    /// The native transport itself was lost (queue overflow, unplanned close,
+    /// malformed frame, unplanned reader end): facts may be missing, so the source
+    /// is marked `stale` once drained, alongside any recorded gap.
+    /// Semantic/normalization gaps never set this.
+    transport_loss: bool,
+    /// The one accompanying `stale` update was attempted (never replayed).
+    source_health_attempted: bool,
 }
 
 struct ChildState {
@@ -599,6 +606,8 @@ impl EventProcessor {
             child_pending: HashMap::new(),
             children: ChildThreads::default(),
             gap_last_served: None,
+            transport_loss: false,
+            source_health_attempted: false,
         }
     }
 
@@ -677,11 +686,16 @@ impl EventProcessor {
             StreamState::Closed => {
                 if !self.planned_stop {
                     self.defer_gap("Codex app-server event stream closed");
+                    self.transport_loss = true;
                 }
             }
-            StreamState::Overflow => self.defer_gap("Codex app-server event queue overflowed"),
+            StreamState::Overflow => {
+                self.defer_gap("Codex app-server event queue overflowed");
+                self.transport_loss = true;
+            }
             StreamState::Malformed => {
-                self.defer_gap("Codex app-server stream contained an invalid frame")
+                self.defer_gap("Codex app-server stream contained an invalid frame");
+                self.transport_loss = true;
             }
             StreamState::Open => {}
         }
@@ -731,6 +745,10 @@ impl EventProcessor {
             None => {
                 self.frames_drained = true;
                 self.accept_frames = false;
+                if !self.planned_stop {
+                    // Unplanned reader end: the transport is over.
+                    self.transport_loss = true;
+                }
                 if !self.buffer.is_empty() {
                     self.buffer.clear();
                     self.buffer_bytes = 0;
@@ -763,6 +781,29 @@ impl EventProcessor {
         {
             let _ = self.record_gap(reason).await;
         }
+        if queue_empty && self.transport_loss {
+            self.mark_source_stale().await;
+        }
+    }
+
+    /// One explicit `stale` health update for a lost native transport, through the
+    /// existing `source.health` mechanism. Attempted once and never replayed.
+    async fn mark_source_stale(&mut self) {
+        if self.source_health_attempted {
+            return;
+        }
+        self.source_health_attempted = true;
+        let request = json!({
+            "credential": self.credential.clone(),
+            "agent_id": self.agent_id.clone(),
+            "generation": self.generation,
+            "source": "stream",
+            "health": "stale",
+        });
+        let _ = self
+            .host
+            .call("source.health", request, Instant::now() + EVENT_DEADLINE)
+            .await;
     }
 
     fn settle_spawn_window(&mut self) {
