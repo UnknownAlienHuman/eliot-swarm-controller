@@ -19,7 +19,7 @@ use crate::native::{
     ClaudeClient, ClaudeFrame,
     types::{
         CanUseToolBody, CommandLifecycle, PermissionResult, ResultRecord, assistant_model,
-        assistant_text,
+        assistant_text, result_usage,
     },
 };
 
@@ -1453,6 +1453,13 @@ impl EventProcessor {
             "turn_id": turn_id.clone(),
             "status": terminal_reason.clone(),
         });
+        // Optional native main-loop turn usage: absent/malformed usage never
+        // blocks or gaps this terminal; it simply leaves `data.usage` unset.
+        // Attaches before `attach_final_text` so the existing bounded
+        // terminal-text accounting includes the usage bytes.
+        if let Some(usage) = result_usage(record) {
+            data["usage"] = serde_json::to_value(&usage).unwrap_or(Value::Null);
+        }
         if let Some(text) = self.final_text.as_ref() {
             // Stream-json carries no failed flag: keep the PR1 omit-on-overflow
             // behavior for every terminal by reporting the bound case as failed.

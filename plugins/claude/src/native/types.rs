@@ -7,6 +7,7 @@
 //! stay open: unknown fields are ignored, required fields are checked by the
 //! caller that consumes them.
 
+use eliot_core::TurnUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -146,6 +147,45 @@ pub(crate) struct ResultRecord {
     pub terminal_reason: String,
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+/// Extract one turn's native token usage from a terminal `result` record's
+/// `usage`. With persistent streaming input, `result.usage` covers only the
+/// current user turn's main loop (subagents excluded); `result.modelUsage`
+/// and `total_cost_usd` are cumulative/estimated and are never read here.
+/// Only genuinely supplied nonnegative integer counters are mapped; missing
+/// or malformed values stay null (never zero, never a sum), and an absent or
+/// wholly malformed `usage` yields no usage at all so completion proceeds.
+pub(crate) fn result_usage(record: &Value) -> Option<TurnUsage> {
+    let usage = record.get("usage")?.as_object()?;
+    let counter = |key: &str| {
+        usage
+            .get(key)
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0)
+    };
+    let input_tokens = counter("input_tokens");
+    let output_tokens = counter("output_tokens");
+    let cache_read_tokens = counter("cache_read_input_tokens");
+    let cache_write_tokens = counter("cache_creation_input_tokens");
+    if input_tokens.is_none()
+        && output_tokens.is_none()
+        && cache_read_tokens.is_none()
+        && cache_write_tokens.is_none()
+    {
+        return None;
+    }
+    Some(TurnUsage {
+        scope: Some("main_loop_turn".to_owned()),
+        message_id: None,
+        input_tokens,
+        output_tokens,
+        reasoning_tokens: None,
+        thinking_tokens: None,
+        cache_read_tokens,
+        cache_write_tokens,
+        total_tokens: None,
+    })
 }
 
 /// Extract the model reported by an `assistant` record's message.
