@@ -58,6 +58,9 @@ The notice is an ordinary owner `send` bound to the recipient's current
 generation and carrying only the unread count at claim time. It never contains
 the body or marks it read. Unknown notice is not blindly retried;
 provider hold, pending request, current unknown gate and drain suppress new wake.
+A busy or waiting recipient also suppresses a new mail wake: an ordinary queued
+`send` cannot notify mid-turn anyway, so the wake is deferred (skipped, not
+queued) rather than dispatched after the inbox was already read and acked.
 A recipient with no live plugin owner for a dispatched generation stays queue-only.
 
 Without independent recipient identity, route only a generic notice to a live routed
