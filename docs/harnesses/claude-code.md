@@ -85,6 +85,14 @@ turn. A delayed hook is inject, never advertised as exact steer.
 ## Source ownership and recovery
 
 The stream-json stdout stream owns supplied session/turn/message/tool/usage facts.
+A terminal `result` record's `usage` is mapped, when genuinely supplied as
+nonnegative counters, into `turn.completed` `data.usage` at `main_loop_turn`
+scope with `message_id` null: with persistent streaming input it covers only
+the current user turn's main loop (subagents excluded). Cumulative/estimated
+`modelUsage` and `total_cost_usd` are never turn totals and are not persisted
+as usage or billing; unavailable/malformed individual counters stay null
+(other valid counters are retained), and no valid native counters means
+`data.usage` is omitted — never blocks or gaps the terminal.
 Callbacks own missing permission/question decisions; hooks never mirror the same
 lifecycle. Final text is
 persisted before exact terminal result. Distinguish content blocks/tool ids within a
