@@ -166,6 +166,13 @@ fn persist_turn_associated(
                              updated_at = ?3 WHERE id = ?4",
         params![turn_id, encode_json(&outcome)?, now, command_id],
     ));
+    // Presentation stamps the notice cooldown at native acceptance, so a long
+    // queue cannot spend it while waiting. Ordinary sends match no notice row.
+    db!(tx.execute(
+        "UPDATE mail_notices SET last_notice_at = ?1
+         WHERE recipient = ?2 AND open_notice_command = ?3",
+        params![now, agent_num, command_id],
+    ));
     Ok(PendingCommandEvent {
         command_id: command_id.to_owned(),
         data: json!({

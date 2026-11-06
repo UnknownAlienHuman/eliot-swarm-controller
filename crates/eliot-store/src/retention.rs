@@ -296,6 +296,20 @@ impl Store {
             .map_err(sql_error)?;
         let mut deleted = 0_i64;
         {
+            // Clear open-notice references to the exact doomed commands
+            // first, preserving presentation time; unadmitted reservations
+            // have no command row and can never be in this set.
+            let mut clear = tx
+                .prepare(
+                    "UPDATE mail_notices SET open_notice_command = NULL
+                     WHERE open_notice_command = ?1",
+                )
+                .map_err(sql_error)?;
+            for member in &doomed {
+                db!(clear.execute([&member.id]));
+            }
+        }
+        {
             let mut delete = tx
                 .prepare("DELETE FROM commands WHERE id = ?1")
                 .map_err(sql_error)?;

@@ -1286,8 +1286,10 @@ mod tests {
                 .and_then(|state| state.open_notice_command.clone()),
             Some(first.clone())
         );
-        assert_eq!(state.map(|state| state.last_notice_at), Some(now));
-        // The cooldown coalesces the immediate second conflict.
+        // A claim spends no cooldown: presentation time stays 0 until
+        // native turn association stamps it.
+        assert_eq!(state.map(|state| state.last_notice_at), Some(0));
+        // The open claim coalesces the immediate second conflict.
         let suppressed = store
             .notice_claim(
                 &a,
@@ -1299,7 +1301,7 @@ mod tests {
         assert_eq!(suppressed, None);
 
         // Releasing the wrong command disturbs nothing; releasing the
-        // recorded one frees the next conflict after the cooldown.
+        // recorded one frees the next conflict immediately.
         store
             .notice_release(&a, &Ulid::new().to_string())
             .expect("release of a foreign command is a no-op");
@@ -1313,7 +1315,11 @@ mod tests {
         store
             .notice_release(&a, &first)
             .expect("release the failed notice");
-        assert_eq!(store.notice_state(&a).expect("state gone"), None);
+        // Release clears only the open claim; the row and its zero
+        // presentation time remain.
+        let released = store.notice_state(&a).unwrap().expect("row remains");
+        assert_eq!(released.open_notice_command, None);
+        assert_eq!(released.last_notice_at, 0);
         let later = now + eliot_core::api::MAIL_NOTICE_COOLDOWN_MS;
         let claim = store
             .notice_claim(
@@ -1441,7 +1447,7 @@ mod tests {
         let mut send = SubmitCommand::new(mail_notice.clone(), "send");
         send.target = Some(a.clone());
         send.expected_generation = Some(1);
-        send.args = json!({"text": "1 unread messages; run swarm inbox"});
+        send.args = json!({"text": "1 unread messages; run swarm inbox", "notice_kind": "mail"});
         store.submit("owner", send, now).expect("admit mail notice");
         let suppressed = store
             .notice_claim(

@@ -770,6 +770,14 @@ impl Store {
              WHERE source IN ('os', 'git', 'workspace_process') AND state = 'open'",
             [now],
         ));
+        // Clear only commandless notice reservations (crash between claim
+        // commit and submit); notices with a durable command are untouched.
+        db!(tx.execute(
+            "UPDATE mail_notices SET open_notice_command = NULL
+             WHERE open_notice_command IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM commands WHERE commands.id = mail_notices.open_notice_command)",
+            [],
+        ));
         let mut dispatched_statement = tx
             .prepare(
                 "SELECT id, target, generation FROM commands
@@ -3392,6 +3400,54 @@ fn earliest_pending_send(
             |row| row.get(0),
         )
         .optional()
+        .map_err(sql_error)
+}
+
+/// Current-generation `send` input awaiting `turn.started` (accepted,
+/// queued, dispatched or unknown, no turn). Shared send-lane proof for
+/// the notice claim and admission gates.
+fn has_pending_send_input(
+    connection: &Connection,
+    agent_num: i64,
+    generation: i64,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM commands
+                 WHERE target = ?1 AND generation = ?2 AND verb = 'send'
+                   AND state IN ('accepted', 'queued', 'dispatched', 'unknown')
+                   AND turn_id IS NULL
+             )",
+            params![agent_num, generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
+}
+
+/// Unknown command or turn fencing notice presentation; shared by the
+/// notice claim gate and mail admission revalidation.
+fn has_unknown_gate(connection: &Connection, agent_num: i64) -> Result<bool> {
+    let unknown_command: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM commands WHERE target = ?1 AND state = 'unknown'
+             )",
+            params![agent_num],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if unknown_command {
+        return Ok(true);
+    }
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM turns WHERE agent = ?1 AND state = ?2
+             )",
+            params![agent_num, turn_state_name(TurnState::Unknown)],
+            |row| row.get(0),
+        )
         .map_err(sql_error)
 }
 
