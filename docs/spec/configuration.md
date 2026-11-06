@@ -61,13 +61,22 @@ permissions = "workspace-write"
 pass_env = ["CODEX_HOME"]
 ```
 
-The profile author supplies an exact model string. On the direct ChatGPT Codex route,
-the Codex plugin uses native `model/list` to look up that exact model and its supported
-reasoning efforts; a missing catalog entry fails startup explicitly. On an explicitly
-configured Responses route, the plugin skips that lookup and uses the explicit effort;
-provider rejection is surfaced when the native operation reports it. Neither route
-issues a separate inference or entitlement probe, or selects another model, route or
-account automatically.
+The profile author supplies an exact model string. Reasoning effort is optional
+on every Codex route: when the profile omits `effort`, the plugin omits the
+native effort wire fields (`thread/start`/`thread/resume` config and
+`turn/start` effort) and preserves the provider/native default, reporting
+the effective native readback separately; when a collaboration mode is
+requested, its replacement settings carry the actual native readback effort
+so the native selection is not cleared to the model default, while the
+requested effort stays absent; no effort value is fabricated. A present effort is enforced exactly and a
+missing model catalog entry on the direct route still fails startup
+explicitly. On the direct ChatGPT Codex route, the Codex plugin uses native
+`model/list` to look up that exact model and its supported reasoning efforts;
+on an explicitly configured Responses route, the plugin skips that lookup and
+passes through the explicit effort unchanged; provider rejection is surfaced
+when the native operation reports it. Neither route issues a separate
+inference or entitlement probe, or selects another model, route or account
+automatically.
 [`Codex`](../harnesses/codex.md#first-useful-path) owns native bring-up steps. Existing
 workspace and owner login suffice; no proxy/account registry is mandatory.
 

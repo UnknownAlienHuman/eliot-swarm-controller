@@ -87,7 +87,14 @@ struct AgentSession {
     thread_id: Option<String>,
     native_scope: String,
     requested_model: String,
-    selected_effort: String,
+    /// Pinned reasoning effort, or `None` when the profile omitted it and
+    /// the native/provider default is preserved by omitting the wire field.
+    selected_effort: Option<String>,
+    /// Actual native readback effort from thread start/resume. Used only to
+    /// preserve the native selection through the full collaboration-settings
+    /// replacement when the profile effort is omitted; `requested` stays
+    /// absent and the normal turn `effort` field stays omitted.
+    native_effort: Option<String>,
     collaboration_mode: Option<NativeCollaborationModeKind>,
     secrets: Vec<String>,
     native: NativeProcess,
@@ -646,7 +653,8 @@ impl CodexPlugin {
             thread_id: None,
             native_scope: String::new(),
             requested_model: requested_model.clone(),
-            selected_effort: String::new(),
+            selected_effort: None,
+            native_effort: None,
             collaboration_mode,
             secrets,
             native,
@@ -775,9 +783,13 @@ impl CodexPlugin {
                 cwd: Some(workspace.to_string_lossy().into_owned()),
                 sandbox: Some(sandbox_mode),
                 approval_policy: Some(json!(approval_policy.clone())),
-                config: Some(NativeThreadConfigOverrides {
-                    model_reasoning_effort: selected_effort.clone(),
-                }),
+                // Omitted effort omits the whole config overlay, preserving
+                // the native/provider default (schema: config optional).
+                config: selected_effort
+                    .clone()
+                    .map(|effort| NativeThreadConfigOverrides {
+                        model_reasoning_effort: effort,
+                    }),
             };
             (
                 "thread/resume",
@@ -795,9 +807,13 @@ impl CodexPlugin {
                 model_provider: Some(route.provider().to_owned()),
                 sandbox: Some(sandbox_mode),
                 approval_policy: Some(json!(approval_policy.clone())),
-                config: Some(NativeThreadConfigOverrides {
-                    model_reasoning_effort: selected_effort.clone(),
-                }),
+                // Omitted effort omits the whole config overlay, preserving
+                // the native/provider default (schema: config optional).
+                config: selected_effort
+                    .clone()
+                    .map(|effort| NativeThreadConfigOverrides {
+                        model_reasoning_effort: effort,
+                    }),
                 service_tier: None,
                 ephemeral: None,
             };
@@ -889,6 +905,10 @@ impl CodexPlugin {
             }
         };
         session.thread_id = Some(readback.thread.id.clone());
+        // Remember the actual native selection for collaboration settings
+        // replacement (see send_command); effective reporting uses this
+        // same readback value, never a fabricated effort.
+        session.native_effort = readback.reasoning_effort.clone();
         if resume_subject.is_some()
             && response_value
                 .get("thread")
@@ -900,11 +920,15 @@ impl CodexPlugin {
                 "Codex thread/resume did not prove the resumed thread idle; no input was sent",
             ));
         }
+        // Only a requested effort is verified/enforced. An omitted effort
+        // leaves the native default in `effective.effort`, reported
+        // separately from `requested.effort` (null).
         let effort_verified = route.requires_chatgpt()
+            && selected_effort.is_some()
             && readback
                 .reasoning_effort
                 .as_deref()
-                .is_some_and(|effort| effort == selected_effort);
+                .is_some_and(|effort| Some(effort) == selected_effort.as_deref());
         let effective = json!({
             "model": readback.model.clone(),
             "model_provider": readback.model_provider.clone(),
@@ -919,10 +943,13 @@ impl CodexPlugin {
             && paths_equal(Path::new(&readback.cwd), &workspace)
             && sandbox_matches(&readback.sandbox, &permissions, &workspace)
             && readback_approval_matches(&readback.approval_policy, &approval_policy)
-            && readback
-                .reasoning_effort
-                .as_deref()
-                .is_none_or(|effort| effort == selected_effort);
+            // Enforce the exact effective effort only if one was requested;
+            // an omitted effort accepts and reports the native readback.
+            && (selected_effort.is_none()
+                || readback
+                    .reasoning_effort
+                    .as_deref()
+                    .is_none_or(|effort| Some(effort) == selected_effort.as_deref()));
         if let Err(error) = session
             .events
             .ready(
@@ -1027,7 +1054,7 @@ impl CodexPlugin {
         requested_effort: Option<&str>,
         experimental_api: bool,
         context: NativeStartContext<'_>,
-    ) -> Result<(String, String)> {
+    ) -> Result<(Option<String>, String)> {
         let init_params = NativeInitializeParams {
             client_info: NativeClientInfo {
                 name: "eliot".to_owned(),
@@ -1164,7 +1191,7 @@ impl CodexPlugin {
 
         if !context.route.requires_chatgpt() {
             return Ok((
-                context.route.explicit_effort(requested_effort)?,
+                context.route.optional_effort(requested_effort)?,
                 native_scope,
             ));
         }
@@ -1177,7 +1204,7 @@ impl CodexPlugin {
                     .iter()
                     .any(|supported| supported.reasoning_effort == effort) =>
             {
-                effort.to_owned()
+                Some(effort.to_owned())
             }
             Some(_) => {
                 return Err(Error::new(
@@ -1185,19 +1212,10 @@ impl CodexPlugin {
                     "Codex profile effort is not supported by the exact selected model",
                 ));
             }
-            None => {
-                if !model
-                    .supported_reasoning_efforts
-                    .iter()
-                    .any(|supported| supported.reasoning_effort == model.default_reasoning_effort)
-                {
-                    return Err(Error::new(
-                        "profile_error",
-                        "Codex model catalogue default effort is not in its supported-effort list",
-                    ));
-                }
-                model.default_reasoning_effort
-            }
+            // Omitted effort: preserve the native default by omitting the
+            // wire field. The catalog lookup above still proves the exact
+            // model exists; no medium/xhigh value is fabricated here.
+            None => None,
         };
         Ok((effort, native_scope))
     }
@@ -1302,14 +1320,26 @@ impl CodexPlugin {
             ))],
             cwd: None,
             model: Some(session.requested_model.clone()),
-            effort: Some(session.selected_effort.clone()),
+            // Omitted effort omits the wire field (schema: effort optional,
+            // anyOf ReasoningEffort|null), preserving the native default.
+            effort: session.selected_effort.clone(),
             collaboration_mode: session
                 .collaboration_mode
                 .map(|mode| NativeCollaborationMode {
                     mode,
                     settings: NativeCollaborationSettings {
                         model: session.requested_model.clone(),
-                        reasoning_effort: Some(session.selected_effort.clone()),
+                        // Native replaces the full collaboration settings
+                        // when the mode is present, so a null effort here
+                        // would clear the native-configured selection and
+                        // fall back to the model default. Carry the actual
+                        // native readback instead; no arbitrary reasoning
+                        // is forced, the requested effort stays absent and
+                        // the normal turn `effort` field above stays omitted.
+                        reasoning_effort: session
+                            .selected_effort
+                            .clone()
+                            .or_else(|| session.native_effort.clone()),
                         developer_instructions: None,
                     },
                 }),
@@ -2953,7 +2983,8 @@ mod tests {
             thread_id: None,
             native_scope: String::new(),
             requested_model: "test-model".to_owned(),
-            selected_effort: String::new(),
+            selected_effort: None,
+            native_effort: None,
             collaboration_mode: None,
             secrets: Vec::new(),
             native,

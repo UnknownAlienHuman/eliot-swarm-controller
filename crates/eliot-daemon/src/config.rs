@@ -1806,17 +1806,10 @@ fn bind_route_and_capacity(
             .ok_or_else(|| fail("proxy", "named adopted proxy was not found"))?
             .get_ref();
 
-        if entry
-            .effort
-            .as_deref()
-            .is_none_or(|effort| effort.trim().is_empty())
-        {
-            return Err(fail(
-                "effort",
-                "a routed Codex profile requires an explicit effort",
-            ));
-        }
-
+        // Reasoning effort is optional on a routed Codex profile: an omitted
+        // effort leaves the snapshot without an `effort` key, and the native
+        // plugin omits the wire field to preserve the provider/native
+        // default. No effort value is fabricated here.
         let client_key_env_name = proxy
             .api_key_env
             .as_deref()
@@ -3198,7 +3191,7 @@ base_url_for.codex = "http://127.0.0.1:10300/v1"
     }
 
     #[test]
-    fn l34_requires_explicit_health_base_and_effort_without_fallbacks() {
+    fn l34_requires_explicit_health_and_base_but_effort_is_optional() {
         for source in [
             "[proxies.opencodex]\nattach='http://127.0.0.1:10300'\nbase_url_for.codex='http://127.0.0.1:10300/v1'\n",
             "[proxies.opencodex]\nattach='http://127.0.0.1:10300'\nhealth='/readyz'\n",
@@ -3216,7 +3209,12 @@ attach = "http://127.0.0.1:10300"
 health = "/api/system/health"
 base_url_for.codex = "http://127.0.0.1:10300/v1"
 "#;
-        assert!(resolve_text_profile(without_effort, "routed").is_err());
+        // Omitted effort passes daemon admission unchanged: the snapshot
+        // carries the route binding and no `effort` key, so the plugin can
+        // omit the wire field and preserve the native default.
+        let routed = resolve_text_profile(without_effort, "routed").unwrap();
+        assert!(routed.get("effort").is_none());
+        assert!(routed.get("route_binding").is_some());
 
         let direct = "[profiles.direct]\nharness='codex'\nmodel='gpt-6-luna'\n";
         let direct = resolve_text_profile(direct, "direct").unwrap();
