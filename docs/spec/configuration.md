@@ -438,6 +438,14 @@ Build the native environment from OS baseline, admitted nonsecret `pass_env` val
 literal nonsecret `env`, named secrets resolved in memory, then Eliot identity/Git/PATH.
 `secret_env` is a subset of `pass_env`; those values are never persisted. Missing named
 required values fail clearly. Windows keys compare case-insensitively.
+The managed Agent target environment sets `ELIOT_HOME` to the owned data directory,
+overriding ambient/profile, alongside `ELIOT_AGENT_ID`/`ELIOT_AGENT_GENERATION`/`ELIOT_AGENT_TOKEN`.
+It prepends the active controller executable's parent directory to `PATH`, preserving the
+native baseline entries, so bare `swarm` resolves to the current controller before ambient/legacy bins.
+A controller directory containing the OS `PATH` separator (`;` on Windows, `:` elsewhere)
+is explicitly unsupported: native shells split `PATH` without quote awareness, so managed
+start rejects it before native spawn as a definite rejected result (no native I/O dispatched),
+instead of an unknown outcome or a silent legacy `swarm` resolution.
 An adopted route stores only the optional client-key environment-variable name; the
 profile must explicitly allow that name in pass_env. Its value is resolved at runtime
 and is not sent with the unauthenticated readiness request.
