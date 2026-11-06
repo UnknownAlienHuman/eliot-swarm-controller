@@ -92,7 +92,7 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 | `agent.snapshot` | controlled command/turn binding, or exact subject plus `observation` page query | bounded readback; private history never acknowledges controlled effects |
 | `agent.attach` | exact subject, generation, observe/control, profile/environment, source plan/cursors | attach only to that subject; otherwise not found/unsupported |
 | `agent.detach` | exact observed subject/generation and command id | close only its reader; never end the native session |
-| `discover` | frozen profile, target environment without Agent identity, optional exact scope/cursor, bounded limit | read-only native-subject metadata page |
+| `discover` | frozen profile, target environment without Agent identity, optional exact scope/cursor, `archived` (default `false`), bounded limit | read-only native-subject metadata page |
 | `profile.store` (L3) | shared [`ProfileStoreParams`](../../crates/eliot-plugin/src/protocol.rs) | Return the effective [`NativeStoreBinding`](../../crates/eliot-core/src/native_store.rs) using the caller's actual prepared workspace and a bounded, owned metadata reader; success requires confirmed reader cleanup. It creates no model or thread, performs no native control and publishes no Agent events. This is outside the L1/L2 first-harness subset. |
 | `shutdown` | none | close owned paths, drain, exit; never kill an adopted service |
 
@@ -136,7 +136,9 @@ ordinary send dispatch.
 of an Agent and has no authority to call `events.put`, `process.put` or other durable
 Agent requests. Its result is `{harness,native_scope,subjects,next_cursor,coverage}`
 using the bounded metadata shape in [API](api.md#discover-attach-detach-and-resume).
-It owns only its reader process tree. Profile/scope/filter cursor mismatches reject;
+It owns only its reader process tree. `archived` is part of the cursor filter binding;
+an adapter that does not support archived selection rejects `archived:true` as
+`unsupported` rather than substituting the default selection. Profile/scope/filter cursor mismatches reject;
 an oversized entry or malformed/nonadvancing page is an explicit error, not a skipped
 subject or a synthetic complete page. Plugin shutdown closes the reader without
 controlling any discovered subject.

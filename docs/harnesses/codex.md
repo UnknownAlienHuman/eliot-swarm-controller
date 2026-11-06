@@ -241,7 +241,8 @@ arguments/digests or replay input. See
 ## Recovery and later capabilities
 
 Installed Codex 0.161.0 discovery uses `initialize`/`initialized` followed by bounded
-`thread/list` with `useStateDbOnly=true`, explicit source kinds and updated-time ordering.
+`thread/list` with `useStateDbOnly=true`, explicit source kinds, updated-time ordering
+and `archived` set only from the explicit caller selection (default `false`).
 Before listing, a probe reads effective configuration and requirements for its actual
 cwd, then closes. Configuration takes precedence over `CODEX_SQLITE_HOME`, then the
 Codex home default. A second reader starts with the selected canonical SQLite directory
@@ -251,7 +252,9 @@ exact SQLite requirements and higher-precedence legacy managed layers reject exp
 This readback does not lock external management policy against transient changes.
 The verified default retains its Codex-home scope; another store gets a distinct scope.
 It returns metadata without the thread preview. Cursors bind the verified store,
-profile, environment and filters; state-DB-only enumeration does not claim complete rollout coverage.
+profile, environment and filters; state-DB-only enumeration covers only the SDK-returned
+subjects (retained archives for archived selection) and does not claim complete rollout,
+raw database/history-row, or capacity coverage.
 The reader never calls `thread/resume` or `thread/start` to obtain visibility.
 The installed stable and experimental schemas expose no passive subscription operation.
 `thread/read`, `thread/turns/list` and `thread/items/list` are separate bounded historical

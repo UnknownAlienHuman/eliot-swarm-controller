@@ -32,6 +32,8 @@ pub struct AgentDiscoverRequest {
         deserialize_with = "optional_text"
     )]
     pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub archived: bool,
     #[serde(
         default = "super::default_limit",
         deserialize_with = "super::event_limit"
@@ -46,6 +48,7 @@ impl AgentDiscoverRequest {
             harness: None,
             native_scope: None,
             cursor: None,
+            archived: false,
             limit: super::DEFAULT_LIMIT,
         }
     }

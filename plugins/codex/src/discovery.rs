@@ -201,7 +201,12 @@ pub(crate) async fn discover(
     if let Some(scope) = &params.native_scope {
         check_text(scope, MAX_REFERENCE_BYTES, true)?;
     }
-    let binding = request_binding(&params.profile, &params.target_environment, params.limit)?;
+    let binding = request_binding(
+        &params.profile,
+        &params.target_environment,
+        params.archived,
+        params.limit,
+    )?;
     let cursor = decode_cursor(
         params.cursor.as_deref(),
         &binding,
@@ -511,7 +516,7 @@ async fn read_page(
         sort_direction: "desc".to_owned(),
         source_kinds: SOURCE_KINDS.to_vec(),
         model_providers: Vec::new(),
-        archived: false,
+        archived: params.archived,
         use_state_db_only: true,
     };
     let response = client
@@ -750,7 +755,12 @@ fn validate_store(
     Ok(())
 }
 
-fn request_binding(profile: &Value, target_environment: &Value, limit: usize) -> Result<String> {
+fn request_binding(
+    profile: &Value,
+    target_environment: &Value,
+    archived: bool,
+    limit: usize,
+) -> Result<String> {
     let context = json!({
         "profile": profile,
         // Resolved environment values contribute only to the digest, never the cursor payload.
@@ -760,7 +770,7 @@ fn request_binding(profile: &Value, target_environment: &Value, limit: usize) ->
         "sortDirection": "desc",
         "sourceKinds": SOURCE_KINDS,
         "modelProviders": [],
-        "archived": false,
+        "archived": archived,
         "useStateDbOnly": true,
         // Native cursor stability across page-size changes is not assumed.
         "limit": limit,
@@ -1078,7 +1088,8 @@ mod tests {
             "CODEX_SQLITE_HOME": "original-database",
         });
         let scope = "codex:test-scope";
-        let binding = request_binding(&profile, &environment, 100).expect("original binding");
+        let binding =
+            request_binding(&profile, &environment, false, 100).expect("original binding");
         let cursor = format!(
             "{CURSOR_PREFIX}{}",
             serde_json::to_string(&Cursor {
@@ -1099,7 +1110,7 @@ mod tests {
             "CODEX_SQLITE_HOME": "different-database",
         });
         let changed_binding =
-            request_binding(&profile, &changed_environment, 100).expect("changed binding");
+            request_binding(&profile, &changed_environment, false, 100).expect("changed binding");
         // These are the pure preflight helpers called before NativeProcess::spawn.
         let error = decode_cursor(Some(&cursor), &changed_binding, Some(scope))
             .err()
