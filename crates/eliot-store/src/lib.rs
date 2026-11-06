@@ -2588,18 +2588,7 @@ fn has_open_request_reply(
     request_id: &str,
     except_command: Option<&str>,
 ) -> Result<bool> {
-    connection
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM commands
-                 WHERE target = ?1 AND generation = ?2 AND request_id = ?3
-                   AND state IN ('accepted', 'queued', 'dispatched', 'unknown', 'applied')
-                   AND (?4 IS NULL OR id != ?4)
-             )",
-            params![agent, generation, request_id, except_command],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)
+    admission::request_reply_blocked(connection, agent, generation, request_id, except_command)
 }
 
 type StoredWriteBinding = (String, String, Vec<u8>, String);

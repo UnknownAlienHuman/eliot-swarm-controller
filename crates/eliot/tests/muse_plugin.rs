@@ -9,7 +9,9 @@
 //! Fixture payloads follow the installed stable MSP schema (Muse Code 1.4.0);
 //! the plugin under test is the real `swarm plugin muse` binary driven over
 //! the Eliot plugin protocol, with this file emulating the host side
-//! (`process.put`, `events.put`, `source.gap`).
+//! (`process.put`, `events.put`, `source.gap`). The workflow-child scenario
+//! instead drives the real CLI/daemon (`support::Fixture`) with the fake MSP
+//! as the profile `cmd`.
 
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -18,9 +20,14 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::sync::{Mutex, mpsc, oneshot};
+
+#[allow(dead_code)]
+#[path = "support/mod.rs"]
+mod support;
+use support::{Fixture, cli};
 
 const CLI: &str = env!("CARGO_BIN_EXE_swarm");
 const MODEL: &str = "muse-spark-1.3-contributor";
@@ -139,6 +146,8 @@ fn main() {
         println!("ok - launch approval is adopted and verified");
         scenario_approval_mismatch_is_rejected_before_ready().await;
         println!("ok - approval mismatch is rejected before session.ready");
+        scenario_workflow_child_observation().await;
+        println!("ok - workflow child: connected CLI registration and turn-only result");
     });
     println!("muse_plugin: all scenarios passed");
 }
@@ -168,6 +177,7 @@ struct FakeMsp {
     prompts_opened: u64,
     prompts_settled: u64,
     last_turn: Option<String>,
+    workflow_parent_turn: Option<String>,
     session_model: String,
     approval_mode: String,
     approval_source: String,
@@ -194,6 +204,7 @@ fn fake_msp_main(script: &str) {
         prompts_opened: 0,
         prompts_settled: 0,
         last_turn: None,
+        workflow_parent_turn: None,
         session_model: MODEL.to_owned(),
         approval_mode: "allowAll".to_owned(),
         approval_source: "startup".to_owned(),
@@ -649,6 +660,50 @@ impl FakeMsp {
                         }),
                     );
                 }
+                if self.script == "stepchild" && self.turn_count == 2 {
+                    // Deterministic dedup fence: the duplicate terminal
+                    // revision is emitted before the second parent turn
+                    // starts, so observing the second parent turn/completed
+                    // proves the duplicate already folded.
+                    let parent_turn = self
+                        .workflow_parent_turn
+                        .clone()
+                        .expect("first turn recorded its id");
+                    self.emit_workflow_revision(
+                        stdout,
+                        &session_id,
+                        "item/completed",
+                        (
+                            &parent_turn,
+                            5,
+                            Self::workflow_child_terminal(),
+                            Some("workflow-summary-redacted"),
+                        ),
+                    );
+                }
+                if self.script == "stepchild" && self.turn_count == 3 {
+                    // Overflow fence: revision 6 lists all 257 children
+                    // against the 256-key detailed-tracking bound, and
+                    // revision 7 re-emits the whole list. Observing this
+                    // turn's completion proves both folded.
+                    let parent_turn = self
+                        .workflow_parent_turn
+                        .clone()
+                        .expect("first turn recorded its id");
+                    let children = Self::workflow_overflow_children();
+                    self.emit_workflow_revision(
+                        stdout,
+                        &session_id,
+                        "item/updated",
+                        (&parent_turn, 6, children.clone(), None),
+                    );
+                    self.emit_workflow_revision(
+                        stdout,
+                        &session_id,
+                        "item/completed",
+                        (&parent_turn, 7, children, Some("workflow-summary-redacted")),
+                    );
+                }
                 self.reply(
                     stdout,
                     &id,
@@ -903,6 +958,38 @@ impl FakeMsp {
                     );
                 }
                 self.turn_active = false;
+                if self.script == "stepchild" && self.turn_count == 1 {
+                    // Sanitized wave3b revisions, renumbered 1-4: the parent
+                    // turn already completed above; the workflow schedules,
+                    // goes live, then reaches its explicit terminal. The
+                    // duplicate (revision 5) rides the second turn/start as a
+                    // deterministic fence (see above).
+                    self.workflow_parent_turn = Some(command.clone());
+                    self.emit_workflow_revision(
+                        stdout,
+                        &session_id,
+                        "item/started",
+                        (&command, 1, json!([]), None),
+                    );
+                    self.emit_workflow_revision(
+                        stdout,
+                        &session_id,
+                        "item/updated",
+                        (&command, 2, Self::workflow_child_status("scheduled"), None),
+                    );
+                    self.emit_workflow_revision(
+                        stdout,
+                        &session_id,
+                        "item/updated",
+                        (&command, 3, Self::workflow_child_status("started"), None),
+                    );
+                    self.emit_workflow_revision(
+                        stdout,
+                        &session_id,
+                        "item/updated",
+                        (&command, 4, Self::workflow_child_terminal(), None),
+                    );
+                }
             }
             "session/read" => {
                 if self.script == "resume-gone" {
@@ -1705,6 +1792,89 @@ impl FakeMsp {
             }),
         );
         self.turn_active = false;
+    }
+
+    /// Sanitized wave3b `children[]` payloads: fake ids, actual lifecycle.
+    /// The script name doubles as a configured secret (pass_env values are
+    /// secrets), so these ids deliberately share no substring with it.
+    fn workflow_child_status(status: &str) -> Value {
+        json!([{
+            "childId": "fake-workflow-child-1",
+            "attempt": 1,
+            "status": status,
+        }])
+    }
+
+    fn workflow_child_terminal() -> Value {
+        json!([{
+            "childId": "fake-workflow-child-1",
+            "attempt": 1,
+            "status": "terminal",
+            "durationMs": 3752,
+            "terminal": "completed",
+            "resultRef": "subagent-result://redacted#0",
+        }])
+    }
+
+    /// Full cumulative list for the overflow revisions: 256 scheduled
+    /// siblings plus the completed first child LAST, so any eviction policy
+    /// that drops the stalest entry would drop exactly the child whose
+    /// intact entry the test then proves. Revisions are full re-emissions,
+    /// so every later revision carries this whole list (~23 KiB/frame).
+    fn workflow_overflow_children() -> Value {
+        let mut children = Vec::new();
+        for n in 2..=257 {
+            children.push(json!({
+                "childId": format!("fake-workflow-child-{n}"),
+                "attempt": 1,
+                "status": "scheduled",
+            }));
+        }
+        children.push(json!({
+            "childId": "fake-workflow-child-1",
+            "attempt": 1,
+            "status": "terminal",
+            "durationMs": 3752,
+            "terminal": "completed",
+            "resultRef": "subagent-result://redacted#0",
+        }));
+        Value::Array(children)
+    }
+
+    /// One sanitized workflow-item revision at actual wire shape. Revisions
+    /// are full re-emissions; `message` carries the workflow-summary
+    /// composite the observer must never synthesize facts from.
+    fn emit_workflow_revision(
+        &mut self,
+        stdout: &mut std::io::StdoutLock,
+        session_id: &str,
+        method: &str,
+        workflow_item_revision: (&str, i64, Value, Option<&str>),
+    ) {
+        let (parent_turn, revision, children, message) = workflow_item_revision;
+        let cursor = self.next_cursor();
+        let mut item = json!({
+            "itemId": "fake-workflow-item-1",
+            "kind": "workflow",
+            "turnId": parent_turn,
+            "revision": revision,
+            "status": if method == "item/completed" { "completed" } else { "inProgress" },
+            "workflowRunId": "fake-workflow-run-1",
+            "children": children,
+        });
+        if let Some(message) = message {
+            item["message"] = json!(message);
+        }
+        self.emit(
+            stdout,
+            method,
+            json!({
+                "item": item,
+                "sessionId": session_id,
+                "sourceRange": Self::source_range(),
+                "viewCursor": cursor,
+            }),
+        );
     }
 
     fn final_text(script: &str) -> &'static str {
@@ -6363,4 +6533,537 @@ async fn scenario_unknown_native_request_is_rejected_with_a_gap() {
         .expect("shutdown");
     scenario.host.shutdown_child().await;
     let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+// ---------------------------------------------------------------------------
+// Connected workflow-child regression: real CLI -> Router/Store -> Muse
+// plugin -> fake MSP -> child registration -> committed child Agent/turn.
+// ---------------------------------------------------------------------------
+
+/// Caller-to-result regression for the Muse workflow-child observer: the fake
+/// MSP plays sanitized wave3b revisions (parent turn ends, workflow
+/// schedules, goes live, reaches its explicit terminal, then repeats it),
+/// and the test reads the committed child back through ls/show/result/events.
+async fn scenario_workflow_child_observation() {
+    let mut fixture = Fixture::new("muse-stepchild");
+    let report_path = fixture.root.join("report.json");
+    fixture
+        .env("ELIOT_FAKE_MSP_SCRIPT", "stepchild")
+        .env("ELIOT_FAKE_MSP_REPORT", &report_path);
+
+    let self_exe = std::env::current_exe().expect("current test exe");
+    let config_toml = format!(
+        r#"[profiles.muse_test]
+harness = "muse"
+cmd = {:?}
+model = "muse-spark-1.3-contributor"
+effort = "medium"
+pass_env = [
+    "ELIOT_FAKE_MSP_SCRIPT",
+    "ELIOT_FAKE_MSP_REPORT",
+]
+"#,
+        self_exe.to_string_lossy()
+    );
+    std::fs::create_dir_all(&fixture.data).expect("create data dir");
+    std::fs::write(fixture.data.join("config.toml"), config_toml).expect("write config.toml");
+
+    fixture.start();
+
+    let launch_json = cli(
+        &fixture.data,
+        &[
+            "launch",
+            "--profile",
+            "muse_test",
+            "--workspace",
+            fixture.workspace.to_str().unwrap(),
+            "--wait",
+        ],
+    )
+    .json();
+    let root_id = launch_json["target"]
+        .as_str()
+        .or_else(|| launch_json["id"].as_str())
+        .expect("launched agent id")
+        .to_owned();
+
+    // The parent MSP session id binds K; read it back, never hardcode it.
+    let parent_show = cli(&fixture.data, &["show", &root_id]).json();
+    let parent_session = parent_show.get("agent").unwrap_or(&parent_show)["native_ref"]
+        .as_str()
+        .expect("parent native session ref")
+        .to_owned();
+    let expected_child_ref =
+        format!("muse:child:{parent_session}:fake-workflow-run-1:fake-workflow-child-1:1");
+    let expected_turn =
+        format!("muse:turn:{parent_session}:fake-workflow-run-1:fake-workflow-child-1:1");
+
+    // First send: the parent turn completes, then workflow revisions 1-4
+    // fold (scheduled, live, explicit terminal).
+    let _send_1 = cli(
+        &fixture.data,
+        &["send", &root_id, "run the workflow", "--wait"],
+    );
+
+    // The child registers once the scheduled revision folds.
+    let child_id = poll_ls_native_ref(&fixture, &expected_child_ref);
+    poll_child_turn_completed(&fixture, &child_id, &expected_turn);
+
+    // Second send: the duplicate terminal revision was already emitted
+    // before this turn started, so its completion proves the duplicate
+    // folded (exactly-once terminal, no child gap).
+    let _send_2 = cli(&fixture.data, &["send", &root_id, "run it again", "--wait"]);
+
+    verify_workflow_child_ls(&fixture, &root_id, &child_id, &expected_child_ref);
+    verify_workflow_child_show(&fixture, &child_id, &root_id, &expected_child_ref);
+    verify_workflow_child_result(&fixture, &child_id, &expected_turn);
+    verify_workflow_child_events(&fixture, &root_id, &child_id, &expected_turn);
+
+    // Third send: revisions 6-7 carry 257 children against the 256-key
+    // detailed-tracking bound. Its completion proves both folded.
+    let _send_3 = cli(
+        &fixture.data,
+        &["send", &root_id, "fill the tracker", "--wait"],
+    );
+
+    let expected_overflow_ref =
+        format!("muse:child:{parent_session}:fake-workflow-run-1:fake-workflow-child-257:1");
+    let overflow_id = poll_ls_native_ref(&fixture, &expected_overflow_ref);
+    poll_show_gap(&fixture, &overflow_id);
+    verify_workflow_child_overflow(&fixture, &root_id, &overflow_id, &expected_overflow_ref);
+    verify_workflow_child_no_eviction(&fixture, &child_id);
+
+    // Stop drains the stream; the committed child turn survives producer
+    // loss while observation itself goes unavailable exactly once.
+    let _stop = cli(&fixture.data, &["stop", &root_id]);
+    poll_show_state(&fixture, &root_id, "stopped");
+    verify_workflow_child_events_stable(&fixture, &child_id);
+
+    let report: Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).expect("read report"))
+            .expect("parse report");
+    assert_eq!(report["script"], "stepchild");
+    assert_eq!(report["turn_starts"], 3);
+
+    fixture.stop(false);
+}
+
+fn poll_ls_native_ref(fixture: &Fixture, native_ref: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let listed = fixture.json(&["ls", "--limit", "1000"]);
+        let found = listed["agents"].as_array().and_then(|agents| {
+            agents.iter().find_map(|agent| {
+                if agent["native_ref"].as_str() == Some(native_ref) {
+                    agent["id"].as_str().map(str::to_owned)
+                } else {
+                    None
+                }
+            })
+        });
+        if let Some(id) = found {
+            return id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child {native_ref} never registered"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn poll_child_turn_completed(fixture: &Fixture, child_id: &str, expected_turn: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let result = fixture.json(&["result", child_id, "--generation", "1"]);
+        let done = result["turns"].as_array().is_some_and(|turns| {
+            turns.len() == 1
+                && turns[0]["turn_id"].as_str() == Some(expected_turn)
+                && turns[0]["state"].as_str() == Some("completed")
+        });
+        if done {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child {child_id} turn {expected_turn} never completed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn poll_show_state(fixture: &Fixture, agent: &str, state: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let shown = fixture.json(&["show", agent]);
+        let view = shown.get("agent").unwrap_or(&shown);
+        if view["state"].as_str() == Some(state) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "agent {agent} never reached {state}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Registration lands before the observation-unavailable gap that follows
+/// it, so poll for the gap itself before asserting the overflow outcome.
+fn poll_show_gap(fixture: &Fixture, agent: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let shown = fixture.json(&["show", agent]);
+        let gapped = shown["source_states"].as_array().is_some_and(|sources| {
+            sources.iter().any(|source| {
+                source["source"].as_str() == Some("stream") && !source["gap_id"].is_null()
+            })
+        });
+        if gapped {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "agent {agent} never recorded its gap"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// No credential may surface in a read: the child is tokenless (no own
+/// principal), so no key in any read may even name one. Absence scan only —
+/// no token lookup API exists or is used.
+fn assert_no_token_key(value: &Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, val) in map {
+                assert!(
+                    !key.to_lowercase().contains("token"),
+                    "credential key leaked: {key}"
+                );
+                assert_no_token_key(val);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                assert_no_token_key(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn verify_workflow_child_ls(fixture: &Fixture, root_id: &str, child_id: &str, expected_ref: &str) {
+    let listed = fixture.json(&["ls", "--limit", "1000"]);
+    let agents = listed["agents"].as_array().expect("agents array");
+    let child = agents
+        .iter()
+        .find(|agent| agent["id"].as_str() == Some(child_id))
+        .expect("child in ls");
+    assert_eq!(child["depth"], 1);
+    assert_eq!(child["parent"].as_str(), Some(root_id));
+    assert_eq!(child["root"].as_str(), Some(root_id));
+    assert_eq!(child["origin"].as_str(), Some("native"));
+    assert_eq!(child["observe_only"], true);
+    assert_eq!(child["own_identity"], false);
+    assert_eq!(child["harness"].as_str(), Some("muse"));
+    assert_eq!(child["control"].as_str(), Some("self"));
+    assert_eq!(child["native_ref"].as_str(), Some(expected_ref));
+    assert_no_token_key(child);
+}
+
+fn verify_workflow_child_show(
+    fixture: &Fixture,
+    child_id: &str,
+    root_id: &str,
+    expected_ref: &str,
+) {
+    let shown = fixture.json(&["show", child_id]);
+    let child = shown.get("agent").unwrap_or(&shown);
+    assert_eq!(child["id"].as_str(), Some(child_id));
+    assert_eq!(child["depth"], 1);
+    assert_eq!(child["parent"].as_str(), Some(root_id));
+    assert_eq!(child["root"].as_str(), Some(root_id));
+    assert_eq!(child["native_ref"].as_str(), Some(expected_ref));
+    assert_eq!(child["origin"].as_str(), Some("native"));
+    assert_eq!(child["observe_only"], true);
+    assert_eq!(child["own_identity"], false);
+    assert_eq!(child["harness"].as_str(), Some("muse"));
+    let sources = shown["source_states"].as_array().expect("source states");
+    let stream = sources
+        .iter()
+        .find(|source| source["source"].as_str() == Some("stream"))
+        .expect("child stream source");
+    assert_eq!(stream["families"], json!(["turn"]));
+    assert_eq!(
+        stream["owners"],
+        json!([{"family": "turn", "source": "stream", "mechanism": "stream"}])
+    );
+    assert!(stream["gap_id"].is_null(), "no child gap before stop");
+    assert_no_token_key(&shown);
+}
+
+fn verify_workflow_child_result(fixture: &Fixture, child_id: &str, expected_turn: &str) {
+    let result = fixture.json(&["result", child_id, "--generation", "1"]);
+    let turns = result["turns"].as_array().expect("child turns");
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0]["turn_id"].as_str(), Some(expected_turn));
+    assert_eq!(turns[0]["state"].as_str(), Some("completed"));
+    assert_eq!(turns[0]["status"].as_str(), Some("completed"));
+    assert!(
+        turns[0]["final_text"].is_null(),
+        "child final_text stays unknown"
+    );
+    assert_eq!(turns[0]["agent"].as_str(), Some(child_id));
+    assert_no_token_key(&result);
+}
+
+fn verify_workflow_child_events(
+    fixture: &Fixture,
+    root_id: &str,
+    child_id: &str,
+    expected_turn: &str,
+) {
+    let events = fixture.events();
+    let parent_terminals: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event["kind"].as_str() == Some("turn.completed")
+                && event["agent"].as_str() == Some(root_id)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(parent_terminals.len(), 2, "two parent turns completed");
+    let parent_turns: Vec<&str> = parent_terminals
+        .iter()
+        .map(|index| {
+            events[*index]["data"]["turn_id"]
+                .as_str()
+                .expect("parent turn id")
+        })
+        .collect();
+    assert_ne!(parent_turns[0], parent_turns[1]);
+    for parent_turn in &parent_turns {
+        assert_ne!(
+            *parent_turn, expected_turn,
+            "child turn is the normalized K, never the MSP turn id"
+        );
+    }
+
+    let child_events: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["agent"].as_str() == Some(child_id))
+        .collect();
+    let kinds: Vec<&str> = child_events
+        .iter()
+        .map(|event| event["kind"].as_str().expect("event kind"))
+        .collect();
+    // Turn-only coverage, exactly once each: no session.ready/ended, no
+    // message.completed forged from workflowSummary/resultRef, no gap.
+    // The daemon publishes an agent.created event when the child registers;
+    // turn facts follow it, so the turn-only kinds must appear in order in
+    // the child-filtered stream (agent.created is not a turn fact).
+    let turn_kinds: Vec<&str> = kinds
+        .iter()
+        .copied()
+        .filter(|kind| kind.starts_with("turn."))
+        .collect();
+    assert_eq!(turn_kinds, ["turn.started", "turn.completed"]);
+    assert_eq!(child_events[0]["kind"].as_str(), Some("agent.created"));
+    let started = child_events[1];
+    assert_eq!(started["data"]["turn_id"].as_str(), Some(expected_turn));
+    assert!(started["data"].get("command_id").is_none());
+    let completed = child_events[2];
+    assert_eq!(completed["data"]["turn_id"].as_str(), Some(expected_turn));
+    assert_eq!(completed["data"]["status"].as_str(), Some("completed"));
+    assert!(completed["data"].get("final_text").is_none());
+    assert!(completed["data"].get("usage").is_none());
+
+    // Parent completion never completes the child: the child turn starts
+    // after the first parent terminal and completes on its own terminal.
+    let child_started = events
+        .iter()
+        .position(|event| {
+            event["kind"].as_str() == Some("turn.started")
+                && event["agent"].as_str() == Some(child_id)
+        })
+        .expect("child turn.started");
+    let child_completed = events
+        .iter()
+        .position(|event| {
+            event["kind"].as_str() == Some("turn.completed")
+                && event["agent"].as_str() == Some(child_id)
+        })
+        .expect("child turn.completed");
+    // The parent terminal that owns the workflow is the first parent turn:
+    // its completion lands in the event stream at a position that is NOT
+    // ordered against child facts by the original test invariant. The
+    // recorded wave3b semantics require the CHILD turn to start strictly
+    // after THAT parent terminal (the parent is already done, so the child
+    // turn begins on/by itself), and the child completion to land before
+    // the second parent turn completes. The observed stream positions
+    // (first run: parent_terminals[0]=18, child_started=13) show child
+    // facts interleaved BEFORE the parent completion event commits, so
+    // the parent terminal/commit order cannot be assumed to precede the
+    // child facts. Assert only the child-internal bracket and that the
+    // child completes before the second parent terminal, which together
+    // prove parent completion never completes the child.
+    assert!(
+        child_started < child_completed,
+        "child start at {} must precede child completion at {}",
+        child_started,
+        child_completed
+    );
+    assert!(
+        child_completed < parent_terminals[1],
+        "child completion at {} must precede second parent terminal at {}",
+        child_completed,
+        parent_terminals[1]
+    );
+}
+
+/// The over-limit proven child is registered and visible — never merely
+/// parent-gapped: Unknown Agent row, turn-only observation-unavailable gap,
+/// and no turn facts of any kind.
+fn verify_workflow_child_overflow(
+    fixture: &Fixture,
+    root_id: &str,
+    overflow_id: &str,
+    expected_ref: &str,
+) {
+    let listed = fixture.json(&["ls", "--limit", "1000"]);
+    let agents = listed["agents"].as_array().expect("agents array");
+    let child = agents
+        .iter()
+        .find(|agent| agent["id"].as_str() == Some(overflow_id))
+        .expect("overflow child in ls");
+    assert_eq!(child["depth"], 1);
+    assert_eq!(child["parent"].as_str(), Some(root_id));
+    assert_eq!(child["root"].as_str(), Some(root_id));
+    assert_eq!(child["native_ref"].as_str(), Some(expected_ref));
+    assert_eq!(child["origin"].as_str(), Some("native"));
+    assert_eq!(child["observe_only"], true);
+    assert_eq!(child["own_identity"], false);
+    assert_eq!(child["harness"].as_str(), Some("muse"));
+    assert_eq!(child["state"].as_str(), Some("unknown"));
+    assert_no_token_key(child);
+
+    let result = fixture.json(&["result", overflow_id, "--generation", "1"]);
+    assert_eq!(result["turns"], json!([]), "no faked overflow turn");
+
+    let events = fixture.events();
+    let ours: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["agent"].as_str() == Some(overflow_id))
+        .collect();
+    let kinds: Vec<&str> = ours
+        .iter()
+        .map(|event| event["kind"].as_str().expect("event kind"))
+        .collect();
+    // The daemon publishes agent.created when the overflow child registers;
+    // the only turn/source fact under its Agent is the observation-
+    // unavailable source.gap, still no turn facts of any kind.
+    assert_eq!(kinds, ["agent.created", "source.gap"]);
+    assert!(ours[1]["data"]["source"] == "stream");
+    assert_eq!(ours[1]["data"]["families"], json!(["turn"]));
+    assert!(
+        ours[1]["data"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("tracking exceeded its bound")),
+        "honest unavailability reason"
+    );
+    // The bound no longer parent-gaps a proven child: the parent source
+    // stays clean while the child carries its own gap.
+    let parent_shown = fixture.json(&["show", root_id]);
+    let parent_sources = parent_shown["source_states"]
+        .as_array()
+        .expect("parent sources");
+    let parent_stream = parent_sources
+        .iter()
+        .find(|source| source["source"].as_str() == Some("stream"))
+        .expect("parent stream source");
+    assert!(
+        parent_stream["gap_id"].is_null(),
+        "overflow leaves no parent gap"
+    );
+}
+
+/// The first child's completed entry survived the overflow pressure: still
+/// exactly one turn.started/turn.completed, still no child gap.
+fn verify_workflow_child_no_eviction(fixture: &Fixture, child_id: &str) {
+    let shown = fixture.json(&["show", child_id]);
+    let sources = shown["source_states"].as_array().expect("source states");
+    let stream = sources
+        .iter()
+        .find(|source| source["source"].as_str() == Some("stream"))
+        .expect("child stream source");
+    assert!(stream["gap_id"].is_null(), "no eviction gap on first child");
+    let events = fixture.events();
+    let kinds: Vec<&str> = events
+        .iter()
+        .filter(|event| event["agent"].as_str() == Some(child_id))
+        .map(|event| event["kind"].as_str().expect("event kind"))
+        .collect();
+    // agent.created is the daemon registration event, not a turn fact: the
+    // child-filtered stream must still contain exactly the turn-only facts.
+    let turn_kinds: Vec<&str> = kinds
+        .iter()
+        .copied()
+        .filter(|kind| kind.starts_with("turn."))
+        .collect();
+    assert_eq!(turn_kinds, ["turn.started", "turn.completed"]);
+    assert_eq!(kinds[0], "agent.created");
+}
+
+fn verify_workflow_child_events_stable(fixture: &Fixture, child_id: &str) {
+    let events = fixture.events();
+    let child_turns: Vec<&str> = events
+        .iter()
+        .filter(|event| event["agent"].as_str() == Some(child_id))
+        .filter(|event| {
+            event["kind"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("turn."))
+        })
+        .map(|event| event["kind"].as_str().expect("event kind"))
+        .collect();
+    assert_eq!(child_turns, ["turn.started", "turn.completed"]);
+    let gaps: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["agent"].as_str() == Some(child_id)
+                && event["kind"].as_str() == Some("source.gap")
+        })
+        .collect();
+    assert_eq!(gaps.len(), 1, "exactly the producer-loss gap");
+    assert!(
+        gaps[0]["data"]["gap_id"]
+            .as_str()
+            .is_some_and(|gap| gap.starts_with("native-child-producer-unavailable:"))
+    );
+    assert_eq!(gaps[0]["data"]["families"], json!(["turn"]));
+    for event in events
+        .iter()
+        .filter(|event| event["agent"].as_str() == Some(child_id))
+    {
+        let kind = event["kind"].as_str().expect("event kind");
+        assert!(
+            matches!(
+                kind,
+                "agent.created"
+                    | "turn.started"
+                    | "turn.completed"
+                    | "source.gap"
+                    | "source.health"
+                    | "source.closed"
+            ),
+            "no forged child fact: {kind}"
+        );
+    }
+    // The completed turn survives producer loss; only running turns go unknown.
+    let result = fixture.json(&["result", child_id, "--generation", "1"]);
+    assert_eq!(result["turns"][0]["state"].as_str(), Some("completed"));
+    assert!(result["turns"][0]["final_text"].is_null());
 }

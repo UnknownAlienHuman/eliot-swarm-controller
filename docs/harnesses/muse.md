@@ -58,8 +58,36 @@ with the offered choices or questions (child approvals keep their subagent origi
 provenance); the transport receipt acknowledges presentation only and the
 decision travels as `approval/decide`, `userInput/answer` or `userInput/cancel`
 with the exact ids, an offered choice, and the current requirement. Replies decide
-from the current offer, never the opened snapshot: a stale choice is rejected, a
-consumed multi-stage reply resets on `approval/updated`, and only
+from the current offer, never a stale snapshot: a stale choice is rejected. A
+genuinely newer multi-stage requirement (same approval, strictly greater source
+index) replaces the in-memory offer, is persisted under the exact pending id with
+normalized `offer_seq`, and resets a consumed (Written) reply so the next stage can be
+decided; an Unknown reply is never reset nor rearmed. Each Applied approval outcome records `decided_offer_seq`, and the next
+explicit choice is admitted only once the persisted current offer is fresh past
+it. Duplicates and stale offers change nothing; unknown stays fenced. A decide
+control result is qualified against the authoritative view stream before it is
+returned, within the single absolute deadline captured before the write (never
+renewed): Applied only with exact proof derived from the owning path's
+successful validation and required persistence — a terminal resolution naming this
+generation's native decide id, or, after a clean admission ack, an offer
+advanced past the decided requirement that the owning path validated (for
+`approval/request`, the full request validation, so an offer the owning path
+rejects, such as one with no choices, never qualifies) and persisted. A
+rejected frame, a gap, or a failed persistence never qualifies, and no
+pre-parse of a frame counts as proof. Persistence is explicit: the offer
+helper reports success only after its actual commit, so a deferred or
+gapped offer (including an oversized envelope) never qualifies and the
+old Store offer is never treated as fresh. A terminal resolution must
+also name the exact retained turn on the wire: a resolution naming
+another turn is gapped before any commit, removal, or proof, and never
+mutates the retained entry. Changed offers without admission,
+absent requests, final text, and artifacts alone never qualify; missing or
+mismatched deciders, stream end, and deadline expiry stay unknown. An
+admitted-but-unproven decide stays Unknown with both the Core command id and
+the native decide id retained: only a late resolution naming that exact native
+id binds it, otherwise it closes unbound, and it is never replayed. Outcomes
+carry only whitelisted diagnostics: the numeric native error code and the
+resolved-decider present/match booleans. Only
 schema-documented pre-admission/validation errors prove rejection (anything else is
 unknown, never resubmitted). Approve and deny take an optional `choice_id` and
 optional `feedback` where the choice accepts it; answer takes `answers` mapping
@@ -69,7 +97,7 @@ for its pointer set and opens only what still binds to the live turn; anything
 naming the dead generation's turn is receipted and dropped as an orphan, never
 answered, and a failed pull never fails the resume.
 
-## Host permissions, route and final checks
+## Host permissions
 
 Sandbox posture is fixed at owned host birth (`muse serve` flags); MSP session/turn
 wire carries no sandbox field and posture is not negotiable per session. Profile
@@ -80,6 +108,50 @@ so effective permissions are reported as unknown (`permissions: null`,
 `permissions_verified: false`) and never derived from the requested flag or any
 unproven wire alias. The host flag remains applied at birth; a real native tool probe
 is still required to confirm effective posture.
+
+## Workflow children (native, observe-only)
+
+The Muse plugin observes actual `workflow` item revisions through the existing
+[`NativeWorkflowItemNotification` and `NativeWorkflowChild` DTOs](../../plugins/muse/src/native/types.rs)
+and tracks each child with [`WorkflowChildKey`](../../plugins/muse/src/workflow_child.rs)
+under `K(parentSessionId, workflowRunId, childId, attempt)`. The key retains
+`attempt` as the exact signed SDK wire integer. One native `host.agent` child
+is one Eliot Agent per canonical key — the key builds the collision-free
+canonical opaque `native_ref`, registration id, and turn key (stable across
+revisions; the shared core carries only the harness-generic registration
+RPC). The wire carries no session or turn id on the child itself, so the ONE
+normalized Eliot turn key is synthesized and is explicitly NOT an MSP turn id.
+
+Turn-only coverage (`turn` family): `scheduled` registers the observe-only
+tokenless child (Agent `Unknown`, no principal, no control verbs) through the
+shared `ChildRegistration` RPC; the first live actual-wire state (`started`,
+`usage`, `completed` without terminal) commits exactly one `turn.started`;
+`completed` WITHOUT an explicit `terminal` never completes; an explicit
+terminal commits exactly one `turn.completed` with the existing Muse status
+mapping (`completed`/`failed`/`cancelled` to
+`completed`/`failed`/`interrupted`, unknown terminals gap instead); a repeated
+terminal revision dedups. Never `session.ready`/`session.ended` or
+`message.completed`: there is no child session to fake (`childSessionId` is
+null on the wire), and `resultRef`/`message` history composites are
+unsupported — no fact is ever synthesized from them, and public history
+composites stay with the shared-boundary owner for dispatch.
+
+Workflow child revisions route independently of active-parent-turn buffering,
+and child tracking continues after the parent turn completes. Each key
+preserves its ParentSession/run/child/attempt binding plus the latest actual
+wire revision/status/sourceRange.
+Terminal stream loss unknowns open children (with a child gap when a turn
+started) and keeps already-completed ones; transient view gaps self-heal
+because every revision re-emits the full child list, so tracking continues.
+Detailed tracking is bounded (256 keys plus 256 unknown markers), but the
+bound never hides a proven child: an over-limit newcomer is still persisted
+through one idempotent registration plus an observation-unavailable child
+gap (visible Agent row, Unknown state, no turn facts, no replay), then marked
+unknown — never evicting a proven tracked child. Final text, usage
+provenance/transitive attribution, and timing stay unknown: no totals, and no
+timestamp is invented from `durationMs`. No new wire fields are introduced.
+
+## Route and final checks
 
 Do not assume a generic base-URL override. Use explicit native account/billing profiles
 and report what the host actually exposes. L7 covers lost replies, exact request/turn

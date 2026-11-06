@@ -12,6 +12,7 @@
 
 use eliot_core::{ProviderRestriction, ProviderRestrictionKind};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 // ---------------------------------------------------------------------------
 // JSON-RPC envelope
@@ -740,8 +741,11 @@ pub struct NativeApprovalDecideResult {
 }
 
 /// `approval/resolved` params: the first durable terminal decision. Only the
-/// binding fields are modelled; the decision itself has no Eliot channel
-/// (`request.resolved` carries no details by Store contract).
+/// binding fields are modelled, plus the optional native id of the decide
+/// command that resolved it: when a reply RPC outcome stays ambiguous, an
+/// exact `decidedByCommandId` match against the captured outstanding decide
+/// proves this generation's write applied. The decision itself has no Eliot
+/// channel (`request.resolved` carries no details by Store contract).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeApprovalResolvedNotification {
@@ -749,6 +753,8 @@ pub struct NativeApprovalResolvedNotification {
     pub session_id: String,
     pub turn_id: String,
     pub view_cursor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by_command_id: Option<String>,
 }
 
 /// `approval/updated` params: the refreshed pending view plus one change.
@@ -941,6 +947,78 @@ pub const APPROVAL_MODES: [&str; 4] = ["allowAll", "promptUnmatched", "onRequest
 
 pub fn is_approval_mode(value: &str) -> bool {
     APPROVAL_MODES.contains(&value)
+}
+
+// ---------------------------------------------------------------------------
+// Workflow children (installed WorkflowChild schema + wave3b actual wire)
+// ---------------------------------------------------------------------------
+
+/// One workflow child lifecycle fact: a `children[]` entry of a `workflow`
+/// item. Only the fields the turn-only observer consumes are modelled.
+///
+/// Installed `WorkflowChild` wire schema (Muse Code 1.4.0, bundle fingerprint
+/// `sha256:36466f63…0d3d7f`, wave3b probe receipt): `attempt`, `childId`,
+/// `durationMs`, `label`, `phase`, `resultRef`, `status`, `terminal`, `usage`.
+/// Correlation boundary: keyed strictly by `(childId, attempt)` inside
+/// `Item.children` under `workflowRunId` — no `sessionId` or `turnId` exists
+/// on the wire for a child, so the Eliot turn key is synthesized, never read.
+/// Deliberately unmodelled: `durationMs` (a duration, never converted into an
+/// invented timestamp), `resultRef` (never dereferenced; no `message.completed`
+/// or `session.*` fact is ever synthesized from it), `usage` (provenance and
+/// transitive attribution unknown; never totaled), `label`/`phase` (ignored).
+/// Unknown fields are ignored per additive-optional evolution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeWorkflowChild {
+    pub child_id: String,
+    pub attempt: i64,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<String>,
+}
+
+/// A `workflow` transcript item at one revision: a full re-emission of the
+/// child list, never a delta. `revision`/`status`/`sourceRange` stay the
+/// actual wire values; the child terminal (not the item status) drives the
+/// mapping, and the `message` workflow-summary composite is unsupported — no
+/// public history fact is ever synthesized from it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeWorkflowItem {
+    pub item_id: String,
+    pub revision: i64,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub workflow_run_id: String,
+    #[serde(default)]
+    pub children: Vec<NativeWorkflowChild>,
+}
+
+/// `item/started` | `item/updated` | `item/completed` envelope for a workflow
+/// item. The view cursor is not needed (revisions order the evidence); the
+/// `sourceRange` is retained for provenance, never as a replay cursor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeWorkflowItemNotification {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_range: Option<Value>,
+    pub item: NativeWorkflowItem,
+}
+
+impl NativeTurnTerminal {
+    /// Parse a workflow-child `terminal` string with the turn-terminal
+    /// vocabulary (`completed` | `failed` | `cancelled`). Wire-open: unknown
+    /// values decode as `Unknown` and must not settle a turn.
+    pub fn parse_workflow_terminal(value: &str) -> Self {
+        match value {
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1262,5 +1340,216 @@ mod tests {
         .expect("empty pending halves decode");
         assert!(result.approvals.is_empty());
         assert!(result.user_inputs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod workflow_schema_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Sanitized wave3b `item/updated` revision 2: the child is scheduled AFTER
+    /// the parent `turn/completed`. Shapes verbatim, ids redacted.
+    fn scheduled_revision() -> serde_json::Value {
+        json!({
+            "sessionId": "parent-session-sanitized",
+            "viewCursor": "v:redacted:14",
+            "sourceRange": {
+                "stream": {"kind": "session", "id": "parent-session-sanitized"},
+                "first": {"id": "workflow-item-sanitized", "sequence": 78},
+                "last": {"id": "rev-cursor-sanitized", "sequence": 97},
+            },
+            "item": {
+                "itemId": "workflow-item-sanitized",
+                "kind": "workflow",
+                "turnId": "parent-turn-sanitized",
+                "revision": 2,
+                "status": "inProgress",
+                "recordedAt": "2026-11-05T09:59:02.775698Z",
+                "fallbackText": "Workflow: model-chosen generated workflow",
+                "workflowRunId": "workflow-run-sanitized",
+                "entryId": "Read marker file",
+                "scriptId": "generated.workflow.Read_marker_file",
+                "triggerSource": "guidanceAuto",
+                "children": [
+                    {"childId": "child-sanitized", "attempt": 1, "status": "scheduled"},
+                ],
+            },
+        })
+    }
+
+    /// Sanitized wave3b `item/completed` revision 7: explicit terminal plus the
+    /// history-composite payloads the observer must never synthesize from.
+    fn terminal_revision() -> serde_json::Value {
+        json!({
+            "sessionId": "parent-session-sanitized",
+            "viewCursor": "v:redacted:19",
+            "sourceRange": {
+                "stream": {"kind": "session", "id": "parent-session-sanitized"},
+                "first": {"id": "workflow-item-sanitized", "sequence": 78},
+                "last": {"id": "rev-cursor-sanitized", "sequence": 117},
+            },
+            "item": {
+                "itemId": "workflow-item-sanitized",
+                "kind": "workflow",
+                "turnId": "parent-turn-sanitized",
+                "revision": 7,
+                "status": "completed",
+                "recordedAt": "2026-11-05T09:59:06.631016Z",
+                "fallbackText": "Workflow: model-chosen generated workflow",
+                "workflowRunId": "workflow-run-sanitized",
+                "entryId": "Read marker file",
+                "scriptId": "generated.workflow.Read_marker_file",
+                "triggerSource": "guidanceAuto",
+                "children": [{
+                    "childId": "child-sanitized",
+                    "attempt": 1,
+                    "status": "terminal",
+                    "durationMs": 3752,
+                    "terminal": "completed",
+                    "resultRef": "subagent-result://redacted#0",
+                    "label": "Read marker file",
+                    "phase": "settled",
+                    "usage": {
+                        "inputTokens": 10,
+                        "outputTokens": 2,
+                        "cachedTokens": 4,
+                        "cacheWriteTokens": 0,
+                        "cacheReadTokens": 4,
+                        "reasoningTokens": 1,
+                    },
+                    "futureChildField": {"nested": true},
+                }],
+                "message": "workflow-summary-redacted",
+                "futureItemField": [1, 2],
+            },
+            "emittedAtMs": 1793872746634u64,
+        })
+    }
+
+    #[test]
+    fn scheduled_and_terminal_revisions_decode_with_binding_intact() {
+        let scheduled: NativeWorkflowItemNotification =
+            serde_json::from_value(scheduled_revision()).expect("scheduled rev decodes");
+        assert_eq!(scheduled.session_id, "parent-session-sanitized");
+        assert_eq!(scheduled.item.item_id, "workflow-item-sanitized");
+        assert_eq!(scheduled.item.revision, 2);
+        assert_eq!(scheduled.item.status, "inProgress");
+        assert_eq!(
+            scheduled.item.turn_id.as_deref(),
+            Some("parent-turn-sanitized")
+        );
+        assert_eq!(scheduled.item.workflow_run_id, "workflow-run-sanitized");
+        assert!(scheduled.source_range.is_some());
+        assert_eq!(scheduled.item.children.len(), 1);
+        let child = &scheduled.item.children[0];
+        assert_eq!(child.child_id, "child-sanitized");
+        assert_eq!(child.attempt, 1);
+        assert_eq!(child.status, "scheduled");
+        assert_eq!(child.terminal, None);
+
+        let terminal: NativeWorkflowItemNotification =
+            serde_json::from_value(terminal_revision()).expect("terminal rev decodes");
+        assert_eq!(terminal.item.revision, 7);
+        assert_eq!(terminal.item.status, "completed");
+        let child = &terminal.item.children[0];
+        assert_eq!(child.status, "terminal");
+        assert_eq!(child.terminal.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn composites_and_unknown_fields_are_tolerated_never_modelled() {
+        // `durationMs`, `resultRef`, `usage`, `label`, `phase`, the item
+        // `message` composite and every future field decode without a home:
+        // the DTO has nowhere to put them, so no fact can cite them.
+        let notification: NativeWorkflowItemNotification =
+            serde_json::from_value(terminal_revision()).expect("composite rev decodes");
+        let encoded = serde_json::to_value(&notification).expect("DTO re-encodes");
+        let text = encoded.to_string();
+        for forbidden in [
+            "durationMs",
+            "resultRef",
+            "usage",
+            "label",
+            "phase",
+            "message",
+            "futureChildField",
+            "futureItemField",
+            "subagent-result",
+            "workflow-summary-redacted",
+        ] {
+            assert!(!text.contains(forbidden), "DTO must not retain {forbidden}");
+        }
+    }
+
+    #[test]
+    fn empty_children_and_missing_provenance_decode() {
+        // Revision 1 carries no children yet; cursor/range stay optional so a
+        // host that omits them still parses.
+        let notification: NativeWorkflowItemNotification = serde_json::from_value(json!({
+            "sessionId": "parent-session-sanitized",
+            "item": {
+                "itemId": "workflow-item-sanitized",
+                "kind": "workflow",
+                "revision": 1,
+                "status": "inProgress",
+                "workflowRunId": "workflow-run-sanitized",
+                "children": [],
+            },
+        }))
+        .expect("childless rev decodes");
+        assert!(notification.item.children.is_empty());
+        assert_eq!(notification.source_range, None);
+        assert_eq!(notification.item.turn_id, None);
+    }
+
+    #[test]
+    fn child_binding_fields_are_required() {
+        for child in [
+            json!({"attempt": 1, "status": "scheduled"}),
+            json!({"childId": "child-sanitized", "status": "scheduled"}),
+            json!({"childId": "child-sanitized", "attempt": 1}),
+        ] {
+            assert!(
+                serde_json::from_value::<NativeWorkflowChild>(child).is_err(),
+                "child identity must be complete"
+            );
+        }
+        assert!(
+            serde_json::from_value::<NativeWorkflowItemNotification>(json!({
+                "sessionId": "parent-session-sanitized",
+                "item": {
+                    "itemId": "workflow-item-sanitized",
+                    "kind": "workflow",
+                    "revision": 2,
+                    "status": "inProgress",
+                    "children": [],
+                },
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workflow_terminal_parses_the_turn_vocabulary_openly() {
+        assert_eq!(
+            NativeTurnTerminal::parse_workflow_terminal("completed"),
+            NativeTurnTerminal::Completed
+        );
+        assert_eq!(
+            NativeTurnTerminal::parse_workflow_terminal("failed"),
+            NativeTurnTerminal::Failed
+        );
+        assert_eq!(
+            NativeTurnTerminal::parse_workflow_terminal("cancelled"),
+            NativeTurnTerminal::Cancelled
+        );
+        for unknown in ["", "inProgress", "expired", "COMPLETED", " completed"] {
+            assert_eq!(
+                NativeTurnTerminal::parse_workflow_terminal(unknown),
+                NativeTurnTerminal::Unknown,
+                "terminal={unknown}"
+            );
+        }
     }
 }

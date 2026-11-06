@@ -8,7 +8,9 @@
 //! the ACK is validated with `ChildRegistration::validate_ack` before any fact
 //! is published under the child identity.
 
-use eliot_core::{ChildRegistration, ChildRegistrationAck, Error, Result};
+use eliot_core::{
+    CODEX_NATIVE_CHILD_FAMILIES, ChildRegistration, ChildRegistrationAck, Error, Result,
+};
 use eliot_plugin::PeerClient;
 use tokio::time::Instant;
 
@@ -75,7 +77,7 @@ pub(crate) async fn register_child(
         .await?;
     let ack: ChildRegistrationAck = serde_json::from_value(value)
         .map_err(|_| Error::new("source_integrity", "child ACK was not well formed"))?;
-    registration.validate_ack(&ack)?;
+    registration.validate_ack(&ack, "codex", &CODEX_NATIVE_CHILD_FAMILIES)?;
     Ok(ack)
 }
 
@@ -151,18 +153,28 @@ pub(crate) mod tests {
     #[test]
     fn ack_validation_accepts_only_the_exact_child_plan() {
         let reg = registration();
-        reg.validate_ack(&test_ack(&reg)).expect("exact plan");
+        reg.validate_ack(&test_ack(&reg), "codex", &CODEX_NATIVE_CHILD_FAMILIES)
+            .expect("exact plan");
         let mut wrong = test_ack(&reg);
         wrong
             .source_plan
             .insert("tool".to_owned(), "stream".to_owned());
-        assert!(reg.validate_ack(&wrong).is_err());
+        assert!(
+            reg.validate_ack(&wrong, "codex", &CODEX_NATIVE_CHILD_FAMILIES)
+                .is_err()
+        );
         let mut wrong = test_ack(&reg);
         wrong.agent.native_ref = Some("other".to_owned());
-        assert!(reg.validate_ack(&wrong).is_err());
+        assert!(
+            reg.validate_ack(&wrong, "codex", &CODEX_NATIVE_CHILD_FAMILIES)
+                .is_err()
+        );
         let mut wrong = test_ack(&reg);
         wrong.agent.control = AgentControl::Tree;
-        assert!(reg.validate_ack(&wrong).is_err());
+        assert!(
+            reg.validate_ack(&wrong, "codex", &CODEX_NATIVE_CHILD_FAMILIES)
+                .is_err()
+        );
     }
 
     #[test]
@@ -176,7 +188,8 @@ pub(crate) mod tests {
         assert_eq!(decoded, reg);
         let value: Value = serde_json::to_value(test_ack(&reg)).expect("ack encode");
         let round: ChildRegistrationAck = serde_json::from_value(value).expect("ack decode");
-        reg.validate_ack(&round).expect("round trip");
+        reg.validate_ack(&round, "codex", &CODEX_NATIVE_CHILD_FAMILIES)
+            .expect("round trip");
     }
 
     #[test]

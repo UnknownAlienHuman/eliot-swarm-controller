@@ -20,9 +20,9 @@ use crate::{
     workspaces::WorkspaceManager,
 };
 use eliot_core::{
-    Agent, AgentState, Command, CommandState, Error, Event, FrozenScriptContext, FrozenScriptRun,
-    NativeStoreBinding, Result, RunDefinitionArgs, ScriptProcessResult, SecretPolicy,
-    SubmitCommand, Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
+    Agent, AgentOrigin, AgentState, Command, CommandState, Error, Event, FrozenScriptContext,
+    FrozenScriptRun, NativeStoreBinding, Result, RunDefinitionArgs, ScriptProcessResult,
+    SecretPolicy, SubmitCommand, Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
     api::{
         AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
         AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
@@ -1967,6 +1967,13 @@ impl Router {
             .as_deref()
             .filter(|native_ref| !native_ref.is_empty())
             .ok_or_else(|| Error::new("bad_state", "Agent has no native reference"))?;
+
+        if agent.origin == AgentOrigin::Native && agent.harness == "muse" {
+            return Err(Error::new(
+                "unsupported",
+                "native history is unsupported for Muse child observations",
+            ));
+        }
 
         // This is a private native read. It is deliberately not reduced, stored,
         // published, or used to settle a command or input acknowledgement.
@@ -9630,6 +9637,193 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn muse_native_child_history_returns_unsupported_preserving_fences_and_codex_path() {
+        let router = router();
+        let (muse_parent, muse_parent_ref) = {
+            let mut store = router.inner.store.lock().await;
+            let launch_id = ulid::Ulid::new().to_string();
+            let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
+            launch.expected_generation = Some(0);
+            launch.args = json!({
+                "harness": "muse",
+                "profile": "muse-test",
+                "profile_snapshot": {},
+                "project": "native-child-history-test",
+                "workspace": "synthetic-workspace",
+            });
+            let command_id = launch.id.clone();
+            let parent_id = store
+                .submit("owner", launch, now_ms())
+                .unwrap()
+                .command
+                .target
+                .unwrap();
+            store.dispatch(&command_id, now_ms()).unwrap();
+            store
+                .put_batch(
+                    eliot_core::SourceBatch {
+                        batch_id: "muse-parent:ready".to_owned(),
+                        agent_id: parent_id.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        cursor: None,
+                        events: vec![eliot_core::NativeEvent {
+                            kind: "session.ready".to_owned(),
+                            native_id: "muse-parent:ready".to_owned(),
+                            ts: None,
+                            data: json!({
+                                "command_id": command_id,
+                                "native_scope": "muse:scope",
+                                "native_ref": "muse-session-1",
+                            }),
+                        }],
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            (parent_id, "muse-session-1".to_owned())
+        };
+
+        let muse_child_id = {
+            let mut store = router.inner.store.lock().await;
+            let change = store
+                .register_native_child(
+                    &muse_parent,
+                    1,
+                    eliot_core::ChildRegistration {
+                        registration_id: "muse:spawn:1".to_owned(),
+                        parent_id: muse_parent.clone(),
+                        parent_generation: 1,
+                        parent_native_ref: muse_parent_ref,
+                        native_scope: "muse:scope".to_owned(),
+                        native_ref: "muse:child:[\"muse-session-1\",\"run-1\",\"child-1\",1]"
+                            .to_owned(),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            change.value.agent.id
+        };
+
+        let (codex_parent, codex_parent_ref) = {
+            let mut store = router.inner.store.lock().await;
+            let launch_id = ulid::Ulid::new().to_string();
+            let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
+            launch.expected_generation = Some(0);
+            launch.args = json!({
+                "harness": "codex",
+                "profile": "codex-test",
+                "profile_snapshot": {},
+                "project": "native-child-history-test",
+                "workspace": "synthetic-workspace",
+            });
+            let command_id = launch.id.clone();
+            let parent_id = store
+                .submit("owner", launch, now_ms())
+                .unwrap()
+                .command
+                .target
+                .unwrap();
+            store.dispatch(&command_id, now_ms()).unwrap();
+            store
+                .put_batch(
+                    eliot_core::SourceBatch {
+                        batch_id: "codex-parent:ready".to_owned(),
+                        agent_id: parent_id.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        cursor: None,
+                        events: vec![eliot_core::NativeEvent {
+                            kind: "session.ready".to_owned(),
+                            native_id: "codex-parent:ready".to_owned(),
+                            ts: None,
+                            data: json!({
+                                "command_id": command_id,
+                                "native_scope": "codex:scope",
+                                "native_ref": "codex-session-1",
+                            }),
+                        }],
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            (parent_id, "codex-session-1".to_owned())
+        };
+
+        let codex_child_id = {
+            let mut store = router.inner.store.lock().await;
+            let change = store
+                .register_native_child(
+                    &codex_parent,
+                    1,
+                    eliot_core::ChildRegistration {
+                        registration_id: "codex:spawn:1".to_owned(),
+                        parent_id: codex_parent.clone(),
+                        parent_generation: 1,
+                        parent_native_ref: codex_parent_ref,
+                        native_scope: "codex:scope".to_owned(),
+                        native_ref: "codex-child-1".to_owned(),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            change.value.agent.id
+        };
+
+        // Grammar validation precedes dispatch:
+        assert_eq!(
+            router
+                .agent_history(
+                    &json!({"id": muse_child_id, "source": "invalid_source", "view": "turns"}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
+
+        // Generation fence precedes dispatch:
+        assert_eq!(
+            router
+                .agent_history(
+                    &json!({"id": muse_child_id, "generation": 2, "source": "native", "view": "turns"}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "stale_generation"
+        );
+
+        // Muse native child explicitly returns unsupported at dispatch boundary:
+        assert_eq!(
+            router
+                .agent_history(
+                    &json!({"id": muse_child_id, "generation": 1, "source": "native", "view": "turns"}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+
+        // Codex native child path unchanged: proceeds past dispatch boundary to snapshot_observer:
+        assert_eq!(
+            router
+                .agent_history(
+                    &json!({"id": codex_child_id, "generation": 1, "source": "native", "view": "turns"}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "unavailable"
+        );
     }
 
     pub(super) fn read_fixture_event(

@@ -2710,7 +2710,7 @@ fn muse_manifest() -> PluginManifest {
             discover: false,
             observe: false,
             start_requires_input: false,
-            native_children: false,
+            native_children: true,
         },
         sources: BTreeMap::from([("controlled".to_owned(), controlled)]),
         proxy: "none".to_owned(),
@@ -2803,7 +2803,7 @@ mod tests {
         );
         assert!(manifest.child_verbs.is_empty());
         assert!(!manifest.features.start_requires_input);
-        assert!(!manifest.features.native_children);
+        assert!(manifest.features.native_children);
         assert!(!manifest.features.discover);
         assert!(!manifest.features.observe);
         assert_eq!(manifest.sources.len(), 1);

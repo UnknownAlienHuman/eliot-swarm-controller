@@ -1,6 +1,10 @@
+#[path = "workflow_child.rs"]
+mod workflow_child;
+
 use eliot_core::{Error, ProviderRestriction, Result, SecretPolicy};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
+    protocol::MAX_COMMAND_ID_BYTES,
     session::{
         EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error,
         event_id as shared_event_id, native_no_write, rejected_control, request_event_id,
@@ -15,10 +19,16 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+use self::workflow_child::{
+    MAX_WORKFLOW_CHILDREN, PlannedAction, WorkflowChildKey, WorkflowChildState, binding_from_ack,
+    child_event_id, complete_event_data, is_admission_rejection, is_workflow_item_frame,
+    muse_child_key, register_child, should_bypass_parent_buffer, start_event_data,
+};
 use crate::native::{
-    NativeClient, NativeFrame, StreamState,
+    NativeClient, NativeFrame, StreamState, native_error_code,
     requests::{
-        CorePending, describe_request, refresh_offer_from_raw, reply_for, same_approval_offer,
+        CorePending, describe_request, is_newer_approval_requirement, refresh_offer_from_raw,
+        reply_for, same_approval_offer,
     },
     types::{
         NativeApprovalDecideResult, NativeApprovalResolvedNotification,
@@ -28,7 +38,8 @@ use crate::native::{
         NativeSessionViewHealthChangedNotification, NativeTurnCompletedNotification,
         NativeTurnError, NativeTurnStartedNotification, NativeTurnTerminal,
         NativeUserInputAnswerResult, NativeUserInputCancelResult,
-        NativeUserInputSettledNotification, NativeViewHealth,
+        NativeUserInputSettledNotification, NativeViewHealth, NativeWorkflowChild,
+        NativeWorkflowItemNotification,
     },
 };
 
@@ -137,9 +148,92 @@ enum NativeReplyState {
 struct PendingNativeRequest {
     request: CorePending,
     reply_command_id: Option<String>,
+    /// Native `commandId` of the outstanding reply while Writing, retained
+    /// while its outcome stays Unknown so a later `approval/resolved` can
+    /// prove (via `decidedByCommandId`) that this exact decide applied.
+    /// Retained on every Unknown outcome (admitted-unproven and ambiguous
+    /// alike); cleared only when the entry returns to Available or settles
+    /// as Written for a non-decide reply.
+    reply_native_command_id: Option<String>,
     reply_state: NativeReplyState,
     /// Observation counter at the last stream update of this entry.
     observed_at: u64,
+}
+
+/// Exact binding captured when an `approval/decide` is written, used to
+/// qualify the control result against authoritative view frames. Generation
+/// rides on the live turn: the captured turn is active at send time, and
+/// only frames naming this exact session, turn, and approval can qualify.
+#[derive(Clone)]
+struct DecideCapture {
+    session_id: String,
+    turn_id: String,
+    approval_id: String,
+    decided_seq: i64,
+    native_command_id: String,
+}
+
+/// Whitelisted view diagnostics for a decide qualification: whether a
+/// terminal resolution for this exact decide was observed, and whether it
+/// carried a decider id that matched ours. Booleans only, never payload.
+#[derive(Clone, Default)]
+struct DecideViewDiag {
+    resolved_seen: bool,
+    decider_present: bool,
+    decider_match: bool,
+    resolved_decisive: bool,
+}
+
+/// Exact decider proof: the resolution names this generation's outstanding
+/// decide command id, non-empty on both sides. Anything else — missing,
+/// blank, or another decider — proves nothing about our write.
+fn resolved_decider_matches(decided_by: Option<&str>, ours: &str) -> bool {
+    !ours.trim().is_empty() && decided_by.is_some_and(|id| !id.trim().is_empty() && id == ours)
+}
+
+/// How the decide RPC settled before view qualification: a clean admission
+/// ack still needs view proof, while an ambiguous outcome additionally
+/// carries the RPC error code and the reason to keep if unproven.
+enum DecideRpcOutcome<'a> {
+    Admitted,
+    Ambiguous {
+        error_code: Option<i64>,
+        unproven_reason: &'a str,
+    },
+}
+
+/// One decide awaiting view qualification: the exact sent binding plus the
+/// control identities the result is settled under.
+struct DecideQualification<'a> {
+    command_id: &'a str,
+    request_id: &'a str,
+    turn_id: &'a str,
+    capture: &'a DecideCapture,
+    deadline: Instant,
+    rpc: DecideRpcOutcome<'a>,
+}
+
+/// Attach the whitelisted decide diagnostics to a control outcome: the
+/// numeric native error code when the RPC itself errored, and the
+/// resolved-decider booleans when a terminal resolution was observed.
+/// Nothing else is ever attached: no raw errors, payloads, or ids.
+fn with_decide_diag(mut outcome: Value, error_code: Option<i64>, diag: &DecideViewDiag) -> Value {
+    if let Some(fields) = outcome.as_object_mut() {
+        if let Some(code) = error_code {
+            fields.insert("native_error_code".to_owned(), Value::from(code));
+        }
+        if diag.resolved_seen {
+            fields.insert(
+                "resolved_decider_present".to_owned(),
+                Value::from(diag.decider_present),
+            );
+            fields.insert(
+                "resolved_decider_match".to_owned(),
+                Value::from(diag.decider_match),
+            );
+        }
+    }
+    outcome
 }
 
 #[derive(Clone)]
@@ -175,7 +269,7 @@ struct EventProcessor {
     gap_number: u64,
     accept_frames: bool,
     planned_stop: bool,
-    loss_reason: Option<&'static str>,
+    loss_reason: Option<String>,
     frames_drained: bool,
     pending_end_stop: Option<oneshot::Sender<Result<()>>>,
     writes_blocked: bool,
@@ -199,6 +293,27 @@ struct EventProcessor {
     expected_requests: HashSet<String>,
     /// Pulled snapshot entries waiting for a live turn to bind to.
     stashed_entries: Vec<StashedPending>,
+    /// Native scope bound at readiness: workflow-child registration needs the
+    /// exact scope the parent session committed.
+    native_scope: Option<String>,
+    /// Workflow-child tracking by canonical key K. Children outlive the
+    /// parent turn: parent completion never clears this map.
+    workflow_children: HashMap<WorkflowChildKey, WorkflowChildState>,
+    /// Bounded unknown markers for children whose observation was lost
+    /// (overflow, rejected registration, stream end). Repeats stay silent;
+    /// eviction only re-gaps, never re-hides a proven tracked child.
+    workflow_unknown: HashSet<WorkflowChildKey>,
+    workflow_unknown_order: VecDeque<WorkflowChildKey>,
+    /// Active decide qualification while `pump_decide_proof` pumps frames.
+    /// Owning paths (`resolve_approval`, `refresh_approval`,
+    /// `process_request`) set the frame proof/diag fields below only after
+    /// their own successful validation and required persistence; the pump
+    /// reads them only after `handle_frame` returns. `None` outside a pump.
+    active_decide: Option<DecideCapture>,
+    active_decide_admission: bool,
+    frame_decide_proof: bool,
+    frame_decide_decisive: bool,
+    frame_decide_diag: DecideViewDiag,
 }
 
 struct StashedPending {
@@ -395,6 +510,15 @@ impl EventProcessor {
             dropped_native_order: VecDeque::new(),
             expected_requests: HashSet::new(),
             stashed_entries: Vec::new(),
+            native_scope: None,
+            workflow_children: HashMap::new(),
+            workflow_unknown: HashSet::new(),
+            workflow_unknown_order: VecDeque::new(),
+            active_decide: None,
+            active_decide_admission: false,
+            frame_decide_proof: false,
+            frame_decide_decisive: false,
+            frame_decide_diag: DecideViewDiag::default(),
         }
     }
 
@@ -403,7 +527,11 @@ impl EventProcessor {
         self.status.observation
     }
 
-    async fn handle_control(&mut self, control: Control) -> bool {
+    async fn handle_control(
+        &mut self,
+        frames: &mut mpsc::Receiver<NativeFrame>,
+        control: Control,
+    ) -> bool {
         match control {
             Control::ViewReadback {
                 session_id,
@@ -462,7 +590,7 @@ impl EventProcessor {
                 reply,
             } => {
                 let result = self
-                    .reply_request(&command_id, &request_id, &turn_id, &verb, &args)
+                    .reply_request(frames, &command_id, &request_id, &turn_id, &verb, &args)
                     .await;
                 let _ = reply.send(result);
                 true
@@ -552,7 +680,15 @@ impl EventProcessor {
                 }
             }
             Some(NativeFrame::Notification { method, params }) => {
-                if self.should_buffer(&method) {
+                // Workflow children ride the parent stream but outlive the
+                // parent turn: route them before active-parent-turn buffering.
+                let bypass_buffer = should_bypass_parent_buffer(
+                    self.status.ready,
+                    self.status.session_id.is_some(),
+                    &method,
+                    &params,
+                );
+                if !bypass_buffer && self.should_buffer(&method) {
                     self.buffer_frame(BufferedNativeFrame::Notification { method, params });
                 } else if let Err(error) = self.process_notification(method, params).await {
                     self.status.source_unknown = true;
@@ -580,15 +716,16 @@ impl EventProcessor {
                 if !self.planned_stop && self.loss_reason.is_none() {
                     self.defer_gap("Muse native event reader closed");
                 }
+                self.settle_workflow_children().await;
                 self.report_gap_if_queue_empty(true).await;
                 self.finish_pending_end_stop().await;
             }
         }
     }
 
-    fn defer_gap(&mut self, reason: &'static str) {
+    fn defer_gap(&mut self, reason: impl Into<String>) {
         if self.loss_reason.is_none() {
-            self.loss_reason = Some(reason);
+            self.loss_reason = Some(reason.into());
         }
     }
 
@@ -596,9 +733,9 @@ impl EventProcessor {
         if queue_empty
             && !self.gap_reported
             && !self.writes_blocked
-            && let Some(reason) = self.loss_reason
+            && let Some(reason) = self.loss_reason.clone()
         {
-            let _ = self.record_gap(reason).await;
+            let _ = self.record_gap(&reason).await;
         }
     }
 
@@ -675,6 +812,7 @@ impl EventProcessor {
             ));
         }
         self.status.session_id = Some(session_id.clone());
+        self.native_scope = Some(native_scope.clone());
         self.flush_buffered_health().await?;
         if self.status.view_unavailable {
             return Err(Error::new(
@@ -753,7 +891,14 @@ impl EventProcessor {
         while let Some(frame) = self.buffer.pop_front() {
             self.buffer_bytes = self.buffer_bytes.saturating_sub(frame.size);
             let should_buffer = match &frame.frame {
-                BufferedNativeFrame::Notification { method, .. } => self.should_buffer(method),
+                BufferedNativeFrame::Notification { method, params } => {
+                    !should_bypass_parent_buffer(
+                        self.status.ready,
+                        self.status.session_id.is_some(),
+                        method,
+                        params,
+                    ) && self.should_buffer(method)
+                }
                 BufferedNativeFrame::Request { .. } => {
                     !self.status.ready || self.status.active_turn_id.is_none()
                 }
@@ -843,6 +988,7 @@ impl EventProcessor {
             .active_turn_id
             .as_deref()
             .ok_or_else(|| Error::new("unknown", "Muse request has no associated turn"))?;
+        let session_id_owned = session_id.to_owned();
         let request = match describe_request(&method, &params, session_id, turn_id) {
             Ok(request) => request,
             Err(error) if error.code == "source_integrity" => {
@@ -861,10 +1007,30 @@ impl EventProcessor {
                         .await;
                     return Ok(());
                 }
-                return self.reject_request(id, &method, &params, error).await;
+                let gap_reason = native_request_gap_reason(
+                    &method,
+                    &error.code,
+                    &params,
+                    session_id,
+                    turn_id,
+                    self.status.active_turn_id.is_some(),
+                );
+                return self
+                    .reject_request(id, &method, &params, error, gap_reason)
+                    .await;
             }
             Err(error) => {
-                return self.reject_request(id, &method, &params, error).await;
+                let gap_reason = native_request_gap_reason(
+                    &method,
+                    &error.code,
+                    &params,
+                    session_id,
+                    turn_id,
+                    self.status.active_turn_id.is_some(),
+                );
+                return self
+                    .reject_request(id, &method, &params, error, gap_reason)
+                    .await;
             }
         };
         // The receipt acknowledges presentation only (SS5.3.3): it changes no
@@ -901,14 +1067,62 @@ impl EventProcessor {
                         same_approval_offer(&existing.request.details, &params)
                     });
             let observed = self.observe();
-            if let Some(existing) = self.pending_requests.get_mut(&request_id) {
-                existing.observed_at = observed;
-                if !same && refresh_offer_from_raw(&mut existing.request.details, &params).is_err()
-                {
-                    return self
-                        .record_gap("Muse re-issued approval omitted its refreshed offer")
-                        .await;
+            let (prior, newer) = self
+                .pending_requests
+                .get(&request_id)
+                .map(|existing| {
+                    (
+                        existing.reply_state,
+                        !same && is_newer_approval_requirement(&existing.request.details, &params),
+                    )
+                })
+                .unwrap_or((NativeReplyState::Available, false));
+            if same || !newer {
+                if let Some(existing) = self.pending_requests.get_mut(&request_id) {
+                    existing.observed_at = observed;
                 }
+                if let Some(native_id) = orphan_request_id(&method, &params) {
+                    self.expected_requests.remove(native_id.as_str());
+                }
+                return Ok(());
+            }
+            let refreshed = if let Some(existing) = self.pending_requests.get_mut(&request_id) {
+                existing.observed_at = observed;
+                if refresh_offer_from_raw(&mut existing.request.details, &params).is_err() {
+                    None
+                } else {
+                    if existing.reply_state == NativeReplyState::Written {
+                        existing.reply_state = NativeReplyState::Available;
+                        existing.reply_command_id = None;
+                        existing.reply_native_command_id = None;
+                    }
+                    Some(existing.request.clone())
+                }
+            } else {
+                None
+            };
+            let Some(refreshed) = refreshed else {
+                return self
+                    .record_gap("Muse re-issued approval omitted its refreshed offer")
+                    .await;
+            };
+            if matches!(
+                prior,
+                NativeReplyState::Available | NativeReplyState::Written
+            ) && !self.commit_offer_update(&refreshed).await?
+            {
+                return Ok(());
+            }
+            if let (Some(seq), Some(approval_id)) = (
+                refreshed.details.get("offer_seq").and_then(Value::as_i64),
+                refreshed.details.get("approval_id").and_then(Value::as_str),
+            ) {
+                self.note_decide_offer_proof(
+                    session_id_owned.as_str(),
+                    refreshed.turn_id.as_str(),
+                    approval_id,
+                    seq,
+                );
             }
             if let Some(native_id) = orphan_request_id(&method, &params) {
                 self.expected_requests.remove(native_id.as_str());
@@ -944,6 +1158,19 @@ impl EventProcessor {
             }
         };
         self.commit_event("request.opened", native_id, data).await?;
+        let open_proof: Option<(String, i64, String)> = if request.kind == "approval" {
+            match (
+                request.details.get("offer_seq").and_then(Value::as_i64),
+                request.details.get("approval_id").and_then(Value::as_str),
+            ) {
+                (Some(seq), Some(approval_id)) => {
+                    Some((request.turn_id.clone(), seq, approval_id.to_owned()))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let observed = self.observe();
         if let Some(native_id) = pending_native_id(&request) {
             self.native_index
@@ -955,10 +1182,19 @@ impl EventProcessor {
             PendingNativeRequest {
                 request,
                 reply_command_id: None,
+                reply_native_command_id: None,
                 reply_state: NativeReplyState::Available,
                 observed_at: observed,
             },
         );
+        if let Some((open_turn, seq, approval_id)) = open_proof {
+            self.note_decide_offer_proof(
+                session_id_owned.as_str(),
+                open_turn.as_str(),
+                approval_id.as_str(),
+                seq,
+            );
+        }
         Ok(())
     }
 
@@ -968,6 +1204,7 @@ impl EventProcessor {
         method: &str,
         params: &Value,
         error: Error,
+        gap_reason: String,
     ) -> Result<()> {
         let rejected = self
             .native
@@ -981,13 +1218,158 @@ impl EventProcessor {
         } else if rejected.is_err() {
             self.defer_gap("Muse native request rejection was not written");
         } else {
-            self.defer_gap("Muse native request did not match its exact session/turn schema");
+            self.defer_gap(gap_reason);
         }
         Ok(())
     }
 
+    /// Pump live native frames through the existing frame path while an
+    /// `approval/decide` control result stays unqualified, watching for the
+    /// authoritative view proof of this exact decide: a terminal resolution
+    /// naming our native command id, or — only after a clean admission ack —
+    /// an offer that advanced past our decided requirement. Every drained
+    /// frame is processed normally in arrival order (`handle_frame` first);
+    /// nothing is dropped and no pre-parse of the frame is consulted.
+    /// Proof is recorded only by the owning paths (`resolve_approval`,
+    /// `refresh_approval`, `process_request`) after their own successful
+    /// validation and required persistence, and read only after that frame
+    /// has been handled. A rejected frame, a gap, or a failed persistence
+    /// therefore never counts as Applied. Returns true once the decide is
+    /// proven applied. The single absolute deadline (captured before the
+    /// write, never renewed) and stream EOF both end the wait unproven.
+    async fn pump_decide_proof(
+        &mut self,
+        frames: &mut mpsc::Receiver<NativeFrame>,
+        capture: &DecideCapture,
+        deadline: Instant,
+        admission_proven: bool,
+        diag: &mut DecideViewDiag,
+    ) -> bool {
+        self.active_decide = Some(capture.clone());
+        self.active_decide_admission = admission_proven;
+        self.frame_decide_proof = false;
+        self.frame_decide_decisive = false;
+        self.frame_decide_diag = DecideViewDiag::default();
+        let proven = 'outer: loop {
+            while Instant::now() < deadline {
+                let Ok(frame) = frames.try_recv() else {
+                    break;
+                };
+                let frame_proven = self.pump_one_decide_frame(frames, frame, diag).await;
+                if frame_proven {
+                    break 'outer true;
+                }
+                if self.frame_decide_decisive {
+                    break 'outer false;
+                }
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            match timeout_at(deadline, frames.recv()).await {
+                Ok(Some(frame)) => {
+                    let frame_proven = self.pump_one_decide_frame(frames, frame, diag).await;
+                    if frame_proven {
+                        break true;
+                    }
+                    if self.frame_decide_decisive {
+                        break false;
+                    }
+                }
+                _ => break false,
+            }
+        };
+        self.active_decide = None;
+        self.active_decide_admission = false;
+        self.frame_decide_proof = false;
+        self.frame_decide_decisive = false;
+        proven
+    }
+
+    /// Handle one pumped frame in arrival order and merge any proof/diag
+    /// the owning path recorded for that exact frame. Returns true only
+    /// when the owning path proved this decide applied.
+    async fn pump_one_decide_frame(
+        &mut self,
+        frames: &mut mpsc::Receiver<NativeFrame>,
+        frame: NativeFrame,
+        diag: &mut DecideViewDiag,
+    ) -> bool {
+        self.frame_decide_proof = false;
+        self.frame_decide_decisive = false;
+        self.frame_decide_diag = DecideViewDiag::default();
+        self.handle_frame(Some(frame)).await;
+        self.report_gap_if_queue_empty(frames.is_empty()).await;
+        if self.frame_decide_diag.resolved_seen {
+            diag.resolved_seen = true;
+            diag.decider_present = self.frame_decide_diag.decider_present;
+            diag.decider_match = self.frame_decide_diag.decider_match;
+            diag.resolved_decisive = true;
+        }
+        self.frame_decide_proof
+    }
+
+    /// Record non-terminal offer proof from an owning path: only with
+    /// admission proven, on the exact captured session/turn/approval, and
+    /// only when the owning refreshed offer is strictly past the decided
+    /// requirement. Callers invoke this only after their own successful
+    /// validation (and, where they persist, successful persistence).
+    fn note_decide_offer_proof(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        approval_id: &str,
+        offer_seq: i64,
+    ) {
+        let Some(capture) = self.active_decide.clone() else {
+            return;
+        };
+        if !self.active_decide_admission {
+            return;
+        }
+        if capture.session_id != session_id
+            || capture.turn_id != turn_id
+            || capture.approval_id != approval_id
+        {
+            return;
+        }
+        if offer_seq > capture.decided_seq {
+            self.frame_decide_proof = true;
+        }
+    }
+
+    /// Record terminal-resolution proof/diag from `resolve_approval`, only
+    /// after its commit succeeded and the entry was removed. A resolution
+    /// that does not name our native decide id is decisive the other way.
+    fn note_decide_resolved(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        approval_id: &str,
+        decided_by: Option<&str>,
+        bound_to_ours: bool,
+    ) {
+        let Some(capture) = self.active_decide.clone() else {
+            return;
+        };
+        if capture.session_id != session_id
+            || capture.turn_id != turn_id
+            || capture.approval_id != approval_id
+        {
+            return;
+        }
+        self.frame_decide_diag.resolved_seen = true;
+        self.frame_decide_diag.decider_present = decided_by.is_some_and(|id| !id.trim().is_empty());
+        self.frame_decide_diag.decider_match =
+            resolved_decider_matches(decided_by, &capture.native_command_id);
+        self.frame_decide_diag.resolved_decisive = true;
+        self.frame_decide_decisive = true;
+        self.frame_decide_proof = bound_to_ours && self.frame_decide_diag.decider_match;
+    }
+
     async fn reply_request(
         &mut self,
+        frames: &mut mpsc::Receiver<NativeFrame>,
         command_id: &str,
         request_id: &str,
         turn_id: &str,
@@ -1052,13 +1434,51 @@ impl EventProcessor {
         }
         .unwrap_or_default()
         .to_owned();
+        let decided_offer_seq = (reply.method == "approval/decide")
+            .then(|| {
+                params
+                    .get("requirementId")
+                    .and_then(|value| value.get("sourceIndex"))
+                    .and_then(Value::as_i64)
+            })
+            .flatten();
+        let is_decide = reply.method == "approval/decide";
+        // View qualification needs the exact sent binding. It is read from
+        // the same validated values the reply was built from, so it cannot
+        // be missing; anything else leaves the request available pre-write.
+        let capture: Option<DecideCapture> = if !is_decide {
+            None
+        } else {
+            let (Some(approval_id), Some(sent_session), Some(seq)) = (
+                params.get("approvalId").and_then(Value::as_str),
+                params.get("sessionId").and_then(Value::as_str),
+                decided_offer_seq,
+            ) else {
+                return Ok(rejected_control(
+                    "Muse request reply binding could not be captured",
+                ));
+            };
+            Some(DecideCapture {
+                session_id: sent_session.to_owned(),
+                turn_id: turn_id.to_owned(),
+                approval_id: approval_id.to_owned(),
+                decided_seq: seq,
+                native_command_id: native_command_id.clone(),
+            })
+        };
         let request = entry.request.clone();
         entry.reply_state = NativeReplyState::Writing;
-        let acknowledged = match self
-            .native
-            .call(reply.method, params, Instant::now() + EVENT_DEADLINE)
-            .await
-        {
+        entry.reply_native_command_id = Some(native_command_id.clone());
+        if is_decide {
+            // The view-wait below may resolve while this RPC is outstanding;
+            // the outstanding Eliot command must already be recorded so the
+            // resolution can bind it.
+            entry.reply_command_id = Some(command_id.to_owned());
+        }
+        // ONE absolute deadline, captured before the write and carried
+        // through the RPC and the view wait alike: never renewed.
+        let deadline = Instant::now() + EVENT_DEADLINE;
+        let acknowledged = match self.native.call(reply.method, params, deadline).await {
             Ok(ack) => ack,
             Err(error) if native_no_write(&error.code) || error.code == "native_rejected" => {
                 // Proven not admitted (transport never wrote, or a
@@ -1067,23 +1487,56 @@ impl EventProcessor {
                 if let Some(entry) = self.pending_requests.get_mut(request_id) {
                     entry.reply_state = NativeReplyState::Available;
                     entry.reply_command_id = None;
+                    entry.reply_native_command_id = None;
                 }
                 return Ok(rejected_control("Muse request reply was not admitted"));
             }
-            Err(_) => {
-                if let Some(entry) = self.pending_requests.get_mut(request_id) {
-                    entry.reply_state = NativeReplyState::Unknown;
-                    entry.reply_command_id = Some(command_id.to_owned());
+            Err(error) => {
+                let error_code = native_error_code(&error);
+                if !is_decide {
+                    if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                        entry.reply_state = NativeReplyState::Unknown;
+                        entry.reply_command_id = Some(command_id.to_owned());
+                    }
+                    return Ok(unknown_control(
+                        "Muse request reply may have been dispatched; it will not be repeated",
+                    ));
                 }
-                return Ok(unknown_control(
-                    "Muse request reply may have been dispatched; it will not be repeated",
-                ));
+                let Some(capture) = capture else {
+                    if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                        entry.reply_state = NativeReplyState::Unknown;
+                        entry.reply_command_id = Some(command_id.to_owned());
+                    }
+                    let _ = self
+                        .record_gap("Muse decide binding could not be captured")
+                        .await;
+                    return Ok(unknown_control(
+                        "Muse request reply binding is unresolved and will not be repeated",
+                    ));
+                };
+                return self
+                    .qualify_decide(
+                        frames,
+                        DecideQualification {
+                            command_id,
+                            request_id,
+                            turn_id,
+                            capture: &capture,
+                            deadline,
+                            rpc: DecideRpcOutcome::Ambiguous {
+                                error_code,
+                                unproven_reason:
+                                    "Muse request reply may have been dispatched; it will not be repeated",
+                            },
+                        },
+                    )
+                    .await;
             }
         };
         // Admission proves nothing by itself (the ack echoes the command
         // id, not the decision): the ack must echo the exact submitted
         // command id, the acceptance status, and the exact decided request
-        // id. A malformed ack leaves the write unknown.
+        // id.
         let acked = match reply.method {
             "approval/decide" => serde_json::from_value::<NativeApprovalDecideResult>(acknowledged)
                 .ok()
@@ -1109,25 +1562,197 @@ impl EventProcessor {
                         && ack.user_input_id == expected_native_id
                 }),
         };
-        if !acked {
+        if !is_decide {
+            if !acked {
+                if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                    entry.reply_state = NativeReplyState::Unknown;
+                    entry.reply_command_id = Some(command_id.to_owned());
+                }
+                return Ok(unknown_control(
+                    "Muse request reply did not acknowledge the exact submitted command",
+                ));
+            }
+            if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                entry.reply_state = NativeReplyState::Written;
+                entry.reply_command_id = Some(command_id.to_owned());
+                entry.reply_native_command_id = None;
+            }
+            return Ok(json!({
+                "state": "applied",
+                "command_id": command_id,
+                "request_id": request.id,
+                "turn_id": request.turn_id,
+            }));
+        }
+        let Some(capture) = capture else {
             if let Some(entry) = self.pending_requests.get_mut(request_id) {
                 entry.reply_state = NativeReplyState::Unknown;
                 entry.reply_command_id = Some(command_id.to_owned());
             }
+            let _ = self
+                .record_gap("Muse decide binding could not be captured")
+                .await;
             return Ok(unknown_control(
-                "Muse request reply did not acknowledge the exact submitted command",
+                "Muse request reply binding is unresolved and will not be repeated",
             ));
+        };
+        // A decide is Applied only on authoritative view proof, never from
+        // the admission ack alone; a malformed ack qualifies like an
+        // ambiguous RPC error (a resolution naming our decide still proves
+        // the write applied).
+        if acked {
+            self.qualify_decide(
+                frames,
+                DecideQualification {
+                    command_id,
+                    request_id,
+                    turn_id,
+                    capture: &capture,
+                    deadline,
+                    rpc: DecideRpcOutcome::Admitted,
+                },
+            )
+            .await
+        } else {
+            self.qualify_decide(
+                frames,
+                DecideQualification {
+                    command_id,
+                    request_id,
+                    turn_id,
+                    capture: &capture,
+                    deadline,
+                    rpc: DecideRpcOutcome::Ambiguous {
+                        error_code: None,
+                        unproven_reason:
+                            "Muse request reply did not acknowledge the exact submitted command",
+                    },
+                },
+            )
+            .await
         }
-        if let Some(entry) = self.pending_requests.get_mut(request_id) {
-            entry.reply_state = NativeReplyState::Written;
-            entry.reply_command_id = Some(command_id.to_owned());
+    }
+
+    /// Settle one written decide against the authoritative view stream: pump
+    /// live frames through the existing frame path until this exact decide is
+    /// proven applied, proven otherwise decided, the stream ends, or the
+    /// single carried deadline expires. Proven terminal proof removed the
+    /// entry via the pumped resolution; proven nonterminal proof only
+    /// refreshed it, so the stage is consumed here (mirroring the update
+    /// reset, which cannot fire while Writing) and the consumed offer is
+    /// persisted for the owner projection and the stage gate; if that
+    /// required persistence fails or gaps, the result is Unknown, never
+    /// Applied. Unproven outcomes stay honest and fenced: an
+    /// admitted-but-unproven write stays Unknown with both the Core and
+    /// native bindings retained, so only a late resolution naming this
+    /// exact native decide id can bind it (otherwise it closes unbound);
+    /// an ambiguous write likewise stays fenced unknown. Never resends,
+    /// never rearms Unknown.
+    async fn qualify_decide(
+        &mut self,
+        frames: &mut mpsc::Receiver<NativeFrame>,
+        qualification: DecideQualification<'_>,
+    ) -> Result<Value> {
+        let DecideQualification {
+            command_id,
+            request_id,
+            turn_id,
+            capture,
+            deadline,
+            rpc,
+        } = qualification;
+        let admission_proven = matches!(rpc, DecideRpcOutcome::Admitted);
+        let mut diag = DecideViewDiag::default();
+        let proven = self
+            .pump_decide_proof(frames, capture, deadline, admission_proven, &mut diag)
+            .await;
+        if proven {
+            if let Some(refreshed) = self
+                .pending_requests
+                .get(request_id)
+                .map(|entry| entry.request.clone())
+            {
+                let live_turn =
+                    self.status.active_turn_id.as_deref() == Some(refreshed.turn_id.as_str());
+                if live_turn {
+                    // The pumped update could not persist while Writing, so
+                    // this is the required persistence for non-terminal
+                    // proof (terminal proof already removed the entry and
+                    // persisted its resolution in the owning path). A
+                    // failed or gapped persistence is never Applied.
+                    let persisted = matches!(self.commit_offer_update(&refreshed).await, Ok(true));
+                    if !persisted {
+                        if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                            entry.reply_state = NativeReplyState::Unknown;
+                            entry.reply_command_id = Some(command_id.to_owned());
+                        }
+                        let error_code = match rpc {
+                            DecideRpcOutcome::Admitted => None,
+                            DecideRpcOutcome::Ambiguous { error_code, .. } => error_code,
+                        };
+                        return Ok(with_decide_diag(
+                            unknown_control(
+                                "Muse consumed offer update was not persisted; it will not be repeated",
+                            ),
+                            error_code,
+                            &diag,
+                        ));
+                    }
+                }
+                if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                    entry.reply_state = NativeReplyState::Available;
+                    entry.reply_command_id = None;
+                    entry.reply_native_command_id = None;
+                }
+            }
+            let outcome = json!({
+                "state": "applied",
+                "command_id": command_id,
+                "request_id": request_id,
+                "turn_id": turn_id,
+                "decided_offer_seq": capture.decided_seq,
+            });
+            let error_code = match rpc {
+                DecideRpcOutcome::Admitted => None,
+                DecideRpcOutcome::Ambiguous { error_code, .. } => error_code,
+            };
+            return Ok(with_decide_diag(outcome, error_code, &diag));
         }
-        Ok(json!({
-            "state": "applied",
-            "command_id": command_id,
-            "request_id": request.id,
-            "turn_id": request.turn_id,
-        }))
+        match rpc {
+            DecideRpcOutcome::Admitted => {
+                // Unproven after admission: stay Unknown with both the Core
+                // command id and the native decide id retained. Storing
+                // Written and clearing the native id would let a later
+                // missing/foreign `decidedByCommandId` bind this write at
+                // resolution time; Unknown requires exact late proof and
+                // otherwise closes unbound. Never replayed or rearmed.
+                if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                    entry.reply_state = NativeReplyState::Unknown;
+                    entry.reply_command_id = Some(command_id.to_owned());
+                }
+                Ok(with_decide_diag(
+                    unknown_control(
+                        "Muse request reply was admitted but its decision is unproven; it will not be repeated",
+                    ),
+                    None,
+                    &diag,
+                ))
+            }
+            DecideRpcOutcome::Ambiguous {
+                error_code,
+                unproven_reason,
+            } => {
+                if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                    entry.reply_state = NativeReplyState::Unknown;
+                    entry.reply_command_id = Some(command_id.to_owned());
+                }
+                Ok(with_decide_diag(
+                    unknown_control(unproven_reason),
+                    error_code,
+                    &diag,
+                ))
+            }
+        }
     }
 
     /// Adopt pulled snapshot entries. Entries that bind to the live turn are
@@ -1233,6 +1858,7 @@ impl EventProcessor {
             PendingNativeRequest {
                 request: entry,
                 reply_command_id: None,
+                reply_native_command_id: None,
                 reply_state: NativeReplyState::Available,
                 observed_at: observed,
             },
@@ -1265,6 +1891,9 @@ impl EventProcessor {
     }
 
     async fn process_notification(&mut self, method: String, params: Value) -> Result<()> {
+        if is_workflow_item_frame(&method, &params) {
+            return self.observe_workflow_item(params).await;
+        }
         match method.as_str() {
             "session/viewHealthChanged" => {
                 let notification: NativeSessionViewHealthChangedNotification =
@@ -1557,6 +2186,8 @@ impl EventProcessor {
             }
         }
         self.expected_requests.clear();
+        // Parent completion keeps child tracking: workflow children outlive
+        // the parent turn and settle on their own terminal revisions.
         Ok(())
     }
 
@@ -1626,10 +2257,34 @@ impl EventProcessor {
                 .record_gap("Muse approval resolution did not match a retained open")
                 .await;
         }
+        // The wire turn must name the exact retained turn before anything
+        // is committed, removed, or recorded as proof: a resolution for
+        // another turn never qualifies and never mutates this entry.
+        if notification.turn_id != entry.request.turn_id {
+            return self
+                .record_gap("Muse approval resolution named another turn")
+                .await;
+        }
         let turn_id = entry.request.turn_id.clone();
-        // `request.resolved` binds the exact dispatched Eliot reply; anything
-        // else (policy/judge/timeout, or a reply this generation never wrote)
-        // closes without a command binding.
+        // `request.resolved` binds the exact dispatched Eliot reply: an
+        // acked decide, or a Writing/Unknown one the resolution itself names
+        // via `decidedByCommandId` (resolved-before-qualifying-ACK order,
+        // and late proof for an admitted-but-unproven Unknown). Anything
+        // else (policy/judge/timeout, another decider, an unnamed resolution,
+        // or a reply this generation never wrote) closes without a binding.
+        // Writing is reachable here only from inside the decide view-wait,
+        // which pumps frames while its own RPC is outstanding; anywhere else
+        // the sequential loop keeps Writing and resolution apart.
+        let proven_ours = matches!(
+            entry.reply_state,
+            NativeReplyState::Writing | NativeReplyState::Unknown
+        ) && entry.reply_command_id.is_some()
+            && entry
+                .reply_native_command_id
+                .as_deref()
+                .is_some_and(|ours| {
+                    resolved_decider_matches(notification.decided_by_command_id.as_deref(), ours)
+                });
         let (kind, data) = match (entry.reply_state, entry.reply_command_id.as_ref()) {
             (NativeReplyState::Written, Some(command_id)) => (
                 "request.resolved",
@@ -1639,6 +2294,18 @@ impl EventProcessor {
                     "turn_id": turn_id,
                 }),
             ),
+            (NativeReplyState::Writing | NativeReplyState::Unknown, Some(command_id))
+                if proven_ours =>
+            {
+                (
+                    "request.resolved",
+                    json!({
+                        "command_id": command_id,
+                        "request_id": request_id,
+                        "turn_id": turn_id,
+                    }),
+                )
+            }
             _ => (
                 "request.closed",
                 json!({
@@ -1648,19 +2315,32 @@ impl EventProcessor {
             ),
         };
         let commit_id = request_event_id(&request_id, kind, "muse", "Muse")?;
+        let bound_to_ours = kind == "request.resolved";
         self.commit_event(kind, commit_id, data).await?;
         self.pending_requests.remove(&request_id);
         self.native_index.remove(native_id);
         self.observe();
         self.remember_resolved(native_id.to_owned());
+        // Terminal proof for an active decide is recorded only here, after
+        // the owning commit above succeeded. The helper additionally
+        // requires an exact decider match, so a bound-but-unnamed or
+        // foreign-decider resolution is decisive without being Applied.
+        self.note_decide_resolved(
+            notification.session_id.as_str(),
+            notification.turn_id.as_str(),
+            native_id,
+            notification.decided_by_command_id.as_deref(),
+            bound_to_ours,
+        );
         Ok(())
     }
 
     /// `approval/updated`: one stage was satisfied while further requirements
-    /// remain. The in-memory offer is replaced wholesale (the Store keeps the
-    /// opened snapshot and has no update event) and a consumed reply resets
-    /// to Available so the next stage can be decided; an uncertain reply is
-    /// never reset.
+    /// remain. A genuinely newer requirement replaces the in-memory offer and
+    /// is persisted under the exact pending id so the owner projection exposes
+    /// the current offer; a consumed reply resets to Available so the next
+    /// stage can be decided. Duplicates and stale offers touch nothing but the
+    /// observation counter; an uncertain reply is never reset nor persisted.
     async fn refresh_approval(&mut self, params: Value) -> Result<()> {
         let raw = params.clone();
         let notification: NativeApprovalUpdatedNotification = serde_json::from_value(params)
@@ -1691,18 +2371,57 @@ impl EventProcessor {
                 .await;
         };
         let observed = self.observe();
-        let Some(entry) = self.pending_requests.get_mut(&request_id) else {
+        let (prior, same, newer) = self
+            .pending_requests
+            .get(&request_id)
+            .map(|entry| {
+                (
+                    entry.reply_state,
+                    same_approval_offer(&entry.request.details, &raw),
+                    is_newer_approval_requirement(&entry.request.details, &raw),
+                )
+            })
+            .unwrap_or((NativeReplyState::Available, false, false));
+        if same || !newer {
+            if let Some(entry) = self.pending_requests.get_mut(&request_id) {
+                entry.observed_at = observed;
+            }
             return Ok(());
+        }
+        let refreshed = if let Some(entry) = self.pending_requests.get_mut(&request_id) {
+            entry.observed_at = observed;
+            if refresh_offer_from_raw(&mut entry.request.details, &raw).is_err() {
+                None
+            } else {
+                if entry.reply_state == NativeReplyState::Written {
+                    entry.reply_state = NativeReplyState::Available;
+                    entry.reply_command_id = None;
+                    entry.reply_native_command_id = None;
+                }
+                Some(entry.request.clone())
+            }
+        } else {
+            None
         };
-        entry.observed_at = observed;
-        if refresh_offer_from_raw(&mut entry.request.details, &raw).is_err() {
+        let Some(refreshed) = refreshed else {
             return self
                 .record_gap("Muse approval update omitted its refreshed offer")
                 .await;
+        };
+        if matches!(
+            prior,
+            NativeReplyState::Available | NativeReplyState::Written
+        ) && !self.commit_offer_update(&refreshed).await?
+        {
+            return Ok(());
         }
-        if entry.reply_state == NativeReplyState::Written {
-            entry.reply_state = NativeReplyState::Available;
-            entry.reply_command_id = None;
+        if let Some(seq) = refreshed.details.get("offer_seq").and_then(Value::as_i64) {
+            self.note_decide_offer_proof(
+                notification.session_id.as_str(),
+                refreshed.turn_id.as_str(),
+                native_id,
+                seq,
+            );
         }
         Ok(())
     }
@@ -1850,10 +2569,449 @@ impl EventProcessor {
         }
     }
 
+    /// Fold one workflow-item revision: every `children[]` entry drives its
+    /// canonical key K independently. One malformed entry gaps the parent
+    /// source; proven siblings still fold.
+    async fn observe_workflow_item(&mut self, params: Value) -> Result<()> {
+        let notification: NativeWorkflowItemNotification =
+            serde_json::from_value(params).map_err(|_| {
+                Error::new(
+                    "native_protocol",
+                    "Muse workflow item did not match the installed schema",
+                )
+            })?;
+        if self.status.session_id.as_deref() != Some(notification.session_id.as_str()) {
+            return self
+                .record_gap("Muse workflow update named another native session")
+                .await;
+        }
+        for child in &notification.item.children {
+            if let Err(error) = self.observe_workflow_child(&notification, child).await {
+                self.status.source_unknown = true;
+                if !self.gap_reported && !self.writes_blocked {
+                    let _ = self
+                        .record_gap("Muse workflow child entry could not be normalized")
+                        .await;
+                }
+                if self.status.failure.is_none() {
+                    self.status.failure = Some(error.message);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drive one child entry to its plan. Child-scoped failures become child
+    /// gaps; only a malformed binding errors to the parent gap above.
+    async fn observe_workflow_child(
+        &mut self,
+        notification: &NativeWorkflowItemNotification,
+        child: &NativeWorkflowChild,
+    ) -> Result<()> {
+        let key = muse_child_key(
+            &notification.session_id,
+            &notification.item.workflow_run_id,
+            &child.child_id,
+            child.attempt,
+        )?;
+        if self.workflow_unknown.contains(&key) {
+            return Ok(());
+        }
+        if !self.workflow_children.contains_key(&key) {
+            if self.workflow_children.len() >= MAX_WORKFLOW_CHILDREN {
+                // Detailed tracking is full, but this proven child must stay
+                // visible: persist it through one idempotent registration
+                // plus an honest observation-unavailable child gap. No state
+                // retained, no replay, no eviction, no turn facts.
+                self.persist_overflow_child(&key).await;
+                self.remember_workflow_unknown(key);
+                return Ok(());
+            }
+            self.workflow_children
+                .insert(key.clone(), WorkflowChildState::new());
+        }
+        if let Some(state) = self.workflow_children.get_mut(&key) {
+            state.observe_rev(
+                notification.item.revision,
+                &notification.item.status,
+                notification.source_range.clone(),
+            );
+        }
+        loop {
+            let planned = self
+                .workflow_children
+                .get(&key)
+                .map(|state| state.plan(&child.status, child.terminal.as_deref()))
+                .unwrap_or(PlannedAction::Ignore);
+            match planned {
+                PlannedAction::Ignore => return Ok(()),
+                PlannedAction::ChildGap {
+                    reason,
+                    mark_unknown,
+                } => {
+                    let host = self.host.clone();
+                    let credential = self.credential.clone();
+                    let sink = &mut self.sink;
+                    if let Some(state) = self.workflow_children.get_mut(&key) {
+                        let _ = state.record_gap(sink, &host, &credential, reason).await;
+                        if mark_unknown {
+                            state.unknown = true;
+                        }
+                    }
+                    return Ok(());
+                }
+                PlannedAction::Register => {
+                    if !self.register_workflow_child(&key).await {
+                        return Ok(());
+                    }
+                }
+                PlannedAction::Start => {
+                    self.start_workflow_child_turn(&key).await;
+                    return Ok(());
+                }
+                PlannedAction::Complete { status } => {
+                    self.complete_workflow_child_turn(&key, status, notification.item.revision)
+                        .await;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Persist one proven over-limit child without detailed tracking: a
+    /// single idempotent registration makes the Agent row visible with
+    /// Unknown state, and one child-scoped gap marks turn observation
+    /// unavailable. No turn facts are committed, no state is retained, and
+    /// an uncertain outcome is never replayed — the unknown marker stops
+    /// later revisions, and idempotent re-registration stays safe if the
+    /// bounded marker ever expires. Only registration failure falls back to
+    /// a parent gap, mirroring the tracked-key rejection path.
+    async fn persist_overflow_child(&mut self, key: &WorkflowChildKey) {
+        let Some(native_scope) = self.native_scope.clone() else {
+            let _ = self
+                .record_gap("Muse workflow child registration lacks its native scope")
+                .await;
+            return;
+        };
+        let registration =
+            match key.build_registration(&self.agent_id, self.generation, &native_scope) {
+                Ok(registration) => registration,
+                Err(_) => {
+                    let _ = self
+                        .record_gap("Muse workflow child registration could not be built")
+                        .await;
+                    return;
+                }
+            };
+        let ack = match register_child(&self.host, &self.credential, registration.clone()).await {
+            Ok(ack) => ack,
+            Err(error) if is_admission_rejection(&error) => {
+                let _ = self
+                    .record_gap("Muse workflow child registration was rejected")
+                    .await;
+                return;
+            }
+            Err(_) => {
+                let _ = self
+                    .record_gap("Muse workflow child registration outcome is unknown")
+                    .await;
+                return;
+            }
+        };
+        let mut ephemeral = WorkflowChildState::new();
+        ephemeral.binding = Some(binding_from_ack(registration, &ack));
+        let host = self.host.clone();
+        let credential = self.credential.clone();
+        let sink = &mut self.sink;
+        // Best-effort explicit unavailability: even if this RPC is lost, the
+        // visible Unknown row with no turns stays honest (nothing claimed),
+        // while a parent gap here would misattribute parent-source loss.
+        let _ = ephemeral
+            .record_gap(
+                sink,
+                &host,
+                &credential,
+                "Muse workflow-child observation unavailable: tracking exceeded its bound",
+            )
+            .await;
+    }
+
+    /// Register one workflow child, retrying the retained identical
+    /// registration after a lost ACK. Returns true when the caller should
+    /// re-plan the same revision against the new binding.
+    async fn register_workflow_child(&mut self, key: &WorkflowChildKey) -> bool {
+        let Some(native_scope) = self.native_scope.clone() else {
+            // Readiness always binds the scope before workflow routing; a
+            // missing scope retries on the next revision, never unknowns.
+            let _ = self
+                .record_gap("Muse workflow child registration lacks its native scope")
+                .await;
+            return false;
+        };
+        let retained = self
+            .workflow_children
+            .get(key)
+            .and_then(|state| state.pending_registration.clone());
+        let registration = match retained {
+            Some(registration) => registration,
+            None => match key.build_registration(&self.agent_id, self.generation, &native_scope) {
+                Ok(registration) => registration,
+                Err(_) => {
+                    if let Some(state) = self.workflow_children.get_mut(key) {
+                        state.unknown = true;
+                    }
+                    let _ = self
+                        .record_gap("Muse workflow child registration could not be built")
+                        .await;
+                    return false;
+                }
+            },
+        };
+        if let Some(state) = self.workflow_children.get_mut(key) {
+            state.pending_registration = Some(registration.clone());
+        }
+        match register_child(&self.host, &self.credential, registration.clone()).await {
+            Ok(ack) => {
+                let binding = binding_from_ack(registration, &ack);
+                if let Some(state) = self.workflow_children.get_mut(key) {
+                    state.pending_registration = None;
+                    state.binding = Some(binding);
+                }
+                true
+            }
+            Err(error) if is_admission_rejection(&error) => {
+                if let Some(state) = self.workflow_children.get_mut(key) {
+                    state.pending_registration = None;
+                    state.unknown = true;
+                }
+                let _ = self
+                    .record_gap("Muse workflow child registration was rejected")
+                    .await;
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Commit the ONE `turn.started` for a registered child. A failed commit
+    /// already recorded its child gap; the key unknowns and stops.
+    async fn start_workflow_child_turn(&mut self, key: &WorkflowChildKey) {
+        let native_id = match child_event_id(key, "turn.started") {
+            Ok(native_id) => native_id,
+            Err(_) => {
+                let host = self.host.clone();
+                let credential = self.credential.clone();
+                let sink = &mut self.sink;
+                if let Some(state) = self.workflow_children.get_mut(key) {
+                    let _ = state
+                        .record_gap(
+                            sink,
+                            &host,
+                            &credential,
+                            "Muse workflow child turn identity exceeded its bound",
+                        )
+                        .await;
+                    state.unknown = true;
+                }
+                return;
+            }
+        };
+        let data = start_event_data(key);
+        let host = self.host.clone();
+        let credential = self.credential.clone();
+        let sink = &mut self.sink;
+        let committed = match self.workflow_children.get_mut(key) {
+            Some(state) => state
+                .commit_event(sink, &host, &credential, "turn.started", native_id, data)
+                .await
+                .is_ok(),
+            None => return,
+        };
+        if let Some(state) = self.workflow_children.get_mut(key) {
+            if committed {
+                state.started = true;
+            } else {
+                state.unknown = true;
+            }
+        }
+    }
+
+    /// Commit the ONE `turn.completed`, starting first when the live states
+    /// were never observed: an explicit terminal proves the turn ran.
+    async fn complete_workflow_child_turn(
+        &mut self,
+        key: &WorkflowChildKey,
+        status: &'static str,
+        revision: i64,
+    ) {
+        if self
+            .workflow_children
+            .get(key)
+            .is_some_and(|state| !state.started)
+        {
+            self.start_workflow_child_turn(key).await;
+            if self
+                .workflow_children
+                .get(key)
+                .is_some_and(|state| !state.started)
+            {
+                return;
+            }
+        }
+        let native_id = match child_event_id(key, "turn.completed") {
+            Ok(native_id) => native_id,
+            Err(_) => {
+                let host = self.host.clone();
+                let credential = self.credential.clone();
+                let sink = &mut self.sink;
+                if let Some(state) = self.workflow_children.get_mut(key) {
+                    let _ = state
+                        .record_gap(
+                            sink,
+                            &host,
+                            &credential,
+                            "Muse workflow child turn identity exceeded its bound",
+                        )
+                        .await;
+                    state.unknown = true;
+                }
+                return;
+            }
+        };
+        let data = complete_event_data(key, status);
+        let host = self.host.clone();
+        let credential = self.credential.clone();
+        let sink = &mut self.sink;
+        let committed = match self.workflow_children.get_mut(key) {
+            Some(state) => state
+                .commit_event(sink, &host, &credential, "turn.completed", native_id, data)
+                .await
+                .is_ok(),
+            None => return,
+        };
+        if let Some(state) = self.workflow_children.get_mut(key) {
+            if committed {
+                state.completed_status = Some(status.to_owned());
+                state.completed_revision = Some(revision);
+            } else {
+                state.unknown = true;
+            }
+        }
+    }
+
+    /// Stream end settles child tracking: completed children keep their
+    /// terminal, open children go unknown — their terminal can never be
+    /// observed now. A pending registration is a parent gap.
+    async fn settle_workflow_children(&mut self) {
+        let open: Vec<WorkflowChildKey> = self
+            .workflow_children
+            .iter()
+            .filter(|entry| entry.1.completed_status.is_none() && !entry.1.unknown)
+            .map(|entry| entry.0.clone())
+            .collect();
+        if open.is_empty() {
+            return;
+        }
+        let mut pending_lost = false;
+        for key in &open {
+            if let Some(state) = self.workflow_children.get_mut(key) {
+                if state.pending_registration.is_some() {
+                    state.pending_registration = None;
+                    pending_lost = true;
+                }
+                state.unknown = true;
+            }
+        }
+        for key in &open {
+            let running = self.workflow_children.get(key).is_some_and(|state| {
+                state.started && state.completed_status.is_none() && state.binding.is_some()
+            });
+            if !running {
+                continue;
+            }
+            let host = self.host.clone();
+            let credential = self.credential.clone();
+            let sink = &mut self.sink;
+            if let Some(state) = self.workflow_children.get_mut(key) {
+                let _ = state
+                    .record_gap(
+                        sink,
+                        &host,
+                        &credential,
+                        "Muse workflow child observation ended before its terminal",
+                    )
+                    .await;
+            }
+        }
+        if pending_lost {
+            let _ = self
+                .record_gap("Muse workflow child registration acknowledgement is unresolved")
+                .await;
+        }
+    }
+
+    fn remember_workflow_unknown(&mut self, key: WorkflowChildKey) {
+        if self.workflow_unknown.insert(key.clone()) {
+            self.workflow_unknown_order.push_back(key);
+            while self.workflow_unknown_order.len() > MAX_WORKFLOW_CHILDREN {
+                if let Some(expired) = self.workflow_unknown_order.pop_front() {
+                    self.workflow_unknown.remove(&expired);
+                }
+            }
+        }
+    }
+
     async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
         self.stream_source()
             .commit_event(kind, native_id, data)
             .await
+    }
+
+    /// Persist a refreshed offer. Returns `Ok(true)` only after the actual
+    /// required `request.opened` commit succeeded. `Ok(false)` means the
+    /// call was handled but nothing was persisted (a gap was recorded, or
+    /// an oversized envelope was deferred); `Err` means the commit or gap
+    /// acknowledgement itself is unknown. Callers that need persistence
+    /// proof must require `Ok(true)` — never infer it from gap latches.
+    async fn commit_offer_update(&mut self, refreshed: &CorePending) -> Result<bool> {
+        let Some(command_id) = self.status.active_command_id.clone() else {
+            self.record_gap("Muse refreshed offer arrived with no active command")
+                .await?;
+            return Ok(false);
+        };
+        let (Some(seq), Some(cursor)) = (
+            refreshed.details.get("offer_seq").and_then(Value::as_i64),
+            refreshed.details.get("view_cursor").and_then(Value::as_str),
+        ) else {
+            self.record_gap("Muse refreshed offer omitted its identity")
+                .await?;
+            return Ok(false);
+        };
+        if cursor.trim().is_empty() {
+            self.record_gap("Muse refreshed offer omitted its identity")
+                .await?;
+            return Ok(false);
+        }
+        let native_id = format!("muse-o:{}:s{seq}:{cursor}", refreshed.id);
+        if native_id.len() > MAX_COMMAND_ID_BYTES {
+            self.record_gap("Muse refreshed offer identity exceeded its bound")
+                .await?;
+            return Ok(false);
+        }
+        let policy = SecretPolicy::new(self.secrets.iter().cloned());
+        let data = json!({
+            "command_id": command_id,
+            "request_id": refreshed.id,
+            "turn_id": refreshed.turn_id,
+            "kind": refreshed.kind,
+            "details": redact_request_details_for_commit(&refreshed.details, &policy),
+        });
+        if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
+            self.defer_gap("Muse refreshed offer exceeded the persisted-event bound");
+            return Ok(false);
+        }
+        self.commit_event("request.opened", native_id, data).await?;
+        Ok(true)
     }
 
     fn bind_view_session(&mut self, session_id: &str) -> Result<()> {
@@ -1951,7 +3109,7 @@ async fn run(
             control = controls.recv() => {
                 match control {
                     Some(control) => {
-                        if !processor.handle_control(control).await {
+                        if !processor.handle_control(&mut frames, control).await {
                             break;
                         }
                         // Associate flushes buffered frames inline and request
@@ -1982,6 +3140,43 @@ fn validate_session_and_turn(status: &EventStatus, session_id: &str, turn_id: &s
 /// `event_id_rejects_blank_or_oversize_identity` test.
 fn event_id(session_id: &str, turn_id: &str, item_id: &str, kind: &str) -> Result<String> {
     shared_event_id(session_id, turn_id, item_id, kind, "muse", "Muse")
+}
+
+/// Builds a gap reason from fixed classes and boolean comparisons only.
+fn native_request_gap_reason(
+    method: &str,
+    error_code: &str,
+    params: &Value,
+    expected_session: &str,
+    active_turn: &str,
+    active_parent_turn_present: bool,
+) -> String {
+    let method_class = match method {
+        "approval/request" => "approval",
+        "userInput/request" => "userInput",
+        _ => "other",
+    };
+    let error_class = match error_code {
+        "native_protocol" => "native_protocol",
+        "source_integrity" => "source_integrity",
+        "unsupported" => "unsupported",
+        _ => "other",
+    };
+    let session_id = params.get("sessionId");
+    let session_value = session_id.and_then(Value::as_str);
+    let turn_id = params.get("turnId");
+    let turn_value = turn_id.and_then(Value::as_str);
+
+    format!(
+        "Muse native request validation: method_class={method_class} error_code={error_class} active_parent_turn_present={active_parent_turn_present} session_id_present={} session_id_nonblank={} session_id_matches_expected={} turn_id_present={} turn_id_nonblank={} turn_id_matches_active={} subagent_origin_present={}",
+        session_id.is_some(),
+        session_value.is_some_and(|value| !value.trim().is_empty()),
+        session_value.is_some_and(|value| value == expected_session),
+        turn_id.is_some(),
+        turn_value.is_some_and(|value| !value.trim().is_empty()),
+        turn_value.is_some_and(|value| value == active_turn),
+        params.get("subagentOrigin").is_some(),
+    )
 }
 
 /// The native approval/user-input id carried by raw server-request params, if
@@ -2028,8 +3223,9 @@ fn pending_native_id(request: &CorePending) -> Option<&str> {
 
 /// Map the MSP terminal to the stored turn status. `cancelled` folds to
 /// `interrupted`, matching the Codex path; an unknown wire terminal settles
-/// nothing and the caller records a gap instead.
-fn turn_status(terminal: &NativeTurnTerminal) -> Option<&'static str> {
+/// nothing and the caller records a gap instead. Shared with the
+/// workflow-child observer: child terminals use this same mapping.
+pub(crate) fn turn_status(terminal: &NativeTurnTerminal) -> Option<&'static str> {
     match terminal {
         NativeTurnTerminal::Completed => Some("completed"),
         NativeTurnTerminal::Failed => Some("failed"),
@@ -2091,6 +3287,71 @@ fn attach_provider_restriction(
 mod tests {
     use super::*;
     use eliot_plugin::protocol::MAX_COMMAND_ID_BYTES;
+
+    #[test]
+    fn native_request_gap_reason_keeps_only_bounded_metadata() {
+        let session_marker = "SESSION_VALUE_MUST_NOT_BE_RECORDED";
+        let active_turn_marker = "ACTIVE_TURN_VALUE_MUST_NOT_BE_RECORDED";
+        let params = json!({
+            "sessionId": session_marker,
+            "turnId": "STALE_TURN_VALUE_MUST_NOT_BE_RECORDED",
+            "approvalId": "APPROVAL_ID_MUST_NOT_BE_RECORDED",
+            "toolCallId": "TOOL_CALL_ID_MUST_NOT_BE_RECORDED",
+            "rawArgs": "TOOL_ARGUMENTS_MUST_NOT_BE_RECORDED",
+            "token": "TOKEN_MUST_NOT_BE_RECORDED",
+            "subagentOrigin": {
+                "childRunId": "CHILD_RUN_ID_MUST_NOT_BE_RECORDED",
+                "childSessionId": "CHILD_SESSION_ID_MUST_NOT_BE_RECORDED",
+            },
+        });
+
+        let reason = native_request_gap_reason(
+            "approval/request",
+            "source_integrity",
+            &params,
+            session_marker,
+            active_turn_marker,
+            true,
+        );
+
+        assert!(reason.len() <= 512);
+        assert!(reason.contains("method_class=approval"));
+        assert!(reason.contains("error_code=source_integrity"));
+        assert!(reason.contains("active_parent_turn_present=true"));
+        assert!(reason.contains("session_id_present=true"));
+        assert!(reason.contains("session_id_nonblank=true"));
+        assert!(reason.contains("session_id_matches_expected=true"));
+        assert!(reason.contains("turn_id_present=true"));
+        assert!(reason.contains("turn_id_nonblank=true"));
+        assert!(reason.contains("turn_id_matches_active=false"));
+        assert!(reason.contains("subagent_origin_present=true"));
+        for marker in [
+            session_marker,
+            active_turn_marker,
+            "STALE_TURN_VALUE_MUST_NOT_BE_RECORDED",
+            "APPROVAL_ID_MUST_NOT_BE_RECORDED",
+            "TOOL_CALL_ID_MUST_NOT_BE_RECORDED",
+            "TOOL_ARGUMENTS_MUST_NOT_BE_RECORDED",
+            "TOKEN_MUST_NOT_BE_RECORDED",
+            "CHILD_RUN_ID_MUST_NOT_BE_RECORDED",
+            "CHILD_SESSION_ID_MUST_NOT_BE_RECORDED",
+        ] {
+            assert!(!reason.contains(marker));
+        }
+
+        let unknown = native_request_gap_reason(
+            "untrusted method value",
+            "untrusted error value",
+            &Value::Null,
+            "expected-session",
+            "active-turn",
+            false,
+        );
+        assert!(unknown.contains("method_class=other"));
+        assert!(unknown.contains("error_code=other"));
+        assert!(!unknown.contains("untrusted method value"));
+        assert!(!unknown.contains("untrusted error value"));
+    }
 
     #[test]
     fn terminal_mapping_cancels_to_interrupted() {
