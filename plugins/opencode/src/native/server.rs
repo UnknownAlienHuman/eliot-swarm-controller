@@ -34,15 +34,15 @@ use tokio::{
     time::{Instant, sleep, timeout_at},
 };
 
-use crate::native::client::OpenCodeHttp;
+use crate::native::{AuthSetup, AuthTransfer, client::OpenCodeHttp, transfer_selected_integration};
 
 const READINESS_POLL: Duration = Duration::from_millis(250);
 
 /// The generated per-Agent config: the frozen profile model plus an
 /// explicitly empty MCP set. No permissions, providers, plugins or
-/// credentials: the Agent runs the server defaults, and provider keys can
-/// only arrive through the target environment the host passes on top of the
-/// daemon-allowlisted plugin environment the child inherits.
+/// credentials: the Agent runs the server defaults, and the selected native
+/// credential arrives through the pre-serve auth transfer into the isolated
+/// store, never through this document.
 fn agent_config_json(model: &str) -> String {
     serde_json::json!({
         "$schema": "https://opencode.ai/config.json",
@@ -60,6 +60,7 @@ pub struct ServerLaunch {
     pub agent_id: String,
     pub environment: Vec<(OsString, OsString)>,
     pub model: String,
+    pub auth: AuthSetup,
 }
 
 /// A running owned server: its child, HTTP client, and addresses.
@@ -73,15 +74,21 @@ pub struct OwnedServer {
 }
 
 impl OwnedServer {
-    /// Write the per-generation config, reserve a loopback port, spawn the
+    /// Write the per-generation config, prepare the selected native
+    /// credential in the isolated store, reserve a loopback port, spawn the
     /// server on the per-Agent store, and wait for readiness. Any failure
     /// leaves no running child behind. The child inherits the
     /// daemon-allowlisted plugin environment plus the shared target
     /// environment the host built, the generated password, and the XDG
     /// roots — exactly like the Codex/Muse stdio servers, with no
     /// `env_clear` and no third allowlist.
-    pub async fn spawn(launch: ServerLaunch, secrets: &[String]) -> Result<Self> {
-        let config_dir = launch.instance_dir.join("config").join("opencode");
+    pub async fn spawn(
+        launch: ServerLaunch,
+        secrets: &[String],
+        auth_deadline: Instant,
+    ) -> Result<Self> {
+        let config_root = launch.instance_dir.join("config");
+        let config_dir = config_root.join("opencode");
         let data_dir = stable_store_dir(&launch.store_root, &launch.agent_id)?;
         std::fs::create_dir_all(&config_dir).map_err(|error| {
             Error::new(
@@ -102,6 +109,24 @@ impl OwnedServer {
                 format!("OpenCode per-Agent config could not be written: {error}"),
             )
         })?;
+        // The isolated store sees no canonical credential, so the selected
+        // integration moves in before `serve` starts, under these exact
+        // XDG roots. A refused or ambiguous transfer fails the start with
+        // no server child; resume reuses a correctly present credential.
+        transfer_selected_integration(
+            &AuthTransfer {
+                program: &launch.program,
+                selector: &launch.auth.selector,
+                workspace: &launch.workspace,
+                export_environment: &[],
+                import_environment: &launch.environment,
+                isolated_config_home: &config_root,
+                isolated_data_home: &data_dir,
+                reuse_existing: launch.auth.reuse_existing,
+            },
+            auth_deadline,
+        )
+        .await?;
 
         // Reserve a loopback port, then hand it to the server. A transient
         // bind race resolves as a spawn/readiness failure with no process
@@ -141,7 +166,7 @@ impl OwnedServer {
             .current_dir(&launch.workspace)
             .envs(launch.environment)
             .env("OPENCODE_PASSWORD", &password)
-            .env("XDG_CONFIG_HOME", launch.instance_dir.join("config"))
+            .env("XDG_CONFIG_HOME", &config_root)
             .env("XDG_DATA_HOME", &data_dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())

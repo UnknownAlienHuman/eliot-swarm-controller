@@ -26,6 +26,7 @@ const MAX_PROFILES: usize = 256;
 const MAX_PROJECT_PATH_LEN: usize = 4096;
 const MAX_MODEL_LEN: usize = 256;
 const MAX_EFFORT_LEN: usize = 128;
+const MAX_AUTH_INTEGRATION_LEN: usize = 128;
 const MAX_CMD_LEN: usize = 1024;
 const MAX_ENV_NAME_LEN: usize = 256;
 const MAX_PASS_ENV_ENTRIES: usize = 64;
@@ -365,6 +366,8 @@ struct ProfileEntry {
     permissions: Option<String>,
     #[serde(default)]
     approval_policy: Option<String>,
+    #[serde(default)]
+    auth_integration: Option<String>,
     #[serde(default)]
     mode: Option<String>,
     #[serde(default)]
@@ -952,6 +955,7 @@ fn snapshot_from_entry(
             || entry.approval.is_some()
             || entry.mode.is_some()
             || entry.dangerously_skip_permissions.is_some()
+            || entry.auth_integration.is_some()
             || entry.pass_env.is_some()
             || !entry.setup.is_empty()
             || entry.scratch != default_scratch()
@@ -1074,6 +1078,16 @@ fn snapshot_from_entry(
             name,
             "mode",
             "mode and dangerously_skip_permissions have no Codex mapping",
+            "unsupported",
+        ));
+    }
+    if entry.auth_integration.is_some() {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "auth_integration",
+            "auth_integration has no Codex mapping",
             "unsupported",
         ));
     }
@@ -1347,6 +1361,16 @@ fn muse_snapshot_from_entry(
             "unsupported",
         ));
     }
+    if entry.auth_integration.is_some() {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "auth_integration",
+            "the Muse slice has no mapping for this preset",
+            "unsupported",
+        ));
+    }
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("muse".to_owned()));
@@ -1487,6 +1511,16 @@ fn claude_snapshot_from_entry(
             "unsupported",
         ));
     }
+    if entry.auth_integration.is_some() {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "auth_integration",
+            "the Claude slice has no mapping for this preset",
+            "unsupported",
+        ));
+    }
     let pass_env = match entry.pass_env.as_deref() {
         Some(names) => validate_pass_env(name, names, source, table_offset)?,
         None => Vec::new(),
@@ -1568,8 +1602,11 @@ fn claude_snapshot_from_entry(
 /// id in the installed `provider/model` form (split at the first slash) and a required explicit
 /// native `cmd` (the Muse treatment: stop and process registration address
 /// the exact spawned PID, so `.cmd`/`.bat`/`.ps1` wrappers are rejected).
-/// Effort, approval, collaboration, permission and approval-policy presets
-/// have no OpenCode mapping and stay rejected until one lands.
+/// An optional nonsecret `auth_integration` names the one native integration
+/// whose canonical credential the pre-serve transfer prepares; the plugin
+/// requires it at admission. Effort, approval, collaboration, permission and
+/// approval-policy presets have no OpenCode mapping and stay rejected until
+/// one lands.
 fn opencode_snapshot_from_entry(
     name: &str,
     entry: &ProfileEntry,
@@ -1636,10 +1673,33 @@ fn opencode_snapshot_from_entry(
             "unsupported",
         ));
     }
+    if let Some(selector) = entry.auth_integration.as_deref() {
+        let trimmed = selector.trim();
+        if trimmed.is_empty()
+            || trimmed.len() > MAX_AUTH_INTEGRATION_LEN
+            || trimmed.starts_with('-')
+            || trimmed.chars().any(|value| value.is_control())
+        {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                "auth_integration",
+                "must be a non-empty integration ID or name of at most 128 bytes with no control characters and no leading dash",
+                "profile_error",
+            ));
+        }
+    }
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("opencode".to_owned()));
     snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    if let Some(selector) = entry.auth_integration.as_deref() {
+        snapshot.insert(
+            "auth_integration".to_owned(),
+            Value::String(selector.trim().to_owned()),
+        );
+    }
     insert_control(
         &mut snapshot,
         name,
@@ -1724,6 +1784,16 @@ fn antigravity_snapshot_from_entry(
                 "unsupported",
             ));
         }
+    }
+    if entry.auth_integration.is_some() {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "auth_integration",
+            "the Antigravity slice has no mapping for this preset",
+            "unsupported",
+        ));
     }
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();

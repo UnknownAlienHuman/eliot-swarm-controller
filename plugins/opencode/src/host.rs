@@ -1,7 +1,7 @@
 use crate::{
     events::{EventConfig, EventHandle, EventStatus, TurnFacts},
     native::{
-        HttpOutcome, OpenCodeHttp, OwnedServer, ServerLaunch,
+        AuthSetup, HttpOutcome, IntegrationSelector, OpenCodeHttp, OwnedServer, ServerLaunch,
         types::{InboxUser, ModelRef, SessionInfo},
     },
 };
@@ -127,7 +127,8 @@ struct ControlBinding {
 }
 
 /// A start request that passed admission: decoded params plus the validated
-/// frozen profile, workspace, child environment, and redaction secrets.
+/// frozen profile, workspace, child environment, selected native auth
+/// integration, and redaction secrets.
 struct ParsedStart {
     params: AgentStartParams,
     requested_model: String,
@@ -136,6 +137,7 @@ struct ParsedStart {
     workspace: PathBuf,
     program: OsString,
     environment: Vec<(OsString, OsString)>,
+    auth_selector: IntegrationSelector,
     secrets: Vec<String>,
     credential: String,
     instance_dir: String,
@@ -373,6 +375,7 @@ impl OpenCodePlugin {
             .transpose()?;
         let (requested_model, model_ref) = start_model_ref(profile)?;
         let requested_agent = optional_profile_text(profile, "agent", "OpenCode")?;
+        let auth_selector = start_auth_selector(profile)?;
         let (workspace, program) = start_paths(profile, &params)?;
         let TargetEnvironment {
             variables: environment,
@@ -391,6 +394,7 @@ impl OpenCodePlugin {
             workspace,
             program,
             environment,
+            auth_selector,
             secrets,
             credential: initialized.credential.clone(),
             instance_dir: initialized.instance_dir.clone(),
@@ -490,8 +494,13 @@ impl OpenCodePlugin {
                 agent_id: parsed.params.agent_id.clone(),
                 environment: parsed.environment.clone(),
                 model: parsed.requested_model.clone(),
+                auth: AuthSetup {
+                    selector: parsed.auth_selector.clone(),
+                    reuse_existing: parsed.resume.is_some(),
+                },
             },
             &parsed.secrets,
+            Instant::now() + RPC_TIMEOUT,
         )
         .await
         {
@@ -1973,6 +1982,24 @@ impl OpenCodePlugin {
             session.events.close().await;
         }
     }
+}
+
+/// The frozen profile auth selector: the one explicitly selected native
+/// integration (ID or name) whose canonical credential the pre-serve
+/// transfer prepares. Required and nonsecret; the capacity-only account
+/// field is never consulted for authentication.
+fn start_auth_selector(profile: &serde_json::Map<String, Value>) -> Result<IntegrationSelector> {
+    let raw = profile
+        .get("auth_integration")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "profile_error",
+                "OpenCode profile requires an explicit auth_integration selector",
+            )
+        })?;
+    IntegrationSelector::new(raw).map_err(|error| error.with_code("profile_error"))
 }
 
 /// The frozen profile model: an exact `provider/id` selection plus its
