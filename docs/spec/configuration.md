@@ -444,7 +444,8 @@ It prepends the active controller executable's parent directory to `PATH`, prese
 native baseline entries, so bare `swarm` resolves to the current controller before ambient/legacy bins.
 A controller directory containing the OS `PATH` separator (`;` on Windows, `:` elsewhere)
 is explicitly unsupported: native shells split `PATH` without quote awareness, so managed
-start rejects it before native spawn instead of silently resolving a legacy `swarm`.
+start rejects it before native spawn as a definite rejected result (no native I/O dispatched),
+instead of an unknown outcome or a silent legacy `swarm` resolution.
 An adopted route stores only the optional client-key environment-variable name; the
 profile must explicitly allow that name in pass_env. Its value is resolved at runtime
 and is not sent with the unauthenticated readiness request.

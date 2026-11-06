@@ -2544,8 +2544,10 @@ fn build_target_environment(data_root: &Path, agent: &Agent, agent_token: &str) 
         .as_encoded_bytes()
         .contains(&b':');
     if separator_present {
+        // Pre-effect gate (before instance/monitoring/spawn): native I/O
+        // provably did not start, so the existing classifier settles Rejected.
         return Err(Error::new(
-            "unsupported",
+            "native_not_dispatched",
             "controller directory path cannot be represented in native PATH",
         ));
     }
