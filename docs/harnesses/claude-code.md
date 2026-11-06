@@ -14,16 +14,17 @@ Claude Code 2.1.278): [headless](https://code.claude.com/docs/en/headless),
 [CLI](https://code.claude.com/docs/en/cli-reference).
 The TypeScript Agent SDK is not used.
 These notes do not establish runtime support or a current license approval.
-Verified live on Claude Code 2.1.278 (2026-11-04): with
+Verified live on Claude Code 2.1.278: with
 `--permission-prompt-tool stdio` a tool use arrives as a `control_request`
 `{"subtype":"can_use_tool","tool_name","display_name","input","description",
 "permission_suggestions","tool_use_id"}`; a `control_response` with
 `{"behavior":"allow","updatedInput":<input>}` runs the tool and
 `{"behavior":"deny","message":…}` refuses it, each on the same `request_id`.
-Unverified live (fake-only until a live run): the `set_model` /
-`set_permission_mode` calls on a resumed session (their success shape was
-observed once on a fresh CLI, but the resume-realign flow never ran live) and
-the resumed CLI's session re-announcement.
+Live on a resumed session: the unconditional `set_model` realign call and
+the resumed CLI's re-announcement of the same retained session id.
+Unverified live: the `set_permission_mode` call, which runs only when the
+frozen profile sets a permission mode that differs from the resumed
+session's current mode; no drift has occurred in a live run yet.
 
 ## Native identity and generation
 
@@ -47,8 +48,7 @@ exact turn association, the `command_lifecycle` / `assistant` / `system` /
 with a `control_response` carrying the documented SDK `PermissionResult`.
 Arm the message reader before input. SessionStart hook lines carry the minted
 session id before any input, so the adapter declares no `start_requires_input`.
-A resumed CLI re-announces the same retained session id (unverified live;
-the fake re-announces it).
+A resumed CLI re-announces the same retained session id before readiness.
 
 Resolve Windows executables explicitly; never insert an unrequested shell wrapper.
 Avoid modes that disable required hooks/instructions.
@@ -73,10 +73,10 @@ covers their fate.
 | inject | unsupported: no inject verb; a turn never receives another turn's queued context |
 | interrupt | stdin `control_request interrupt` for the bound active turn uuid, with the `still_queued` readback; the terminal follows and unknown is not repeated |
 | stop | drop stdin (the CLI exits on EOF) and kill only the direct CLI child by handle; does not merely detach observation; grandchildren are reaped by the generation Job on Windows / process group on Unix, not the plugin (see Transport) |
-| resume | new plugin/CLI with `--resume` and the exact retained session id; never resend prior prompt; the frozen model is re-applied via `set_model` and a drifted permission mode via `set_permission_mode` on the idle preflight (both fake-only, unverified live) |
+| resume | new plugin/CLI with `--resume` and the exact retained session id; never resend prior prompt; the frozen model is re-applied via `set_model` on the idle preflight, and a drifted permission mode via `set_permission_mode` (drift path unverified live: no live resume has drifted yet) |
 | approve/deny | exact `can_use_tool` native request id; allow echoes the asked `input` as `updatedInput`, deny sends the fixed message (verified live, 2.1.278) |
 | answer | unsupported: the AskUserQuestion shape on the installed CLI is unverified |
-| configure | applied at start, not a runtime verb: `--model` / `--permission-mode` argv on a fresh start, `set_model` / `set_permission_mode` realign on resume; requested vs effective settings are reported before readiness, with `effective.model` always null (the CLI never reads the active model back; `models[]` membership is the only proof) |
+| configure | applied at start, not a runtime verb: `--model` / `--permission-mode` argv on a fresh start, `set_model` / `set_permission_mode` realign on resume; requested vs effective settings are reported before readiness, with `effective.model` always null (the CLI never reads the active model back; `models[]` membership proves availability/membership only, never which model is actually serving) |
 | goal | no native goal mechanism; goal selection stays in Eliot |
 
 If a turn ends before queued hook context is consumed, do not deliver it to a later
