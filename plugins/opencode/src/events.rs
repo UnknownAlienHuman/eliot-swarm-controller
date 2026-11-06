@@ -27,7 +27,7 @@ use crate::native::{
     client::{HttpOutcome, OpenCodeHttp},
     requests::{
         CorePending, ReplyRoute, StagedReply, describe_form, describe_permission,
-        redact_details_for_commit, reply_for,
+        public_request_view, redact_details_for_commit, reply_for,
     },
     sse::SseFrame,
     types::{
@@ -1515,15 +1515,21 @@ impl EventProcessor {
             "opencode",
             "OpenCode",
         )?;
+        let Ok((public_kind, public_details)) = public_request_view(&pending) else {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode public request view could not be normalized",
+            ));
+        };
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
-        let committed = redact_details_for_commit(&pending.details, &secrets);
+        let committed = redact_details_for_commit(&public_details, &secrets);
         self.commit_event(
             "request.opened",
             native_id,
             json!({
                 "request_id": pending.id,
                 "turn_id": pending.turn_id,
-                "kind": pending.kind,
+                "kind": public_kind,
                 "details": committed,
             }),
         )

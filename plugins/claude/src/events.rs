@@ -1,10 +1,13 @@
-use eliot_core::{Error, Result, SecretPolicy};
+use eliot_core::{
+    Error, Result, SecretPolicy,
+    requests::{ApprovalChoice, ApprovalDecision, ApprovalRequest},
+};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     native_stdio::StreamState,
     session::{
-        EVENT_DEADLINE, StreamSource, attach_final_text, rejected_control, request_event_id,
-        unknown_control,
+        EVENT_DEADLINE, StreamSource, approval_reply_args, attach_final_text, rejected_control,
+        request_event_id, unknown_control,
     },
 };
 use serde::Serialize;
@@ -28,6 +31,8 @@ const EARLY_EVENT_LIMIT: usize = 128;
 const EARLY_EVENT_BYTES: usize = 256 * 1024;
 const MAX_PENDING_REQUESTS: usize = 16;
 const DENY_MESSAGE: &str = "Eliot denied this tool call.";
+const APPROVE_CHOICE_ID: &str = "approve";
+const DENY_CHOICE_ID: &str = "deny";
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventStatus {
@@ -134,6 +139,79 @@ struct PendingNativeRequest {
     input: Value,
     reply_command_id: Option<String>,
     reply_state: NativeReplyState,
+}
+
+/// Compose a decision-relevant plain-text summary of a `can_use_tool` ask:
+/// the tool name plus its semantic string arguments (command, description,
+/// cwd, file/path targets) flattened from the native input. This is plain
+/// text, not a native record: transport ids and the verbatim input stay
+/// private in the pending struct above. No summary cap beyond the owning
+/// event-size bound: truncation would hide decision-critical suffixes and,
+/// if done before redaction, could split a configured secret and defeat
+/// full-secret redaction. Callers redact this composed text before the
+/// existing event-size decision.
+fn approval_summary(tool_name: &str, input: Option<&Value>) -> String {
+    let mut parts = vec![format!("{tool_name} tool permission request")];
+    let mut flattened = Vec::new();
+    collect_summary_args(input, &mut flattened);
+    flattened.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    for (key, value) in flattened {
+        parts.push(format!("{key}: {value}"));
+    }
+    parts.join("; ")
+}
+
+/// Flatten the string leaves of a native input value into owned (key,
+/// value) pairs, keeping the field label for string arrays (e.g. a path
+/// array reads "paths: <joined>") so operation fields survive without a
+/// JSON dump. Dropped: transport envelope ids and any non-string leaf.
+fn collect_summary_args(input: Option<&Value>, out: &mut Vec<(String, String)>) {
+    collect_summary_args_labeled(None, input, out);
+}
+
+fn collect_summary_args_labeled(
+    label: Option<&str>,
+    input: Option<&Value>,
+    out: &mut Vec<(String, String)>,
+) {
+    let Some(input) = input else { return };
+    match input {
+        Value::String(text) if !text.trim().is_empty() => {
+            if let Some(label) = label {
+                out.push((label.to_owned(), text.clone()));
+            }
+        }
+        Value::Object(map) => {
+            for (key, value) in map {
+                match value {
+                    Value::String(text) if !text.trim().is_empty() => {
+                        out.push((key.clone(), text.clone()));
+                    }
+                    Value::Object(_) | Value::Array(_) => {
+                        collect_summary_args_labeled(Some(key), Some(value), out)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Value::Array(items) => {
+            let strings: Vec<String> = items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            if !strings.is_empty()
+                && let Some(label) = label
+            {
+                out.push((label.to_owned(), strings.join(", ")));
+            }
+            for item in items {
+                collect_summary_args_labeled(label, Some(item), out);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1168,17 +1246,37 @@ impl EventProcessor {
                 .await;
         };
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
-        let mut details = json!({
-            "tool_name": body.tool_name.clone(),
-            "tool_use_id": body.tool_use_id.clone(),
-            "input": body.input.clone().unwrap_or(Value::Null),
-        });
-        policy.redact_values(&mut details);
+        // The public approval fact carries only a neutral summary (the
+        // decision-relevant operation: command/description/cwd and file/path
+        // targets from the native ask, composed as plain text, not a native
+        // record. The native transport ids and the full native input stay
+        // private in the retained pending struct below. The composed
+        // summary is redacted before commit and bounded; an oversized event
+        // takes the existing event-bound gap path via the size check below.
+        let summary = policy.redact_text(&approval_summary(&body.tool_name, body.input.as_ref()));
+        let approval = ApprovalRequest {
+            summary,
+            choices: vec![
+                ApprovalChoice {
+                    id: APPROVE_CHOICE_ID.to_owned(),
+                    label: "Approve".to_owned(),
+                    decision: ApprovalDecision::Approve,
+                },
+                ApprovalChoice {
+                    id: DENY_CHOICE_ID.to_owned(),
+                    label: "Deny".to_owned(),
+                    decision: ApprovalDecision::Deny,
+                },
+            ],
+            feedback_allowed: false,
+        };
+        let details = serde_json::to_value(&approval)
+            .map_err(|_| Error::new("internal", "Claude approval details could not be encoded"))?;
         let data = json!({
             "command_id": command_id.clone(),
             "request_id": request_id,
             "turn_id": turn_id.clone(),
-            "kind": "permission",
+            "kind": "approval",
             "details": details,
         });
         if serde_json::to_vec(&data).map_or(usize::MAX, |bytes| bytes.len()) > MAX_EVENT_BYTES {
@@ -1257,24 +1355,46 @@ impl EventProcessor {
                 "Claude request reply verb is not implemented",
             ));
         }
-        if !args.as_object().is_some_and(|args| args.is_empty()) {
-            return Err(rejected_control(
-                "Claude approval replies accept only empty arguments",
-            ));
+        let args = match approval_reply_args(args) {
+            Ok(args) => args,
+            Err(error) => return Err(rejected_control(&error.message)),
+        };
+        let choice_id = match args.get("choice_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(choice)) if !choice.trim().is_empty() => Some(choice.as_str()),
+            Some(_) => {
+                return Err(rejected_control(
+                    "Claude approval choice_id must be a non-empty string",
+                ));
+            }
+        };
+        // The binary native offer: an explicit canonical choice, when
+        // provided, must name one of these two ids and must match the verb.
+        // No autochoice: an omitted choice follows the verb, as before, and
+        // a choice that disagrees with the verb is rejected, never silently
+        // remapped to the other native decision.
+        let decision = match (verb, choice_id) {
+            ("approve", None | Some("approve")) => PermissionResult::Allow {
+                updated_input: entry.input.clone(),
+            },
+            ("deny", None | Some("deny")) => PermissionResult::Deny {
+                message: DENY_MESSAGE.to_owned(),
+            },
+            _ => {
+                return Err(rejected_control(
+                    "Claude approval choice does not match the reply verb",
+                ));
+            }
+        };
+        if args.contains_key("feedback") {
+            return Err(rejected_control("Claude approval feedback is not allowed"));
         }
         if self.frames_drained && !self.planned_stop {
             return Err(unknown_control(
                 "Claude event stream was lost before the request reply; outcome is unresolved and will not be repeated",
             ));
         }
-        Ok(match verb {
-            "approve" => PermissionResult::Allow {
-                updated_input: entry.input.clone(),
-            },
-            _ => PermissionResult::Deny {
-                message: DENY_MESSAGE.to_owned(),
-            },
-        })
+        Ok(decision)
     }
 
     /// Decide one open permission: write the exact `control_response`, then

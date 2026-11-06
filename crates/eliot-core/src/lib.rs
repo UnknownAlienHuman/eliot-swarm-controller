@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod limits;
+pub mod requests;
 
 pub use api::{
     DEFAULT_GIT_FETCH_TIMEOUT_MS, FrozenGitFetch, FrozenScriptContext, FrozenScriptInterpreter,

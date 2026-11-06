@@ -2264,32 +2264,18 @@ fn read_answers_file(path: &Path) -> Result<Value, Failure> {
 
     let answers: Value = serde_json::from_slice(&bytes)
         .map_err(|_| Failure::new(2, "answers file must contain valid answer JSON"))?;
-    let Some(questions) = answers.as_object() else {
+    if !answers.is_object() {
         return Err(Failure::new(
             2,
             "answers file must be an object keyed by question id",
         ));
-    };
-    for question in questions.values() {
-        let Some(question) = question.as_object() else {
-            return Err(Failure::new(
-                2,
-                "each answer entry must contain an answers array",
-            ));
-        };
-        let Some(values) = question.get("answers").and_then(Value::as_array) else {
-            return Err(Failure::new(
-                2,
-                "each answer entry must contain an answers array",
-            ));
-        };
-        if question.len() != 1 || values.iter().any(|value| !value.is_string()) {
-            return Err(Failure::new(
-                2,
-                "each answer entry must contain only an array of strings",
-            ));
-        }
     }
+    eliot_core::requests::parse_answers_map(&answers).map_err(|_| {
+        Failure::new(
+            2,
+            "each answer entry must contain only an answers array of strings",
+        )
+    })?;
     Ok(answers)
 }
 

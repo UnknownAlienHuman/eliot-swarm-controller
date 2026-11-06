@@ -124,7 +124,10 @@ Turn controls require an active turn; request replies require a pending native r
 `expected_turn_id`, and `--request` maps to `request_id`; a missing
 request is captured by the Store only when exactly one native request is pending.
 `answer --answers-file` submits the bounded parsed `{ question: { answers: [string] } }`
-body, not a path. Secret-question answers stay unsupported before Store persistence.
+body, not a path. The shared shape is owned by `eliot_core::requests`
+(`AnswerArgs`/`Answers`); foreign answer shapes reject before persistence and each
+plugin translates the universal answer to its native write. Secret-question answers
+stay unsupported before Store persistence.
 For command approvals set profile `approval_policy = "on-request"`. For native questions
 set optional `collaboration_mode = "plan"`; the question exercise used
 `permissions = "read-only"`. Clearing pending requests during interrupt/stop or closing

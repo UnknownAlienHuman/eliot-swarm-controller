@@ -897,6 +897,9 @@ pub(super) fn submit_tx(
                 check_input(&text)?;
                 provider_holds::require_unheld_tx(tx, &agent)?;
             }
+            if request.verb == "answer" {
+                eliot_core::requests::AnswerArgs::parse(&request.args)?;
+            }
             let mut params = json!({
                 "agent_id": agent.id,
                 "generation": agent.generation,

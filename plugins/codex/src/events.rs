@@ -1237,12 +1237,15 @@ impl EventProcessor {
             .active_command_id
             .clone()
             .ok_or_else(|| Error::new("unknown", "Codex request has no Eliot send command"))?;
-        let public_details = request.details.clone();
+        let Ok((public_kind, public_details)) = requests::public_request_view(&request) else {
+            self.defer_gap("Codex public request view could not be normalized");
+            return Ok(());
+        };
         let data = json!({
             "command_id": command_id,
             "request_id": request.id,
             "turn_id": request.turn_id,
-            "kind": request.kind,
+            "kind": public_kind,
             "details": public_details,
         });
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {

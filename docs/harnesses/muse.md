@@ -27,7 +27,7 @@ Use supported typed APIs, not an inferred method list from a different host vers
 | steer/interrupt | steer is turn/steer with the exact expected turn; interrupt is turn/cancel on the exact turn (halt running, keep queue; turn/unqueue targets queued submits, never used here) |
 | inject | exact supported steer or explicit next-send prepend, mechanism reported |
 | stop/resume | clear/pause native Goal as necessary and close owned host; resume exact session without old input |
-| approve/deny/answer | exact session/child request id and offered choice/requirement |
+| approve/deny/answer | exact session/child request id and offered choice/requirement; public details are the shared ApprovalRequest/QuestionRequest, answers are the universal answers map |
 | configure | model/reasoning/approval setters followed by effective readback |
 | goal | native set/edit/pause/resume/clear where installed schema supports them |
 | compact/fork/background | native-only, advertised after implementation |
@@ -92,10 +92,22 @@ id binds it, otherwise it closes unbound, and it is never replayed. Outcomes
 carry only whitelisted diagnostics: the numeric native error code and the
 resolved-decider present/match booleans. Only
 schema-documented pre-admission/validation errors prove rejection (anything else is
-unknown, never resubmitted). Approve and deny take an optional `choice_id` and
-optional `feedback` where the choice accepts it; answer takes `answers` mapping
-every offered question id to exactly one of `selected_label`, `selected_labels`
-or `free_text` plus an optional `note`. Resume pulls `approval/listPending` once
+unknown, never resubmitted). Approve and deny take an optional `choice_id` and optional `feedback` where
+the choice accepts it; answer takes the universal `{"answers": {question_id:
+{"answers": [string]}}}` mapping every offered question id to its canonical
+strings. The public `request.opened` carries kind `approval` with the shared
+`ApprovalRequest` (`summary`, `choices` with explicit `approve`/`deny`
+decisions, `feedback_allowed`) or kind `question` with the shared
+`QuestionRequest`; native binding, offers, `offer_seq`, requirement and view
+cursors stay private in the retained pending entry, and every initial, refresh
+and reopen branch republishes the normalized view. Native option labels become
+canonical option ids (upstream carries no ids); option-bearing single/multiple
+modes map to `single`/`multiple`, option-less questions to `text` with free
+entry. Natively stated selection bounds pass through, absent bounds stay
+absent, and negative bounds reject at describe. Canonical strings map back to
+the wire shape the offered question requires (`selected_label`,
+`selected_labels` or `free_text`); unknown future approval decisions stay out
+of the public offer and no verb decides them. Resume pulls `approval/listPending` once
 for its pointer set and opens only what still binds to the live turn; anything
 naming the dead generation's turn is receipted and dropped as an orphan, never
 answered, and a failed pull never fails the resume.

@@ -11,10 +11,132 @@
 //! tag `v2.0.32`, verified against a locally started server with no model
 //! call. No I/O: the event processor owns the stream and the HTTP writes.
 
+use eliot_core::requests::{
+    AnswerArgs, ApprovalChoice, ApprovalDecision, ApprovalRequest, Question, QuestionKind,
+    QuestionOption, QuestionRequest,
+};
 use eliot_core::{Error, Result, SecretPolicy};
 use serde_json::{Map, Value};
 
 use crate::native::types::{FormInfo, PermissionRequest};
+
+/// Project the retained native offer to its public request.opened kind and
+/// details: approval with the shared ApprovalRequest, or question with the
+/// shared QuestionRequest. Native binding and offers stay private in the
+/// pending entry; every initial, refresh and reopen branch publishes
+/// through this projection.
+pub(crate) fn public_request_view(request: &CorePending) -> Result<(String, Value)> {
+    let details = request.details.as_object().ok_or_else(|| {
+        Error::new(
+            "source_integrity",
+            "pending request details are not an object",
+        )
+    })?;
+    match request.kind.as_str() {
+        "approval" => Ok(("approval".to_owned(), public_approval_details(details)?)),
+        "question" => Ok(("question".to_owned(), public_question_details(details)?)),
+        _ => Err(Error::new(
+            "source_integrity",
+            "pending request kind is neither approval nor question",
+        )),
+    }
+}
+
+fn public_approval_details(details: &Map<String, Value>) -> Result<Value> {
+    let action = details
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let resources: Vec<&str> = details
+        .get("resources")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut summary = format!("Approval to {action}");
+    if !resources.is_empty() {
+        summary.push_str(" for ");
+        summary.push_str(&resources.join(", "));
+    }
+    if let Some(message) = details
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        summary.push_str(": ");
+        summary.push_str(message);
+    }
+    serde_json::to_value(ApprovalRequest {
+        summary,
+        choices: vec![
+            ApprovalChoice {
+                id: "once".to_owned(),
+                label: "Approve once".to_owned(),
+                decision: ApprovalDecision::Approve,
+            },
+            ApprovalChoice {
+                id: "always".to_owned(),
+                label: "Approve always".to_owned(),
+                decision: ApprovalDecision::Approve,
+            },
+            ApprovalChoice {
+                id: "reject".to_owned(),
+                label: "Reject".to_owned(),
+                decision: ApprovalDecision::Deny,
+            },
+        ],
+        feedback_allowed: true,
+    })
+    .map_err(|_| Error::new("internal", "approval public details could not be encoded"))
+}
+
+fn public_question_details(details: &Map<String, Value>) -> Result<Value> {
+    let form: FormInfo = serde_json::from_value(Value::Object(details.clone())).map_err(|_| {
+        Error::new(
+            "source_integrity",
+            "pending request omitted its offered form",
+        )
+    })?;
+    let questions = form
+        .fields
+        .iter()
+        .map(|field| {
+            let (kind, free_entry) = match field.field_type.as_str() {
+                "number" | "integer" => (QuestionKind::Number, false),
+                "boolean" => (QuestionKind::Boolean, false),
+                "multiselect" => (QuestionKind::Multiple, field.custom),
+                "external" => {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "pending request carries an unsupported external field",
+                    ));
+                }
+                _ if !field.options.is_empty() => (QuestionKind::Single, field.custom),
+                _ => (QuestionKind::Text, true),
+            };
+            Ok(Question {
+                id: field.key.clone(),
+                kind,
+                title: field.title.clone().or_else(|| Some(form.title.clone())),
+                prompt: field.description.clone().or_else(|| field.title.clone()),
+                options: field
+                    .options
+                    .iter()
+                    .map(|option| QuestionOption {
+                        id: option.value.clone(),
+                        label: option.label.clone(),
+                        description: option.description.clone(),
+                    })
+                    .collect(),
+                free_entry,
+                is_secret: false,
+                min_selections: field.min_items,
+                max_selections: field.max_items,
+            })
+        })
+        .collect::<Result<Vec<Question>>>()?;
+    serde_json::to_value(QuestionRequest { questions })
+        .map_err(|_| Error::new("internal", "question public details could not be encoded"))
+}
 
 /// Native request metadata returned to the EventProcessor for durable
 /// opening. `details` carries the offered decision data the owner decides
@@ -220,20 +342,12 @@ fn reply_to_approval(request: &CorePending, approve: bool, args: &Value) -> Resu
     })
 }
 
-/// Form answers: `args.answers` maps field keys to values. Keys must be
-/// offered and option-bearing non-custom fields only accept offered values;
-/// the native endpoint enforces the rest (required, `when`, value types)
-/// and answers 400 when the answer violates them. Partial answers are
-/// allowed: optional fields, defaults and conditions are the server's call.
+/// Canonical answers via the shared DTO, converted to native scalar,
+/// string-array, number or boolean by the offered field type. Unknown
+/// fields and non-offered option values reject before any write; the
+/// native endpoint enforces required, when, formats, bounds and defaults.
 fn reply_to_form(request: &CorePending, args: &Value) -> Result<StagedReply> {
-    let args = args
-        .as_object()
-        .filter(|args| args.len() == 1)
-        .ok_or_else(|| Error::new("invalid", "answer args must contain only answers"))?;
-    let answers = args
-        .get("answers")
-        .and_then(Value::as_object)
-        .ok_or_else(|| Error::new("invalid", "answer args.answers must be an object"))?;
+    let parsed = AnswerArgs::parse(args)?;
     let form: FormInfo = serde_json::from_value(request.details.clone()).map_err(|_| {
         Error::new(
             "source_integrity",
@@ -245,11 +359,13 @@ fn reply_to_form(request: &CorePending, args: &Value) -> Result<StagedReply> {
         .iter()
         .map(|field| (field.key.as_str(), field))
         .collect::<std::collections::BTreeMap<_, _>>();
-    for (key, value) in answers {
+    let mut answer = Map::new();
+    for (key, entry) in &parsed.answers {
         let field = offered
             .get(key.as_str())
             .ok_or_else(|| Error::new("invalid", "answer names a field that was not offered"))?;
-        check_offered_option(field, value)?;
+        let value = native_value(field, &entry.answers)?;
+        answer.insert(key.clone(), value);
     }
     let native_id = request
         .details
@@ -257,46 +373,90 @@ fn reply_to_form(request: &CorePending, args: &Value) -> Result<StagedReply> {
         .and_then(Value::as_str)
         .ok_or_else(|| Error::new("source_integrity", "pending request omitted its form id"))?;
     Ok(StagedReply {
-        route: ReplyRoute::Form {
-            answer: answers.clone(),
-        },
+        route: ReplyRoute::Form { answer },
         native_id: native_id.to_owned(),
     })
 }
 
-/// A non-custom field with offered options only accepts offered values (a
-/// single string, or every member of a string array for multiselect).
-fn check_offered_option(field: &crate::native::types::FormField, value: &Value) -> Result<()> {
-    if field.options.is_empty() || field.custom {
-        return Ok(());
+fn native_value(field: &crate::native::types::FormField, answers: &[String]) -> Result<Value> {
+    fn single(answers: &[String]) -> Result<&str> {
+        match answers {
+            [one] => Ok(one.as_str()),
+            _ => Err(Error::new(
+                "invalid",
+                "answer must contain exactly one value for this field type",
+            )),
+        }
     }
-    let values = match value {
-        Value::String(one) => vec![one.as_str()],
-        Value::Array(many) => {
-            let mut values = Vec::with_capacity(many.len());
-            for entry in many {
-                values.push(entry.as_str().ok_or_else(|| {
-                    Error::new("invalid", "answer option values must be strings")
-                })?);
+    fn offered(field: &crate::native::types::FormField, values: &[&str]) -> Result<()> {
+        if field.custom || field.options.is_empty() {
+            return Ok(());
+        }
+        for value in values {
+            if !field.options.iter().any(|option| option.value == *value) {
+                return Err(Error::new(
+                    "invalid",
+                    "answer was not among the offered choices",
+                ));
             }
-            values
         }
+        Ok(())
+    }
+    match field.field_type.as_str() {
+        "number" | "integer" => {
+            let one = single(answers)?;
+            let value = serde_json::from_str::<serde_json::Number>(one)
+                .map_err(|_| Error::new("invalid", "answer must be a number"))?;
+            if value.as_f64().is_none_or(|n| !n.is_finite()) {
+                return Err(Error::new("invalid", "answer must be a finite number"));
+            }
+            Ok(Value::Number(value))
+        }
+        "boolean" => {
+            let one = single(answers)?;
+            match one {
+                "true" => Ok(Value::Bool(true)),
+                "false" => Ok(Value::Bool(false)),
+                _ => Err(Error::new("invalid", "answer must be a boolean")),
+            }
+        }
+        "multiselect" => {
+            let values: Vec<&str> = answers.iter().map(String::as_str).collect();
+            offered(field, &values)?;
+            if let Some(min) = field.min_items
+                && (values.len() as u64) < min
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "answer has fewer selections than the offered minimum",
+                ));
+            }
+            if let Some(max) = field.max_items
+                && (values.len() as u64) > max
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "answer has more selections than the offered maximum",
+                ));
+            }
+            Ok(Value::Array(
+                values
+                    .into_iter()
+                    .map(Into::into)
+                    .map(Value::String)
+                    .collect(),
+            ))
+        }
+        "external" => Err(Error::new(
+            "unsupported",
+            "external form field cannot be answered",
+        )),
         _ => {
-            return Err(Error::new(
-                "invalid",
-                "answer option values must be strings",
-            ));
-        }
-    };
-    for value in values {
-        if !field.options.iter().any(|option| option.value == value) {
-            return Err(Error::new(
-                "invalid",
-                "answer was not among the offered choices",
-            ));
+            let one = single(answers)?;
+            offered(field, &[one])?;
+            Ok(Value::String(one.to_owned()))
         }
     }
-    Ok(())
 }
 
 /// Deny on a question cancels the native form. No answers travel.
@@ -322,69 +482,21 @@ fn require_nonempty(value: &str, what: &str) -> Result<()> {
     eliot_plugin::session::require_nonempty(value, "OpenCode", what)
 }
 
-/// Redact display text in committed request details with the session
-/// secret policy. Structure (native ids, field keys/types) stays so the
-/// offer keeps its shape; every human-readable string is redacted. Only
+/// Redact the committed public request.opened details with the session
+/// secret policy. Approval summary fields and question prompts/options
+/// mask known secrets; opaque identifiers and keys pass through. Only
 /// known secrets mask — ordinary offers pass through byte-identical — and
 /// the in-memory offer stays raw so choice matching keeps working.
 pub(crate) fn redact_details_for_commit(details: &Value, policy: &SecretPolicy) -> Value {
     let mut redacted = details.clone();
-    if let Some(action) = redacted.get("action").and_then(Value::as_str) {
-        redacted["action"] = Value::String(policy.redact_text(action));
-    }
-    if let Some(resources) = redacted.get("resources").and_then(Value::as_array) {
-        redacted["resources"] = Value::Array(
-            resources
-                .iter()
-                .map(|resource| match resource.as_str() {
-                    Some(text) => Value::String(policy.redact_text(text)),
-                    None => resource.clone(),
-                })
-                .collect(),
-        );
-    }
-    if let Some(message) = redacted.get("message").and_then(Value::as_str) {
-        redacted["message"] = Value::String(policy.redact_text(message));
-    }
-    if let Some(title) = redacted.get("title").and_then(Value::as_str) {
-        redacted["title"] = Value::String(policy.redact_text(title));
-    }
-    if let Some(fields) = redacted.get_mut("fields").and_then(Value::as_array_mut) {
-        for field in fields {
-            redact_field_for_commit(field, policy);
-        }
-    }
-    redacted
-}
-
-/// Redact one committed form field: titles, descriptions and option
-/// labels/values mask known secrets; keys, types and flags stay.
-fn redact_field_for_commit(field: &mut Value, policy: &SecretPolicy) {
-    for key in ["title", "description", "placeholder", "pattern", "default"] {
-        if let Some(text) = field.get(key).and_then(Value::as_str) {
-            field[key] = Value::String(policy.redact_text(text));
-        }
-    }
-    if let Some(options) = field.get_mut("options").and_then(Value::as_array_mut) {
-        for option in options {
-            for key in ["value", "label", "description"] {
-                if let Some(text) = option.get(key).and_then(Value::as_str) {
-                    option[key] = Value::String(policy.redact_text(text));
-                }
+    if let Some(fields) = redacted.as_object_mut() {
+        for key in ["summary", "questions", "choices"] {
+            if let Some(field) = fields.get_mut(key) {
+                policy.redact_values(field);
             }
         }
     }
-    if let Some(defaults) = field.get("default").and_then(Value::as_array) {
-        field["default"] = Value::Array(
-            defaults
-                .iter()
-                .map(|entry| match entry.as_str() {
-                    Some(text) => Value::String(policy.redact_text(text)),
-                    None => entry.clone(),
-                })
-                .collect(),
-        );
-    }
+    redacted
 }
 
 #[cfg(test)]
@@ -509,30 +621,48 @@ mod tests {
     #[test]
     fn form_answers_check_keys_and_offered_options() {
         let pending = describe_form(&form(), "ses_test", "turn-1").expect("described");
-        let staged = reply_for(&pending, "answer", &json!({"answers": {"choice": "a"}}))
-            .expect("offered option");
+        let ans = |v: serde_json::Value| {
+            serde_json::to_value(AnswerArgs {
+                answers: serde_json::from_value(v).expect("parse"),
+            })
+            .expect("args")
+        };
+        let staged = reply_for(
+            &pending,
+            "answer",
+            &json!({"answers": {"choice": {"answers": ["a"]}}}),
+        )
+        .expect("offered option");
         assert!(matches!(staged.route, ReplyRoute::Form { .. }));
         assert_eq!(staged.native_id, "frm_test1");
-        // Free-text fields and multiselect arrays pass their keys through.
+        if let ReplyRoute::Form { answer } = staged.route {
+            assert_eq!(answer.get("choice").and_then(Value::as_str), Some("a"));
+        }
         reply_for(
             &pending,
             "answer",
-            &json!({"answers": {"note": "anything", "tags": ["x", "y"]}}),
+            &json!({"answers": {"note": {"answers": ["anything"]}, "tags": {"answers": ["x", "y"]}}}),
         )
         .expect("free keys");
-        // An offered value in either scalar or array shape stages; the
-        // server owns the exact shape rule and answers 400 otherwise.
-        reply_for(&pending, "answer", &json!({"answers": {"tags": "x"}})).expect("scalar");
-        // Unknown keys and non-offered options are invalid.
+        // Single-entry multiselect canonical answer is valid.
+        reply_for(
+            &pending,
+            "answer",
+            &json!({"answers": {"tags": {"answers": ["x"]}}}),
+        )
+        .expect("scalar one");
+        // Unknown keys, non-offered options and scalar foreign shapes reject.
         for answers in [
-            json!({"answers": {"missing": "a"}}),
-            json!({"answers": {"choice": "zzz"}}),
-            json!({"answers": {"tags": ["x", "zzz"]}}),
-            json!({"answers": {"tags": [7]}}),
+            json!({"answers": {"missing": {"answers": ["a"]}}}),
+            json!({"answers": {"choice": {"answers": ["zzz"]}}}),
+            json!({"answers": {"tags": {"answers": ["x", "zzz"]}}}),
+            json!({"answers": {"tags": {"answers": [7]}}}),
+            json!({"answers": {"choice": "a"}}),
         ] {
             let error = reply_for(&pending, "answer", &answers).expect_err("rejected");
             assert_eq!(error.code, "invalid", "{answers}");
         }
+        let _ = ans(json!({"choice": {"answers": ["a"]}}));
         // Deny cancels with no answers.
         let staged = reply_for(&pending, "deny", &json!({})).expect("cancel");
         assert_eq!(staged.route, ReplyRoute::FormCancel);
@@ -548,14 +678,12 @@ mod tests {
         let mut tainted = asked();
         tainted.message = Some("token hunter2 inside".to_owned());
         let pending = describe_permission(&tainted, "ses_test", "turn-1").expect("described");
-        let committed = redact_details_for_commit(&pending.details, &policy);
+        let (kind, details) = public_request_view(&pending).expect("view");
+        assert_eq!(kind, "approval");
+        let committed = redact_details_for_commit(&details, &policy);
         let encoded = serde_json::to_string(&committed).expect("encode");
         assert!(!encoded.contains("hunter2"), "{encoded}");
-        assert_eq!(
-            committed.get("permission_id").and_then(Value::as_str),
-            Some("per_test1"),
-            "ids stay"
-        );
+        assert!(committed.get("choices").is_some(), "choices stay");
         // The in-memory offer stays raw so matching keeps working.
         assert!(
             serde_json::to_string(&pending.details)
@@ -564,18 +692,53 @@ mod tests {
         );
         let mut tainted_form = form();
         tainted_form.title = "rotate hunter2 now".to_owned();
+        tainted_form.fields[0].title = Some("Pick hunter2".to_owned());
         let pending = describe_form(&tainted_form, "ses_test", "turn-1").expect("described");
-        let committed = redact_details_for_commit(&pending.details, &policy);
+        let (kind, details) = public_request_view(&pending).expect("view");
+        assert_eq!(kind, "question");
+        let committed = redact_details_for_commit(&details, &policy);
         let encoded = serde_json::to_string(&committed).expect("encode");
         assert!(!encoded.contains("hunter2"), "{encoded}");
         assert_eq!(
             committed
-                .get("fields")
-                .and_then(|fields| fields.get(0))
-                .and_then(|field| field.get("key"))
+                .get("questions")
+                .and_then(|q| q.get(0))
+                .and_then(|q| q.get("id"))
                 .and_then(Value::as_str),
             Some("choice"),
-            "keys stay"
+            "ids stay"
+        );
+    }
+
+    #[test]
+    fn public_view_shapes() {
+        let pending = describe_permission(&asked(), "ses_test", "turn-1").expect("described");
+        let (kind, details) = public_request_view(&pending).expect("approval view");
+        assert_eq!(kind, "approval");
+        let choices = details
+            .get("choices")
+            .and_then(Value::as_array)
+            .expect("choices");
+        assert_eq!(choices.len(), 3);
+        assert_eq!(
+            choices[2].get("decision").and_then(Value::as_str),
+            Some("deny")
+        );
+        let pending = describe_form(&form(), "ses_test", "turn-1").expect("described");
+        let (kind, details) = public_request_view(&pending).expect("question view");
+        assert_eq!(kind, "question");
+        let questions = details
+            .get("questions")
+            .and_then(Value::as_array)
+            .expect("questions");
+        assert_eq!(questions.len(), 3);
+        assert_eq!(
+            questions[0].get("kind").and_then(Value::as_str),
+            Some("single")
+        );
+        assert_eq!(
+            questions[2].get("kind").and_then(Value::as_str),
+            Some("multiple")
         );
     }
 }

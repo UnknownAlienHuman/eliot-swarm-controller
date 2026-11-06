@@ -163,12 +163,20 @@ pub struct FormInfo {
 #[serde(rename_all = "camelCase")]
 pub struct FormField {
     pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(rename = "type")]
     pub field_type: String,
     #[serde(default)]
     pub options: Vec<FormOption>,
     #[serde(default)]
     pub custom: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "minItems")]
+    pub min_items: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "maxItems")]
+    pub max_items: Option<u64>,
 }
 
 /// `Form.Option`: `{value, label, description?}`.
@@ -177,6 +185,8 @@ pub struct FormField {
 pub struct FormOption {
     pub value: String,
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// `POST /api/session/{id}/form/{formID}/reply` (`session.form.reply`)

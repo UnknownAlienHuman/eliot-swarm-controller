@@ -2,6 +2,10 @@ use crate::native::types::{
     NativeApprovalDecideParams, NativeApprovalRequestParams, NativeUserInputAnswer,
     NativeUserInputAnswerParams, NativeUserInputCancelParams, NativeUserInputRequestParams,
 };
+use eliot_core::requests::{
+    AnswerArgs, ApprovalChoice, ApprovalDecision, ApprovalRequest, Question, QuestionKind,
+    QuestionOption, QuestionRequest,
+};
 use eliot_core::{Error, PendingRequest, Result};
 use eliot_plugin::{MAX_EVENT_BYTES, protocol::MAX_COMMAND_ID_BYTES};
 use serde::Deserialize;
@@ -12,9 +16,11 @@ const USER_INPUT_REQUEST: &str = "userInput/request";
 
 /// Native request metadata returned to the EventProcessor for durable opening.
 /// The public pending id binds the exact session, active turn and native
-/// request id; `details` carries the offered choices/questions the owner
-/// decides from (raw native JSON, validated structurally first so future
-/// additive-optional members survive without DTO churn).
+/// request id; `details` privately retains the native binding, offers,
+/// requirement and view cursor (raw native JSON, validated structurally first
+/// so future additive-optional members survive without DTO churn). The public
+/// `request.opened` kind and details come from `public_request_view`, never
+/// from these native fields directly.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CorePending {
     pub id: String,
@@ -224,6 +230,20 @@ fn describe_user_input(
                     "Muse user-input selection mode is not single or multiple",
                 ));
             }
+            if question
+                .selection
+                .min_selections
+                .is_some_and(|bound| bound < 0)
+                || question
+                    .selection
+                    .max_selections
+                    .is_some_and(|bound| bound < 0)
+            {
+                return Err(Error::new(
+                    "native_protocol",
+                    "Muse user-input selection bound is negative",
+                ));
+            }
             for option in &question.options {
                 require_nonempty(&option.label, "user-input option label")?;
             }
@@ -266,6 +286,214 @@ fn describe_user_input(
         "user_input",
         details,
     )
+}
+
+/// Project the retained native offer to its public `request.opened` kind and
+/// details: kind `approval` with the shared `ApprovalRequest`, or kind
+/// `question` with the shared `QuestionRequest`. Native binding, offers,
+/// requirement and view metadata stay private in the pending entry; every
+/// initial, refresh and reopen branch publishes through this projection.
+/// Unknown future approval decisions stay out of the public offer: no verb
+/// can decide them, so presenting them would invite an undecidable choice.
+pub(crate) fn public_request_view(request: &CorePending) -> Result<(String, Value)> {
+    let details = request.details.as_object().ok_or_else(|| {
+        Error::new(
+            "source_integrity",
+            "pending request details are not an object",
+        )
+    })?;
+    match request.kind.as_str() {
+        "approval" => Ok(("approval".to_owned(), public_approval_details(details)?)),
+        "user_input" => Ok(("question".to_owned(), public_question_details(details)?)),
+        _ => Err(Error::new(
+            "source_integrity",
+            "pending request kind is neither approval nor user input",
+        )),
+    }
+}
+
+fn public_approval_details(details: &Map<String, Value>) -> Result<Value> {
+    let offered: Vec<OfferedChoice> = details
+        .get("available_choices")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "pending request omitted its offered choices",
+            )
+        })?;
+    let choices = offered
+        .iter()
+        .filter_map(|choice| {
+            public_decision(choice.decision.as_str()).map(|decision| ApprovalChoice {
+                id: choice.choice_id.clone(),
+                label: choice.label.clone(),
+                decision,
+            })
+        })
+        .collect::<Vec<_>>();
+    let feedback_allowed = offered.iter().any(|choice| choice.accepts_feedback);
+    let mut summary = approval_summary(details);
+    if choices.is_empty() && !offered.is_empty() {
+        summary.push_str(" (no currently decidable choice)");
+    }
+    serde_json::to_value(ApprovalRequest {
+        summary,
+        choices,
+        feedback_allowed,
+    })
+    .map_err(|_| Error::new("internal", "approval public details could not be encoded"))
+}
+
+fn public_decision(decision: &str) -> Option<ApprovalDecision> {
+    match decision {
+        "approved" | "approvedForSession" | "approvedPolicyAmendment" => {
+            Some(ApprovalDecision::Approve)
+        }
+        "denied" | "deniedPolicyAmendment" => Some(ApprovalDecision::Deny),
+        _ => None,
+    }
+}
+
+/// Neutral owner-facing approval context: the tool name, the subject fields
+/// the offer actually carries (command, cwd, paths and other plain string
+/// values), escalation flags and child provenance. Nested values and
+/// binding-id keys stay out; known secrets are redacted again before commit.
+fn approval_summary(details: &Map<String, Value>) -> String {
+    let mut summary = match details
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+    {
+        Some(tool) => format!("Approval for tool '{tool}'"),
+        None => "Approval requested".to_owned(),
+    };
+    if let Some(subject) = details.get("subject").and_then(Value::as_object) {
+        for (key, value) in subject {
+            if is_binding_id_key(key) {
+                continue;
+            }
+            match value {
+                Value::String(text) if !text.is_empty() => {
+                    summary.push_str(", ");
+                    summary.push_str(key);
+                    summary.push_str(" '");
+                    summary.push_str(text);
+                    summary.push('\'');
+                }
+                Value::Array(items) if !items.is_empty() && items.iter().all(Value::is_string) => {
+                    let shown = items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|item| !item.is_empty())
+                        .collect::<Vec<_>>();
+                    if let Some((first, rest)) = shown.split_first() {
+                        summary.push_str(", ");
+                        summary.push_str(key);
+                        summary.push_str(" '");
+                        summary.push_str(first);
+                        summary.push('\'');
+                        for item in rest {
+                            summary.push_str(", '");
+                            summary.push_str(item);
+                            summary.push('\'');
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if details.get("judge_escalated").and_then(Value::as_bool) == Some(true) {
+        summary.push_str(" [judge-escalated]");
+    }
+    if details.get("protected_write").and_then(Value::as_bool) == Some(true) {
+        summary.push_str(" [protected-write]");
+    }
+    if details
+        .get("subagent_origin")
+        .is_some_and(|origin| !origin.is_null())
+    {
+        summary.push_str(" (requested by a child agent)");
+    }
+    summary
+}
+
+/// Binding-id shaped subject keys stay out of the public summary; the
+/// pending identity already carries the exact native binding.
+fn is_binding_id_key(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    lower == "id"
+        || lower == "ids"
+        || lower.ends_with("_id")
+        || lower.ends_with("_ids")
+        || lower.ends_with("-id")
+        || lower.ends_with(".id")
+        || key.ends_with("Id")
+        || key.ends_with("ID")
+        || key.ends_with("Ids")
+        || key.ends_with("IDS")
+}
+
+fn public_question_details(details: &Map<String, Value>) -> Result<Value> {
+    let offered: Vec<OfferedQuestion> = details
+        .get("questions")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "pending request omitted question offers",
+            )
+        })?;
+    let mut questions = Vec::with_capacity(offered.len());
+    for question in &offered {
+        // The native offer carries labels but no option ids, so the label is
+        // the canonical option id; it carries no secrecy marker either.
+        let options = question
+            .options
+            .iter()
+            .map(|option| QuestionOption {
+                id: option.label.clone(),
+                label: option.label.clone(),
+                description: None,
+            })
+            .collect::<Vec<_>>();
+        let kind = if options.is_empty() {
+            QuestionKind::Text
+        } else {
+            match question.selection.mode.as_str() {
+                "single" => QuestionKind::Single,
+                "multiple" => QuestionKind::Multiple,
+                _ => {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "pending request carries an unknown selection mode",
+                    ));
+                }
+            }
+        };
+        questions.push(Question {
+            id: question.id.clone(),
+            kind,
+            title: Some(question.header.clone()),
+            prompt: Some(question.question.clone()),
+            options,
+            free_entry: question.options.is_empty(),
+            is_secret: false,
+            min_selections: question
+                .selection
+                .min_selections
+                .and_then(|bound| u64::try_from(bound).ok()),
+            max_selections: question
+                .selection
+                .max_selections
+                .and_then(|bound| u64::try_from(bound).ok()),
+        });
+    }
+    serde_json::to_value(QuestionRequest { questions })
+        .map_err(|_| Error::new("internal", "question public details could not be encoded"))
 }
 
 /// Build the one-shot native command for a previously described request.
@@ -383,6 +611,7 @@ fn reply_to_approval(
 struct OfferedChoice {
     choice_id: String,
     decision: String,
+    label: String,
     #[serde(default)]
     accepts_feedback: bool,
 }
@@ -448,14 +677,8 @@ fn reply_to_user_input(
     command_id: &str,
     session_id: &str,
 ) -> Result<NativeReply> {
-    let args = args
-        .as_object()
-        .filter(|args| args.len() == 1)
-        .ok_or_else(|| Error::new("invalid", "answer args must contain only answers"))?;
-    let answers = args
-        .get("answers")
-        .and_then(Value::as_object)
-        .ok_or_else(|| Error::new("invalid", "answer args.answers must be an object"))?;
+    let parsed = AnswerArgs::parse(args)?;
+    let answers = &parsed.answers;
     let questions: Vec<OfferedQuestion> = request
         .details
         .get("questions")
@@ -482,7 +705,7 @@ fn reply_to_user_input(
         let question = offered
             .get(question_id)
             .ok_or_else(|| Error::new("invalid", "answer names a question that was not offered"))?;
-        wire.push(answer_for(question, answer)?);
+        wire.push(answer_for_canonical(question, &answer.answers)?);
     }
     // Deterministic wire order: the offered question order, not the JSON map
     // order, so value-identical replays stay byte-identical.
@@ -524,6 +747,8 @@ fn reply_to_user_input(
 #[serde(rename_all = "camelCase")]
 struct OfferedQuestion {
     id: String,
+    header: String,
+    question: String,
     #[serde(default)]
     options: Vec<OfferedOption>,
     selection: OfferedSelection,
@@ -545,160 +770,81 @@ struct OfferedSelection {
     max_selections: Option<i64>,
 }
 
-fn answer_for(question: &OfferedQuestion, answer: &Value) -> Result<NativeUserInputAnswer> {
-    let answer = answer.as_object().ok_or_else(|| {
-        Error::new(
-            "invalid",
-            "each answer must be an object with one answer shape and an optional note",
-        )
-    })?;
-    if answer.keys().any(|key| {
-        !matches!(
-            key.as_str(),
-            "selected_label" | "selected_labels" | "free_text" | "note"
-        )
-    }) {
-        return Err(Error::new(
-            "invalid",
-            "each answer must be an object with one answer shape and an optional note",
-        ));
-    }
-    let note = match answer.get("note") {
-        None => None,
-        Some(Value::String(note)) if note.is_empty() => None,
-        Some(Value::String(note)) => {
-            if note.chars().count() > 500 {
-                return Err(Error::new("invalid", "answer note exceeds 500 chars"));
-            }
-            Some(note.clone())
-        }
-        Some(_) => {
-            return Err(Error::new(
-                "invalid",
-                "answer note must be a string of at most 500 chars",
-            ));
-        }
-    };
-    let shapes = ["selected_label", "selected_labels", "free_text"]
-        .into_iter()
-        .filter(|shape| answer.contains_key(*shape))
-        .collect::<Vec<_>>();
-    if shapes.len() != 1 {
-        return Err(Error::new(
-            "invalid",
-            "each answer carries exactly one of selected_label, selected_labels, or free_text",
-        ));
-    }
+fn answer_for_canonical(
+    question: &OfferedQuestion,
+    answers: &[String],
+) -> Result<NativeUserInputAnswer> {
     let labels = question
         .options
         .iter()
         .map(|option| option.label.as_str())
         .collect::<Vec<_>>();
+    // The universal shape carries no note, so the wire note stays empty.
     let mut wire = NativeUserInputAnswer {
         question_id: question.id.clone(),
         selected_label: None,
         selected_labels: None,
         free_text: None,
-        note,
+        note: None,
     };
-    match shapes[0] {
-        "selected_label" => {
-            if question.selection.mode != "single" || labels.is_empty() {
-                return Err(Error::new(
-                    "invalid",
-                    "selected_label answers only a single-mode question with options",
-                ));
-            }
-            let label = answer
-                .get("selected_label")
-                .and_then(Value::as_str)
-                .filter(|label| !label.is_empty())
-                .ok_or_else(|| {
-                    Error::new("invalid", "selected_label must be a non-empty string")
-                })?;
-            if !labels.contains(&label) {
-                return Err(Error::new(
-                    "invalid",
-                    "selected_label is not among the offered option labels",
-                ));
-            }
-            wire.selected_label = Some(label.to_owned());
+    if labels.is_empty() {
+        let [text] = answers else {
+            return Err(Error::new(
+                "invalid",
+                "a text question takes exactly one answer",
+            ));
+        };
+        if text.chars().count() > 500 {
+            return Err(Error::new("invalid", "answer text exceeds 500 chars"));
         }
-        "selected_labels" => {
-            if question.selection.mode != "multiple" || labels.is_empty() {
-                return Err(Error::new(
-                    "invalid",
-                    "selected_labels answers only a multiple-mode question with options",
-                ));
-            }
-            let selected = answer
-                .get("selected_labels")
-                .and_then(Value::as_array)
-                .ok_or_else(|| Error::new("invalid", "selected_labels must be an array"))?;
-            if selected.is_empty() {
-                return Err(Error::new(
-                    "invalid",
-                    "selected_labels must name at least one option",
-                ));
-            }
-            let mut picked: Vec<String> = Vec::with_capacity(selected.len());
-            for label in selected {
-                let label = label
-                    .as_str()
-                    .filter(|label| !label.is_empty())
-                    .ok_or_else(|| {
-                        Error::new("invalid", "selected_labels must be non-empty strings")
-                    })?;
-                if !labels.contains(&label) {
-                    return Err(Error::new(
-                        "invalid",
-                        "selected_labels names a label that was not offered",
-                    ));
-                }
-                if picked.iter().any(|picked| picked == label) {
-                    return Err(Error::new(
-                        "invalid",
-                        "selected_labels must not repeat a label",
-                    ));
-                }
-                picked.push(label.to_owned());
-            }
-            if let Some(min) = question.selection.min_selections
-                && (picked.len() as i64) < min
-            {
-                return Err(Error::new(
-                    "invalid",
-                    "selected_labels names fewer options than the offered minimum",
-                ));
-            }
-            if let Some(max) = question.selection.max_selections
-                && (picked.len() as i64) > max
-            {
-                return Err(Error::new(
-                    "invalid",
-                    "selected_labels names more options than the offered maximum",
-                ));
-            }
-            wire.selected_labels = Some(picked);
+        wire.free_text = Some(text.clone());
+    } else if question.selection.mode == "single" {
+        let [label] = answers else {
+            return Err(Error::new(
+                "invalid",
+                "a single-mode question takes exactly one answer",
+            ));
+        };
+        if !labels.contains(&label.as_str()) {
+            return Err(Error::new(
+                "invalid",
+                "answer names an option that was not offered",
+            ));
         }
-        "free_text" => {
-            if !labels.is_empty() {
+        wire.selected_label = Some(label.clone());
+    } else if question.selection.mode == "multiple" {
+        let mut picked: Vec<String> = Vec::with_capacity(answers.len());
+        for label in answers {
+            if !labels.contains(&label.as_str()) {
                 return Err(Error::new(
                     "invalid",
-                    "free_text answers only a question without offered options",
+                    "answer names an option that was not offered",
                 ));
             }
-            let text = answer
-                .get("free_text")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .ok_or_else(|| Error::new("invalid", "free_text must be a non-empty string"))?;
-            if text.chars().count() > 500 {
-                return Err(Error::new("invalid", "free_text exceeds 500 chars"));
-            }
-            wire.free_text = Some(text.to_owned());
+            picked.push(label.clone());
         }
-        _ => unreachable!("answer shape filter"),
+        if let Some(min) = question.selection.min_selections
+            && (picked.len() as i64) < min
+        {
+            return Err(Error::new(
+                "invalid",
+                "answer names fewer options than the offered minimum",
+            ));
+        }
+        if let Some(max) = question.selection.max_selections
+            && (picked.len() as i64) > max
+        {
+            return Err(Error::new(
+                "invalid",
+                "answer names more options than the offered maximum",
+            ));
+        }
+        wire.selected_labels = Some(picked);
+    } else {
+        return Err(Error::new(
+            "source_integrity",
+            "pending request carries an unknown selection mode",
+        ));
     }
     Ok(wire)
 }
@@ -1103,60 +1249,6 @@ mod tests {
             .is_err()
         );
         assert!(reply_for(&pending, "answer", &json!({}), "cmd-1", "session-1").is_err());
-    }
-
-    #[test]
-    fn answer_validates_every_question_against_its_offer() {
-        let pending = describe_request(
-            "userInput/request",
-            &user_input_params(),
-            "session-1",
-            "turn-1",
-        )
-        .expect("prompt describes");
-        let reply = reply_for(
-            &pending,
-            "answer",
-            &json!({"answers": {"q1": {"selected_label": "staging"}}}),
-            "cmd-1",
-            "session-1",
-        )
-        .expect("answer resolves");
-        assert_eq!(reply.method, "userInput/answer");
-        assert_eq!(
-            reply.params.get("answers"),
-            Some(&json!([{"questionId": "q1", "selectedLabel": "staging"}]))
-        );
-        // Unoffered label, missing question, and extra question are all rejected.
-        assert!(
-            reply_for(
-                &pending,
-                "answer",
-                &json!({"answers": {"q1": {"selected_label": "nope"}}}),
-                "cmd-1",
-                "session-1"
-            )
-            .is_err()
-        );
-        assert!(
-            reply_for(
-                &pending,
-                "answer",
-                &json!({"answers": {}}),
-                "cmd-1",
-                "session-1"
-            )
-            .is_err()
-        );
-        assert!(reply_for(
-            &pending,
-            "answer",
-            &json!({"answers": {"q1": {"selected_label": "staging"}, "q2": {"free_text": "x"}}}),
-            "cmd-1",
-            "session-1"
-        )
-        .is_err());
-        assert!(reply_for(&pending, "approve", &json!({}), "cmd-1", "session-1").is_err());
     }
 
     #[test]

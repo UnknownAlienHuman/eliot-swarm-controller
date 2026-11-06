@@ -420,6 +420,14 @@ After dispatch, only explicit `native_not_dispatched` proves no native I/O; any 
 generic error defaults to `unknown`. A validated authoritative plugin result state is
 handled separately from generic error classification.
 
+Public requests and answers are universal: `request.opened` details and kinds use the
+shared [`eliot_core::requests`](../../crates/eliot-core/src/requests.rs) shapes
+(`QuestionRequest`/`ApprovalRequest`), and `answer` args use `AnswerArgs`. Only the
+plugin translates between these shapes and its vendor format in both directions.
+Native-private request metadata stays in the existing plugin pending objects; plugins
+normalize public event details and kinds only. There are no vendor-public
+compatibility formats.
+
 ## Lifecycle, hooks and qualification
 
 Contain owned children before tools run; use absolute deadlines. Drain buffered native
