@@ -90,6 +90,11 @@ struct AgentSession {
     /// Pinned reasoning effort, or `None` when the profile omitted it and
     /// the native/provider default is preserved by omitting the wire field.
     selected_effort: Option<String>,
+    /// Actual native readback effort from thread start/resume. Used only to
+    /// preserve the native selection through the full collaboration-settings
+    /// replacement when the profile effort is omitted; `requested` stays
+    /// absent and the normal turn `effort` field stays omitted.
+    native_effort: Option<String>,
     collaboration_mode: Option<NativeCollaborationModeKind>,
     secrets: Vec<String>,
     native: NativeProcess,
@@ -649,6 +654,7 @@ impl CodexPlugin {
             native_scope: String::new(),
             requested_model: requested_model.clone(),
             selected_effort: None,
+            native_effort: None,
             collaboration_mode,
             secrets,
             native,
@@ -899,6 +905,10 @@ impl CodexPlugin {
             }
         };
         session.thread_id = Some(readback.thread.id.clone());
+        // Remember the actual native selection for collaboration settings
+        // replacement (see send_command); effective reporting uses this
+        // same readback value, never a fabricated effort.
+        session.native_effort = readback.reasoning_effort.clone();
         if resume_subject.is_some()
             && response_value
                 .get("thread")
@@ -1319,7 +1329,17 @@ impl CodexPlugin {
                     mode,
                     settings: NativeCollaborationSettings {
                         model: session.requested_model.clone(),
-                        reasoning_effort: session.selected_effort.clone(),
+                        // Native replaces the full collaboration settings
+                        // when the mode is present, so a null effort here
+                        // would clear the native-configured selection and
+                        // fall back to the model default. Carry the actual
+                        // native readback instead; no arbitrary reasoning
+                        // is forced, the requested effort stays absent and
+                        // the normal turn `effort` field above stays omitted.
+                        reasoning_effort: session
+                            .selected_effort
+                            .clone()
+                            .or_else(|| session.native_effort.clone()),
                         developer_instructions: None,
                     },
                 }),
@@ -2964,6 +2984,7 @@ mod tests {
             native_scope: String::new(),
             requested_model: "test-model".to_owned(),
             selected_effort: None,
+            native_effort: None,
             collaboration_mode: None,
             secrets: Vec::new(),
             native,

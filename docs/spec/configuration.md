@@ -63,10 +63,12 @@ pass_env = ["CODEX_HOME"]
 
 The profile author supplies an exact model string. Reasoning effort is optional
 on every Codex route: when the profile omits `effort`, the plugin omits the
-native effort wire fields (`thread/start`/`thread/resume` config,
-`turn/start` effort and collaboration settings) and preserves the
-provider/native default, reporting the effective native readback separately;
-no effort value is fabricated. A present effort is enforced exactly and a
+native effort wire fields (`thread/start`/`thread/resume` config and
+`turn/start` effort) and preserves the provider/native default, reporting
+the effective native readback separately; when a collaboration mode is
+requested, its replacement settings carry the actual native readback effort
+so the native selection is not cleared to the model default, while the
+requested effort stays absent; no effort value is fabricated. A present effort is enforced exactly and a
 missing model catalog entry on the direct route still fails startup
 explicitly. On the direct ChatGPT Codex route, the Codex plugin uses native
 `model/list` to look up that exact model and its supported reasoning efforts;
