@@ -227,6 +227,15 @@ otherwise. The durable request row becomes `resolved`; this records closure, nev
 application or acknowledgement of a reply command. Any unknown reply stays unknown.
 Request closure neither creates nor resolves a source gap.
 
+A harness may re-open its exact pending id with updated details proven from its
+authentic native stream (same turn and kind); the projection and durable row adopt
+the current offer. For multi-stage offers the harness normalizes an integer
+`offer_seq` in pending details and records the decided integer as
+`decided_offer_seq` in each Applied reply outcome. Unknown and inflight replies
+always fence; a definite Applied stops fencing only once the persisted current
+`offer_seq` is genuinely fresh past every Applied decision. Harnesses without
+multi-stage offers omit both fields and keep the single-reply fence.
+
 Lifecycle, health and gap metadata are independent. Handoff changes named family
 ownership, not predecessor lifecycle. Cursor-backed recovery resumes strictly after
 its opaque committed cursor. No cursor means live-edge recovery plus explicit gap,

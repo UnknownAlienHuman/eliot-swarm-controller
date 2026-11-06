@@ -4,6 +4,7 @@ mod workflow_child;
 use eliot_core::{Error, ProviderRestriction, Result, SecretPolicy};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
+    protocol::MAX_COMMAND_ID_BYTES,
     session::{
         EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error,
         event_id as shared_event_id, native_no_write, rejected_control, request_event_id,
@@ -26,7 +27,8 @@ use self::workflow_child::{
 use crate::native::{
     NativeClient, NativeFrame, StreamState,
     requests::{
-        CorePending, describe_request, refresh_offer_from_raw, reply_for, same_approval_offer,
+        CorePending, describe_request, is_newer_approval_requirement, refresh_offer_from_raw,
+        reply_for, same_approval_offer,
     },
     types::{
         NativeApprovalDecideResult, NativeApprovalResolvedNotification,
@@ -962,19 +964,49 @@ impl EventProcessor {
                         same_approval_offer(&existing.request.details, &params)
                     });
             let observed = self.observe();
-            if let Some(existing) = self.pending_requests.get_mut(&request_id) {
+            let (prior, newer) = self
+                .pending_requests
+                .get(&request_id)
+                .map(|existing| {
+                    (
+                        existing.reply_state,
+                        !same && is_newer_approval_requirement(&existing.request.details, &params),
+                    )
+                })
+                .unwrap_or((NativeReplyState::Available, false));
+            if same || !newer {
+                if let Some(existing) = self.pending_requests.get_mut(&request_id) {
+                    existing.observed_at = observed;
+                }
+                if let Some(native_id) = orphan_request_id(&method, &params) {
+                    self.expected_requests.remove(native_id.as_str());
+                }
+                return Ok(());
+            }
+            let refreshed = if let Some(existing) = self.pending_requests.get_mut(&request_id) {
                 existing.observed_at = observed;
-                if !same {
-                    if refresh_offer_from_raw(&mut existing.request.details, &params).is_err() {
-                        return self
-                            .record_gap("Muse re-issued approval omitted its refreshed offer")
-                            .await;
-                    }
+                if refresh_offer_from_raw(&mut existing.request.details, &params).is_err() {
+                    None
+                } else {
                     if existing.reply_state == NativeReplyState::Written {
                         existing.reply_state = NativeReplyState::Available;
                         existing.reply_command_id = None;
                     }
+                    Some(existing.request.clone())
                 }
+            } else {
+                None
+            };
+            let Some(refreshed) = refreshed else {
+                return self
+                    .record_gap("Muse re-issued approval omitted its refreshed offer")
+                    .await;
+            };
+            if matches!(
+                prior,
+                NativeReplyState::Available | NativeReplyState::Written
+            ) {
+                self.commit_offer_update(&refreshed).await?;
             }
             if let Some(native_id) = orphan_request_id(&method, &params) {
                 self.expected_requests.remove(native_id.as_str());
@@ -1119,6 +1151,14 @@ impl EventProcessor {
         }
         .unwrap_or_default()
         .to_owned();
+        let decided_offer_seq = (reply.method == "approval/decide")
+            .then(|| {
+                params
+                    .get("requirementId")
+                    .and_then(|value| value.get("sourceIndex"))
+                    .and_then(Value::as_i64)
+            })
+            .flatten();
         let request = entry.request.clone();
         entry.reply_state = NativeReplyState::Writing;
         let acknowledged = match self
@@ -1189,12 +1229,16 @@ impl EventProcessor {
             entry.reply_state = NativeReplyState::Written;
             entry.reply_command_id = Some(command_id.to_owned());
         }
-        Ok(json!({
+        let mut outcome = json!({
             "state": "applied",
             "command_id": command_id,
             "request_id": request.id,
             "turn_id": request.turn_id,
-        }))
+        });
+        if let (Some(seq), Some(fields)) = (decided_offer_seq, outcome.as_object_mut()) {
+            fields.insert("decided_offer_seq".to_owned(), Value::from(seq));
+        }
+        Ok(outcome)
     }
 
     /// Adopt pulled snapshot entries. Entries that bind to the live turn are
@@ -1729,10 +1773,11 @@ impl EventProcessor {
     }
 
     /// `approval/updated`: one stage was satisfied while further requirements
-    /// remain. The in-memory offer is replaced wholesale (the Store keeps the
-    /// opened snapshot and has no update event) and a consumed reply resets
-    /// to Available so the next stage can be decided; an uncertain reply is
-    /// never reset.
+    /// remain. A genuinely newer requirement replaces the in-memory offer and
+    /// is persisted under the exact pending id so the owner projection exposes
+    /// the current offer; a consumed reply resets to Available so the next
+    /// stage can be decided. Duplicates and stale offers touch nothing but the
+    /// observation counter; an uncertain reply is never reset nor persisted.
     async fn refresh_approval(&mut self, params: Value) -> Result<()> {
         let raw = params.clone();
         let notification: NativeApprovalUpdatedNotification = serde_json::from_value(params)
@@ -1763,18 +1808,47 @@ impl EventProcessor {
                 .await;
         };
         let observed = self.observe();
-        let Some(entry) = self.pending_requests.get_mut(&request_id) else {
+        let (prior, same, newer) = self
+            .pending_requests
+            .get(&request_id)
+            .map(|entry| {
+                (
+                    entry.reply_state,
+                    same_approval_offer(&entry.request.details, &raw),
+                    is_newer_approval_requirement(&entry.request.details, &raw),
+                )
+            })
+            .unwrap_or((NativeReplyState::Available, false, false));
+        if same || !newer {
+            if let Some(entry) = self.pending_requests.get_mut(&request_id) {
+                entry.observed_at = observed;
+            }
             return Ok(());
+        }
+        let refreshed = if let Some(entry) = self.pending_requests.get_mut(&request_id) {
+            entry.observed_at = observed;
+            if refresh_offer_from_raw(&mut entry.request.details, &raw).is_err() {
+                None
+            } else {
+                if entry.reply_state == NativeReplyState::Written {
+                    entry.reply_state = NativeReplyState::Available;
+                    entry.reply_command_id = None;
+                }
+                Some(entry.request.clone())
+            }
+        } else {
+            None
         };
-        entry.observed_at = observed;
-        if refresh_offer_from_raw(&mut entry.request.details, &raw).is_err() {
+        let Some(refreshed) = refreshed else {
             return self
                 .record_gap("Muse approval update omitted its refreshed offer")
                 .await;
-        }
-        if entry.reply_state == NativeReplyState::Written {
-            entry.reply_state = NativeReplyState::Available;
-            entry.reply_command_id = None;
+        };
+        if matches!(
+            prior,
+            NativeReplyState::Available | NativeReplyState::Written
+        ) {
+            self.commit_offer_update(&refreshed).await?;
         }
         Ok(())
     }
@@ -2318,6 +2392,46 @@ impl EventProcessor {
         self.stream_source()
             .commit_event(kind, native_id, data)
             .await
+    }
+
+    async fn commit_offer_update(&mut self, refreshed: &CorePending) -> Result<()> {
+        let Some(command_id) = self.status.active_command_id.clone() else {
+            return self
+                .record_gap("Muse refreshed offer arrived with no active command")
+                .await;
+        };
+        let (Some(seq), Some(cursor)) = (
+            refreshed.details.get("offer_seq").and_then(Value::as_i64),
+            refreshed.details.get("view_cursor").and_then(Value::as_str),
+        ) else {
+            return self
+                .record_gap("Muse refreshed offer omitted its identity")
+                .await;
+        };
+        if cursor.trim().is_empty() {
+            return self
+                .record_gap("Muse refreshed offer omitted its identity")
+                .await;
+        }
+        let native_id = format!("muse-o:{}:s{seq}:{cursor}", refreshed.id);
+        if native_id.len() > MAX_COMMAND_ID_BYTES {
+            return self
+                .record_gap("Muse refreshed offer identity exceeded its bound")
+                .await;
+        }
+        let policy = SecretPolicy::new(self.secrets.iter().cloned());
+        let data = json!({
+            "command_id": command_id,
+            "request_id": refreshed.id,
+            "turn_id": refreshed.turn_id,
+            "kind": refreshed.kind,
+            "details": redact_request_details_for_commit(&refreshed.details, &policy),
+        });
+        if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
+            self.defer_gap("Muse refreshed offer exceeded the persisted-event bound");
+            return Ok(());
+        }
+        self.commit_event("request.opened", native_id, data).await
     }
 
     fn bind_view_session(&mut self, session_id: &str) -> Result<()> {

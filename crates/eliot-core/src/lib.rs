@@ -905,11 +905,11 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             let kind = required_text(event, "kind")?;
             let details = optional_details(event)?;
             if let Some(existing) = agent.pending.iter().find(|p| p.id == request_id) {
-                // Identical duplicate: Store owns native-id dedup; tolerate exact replay.
-                if existing.turn_id != turn_id
-                    || existing.kind != kind
-                    || existing.details != details
-                {
+                // Same binding, new offer: a harness may re-open its exact pending
+                // id with updated details proven from its authentic native stream
+                // (Muse multi-stage advances its current requirement this way).
+                // Conflicting bindings still fail; identical replays stay idempotent.
+                if existing.turn_id != turn_id || existing.kind != kind {
                     return Err(Error::new(
                         "source_integrity",
                         format!(
@@ -917,6 +917,11 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                             agent.id
                         ),
                     ));
+                }
+                if existing.details != details
+                    && let Some(slot) = next.pending.iter_mut().find(|p| p.id == request_id)
+                {
+                    slot.details = details.clone();
                 }
                 // State follows the pending set: open requests imply waiting.
                 next.state = AgentState::Waiting;

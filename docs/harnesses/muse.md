@@ -58,8 +58,13 @@ with the offered choices or questions (child approvals keep their subagent origi
 provenance); the transport receipt acknowledges presentation only and the
 decision travels as `approval/decide`, `userInput/answer` or `userInput/cancel`
 with the exact ids, an offered choice, and the current requirement. Replies decide
-from the current offer, never the opened snapshot: a stale choice is rejected, a
-consumed multi-stage reply resets on `approval/updated`, and only
+from the current offer, never a stale snapshot: a stale choice is rejected. A
+genuinely newer multi-stage requirement (same approval, strictly greater source
+index) replaces the in-memory offer, is persisted under the exact pending id with
+normalized `offer_seq`, and resets a consumed reply so the next stage can be
+decided; each Applied approval outcome records `decided_offer_seq`, and the next
+explicit choice is admitted only once the persisted current offer is fresh past
+it. Duplicates and stale offers change nothing; unknown stays fenced. Only
 schema-documented pre-admission/validation errors prove rejection (anything else is
 unknown, never resubmitted). Approve and deny take an optional `choice_id` and
 optional `feedback` where the choice accepts it; answer takes `answers` mapping

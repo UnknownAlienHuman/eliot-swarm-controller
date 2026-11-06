@@ -954,3 +954,78 @@ pub(super) fn submit_tx(
         is_new: true,
     })
 }
+
+/// Whether a reply command is still unresolved for this native request.
+/// Unknown and inflight always fence. A definite Applied only stops fencing
+/// once the persisted current offer is genuinely fresh past every Applied
+/// decision: the harness normalizes its current offer binding as an integer
+/// `offer_seq` in pending details and records the decided binding as integer
+/// `decided_offer_seq` in each Applied reply outcome. All Applied decided
+/// strictly below current are consumed; anything missing, malformed, equal,
+/// or older stays blocking. Harnesses without multi-stage offers omit both
+/// fields and keep the single-reply fence.
+pub(super) fn request_reply_blocked(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+    request_id: &str,
+    except_command: Option<&str>,
+) -> Result<bool> {
+    let mut stmt = connection
+        .prepare(
+            "SELECT state, outcome FROM commands
+             WHERE target = ?1 AND generation = ?2 AND request_id = ?3
+               AND state IN ('accepted', 'queued', 'dispatched', 'unknown', 'applied')
+               AND (?4 IS NULL OR id != ?4)",
+        )
+        .map_err(sql_error)?;
+    let rows: Vec<(String, Option<String>)> = stmt
+        .query_map(
+            params![agent, generation, request_id, except_command],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(sql_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(sql_error)?;
+    if rows.iter().any(|(state, _)| {
+        matches!(
+            state.as_str(),
+            "accepted" | "queued" | "dispatched" | "unknown"
+        )
+    }) {
+        return Ok(true);
+    }
+    let applied: Vec<&Option<String>> = rows
+        .iter()
+        .filter(|(state, _)| state == "applied")
+        .map(|(_, outcome)| outcome)
+        .collect();
+    if applied.is_empty() {
+        return Ok(false);
+    }
+    let Some((pending, state)) = load_pending_request(connection, agent, generation, request_id)?
+    else {
+        return Ok(true);
+    };
+    if state != "pending" {
+        return Ok(true);
+    }
+    let Some(current) = pending.details.get("offer_seq").and_then(Value::as_i64) else {
+        return Ok(true);
+    };
+    for outcome in applied {
+        let Some(text) = outcome.as_deref() else {
+            return Ok(true);
+        };
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            return Ok(true);
+        };
+        let Some(decided) = value.get("decided_offer_seq").and_then(Value::as_i64) else {
+            return Ok(true);
+        };
+        if decided >= current {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}

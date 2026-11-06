@@ -167,6 +167,10 @@ fn describe_approval(
             .cloned()
             .unwrap_or(Value::Null),
     );
+    details.insert(
+        "offer_seq".to_owned(),
+        Value::from(request.current_requirement_id.source_index),
+    );
     if let Some(origin) = request.subagent_origin.clone() {
         details.insert("subagent_origin".to_owned(), origin);
     }
@@ -753,8 +757,11 @@ fn reply_to_user_input_cancel(
 
 /// Refresh the in-memory offer after `approval/updated`: the available
 /// choices, current requirement and view cursor are replaced wholesale from
-/// the validated raw params. The Store keeps the opened snapshot (it has no
-/// update event); the reply path always decides from this refreshed offer.
+/// the validated raw params, plus the subject when the raw offer carries it
+/// (stage resolutions advance with the requirement). The caller persists the
+/// same refreshed offer to the Store under the exact pending id so the owner
+/// projection exposes the current requirement; the reply path always decides
+/// from this refreshed offer.
 pub(crate) fn refresh_offer_from_raw(details: &mut Value, raw: &Value) -> Result<()> {
     let Some(fields) = details.as_object_mut() else {
         return Err(Error::new(
@@ -777,7 +784,43 @@ pub(crate) fn refresh_offer_from_raw(details: &mut Value, raw: &Value) -> Result
         };
         fields.insert(camel.to_owned(), value.clone());
     }
+    if let Some(subject) = raw.get("subject") {
+        fields.insert("subject".to_owned(), subject.clone());
+    }
+    if let Some(index) = raw
+        .get("currentRequirementId")
+        .and_then(|value| value.get("sourceIndex"))
+        .and_then(Value::as_i64)
+    {
+        fields.insert("offer_seq".to_owned(), Value::from(index));
+    }
     Ok(())
+}
+
+/// Whether `raw` proves a strictly newer multi-stage requirement than the
+/// retained offer: same approval id, strictly greater source index. Anything
+/// else (same or older index, another approval, malformed) is not newer.
+pub(crate) fn is_newer_approval_requirement(existing_details: &Value, raw: &Value) -> bool {
+    let current = existing_details
+        .get("current_requirement")
+        .and_then(|value| {
+            Some((
+                value.get("approvalId")?.as_str()?,
+                value.get("sourceIndex")?.as_i64()?,
+            ))
+        });
+    let incoming = raw.get("currentRequirementId").and_then(|value| {
+        Some((
+            value.get("approvalId")?.as_str()?,
+            value.get("sourceIndex")?.as_i64()?,
+        ))
+    });
+    match (current, incoming) {
+        (Some((old_approval, old_index)), Some((new_approval, new_index))) => {
+            !old_approval.is_empty() && old_approval == new_approval && new_index > old_index
+        }
+        _ => false,
+    }
 }
 
 /// Whether a re-issued `approval/request` carries the same offer the entry

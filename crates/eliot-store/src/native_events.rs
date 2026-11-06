@@ -278,6 +278,19 @@ fn persist_request_opened(
     }
     match load_pending_request(tx, agent_num, generation, request_id)? {
         Some((old, state)) if state == "pending" && old == projected => {}
+        Some((old, state))
+            if state == "pending"
+                && old.turn_id == projected.turn_id
+                && old.kind == projected.kind =>
+        {
+            let details = encode_json(details)?;
+            db!(tx.execute(
+                "UPDATE pending_requests SET details = ?1
+                 WHERE agent = ?2 AND generation = ?3 AND request_id = ?4
+                   AND turn_id = ?5 AND state = 'pending'",
+                params![details, agent_num, generation, request_id, turn_id],
+            ));
+        }
         Some(_) => {
             return Err(Error::new(
                 "source_integrity",
