@@ -106,8 +106,12 @@ and uses the renewed expiry for subsequent authenticated reads. Its authorizatio
 has a monotonic deadline and sticky expiry; wall-clock rollback cannot resume
 polling without verified renewal. Expired sessions are reaped in bounded batches
 before a new session acquires capacity; existing-session renewal precedes reaping.
-Each GET stream
-still ends at that GET's own authorizing assertion expiry. Stateless
+Reservations also follow the actual SDK handler lifetime: idle/closed SDK sessions
+release auth capacity independently of JWT expiry. Authentication, response cleanup
+and bounded reaping reconcile absent SDK sessions, including SessionNotFound.
+Each GET stream ends at the immutable monotonic credential deadline captured during
+that request's verified authentication, even if the handler is delayed or the wall
+clock changes. The renewable session lease cannot extend that GET. Stateless
 requests carry fresh server-generated connection/call correlation without inventing
 a session. `clientInfo` is untrusted and unused. No local Agent/PID or generation
 is created for a remote caller.
@@ -120,7 +124,9 @@ results expose it as `structuredContent.remote_call`. This is provenance for the
 existing owner-only app, not additional roles or per-user permissions. Standard
 `command.submit` admission persists the context in the existing command cause and
 every associated new admission event (including `agent.created`)
-before commit and publication; retries retain their original admitted cause. Reads
+before commit and publication. Direct, live-rule, catch-up and script admission use
+the same event-cause annotator; derived events inherit their verified child command,
+rule, depth and remote cause. Retried admissions retain their original cause. Reads
 do not create an audit event, and other RPC results carry call context without
 claiming command-cause attribution. JWTs, OAuth tokens, cookies and owner credentials
 never enter that context or semantic data.

@@ -40,7 +40,7 @@ use rmcp::transport::streamable_http_server::{
 use tokio_util::sync::CancellationToken;
 
 use super::EliotMcpHandler;
-use super::origin_auth::{OriginAuth, VerifiedRequest, now_seconds};
+use super::origin_auth::{OriginAuth, SessionLifetime, VerifiedRequest};
 
 /// MCP route served locally; the owner-managed tunnel maps the public URL
 /// onto it. Single route by design: no arbitrary routes. Also the required
@@ -110,6 +110,7 @@ pub async fn run_http(
                 notify_owner_events: true,
                 shutdown: factory_shutdown.clone(),
                 notify_spawned: Arc::new(AtomicBool::new(false)),
+                session_lifetime: Arc::new(SessionLifetime::default()),
                 log_level: Arc::new(RwLock::new(LoggingLevel::Info)),
             })
         },
@@ -222,14 +223,12 @@ async fn serve_mcp(
             // A persistent GET stream must not outlive the credential that
             // authorized that HTTP request, even if its MCP session survives.
             use futures_util::StreamExt as _;
-            let lifetime = std::time::Duration::from_secs(
-                verified.context.expires_at.saturating_sub(now_seconds()),
-            );
+            let deadline = tokio::time::Instant::from_std(verified.request_deadline);
             response.map(|body| {
                 axum::body::Body::from_stream(
                     axum::body::Body::new(body)
                         .into_data_stream()
-                        .take_until(tokio::time::sleep(lifetime)),
+                        .take_until(tokio::time::sleep_until(deadline)),
                 )
             })
         }

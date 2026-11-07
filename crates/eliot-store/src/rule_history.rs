@@ -292,7 +292,10 @@ impl Store {
             let cause = core::EventCause {
                 command_id: child_id.clone(),
                 rule: Some(request.rule.clone()),
-                remote_call: None,
+                remote_call: trigger
+                    .cause
+                    .as_ref()
+                    .and_then(|cause| cause.remote_call.clone()),
                 depth,
             };
             tx.execute_batch("SAVEPOINT rule_catch_up_action")

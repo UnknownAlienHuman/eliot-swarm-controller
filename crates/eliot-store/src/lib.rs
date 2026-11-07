@@ -3103,38 +3103,88 @@ fn annotate_new_command_cause_tx(
         ));
     }
 
+    annotate_admission_event_cause_tx(tx, command_event, &cause)
+}
+
+/// Common direct/rule/script admission event boundary. The caller first binds
+/// the new command row; every returned event associated with that command uses
+/// this same compare-and-swap, including events without data.command_id.
+fn annotate_admission_event_cause_tx(
+    tx: &Transaction<'_>,
+    event: &mut Event,
+    cause: &core::EventCause,
+) -> Result<()> {
+    validate_event_cause_shape(cause, Some(&cause.command_id))?;
+    if event.source != "daemon"
+        || event
+            .cause
+            .as_ref()
+            .is_some_and(|old| old.command_id != cause.command_id)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "admission event is not bound to its causal command",
+        ));
+    }
+    let original = event.cause.as_ref().map(encode_json).transpose()?;
+    let encoded = encode_json(cause)?;
     let changed = tx
         .execute(
-            "UPDATE events SET cause = ?1
-             WHERE seq = ?2 AND source = 'daemon' AND kind = ?3 AND cause = ?4
-               AND json_extract(data, '$.command_id') = ?5",
-            params![
-                cause_json,
-                command_event.seq,
-                command_event.kind,
-                default_json,
-                command_id
-            ],
+            "UPDATE events SET cause = ?1 WHERE seq = ?2 AND source = 'daemon' AND cause IS ?3",
+            params![encoded, event.seq, original],
         )
         .map_err(sql_error)?;
     if changed != 1 {
         let stored: Option<String> = tx
             .query_row(
                 "SELECT cause FROM events WHERE seq = ?1",
-                [command_event.seq],
+                [event.seq],
                 |row| row.get(0),
             )
             .optional()
             .map_err(sql_error)?
             .flatten();
-        if decode_event_cause(stored.as_deref(), Some(command_id)).as_ref() != Some(&cause) {
+        if decode_event_cause(stored.as_deref(), Some(&cause.command_id)).as_ref() != Some(cause) {
             return Err(Error::new(
                 "source_integrity",
-                "new command event cause could not be bound to its exact command",
+                "admission event cause changed before annotation",
             ));
         }
     }
-    command_event.cause = Some(cause);
+    event.cause = Some(cause.clone());
+    Ok(())
+}
+
+fn annotate_admission_command_cause_tx(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    events: &mut [Event],
+    cause: core::EventCause,
+) -> Result<()> {
+    let index = events
+        .iter()
+        .position(|event| {
+            event.kind.starts_with("command.")
+                && event.data.get("command_id").and_then(Value::as_str) == Some(command_id)
+        })
+        .ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "new admission has no matching command event",
+            )
+        })?;
+    annotate_new_command_cause_tx(tx, command_id, &mut events[index], cause.clone())?;
+    for (i, event) in events.iter_mut().enumerate() {
+        if i != index
+            && (event
+                .cause
+                .as_ref()
+                .is_some_and(|old| old.command_id == command_id)
+                || event.data.get("command_id").and_then(Value::as_str) == Some(command_id))
+        {
+            annotate_admission_event_cause_tx(tx, event, &cause)?;
+        }
+    }
     Ok(())
 }
 
@@ -3195,7 +3245,6 @@ fn annotate_remote_admission_event_tx(
             "admission provenance requires a daemon event",
         ));
     }
-    let original_event_cause = event.cause.as_ref().map(encode_json).transpose()?;
     let mut cause = event.cause.clone().unwrap_or_else(|| root_cause.clone());
     let stored = command_cause_tx(tx, &cause.command_id)?
         .ok_or_else(|| Error::new("source_integrity", "admission event has no bound command"))?;
@@ -3232,20 +3281,7 @@ fn annotate_remote_admission_event_tx(
             "remote cause does not name a newly admitted command",
         ));
     }
-    let changed = tx
-        .execute(
-            "UPDATE events SET cause = ?1 WHERE seq = ?2 AND source = 'daemon' AND cause IS ?3",
-            params![encoded, event.seq, original_event_cause],
-        )
-        .map_err(sql_error)?;
-    if changed != 1 {
-        return Err(Error::new(
-            "source_integrity",
-            "remote cause does not match its new admission event",
-        ));
-    }
-    event.cause = Some(cause);
-    Ok(())
+    annotate_admission_event_cause_tx(tx, event, &cause)
 }
 
 fn admit_linked_send(

@@ -4,6 +4,7 @@
 //! no cryptographic or OAuth implementation is copied here.
 use axum::http::{HeaderMap, Method, StatusCode};
 use eliot_core::{RemoteCallContext, RemoteIdentity};
+use eliot_plugin::sync::LockExt;
 use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header,
     jwk::{JwkSet, KeyAlgorithm, PublicKeyUse},
@@ -15,7 +16,7 @@ use serde::Deserialize;
 use std::{
     collections::HashMap,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch};
@@ -46,7 +47,59 @@ struct Session {
     identity: RemoteIdentity,
     connection_id: String,
     lease: Arc<SessionLease>,
-    _slot: Arc<OwnedSemaphorePermit>,
+    slot: Arc<SessionSlot>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.slot.release();
+        self.lease.close();
+    }
+}
+
+/// Reservation is released by the actual SDK handler lifetime, even when an
+/// auth binding or an in-flight request still holds an Arc to this reservation.
+pub(super) struct SessionSlot(StdMutex<Option<OwnedSemaphorePermit>>);
+
+impl SessionSlot {
+    fn release(&self) {
+        drop(self.0.lock_recover().take());
+    }
+}
+
+#[derive(Default)]
+pub(super) struct SessionLifetime {
+    binding: StdMutex<Option<(Arc<SessionSlot>, Arc<SessionLease>)>>,
+}
+
+impl SessionLifetime {
+    pub fn bind(&self, verified: &VerifiedRequest) -> Result<(), StatusCode> {
+        let mut binding = self.binding.lock_recover();
+        match (&*binding, &verified.slot) {
+            (None, Some(slot)) => {
+                *binding = Some((slot.clone(), verified.lease.clone()));
+                Ok(())
+            }
+            (Some((slot, lease)), candidate)
+                if Arc::ptr_eq(lease, &verified.lease)
+                    && candidate
+                        .as_ref()
+                        .is_none_or(|candidate| Arc::ptr_eq(slot, candidate)) =>
+            {
+                Ok(())
+            }
+            _ => Err(StatusCode::UNAUTHORIZED),
+        }
+    }
+}
+
+impl Drop for SessionLifetime {
+    fn drop(&mut self) {
+        if let Some((slot, lease)) = self.binding.lock_recover().take() {
+            slot.release();
+            lease.close();
+        }
+    }
 }
 
 pub(super) struct OriginAuth {
@@ -64,7 +117,8 @@ pub(super) struct OriginAuth {
 pub(super) struct VerifiedRequest {
     pub context: RemoteCallContext,
     pub lease: Arc<SessionLease>,
-    slot: Option<Arc<OwnedSemaphorePermit>>,
+    pub request_deadline: Instant,
+    slot: Option<Arc<SessionSlot>>,
 }
 
 /// Shared only with the SDK session's existing notification task. Renewal is
@@ -301,6 +355,15 @@ impl OriginAuth {
         }
         let (connection_id, lease, slot) = if let Some(id) = &session_id {
             let mut sessions = self.sessions.lock().await;
+            if !self
+                .sdk_sessions
+                .has_session(&id.clone().into())
+                .await
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            {
+                drop(sessions.remove(id));
+                return Err(StatusCode::NOT_FOUND);
+            }
             let session = sessions.get_mut(id).ok_or(StatusCode::NOT_FOUND)?;
             if session.identity != identity {
                 return Err(StatusCode::FORBIDDEN);
@@ -325,7 +388,7 @@ impl OriginAuth {
             (
                 ulid::Ulid::new().to_string(),
                 Arc::new(SessionLease::new(claims.exp, deadline)),
-                Some(Arc::new(slot)),
+                Some(Arc::new(SessionSlot(StdMutex::new(Some(slot))))),
             )
         };
         // SDK request Parts must never retain bearer material.
@@ -357,6 +420,7 @@ impl OriginAuth {
         Ok(VerifiedRequest {
             context,
             lease,
+            request_deadline: deadline,
             slot,
         })
     }
@@ -364,20 +428,24 @@ impl OriginAuth {
     // Reap through the SDK's own session lifecycle, not just the auth binding.
     // Work is bounded per authenticated request; no background registry/driver.
     async fn reap_expired_sessions(&self) {
-        let expired = self
-            .sessions
-            .lock()
-            .await
-            .iter()
-            .filter(|(_, session)| {
-                session
-                    .lease
-                    .current_authorization()
-                    .is_none_or(|authorization| authorization.expired)
-            })
-            .take(64)
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
+        let expired = {
+            let sessions = self.sessions.lock().await;
+            // This is the actual pinned SDK manager's public session map;
+            // its worker removes idle/dead sessions via close_session.
+            let sdk = self.sdk_sessions.sessions.read().await;
+            sessions
+                .iter()
+                .filter(|(id, session)| {
+                    !sdk.contains_key(id.as_str())
+                        || session
+                            .lease
+                            .current_authorization()
+                            .is_none_or(|authorization| authorization.expired)
+                })
+                .take(64)
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        };
         let _ = tokio::time::timeout(Duration::from_secs(1), async {
             for id in expired {
                 // Serialize closure with refresh and recheck the live lease:
@@ -386,10 +454,15 @@ impl OriginAuth {
                 let Some(session) = sessions.get(&id) else {
                     continue;
                 };
-                if session
-                    .lease
-                    .current_authorization()
-                    .is_some_and(|authorization| !authorization.expired)
+                let sdk_closed = matches!(
+                    self.sdk_sessions.has_session(&id.clone().into()).await,
+                    Ok(false)
+                );
+                if !sdk_closed
+                    && session
+                        .lease
+                        .current_authorization()
+                        .is_some_and(|authorization| !authorization.expired)
                 {
                     continue;
                 }
@@ -415,6 +488,14 @@ impl OriginAuth {
         headers: &HeaderMap,
     ) -> Result<(), StatusCode> {
         let mut sessions = self.sessions.lock().await;
+        if let Some(id) = &request.context.session_id
+            && matches!(
+                self.sdk_sessions.has_session(&id.clone().into()).await,
+                Ok(false)
+            )
+        {
+            drop(sessions.remove(id));
+        }
         if method == Method::DELETE && status.is_success() {
             if let Some(id) = &request.context.session_id
                 && let Some(session) = sessions.remove(id)
@@ -429,6 +510,15 @@ impl OriginAuth {
             if id.len() > 256 {
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
+            if request.lease.current_authorization().is_none()
+                || !self
+                    .sdk_sessions
+                    .has_session(&id.to_owned().into())
+                    .await
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            {
+                return Err(StatusCode::NOT_FOUND);
+            }
             let slot = request
                 .slot
                 .clone()
@@ -439,7 +529,7 @@ impl OriginAuth {
                     identity: request.context.identity.clone(),
                     connection_id: request.context.connection_id.clone(),
                     lease: request.lease.clone(),
-                    _slot: slot,
+                    slot,
                 },
             );
         }

@@ -2882,16 +2882,7 @@ pub(super) fn annotate_rule_command_event(
     events: &mut [Event],
     cause: core::EventCause,
 ) -> Result<()> {
-    let event = events
-        .iter_mut()
-        .find(|event| event.data.get("command_id").and_then(Value::as_str) == Some(command_id))
-        .ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "new rule command has no matching returned command event",
-            )
-        })?;
-    annotate_new_command_cause_tx(tx, command_id, event, cause)
+    annotate_admission_command_cause_tx(tx, command_id, events, cause)
 }
 
 fn reject_rule_event(

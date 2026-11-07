@@ -78,6 +78,7 @@ pub async fn run_stdio(data_dir: PathBuf) -> Result<(), String> {
         notify_owner_events: false,
         shutdown: CancellationToken::new(),
         notify_spawned: Arc::new(AtomicBool::new(false)),
+        session_lifetime: Arc::new(origin_auth::SessionLifetime::default()),
         log_level: Arc::new(RwLock::new(LoggingLevel::Info)),
     };
     let (stdin, stdout) = rmcp::transport::io::stdio();
@@ -105,6 +106,8 @@ struct EliotMcpHandler {
     /// Guards the one-task-per-session invariant against repeated
     /// `notifications/initialized` deliveries.
     notify_spawned: Arc<AtomicBool>,
+    /// Last SDK handler clone releases its actual session reservation.
+    session_lifetime: Arc<origin_auth::SessionLifetime>,
     /// Per-session `logging/setLevel` minimum severity (default `Info`).
     /// Written by `set_level`, read by the session notify task.
     #[allow(deprecated)] // SEP-2577: LoggingLevel is deprecated but functional in rmcp 3.9.
@@ -112,6 +115,28 @@ struct EliotMcpHandler {
 }
 
 impl ServerHandler for EliotMcpHandler {
+    fn initialize(
+        &self,
+        request: rmcp::model::InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<rmcp::model::InitializeResult, McpError>> + MaybeSendFuture + '_
+    {
+        if self.notify_owner_events {
+            let verified = context
+                .extensions
+                .get::<axum::http::request::Parts>()
+                .and_then(|parts| parts.extensions.get::<origin_auth::VerifiedRequest>());
+            if verified.is_none_or(|verified| self.session_lifetime.bind(verified).is_err()) {
+                return std::future::ready(Err(McpError::invalid_request(
+                    "verified session reservation is missing",
+                    None,
+                )));
+            }
+        }
+        context.peer.set_peer_info(request.clone());
+        std::future::ready(self.negotiate_initialize(&request))
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(server_capabilities(self.notify_owner_events))
             .with_server_info(Implementation::new("eliot", env!("CARGO_PKG_VERSION")))
