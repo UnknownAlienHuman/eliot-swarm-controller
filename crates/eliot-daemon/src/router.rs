@@ -1243,7 +1243,15 @@ impl Router {
         ) {
             validate_plugin_command_args(&request)?;
         }
-        if contains_known_secret(&request.args, &self.inner.secrets) {
+        // Emit data is arbitrary JSON: its object keys can smuggle a known
+        // credential past the values-only check. Block keys before
+        // admission; never persist or log the offending key.
+        let secret_hit = if matches!(request.verb.as_str(), "notify" | "emit") {
+            contains_known_secret_including_keys(&request.args, &self.inner.secrets)
+        } else {
+            contains_known_secret(&request.args, &self.inner.secrets)
+        };
+        if secret_hit {
             return Err(Error::new(
                 "secret_in_payload",
                 "durable command text contains a known credential",

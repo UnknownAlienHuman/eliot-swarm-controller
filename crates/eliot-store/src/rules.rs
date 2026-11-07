@@ -2497,7 +2497,10 @@ fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand)
     if !valid_event_rule_action_request(request) {
         return Some("rule_action_binding_invalid".to_owned());
     }
-    if matches!(request.verb.as_str(), "launch" | "git.fetch") {
+    if matches!(
+        request.verb.as_str(),
+        "launch" | "git.fetch" | "notify" | "emit"
+    ) {
         return None;
     }
     if request.target != event.agent.map(format_agent_id)

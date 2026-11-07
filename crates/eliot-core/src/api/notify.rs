@@ -25,13 +25,13 @@ impl NotifyDefinitionArgs {
         if let Some(title) = &self.title {
             validate_text(title, "notify title")?;
         }
-        let encoded =
-            serde_json::to_vec(self).map_err(|_| invalid("notify arguments cannot be encoded"))?;
-        if encoded.len() > MAX_EVENT_BYTES {
-            return Err(invalid(
-                "notify arguments exceed the 64 KiB persisted-event bound",
-            ));
+        // Bound the final persisted event payload shape (`{message,title?}`),
+        // not just the DTO, so Store never rejects it at commit time.
+        let mut payload = serde_json::json!({"message": self.message});
+        if let Some(title) = &self.title {
+            payload["title"] = Value::String(title.clone());
         }
+        bound_payload(&payload, "notify")?;
         Ok(())
     }
 }
@@ -55,15 +55,21 @@ impl EmitDefinitionArgs {
         {
             return Err(invalid("emit topic must be a bounded dotted name"));
         }
-        let encoded =
-            serde_json::to_vec(&self.data).map_err(|_| invalid("emit data cannot be encoded"))?;
-        if encoded.len() > MAX_EVENT_BYTES {
-            return Err(invalid(
-                "emit data exceeds the 64 KiB persisted-event bound",
-            ));
-        }
+        // Bound the final persisted wrapper (`{data:...}`), not raw data.
+        bound_payload(&serde_json::json!({"data": self.data}), "emit")?;
         Ok(())
     }
+}
+
+fn bound_payload(payload: &Value, what: &str) -> Result<()> {
+    let encoded = serde_json::to_vec(payload)
+        .map_err(|_| invalid(format!("{what} payload cannot be encoded")))?;
+    if encoded.len() > MAX_EVENT_BYTES {
+        return Err(invalid(format!(
+            "{what} persisted payload exceeds the 64 KiB event bound"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_text(value: &str, what: &str) -> Result<()> {
