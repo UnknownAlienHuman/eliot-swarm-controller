@@ -23,7 +23,7 @@ use tokio::{
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
 const PIPE_QUEUE_CAPACITY: usize = 16;
-const MAX_PENDING_CALLS: usize = 32;
+pub(crate) const MAX_PENDING_CALLS: usize = 32;
 
 type Pending = HashMap<String, oneshot::Sender<Result<RpcResponse>>>;
 
