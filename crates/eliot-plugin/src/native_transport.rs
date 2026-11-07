@@ -305,6 +305,12 @@ impl NativeChild {
         self.process_exit.borrow().is_some()
     }
 
+    /// Wait for the owned child waiter to observe its OS exit without
+    /// terminating the child or imposing a deadline.
+    pub async fn wait_for_process_exit(&mut self) -> Result<ExitStatus> {
+        self.wait_process_exit().await
+    }
+
     /// True once the stdout reader task has ended, whether it ended cleanly or
     /// with a typed stream fault. Callers can require this before owner cleanup.
     pub fn output_reader_finished(&self) -> bool {
@@ -353,7 +359,18 @@ impl NativeChild {
         result.map_err(|error| self.diagnostic_error(error))
     }
 
+    /// Wait passively for the owned stdout reader task to finish, retaining
+    /// its result so the bounded drain helper can confirm the full endpoint.
+    pub async fn wait_for_output_reader_finished(&mut self) -> Result<()> {
+        let result = self.await_stdout_drained_until(None).await;
+        result.map_err(|error| self.diagnostic_error(error))
+    }
+
     async fn await_stdout_drained(&mut self, deadline: Instant) -> Result<()> {
+        self.await_stdout_drained_until(Some(deadline)).await
+    }
+
+    async fn await_stdout_drained_until(&mut self, deadline: Option<Instant>) -> Result<()> {
         if let Some(result) = &self.output_reader_result {
             return result.clone();
         }
@@ -366,7 +383,7 @@ impl NativeChild {
             })?;
             if reader.is_finished() {
                 (&mut *reader).await
-            } else {
+            } else if let Some(deadline) = deadline {
                 match timeout_at(deadline, reader).await {
                     Ok(result) => result,
                     Err(_) => {
@@ -379,6 +396,8 @@ impl NativeChild {
                         ));
                     }
                 }
+            } else {
+                (&mut *reader).await
             }
         };
         let result = match reader_result {
