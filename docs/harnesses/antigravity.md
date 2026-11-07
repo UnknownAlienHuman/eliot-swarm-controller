@@ -57,7 +57,10 @@ preceding `session/update`, so the exact prepared turn settles only
 after those updates have been consumed — never from a direct pending
 route, a sleep, or silence. Send returns `applied` on the first
 associated update; the terminal `stopReason` settles the turn through
-the event state, never from the send ack alone. `end_turn`/`max_tokens`/`max_turn_requests` complete the
+the event state, never from the send ack alone. The fenced registration
+is held until that actual in-band terminal reply, an error, a stream
+fault, stop, or drop — stream silence is not staleness and no
+model-turn timer expires admitted work. `end_turn`/`max_tokens`/`max_turn_requests` complete the
 turn, `cancelled` settles an interrupt, `refusal` fails it, and any other
 stop reason is a native protocol gap. Assistant text is accumulated from
 `agent_message_chunk` updates (bounded at 256 KiB, then

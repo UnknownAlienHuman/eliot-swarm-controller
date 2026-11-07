@@ -4,9 +4,7 @@ use eliot_core::{ContextItem, Error, Result, SecretPolicy, SourceHealthUpdate};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     native_transport::StreamState,
-    session::{
-        EVENT_DEADLINE, StreamSource, attach_final_text, event_id, next_input_outcomes,
-    },
+    session::{EVENT_DEADLINE, StreamSource, attach_final_text, event_id, next_input_outcomes},
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -24,12 +22,6 @@ pub(crate) type Shared = Arc<Mutex<State>>;
 /// tail is dropped and the turn carries `final_text_unavailable` instead
 /// of an unbounded payload.
 const MAX_TURN_TEXT_BYTES: usize = 256 * 1024;
-
-/// Bounded wait for the fenced terminal reply of one prompt. The
-/// process lifetime and stream loss settle earlier; this only bounds a
-/// missing reply from leaving the turn stuck busy forever.
-pub(crate) const PROMPT_TERMINAL_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(30 * 60);
 
 #[derive(Clone, Serialize)]
 pub(crate) struct TurnFacts {
@@ -67,12 +59,9 @@ pub(crate) struct State {
     tools: HashMap<String, (String, String)>,
     /// RAII registration of the outstanding fenced prompt call. Exactly
     /// one owner (this state); clearing it retires both transport maps.
+    /// Held until the actual in-band terminal reply, an error, a stream
+    /// fault, stop, or drop — stream silence alone never expires it.
     fenced_guard: Option<FencedGuard>,
-    /// Absolute deadline for the fenced terminal reply, while a prompt
-    /// is outstanding.
-    prompt_expiry: Option<Instant>,
-    /// Wakes the event loop when the prompt deadline is armed or cleared.
-    prompt_expiry_wake: watch::Sender<()>,
     text_accum: String,
     text_truncated: bool,
     writes_blocked: bool,
@@ -103,7 +92,6 @@ impl State {
         policy: SecretPolicy,
         conversation: String,
     ) -> Self {
-        let (prompt_expiry_wake, _) = watch::channel(());
         Self {
             sink: CommitSink::new(host.clone(), credential.clone()),
             host,
@@ -116,8 +104,6 @@ impl State {
             tool_emitted: std::collections::HashSet::new(),
             tools: HashMap::new(),
             fenced_guard: None,
-            prompt_expiry: None,
-            prompt_expiry_wake,
             text_accum: String::new(),
             text_truncated: false,
             writes_blocked: false,
@@ -143,25 +129,13 @@ impl State {
             .map(|(_, status)| status.as_str())
     }
 
-    fn subscribe_prompt_expiry_wake(&self) -> watch::Receiver<()> {
-        self.prompt_expiry_wake.subscribe()
-    }
-
-    fn set_prompt_expiry(&mut self, expiry: Option<Instant>) {
-        if self.prompt_expiry != expiry {
-            self.prompt_expiry = expiry;
-            self.prompt_expiry_wake.send_modify(|_| {});
-        }
-    }
-
-    /// Take ownership of the fenced prompt registration and arm its
-    /// terminal expiry — but only if the expected prepared turn is still
-    /// pending and live. The fenced reply may have settled (or the
-    /// stream may have been lost) while the dispatch write was in flight;
-    /// in that case the guard is retired immediately by drop and no
-    /// stale expiry is ever armed for a finished or other turn. The
-    /// associated oneshot already proves association, so a confirmed
-    /// terminal settlement is never downgraded by a late guard.
+    /// Take ownership of the fenced prompt registration — but only if
+    /// the expected prepared turn is still pending and live. The fenced
+    /// reply may have settled (or the stream may have been lost) while
+    /// the dispatch write was in flight; in that case the guard is
+    /// retired immediately by drop. The associated oneshot already
+    /// proves association, so a confirmed terminal settlement is never
+    /// downgraded by a late guard.
     pub fn arm_fenced(&mut self, guard: FencedGuard, expected_turn: &str) {
         let live = self.failure.is_none()
             && !self.source_unknown
@@ -171,31 +145,11 @@ impl State {
                 .is_some_and(|pending| pending.turn == expected_turn);
         if live {
             self.fenced_guard = Some(guard);
-            self.set_prompt_expiry(Some(Instant::now() + PROMPT_TERMINAL_TIMEOUT));
         }
     }
 
     fn clear_fenced(&mut self) {
         self.fenced_guard = None;
-        self.set_prompt_expiry(None);
-    }
-
-    /// Bounded terminal expiry from the event loop: a missing fenced
-    /// reply settles Unknown, never a stuck busy turn and never a replay.
-    pub async fn expire_prompt_if_current(&mut self, deadline: Instant, turn: &str) {
-        if self.prompt_expiry != Some(deadline)
-            || !self
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.turn == turn)
-        {
-            return;
-        }
-        self.fail_prompt(Error::new(
-            "unknown",
-            "Antigravity prompt terminal reply deadline elapsed",
-        ))
-        .await;
     }
 
     pub fn active_turn(&self) -> Option<&str> {
@@ -693,23 +647,15 @@ pub(crate) fn spawn(
     client: AgyClient,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut prompt_expiry_wake = state.lock().await.subscribe_prompt_expiry_wake();
         // Observe watch faults while active, including with no incoming
         // frames: a record-local Malformed keeps the reader open, so an
         // EOF-only check would let it vanish while later facts commit.
+        // No model-turn timer lives here: stream silence is not staleness
+        // and a wait timeout never cancels admitted work; the fenced
+        // terminal reply, an error, a stream fault, stop, or drop are the
+        // only settlements.
         let mut stream_open = true;
         loop {
-            // Bounded terminal expiry for the outstanding fenced prompt,
-            // armed by the event loop itself (no sleep heuristic for
-            // ordering: the fenced reply is in-band; this only bounds a
-            // missing reply).
-            let (expiry, turn) = {
-                let state = state.lock().await;
-                (
-                    state.prompt_expiry,
-                    state.pending.as_ref().map(|pending| pending.turn.clone()),
-                )
-            };
             let frame = tokio::select! {
                 frame = frames.recv() => frame,
                 changed = stream.changed(), if stream_open => {
@@ -729,19 +675,6 @@ pub(crate) fn spawn(
                             )).await;
                         }
                         _ => {}
-                    }
-                    continue;
-                }
-                changed = prompt_expiry_wake.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                    continue;
-                }
-                _ = tokio::time::sleep_until(expiry.unwrap_or_else(|| Instant::now() + PROMPT_TERMINAL_TIMEOUT)), if expiry.is_some() && turn.is_some() => {
-                    let mut state = state.lock().await;
-                    if let (Some(deadline), Some(turn)) = (expiry, turn) {
-                        state.expire_prompt_if_current(deadline, &turn).await;
                     }
                     continue;
                 }

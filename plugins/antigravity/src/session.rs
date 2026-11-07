@@ -4,7 +4,7 @@ use eliot_core::{Error, InjectPoint, Result, canonical_json_sha256};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, MAX_TEXT_BYTES,
     PeerClient,
-<    session::{
+    session::{
         native_no_write, register_native_process, unknown_snapshot, with_claimed_context,
         with_context_points,
     },
@@ -230,7 +230,7 @@ impl Session {
                     "Antigravity ACP set_config_option response did not match its envelope",
                 )
             })?;
-<            let verified = echoed
+            let verified = echoed
                 .config_options
                 .iter()
                 .find(|option| option.id == config_id)
@@ -409,7 +409,7 @@ impl Session {
             turn: turn.clone(),
             outcome: unknown.clone(),
         });
-<        // The terminal reply is fenced into the ordered frame channel, so
+        // The terminal reply is fenced into the ordered frame channel, so
         // the event task settles this exact turn behind every preceding
         // update. This send only waits for the first association, as
         // before; a slow first update keeps the retained `unknown`
