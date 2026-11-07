@@ -12,13 +12,17 @@
 //! 3. `HookServer`: Session-owned private listener that yields `HookCallback` on
 //!    `accept()`. The session consumes `HookCallback::respond()` after validating
 //!    session/conversation binding and emitting before-model events.
-//! 4. `run_helper`: Command-hook helper invoked by the hidden CLI, which reads vendor
-//!    stdin, queries the owning plugin over private IPC, writes the native stdout
-//!    JSON, and reports the response-write result back to the plugin.
+//! 4. `run_helper`: Command-hook helper invoked by the hidden CLI, which captures
+//!    immutable process origin metadata, queries the owning plugin over private IPC,
+//!    writes native stdout JSON, and reports the response-write result back to the plugin.
 
 use std::{ffi::OsString, sync::Arc, time::Duration};
 
 use eliot_core::{Error, Result};
+use eliot_plugin::{
+    MAX_FRAME_BYTES,
+    native_transport::{ProcessBirthIdentity, current_process_birth_identity},
+};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -36,11 +40,20 @@ pub const ENV_HOOK_ENDPOINT: &str = "ELIOT_AGY_HOOK_ENDPOINT";
 /// Environment variable carrying the scoped authentication token for private hook IPC.
 pub const ENV_HOOK_TOKEN: &str = "ELIOT_AGY_HOOK_TOKEN";
 
-/// Default hook group name in `hooks.json`.
-pub const DEFAULT_HOOK_NAME: &str = "eliot-system-context";
+/// Environment variable specifying the path to the Eliot hook helper executable.
+pub const ENV_HOOK_HELPER: &str = "ELIOT_AGY_HOOK_HELPER";
 
-/// Maximum allowable line length for framed IPC messages (256 KB).
-pub const MAX_HOOK_FRAME_BYTES: usize = 256 * 1024;
+/// Exact serialized byte overhead of the `IpcQueryResponse` wrapper and framing newline
+/// around the constituent `HookOutput` payload:
+/// `{"accepted":true,"output":...}\n` (26 bytes prefix + 1 byte closing brace + 1 byte newline).
+pub const IPC_WRAPPER_OVERHEAD_BYTES: usize = br#"{"accepted":true,"output":}"#.len() + 1;
+
+/// Maximum allowable line length for framed hook IPC messages.
+///
+/// Derived compositionally from the two shared constituent payload bounds
+/// (`eliot_plugin::MAX_FRAME_BYTES` for claimed context and steer output)
+/// plus the exact fixed `IpcQueryResponse` JSON wrapper and framing newline.
+pub const MAX_HOOK_FRAME_BYTES: usize = 2 * MAX_FRAME_BYTES + IPC_WRAPPER_OVERHEAD_BYTES;
 
 /// Timeout for helper IPC query operations.
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -57,11 +70,14 @@ pub struct HookInput {
     pub initial_num_steps: u64,
 }
 
+/// Helper origin identity alias carried through IPC queries.
+pub type HelperOrigin = ProcessBirthIdentity;
+
 /// Vendor hook response output to stdout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct HookOutput {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inject_steps: Vec<HookStep>,
 }
 
@@ -97,20 +113,6 @@ impl HookStep {
     }
 }
 
-/// Generate the named-group `hooks.json` configuration structure.
-pub fn hooks_json(group_name: &str, command: &str) -> serde_json::Value {
-    serde_json::json!({
-        (group_name): {
-            "PreInvocation": [
-                {
-                    "type": "command",
-                    "command": command
-                }
-            ]
-        }
-    })
-}
-
 /// Helper query sent by the command hook helper to the owning plugin session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -119,6 +121,7 @@ pub struct IpcQuery {
     pub conversation_id: String,
     pub invocation_num: u64,
     pub initial_num_steps: u64,
+    pub origin: HelperOrigin,
 }
 
 /// Response returned by the owning plugin session to the helper carrying full HookOutput.
@@ -240,6 +243,7 @@ impl HookServer {
 
             return Ok(HookCallback {
                 input,
+                origin: query.origin,
                 parts: Some((reader, write_half)),
                 token: Arc::clone(&self.token),
             });
@@ -250,6 +254,7 @@ impl HookServer {
 /// Active hook callback handle held by the owning plugin session.
 pub struct HookCallback {
     pub input: HookInput,
+    pub origin: HelperOrigin,
     parts: Option<(BufReader<OwnedReadHalf>, OwnedWriteHalf)>,
     token: Arc<String>,
 }
@@ -258,6 +263,11 @@ impl HookCallback {
     /// Read the incoming hook input DTO.
     pub fn input(&self) -> &HookInput {
         &self.input
+    }
+
+    /// Read the immutable origin metadata captured at helper process creation.
+    pub fn origin(&self) -> &HelperOrigin {
+        &self.origin
     }
 
     /// Send the hook response output to the helper and await confirmed stdout write acknowledgment.
@@ -341,6 +351,23 @@ impl Drop for HookCallback {
 
 /// Hidden CLI helper entrypoint invoked by `swarm plugin antigravity-hook`.
 pub async fn run_helper() -> Result<()> {
+    // If managed endpoint/token are absent, emit an empty JSON object and exit successfully.
+    // This check runs before process birth query so outside-session invocations don't query OS identity.
+    let (Ok(endpoint), Ok(token)) = (
+        std::env::var(ENV_HOOK_ENDPOINT),
+        std::env::var(ENV_HOOK_TOKEN),
+    ) else {
+        write_stdout_json(&HookOutput::empty()).await?;
+        return Ok(());
+    };
+
+    let origin = current_process_birth_identity().map_err(|e| {
+        Error::new(
+            "process_identity",
+            format!("Could not read helper process birth identity: {e}"),
+        )
+    })?;
+
     let mut stdin = tokio::io::stdin();
     let input = match timeout(IPC_TIMEOUT, read_hook_input(&mut stdin)).await {
         Ok(Ok(input)) => input,
@@ -348,14 +375,6 @@ pub async fn run_helper() -> Result<()> {
             let _ = write_stdout_json(&HookOutput::empty()).await;
             return Ok(());
         }
-    };
-
-    let (Ok(endpoint), Ok(token)) = (
-        std::env::var(ENV_HOOK_ENDPOINT),
-        std::env::var(ENV_HOOK_TOKEN),
-    ) else {
-        let _ = write_stdout_json(&HookOutput::empty()).await;
-        return Ok(());
     };
 
     let stream = match timeout(IPC_TIMEOUT, TcpStream::connect(&endpoint)).await {
@@ -374,6 +393,7 @@ pub async fn run_helper() -> Result<()> {
         conversation_id: input.conversation_id,
         invocation_num: input.invocation_num,
         initial_num_steps: input.initial_num_steps,
+        origin,
     };
 
     let mut query_bytes =

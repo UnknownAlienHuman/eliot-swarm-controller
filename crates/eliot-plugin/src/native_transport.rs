@@ -19,7 +19,7 @@ use std::{
 };
 
 use futures_util::{FutureExt, SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     process::{ChildStdin, ChildStdout, Command},
@@ -35,6 +35,182 @@ use crate::{StderrCapture, StderrView, spawn_stderr, sync::LockExt};
 const MAX_NATIVE_FRAME_BYTES: usize = 1024 * 1024;
 const NATIVE_EVENT_QUEUE: usize = 64;
 const NATIVE_EXIT_DRAIN: Duration = Duration::from_secs(1);
+
+/// Kernel process birth identity. `start_time` is measured in the same OS
+/// clock domain as [`process_birth_boundary`].
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessBirthIdentity {
+    pub pid: u32,
+    pub start_time: u64,
+}
+
+/// Read this process's immutable kernel birth identity.
+pub fn current_process_birth_identity() -> Result<ProcessBirthIdentity> {
+    process_birth_identity(std::process::id())
+}
+
+/// Read a live process's kernel birth identity for the given PID.
+pub fn process_birth_identity(pid: u32) -> Result<ProcessBirthIdentity> {
+    if pid == 0 {
+        return Err(Error::new(
+            "process_identity",
+            "process id must be positive",
+        ));
+    }
+    Ok(ProcessBirthIdentity {
+        pid,
+        start_time: process_birth::process_start_time(pid)?,
+    })
+}
+
+/// Capture a prompt opening boundary in the same OS clock domain as process
+/// birth identities, before dispatching the native prompt request.
+pub fn process_birth_boundary() -> Result<u64> {
+    process_birth::boundary()
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod process_birth {
+    use std::mem::MaybeUninit;
+
+    use eliot_core::{Error, Result};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, FILETIME, HANDLE},
+        System::{
+            SystemInformation::GetSystemTimeAsFileTime,
+            Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        },
+    };
+
+    struct OwnedProcess(HANDLE);
+
+    impl Drop for OwnedProcess {
+        fn drop(&mut self) {
+            // SAFETY: this handle is uniquely owned by `OwnedProcess`.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn ticks(time: FILETIME) -> u64 {
+        (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+    }
+
+    pub fn process_start_time(pid: u32) -> Result<u64> {
+        // SAFETY: no pointers are passed; only query rights are requested.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return Err(Error::new(
+                "process_identity",
+                "could not open process to verify its birth identity",
+            ));
+        }
+        let handle = OwnedProcess(handle);
+        let mut creation = MaybeUninit::<FILETIME>::uninit();
+        let mut exit = MaybeUninit::<FILETIME>::uninit();
+        let mut kernel = MaybeUninit::<FILETIME>::uninit();
+        let mut user = MaybeUninit::<FILETIME>::uninit();
+        // SAFETY: the live handle remains owned, and all output pointers refer
+        // to writable FILETIME values initialized by a successful call.
+        let ok = unsafe {
+            GetProcessTimes(
+                handle.0,
+                creation.as_mut_ptr(),
+                exit.as_mut_ptr(),
+                kernel.as_mut_ptr(),
+                user.as_mut_ptr(),
+            )
+        };
+        if ok == 0 {
+            return Err(Error::new(
+                "process_identity",
+                "could not read process birth identity",
+            ));
+        }
+        // SAFETY: GetProcessTimes initialized creation on success.
+        Ok(ticks(unsafe { creation.assume_init() }))
+    }
+
+    pub fn boundary() -> Result<u64> {
+        let mut time = MaybeUninit::<FILETIME>::uninit();
+        // SAFETY: GetSystemTimeAsFileTime initializes its writable output.
+        unsafe { GetSystemTimeAsFileTime(time.as_mut_ptr()) };
+        // SAFETY: the API initialized the FILETIME value.
+        Ok(ticks(unsafe { time.assume_init() }))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+mod process_birth {
+    use std::{fs, io};
+
+    use eliot_core::{Error, Result};
+
+    pub fn process_start_time(pid: u32) -> Result<u64> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map_err(|_| Error::new("process_identity", "could not read process birth identity"))?;
+        let fields = stat
+            .rfind(')')
+            .and_then(|end| stat.get(end + 1..))
+            .ok_or_else(|| Error::new("process_identity", "process stat is malformed"))?;
+        fields
+            .split_whitespace()
+            .nth(19)
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| Error::new("process_identity", "process start time is unavailable"))
+    }
+
+    pub fn boundary() -> Result<u64> {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime initializes the writable timespec. CLOCK_BOOTTIME
+        // uses the same boot-relative clock as Linux /proc starttime.
+        if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut time) } != 0 {
+            return Err(Error::new(
+                "process_identity",
+                io::Error::last_os_error().to_string(),
+            ));
+        }
+        // SAFETY: sysconf takes no pointers and reports the kernel USER_HZ.
+        let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if ticks_per_second <= 0 {
+            return Err(Error::new(
+                "process_identity",
+                "kernel process clock rate is unavailable",
+            ));
+        }
+        let seconds = u64::try_from(time.tv_sec)
+            .map_err(|_| Error::new("process_identity", "boot clock is invalid"))?;
+        let nanos = u64::try_from(time.tv_nsec)
+            .map_err(|_| Error::new("process_identity", "boot clock is invalid"))?;
+        Ok(seconds
+            .saturating_mul(ticks_per_second as u64)
+            .saturating_add(nanos.saturating_mul(ticks_per_second as u64) / 1_000_000_000))
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+mod process_birth {
+    use eliot_core::{Error, Result};
+
+    pub fn process_start_time(_pid: u32) -> Result<u64> {
+        Err(Error::new(
+            "unsupported",
+            "kernel process birth identity is unavailable on this platform",
+        ))
+    }
+
+    pub fn boundary() -> Result<u64> {
+        Err(Error::new(
+            "unsupported",
+            "kernel process birth boundary is unavailable on this platform",
+        ))
+    }
+}
 
 /// Display nouns for transport diagnostics, e.g. `("Muse", "Muse session
 /// host")`. The protocol layers pass their exact historical labels so

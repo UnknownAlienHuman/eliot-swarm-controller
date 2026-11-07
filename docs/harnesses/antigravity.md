@@ -99,46 +99,53 @@ verbs are launch/resume/send/steer/interrupt/stop. Inject (including
 ## System context and steer hooks
 
 The Antigravity CLI hooks documentation (accessed 2026-11-07; adapter
-version metadata is 1.5.2) defines workspace hooks in `.agents/hooks.json`. Its
-`PreInvocation` input includes `conversationId`, zero-indexed
-`invocationNum`, and `initialNumSteps` (trajectory step count); output
-`injectSteps` accepts `ephemeralMessage`. Eliot writes one named hook group
-under the plugin's private instance directory at `.agents/hooks.json`,
-adds that directory with native `--add-dir`, and invokes the hidden
-`swarm plugin antigravity-hook` helper. The real workspace remains the ACP
-cwd; the plugin does not edit project/global hooks, copy authentication,
-or change login/native-store paths.
+version metadata is 1.5.2) defines named hook groups. `PreInvocation` input
+includes `conversationId`, zero-indexed `invocationNum`, and
+`initialNumSteps` (trajectory step count); output `injectSteps` accepts
+`ephemeralMessage`. The builtin user configuration is
+`~/.gemini/config/hooks.json`; Root owns adding one Eliot group there. The
+plugin never edits that file or a user project. It does not use `--add-dir`
+as a hook loader or move authentication/native-store data.
 
-The hook helper uses a bounded, per-generation loopback IPC endpoint and
-random token; the plugin's authenticated instance channel binds generation.
-The owning plugin requires `conversationId` to equal its exact retained ACP
-session id and captures the pending Eliot turn when it accepts the callback,
-then rechecks that same binding before responding. A mismatch or stale
-callback receives empty output. No native turn id is invented. The plugin
-sends `hook.event` with `hook:"before_model"` over the existing authenticated
-channel.
-FIFO `turn_safe_point` claims are returned as an ephemeral system message.
-After the helper confirms that its stdout response was written, the plugin
-commits `hook.before_model` with the exact Eliot turn and callback consumer
-on the existing event path. A context outcome is included only when claimed
-context was written. Stale callbacks and unconfirmed writes produce no
-applied receipt; claims are never replayed or moved to another turn.
+Each managed ACP generation receives `ELIOT_AGY_HOOK_HELPER` pointing to the
+current Eliot executable plus its own loopback endpoint and random token.
+The global hook command invokes that helper. With no managed endpoint/token,
+the helper writes `{}` and exits successfully. A Root live probe of the
+version-pinned adapter completed a native source-review task but emitted zero
+`hook.before_model` events; no context or steer was queued, and Root found no
+native source gap. Therefore global hook loading and activation remain
+unqualified until Root's builtin-config probe observes the event path. No
+`Ready` result or generated hook file is activation proof.
 
-`steer` retains its command id and captured turn while waiting for the next
-live `PreInvocation` in that prompt. It writes a separate
-`ephemeralMessage` step in the same callback response, returns `applied`
-only after the helper confirms stdout, and reports the mechanism
+The helper captures its kernel `ProcessBirthIdentity { pid, start_time }` at
+entry. The plugin verifies that tuple against the OS and accepts it only when
+the process start is after the immutable pending-prompt opening boundary
+captured before `session/prompt`. The retained callback binding includes the
+conversation, Eliot generation, turn, opening boundary, and helper origin;
+it is rechecked before `hook.event` can claim FIFO `turn_safe_point` context.
+Late or expired callbacks are discarded before claim. Native `invocationNum`
+and repeated prompt text are not turn identity. The kernel birth query is
+implemented for Windows and Linux; other targets fail closed as unsupported.
+
+The Core `hook.event` response and each steer HookOutput retain their shared
+frame bounds; the private IPC frame reserves both bounds plus the complete
+response envelope. Claimed context stays FIFO and is never cleared after the
+claim. If the combined response cannot fit, context takes priority and steer
+remains pending for a later callback in the same prompt. After the helper
+confirms its stdout write, the plugin commits `hook.before_model` with the
+exact Eliot turn and consumer on the existing event path. A context outcome
+is included only when claimed context was written.
+
+`steer` retains its command id, generation, and captured turn while waiting
+for a live `PreInvocation` in that prompt. Its host response is deferred while
+the same host continues to serve interrupt, stop, shutdown, and other control
+requests; an outer RPC timeout does not cancel the retained waiter. Steer
+uses a separate `ephemeralMessage` step, reports `applied` only after helper
+stdout confirmation, and reports the mechanism
 `antigravity.PreInvocation.injectSteps.ephemeralMessage`. If the turn ends
-first, steer settles stale; an uncertain response stays unknown and is
-never resent. This is the native PreInvocation point, not an ACP steer
-method or an `active_turn` inject.
-
-The native CLI option exists, but actual discovery/activation of the
-private customization directory under `agy acp` is not qualified. The
-scope/repetition behavior of `invocationNum` is also unverified, so it is
-not used as turn identity. Root must prove activation and callback-to-prompt
-binding with an installed Antigravity agent before claiming runtime
-support. Controlled families remain session/turn/message/tool, with
+first, the retained result is stale or unknown and is never resent. This is
+the native PreInvocation point, not an ACP steer method or an `active_turn`
+inject. Controlled families remain session/turn/message/tool, with
 `hook.before_model` owned by the existing turn family.
 
 ## Facts and recovery

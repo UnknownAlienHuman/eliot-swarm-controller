@@ -13,7 +13,11 @@ use tokio::{
     time::{Duration, Instant},
 };
 
-use crate::{events::FAMILIES, hooks::HookServer, session::Session};
+use crate::{
+    events::FAMILIES,
+    hooks::HookServer,
+    session::{DeferredSteer, Session, SteerStart, unknown_steer},
+};
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -22,6 +26,20 @@ struct Plugin {
     initialized: Option<InitializeParams>,
     session: Option<Session>,
     start: Option<(Value, Result<Value>)>,
+}
+
+enum DispatchOutcome {
+    Immediate(Value),
+    Deferred(DeferredSteer),
+}
+
+struct DeferredCompletion {
+    request_id: Value,
+    seq: i64,
+    generation: i64,
+    command_id: String,
+    turn_id: String,
+    outcome: Result<Value>,
 }
 
 pub(crate) async fn run() -> Result<()> {
@@ -36,21 +54,105 @@ pub(crate) async fn run() -> Result<()> {
         }
     });
     let mut plugin = Plugin::default();
+    let (deferred_tx, mut deferred_rx) = mpsc::channel(16);
+    let mut deferred_count = 0_usize;
+    let mut shutdown_requested = false;
     let mut shutdown = false;
-    while let Some(request) = requests.recv().await {
-        let stopping = request.method == "shutdown";
-        let result = plugin.dispatch(&request, &client).await;
-        let settled = result.is_ok();
-        if client
-            .respond(request.id, result, Instant::now() + TIMEOUT)
-            .await
-            .is_err()
-        {
-            break;
+    let mut transport_closed = false;
+    while !shutdown_requested || deferred_count > 0 {
+        enum Next {
+            Request(Option<RpcRequest>),
+            Deferred(Option<DeferredCompletion>),
         }
-        if stopping {
-            shutdown = settled;
-            break;
+        let next = tokio::select! {
+            request = requests.recv(), if !shutdown_requested => Next::Request(request),
+            completed = deferred_rx.recv(), if deferred_count > 0 => Next::Deferred(completed),
+        };
+        match next {
+            Next::Request(Some(request)) => {
+                let stopping = request.method == "shutdown";
+                match plugin.dispatch(&request, &client).await {
+                    Ok(DispatchOutcome::Immediate(result)) => {
+                        if client
+                            .respond(request.id, Ok(result), Instant::now() + TIMEOUT)
+                            .await
+                            .is_err()
+                        {
+                            transport_closed = true;
+                            break;
+                        }
+                        if stopping {
+                            shutdown_requested = true;
+                            shutdown = true;
+                        }
+                    }
+                    Ok(DispatchOutcome::Deferred(deferred)) => {
+                        let request_id = request.id;
+                        let seq = deferred.seq;
+                        let generation = deferred.generation;
+                        let command_id = deferred.command_id.clone();
+                        let turn_id = deferred.turn_id.clone();
+                        let sender = deferred_tx.clone();
+                        deferred_count += 1;
+                        tokio::spawn(async move {
+                            let outcome = match deferred.receiver.await {
+                                Ok(outcome) => outcome,
+                                Err(_) => Ok(unknown_steer(
+                                    &command_id,
+                                    &turn_id,
+                                    "PreInvocation response outcome is unknown",
+                                )),
+                            };
+                            let _ = sender
+                                .send(DeferredCompletion {
+                                    request_id,
+                                    seq,
+                                    generation,
+                                    command_id,
+                                    turn_id,
+                                    outcome,
+                                })
+                                .await;
+                        });
+                    }
+                    Err(error) => {
+                        if client
+                            .respond(request.id, Err(error), Instant::now() + TIMEOUT)
+                            .await
+                            .is_err()
+                        {
+                            transport_closed = true;
+                            break;
+                        }
+                        if stopping {
+                            shutdown_requested = true;
+                        }
+                    }
+                }
+            }
+            Next::Request(None) => break,
+            Next::Deferred(Some(completion)) => {
+                deferred_count = deferred_count.saturating_sub(1);
+                let outcome = plugin.settle_steer(
+                    completion.seq,
+                    completion.generation,
+                    &completion.command_id,
+                    &completion.turn_id,
+                    completion.outcome,
+                );
+                if client
+                    .respond(completion.request_id, outcome, Instant::now() + TIMEOUT)
+                    .await
+                    .is_err()
+                {
+                    transport_closed = true;
+                    break;
+                }
+            }
+            Next::Deferred(None) => {
+                transport_closed = true;
+                break;
+            }
         }
     }
     if let Some(session) = &mut plugin.session {
@@ -58,7 +160,7 @@ pub(crate) async fn run() -> Result<()> {
     }
     reader.abort();
     let _ = reader.await;
-    if shutdown {
+    if shutdown && !transport_closed {
         Ok(())
     } else {
         Err(Error::new(
@@ -69,14 +171,23 @@ pub(crate) async fn run() -> Result<()> {
 }
 
 impl Plugin {
-    async fn dispatch(&mut self, request: &RpcRequest, peer: &PeerClient) -> Result<Value> {
+    async fn dispatch(
+        &mut self,
+        request: &RpcRequest,
+        peer: &PeerClient,
+    ) -> Result<DispatchOutcome> {
         match request.method.as_str() {
-            "initialize" => self.initialize(&request.params),
+            "initialize" => self
+                .initialize(&request.params)
+                .map(DispatchOutcome::Immediate),
             "profile.store" => Err(Error::new(
                 "unsupported",
                 "Antigravity exposes no verified metadata-only native-store readback",
             )),
-            "agent.start" => self.start(&request.params, peer).await,
+            "agent.start" => self
+                .start(&request.params, peer)
+                .await
+                .map(DispatchOutcome::Immediate),
             "agent.command" => {
                 let params: AgentCommandParams =
                     decode(&request.params, "Invalid Antigravity command")?;
@@ -87,7 +198,18 @@ impl Plugin {
                     "Antigravity",
                 )?;
                 let session = self.bound(&params.agent_id, params.generation)?;
-                session.command(params).await
+                if params.verb == "steer" {
+                    match session.begin_steer(params).await? {
+                        SteerStart::Immediate(Ok(value)) => Ok(DispatchOutcome::Immediate(value)),
+                        SteerStart::Immediate(Err(error)) => Err(error),
+                        SteerStart::Deferred(waiter) => Ok(DispatchOutcome::Deferred(waiter)),
+                    }
+                } else {
+                    session
+                        .command(params)
+                        .await
+                        .map(DispatchOutcome::Immediate)
+                }
             }
             "agent.snapshot" => {
                 let params: AgentSnapshotParams =
@@ -101,6 +223,7 @@ impl Plugin {
                 self.bound(&params.agent_id, params.generation)?
                     .snapshot(params)
                     .await
+                    .map(DispatchOutcome::Immediate)
             }
             "agent.stop" => {
                 let params: AgentStopParams = decode(&request.params, "Invalid Antigravity stop")?;
@@ -113,18 +236,33 @@ impl Plugin {
                 self.bound(&params.agent_id, params.generation)?
                     .stop(params)
                     .await
+                    .map(DispatchOutcome::Immediate)
             }
             "shutdown" => {
                 if let Some(session) = &mut self.session {
                     session.terminate(true).await?;
                 }
-                Ok(json!({"state": "shutdown"}))
+                Ok(DispatchOutcome::Immediate(json!({"state": "shutdown"})))
             }
             _ => Err(Error::new(
                 "unsupported",
                 "Antigravity method is unconnected",
             )),
         }
+    }
+
+    fn settle_steer(
+        &mut self,
+        seq: i64,
+        generation: i64,
+        command_id: &str,
+        turn_id: &str,
+        outcome: Result<Value>,
+    ) -> Result<Value> {
+        self.session
+            .as_mut()
+            .ok_or_else(|| Error::new("unknown", "Antigravity session is no longer retained"))?
+            .settle_steer(seq, generation, command_id, turn_id, outcome)
     }
 
     fn bound(&mut self, agent: &str, generation: i64) -> Result<&mut Session> {
@@ -219,7 +357,6 @@ impl Plugin {
             .as_ref()
             .ok_or_else(|| not_initialized("Antigravity"))?;
         let credential = initialized.credential.clone();
-        let instance_dir = PathBuf::from(&initialized.instance_dir);
         let identity = serde_json::to_value(&params)
             .map_err(|_| Error::new("internal", "Could not encode Antigravity start binding"))?;
         if let Some((previous, outcome)) = &self.start {
@@ -232,7 +369,7 @@ impl Plugin {
             return outcome.clone();
         }
         let hooks = HookServer::bind().await?;
-        let plan = crate::profile::Plan::new(&params, &credential, hooks.token(), &instance_dir)?;
+        let plan = crate::profile::Plan::new(&params, &credential, hooks.token())?;
         // Latch before creating a native conversation. Any failure after spawn
         // is retained; this generation never starts a second process on retry.
         self.start = Some((
@@ -242,26 +379,25 @@ impl Plugin {
                 "Antigravity start is unresolved; it will not be replayed",
             )),
         ));
-        let result =
-            match Session::spawn(&params, &plan, peer, &credential, &instance_dir, hooks).await {
-                Ok(session) => {
-                    self.session = Some(session);
-                    let session = self
-                        .session
-                        .as_mut()
-                        .ok_or_else(|| Error::new("internal", "Antigravity session disappeared"))?;
-                    let result = session.start(&plan, peer, &credential).await;
-                    if result.is_err() && session.terminate(true).await.is_err() {
-                        Err(Error::new(
-                            "unknown",
-                            "Antigravity start failed and owned cleanup is unconfirmed",
-                        ))
-                    } else {
-                        result
-                    }
+        let result = match Session::spawn(&params, &plan, peer, &credential, hooks).await {
+            Ok(session) => {
+                self.session = Some(session);
+                let session = self
+                    .session
+                    .as_mut()
+                    .ok_or_else(|| Error::new("internal", "Antigravity session disappeared"))?;
+                let result = session.start(&plan, peer, &credential).await;
+                if result.is_err() && session.terminate(true).await.is_err() {
+                    Err(Error::new(
+                        "unknown",
+                        "Antigravity start failed and owned cleanup is unconfirmed",
+                    ))
+                } else {
+                    result
                 }
-                Err(error) => Err(error),
-            };
+            }
+            Err(error) => Err(error),
+        };
         self.start = Some((identity, result.clone()));
         result
     }

@@ -7,8 +7,10 @@ use eliot_core::{
     ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy, SourceHealthUpdate,
 };
 use eliot_plugin::{
-    CommitSink, MAX_EVENT_BYTES, PeerClient,
-    native_transport::StreamState,
+    CommitSink, MAX_EVENT_BYTES, MAX_FRAME_BYTES, PeerClient,
+    native_transport::{
+        ProcessBirthIdentity, StreamState, process_birth_boundary, process_birth_identity,
+    },
     protocol::{HookEvent, HookResponse},
     session::{EVENT_DEADLINE, StreamSource, attach_final_text, event_id, next_input_outcomes},
 };
@@ -20,7 +22,10 @@ use tokio::{
 };
 
 use crate::{
-    hooks::{HookCallback, HookInput, HookOutput, HookServer, HookStep, MAX_HOOK_FRAME_BYTES},
+    hooks::{
+        HookCallback, HookInput, HookOutput, HookServer, HookStep, IpcQueryResponse,
+        MAX_HOOK_FRAME_BYTES,
+    },
     native::{AcpUpdate, AgyClient, AgyFrame, FencedGuard, PromptResult, classify_update},
 };
 use ulid::Ulid;
@@ -55,6 +60,7 @@ pub(crate) struct TurnFacts {
 struct Pending {
     command: String,
     turn: String,
+    opened_at: u64,
     context: Vec<ContextItem>,
     associated: bool,
     reply: Option<oneshot::Sender<Result<()>>>,
@@ -71,6 +77,9 @@ struct PendingSteer {
 struct HookTurnBinding {
     conversation: String,
     turn: String,
+    generation: i64,
+    prompt_opened_at: u64,
+    origin: ProcessBirthIdentity,
 }
 
 struct AcceptedHook {
@@ -291,7 +300,11 @@ impl State {
         self.policy.contains_text(text)
     }
 
-    fn capture_hook_turn(&self, input: &HookInput) -> Option<String> {
+    fn capture_hook_turn(
+        &self,
+        input: &HookInput,
+        origin: ProcessBirthIdentity,
+    ) -> Option<HookTurnBinding> {
         if self.conversation != input.conversation_id || input.conversation_id.trim().is_empty() {
             return None;
         }
@@ -304,7 +317,17 @@ impl State {
         {
             return None;
         }
-        self.pending.as_ref().map(|pending| pending.turn.clone())
+        let pending = self.pending.as_ref()?;
+        if origin.start_time <= pending.opened_at {
+            return None;
+        }
+        Some(HookTurnBinding {
+            conversation: input.conversation_id.clone(),
+            turn: pending.turn.clone(),
+            generation: self.generation,
+            prompt_opened_at: pending.opened_at,
+            origin,
+        })
     }
 
     fn hook_turn_is_live(&self, conversation: &str, turn: &str) -> bool {
@@ -319,6 +342,14 @@ impl State {
                 .pending
                 .as_ref()
                 .is_some_and(|pending| pending.turn == turn)
+    }
+
+    fn hook_binding_is_live(&self, binding: &HookTurnBinding) -> bool {
+        binding.generation == self.generation
+            && self.hook_turn_is_live(&binding.conversation, &binding.turn)
+            && self.pending.as_ref().is_some_and(|pending| {
+                pending.turn == binding.turn && pending.opened_at == binding.prompt_opened_at
+            })
     }
 
     pub fn arm_steer(
@@ -361,6 +392,27 @@ impl State {
         }
     }
 
+    fn defer_pending_steer(&mut self, steer: PendingSteer) -> Result<()> {
+        if self.pending_steer.is_some() {
+            return Err(Error::new(
+                "busy",
+                "Antigravity already has a steer waiting for PreInvocation",
+            ));
+        }
+        if !self.hook_turn_is_live(&self.conversation, &steer.turn_id) {
+            let _ = steer.reply.send(Err(Error::new(
+                "stale_turn",
+                "Antigravity prompt ended before PreInvocation confirmed steer",
+            )));
+            return Err(Error::new(
+                "stale_turn",
+                "Antigravity prompt ended before PreInvocation confirmed steer",
+            ));
+        }
+        self.pending_steer = Some(steer);
+        Ok(())
+    }
+
     pub fn cancel_pending_steer(&mut self) {
         if let Some(steer) = self.pending_steer.take() {
             let _ = steer.reply.send(Err(Error::new(
@@ -392,10 +444,12 @@ impl State {
         if self.pending.is_some() {
             return Err(Error::new("busy", "Antigravity has one outstanding input"));
         }
+        let opened_at = process_birth_boundary()?;
         let (reply, result) = oneshot::channel();
         self.pending = Some(Pending {
             command,
             turn,
+            opened_at,
             context: Vec::new(),
             associated: false,
             reply: Some(reply),
@@ -961,15 +1015,13 @@ pub(crate) fn spawn(
                     Err(_) => break,
                 };
                 let input = callback.input().clone();
-                let binding = {
-                    hook_state
-                        .lock()
-                        .await
-                        .capture_hook_turn(&input)
-                        .map(|turn| HookTurnBinding {
-                            conversation: input.conversation_id,
-                            turn,
-                        })
+                let origin = *callback.origin();
+                let origin_is_live =
+                    process_birth_identity(origin.pid).is_ok_and(|observed| observed == origin);
+                let binding = if origin_is_live {
+                    hook_state.lock().await.capture_hook_turn(&input, origin)
+                } else {
+                    None
                 };
                 if hook_tx
                     .send(AcceptedHook { callback, binding })
@@ -1088,9 +1140,11 @@ async fn handle_hook_callback(
         let _ = callback.respond(HookOutput::empty()).await;
         return Ok(());
     };
+    let origin_is_live =
+        process_birth_identity(binding.origin.pid).is_ok_and(|observed| observed == binding.origin);
     let live_binding = {
         let mut state = state.lock().await;
-        if state.hook_turn_is_live(&binding.conversation, &binding.turn) {
+        if origin_is_live && state.hook_binding_is_live(&binding) {
             Some((
                 state.take_pending_steer(&binding.turn),
                 state.host.clone(),
@@ -1142,54 +1196,37 @@ async fn handle_hook_callback(
         Err(_) => (Vec::new(), false),
     };
 
-    let context_message = if context.is_empty() {
-        None
-    } else {
-        match eliot_plugin::session::with_claimed_context("", &context, "Antigravity") {
-            Ok(text) => {
-                let message = text.strip_suffix("\n\n").unwrap_or(&text).to_owned();
-                (!message.is_empty()).then_some(message)
-            }
-            Err(_) => None,
-        }
-    };
-
-    let mut include_context = context_message.is_some();
-    let mut output = HookOutput::empty();
-    if let Some(message) = &context_message {
+    // The authenticated Core response fits MAX_FRAME_BYTES. Converting its
+    // ContextItems to ephemeral steps removes each command id and expiry
+    // field, so the context portion remains within that same shared bound.
+    // Steer was independently preflighted against MAX_FRAME_BYTES before it
+    // was armed. The private frame reserves both complete bounds plus the
+    // IpcQueryResponse envelope; this runtime check includes that envelope.
+    let mut output = context_hook_output(&context);
+    let mut steer = steer;
+    if let Some(pending) = &steer {
         output
             .inject_steps
-            .push(HookStep::ephemeral(message.clone()));
+            .push(HookStep::ephemeral(pending.text.clone()));
     }
-    if let Some(steer) = &steer {
-        output
-            .inject_steps
-            .push(HookStep::ephemeral(steer.text.clone()));
-    }
-    if serde_json::to_vec(&output).map_or(true, |bytes| bytes.len() > MAX_HOOK_FRAME_BYTES) {
-        include_context = false;
-        output = HookOutput::empty();
-        if let Some(steer) = &steer {
-            output
-                .inject_steps
-                .push(HookStep::ephemeral(steer.text.clone()));
+    if !hook_ipc_response_fits(&output) {
+        if let Some(pending) = steer.take() {
+            state.lock().await.defer_pending_steer(pending)?;
         }
-    }
-    if serde_json::to_vec(&output).map_or(true, |bytes| bytes.len() > MAX_HOOK_FRAME_BYTES) {
-        let _ = callback.respond(HookOutput::empty()).await;
-        if let Some(steer) = steer {
-            let _ = steer.reply.send(Err(Error::new(
+        output = context_hook_output(&context);
+        if !hook_ipc_response_fits(&output) {
+            return Err(Error::new(
                 "frame_too_large",
-                "Antigravity PreInvocation steer response exceeds its frame bound",
-            )));
+                format!(
+                    "Antigravity context response exceeds its reserved combined frame (shared={MAX_FRAME_BYTES}, private={MAX_HOOK_FRAME_BYTES})"
+                ),
+            ));
         }
-        return Ok(());
     }
 
-    let live = state
-        .lock()
-        .await
-        .hook_turn_is_live(&binding.conversation, &binding.turn);
+    let origin_is_live =
+        process_birth_identity(binding.origin.pid).is_ok_and(|observed| observed == binding.origin);
+    let live = origin_is_live && state.lock().await.hook_binding_is_live(&binding);
     if !live {
         let _ = callback.respond(HookOutput::empty()).await;
         if let Some(steer) = steer {
@@ -1222,7 +1259,7 @@ async fn handle_hook_callback(
         let _ = steer.reply.send(Ok(result));
     }
 
-    if !selection_known || (!context.is_empty() && !include_context) {
+    if !selection_known {
         return Ok(());
     }
 
@@ -1258,4 +1295,22 @@ fn unknown_steer_result(steer: &PendingSteer, reason: &str) -> Value {
         "native_hook": "PreInvocation",
         "reason": reason,
     })
+}
+
+fn context_hook_output(context: &[ContextItem]) -> HookOutput {
+    HookOutput {
+        inject_steps: context
+            .iter()
+            .map(|item| HookStep::ephemeral(item.text.clone()))
+            .collect(),
+    }
+}
+
+fn hook_ipc_response_fits(output: &HookOutput) -> bool {
+    let response = IpcQueryResponse {
+        accepted: true,
+        output: output.clone(),
+    };
+    serde_json::to_vec(&response)
+        .is_ok_and(|bytes| bytes.len().saturating_add(1) <= MAX_HOOK_FRAME_BYTES)
 }
