@@ -85,7 +85,8 @@ is implemented, capability is `degraded`:
 - graceful stop and best-effort kill of known group members;
 - no claim that every descendant died;
 - `stop --force` reports possible orphans rather than clean exact success;
-- `swarm doctor` surfaces them.
+- degraded custody capability and the `orphan_possible` flag are typed surfaces of
+  `daemon.status` (`workspace_custody`) and the `capacity.released` event.
 
 ### Adopted/shared services
 
@@ -113,7 +114,7 @@ and final native events:
 3. commit any terminal native fact first;
 4. if EOF/deadline provides no terminal fact, commit `source.gap` for the uncovered
    tail;
-5. only then emit `session.lost` when exact/shared readback proves control is gone.
+5. only then emit `agent.lost` when exact/shared readback proves control is gone.
 
 For a controlled start/resume, a plugin may report a positively observed native endpoint
 exit after its reader has closed and finished. The daemon preserves the command outcome
@@ -122,7 +123,7 @@ plugin process tree is confirmed cleaned up. An unconfirmed endpoint or cleanup 
 the generation starting/unknown.
 
 Closing or losing the Codex observer's held rollout reader is not native thread-terminal
-evidence and does not emit `session.ended` or `session.lost`. Controlled owned-process
+evidence and does not emit `session.ended` or `agent.lost`. Controlled owned-process
 loss still drains its captured generation and finalizes it through the controlled path;
 observer attachment or reader health cannot suppress or manufacture that lifecycle.
 
