@@ -21,8 +21,9 @@ calls, a bounded frame queue, and output drained before any loss
 conclusion. Turn progress arrives as `session/update` notifications;
 agent-to-client requests (`fs/*`, `terminal/*`, `session/request_permission`,
 `elicitation/create`) are always explicitly rejected as unsupported — never
-auto-approved. The schema has no steer, inject or hooks method; those
-controls are not ACP facts and are not claimed here.
+auto-approved. ACP has no steer, inject or hook method. The system-context
+and steer paths below use the separate native CLI `PreInvocation` hook;
+they are not ACP operations. `active_turn` injection remains unsupported.
 
 The adapter uses `start_requires_input = false`: spawn, `initialize`
 (protocol 1), then `session/new` — or `session/load` with the exact
@@ -91,14 +92,78 @@ Stop sends a best-effort `session/close` for the retained session, then
 closes stdin and drains stdout before settling the session; force targets
 only owned custody. Resume creates a new Agent generation loading the
 exact retained session id, without replaying the old prompt. Connected
-verbs are launch/resume/send/interrupt/stop; steer, inject, configure,
-approve, deny and answer remain `unsupported` on this increment. The
-planned plugin hook-callback increment (exact-turn hook safe-boundary
-steering and turn-safe inject) will bind later through the existing
-`session/update` / `session/cancel` entry points; until then no hook
-claim is made. Controlled families are session/turn/message/tool with no
-request family. `profile.store` is unsupported: launch carries no native
-store binding.
+verbs are launch/resume/send/steer/interrupt/stop. There is no direct plugin
+`inject` verb: `active_turn` inject is unsupported, while system context
+flows through the shared `next_input` (claimed at send) and
+`turn_safe_point` (claimed at `PreInvocation`) points below. Configure,
+approve, deny and answer remain `unsupported`.
+`profile.store` is unsupported: launch carries no native store binding.
+
+## System context and steer hooks
+
+The Antigravity CLI hooks documentation (accessed 2026-11-07; adapter
+version metadata is 1.5.2) defines named hook groups. `PreInvocation` input
+includes `conversationId`, zero-indexed `invocationNum`, and
+`initialNumSteps` (trajectory step count). The current recommended output is
+`{"injectSteps":[{"systemMessage":{"systemMessage":"..."}}]}`;
+`ephemeralMessage` and `hookEphemeralMessage` are deprecated. The plugin
+writes one named group (`eliot-system-context`) to the generation's private `.agents/hooks.json`
+and passes that private directory with `--add-dir`; the real workspace
+remains the ACP cwd. The adapter does not write global or user-project hook
+files, copy authentication, or change login/native-store paths. The private
+config is removed when the generation ends.
+
+Each managed ACP generation receives `ELIOT_AGY_HOOK_HELPER` pointing to the
+current Eliot executable plus its own loopback endpoint
+(`ELIOT_AGY_HOOK_ENDPOINT`) and random token (`ELIOT_AGY_HOOK_TOKEN`). The
+private hook command invokes that same executable as a bare token
+(`<exe> plugin antigravity-hook`) when its path contains no whitespace or
+shell metacharacters. Other command paths remain unsupported until the
+vendor executor's quoting behavior is proven. With no managed
+endpoint/token, the helper writes `{}` and exits successfully.
+
+On Windows, the Antigravity native child receives a `PATH` with the host's
+`SystemRoot\System32` first, followed by the existing effective entries. A
+controlled run showed the original npm-first `cmd` resolution sent hook shell
+commands to Command Code; this child-only order resolves Windows `cmd.exe`
+first without changing the daemon or other providers' environment.
+
+Supported system inject: `next_input` context is claimed FIFO at send
+and prepended to the prompt; `turn_safe_point` context is claimed FIFO at a
+live `PreInvocation` and applied as nested `injectSteps` `systemMessage`
+steps.
+Direct `active_turn` inject is unsupported.
+
+The helper captures its kernel `ProcessBirthIdentity { pid, start_time }` at
+entry. The plugin verifies that tuple against the OS and accepts it only when
+the process start is after the immutable pending-prompt opening boundary
+captured before `session/prompt`. The retained callback binding includes the
+conversation, Eliot generation, turn, opening boundary, and helper origin;
+it is rechecked before `hook.event` can claim FIFO `turn_safe_point` context.
+Late or expired callbacks are discarded before claim. Native `invocationNum`
+and repeated prompt text are not turn identity. The kernel birth query is
+implemented for Windows and Linux; other targets fail closed as unsupported.
+
+The Core `hook.event` response and each steer HookOutput retain their shared
+frame bounds; the private IPC frame reserves both bounds plus the complete
+response envelope. Claimed context stays FIFO and is never cleared after the
+claim. If the combined response cannot fit, context takes priority and steer
+remains pending for a later callback in the same prompt. After the helper
+confirms its stdout write, the plugin commits `hook.before_model` with the
+exact Eliot turn and consumer on the existing event path. A context outcome
+is included only when claimed context was written.
+
+`steer` retains its command id, generation, and captured turn while waiting
+for a live `PreInvocation` in that prompt. Its host response is deferred while
+the same host continues to serve interrupt, stop, shutdown, and other control
+requests; an outer RPC timeout does not cancel the retained waiter. Steer
+uses a `systemMessage` step, reports `applied` only after helper
+stdout confirmation, and reports the mechanism
+`antigravity.PreInvocation.injectSteps.systemMessage`. If the turn ends
+first, the retained result is stale or unknown and is never resent. This is
+the native PreInvocation point, not an ACP steer method or an `active_turn`
+inject. Controlled families remain session/turn/message/tool, with
+`hook.before_model` owned by the existing turn family.
 
 ## Facts and recovery
 

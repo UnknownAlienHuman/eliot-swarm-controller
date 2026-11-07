@@ -1,3 +1,4 @@
+use super::connection::MAX_PENDING_CALLS;
 use super::{PluginClient, PluginConnection};
 mod discovery;
 mod native_children;
@@ -18,13 +19,16 @@ use eliot_plugin::{
     spawn_stderr,
     sync::LockExt,
 };
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Map, Value, json};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsString,
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     process::Stdio,
     sync::{Arc, Mutex, Weak, atomic::AtomicBool},
     time::Duration,
@@ -176,6 +180,14 @@ struct PendingFailure {
     error: Error,
     command_id: String,
 }
+
+struct PluginCommandCompletion {
+    command: Command,
+    reply: oneshot::Sender<Result<Value>>,
+    result: Result<Value>,
+}
+
+type PendingSteerFuture = Pin<Box<dyn Future<Output = PluginCommandCompletion> + Send>>;
 
 struct EventSource {
     store: StoreHandle,
@@ -571,6 +583,7 @@ impl PluginHost {
             _ => {}
         }
         let (sender, stderr, credentials) = self.sender(&key, &command.verb)?;
+        let wait_for_steer = command.verb == "steer";
         let (reply, response) = oneshot::channel();
         timeout_at(
             Instant::now() + RPC_DEADLINE,
@@ -583,16 +596,26 @@ impl PluginHost {
         .await
         .map_err(|_| Error::new("busy", "Agent plugin command queue is full"))?
         .map_err(|_| Error::new("unknown", "owned Agent plugin is no longer available"))?;
-        let result = match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, response).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(Error::new(
-                "unknown",
-                "Agent plugin ended before the command outcome was returned",
-            )),
-            Err(_) => Err(Error::new(
-                "unknown",
-                "Agent plugin command exceeded its absolute deadline",
-            )),
+        let result = if wait_for_steer {
+            match response.await {
+                Ok(result) => result,
+                Err(_) => Err(Error::new(
+                    "unknown",
+                    "Agent plugin ended before the steer outcome was returned",
+                )),
+            }
+        } else {
+            match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, response).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(Error::new(
+                    "unknown",
+                    "Agent plugin ended before the command outcome was returned",
+                )),
+                Err(_) => Err(Error::new(
+                    "unknown",
+                    "Agent plugin command exceeded its absolute deadline",
+                )),
+            }
         };
         result.map_err(|error| diagnose_error(error, &stderr, &credentials))
     }
@@ -1179,6 +1202,7 @@ async fn run_agent_inner(
     } = actor;
     let mut last_command_id = start_command.id.clone();
     let mut planned_exit = false;
+    let mut pending_steers: FuturesUnordered<PendingSteerFuture> = FuturesUnordered::new();
     loop {
         tokio::select! {
             status = child.wait() => {
@@ -1248,6 +1272,18 @@ async fn run_agent_inner(
                 planned_exit = true;
                 break;
             }
+            completion = pending_steers.next(), if !pending_steers.is_empty() => {
+                if let Some(completion) = completion {
+                    complete_plugin_command(
+                        completion,
+                        &agent,
+                        &stderr,
+                        &source_credentials,
+                        pending_failure,
+                        client.reader_closed(),
+                    );
+                }
+            }
             message = messages.recv() => {
                 let Some(message) = message else {
                     let exited = child.terminate().is_ok()
@@ -1267,36 +1303,77 @@ async fn run_agent_inner(
                         reply,
                     } => {
                         last_command_id = command.id.clone();
-                        let verb = command.verb.clone();
-                        let result = match agent_command_params(&agent, &command, dispatch_seq) {
-                            Err(error) => Err(error),
-                            Ok(params) => {
-                                client.call("agent.command", params, deadline()).await
-                                    .map_err(|error| redact_native_error(error, &source_credentials))
-                                    .and_then(|mut value| {
-                                        crate::redaction::redact_outcome(
-                                            &mut value,
+                        match agent_command_params(&agent, &command, dispatch_seq) {
+                            Err(error) => complete_plugin_command(
+                                PluginCommandCompletion {
+                                    command,
+                                    reply,
+                                    result: Err(error),
+                                },
+                                &agent,
+                                &stderr,
+                                &source_credentials,
+                                pending_failure,
+                                client.reader_closed(),
+                            ),
+                            Ok(params) if command.verb == "steer" => {
+                                if pending_steers.len() >= MAX_PENDING_CALLS {
+                                    complete_plugin_command(
+                                        PluginCommandCompletion {
+                                            command,
+                                            reply,
+                                            result: Err(Error::new(
+                                                "native_not_dispatched",
+                                                "plugin has reached its bounded in-flight request limit",
+                                            )),
+                                        },
+                                        &agent,
+                                        &stderr,
+                                        &source_credentials,
+                                        pending_failure,
+                                        client.reader_closed(),
+                                    );
+                                } else {
+                                    match client.begin_call("agent.command", params, deadline()).await {
+                                        Ok(pending_call) => {
+                                            pending_steers.push(Box::pin(async move {
+                                                let result = pending_call.finish(None).await;
+                                                PluginCommandCompletion {
+                                                    command,
+                                                    reply,
+                                                    result,
+                                                }
+                                            }));
+                                        }
+                                        Err(error) => complete_plugin_command(
+                                            PluginCommandCompletion {
+                                                command,
+                                                reply,
+                                                result: Err(error),
+                                            },
+                                            &agent,
+                                            &stderr,
                                             &source_credentials,
-                                        );
-                                        validate_agent_command_result(value, &verb)
-                                    })
-                            }
-                        };
-                        match result {
-                            Err(error) if error.code == "unknown" && client.reader_closed() && pending_failure.is_none() => {
-                                // The actual protocol reader ended. Keep this
-                                // exact pending caller through existing loss
-                                // cleanup, then finish stderr before replying.
-                                *pending_failure = Some(PendingFailure {
-                                    reply: Some(reply), error, command_id: command.id,
-                                });
-                            }
-                            result => {
-                                let result = diagnose_result(result, &stderr, &source_credentials);
-                                if let Err(error) = &result {
-                                    record_plugin_error(error, &agent.id, agent.generation, &command.id, &source_credentials);
+                                            pending_failure,
+                                            client.reader_closed(),
+                                        ),
+                                    }
                                 }
-                                let _ = reply.send(result);
+                            }
+                            Ok(params) => {
+                                let result = client.call("agent.command", params, deadline()).await;
+                                complete_plugin_command(
+                                    PluginCommandCompletion {
+                                        command,
+                                        reply,
+                                        result,
+                                    },
+                                    &agent,
+                                    &stderr,
+                                    &source_credentials,
+                                    pending_failure,
+                                    client.reader_closed(),
+                                );
                             }
                         }
                     }
@@ -1556,6 +1633,28 @@ async fn run_agent_inner(
         }
     }
     cleanup_actor(&state, &key, &plugin_credential, planned_exit).await;
+    if !pending_steers.is_empty() {
+        // Stop/force/source custody above owns teardown. Only then wait for the
+        // transport to close and settle the retained correlated responses.
+        let _ = timeout_at(Instant::now() + STOP_GRACE, client.wait_closed()).await;
+        // A response may already have been routed even if the close signal
+        // misses its bounded wait. Drain ready completions either way.
+        let drain_until = Instant::now() + RPC_GRACE;
+        while !pending_steers.is_empty() {
+            let completion = match timeout_at(drain_until, pending_steers.next()).await {
+                Ok(Some(completion)) => completion,
+                Ok(None) | Err(_) => break,
+            };
+            complete_plugin_command(
+                completion,
+                &agent,
+                &stderr,
+                &source_credentials,
+                pending_failure,
+                client.reader_closed(),
+            );
+        }
+    }
 }
 
 async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSource) {
@@ -2415,6 +2514,53 @@ fn validate_agent_command_result(value: Value, verb: &str) -> Result<Value> {
             "unknown",
             "plugin command response omitted its command outcome",
         )),
+    }
+}
+
+fn complete_plugin_command(
+    completion: PluginCommandCompletion,
+    agent: &Agent,
+    stderr: &StderrView,
+    source_credentials: &[String],
+    pending_failure: &mut Option<PendingFailure>,
+    reader_closed: bool,
+) {
+    let PluginCommandCompletion {
+        command,
+        reply,
+        result,
+    } = completion;
+    let command_id = command.id;
+    let verb = command.verb;
+    let result = result
+        .map_err(|error| redact_native_error(error, source_credentials))
+        .and_then(|mut value| {
+            crate::redaction::redact_outcome(&mut value, source_credentials);
+            validate_agent_command_result(value, &verb)
+        });
+
+    match result {
+        Err(error) if error.code == "unknown" && reader_closed && pending_failure.is_none() => {
+            // Retain one exact caller until actor cleanup finishes stderr.
+            *pending_failure = Some(PendingFailure {
+                reply: Some(reply),
+                error,
+                command_id,
+            });
+        }
+        result => {
+            let result = diagnose_result(result, stderr, source_credentials);
+            if let Err(error) = &result {
+                record_plugin_error(
+                    error,
+                    &agent.id,
+                    agent.generation,
+                    &command_id,
+                    source_credentials,
+                );
+            }
+            let _ = reply.send(result);
+        }
     }
 }
 

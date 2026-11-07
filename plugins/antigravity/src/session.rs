@@ -1,9 +1,15 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use eliot_core::{Error, InjectPoint, Result, canonical_json_sha256};
 use eliot_plugin::{
-    AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, MAX_TEXT_BYTES,
-    PeerClient,
+    AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, MAX_FRAME_BYTES,
+    MAX_TEXT_BYTES, PeerClient,
     session::{
         native_no_write, register_native_process, unknown_snapshot, with_claimed_context,
         with_context_points,
@@ -11,13 +17,14 @@ use eliot_plugin::{
 };
 use serde_json::{Value, json};
 use tokio::{
-    sync::{Mutex, mpsc, watch},
+    sync::{Mutex, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{Instant, timeout_at},
 };
 
 use crate::{
     events::{self, Shared},
+    hooks::{self, HookOutput, HookServer},
     host::TIMEOUT,
     native::{
         AgyClient, AgyFrame, AgyProcess, FencedKind, InitializeResult, LoadSessionResult,
@@ -35,6 +42,34 @@ struct RetainedCommand {
     payload_sha256: [u8; 32],
     turn: String,
     outcome: Result<Value>,
+}
+
+struct OwnedHookConfig {
+    path: PathBuf,
+    remove_agents_dir: bool,
+}
+
+struct HookConfigGuard(Option<OwnedHookConfig>);
+
+impl Drop for HookConfigGuard {
+    fn drop(&mut self) {
+        if let Some(config) = &self.0 {
+            remove_hook_config(config);
+        }
+    }
+}
+
+pub(crate) struct DeferredSteer {
+    pub seq: i64,
+    pub generation: i64,
+    pub command_id: String,
+    pub turn_id: String,
+    pub receiver: oneshot::Receiver<Result<Value>>,
+}
+
+pub(crate) enum SteerStart {
+    Immediate(Result<Value>),
+    Deferred(DeferredSteer),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -81,10 +116,14 @@ pub(crate) struct Session {
     frames: Option<mpsc::Receiver<AgyFrame>>,
     stream: watch::Receiver<StreamState>,
     task: Option<JoinHandle<()>>,
+    hooks: Option<HookServer>,
+    hook_config: Option<OwnedHookConfig>,
     ready: bool,
     highwater_seq: i64,
     retained: Option<RetainedCommand>,
     interrupt_retained: Option<RetainedCommand>,
+    steer_retained: Option<RetainedCommand>,
+    steer_inflight: Option<i64>,
     stop: Option<(String, bool, Result<Value>)>,
 }
 
@@ -94,12 +133,45 @@ impl Session {
         plan: &Plan,
         peer: &PeerClient,
         credential: &str,
+        instance_dir: &Path,
+        hooks: HookServer,
     ) -> Result<Self> {
+        let reserved = [
+            hooks::ENV_HOOK_HELPER,
+            hooks::ENV_HOOK_ENDPOINT,
+            hooks::ENV_HOOK_TOKEN,
+        ];
+        if plan.launch.environment.iter().any(|(name, _)| {
+            reserved
+                .iter()
+                .any(|reserved| name == std::ffi::OsStr::new(reserved))
+        }) {
+            return Err(Error::new(
+                "invalid",
+                "Antigravity hook environment names are reserved for this generation",
+            ));
+        }
+        let helper = std::env::current_exe()
+            .map_err(|_| Error::new("io_error", "Could not locate the Eliot hook helper"))?;
+        if !helper.is_absolute() || !helper.is_file() {
+            return Err(Error::new(
+                "invalid",
+                "Eliot hook helper path is not an existing absolute executable",
+            ));
+        }
+        let mut hook_config = HookConfigGuard(Some(install_hook_config(
+            instance_dir,
+            &plan.launch.cwd,
+            &helper,
+        )?));
+        let mut environment = plan.launch.environment.clone();
+        environment.extend(hooks.endpoint_env());
+        environment.push((hooks::ENV_HOOK_HELPER.into(), helper.into_os_string()));
         let launch = eliot_plugin::native_stdio::NativeLaunch {
             program: plan.launch.program.clone(),
             args: plan.launch.args.clone(),
             cwd: plan.launch.cwd.clone(),
-            environment: plan.launch.environment.clone(),
+            environment,
         };
         let mut native = AgyProcess::spawn(launch, plan.policy.clone()).await?;
         let client = native.client();
@@ -125,10 +197,14 @@ impl Session {
             frames: Some(frames),
             stream,
             task: None,
+            hooks: Some(hooks),
+            hook_config: hook_config.0.take(),
             ready: false,
             highwater_seq: 0,
             retained: None,
             interrupt_retained: None,
+            steer_retained: None,
+            steer_inflight: None,
             stop: None,
         })
     }
@@ -160,11 +236,16 @@ impl Session {
             .frames
             .take()
             .ok_or_else(|| Error::new("internal", "Antigravity reader disappeared"))?;
+        let hooks = self
+            .hooks
+            .take()
+            .ok_or_else(|| Error::new("internal", "Antigravity hook listener disappeared"))?;
         self.task = Some(events::spawn(
             frames,
             self.stream.clone(),
             self.state.clone(),
             self.client.clone(),
+            hooks,
         ));
         let deadline = Instant::now() + TIMEOUT;
         let init_value = self
@@ -340,7 +421,10 @@ impl Session {
                 object.insert("mode".to_owned(), json!(mode));
             }
         }
-        let effective = with_context_points(effective, &[InjectPoint::NextInput]);
+        let effective = with_context_points(
+            effective,
+            &[InjectPoint::NextInput, InjectPoint::TurnSafePoint],
+        );
         if *self.stream.borrow() != StreamState::Open {
             return Err(Error::new(
                 "unknown",
@@ -362,10 +446,14 @@ impl Session {
     pub async fn command(&mut self, params: AgentCommandParams) -> Result<Value> {
         match params.verb.as_str() {
             "send" => self.send(params).await,
+            "steer" => Err(Error::new(
+                "internal",
+                "Antigravity steer must use the deferred host response path",
+            )),
             "interrupt" => self.interrupt(params).await,
             _ => Err(Error::new(
                 "unsupported",
-                "Antigravity supports only send and interrupt; no native steer, inject or configure channel is connected",
+                "Antigravity supports send, steer and interrupt; inject/configure are unsupported",
             )),
         }
     }
@@ -393,6 +481,14 @@ impl Session {
         }
         if params.command_id == self.start_command
             || self.stop.as_ref().is_some_and(|s| s.0 == params.command_id)
+            || self
+                .interrupt_retained
+                .as_ref()
+                .is_some_and(|retained| retained.command_id == params.command_id)
+            || self
+                .steer_retained
+                .as_ref()
+                .is_some_and(|retained| retained.command_id == params.command_id)
         {
             return Err(Error::new(
                 "source_integrity",
@@ -530,6 +626,187 @@ impl Session {
         result
     }
 
+    pub async fn begin_steer(&mut self, params: AgentCommandParams) -> Result<SteerStart> {
+        if params.request_id.is_some() || params.args.as_object().is_none_or(|args| args.len() != 1)
+        {
+            return Err(Error::new(
+                "invalid",
+                "Antigravity steer accepts only args.text and an exact turn",
+            ));
+        }
+        let turn_id = params
+            .turn_id
+            .as_deref()
+            .filter(|turn| !turn.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new("stale_turn", "Antigravity steer requires a captured turn")
+            })?;
+        let text = params
+            .args
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::new("invalid", "Antigravity steer requires args.text"))?;
+        if text.len() > MAX_TEXT_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                "Antigravity steer exceeds the text bound",
+            ));
+        }
+        if text.trim().is_empty() {
+            return Err(Error::new("invalid", "Antigravity steer text is empty"));
+        }
+        if self.state.lock().await.contains_secret(text) {
+            return Err(Error::new(
+                "secret_in_payload",
+                "Antigravity steer contains a known credential",
+            ));
+        }
+        let output = HookOutput::with_system_message(text.to_owned());
+        if serde_json::to_vec(&output).map_or(true, |bytes| {
+            bytes.len().saturating_add(1) > MAX_FRAME_BYTES
+        }) {
+            return Err(Error::new(
+                "frame_too_large",
+                "Antigravity steer does not fit one PreInvocation response",
+            ));
+        }
+        if params.command_id == self.start_command
+            || self
+                .stop
+                .as_ref()
+                .is_some_and(|stop| stop.0 == params.command_id)
+            || self
+                .retained
+                .as_ref()
+                .is_some_and(|retained| retained.command_id == params.command_id)
+            || self
+                .interrupt_retained
+                .as_ref()
+                .is_some_and(|retained| retained.command_id == params.command_id)
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "Antigravity command id belongs to another operation",
+            ));
+        }
+        if !self.ready || self.native.transport.process_exit_observed() {
+            return Err(Error::new(
+                "unknown",
+                "Antigravity steer session readiness is unresolved",
+            ));
+        }
+        let seq = match params.dispatch_seq {
+            Some(seq) if seq > 0 => seq,
+            _ => {
+                return Err(Error::new(
+                    "invalid",
+                    "Antigravity steer requires a positive dispatch sequence",
+                ));
+            }
+        };
+        let payload_sha256 = canonical_json_sha256(&params.args).map_err(|_| {
+            Error::new(
+                "invalid",
+                "Antigravity steer arguments cannot be canonicalized",
+            )
+        })?;
+        match check_history(
+            &self.steer_retained,
+            self.highwater_seq,
+            seq,
+            &params.command_id,
+            payload_sha256,
+        ) {
+            HistoryDecision::RetainedOutcome(outcome) => {
+                if self
+                    .steer_retained
+                    .as_ref()
+                    .is_some_and(|retained| retained.turn == turn_id)
+                {
+                    return Ok(SteerStart::Immediate(outcome.clone()));
+                }
+                return Err(Error::new(
+                    "source_integrity",
+                    "Antigravity steer replay changed its captured turn",
+                ));
+            }
+            HistoryDecision::Conflict => {
+                return Err(Error::new(
+                    "source_integrity",
+                    "Antigravity steer command binding conflicts with retained history",
+                ));
+            }
+            HistoryDecision::EvictedHistory => {
+                return Err(Error::new(
+                    "unknown",
+                    "Antigravity steer private history is unavailable",
+                ));
+            }
+            HistoryDecision::Advance => {}
+        }
+        if self.steer_inflight.is_some() {
+            return Err(Error::new(
+                "busy",
+                "Antigravity already has a steer awaiting its native receipt",
+            ));
+        }
+
+        let receiver = self.state.lock().await.arm_steer(
+            params.command_id.clone(),
+            turn_id.to_owned(),
+            text.to_owned(),
+        )?;
+        self.highwater_seq = seq;
+        self.steer_retained = Some(RetainedCommand {
+            seq,
+            command_id: params.command_id.clone(),
+            payload_sha256,
+            turn: turn_id.to_owned(),
+            outcome: Ok(unknown_steer(
+                &params.command_id,
+                turn_id,
+                "PreInvocation has not confirmed application",
+            )),
+        });
+        self.steer_inflight = Some(seq);
+        Ok(SteerStart::Deferred(DeferredSteer {
+            seq,
+            generation: self.generation,
+            command_id: params.command_id,
+            turn_id: turn_id.to_owned(),
+            receiver,
+        }))
+    }
+
+    pub fn settle_steer(
+        &mut self,
+        seq: i64,
+        generation: i64,
+        command_id: &str,
+        turn_id: &str,
+        outcome: Result<Value>,
+    ) -> Result<Value> {
+        if generation != self.generation {
+            return Err(Error::new(
+                "source_integrity",
+                "Antigravity deferred steer receipt crossed generations",
+            ));
+        }
+        let Some(retained) = self.steer_retained.as_mut().filter(|retained| {
+            retained.seq == seq && retained.command_id == command_id && retained.turn == turn_id
+        }) else {
+            return Err(Error::new(
+                "source_integrity",
+                "Antigravity deferred steer receipt lost its retained identity",
+            ));
+        };
+        retained.outcome = outcome.clone();
+        if self.steer_inflight == Some(seq) {
+            self.steer_inflight = None;
+        }
+        outcome
+    }
+
     /// Interrupt the exact current Eliot turn via the ACP `session/cancel`
     /// notification. The notification proves dispatch only; this command
     /// then waits (bounded) for the prompt task's actual settlement of
@@ -564,6 +841,14 @@ impl Session {
         }
         if params.command_id == self.start_command
             || self.stop.as_ref().is_some_and(|s| s.0 == params.command_id)
+            || self
+                .retained
+                .as_ref()
+                .is_some_and(|retained| retained.command_id == params.command_id)
+            || self
+                .steer_retained
+                .as_ref()
+                .is_some_and(|retained| retained.command_id == params.command_id)
         {
             return Err(Error::new(
                 "source_integrity",
@@ -690,10 +975,15 @@ impl Session {
             .interrupt_retained
             .as_ref()
             .filter(|r| r.command_id == params.command_id);
+        let steer = self
+            .steer_retained
+            .as_ref()
+            .filter(|r| r.command_id == params.command_id);
         let stop = self.stop.as_ref().is_some_and(|s| s.0 == params.command_id);
         if params.command_id != self.start_command
             && retained.is_none()
             && interrupt.is_none()
+            && steer.is_none()
             && !stop
         {
             return unknown_snapshot(&params, "Antigravity command identity is not retained");
@@ -702,10 +992,12 @@ impl Session {
             .turn_id
             .as_deref()
             .or_else(|| retained.map(|r| r.turn.as_str()))
-            .or_else(|| interrupt.map(|r| r.turn.as_str()));
+            .or_else(|| interrupt.map(|r| r.turn.as_str()))
+            .or_else(|| steer.map(|r| r.turn.as_str()));
         if let Some(turn) = turn {
             let proven = retained.is_some_and(|r| r.turn == turn)
-                || interrupt.is_some_and(|r| r.turn == turn);
+                || interrupt.is_some_and(|r| r.turn == turn)
+                || steer.is_some_and(|r| r.turn == turn);
             if !proven {
                 return unknown_snapshot(
                     &params,
@@ -752,9 +1044,17 @@ impl Session {
         }
         if params.command_id == self.start_command
             || self
+                .interrupt_retained
+                .as_ref()
+                .is_some_and(|retained| retained.command_id == params.command_id)
+            || self
                 .retained
                 .as_ref()
                 .is_some_and(|r| r.command_id == params.command_id)
+            || self
+                .steer_retained
+                .as_ref()
+                .is_some_and(|retained| retained.command_id == params.command_id)
         {
             return Err(Error::new(
                 "source_integrity",
@@ -775,7 +1075,11 @@ impl Session {
     }
 
     pub async fn terminate(&mut self, force: bool) -> Result<()> {
-        self.state.lock().await.stopping = true;
+        {
+            let mut state = self.state.lock().await;
+            state.stopping = true;
+            state.cancel_pending_steer();
+        }
         let deadline = Instant::now() + TIMEOUT;
         if self.ready && !self.conversation.is_empty() {
             let _ = self
@@ -798,12 +1102,169 @@ impl Session {
                 .map_err(|_| Error::new("unknown", "Antigravity event reader failed"))?;
             self.task = None;
         }
+        if let Some(config) = self.hook_config.take() {
+            remove_hook_config(&config);
+        }
         if self.ready {
             let mut state = self.state.lock().await;
             state.ended().await?;
         }
         self.ready = false;
         Ok(())
+    }
+}
+
+pub(crate) fn unknown_steer(command_id: &str, turn_id: &str, reason: &str) -> Value {
+    json!({
+        "state": "unknown",
+        "command_id": command_id,
+        "turn_id": turn_id,
+        "mechanism": events::STEER_MECHANISM,
+        "native_hook": "PreInvocation",
+        "reason": reason,
+    })
+}
+
+fn install_hook_config(
+    instance_dir: &Path,
+    workspace: &Path,
+    helper: &Path,
+) -> Result<OwnedHookConfig> {
+    let command = hook_command(helper)?;
+    let private_root = fs::canonicalize(instance_dir).map_err(|_| {
+        Error::new(
+            "invalid",
+            "Antigravity private instance directory is unavailable",
+        )
+    })?;
+    let workspace = fs::canonicalize(workspace)
+        .map_err(|_| Error::new("profile_error", "Antigravity workspace is unavailable"))?;
+    if private_root.starts_with(&workspace) || workspace.starts_with(&private_root) {
+        return Err(Error::new(
+            "invalid",
+            "Antigravity private instance directory overlaps its workspace",
+        ));
+    }
+
+    let agents_dir = private_root.join(".agents");
+    let remove_agents_dir = match fs::create_dir(&agents_dir) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(_) => {
+            return Err(Error::new(
+                "io_error",
+                "Could not create the private Antigravity hooks directory",
+            ));
+        }
+    };
+    let agents_dir = match fs::canonicalize(&agents_dir) {
+        Ok(path) if path.is_dir() && path.starts_with(&private_root) => path,
+        _ => {
+            if remove_agents_dir {
+                let _ = fs::remove_dir(&agents_dir);
+            }
+            return Err(Error::new(
+                "invalid",
+                "Antigravity hooks directory is not contained by its private instance",
+            ));
+        }
+    };
+
+    let config = hooks::hooks_json(hooks::DEFAULT_HOOK_NAME, &command);
+    let mut bytes = match serde_json::to_vec(&config) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            if remove_agents_dir {
+                let _ = fs::remove_dir(&agents_dir);
+            }
+            return Err(Error::new(
+                "internal",
+                "Could not encode Antigravity hook config",
+            ));
+        }
+    };
+    bytes.push(b'\n');
+    let path = agents_dir.join("hooks.json");
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(file) => file,
+        Err(_) => {
+            if remove_agents_dir {
+                let _ = fs::remove_dir(&agents_dir);
+            }
+            return Err(Error::new(
+                "io_error",
+                "Could not create the owned Antigravity hook config",
+            ));
+        }
+    };
+    if file.write_all(&bytes).and_then(|()| file.flush()).is_err() {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        if remove_agents_dir {
+            let _ = fs::remove_dir(&agents_dir);
+        }
+        return Err(Error::new(
+            "io_error",
+            "Could not write the owned Antigravity hook config",
+        ));
+    }
+    Ok(OwnedHookConfig {
+        path,
+        remove_agents_dir,
+    })
+}
+
+fn hook_command(helper: &Path) -> Result<String> {
+    let executable = helper
+        .to_str()
+        .ok_or_else(|| Error::new("invalid", "Eliot hook helper path is not UTF-8"))?;
+    // The pinned AGY Windows log shows literal `\"...\"` tokens are not
+    // recognized by its command executor. Emit an unquoted bare path only
+    // when it has no whitespace or shell metacharacters; other paths stay
+    // explicitly unsupported until the vendor's quoting rules are proven.
+    let unsafe_token = executable.chars().any(|character| {
+        character.is_whitespace()
+            || if cfg!(windows) {
+                matches!(
+                    character,
+                    '&' | '|' | '<' | '>' | '^' | '%' | '!' | '(' | ')' | '"'
+                )
+            } else {
+                matches!(
+                    character,
+                    '&' | '|'
+                        | '<'
+                        | '>'
+                        | ';'
+                        | '$'
+                        | '`'
+                        | '\''
+                        | '"'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '#'
+                        | '('
+                        | ')'
+                )
+            }
+    });
+    if unsafe_token {
+        return Err(Error::new(
+            "unsupported",
+            "Antigravity hook executable path contains unqualified command characters",
+        ));
+    }
+    Ok(format!("{executable} plugin antigravity-hook"))
+}
+
+fn remove_hook_config(config: &OwnedHookConfig) {
+    let _ = fs::remove_file(&config.path);
+    if config.remove_agents_dir
+        && let Some(parent) = config.path.parent()
+    {
+        let _ = fs::remove_dir(parent);
     }
 }
 

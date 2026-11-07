@@ -98,6 +98,13 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 | `profile.store` (L3) | shared [`ProfileStoreParams`](../../crates/eliot-plugin/src/protocol.rs) | Return the effective [`NativeStoreBinding`](../../crates/eliot-core/src/native_store.rs) using the caller's actual prepared workspace and a bounded, owned metadata reader; success requires confirmed reader cleanup. It creates no model or thread, performs no native control and publishes no Agent events. This is outside the L1/L2 first-harness subset. |
 | `shutdown` | none | close owned paths, drain, exit; never kill an adopted service |
 
+Steer uses an ordered, bounded write followed by a correlated response wait: the host
+writes its `agent.command` frame in dispatch order under the writer deadline, then keeps
+the exact response pending without a native/model-turn response deadline while continuing
+to process `interrupt`, `stop`, `agent.snapshot`, and lifecycle messages. The response,
+or transport/generation teardown, settles the wait; unresolved teardown remains `unknown`
+and is never replayed. Other RPC deadlines are unchanged.
+
 An optional shared Core `RouteBinding` travels inside the frozen profile snapshot; it
 does not add a service RPC or a new harness. The controlled Codex process must apply the
 explicit named-provider override and read back its effective configuration before
@@ -223,9 +230,9 @@ channel. The connection credential binds the Agent generation; the plugin cannot
 or override that identity in the callback. The shared wire DTOs are named `HookEvent`
 and `HookResponse`; their field catalog belongs in the [protocol DTO module](../../crates/eliot-plugin/src/protocol.rs),
 while this spec owns their semantics. A callback reports
-`before_tool` (Claude Code `PreToolUse`) or `before_model` (OpenCode `context` hook),
-its exact `turn_id`, and an opaque `consumer_id`; the response carries
-`context[]` as shared Core `ContextItem` values.
+`before_tool` (Claude Code `PreToolUse`) or `before_model` (OpenCode `context` hook and
+Antigravity `PreInvocation`), its exact `turn_id`, and an opaque `consumer_id`; the response
+carries `context[]` as shared Core `ContextItem` values.
 
 For `turn_safe_point`, the host rechecks the authenticated generation, captured turn and
 expiry, then commits FIFO claims in existing command rows before returning the response.
@@ -532,13 +539,12 @@ bind exact generation/request/deadline. Timeout uses the safe native default; la
 approval is discarded, not queued. Hooks do not duplicate the authoritative stream.
 
 The first system-context hook consumer is Claude Code 2.1.278:
-`PreToolUse.additionalContext` is the native `turn_safe_point` application point. Its
-source schema is confirmed; runtime application is not yet qualified. The adapter reports
-the exact turn and opaque consumer through the existing authenticated plugin channel.
-Timeout/cancellation supplies no context, does not override a native result, and discards
-late context instead of queuing it for a later turn. This context path does not make
-permission decisions; existing approval callbacks retain that responsibility. Hooks do
-not duplicate lifecycle already supplied by the stream.
+`PreToolUse.additionalContext` is the native `turn_safe_point` application point. The
+adapter reports the exact turn and opaque consumer through the existing authenticated
+plugin channel. Timeout/cancellation supplies no context, does not override a native
+result, and discards late context instead of queuing it for a later turn. This context
+path does not make permission decisions; existing approval callbacks retain that
+responsibility. Hooks do not duplicate lifecycle already supplied by the stream.
 
 The OpenCode `context` hook (`before_model`) is the second consumer. The Rust host binds
 the native session over RPC `eliot-context` version 1 (`bind`/`next`/`resolve` on the
@@ -546,6 +552,19 @@ existing authenticated HTTP transport) before readiness and advertises `turn_saf
 only after a verified v1 binding. An owned longpoll claims through the same authenticated
 `hook.event` channel before the vendor `resolve` mutates the native system draft; only a
 confirmed `applied`/`empty` may emit a receipt.
+
+The Antigravity `PreInvocation` hook (`before_model`) is the third consumer. The adapter
+installs a private generation-scoped hook group in `.agents/hooks.json` invoking an authenticated
+helper command. When the vendor runner executes the hook, the helper connects to the session-owned
+loopback listener and proves its kernel birth identity. The plugin claims FIFO `turn_safe_point`
+context through the existing authenticated `hook.event` channel, combines it with any pending
+exact-turn steer retained inside the plugin, and packages both into one `HookOutput` with native
+`injectSteps` entries using nested `systemMessage.systemMessage`. Only confirmed helper stdout
+write acknowledgment commits
+`hook.before_model` with `ContextOutcome` (mechanism `antigravity.PreInvocation.injectSteps.systemMessage`).
+A retained exact-turn steer waits for this callback while other control requests remain serviceable;
+this is native `PreInvocation`, not an `active_turn` inject or a new SEND. See [Antigravity harness](../harnesses/antigravity.md)
+for native details.
 
 
 Native adapters echo turns and emit request callbacks over this same transport
