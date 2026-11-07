@@ -587,7 +587,7 @@ impl Router {
             return;
         }
         if matches!(dispatched.verb.as_str(), "notify" | "emit") {
-            self.execute_user_event_command(id, dispatched).await;
+            self.execute_user_event_command(&id, dispatched).await;
             return;
         }
         let target = match dispatched.target.as_deref() {

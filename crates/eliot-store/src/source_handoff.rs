@@ -44,7 +44,7 @@ fn reserved_source(source: &str) -> bool {
 }
 
 /// The generic native stream family vocabulary, independent of any harness.
-fn is_native_family(family: &str) -> bool {
+pub(super) fn is_native_family(family: &str) -> bool {
     matches!(family, "session" | "turn" | "message" | "tool" | "request")
 }
 

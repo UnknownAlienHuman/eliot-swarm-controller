@@ -3418,10 +3418,7 @@ impl Store {
             ));
         }
         for (family, mechanism) in plan {
-            if !matches!(
-                family.as_str(),
-                "session" | "turn" | "message" | "tool" | "request"
-            ) {
+            if !source_handoff::is_native_family(family) {
                 return Err(Error::new(
                     "unsupported",
                     format!("plugin source family {family} is not a common native family"),
@@ -3476,10 +3473,15 @@ impl Store {
                 ))
             })
             .map_err(sql_error)?;
-        let existing = rows
+        let mut existing = rows
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql_error)?;
         drop(statement);
+        // Compare only registered native-family ownership: Monitoring may
+        // already have installed OS/Git/daemon rows for this generation, and
+        // those must be preserved untouched. A native family owned by any
+        // other source or mechanism still conflicts below.
+        existing.retain(|(family, _, _)| source_handoff::is_native_family(family));
         let source = load_source_state(&tx, agent_num, generation, INITIAL_SOURCE)?;
         let identical = existing.len() == plan.len()
             && existing.iter().all(|(family, owner, mechanism)| {
