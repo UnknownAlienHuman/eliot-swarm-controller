@@ -240,7 +240,7 @@ Codex or for unrelated adapters.
       Distinguish this caller from a controlled local native harness/PID. Completion:
       a cloud caller can perform an authenticated MCP call without local process custody.
 
-- [ ] **L6.8 Stalled/unhealthy-agent diagnosis and notification.** Automatically detect
+- [x] **L6.8 Stalled/unhealthy-agent diagnosis and notification.** Automatically detect
       stalled/unhealthy agents from read-only native/process/turn/event facts, without
       treating native process statistics as proof of model progress. On unhealthy or
       no-progress, run read-only diagnosis and deliver actual mail/notify through the
