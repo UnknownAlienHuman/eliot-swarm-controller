@@ -562,6 +562,86 @@ pub struct FormCancelledData {
     pub session_id: String,
 }
 
+// ---------------------------------------------------------------------------
+// Eliot context-hook RPC (vendor-native `context` hook producer)
+// ---------------------------------------------------------------------------
+
+/// `eliot-context` version 1 `bind` input: `{sessionID}`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EliotContextBindInput {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+}
+
+/// `bind` output: `{version, boundSessionID}`. Rust requires `version == 1`
+/// and an exact `boundSessionID` match before advertising `turn_safe_point`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EliotContextBindOutput {
+    pub version: i64,
+    #[serde(rename = "boundSessionID")]
+    pub bound_session_id: String,
+}
+
+/// `next` input: `{sessionID, waitMs}`. The producer clamps the wait and
+/// allows at most one waiter; a second concurrent poll answers `{}`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EliotContextNextInput {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    #[serde(rename = "waitMs")]
+    pub wait_ms: i64,
+}
+
+/// One pending context hook as offered to Rust. `messageID` is the raw
+/// native `Message.id` of the `context` event's last user message; Rust
+/// must prove it through actual inbox delivery, never copy it blindly.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EliotContextHook {
+    #[serde(rename = "hookID")]
+    pub hook_id: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    #[serde(rename = "messageID")]
+    pub message_id: String,
+    #[serde(rename = "expiresInMs")]
+    pub expires_in_ms: i64,
+}
+
+/// `next` output: `{}` or `{hook}`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct EliotContextNextOutput {
+    #[serde(default)]
+    pub hook: Option<EliotContextHook>,
+}
+
+/// `resolve` input: exact hook/session/message identity plus optional
+/// `{context}` or `{cancel}`. Exactly one call per hook, never retried.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EliotContextResolveInput {
+    #[serde(rename = "hookID")]
+    pub hook_id: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    #[serde(rename = "messageID")]
+    pub message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel: Option<bool>,
+}
+
+/// `resolve` output: `{status}`. Only `applied`/`empty` confirm a native
+/// effect; every other status leaves the vendor hook unapplied.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct EliotContextResolveOutput {
+    pub status: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

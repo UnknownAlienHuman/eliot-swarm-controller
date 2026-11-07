@@ -1902,13 +1902,15 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                                     Err(Error::new("invalid", "hook.event params are malformed"))
                                 }
                                 Ok(event)
-                                    if event.hook != "before_tool"
-                                        || event.turn_id.trim().is_empty()
+                                    if !matches!(
+                                        event.hook.as_str(),
+                                        "before_tool" | "before_model"
+                                    ) || event.turn_id.trim().is_empty()
                                         || event.consumer_id.trim().is_empty() =>
                                 {
                                     Err(Error::new(
                                         "invalid",
-                                        "hook.event requires before_tool with an exact turn and consumer",
+                                        "hook.event requires before_tool or before_model with an exact turn and consumer",
                                     ))
                                 }
                                 Ok(event) => match timeout_at(request_deadline, store.lock()).await
@@ -1918,6 +1920,7 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                                         generation,
                                         &event.turn_id,
                                         &event.consumer_id,
+                                        &event.hook,
                                         now_ms(),
                                     ) {
                                         Ok(change) => {

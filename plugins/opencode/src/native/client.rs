@@ -564,6 +564,83 @@ impl OpenCodeHttp {
         Err(readback_error("message list", &response))
     }
 
+    /// `POST /api/rpc/eliot-context/bind` over the existing authenticated
+    /// transport. Idempotent per session id; a foreign id echoes the bound
+    /// one so the caller detects the mismatch by comparison. Classified
+    /// like a write so an uncertain bind never advertises `turn_safe_point`.
+    pub async fn eliot_context_bind(
+        &self,
+        session_id: &str,
+        deadline: Instant,
+    ) -> std::result::Result<crate::native::types::EliotContextBindOutput, HttpOutcome> {
+        let input = crate::native::types::EliotContextBindInput {
+            session_id: session_id.to_owned(),
+        };
+        self.eliot_context_rpc("bind", input, deadline).await
+    }
+
+    /// `POST /api/rpc/eliot-context/next`: long-poll for the next bound-
+    /// session context hook. A poll carries no native effect, so a lost
+    /// reply is retried by the caller's loop; it never latches unknown.
+    pub async fn eliot_context_next(
+        &self,
+        session_id: &str,
+        wait_ms: i64,
+        deadline: Instant,
+    ) -> std::result::Result<crate::native::types::EliotContextNextOutput, HttpOutcome> {
+        let input = crate::native::types::EliotContextNextInput {
+            session_id: session_id.to_owned(),
+            wait_ms,
+        };
+        self.eliot_context_rpc("next", input, deadline).await
+    }
+
+    /// `POST /api/rpc/eliot-context/resolve`: settle exactly one pending
+    /// hook. The caller must invoke this at most once per hook and never
+    /// retry an uncertain outcome (a repeat risks a second effect).
+    pub async fn eliot_context_resolve(
+        &self,
+        input: crate::native::types::EliotContextResolveInput,
+        deadline: Instant,
+    ) -> std::result::Result<crate::native::types::EliotContextResolveOutput, HttpOutcome> {
+        self.eliot_context_rpc("resolve", input, deadline).await
+    }
+
+    /// One `POST /api/rpc/eliot-context/{method}` round trip. Success is
+    /// `200 {output}`; 400/401/404 prove non-admission (`Rejected`), any
+    /// other outcome after dispatch is ambiguous (`Unknown`). The client
+    /// never retries: a repeat would be a second native write.
+    async fn eliot_context_rpc<T, U>(
+        &self,
+        method: &str,
+        input: T,
+        deadline: Instant,
+    ) -> std::result::Result<U, HttpOutcome>
+    where
+        T: serde::Serialize,
+        U: for<'de> serde::Deserialize<'de>,
+    {
+        let path = format!("/api/rpc/eliot-context/{method}");
+        let body = serde_json::json!({"input": input});
+        let response = self
+            .send(reqwest::Method::POST, &path, &[], Some(body), deadline)
+            .await?;
+        if response.status == 200 {
+            let envelope: serde_json::Value = serde_json::from_slice(&response.body)
+                .map_err(|_| HttpOutcome::unknown("OpenCode context RPC returned no output"))?;
+            let output = envelope
+                .get("output")
+                .cloned()
+                .ok_or_else(|| HttpOutcome::unknown("OpenCode context RPC returned no output"))?;
+            return serde_json::from_value::<U>(output)
+                .map_err(|_| HttpOutcome::unknown("OpenCode context RPC output was invalid"));
+        }
+        Err(map_write_error(
+            &format!("eliot-context/{method}"),
+            &response,
+        ))
+    }
+
     /// `GET /api/event`: subscribe to the broadcast event stream. Returns
     /// once the response headers arrive (the subscription is live before
     /// any session create/input that follows); frames flow to the channel.

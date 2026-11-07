@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod context_hooks;
 mod events;
 mod host;
 mod native;

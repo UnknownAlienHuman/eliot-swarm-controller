@@ -38,6 +38,18 @@ use crate::native::{AuthSetup, AuthTransfer, client::OpenCodeHttp, transfer_sele
 
 const READINESS_POLL: Duration = Duration::from_millis(250);
 
+/// Embedded vendor-native context-hook producer shim. Written verbatim into
+/// the isolated per-Agent config root's auto-discovered `opencode/plugins/`
+/// directory before `serve` starts, so the existing per-Agent server loads
+/// it with no `plugins` config entry (the loader skips configured
+/// single-file paths). The shim opens no listener and calls no Eliot
+/// endpoint: Rust reaches it over the existing authenticated HTTP transport
+/// as RPC `eliot-context`. Original code against the installed OpenCode
+/// 2.0.32 `@opencode/plugin` Promise API; no vendor source copied and no
+/// dependency installed.
+const ELIOT_CONTEXT_PLUGIN: &str = include_str!("eliot-context.ts");
+const ELIOT_CONTEXT_PLUGIN_FILE: &str = "eliot-context.ts";
+
 /// The generated per-Agent config: the frozen profile model plus an
 /// explicitly empty MCP set. No permissions, providers, plugins or
 /// credentials: the Agent runs the server defaults, and the selected native
@@ -107,6 +119,28 @@ impl OwnedServer {
             Error::new(
                 "native_spawn",
                 format!("OpenCode per-Agent config could not be written: {error}"),
+            )
+        })?;
+        // Vendor-native context-hook producer: one auto-discovered plugin
+        // file under the isolated root, written before `serve` starts. This
+        // adds nothing to `opencode.jsonc` (model/mcp/auth behavior
+        // unchanged) and touches no global user file: only this directory
+        // gains one file, rewritten verbatim on every start.
+        let plugins_dir = config_dir.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).map_err(|error| {
+            Error::new(
+                "native_spawn",
+                format!("OpenCode per-Agent plugins directory could not be created: {error}"),
+            )
+        })?;
+        std::fs::write(
+            plugins_dir.join(ELIOT_CONTEXT_PLUGIN_FILE),
+            ELIOT_CONTEXT_PLUGIN,
+        )
+        .map_err(|error| {
+            Error::new(
+                "native_spawn",
+                format!("OpenCode per-Agent plugin could not be written: {error}"),
             )
         })?;
         // The isolated store sees no canonical credential, so the selected

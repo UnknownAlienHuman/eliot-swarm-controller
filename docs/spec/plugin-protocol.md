@@ -223,7 +223,8 @@ channel. The connection credential binds the Agent generation; the plugin cannot
 or override that identity in the callback. The shared wire DTOs are named `HookEvent`
 and `HookResponse`; their field catalog belongs in the [protocol DTO module](../../crates/eliot-plugin/src/protocol.rs),
 while this spec owns their semantics. A callback reports
-`before_tool`, its exact `turn_id`, and an opaque `consumer_id`; the response carries
+`before_tool` (Claude Code `PreToolUse`) or `before_model` (OpenCode `context` hook),
+its exact `turn_id`, and an opaque `consumer_id`; the response carries
 `context[]` as shared Core `ContextItem` values.
 
 For `turn_safe_point`, the host rechecks the authenticated generation, captured turn and
@@ -236,12 +237,14 @@ claims are committed, it returns no context; any late context is discarded and n
 applied on a subsequent turn. Permission decisions stay on the existing exact approval
 callbacks.
 
-After the native `control_response` write is confirmed, the plugin publishes a
-`hook.before_tool` fact on the existing event path with the exact turn and consumer plus
+After the native write is confirmed, the plugin publishes a `hook.before_tool` /
+`hook.before_model` fact on the existing event path with the exact turn and consumer plus
 one shared `ContextOutcome` for that callback. Store settles its fixed FIFO claims in the
 same source-batch transaction. A failed or uncertain native write emits no applied fact;
-the claim stays frozen and is never requeued. This adds no second source/lifecycle stream,
-client API method, hook-decision RPC, or policy engine.
+the claim stays frozen and is never requeued. A confirmed receipt may reconcile a claimed
+`unknown` in the same generation against its captured turn record even when its native
+terminal won the race; selection always requires the exact active turn. This adds no second
+source/lifecycle stream, client API method, hook-decision RPC, or policy engine.
 
 ## Durable plugin requests
 
@@ -536,6 +539,13 @@ Timeout/cancellation supplies no context, does not override a native result, and
 late context instead of queuing it for a later turn. This context path does not make
 permission decisions; existing approval callbacks retain that responsibility. Hooks do
 not duplicate lifecycle already supplied by the stream.
+
+The OpenCode `context` hook (`before_model`) is the second consumer. The Rust host binds
+the native session over RPC `eliot-context` version 1 (`bind`/`next`/`resolve` on the
+existing authenticated HTTP transport) before readiness and advertises `turn_safe_point`
+only after a verified v1 binding. An owned longpoll claims through the same authenticated
+`hook.event` channel before the vendor `resolve` mutates the native system draft; only a
+confirmed `applied`/`empty` may emit a receipt.
 
 
 Native adapters echo turns and emit request callbacks over this same transport
