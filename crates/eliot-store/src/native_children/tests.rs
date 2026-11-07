@@ -838,7 +838,7 @@ fn old_producer_cleanup_does_not_touch_new_generation_children_or_active_binding
         [root_num],
     )
     .unwrap();
-    install_initial_source_plan(&tx, root_num, 2, "codex", NOW + 3).unwrap();
+    install_initial_source_plan(&tx, root_num, 2, NOW + 3).unwrap();
     tx.commit().unwrap();
     let mut registration = request(&root, "root-resumed", "new");
     registration.parent_generation = 2;

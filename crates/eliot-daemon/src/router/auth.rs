@@ -245,7 +245,7 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
         }
         if !matches!(
             request.verb.as_str(),
-            "stop" | "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
+            "stop" | "send" | "steer" | "inject" | "interrupt" | "approve" | "deny" | "answer"
         ) || !registration
             .actions
             .iter()

@@ -675,6 +675,20 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 28 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX commands_context_pending ON commands(
+                     target, generation, json_extract(args, '$.point'), turn_id, created_at
+                 ) WHERE verb = 'inject' AND state IN ('accepted', 'queued');
+                 INSERT INTO schema_migrations(version) VALUES (28);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }

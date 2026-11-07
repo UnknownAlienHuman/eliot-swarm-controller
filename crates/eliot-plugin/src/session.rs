@@ -15,13 +15,15 @@
 use std::{collections::HashMap, ffi::OsString, path::Path, time::Duration};
 
 use eliot_core::{
-    Error, NativeEvent, ProcessRecord, ProcessState, Result, SecretPolicy, SourceBatch, SourceGap,
+    ContextItem, ContextOutcome, Error, InjectPoint, NativeEvent, ProcessRecord, ProcessState,
+    Result, SecretPolicy, SourceBatch, SourceGap,
 };
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
 use crate::{
-    AgentSnapshotParams, CommitSink, MAX_EVENT_BYTES, PeerClient, protocol::MAX_COMMAND_ID_BYTES,
+    AgentSnapshotParams, CommitSink, MAX_EVENT_BYTES, MAX_TEXT_BYTES, PeerClient,
+    protocol::MAX_COMMAND_ID_BYTES,
 };
 
 /// Deadline for one stream commit or gap round trip.
@@ -150,6 +152,73 @@ pub fn decode<T: serde::de::DeserializeOwned>(raw: &Value, message: &str) -> Res
 /// side, so the host may report `rejected` (never sent, safe to supersede).
 pub fn native_no_write(code: &str) -> bool {
     matches!(code, "native_not_dispatched" | "busy" | "frame_too_large")
+}
+
+/// Prepend FIFO-claimed context to the original send text for one native input
+/// operation. Items stay in claim order, joined by blank lines, then a blank
+/// line, then the exact original text; item texts are embedded verbatim and only
+/// separators are added. The original text and items are unmodified: retain the
+/// original for idempotency and digests, and send the returned string natively
+/// in the same operation (no second send). The combined text is checked against
+/// `MAX_TEXT_BYTES` here; the caller checks the encoded native frame against
+/// `MAX_FRAME_BYTES` before I/O. Pure: no replay on late or unknown outcomes.
+pub fn with_claimed_context(text: &str, context: &[ContextItem], harness: &str) -> Result<String> {
+    if context.is_empty() {
+        if text.len() > MAX_TEXT_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                format!("{harness} input exceeds 512 KiB"),
+            ));
+        }
+        return Ok(text.to_owned());
+    }
+    let mut combined = String::new();
+    for item in context {
+        if !combined.is_empty() {
+            combined.push_str("\n\n");
+        }
+        combined.push_str(&item.text);
+    }
+    combined.push_str("\n\n");
+    combined.push_str(text);
+    if combined.len() > MAX_TEXT_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            format!("{harness} input with claimed context exceeds 512 KiB"),
+        ));
+    }
+    Ok(combined)
+}
+
+/// Build one [`ContextOutcome`] per FIFO-claimed `next_input` item, in claim
+/// order, for the exact send (`consumer_id`) that applied them inside its
+/// native input. Matches the Store `turn.started.data.context_outcomes`
+/// receipt shape: Store zips these positionally against its FIFO claims and
+/// checks the exact count and consumer binding. Empty in, empty out: the
+/// caller omits the key when nothing was claimed. Pure: no I/O, no replay.
+pub fn next_input_outcomes(items: &[ContextItem], consumer_id: &str) -> Vec<ContextOutcome> {
+    items
+        .iter()
+        .map(|_| ContextOutcome {
+            mechanism: "send".to_owned(),
+            application_point: InjectPoint::NextInput,
+            consumer_id: consumer_id.to_owned(),
+        })
+        .collect()
+}
+
+/// Project normalized supported context points into a `session.ready`
+/// effective object. Admission reads `Agent.effective.context_points` as
+/// `Vec<InjectPoint>`; each adapter declares only the points it actually
+/// consumes. Non-objects pass through unchanged.
+pub fn with_context_points(mut effective: Value, points: &[InjectPoint]) -> Value {
+    if let Some(object) = effective.as_object_mut() {
+        object.insert(
+            "context_points".to_owned(),
+            serde_json::to_value(points).unwrap_or(Value::Null),
+        );
+    }
+    effective
 }
 
 /// `bad_state` for a request that arrived before `initialize`.

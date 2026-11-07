@@ -1,10 +1,13 @@
 use std::{collections::HashMap, sync::Arc};
 
-use eliot_core::{Error, Result, SecretPolicy, SourceHealthUpdate};
+use eliot_core::{ContextItem, Error, Result, SecretPolicy, SourceHealthUpdate};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     native_transport::StreamState,
-    session::{EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error, event_id},
+    session::{
+        EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error, event_id,
+        next_input_outcomes,
+    },
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -33,6 +36,7 @@ pub(crate) struct TurnFacts {
 struct Pending {
     command: String,
     turn: String,
+    context: Vec<ContextItem>,
     associated: bool,
     reply: Option<oneshot::Sender<Result<()>>>,
 }
@@ -125,11 +129,29 @@ impl State {
         self.pending = Some(Pending {
             command,
             turn,
+            context: Vec::new(),
             associated: false,
             reply: Some(reply),
         });
         self.tool_events.clear();
         Ok(result)
+    }
+
+    /// Carry the send's FIFO-claimed context into the pending input. Called
+    /// under the same lock as [`State::prepare`], before the native write;
+    /// refused once the input already associated, so outcomes are never
+    /// attached late or faked.
+    pub fn attach_context(&mut self, command: &str, context: Vec<ContextItem>) -> Result<()> {
+        match self.pending.as_mut() {
+            Some(pending) if pending.command == command && !pending.associated => {
+                pending.context = context;
+                Ok(())
+            }
+            _ => Err(Error::new(
+                "unknown",
+                "Antigravity input association is unresolved",
+            )),
+        }
     }
 
     pub fn withdraw_unwritten(&mut self, command: &str) -> Result<()> {
@@ -170,7 +192,11 @@ impl State {
             return Ok(());
         }
         let turn = pending.turn.clone();
-        let data = json!({"command_id": pending.command, "turn_id": turn});
+        let mut data = json!({"command_id": pending.command, "turn_id": turn});
+        if !pending.context.is_empty() {
+            data["context_outcomes"] =
+                json!(next_input_outcomes(&pending.context, &pending.command));
+        }
         let result = self.commit("turn.started", &turn, "started", data).await;
         if let Some(pending) = self.pending.as_mut() {
             pending.associated = result.is_ok();

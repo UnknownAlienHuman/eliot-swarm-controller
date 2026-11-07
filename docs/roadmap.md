@@ -192,8 +192,9 @@ Read [coordination](spec/coordination.md). Use two Codex Agents initially.
 
 - [x] **L5.1 Mail/variables.** Addressed queued mail, separate delivery and acknowledgement,
       bounded coalesced generic notices, shared variables and CAS. No automatic status chatter.
-      `send`/`steer`/`inject` full-text presentation is `unsupported`; unread bounds come
-      from the config-file `[mail]` table and acknowledged mail older than
+      `mail.send` presentation modes `send`/`steer`/`inject` are `unsupported`; that is a
+      mail-path limit, not the uniform R5 system-control contract. Unread bounds come from
+      the config-file `[mail]` table and acknowledged mail older than
       `daemon.retention.mail_days` is pruned in bounded retention batches (unread mail is
       never pruned; a removed message id older than the retry window reads
       `history_gap`).
@@ -215,13 +216,15 @@ scenarios. Muse, Antigravity, ACP and other adapters are opt-in tasks, not block
 Codex or for unrelated adapters.
 
 - [x] **L6.1 Claude Code.** Native SDK/stream, exact callbacks and reported application
-      points. Delayed hook context is inject, not exact-turn steer.
+      points. The separate shared context-injection and hook-event integration remains
+      tracked in L6.6.
 - [x] **L6.2 OpenCode.** Select one installed API. Shared mode only if per-session
       attribution/environment/stop are supported; otherwise per-Agent server.
       Steer, inject, detach and fork/background stay unconnected.
 - [x] **L6.3 Cross-harness use.** Reuse L4/L5 rules/mail against the added plugins.
-      Add hooks, shared mode, native children or MCP only when a concrete caller needs
-      the capability. Missing semantics reject; no compatibility executor.
+      Keep each control at its actual native application point; remaining shared context
+      injection and hook-event integration is tracked in L6.6. Missing semantics reject;
+      no compatibility executor.
 - [x] **L6.4 Selected optional adapters.** Add only those explicitly selected for the
       release; record the selection here. Unselected adapters stay absent.
       Muse Code selected by the owner 2026-11-03; Antigravity selected 2026-11-04.
@@ -229,9 +232,20 @@ Codex or for unrelated adapters.
 - [x] **L6.5 MCP stdio for an owner-selected caller.** Add one local `swarm mcp`
       server through the existing authenticated API and its bounded query/history surface.
 
-**Feature-complete local scope:** core, Codex, monitoring/workspaces, automation,
-coordination and the selected adapters. Do not hold this milestone for an unused vendor
-or speculative remote/GUI/service feature.
+- [ ] **L6.6 R5 system context control.** Connect typed `inject` through the existing
+      command rows and router: FIFO `next_input` context is prepended inside the same
+      native SEND and applies only with its exact turn association; `turn_safe_point`
+      binds the captured turn and commits its context claim before the authenticated
+      plugin hook response. Normalize `hook.before_tool` through the existing event bus
+      and `on.event` rules. Preserve exact-turn steer/interrupt and existing approval
+      callbacks; adapters report the actual mechanism/application point or `unsupported`,
+      never substitute a weaker SEND. Claude Code 2.1.278
+      `PreToolUse.additionalContext` is the first native consumer (source schema
+      confirmed, runtime application pending). Do not mark complete until the connected
+      path has real installed-agent runtime qualification and is integrated at the root.
+
+The selected local scope remains in progress while L6.6 and the applicable L7
+qualification are incomplete; do not describe it as feature complete.
 
 ## L7 — Qualification, repair and release
 

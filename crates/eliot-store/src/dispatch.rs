@@ -6,6 +6,7 @@ impl Store {
         id: &str,
         now: i64,
         native_store: Option<(&Agent, &NativeStoreBinding)>,
+        context_items: Option<&mut Vec<core::ContextItem>>,
     ) -> Result<Change<Command>> {
         let tx = self
             .connection
@@ -248,7 +249,7 @@ impl Store {
                         "launch target changed before its generation token was committed",
                     ));
                 }
-                install_initial_source_plan(&tx, agent_num, 1, &agent.harness, now)?;
+                install_initial_source_plan(&tx, agent_num, 1, now)?;
                 update_command_state(&tx, id, CommandState::Dispatched, None, Some(1), now)?;
                 events.push(insert_daemon_event_for_command(
                     &tx,
@@ -291,8 +292,8 @@ impl Store {
                         "resume no longer targets the captured terminal Agent generation",
                     ));
                 }
-                // Harness support was proven at admission and the harness is
-                // frozen; only generation, state and pending work are rechecked.
+                // Control-verb support is owned by the PluginHost manifest
+                // check; only generation, state and pending work are rechecked.
                 if has_pending_resume_tx(&tx, agent_num, old_generation, id)? {
                     return Err(Error::new(
                         "bad_state",
@@ -381,7 +382,7 @@ impl Store {
                         "resume target changed before its new generation was committed",
                     ));
                 }
-                install_initial_source_plan(&tx, agent_num, next_generation, &agent.harness, now)?;
+                install_initial_source_plan(&tx, agent_num, next_generation, now)?;
                 update_command_state(
                     &tx,
                     id,
@@ -530,6 +531,19 @@ impl Store {
                         events,
                     });
                 }
+                let claimed_items = if context_items.is_some() {
+                    context::claim_next_input_tx(
+                        &tx,
+                        agent_num,
+                        &agent,
+                        &command.command,
+                        now,
+                        &mut events,
+                    )?
+                } else {
+                    Vec::new()
+                };
+                let send_args = context::send_args(&command.command.args, &claimed_items)?;
                 check_rpc_frame(
                     "agent.command",
                     &json!({
@@ -537,7 +551,7 @@ impl Store {
                         "generation": agent.generation,
                         "command_id": id,
                         "verb": "send",
-                        "args": command.command.args,
+                        "args": send_args,
                     }),
                 )?;
                 update_command_state(&tx, id, CommandState::Dispatched, None, None, now)?;
@@ -550,6 +564,9 @@ impl Store {
                     id,
                     json!({"command_id": id, "verb": "send"}),
                 )?);
+                if let Some(output) = context_items {
+                    *output = claimed_items;
+                }
             }
             "stop" => {
                 if command_generation != agent.generation {
@@ -603,8 +620,8 @@ impl Store {
                         "control command targets a stale Agent generation",
                     ));
                 }
-                // Harness/verb support was proven at admission and both are
-                // frozen; only generation, state, turn and request are rechecked.
+                // Control-verb support is owned by the PluginHost manifest
+                // check; only generation, state, turn and request are rechecked.
                 if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
                     return Err(Error::new(
                         "bad_state",

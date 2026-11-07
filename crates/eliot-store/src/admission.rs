@@ -95,6 +95,12 @@ pub(super) fn admit_send_member(
     }
     let text = required_string(&request.args, "text")?;
     check_input(&text)?;
+    if request.args.get("context_items").is_some() {
+        return Err(Error::new(
+            "invalid",
+            "send context_items are reserved for Store-claimed system context",
+        ));
+    }
     check_rpc_frame(
         "agent.command",
         &json!({
@@ -415,6 +421,16 @@ pub(super) fn submit_tx(
                 tx,
                 &CommandInsert::targetless_admitted(principal, &request, &payload_digest, now),
                 json!({"command_id": request.id, "verb": request.verb}),
+            )?);
+            None
+        }
+        "inject" => {
+            events.push(context::admit_tx(
+                tx,
+                principal,
+                &request,
+                &payload_digest,
+                now,
             )?);
             None
         }
@@ -818,15 +834,9 @@ pub(super) fn submit_tx(
             let agent_num = parse_agent_id(target)?;
             let agent = load_agent_by_num(tx, agent_num)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
-            if !supports_control_verb(&agent.harness, &request.verb) {
-                return Err(Error::new(
-                    "unsupported",
-                    format!(
-                        "{} is not supported by the {} harness",
-                        request.verb, agent.harness
-                    ),
-                ));
-            }
+            // Control-verb support is owned by the PluginHost manifest check;
+            // Store admits every known control verb and retains the live
+            // generation, state, turn, and request checks below.
             if let Some(expected) = request.expected_generation
                 && expected != agent.generation
             {

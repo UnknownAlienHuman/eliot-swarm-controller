@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) struct PendingCommandEvent {
     pub(super) command_id: String,
+    pub(super) state: CommandState,
     pub(super) data: Value,
 }
 
@@ -35,13 +36,22 @@ pub(super) fn persist_effects(
     };
     let mut command_events = Vec::new();
     let mut provider_events = Vec::new();
+    if native_event.kind == "hook.before_tool" {
+        command_events.extend(context::settle_turn_safe_point_claims_tx(
+            tx,
+            agent_num,
+            generation,
+            native_event,
+            now,
+        )?);
+    }
     for effect in effects {
         match effect {
             Effect::CommandTurnAssociated {
                 command_id,
                 turn_id,
             } => {
-                command_events.push(persist_turn_associated(scope, command_id, turn_id)?);
+                command_events.extend(persist_turn_associated(scope, command_id, turn_id)?);
             }
             Effect::RequestPending {
                 request_id,
@@ -81,7 +91,7 @@ pub(super) fn persist_effects(
                 usage,
                 completed_at,
             } => {
-                persist_turn_terminal(
+                command_events.extend(persist_turn_terminal(
                     scope,
                     command_id.as_deref(),
                     turn_id,
@@ -90,7 +100,7 @@ pub(super) fn persist_effects(
                     final_text.as_deref(),
                     usage.as_ref(),
                     *completed_at,
-                )?;
+                )?);
                 if command_id.is_some() {
                     provider_events.extend(provider_holds::terminal_tx(
                         scope.tx,
@@ -110,12 +120,13 @@ fn persist_turn_associated(
     scope: EffectScope<'_, '_>,
     command_id: &str,
     turn_id: &str,
-) -> Result<PendingCommandEvent> {
+) -> Result<Vec<PendingCommandEvent>> {
     let EffectScope {
         tx,
         agent_num,
         generation,
         now,
+        native_event,
         ..
     } = scope;
     let command = load_command_record(tx, command_id)?.ok_or_else(|| {
@@ -173,12 +184,23 @@ fn persist_turn_associated(
          WHERE recipient = ?2 AND open_notice_command = ?3",
         params![now, agent_num, command_id],
     ));
-    Ok(PendingCommandEvent {
+    let mut command_events = vec![PendingCommandEvent {
         command_id: command_id.to_owned(),
+        state: CommandState::Applied,
         data: json!({
             "command_id": command_id, "state": "applied", "outcome": outcome,
         }),
-    })
+    }];
+    command_events.extend(context::apply_next_input_claims_tx(
+        tx,
+        agent_num,
+        generation,
+        command_id,
+        turn_id,
+        native_event,
+        now,
+    )?);
+    Ok(command_events)
 }
 
 fn persist_request_effect(
@@ -514,11 +536,12 @@ fn persist_turn_terminal(
     final_text: Option<&str>,
     usage: Option<&TurnUsage>,
     completed_at: i64,
-) -> Result<()> {
+) -> Result<Vec<PendingCommandEvent>> {
     let EffectScope {
         tx,
         agent_num,
         generation,
+        now,
         next_agent,
         ..
     } = scope;
@@ -586,7 +609,7 @@ fn persist_turn_terminal(
             "terminal turn retains pending requests in the Agent projection",
         ));
     }
-    Ok(())
+    context::cancel_turn_safe_point_tx(tx, agent_num, generation, turn_id, now)
 }
 
 pub(super) fn verified_native_event_cause_tx(

@@ -1,14 +1,16 @@
 use crate::native_child::{
     ChildBinding, binding_from_ack, build_registration, is_admission_rejection, register_child,
 };
-use eliot_core::{ChildRegistration, Error, ProviderRestriction, Result, SecretPolicy, SourceGap};
+use eliot_core::{
+    ChildRegistration, ContextItem, Error, ProviderRestriction, Result, SecretPolicy, SourceGap,
+};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     protocol::MAX_COMMAND_ID_BYTES,
     session::{
         EVENT_DEADLINE, StreamSource, attach_final_text as shared_attach_final_text,
         attach_native_error as shared_attach_native_error, event_id as shared_event_id,
-        native_no_write, rejected_control, unknown_control,
+        native_no_write, next_input_outcomes, rejected_control, unknown_control,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -93,6 +95,7 @@ enum Control {
     AssociateTurn {
         command_id: String,
         turn_id: String,
+        context: Vec<ContextItem>,
         reply: oneshot::Sender<Result<()>>,
     },
     BeginStop {
@@ -496,10 +499,16 @@ impl EventHandle {
         .await
     }
 
-    pub async fn associate_turn(&self, command_id: String, turn_id: String) -> Result<()> {
+    pub async fn associate_turn(
+        &self,
+        command_id: String,
+        turn_id: String,
+        context: Vec<ContextItem>,
+    ) -> Result<()> {
         self.send(|reply| Control::AssociateTurn {
             command_id,
             turn_id,
+            context,
             reply,
         })
         .await
@@ -626,9 +635,10 @@ impl EventProcessor {
             Control::AssociateTurn {
                 command_id,
                 turn_id,
+                context,
                 reply,
             } => {
-                let result = self.associate_turn(command_id, turn_id).await;
+                let result = self.associate_turn(command_id, turn_id, context).await;
                 let _ = reply.send(result);
                 true
             }
@@ -1062,7 +1072,12 @@ impl EventProcessor {
         Ok(())
     }
 
-    async fn associate_turn(&mut self, command_id: String, turn_id: String) -> Result<()> {
+    async fn associate_turn(
+        &mut self,
+        command_id: String,
+        turn_id: String,
+        context: Vec<ContextItem>,
+    ) -> Result<()> {
         if !self.status.ready
             || self.status.thread_id.is_none()
             || command_id.trim().is_empty()
@@ -1090,12 +1105,11 @@ impl EventProcessor {
         self.final_text = None;
         let thread_id = self.status.thread_id.as_deref().unwrap_or_default();
         let native_id = event_id(thread_id, &turn_id, &turn_id, "turn.started")?;
-        self.commit_event(
-            "turn.started",
-            native_id,
-            json!({"command_id": command_id, "turn_id": turn_id}),
-        )
-        .await?;
+        let mut data = json!({"command_id": command_id, "turn_id": turn_id});
+        if !context.is_empty() {
+            data["context_outcomes"] = json!(next_input_outcomes(&context, &command_id));
+        }
+        self.commit_event("turn.started", native_id, data).await?;
         self.flush_buffer().await
     }
 

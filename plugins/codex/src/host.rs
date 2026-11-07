@@ -16,7 +16,7 @@ use crate::{
     observe::ObserverSession,
     route::CodexRoute,
 };
-use eliot_core::{Error, NativeStoreBinding, Result, SecretPolicy};
+use eliot_core::{Error, InjectPoint, NativeStoreBinding, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, DiscoverParams,
     InitializeParams, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObserverAttachParams, ObserverDetachParams,
@@ -27,6 +27,7 @@ use eliot_plugin::{
         optional_profile_text, parse_resume_subject, paths_equal, register_native_process,
         rejected_control, target_environment as shared_target_environment, unknown_control,
         unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
+        with_claimed_context, with_context_points,
     },
 };
 use serde_json::{Value, json};
@@ -938,6 +939,7 @@ impl CodexPlugin {
             "effort": readback.reasoning_effort.clone(),
             "effort_verified": effort_verified,
         });
+        let effective = with_context_points(effective, &[InjectPoint::NextInput]);
         let settings_match = readback.model == requested_model
             && readback.model_provider == route.provider()
             && paths_equal(Path::new(&readback.cwd), &workspace)
@@ -1306,6 +1308,7 @@ impl CodexPlugin {
         if event_status.active_turn_id.is_some() {
             return Err(Error::new("busy", "Codex already has an active turn"));
         }
+        let combined = with_claimed_context(text, &params.context, "Codex")?;
         let command_id = params.command_id.clone();
         session
             .command_inputs
@@ -1315,9 +1318,7 @@ impl CodexPlugin {
                 .thread_id
                 .clone()
                 .ok_or_else(|| Error::new("unknown", "Codex thread identity is unresolved"))?,
-            input: vec![NativeUserInput::Text(NativeTextUserInput::text(
-                text.to_owned(),
-            ))],
+            input: vec![NativeUserInput::Text(NativeTextUserInput::text(combined))],
             cwd: None,
             model: Some(session.requested_model.clone()),
             // Omitted effort omits the wire field (schema: effort optional,
@@ -1399,7 +1400,7 @@ impl CodexPlugin {
             .insert(command_id.clone(), turn_id.clone());
         if session
             .events
-            .associate_turn(command_id.clone(), turn_id.clone())
+            .associate_turn(command_id.clone(), turn_id.clone(), params.context.clone())
             .await
             .is_err()
         {

@@ -1,7 +1,7 @@
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use eliot_core::{
-    Command as CoreCommand, CommandState, Error as CoreError, SubmitCommand, Turn as CoreTurn,
-    TurnState,
+    Command as CoreCommand, CommandState, Error as CoreError, InjectArgs, InjectPoint,
+    SubmitCommand, Turn as CoreTurn, TurnState,
     api::{
         AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
         AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
@@ -206,6 +206,21 @@ enum CliCommand {
         generation: GenerationArgs,
         #[arg(long, value_name = "TURN")]
         turn: Option<String>,
+    },
+    /// Queue system context for the next input or the exact active turn's safe point.
+    Inject {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(value_name = "TEXT", allow_hyphen_values = true)]
+        text: String,
+        #[arg(long, value_parser = ["next_input", "turn_safe_point"], default_value = "next_input")]
+        point: String,
+        #[command(flatten)]
+        generation: GenerationArgs,
+        #[arg(long, value_name = "TURN")]
+        turn: Option<String>,
+        #[arg(long, value_name = "MS")]
+        expires_at_ms: Option<i64>,
     },
     /// Interrupt the exact active turn. `abort` is an alias.
     #[command(alias = "abort")]
@@ -1469,6 +1484,36 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
         } => {
             validate_text(Some(&text))?;
             let mut params = submit_request(id, Some(agent), "steer", json!({ "text": text }))?;
+            params.expected_generation = generation;
+            params.expected_turn_id = turn;
+            submit_and_print(&data_dir, &params, json_output).await
+        }
+        CliCommand::Inject {
+            agent,
+            text,
+            point,
+            generation: GenerationArgs { generation },
+            turn,
+            expires_at_ms,
+        } => {
+            validate_text(Some(&text))?;
+            let point = match point.as_str() {
+                "next_input" => InjectPoint::NextInput,
+                "turn_safe_point" => InjectPoint::TurnSafePoint,
+                _ => {
+                    return Err(Failure::new(
+                        2,
+                        "inject point must be next_input or turn_safe_point",
+                    ));
+                }
+            };
+            let args = serde_json::to_value(&InjectArgs {
+                text,
+                point,
+                expires_at_ms,
+            })
+            .map_err(|_| Failure::new(2, "inject args could not be encoded"))?;
+            let mut params = submit_request(id, Some(agent), "inject", args)?;
             params.expected_generation = generation;
             params.expected_turn_id = turn;
             submit_and_print(&data_dir, &params, json_output).await

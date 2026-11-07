@@ -26,8 +26,8 @@ use eliot_plugin::{
 };
 
 use crate::native::types::{
-    ControlResponse, OutboundControlRequest, OutboundControlResponse, OutboundControlResponseBody,
-    OutboundUserInput, PermissionResult,
+    ControlResponse, HookCallbackResponse, OutboundControlRequest, OutboundControlResponse,
+    OutboundControlResponseBody, OutboundUserInput, PermissionResult,
 };
 
 const LABELS: NativeLabels = NativeLabels {
@@ -147,6 +147,37 @@ impl ClaudeClient {
             return Err(Error::new(
                 "invalid",
                 "Claude permission reply requires the exact native request id",
+            ));
+        }
+        let encoded = encode_frame(
+            LABELS.server,
+            &OutboundControlResponse {
+                kind: "control_response",
+                response: OutboundControlResponseBody {
+                    subtype: "success",
+                    request_id: request_id.to_owned(),
+                    response: result,
+                },
+            },
+        )?;
+        self.write_encoded(encoded, deadline).await
+    }
+
+    /// Answer one installed `hook_callback` request. Empty output is the
+    /// native pass/no-override result; a context override is supplied only
+    /// after the event task rechecks its exact callback and turn binding.
+    /// Like permission replies, this stream has no native write ack: `Ok(())`
+    /// means the correlated response was accepted by the owned writer.
+    pub async fn respond_hook_callback(
+        &self,
+        request_id: &str,
+        result: HookCallbackResponse,
+        deadline: Instant,
+    ) -> Result<()> {
+        if request_id.trim().is_empty() {
+            return Err(Error::new(
+                "invalid",
+                "Claude hook reply requires the exact native request id",
             ));
         }
         let encoded = encode_frame(

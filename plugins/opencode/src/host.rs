@@ -5,7 +5,7 @@ use crate::{
         types::{InboxUser, ModelRef, SessionInfo},
     },
 };
-use eliot_core::{Error, Result};
+use eliot_core::{ContextItem, Error, InjectPoint, Result};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -13,7 +13,8 @@ use eliot_plugin::{
         ResumeSubject, TargetEnvironment, contextual_error, decode, known_command, native_no_write,
         not_initialized, optional_profile_text, parse_resume_subject, paths_equal,
         register_native_process, split_provider_model, target_environment, unknown_snapshot,
-        validate_binding, validate_identity, validate_source_plan,
+        validate_binding, validate_identity, validate_source_plan, with_claimed_context,
+        with_context_points,
     },
 };
 use serde_json::{Value, json};
@@ -685,6 +686,7 @@ impl OpenCodePlugin {
             "model_verified": model_verified,
             "cwd": created.location.as_ref().map(|location| location.directory.clone()),
         });
+        let effective = with_context_points(effective, &[InjectPoint::NextInput]);
         if !model_verified || !location_ok {
             let kill = session
                 .http
@@ -760,6 +762,7 @@ impl OpenCodePlugin {
                 }
                 Err(error) => return Err(self.fail_resume(&parsed, session, error).await),
             };
+        let effective = with_context_points(effective, &[InjectPoint::NextInput]);
         if let Err(error) = session
             .events
             .resume_ready(
@@ -1248,7 +1251,14 @@ impl OpenCodePlugin {
                 PromptAdmission::Rejected(value) => return Ok(value),
                 PromptAdmission::Admitted(inbox) => inbox,
             };
-        Self::associate_prompt_turn(session, command_id, &inbox.id, deadline).await
+        Self::associate_prompt_turn(
+            session,
+            command_id,
+            &inbox.id,
+            params.context.clone(),
+            deadline,
+        )
+        .await
     }
 
     /// Send phase 1, admission: validate the input, replay a retained
@@ -1313,13 +1323,14 @@ impl OpenCodePlugin {
         if event_status.active_turn_id.is_some() {
             return Err(Error::new("busy", "OpenCode already has an active turn"));
         }
+        let combined = with_claimed_context(text, &params.context, "OpenCode")?;
         let command_id = params.command_id.clone();
         session
             .command_inputs
             .insert(command_id.clone(), text.to_owned());
         Ok(SendAdmission::New {
             command_id,
-            text: text.to_owned(),
+            text: combined,
         })
     }
 
@@ -1368,11 +1379,12 @@ impl OpenCodePlugin {
         session: &mut AgentSession,
         command_id: String,
         inbox_id: &str,
+        context: Vec<ContextItem>,
         deadline: Instant,
     ) -> Result<Value> {
         if let Err(error) = session
             .events
-            .associate_inbox(command_id.clone(), inbox_id.to_owned())
+            .associate_inbox(command_id.clone(), inbox_id.to_owned(), context)
             .await
         {
             // The input was admitted, so a lost association is unknown even

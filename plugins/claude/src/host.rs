@@ -5,7 +5,7 @@ use crate::{
         types::{InitializeReadback, OutboundUserInput, OutboundUserMessage},
     },
 };
-use eliot_core::{Error, Result, SecretPolicy};
+use eliot_core::{ContextItem, Error, InjectPoint, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -14,7 +14,8 @@ use eliot_plugin::{
     session::{
         self, contextual_error, decode, native_no_write, not_initialized, optional_profile_text,
         parse_resume_subject, register_native_process, unknown_control, unknown_snapshot,
-        validate_binding, validate_identity, validate_source_plan,
+        validate_binding, validate_identity, validate_source_plan, with_claimed_context,
+        with_context_points,
     },
 };
 use serde_json::{Value, json};
@@ -300,7 +301,7 @@ impl ClaudePlugin {
             .transpose()?;
         validate_source_plan(
             "Claude",
-            &["session", "turn", "message", "request"],
+            &["session", "turn", "message", "request", "tool"],
             params.source_plan.as_ref(),
         )?;
         let frozen_profile = params.profile.as_ref().ok_or_else(|| {
@@ -502,11 +503,19 @@ impl ClaudePlugin {
         params: &AgentStartParams,
         plan: &StartPlan,
     ) -> Result<(AgentSession, Value)> {
+        let callback_id = session.events.hook_callback_id().to_owned();
         let readback = match session
             .native_client
             .control(
                 "initialize",
-                json!({"hooks": null}),
+                json!({
+                    "hooks": {
+                        "PreToolUse": [{
+                            "hookCallbackIds": [callback_id],
+                            "timeout": 30,
+                        }]
+                    }
+                }),
                 Instant::now() + RPC_TIMEOUT,
             )
             .await
@@ -572,6 +581,18 @@ impl ClaudePlugin {
                 }
             }
         }
+        if readback.hooks_applied != Some(true) {
+            return Err(self
+                .reject_start(
+                    session,
+                    params,
+                    Error::new(
+                        "profile_error",
+                        "Claude initialize did not apply the registered PreToolUse callback",
+                    ),
+                )
+                .await);
+        }
         // The CLI never reads the active model back in initialize (note 47):
         // membership in `models[]` above is the only proof, so
         // `effective.model` stays null at readiness and the requested id
@@ -579,15 +600,16 @@ impl ClaudePlugin {
         // reported on an actual native assistant record (message.completed).
         // Requested vs effective permission mode is reported, never forced:
         // launching with `manual` reads back `default` on the installed CLI.
-        Ok((
-            session,
+        let effective = with_context_points(
             json!({
                 "model": null,
                 "permission_mode": effective_mode,
                 "session_state": readback.session_state,
                 "pid": readback.pid,
             }),
-        ))
+            &[InjectPoint::NextInput, InjectPoint::TurnSafePoint],
+        );
+        Ok((session, effective))
     }
 
     /// Commit `session.ready` and retain the ready session. If readiness is
@@ -711,15 +733,17 @@ impl ClaudePlugin {
                 "Claude session or event source outcome is unresolved",
             ));
         }
+        let context = params.context.clone();
         let text = send_text(&params)?;
         if let Some(replay) = replay_send(session, &params.command_id, text) {
             return replay;
         }
         check_send_ready(session)?;
+        let native_content = with_claimed_context(text, &context, "Claude")?;
         session
             .command_inputs
             .insert(params.command_id.clone(), text.to_owned());
-        dispatch_send(session, &params.command_id, text).await
+        dispatch_send(session, &params.command_id, native_content, context).await
     }
 
     async fn interrupt_command(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -1203,11 +1227,16 @@ fn check_send_ready(session: &AgentSession) -> Result<()> {
 /// Mint the exact turn association before the write and register it with
 /// the event task first: an early lifecycle can never miss its waiter, and
 /// a lost association latches unknown without a rewrite.
-async fn dispatch_send(session: &mut AgentSession, command_id: &str, text: &str) -> Result<Value> {
+async fn dispatch_send(
+    session: &mut AgentSession,
+    command_id: &str,
+    content: String,
+    context: Vec<ContextItem>,
+) -> Result<Value> {
     let turn_id = new_uuid();
     let outcome = match session
         .events
-        .expect_turn(command_id.to_owned(), turn_id.clone())
+        .expect_turn(command_id.to_owned(), turn_id.clone(), context)
         .await
     {
         Ok(outcome) => outcome,
@@ -1231,7 +1260,7 @@ async fn dispatch_send(session: &mut AgentSession, command_id: &str, text: &str)
         parent_tool_use_id: None,
         message: OutboundUserMessage {
             role: "user",
-            content: text.to_owned(),
+            content,
         },
     };
     if let Err(error) = session
@@ -1441,6 +1470,7 @@ fn claude_manifest() -> PluginManifest {
         ("message".to_owned(), "stream".to_owned()),
         ("request".to_owned(), "stream".to_owned()),
         ("session".to_owned(), "stream".to_owned()),
+        ("tool".to_owned(), "stream".to_owned()),
         ("turn".to_owned(), "stream".to_owned()),
     ]);
     PluginManifest {

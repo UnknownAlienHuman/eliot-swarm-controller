@@ -125,7 +125,6 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | `events.read/subscribe` | persisted replay plus bounded live delivery |
 | `agent.discover` | owner-only native metadata discovery, without creating Agents |
 | `agent.history` | owner-only bounded history of an exact observed subject |
-| `hook.event` | later exact request/deadline decision |
 | `mail.send/inbox/read/ack`, `var.set/get` | addressed queued mail with separate acknowledgement, shared variables with CAS |
 | `who`, `claim.set/list/release` | current-worker file areas plus advisory claims with coalesced conflict notices |
 | `rule.*` except `rule.get/catch_up` | later automation; effects remain commands |
@@ -139,6 +138,9 @@ The method inventory includes later-layer methods. Later methods identified
 in the Purpose column or by the roadmap are target APIs only and are not registered
 by the current Router; calling one now returns `unsupported`. Their semantics below
 preserve the intended future contract, but do not imply current availability.
+Native hook callbacks are private plugin-protocol traffic over the authenticated
+instance channel, not a client API method; the plugin protocol defines their normalized
+event and context response.
 
 | Surface | Canonical DTO definitions |
 | --- | --- |
@@ -284,6 +286,19 @@ carries its replies in `args` as the shared
 [`AnswerArgs`](../../crates/eliot-core/src/requests.rs); Store admission parses that
 shape before persisting the command, so foreign answer shapes reject as `invalid` and
 raw callers cannot bypass answer syntax.
+
+For `verb:"inject"`, `args` is the canonical Core `InjectArgs` DTO
+([definition](../../crates/eliot-core/src/context.rs)); `point` is required and is either
+`next_input` or `turn_safe_point`, with optional absolute Unix-millisecond
+`expires_at_ms`. Store freezes the target generation and, for `turn_safe_point`, the exact
+active turn at admission. A supplied `expected_turn_id` must match that turn;
+`next_input` has no turn binding and applies to the next SEND in that generation. An
+adapter that cannot apply the requested point returns `unsupported`; it does not map
+inject to SEND. The command's acceptance/queue state means only that the context was
+admitted. `CommandSubmitResponse` retains its existing six fields; for this command its
+`outcome` is the narrow Core `ContextOutcome` identifying the mechanism, actual
+application point and opaque consumer ([definition](../../crates/eliot-core/src/context.rs)).
+It adds no separate receipt or response field.
 
 Resolve the target and validate principal/capability/state before persisting the command
 binding and events. Each verb checks `expected_generation` at its defined admission or
@@ -700,8 +715,10 @@ See [coordination](coordination.md#mailbox) for bounds and presentation policy.
 
 `mail.send` queues one message to 1–100 concrete Agents in a single bounded
 transaction, snapshotting each recipient's current generation; unknown ids
-never create Agents. Only `queue` mode is connected; `send`, `steer` and
-`inject` presentation modes return `unsupported`. A current Agent may queue
+never create Agents. Only `queue` mode is connected; `mail.send` presentation modes
+`send`, `steer` and `inject` return `unsupported`. This limitation is specific to mail
+presentation; the uniform system controls use `command.submit` and their native
+application semantics. A current Agent may queue
 addressed mail to any existing Agent, regardless of project label or worktree;
 mail is communication only and does not grant command control over the
 recipient. Its generation must still be current. A reply names the exact delivery being
@@ -841,7 +858,8 @@ swarm stats A [--generation N]
 swarm git-status A [--generation N]
 swarm edits A [--generation N] [--after PATH] [--limit N]
 swarm send A TEXT [--probe] [--wait] [--generation N]
-swarm steer|inject A TEXT [--generation N] [--turn ID]
+swarm steer A TEXT --turn ID [--generation N]
+swarm inject A TEXT --point next_input|turn_safe_point [--generation N] [--turn ID] [--expires-at-ms MS]
 swarm interrupt|abort A [--generation N] [--turn ID]
 swarm stop A [--force] [--tree | --generation N]
 swarm resume A [PROMPT] [--wait]

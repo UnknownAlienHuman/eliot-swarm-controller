@@ -720,10 +720,11 @@ impl Store {
         // Keep native batch ACKs scoped to native rows; the associated command
         // event follows those rows but commits in the same transaction.
         for command_event in command_events {
+            let event_kind = format!("command.{}", command_state_name(command_event.state));
             committed_events.push(insert_daemon_command_event(
                 &tx,
                 now,
-                "command.applied",
+                &event_kind,
                 Some(agent_num),
                 Some(batch.generation),
                 &command_event.command_id,

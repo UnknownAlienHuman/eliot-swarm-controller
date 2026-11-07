@@ -267,7 +267,7 @@ retry a lost acknowledgement and must report a gap/reconcile current state inste
 | attach / detach | exact subject control/observation transition, generation-fenced |
 | send | input-to-turn association; terminal result is separate |
 | steer / interrupt | exact captured active turn, no implicit fallback |
-| inject | context at the reported safe point or next-send prepend |
+| inject | context at its requested next-input or exact-turn safe point; report the actual application point |
 | stop | end the controlled generation/session; not merely stop watching it |
 | resume | explicit reopen of retained subject as new generation; no old input replay |
 | approve / deny / answer | exact pending request |
@@ -278,6 +278,35 @@ retry a lost acknowledgement and must report a gap/reconcile current state inste
 
 Text is at most 512 KiB and must also fit the encoded plugin frame. Unsupported later
 verbs are not advertised. No fake success or compatibility executor.
+
+### Context injection
+
+The canonical `InjectArgs`, `InjectPoint`, `ContextItem` and `ContextOutcome` DTOs are
+defined in [Core context types](../../crates/eliot-core/src/context.rs); this spec owns
+their command and effect semantics. `inject` uses the existing `SubmitCommand` with
+`args` decoded as `InjectArgs`. The point is `next_input` or `turn_safe_point`, and
+`expires_at_ms` is optional.
+
+Store binds each admitted context command to the target's current generation. A
+`turn_safe_point` command also captures the exact active turn at admission; it cannot
+float to another turn or fall back to a send. `next_input` has no turn binding and is
+eligible only for the next send in that same generation. Pending contexts are claimed
+FIFO from existing command rows; they do not add a table or journal. Admission or queue
+acceptance is not application.
+
+For `next_input`, the router claims eligible, unexpired items as part of dispatching the
+next ordinary SEND and the adapter prepends them inside that same native send. Context
+commands become applied only when that original send is associated with its exact native
+turn. For `turn_safe_point`, an authenticated native hook claims eligible items for the
+captured turn; application is reported only at the requested native point. The retained
+typed outcome identifies the mechanism, actual application point and opaque consumer;
+it is not a second receipt. A missing native mechanism returns `unsupported`, never a
+weaker SEND.
+
+Before dispatch, an expired item or one whose generation or captured turn is stale is
+cancelled. Once claimed/dispatched, an uncertain native effect is `unknown` and is never
+requeued. A late hook response is discarded rather than carried into a later callback or
+turn.
 
 ## Commands and narrow gates
 

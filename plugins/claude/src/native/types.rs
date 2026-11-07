@@ -24,17 +24,17 @@ pub(crate) struct OutboundControlRequest {
 /// (the `can_use_tool` permission reply). The CLI asks on stdout; Eliot
 /// answers on stdin with the documented SDK `PermissionResult`.
 #[derive(Serialize)]
-pub(crate) struct OutboundControlResponse {
+pub(crate) struct OutboundControlResponse<T> {
     #[serde(rename = "type")]
     pub kind: &'static str,
-    pub response: OutboundControlResponseBody,
+    pub response: OutboundControlResponseBody<T>,
 }
 
 #[derive(Serialize)]
-pub(crate) struct OutboundControlResponseBody {
+pub(crate) struct OutboundControlResponseBody<T> {
     pub subtype: &'static str,
     pub request_id: String,
-    pub response: PermissionResult,
+    pub response: T,
 }
 
 /// Documented SDK permission decision (camelCase wire names). Allow must
@@ -65,6 +65,55 @@ pub(crate) struct CanUseToolBody {
     pub tool_use_id: Option<String>,
     #[serde(default)]
     pub input: Option<Value>,
+}
+
+/// Installed 2.1.278 `hook_callback` body. The native input and ids stay
+/// private to this plugin; the event path uses only the bound Eliot turn and
+/// a separately minted opaque consumer id.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct HookCallbackBody {
+    #[serde(default)]
+    pub subtype: String,
+    #[serde(default)]
+    pub callback_id: String,
+    pub input: Value,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+}
+
+/// Native withdrawal of a pending `control_request`; there is no reply to it.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct ControlCancelRequest {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub request_id: String,
+}
+
+/// `hook_callback` success payload. Empty means pass with no override.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct HookCallbackResponse {
+    #[serde(rename = "hookSpecificOutput", skip_serializing_if = "Option::is_none")]
+    pub hook_specific_output: Option<PreToolUseHookOutput>,
+}
+
+impl HookCallbackResponse {
+    pub fn with_context(additional_context: String) -> Self {
+        Self {
+            hook_specific_output: Some(PreToolUseHookOutput {
+                hook_event_name: "PreToolUse",
+                additional_context,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PreToolUseHookOutput {
+    pub hook_event_name: &'static str,
+    pub additional_context: String,
 }
 
 /// Outbound stdin user-input record. `uuid` (Eliot-minted) is the exact turn
@@ -111,6 +160,8 @@ pub(crate) struct InitializeReadback {
     pub pid: Option<u32>,
     #[serde(default)]
     pub session_state: Option<String>,
+    #[serde(default)]
+    pub hooks_applied: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -137,6 +188,8 @@ pub(crate) struct AssistantContentBlock {
     pub kind: String,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 /// Terminal `result` record. Bound to the exact active turn (single flight);
@@ -220,6 +273,25 @@ pub(crate) fn assistant_text(record: &Value) -> String {
         }
     }
     out
+}
+
+/// Tool-use ids in one assistant record. The event processor binds these
+/// native invocation ids to the exact turn already associated by the stream.
+pub(crate) fn assistant_tool_use_ids(record: &Value) -> Vec<String> {
+    let Some(blocks) = record
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter_map(|block| serde_json::from_value::<AssistantContentBlock>(block.clone()).ok())
+        .filter(|block| block.kind == "tool_use")
+        .filter_map(|block| block.id)
+        .filter(|id| !id.trim().is_empty())
+        .collect()
 }
 
 #[cfg(test)]

@@ -15,8 +15,10 @@ The first L3 process caller adds private `process.put` for the Codex app-server 
 It registers a process with the host monitor, without adding a native stream family.
 
 Add discovery, control takeover, transcript handoff, shared services, children and hooks
-with their first roadmap caller. A missing feature returns `unsupported`; do not create
-empty handlers, tables or generic frameworks to anticipate it.
+with their roadmap caller. System-level context injection uses the existing command and
+authenticated plugin-channel paths described below. A missing native application point
+returns `unsupported`; do not create empty handlers, tables or generic frameworks to
+anticipate it.
 
 ## Process modes
 
@@ -132,6 +134,17 @@ frame bound before enqueueing. Retained command retry retains the original commi
 rather than allocating a fresh sequence; initial send linked to launch/resume follows
 ordinary send dispatch.
 
+For SEND, the same `agent.command` effect carries the FIFO `next_input` items claimed
+from existing command rows. The adapter prepends those items inside that native send;
+it does not issue a second send. It reports their application only with the original
+send's exact turn association using `turn.started.data.context_outcomes`, with one
+`ContextOutcome` per claimed item in FIFO order. Store checks the exact claim count and
+consumer binding, then applies them in the same transaction as that turn association.
+`turn_safe_point` items are delivered through the hook callback below for their captured
+turn. The shared `ContextItem` and `ContextOutcome` types are defined in
+[Core context types](../../crates/eliot-core/src/context.rs); their DTOs own the field
+catalog.
+
 `features.discover` defaults to false. A discovery instance initializes independently
 of an Agent and has no authority to call `events.put`, `process.put` or other durable
 Agent requests. Its result is `{harness,native_scope,subjects,next_cursor,coverage}`
@@ -196,6 +209,33 @@ For an input-created session, perform start+linked input once but report session
 input-to-turn association and terminal result independently. Ready alone never proves
 input delivery. Buffer early facts within a bound; overflow records a gap rather than
 inventing completion or issuing another start.
+
+## System context hooks
+
+`hook.event` is a plugin-initiated request on the existing authenticated plugin instance
+channel. The connection credential binds the Agent generation; the plugin cannot choose
+or override that identity in the callback. The shared wire DTOs are named `HookEvent`
+and `HookResponse`; their field catalog belongs in the [protocol DTO module](../../crates/eliot-plugin/src/protocol.rs),
+while this spec owns their semantics. A callback reports
+`before_tool`, its exact `turn_id`, and an opaque `consumer_id`; the response carries
+`context[]` as shared Core `ContextItem` values.
+
+For `turn_safe_point`, the host rechecks the authenticated generation, captured turn and
+expiry, then commits FIFO claims in existing command rows before returning the response.
+A committed claim is not yet an applied result: the existing command outcome records the
+actual mechanism/application point/consumer, and an uncertain response is `unknown` and
+never requeued. `next_input` items travel with the same ordinary `agent.command` SEND and
+are not delivered through a later hook. If the callback times out or is cancelled before
+claims are committed, it returns no context; any late context is discarded and never
+applied on a subsequent turn. Permission decisions stay on the existing exact approval
+callbacks.
+
+After the native `control_response` write is confirmed, the plugin publishes a
+`hook.before_tool` fact on the existing event path with the exact turn and consumer plus
+one shared `ContextOutcome` for that callback. Store settles its fixed FIFO claims in the
+same source-batch transaction. A failed or uncertain native write emits no applied fact;
+the claim stays frozen and is never requeued. This adds no second source/lifecycle stream,
+client API method, hook-decision RPC, or policy engine.
 
 ## Durable plugin requests
 
@@ -401,6 +441,13 @@ text is unavailable, not empty or successful.
 Requested route/settings are not proof of effective values; unavailable readback is
 reported as such. The host owns queued-send FIFO and unknown gates.
 
+Injection must reach the requested native application point. `next_input` is prepended
+inside the same native SEND and applies only with that SEND's exact turn association;
+`turn_safe_point` is bound to its captured turn and delivered through the authenticated
+hook callback. Report the actual native mechanism and application point in the existing
+typed context outcome. Accepted/queued context is not applied, and uncertain claimed
+context is never retried or moved to a later point.
+
 `turn.completed.data.native_error` optionally summarizes an available native error as
 `{message,truncated}`. Redact known secrets with `SecretPolicy` before bounding its
 encoded JSON to 4 KiB and the remaining event-data budget; omit it if it cannot fit.
@@ -444,6 +491,7 @@ Contain owned children before tools run; use absolute deadlines. Drain buffered 
 output before declaring loss. Plugin replacement never rebinds an uncertain old call.
 Persisted facts backpressure; ephemeral telemetry may drop with visible lag.
 
+
 Native reader faults split by proven line boundary. Fatal reader end (EOF,
 codec/UTF-8/IO fault, oversize without a proven line boundary, exit-drain
 deadline) atomically closes response-router registration and the write
@@ -463,6 +511,16 @@ resolve `unknown`, fresh writes are refused `native_not_dispatched`.
 Add hooks only for a missing native fact/decision. Config is session-scoped; decisions
 bind exact generation/request/deadline. Timeout uses the safe native default; late
 approval is discarded, not queued. Hooks do not duplicate the authoritative stream.
+
+The first system-context hook consumer is Claude Code 2.1.278:
+`PreToolUse.additionalContext` is the native `turn_safe_point` application point. Its
+source schema is confirmed; runtime application is not yet qualified. The adapter reports
+the exact turn and opaque consumer through the existing authenticated plugin channel.
+Timeout/cancellation supplies no context, does not override a native result, and discards
+late context instead of queuing it for a later turn. This context path does not make
+permission decisions; existing approval callbacks retain that responsibility. Hooks do
+not duplicate lifecycle already supplied by the stream.
+
 
 Native adapters echo turns and emit request callbacks over this same transport
 through their real implementations. Add crash/child/recovery steps with their real caller. Record/replay and common
