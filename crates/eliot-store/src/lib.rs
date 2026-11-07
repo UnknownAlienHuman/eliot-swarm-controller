@@ -3359,7 +3359,6 @@ fn install_initial_source_plan(
     tx: &Transaction<'_>,
     agent: i64,
     generation: i64,
-    _harness: &str,
     now: i64,
 ) -> Result<()> {
     // The initial install is an empty open stream source. The validated

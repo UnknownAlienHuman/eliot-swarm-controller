@@ -249,7 +249,7 @@ impl Store {
                         "launch target changed before its generation token was committed",
                     ));
                 }
-                install_initial_source_plan(&tx, agent_num, 1, &agent.harness, now)?;
+                install_initial_source_plan(&tx, agent_num, 1, now)?;
                 update_command_state(&tx, id, CommandState::Dispatched, None, Some(1), now)?;
                 events.push(insert_daemon_event_for_command(
                     &tx,
@@ -382,7 +382,7 @@ impl Store {
                         "resume target changed before its new generation was committed",
                     ));
                 }
-                install_initial_source_plan(&tx, agent_num, next_generation, &agent.harness, now)?;
+                install_initial_source_plan(&tx, agent_num, next_generation, now)?;
                 update_command_state(
                     &tx,
                     id,
