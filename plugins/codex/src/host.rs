@@ -27,6 +27,7 @@ use eliot_plugin::{
         optional_profile_text, parse_resume_subject, paths_equal, register_native_process,
         rejected_control, target_environment as shared_target_environment, unknown_control,
         unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
+        with_claimed_context,
     },
 };
 use serde_json::{Value, json};
@@ -1306,6 +1307,7 @@ impl CodexPlugin {
         if event_status.active_turn_id.is_some() {
             return Err(Error::new("busy", "Codex already has an active turn"));
         }
+        let combined = with_claimed_context(text, &params.context, "Codex")?;
         let command_id = params.command_id.clone();
         session
             .command_inputs
@@ -1315,9 +1317,7 @@ impl CodexPlugin {
                 .thread_id
                 .clone()
                 .ok_or_else(|| Error::new("unknown", "Codex thread identity is unresolved"))?,
-            input: vec![NativeUserInput::Text(NativeTextUserInput::text(
-                text.to_owned(),
-            ))],
+            input: vec![NativeUserInput::Text(NativeTextUserInput::text(combined))],
             cwd: None,
             model: Some(session.requested_model.clone()),
             // Omitted effort omits the wire field (schema: effort optional,

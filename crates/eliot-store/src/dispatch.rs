@@ -6,6 +6,7 @@ impl Store {
         id: &str,
         now: i64,
         native_store: Option<(&Agent, &NativeStoreBinding)>,
+        context_items: Option<&mut Vec<core::ContextItem>>,
     ) -> Result<Change<Command>> {
         let tx = self
             .connection
@@ -530,6 +531,19 @@ impl Store {
                         events,
                     });
                 }
+                let claimed_items = if context_items.is_some() {
+                    context::claim_next_input_tx(
+                        &tx,
+                        agent_num,
+                        &agent,
+                        &command.command,
+                        now,
+                        &mut events,
+                    )?
+                } else {
+                    Vec::new()
+                };
+                let send_args = context::send_args(&command.command.args, &claimed_items)?;
                 check_rpc_frame(
                     "agent.command",
                     &json!({
@@ -537,7 +551,7 @@ impl Store {
                         "generation": agent.generation,
                         "command_id": id,
                         "verb": "send",
-                        "args": command.command.args,
+                        "args": send_args,
                     }),
                 )?;
                 update_command_state(&tx, id, CommandState::Dispatched, None, None, now)?;
@@ -550,6 +564,9 @@ impl Store {
                     id,
                     json!({"command_id": id, "verb": "send"}),
                 )?);
+                if let Some(output) = context_items {
+                    *output = claimed_items;
+                }
             }
             "stop" => {
                 if command_generation != agent.generation {

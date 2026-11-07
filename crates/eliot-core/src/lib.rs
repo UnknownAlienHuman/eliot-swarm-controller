@@ -15,6 +15,7 @@ pub use api::{
 mod agent_start;
 mod canonical;
 mod command;
+mod context;
 mod diagnostics;
 mod ids;
 mod native_child;
@@ -29,6 +30,7 @@ pub use command::{
     classify_dispatched_error, command_transition_allowed,
     is_deterministic_pre_admission_rejection, workspace_preparation_transition_allowed,
 };
+pub use context::{ContextItem, ContextOutcome, InjectArgs, InjectPoint};
 pub use diagnostics::{
     MAX_STDERR_BYTES, MAX_STDERR_DIAGNOSTIC_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource,
     bound_stderr_diagnostics,
@@ -1091,7 +1093,7 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             next.active_turn = None;
             next.pending.clear();
         }
-        "tool.started" | "tool.completed" => {
+        "tool.started" | "tool.completed" | "hook.before_tool" => {
             // Pure watch facts: exact active-turn binding only, no state change.
             require_live_turn(agent, event)?;
         }

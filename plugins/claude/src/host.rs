@@ -14,7 +14,7 @@ use eliot_plugin::{
     session::{
         self, contextual_error, decode, native_no_write, not_initialized, optional_profile_text,
         parse_resume_subject, register_native_process, unknown_control, unknown_snapshot,
-        validate_binding, validate_identity, validate_source_plan,
+        validate_binding, validate_identity, validate_source_plan, with_claimed_context,
     },
 };
 use serde_json::{Value, json};
@@ -300,7 +300,7 @@ impl ClaudePlugin {
             .transpose()?;
         validate_source_plan(
             "Claude",
-            &["session", "turn", "message", "request"],
+            &["session", "turn", "message", "request", "tool"],
             params.source_plan.as_ref(),
         )?;
         let frozen_profile = params.profile.as_ref().ok_or_else(|| {
@@ -502,11 +502,19 @@ impl ClaudePlugin {
         params: &AgentStartParams,
         plan: &StartPlan,
     ) -> Result<(AgentSession, Value)> {
+        let callback_id = session.events.hook_callback_id().to_owned();
         let readback = match session
             .native_client
             .control(
                 "initialize",
-                json!({"hooks": null}),
+                json!({
+                    "hooks": {
+                        "PreToolUse": [{
+                            "hookCallbackIds": [callback_id],
+                            "timeout": 30,
+                        }]
+                    }
+                }),
                 Instant::now() + RPC_TIMEOUT,
             )
             .await
@@ -571,6 +579,18 @@ impl ClaudePlugin {
                     return Err(self.reject_start(session, params, error).await);
                 }
             }
+        }
+        if readback.hooks_applied != Some(true) {
+            return Err(self
+                .reject_start(
+                    session,
+                    params,
+                    Error::new(
+                        "profile_error",
+                        "Claude initialize did not apply the registered PreToolUse callback",
+                    ),
+                )
+                .await);
         }
         // The CLI never reads the active model back in initialize (note 47):
         // membership in `models[]` above is the only proof, so
@@ -716,10 +736,11 @@ impl ClaudePlugin {
             return replay;
         }
         check_send_ready(session)?;
+        let native_content = with_claimed_context(text, &params.context, "Claude")?;
         session
             .command_inputs
             .insert(params.command_id.clone(), text.to_owned());
-        dispatch_send(session, &params.command_id, text).await
+        dispatch_send(session, &params.command_id, native_content).await
     }
 
     async fn interrupt_command(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -1203,7 +1224,11 @@ fn check_send_ready(session: &AgentSession) -> Result<()> {
 /// Mint the exact turn association before the write and register it with
 /// the event task first: an early lifecycle can never miss its waiter, and
 /// a lost association latches unknown without a rewrite.
-async fn dispatch_send(session: &mut AgentSession, command_id: &str, text: &str) -> Result<Value> {
+async fn dispatch_send(
+    session: &mut AgentSession,
+    command_id: &str,
+    content: String,
+) -> Result<Value> {
     let turn_id = new_uuid();
     let outcome = match session
         .events
@@ -1231,7 +1256,7 @@ async fn dispatch_send(session: &mut AgentSession, command_id: &str, text: &str)
         parent_tool_use_id: None,
         message: OutboundUserMessage {
             role: "user",
-            content: text.to_owned(),
+            content,
         },
     };
     if let Err(error) = session
@@ -1441,6 +1466,7 @@ fn claude_manifest() -> PluginManifest {
         ("message".to_owned(), "stream".to_owned()),
         ("request".to_owned(), "stream".to_owned()),
         ("session".to_owned(), "stream".to_owned()),
+        ("tool".to_owned(), "stream".to_owned()),
         ("turn".to_owned(), "stream".to_owned()),
     ]);
     PluginManifest {

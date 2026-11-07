@@ -13,7 +13,7 @@ use eliot_plugin::{
         ResumeSubject, TargetEnvironment, contextual_error, decode, known_command, native_no_write,
         not_initialized, optional_profile_text, parse_resume_subject, paths_equal,
         register_native_process, split_provider_model, target_environment, unknown_snapshot,
-        validate_binding, validate_identity, validate_source_plan,
+        validate_binding, validate_identity, validate_source_plan, with_claimed_context,
     },
 };
 use serde_json::{Value, json};
@@ -1313,13 +1313,14 @@ impl OpenCodePlugin {
         if event_status.active_turn_id.is_some() {
             return Err(Error::new("busy", "OpenCode already has an active turn"));
         }
+        let combined = with_claimed_context(text, &params.context, "OpenCode")?;
         let command_id = params.command_id.clone();
         session
             .command_inputs
             .insert(command_id.clone(), text.to_owned());
         Ok(SendAdmission::New {
             command_id,
-            text: text.to_owned(),
+            text: combined,
         })
     }
 

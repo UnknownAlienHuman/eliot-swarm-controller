@@ -5,13 +5,14 @@
 //! blocks. Shared admission, read and progress helpers stay in the parent
 //! module; native I/O still runs outside the Store lock exactly as before.
 use super::{
-    MODE_FORCE, Router, RouterInner, RunWorkerHandle, validate_project_rule_launch_command,
-    validate_project_rule_resume_command, validate_retained_resume_agent,
+    MODE_FORCE, Router, RouterInner, RunWorkerHandle, context,
+    validate_project_rule_launch_command, validate_project_rule_resume_command,
+    validate_retained_resume_agent,
 };
 use crate::common::now_ms;
 use eliot_core::{
-    Agent, AgentState, Command, CommandState, Error, Event, FrozenScriptRun, NativeStoreBinding,
-    Result, SecretPolicy,
+    Agent, AgentState, Command, CommandState, ContextItem, Error, Event, FrozenScriptRun,
+    NativeStoreBinding, Result, SecretPolicy,
     api::{FrozenGitFetch, ProjectRegistrationView},
     classify_dispatched_error,
 };
@@ -109,7 +110,7 @@ impl Router {
         else {
             return;
         };
-        let Some((dispatched, dispatch_seq)) = self
+        let Some((dispatched, dispatch_seq, context_items)) = self
             .dispatch_and_wait_for_effect(
                 &id,
                 &mut receiver,
@@ -121,12 +122,12 @@ impl Router {
             return;
         };
         self.execute_dispatched_command(
-            &id,
             dispatched,
             prepared.git_fetch_registration,
             prepared.resume_source_state,
             linked_id,
             dispatch_seq,
+            context_items,
         )
         .await;
     }
@@ -141,6 +142,11 @@ impl Router {
         has_linked: bool,
     ) -> Option<PreparedCommand> {
         let command = self.load_command_for_dispatch(id).await?;
+        if command.verb == "inject" {
+            // Inject commands are durable pending context. Only a concrete
+            // next_input send or authenticated safe-point callback may claim them.
+            return None;
+        }
         if !self.check_script_dispatch_gate(id, &command).await {
             return None;
         }
@@ -415,17 +421,14 @@ impl Router {
         receiver: &mut broadcast::Receiver<Event>,
         command: &Command,
         launch_binding: &Option<(Agent, NativeStoreBinding)>,
-    ) -> Option<(Command, i64)> {
-        let (dispatched, dispatch_seq) = loop {
+    ) -> Option<(Command, i64, Vec<ContextItem>)> {
+        let (dispatched, dispatch_seq, context_items) = loop {
             let change = {
                 let mut store = self.inner.store.lock().await;
                 let dispatched = match launch_binding {
-                    Some((expected_agent, binding)) => store.dispatch_with_native_store_binding(
-                        id,
-                        now_ms(),
-                        expected_agent,
-                        binding,
-                    ),
+                    Some((expected_agent, binding)) => store
+                        .dispatch_with_native_store_binding(id, now_ms(), expected_agent, binding)
+                        .map(|change| (change.value, Vec::new(), change.events)),
                     None if command.verb == "run"
                         && self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE =>
                     {
@@ -450,21 +453,32 @@ impl Router {
                             "force shutdown prevents local event dispatch",
                         ))
                     }
-                    None => store.dispatch(id, now_ms()),
+                    None if command.verb == "send" => {
+                        store.dispatch_with_context(id, now_ms()).map(|change| {
+                            (
+                                change.value.command,
+                                change.value.context_items,
+                                change.events,
+                            )
+                        })
+                    }
+                    None => store
+                        .dispatch(id, now_ms())
+                        .map(|change| (change.value, Vec::new(), change.events)),
                 };
                 let result = match dispatched {
-                    Ok(change) => {
-                        self.publish_locked(&change.events);
-                        Ok(change)
+                    Ok((command, context_items, events)) => {
+                        self.publish_locked(&events);
+                        Ok((command, context_items, events))
                     }
                     Err(error) => Err(error),
                 };
                 (result, store.is_write_faulted())
             };
             match change.0 {
-                Ok(change) if change.value.state == CommandState::Queued => {
-                    let target = change.value.target.clone();
-                    let generation = change.value.generation;
+                Ok((command, _, _)) if command.state == CommandState::Queued => {
+                    let target = command.target.clone();
+                    let generation = command.generation;
                     if !self
                         .wait_for_queue_release(id, receiver, target, generation)
                         .await
@@ -472,22 +486,22 @@ impl Router {
                         return None;
                     }
                 }
-                Ok(change) if change.value.state.is_terminal() => {
+                Ok((command, _, _)) if command.state.is_terminal() => {
                     // Store may durably cancel a terminal predecessor's
                     // successor at this dispatch gate; never pass it to a native
                     // plugin after that result.
                     self.signal_progress();
                     return None;
                 }
-                Ok(change) => {
-                    let seq = match capture_dispatch_seq(&change.value, &change.events) {
+                Ok((command, context_items, events)) => {
+                    let seq = match capture_dispatch_seq(&command, &events) {
                         Some(seq) => seq,
                         None => {
                             self.signal_progress();
                             return None;
                         }
                     };
-                    break (change.value, seq);
+                    break (command, seq, context_items);
                 }
                 Err(error) => {
                     self.settle_dispatch_error(id, &error, change.1, launch_binding.is_some())
@@ -503,7 +517,7 @@ impl Router {
             self.signal_progress();
             return None;
         }
-        Some((dispatched, dispatch_seq))
+        Some((dispatched, dispatch_seq, context_items))
     }
 
     /// Wait for one bus event that can release a queued dispatch: provider
@@ -555,19 +569,20 @@ impl Router {
     /// Agent and runs one verb-family helper.
     async fn execute_dispatched_command(
         &self,
-        id: &str,
         dispatched: Command,
         git_fetch_registration: Option<ProjectRegistrationView>,
         resume_source_state: Option<Value>,
         linked_id: Option<String>,
         dispatch_seq: i64,
+        context_items: Vec<ContextItem>,
     ) {
+        let id = dispatched.id.clone();
         if dispatched.verb == "run" {
             self.execute_run_command(dispatched).await;
             return;
         }
         if dispatched.verb == "git.fetch" {
-            self.execute_git_fetch_command(id, dispatched, git_fetch_registration)
+            self.execute_git_fetch_command(&id, dispatched, git_fetch_registration)
                 .await;
             return;
         }
@@ -589,29 +604,35 @@ impl Router {
         let verb = dispatched.verb.clone();
         let trailing_signal = match verb.as_str() {
             "attach" => {
-                self.execute_attach_command(id, &agent, dispatched).await;
+                self.execute_attach_command(&id, &agent, dispatched).await;
                 true
             }
             "worktree.remove" => {
-                self.execute_worktree_remove_command(id, dispatched).await;
+                self.execute_worktree_remove_command(&id, dispatched).await;
                 true
             }
             "launch" | "resume" => {
-                self.execute_start_command(id, agent, dispatched, resume_source_state, linked_id)
+                self.execute_start_command(&id, agent, dispatched, resume_source_state, linked_id)
                     .await;
                 true
             }
             "send" => {
-                self.execute_send_command(id, &agent, dispatched, Some(dispatch_seq))
-                    .await
+                self.execute_send_command(
+                    &id,
+                    &agent,
+                    dispatched,
+                    Some(dispatch_seq),
+                    context_items,
+                )
+                .await
             }
             "steer" | "interrupt" | "approve" | "deny" | "answer" => {
-                self.execute_control_command(id, &agent, dispatched, Some(dispatch_seq))
+                self.execute_control_command(&id, &agent, dispatched, Some(dispatch_seq))
                     .await
             }
-            "stop" => self.execute_stop_command(id, &agent, dispatched).await,
+            "stop" => self.execute_stop_command(&id, &agent, dispatched).await,
             "detach" => {
-                self.execute_detach_command(id, &agent, dispatched).await;
+                self.execute_detach_command(&id, &agent, dispatched).await;
                 true
             }
             _ => {
@@ -811,7 +832,15 @@ impl Router {
         agent: &Agent,
         dispatched: Command,
         dispatch_seq: Option<i64>,
+        context_items: Vec<ContextItem>,
     ) -> bool {
+        let dispatched = match context::with_next_input(&dispatched, &context_items) {
+            Ok(dispatched) => dispatched,
+            Err(error) => {
+                self.settle_plugin_error(id, &error).await;
+                return false;
+            }
+        };
         let response = self
             .inner
             .plugin_host

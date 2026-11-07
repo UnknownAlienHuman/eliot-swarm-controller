@@ -31,7 +31,7 @@ use eliot_plugin::{
         TargetEnvironment, decode, known_command, native_no_write, not_initialized,
         optional_profile_text, parse_resume_subject, paths_equal, register_native_process,
         rejected_control, target_environment, unknown_control, unknown_snapshot, validate_binding,
-        validate_identity, validate_source_plan,
+        validate_identity, validate_source_plan, with_claimed_context,
     },
 };
 use serde_json::{Value, json};
@@ -1325,6 +1325,7 @@ impl MusePlugin {
         if event_status.active_turn_id.is_some() {
             return Err(Error::new("busy", "Muse already has an active turn"));
         }
+        let combined = with_claimed_context(text, &params.context, "Muse")?;
         let command_id = params.command_id.clone();
         session
             .command_inputs
@@ -1342,7 +1343,7 @@ impl MusePlugin {
                 .ok_or_else(|| Error::new("unknown", "Muse session identity is unresolved"))?,
             input: vec![NativeTurnInputPart {
                 part_type: "text".to_owned(),
-                text: Some(text.to_owned()),
+                text: Some(combined),
             }],
             reasoning_effort: session.selected_effort.clone(),
         };

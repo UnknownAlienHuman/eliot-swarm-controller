@@ -213,6 +213,14 @@ including kinds beyond `turn.completed`. Matching uses the event-time `subject`
 persisted with the event, never a later Agent-row lookup. The canonical event and subject
 shapes remain in [Core](../../crates/eliot-core/src/lib.rs).
 
+Native before-tool callbacks are normalized as committed `hook.before_tool` events on
+the existing event bus. Rules observe them with the ordinary `on.event` trigger and
+existing event/subject matcher. The synchronous hook response carries only context items
+already claimed at that native point; rule actions run through the ordinary command path
+and cannot decide or alter the in-flight callback. There is no `on.hook` trigger,
+`hook.decide` action, or separate matcher/policy engine. Permission decisions continue
+through the existing exact approval callbacks.
+
 Scalar `match` values compare exactly. String values prefixed `glob:` or `re:` use bounded
 glob or regex matching; `{ one_of = [...] }` accepts a list of scalar values, and
 `{ exists = true|false }` checks path presence. Conditions combine with AND. A missing
@@ -801,10 +809,13 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
 
 ## Approvals and hooks
 
-Async approval rules use exact Agent generation, turn and request. For synchronous
-hooks, return only an immediate decision that committed while the request/deadline was
-valid. On timeout/Store failure return the safe native default; discard late results,
-never enqueue a later approval. Build the shim only with a harness that needs it.
+Async approval callbacks use exact Agent generation, turn and request. The system context
+hook is separate: it returns only FIFO context already committed for the exact generation
+and captured turn before its deadline. It does not approve or deny a tool. On timeout,
+cancellation or Store failure, return no context; discard late context and never enqueue
+it for a later callback or turn. Its first native consumer is Claude Code 2.1.278
+`PreToolUse.additionalContext`; the source schema is confirmed and runtime application is
+still pending qualification.
 
 ## Goal loop
 

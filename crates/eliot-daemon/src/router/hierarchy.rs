@@ -42,7 +42,7 @@ pub(super) fn authorize_agent_submit(
     }
     if !matches!(
         request.verb.as_str(),
-        "send" | "stop" | "steer" | "interrupt" | "approve" | "deny" | "answer"
+        "send" | "stop" | "steer" | "inject" | "interrupt" | "approve" | "deny" | "answer"
     ) {
         return Err(Error::new(
             "not_allowed",

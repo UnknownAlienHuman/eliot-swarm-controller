@@ -1,28 +1,34 @@
 use eliot_core::{
-    Error, Result, SecretPolicy,
+    ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy,
     requests::{ApprovalChoice, ApprovalDecision, ApprovalRequest},
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     native_stdio::StreamState,
+    protocol::{HookEvent, HookResponse},
     session::{
-        EVENT_DEADLINE, StreamSource, approval_reply_args, attach_final_text, rejected_control,
-        request_event_id, unknown_control,
+        EVENT_DEADLINE, StreamSource, approval_reply_args, attach_final_text, native_no_write,
+        rejected_control, request_event_id, unknown_control, with_claimed_context,
     },
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    time::Duration,
+};
 use tokio::{
     sync::{mpsc, oneshot, watch},
+    task::JoinHandle,
     time::{Instant, timeout_at},
 };
 
 use crate::native::{
     ClaudeClient, ClaudeFrame,
     types::{
-        CanUseToolBody, CommandLifecycle, PermissionResult, ResultRecord, assistant_model,
-        assistant_text, result_usage,
+        CanUseToolBody, CommandLifecycle, ControlCancelRequest, HookCallbackBody,
+        HookCallbackResponse, PermissionResult, ResultRecord, assistant_model, assistant_text,
+        assistant_tool_use_ids, result_usage,
     },
 };
 
@@ -30,6 +36,9 @@ const CONTROL_QUEUE: usize = 16;
 const EARLY_EVENT_LIMIT: usize = 128;
 const EARLY_EVENT_BYTES: usize = 256 * 1024;
 const MAX_PENDING_REQUESTS: usize = 16;
+const MAX_PENDING_HOOKS: usize = 16;
+const MAX_TOOL_USE_BINDINGS: usize = 128;
+const HOOK_CALLBACK_TIMEOUT_MS: u64 = 30_000;
 const DENY_MESSAGE: &str = "Eliot denied this tool call.";
 const APPROVE_CHOICE_ID: &str = "approve";
 const DENY_CHOICE_ID: &str = "deny";
@@ -66,6 +75,7 @@ pub(crate) struct EventConfig {
 pub(crate) struct EventHandle {
     control: mpsc::Sender<Control>,
     status: watch::Receiver<EventStatus>,
+    hook_callback_id: String,
 }
 
 /// Outcome of one `ExpectTurn` wait, decided by the exact stream facts.
@@ -105,6 +115,10 @@ enum Control {
         args: Value,
         native: ClaudeClient,
         reply: oneshot::Sender<Result<Value>>,
+    },
+    HookResponseReady {
+        request_id: String,
+        result: Result<Vec<ContextItem>>,
     },
     BeginStop {
         reply: oneshot::Sender<Result<()>>,
@@ -215,6 +229,31 @@ fn collect_summary_args_labeled(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum HookConsumerState {
+    Available,
+    InFlight,
+    Finished,
+}
+
+#[derive(Clone)]
+struct ToolUseBinding {
+    turn_id: String,
+    prompt_id: Option<String>,
+    hook_state: HookConsumerState,
+    active_consumer_id: Option<String>,
+}
+
+struct PendingHookCallback {
+    generation: i64,
+    turn_id: String,
+    tool_use_id: String,
+    consumer_id: String,
+    deadline: Instant,
+    native: ClaudeClient,
+    task: JoinHandle<()>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum NativeReplyState {
     Available,
     Writing,
@@ -227,6 +266,7 @@ struct EventProcessor {
     credential: String,
     agent_id: String,
     generation: i64,
+    hook_callback_id: String,
     secrets: Vec<String>,
     status: EventStatus,
     buffer: VecDeque<BufferedRecord>,
@@ -234,6 +274,8 @@ struct EventProcessor {
     gap_number: u64,
     pending_turn: Option<PendingTurn>,
     pending_requests: HashMap<String, PendingNativeRequest>,
+    tool_use_turns: HashMap<String, ToolUseBinding>,
+    tool_use_tracking_fenced: bool,
     deny_uncertain: HashSet<String>,
     permission_admission_fenced: bool,
     message_seq: u64,
@@ -250,6 +292,8 @@ struct EventProcessor {
     closed: bool,
     native: Option<ClaudeClient>,
     status_tx: watch::Sender<EventStatus>,
+    control_tx: Option<mpsc::Sender<Control>>,
+    pending_hooks: HashMap<String, PendingHookCallback>,
 }
 
 pub(crate) fn spawn(
@@ -260,12 +304,23 @@ pub(crate) fn spawn(
 ) -> EventHandle {
     let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
     let (status_tx, status) = watch::channel(EventStatus::default());
-    let processor = EventProcessor::new(host, config, status_tx.clone());
+    let mut processor = EventProcessor::new(host, config, status_tx.clone());
+    let hook_callback_id = processor.hook_callback_id.clone();
+    processor.control_tx = Some(control.clone());
     tokio::spawn(run(frames, stream, processor, control_rx, status_tx));
-    EventHandle { control, status }
+    EventHandle {
+        control,
+        status,
+        hook_callback_id,
+    }
 }
 
 impl EventHandle {
+    /// Private callback id installed by this session's native initialize.
+    pub fn hook_callback_id(&self) -> &str {
+        &self.hook_callback_id
+    }
+
     /// Commit readiness only after the SessionStart proof is observed: the
     /// initialize reply and the session_start record race, and readiness
     /// must compare against the observed session, never assume it. The
@@ -495,6 +550,7 @@ async fn run(
         }
         publish(&processor, &status);
     }
+    processor.cancel_all_hook_callbacks();
     publish(&processor, &status);
 }
 
@@ -558,9 +614,19 @@ async fn dispatch_control(
             publish(processor, status);
             let _ = reply.send(result);
         }
+        Control::HookResponseReady { request_id, result } => {
+            if let Err(error) = processor.finish_hook_callback(&request_id, result).await {
+                processor.status.source_unknown = true;
+                if processor.status.failure.is_none() {
+                    processor.status.failure = Some(error.message);
+                }
+            }
+            publish(processor, status);
+        }
         Control::BeginStop { reply } => {
             processor.planned_stop = true;
             processor.accept_frames = false;
+            processor.cancel_all_hook_callbacks();
             publish(processor, status);
             let _ = reply.send(Ok(()));
         }
@@ -580,6 +646,7 @@ async fn dispatch_control(
         }
         Control::Close { reply } => {
             processor.closed = true;
+            processor.cancel_all_hook_callbacks();
             processor.finish_pending_end_stop().await;
             let _ = reply.send(());
             return true;
@@ -597,6 +664,7 @@ impl EventProcessor {
             credential: config.credential,
             agent_id: config.agent_id,
             generation: config.generation,
+            hook_callback_id: ulid::Ulid::new().to_string(),
             secrets: config.secrets,
             status: EventStatus::default(),
             buffer: VecDeque::new(),
@@ -604,6 +672,8 @@ impl EventProcessor {
             gap_number: 0,
             pending_turn: None,
             pending_requests: HashMap::new(),
+            tool_use_turns: HashMap::new(),
+            tool_use_tracking_fenced: false,
             deny_uncertain: HashSet::new(),
             permission_admission_fenced: false,
             message_seq: 0,
@@ -618,6 +688,8 @@ impl EventProcessor {
             closed: false,
             native: None,
             status_tx,
+            control_tx: None,
+            pending_hooks: HashMap::new(),
         }
     }
 
@@ -813,14 +885,14 @@ impl EventProcessor {
             return !self.status.ready
                 || (self.status.active_turn_id.is_none() && self.pending_turn.is_some());
         }
-        if kind == Some("control_request")
-            && record
+        if kind == Some("control_request") {
+            let subtype = record
                 .get("request")
                 .and_then(|request| request.get("subtype"))
-                .and_then(Value::as_str)
-                == Some("can_use_tool")
-        {
-            return self.status.active_turn_id.is_none() && self.pending_turn.is_some();
+                .and_then(Value::as_str);
+            if matches!(subtype, Some("can_use_tool" | "hook_callback")) {
+                return self.status.active_turn_id.is_none() && self.pending_turn.is_some();
+            }
         }
         false
     }
@@ -857,6 +929,10 @@ impl EventProcessor {
             "result" => self.complete_turn(&record).await,
             "user" => Ok(()),
             "control_request" => self.observe_control_request(&record).await,
+            "control_cancel_request" => {
+                self.cancel_hook_callback(&record);
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -1022,6 +1098,9 @@ impl EventProcessor {
                 .record_gap("Claude message arrived outside the exact active turn")
                 .await;
         };
+        if is_main_thread_assistant(record) {
+            self.bind_tool_uses(record, &turn_id);
+        }
         let text = assistant_text(record);
         if text.is_empty() {
             return Ok(());
@@ -1051,6 +1130,50 @@ impl EventProcessor {
         }
         self.commit_event("message.completed", native_id, data)
             .await
+    }
+
+    /// Keep a bounded, generation-local association from Claude invocation
+    /// ids to the exact Eliot turn that supplied their assistant tool-use
+    /// blocks. Hook callbacks never fall back to whichever turn is active.
+    fn bind_tool_uses(&mut self, record: &Value, turn_id: &str) {
+        if self.tool_use_tracking_fenced {
+            return;
+        }
+        let prompt_id = assistant_prompt_id(record);
+        for tool_use_id in assistant_tool_use_ids(record) {
+            if let Some(existing) = self.tool_use_turns.get(&tool_use_id).cloned() {
+                let prompt_conflict = matches!(
+                    (existing.prompt_id.as_deref(), prompt_id.as_deref()),
+                    (Some(existing), Some(observed)) if existing != observed
+                );
+                if existing.turn_id != turn_id || prompt_conflict {
+                    self.tool_use_turns.clear();
+                    self.tool_use_tracking_fenced = true;
+                    return;
+                }
+                if existing.prompt_id.is_none()
+                    && let Some(prompt_id) = prompt_id.as_ref()
+                    && let Some(existing) = self.tool_use_turns.get_mut(&tool_use_id)
+                {
+                    existing.prompt_id = Some(prompt_id.clone());
+                }
+                continue;
+            }
+            if self.tool_use_turns.len() >= MAX_TOOL_USE_BINDINGS {
+                self.tool_use_turns.clear();
+                self.tool_use_tracking_fenced = true;
+                return;
+            }
+            self.tool_use_turns.insert(
+                tool_use_id,
+                ToolUseBinding {
+                    turn_id: turn_id.to_owned(),
+                    prompt_id: prompt_id.clone(),
+                    hook_state: HookConsumerState::Available,
+                    active_consumer_id: None,
+                },
+            );
+        }
     }
 
     /// One native callback exists per request ID; a possible write fences it.
@@ -1182,11 +1305,381 @@ impl EventProcessor {
         )
     }
 
+    async fn observe_hook_callback(&mut self, record: &Value) -> Result<()> {
+        if self.frames_drained || self.planned_stop || self.closed {
+            return Ok(());
+        }
+        let request_id = record
+            .get("request_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "native_protocol",
+                    "Claude hook_callback omitted its exact native request id",
+                )
+            })?;
+        if self.pending_hooks.contains_key(request_id) {
+            return Ok(());
+        }
+        let body = record
+            .get("request")
+            .cloned()
+            .and_then(|request| serde_json::from_value::<HookCallbackBody>(request).ok());
+        let deadline = hook_deadline(body.as_ref().and_then(|body| body.deadline_ms));
+        let Some(native) = self.native.clone() else {
+            return Err(Error::new(
+                "unknown",
+                "Claude hook_callback arrived before the native session was ready",
+            ));
+        };
+        let Some(body) = body else {
+            return self.write_hook_pass(&native, request_id, deadline).await;
+        };
+        if body.subtype != "hook_callback"
+            || body.callback_id != self.hook_callback_id
+            || body.input.get("hook_event_name").and_then(Value::as_str) != Some("PreToolUse")
+            || body
+                .input
+                .get("agent_id")
+                .is_some_and(|value| !value.is_null())
+            || body
+                .input
+                .get("parent_tool_use_id")
+                .is_some_and(|value| !value.is_null())
+        {
+            return self.write_hook_pass(&native, request_id, deadline).await;
+        }
+        let input_tool_use_id = body
+            .input
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty());
+        let outer_tool_use_id = body
+            .tool_use_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty());
+        let tool_use_id = match (input_tool_use_id, outer_tool_use_id) {
+            (Some(input), Some(outer)) if input == outer => input.to_owned(),
+            (Some(input), None) => input.to_owned(),
+            (None, Some(outer)) => outer.to_owned(),
+            _ => return self.write_hook_pass(&native, request_id, deadline).await,
+        };
+        let input_prompt_id = body
+            .input
+            .get("prompt_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty());
+        let Some(binding) = self.tool_use_turns.get(&tool_use_id).cloned() else {
+            return self.write_hook_pass(&native, request_id, deadline).await;
+        };
+        if binding.hook_state != HookConsumerState::Available {
+            return self.write_hook_pass(&native, request_id, deadline).await;
+        }
+        if let (Some(input_prompt_id), Some(assistant_prompt_id)) =
+            (input_prompt_id, binding.prompt_id.as_deref())
+            && input_prompt_id != assistant_prompt_id
+        {
+            self.finish_available_tool_use_hook(&tool_use_id);
+            return self.write_hook_pass(&native, request_id, deadline).await;
+        }
+        let turn_id = binding.turn_id.clone();
+        if self.status.active_turn_id.as_deref() != Some(turn_id.as_str())
+            || !self.status.ready
+            || self.status.failure.is_some()
+            || self.status.stopped
+        {
+            self.finish_available_tool_use_hook(&tool_use_id);
+            return self.write_hook_pass(&native, request_id, deadline).await;
+        }
+        if self.pending_hooks.len() >= MAX_PENDING_HOOKS {
+            self.finish_available_tool_use_hook(&tool_use_id);
+            return self.write_hook_pass(&native, request_id, deadline).await;
+        }
+        let Some(control_tx) = self.control_tx.clone() else {
+            self.finish_available_tool_use_hook(&tool_use_id);
+            return self.write_hook_pass(&native, request_id, deadline).await;
+        };
+        let consumer_id = ulid::Ulid::new().to_string();
+        let event = HookEvent {
+            hook: "before_tool".to_owned(),
+            turn_id: turn_id.clone(),
+            consumer_id: consumer_id.clone(),
+        };
+        let params = match serde_json::to_value(event) {
+            Ok(params) => params,
+            Err(_) => {
+                self.finish_available_tool_use_hook(&tool_use_id);
+                return self.write_hook_pass(&native, request_id, deadline).await;
+            }
+        };
+        if let Some(binding) = self.tool_use_turns.get_mut(&tool_use_id) {
+            binding.hook_state = HookConsumerState::InFlight;
+            binding.active_consumer_id = Some(consumer_id.clone());
+        } else {
+            return self.write_hook_pass(&native, request_id, deadline).await;
+        }
+        let host = self.host.clone();
+        let callback_request_id = request_id.to_owned();
+        let callback_deadline = deadline;
+        let task = tokio::spawn(async move {
+            let result = match host.call("hook.event", params, callback_deadline).await {
+                Ok(response) => serde_json::from_value::<HookResponse>(response)
+                    .map(|response| response.context)
+                    .map_err(|_| Error::new("invalid", "Claude hook response was malformed")),
+                Err(error) => Err(error),
+            };
+            let _ = control_tx
+                .send(Control::HookResponseReady {
+                    request_id: callback_request_id,
+                    result,
+                })
+                .await;
+        });
+        self.pending_hooks.insert(
+            request_id.to_owned(),
+            PendingHookCallback {
+                generation: self.generation,
+                turn_id,
+                tool_use_id,
+                consumer_id,
+                deadline,
+                native,
+                task,
+            },
+        );
+        Ok(())
+    }
+
+    async fn finish_hook_callback(
+        &mut self,
+        request_id: &str,
+        result: Result<Vec<ContextItem>>,
+    ) -> Result<()> {
+        let Some(pending) = self.pending_hooks.get(request_id) else {
+            return Ok(());
+        };
+        let native = pending.native.clone();
+        let deadline = pending.deadline;
+        let tool_use_id = pending.tool_use_id.clone();
+        let consumer_id = pending.consumer_id.clone();
+        let context = result.unwrap_or_default();
+        if context.is_empty() {
+            self.pending_hooks.remove(request_id);
+            self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+            return self.write_hook_pass(&native, request_id, deadline).await;
+        }
+        let formatted = match with_claimed_context("", &context, "Claude") {
+            Ok(text) => text.strip_suffix("\n\n").unwrap_or(&text).to_owned(),
+            Err(_) => {
+                self.pending_hooks.remove(request_id);
+                self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+                return self.write_hook_pass(&native, request_id, deadline).await;
+            }
+        };
+        if formatted.trim().is_empty() || !self.hook_callback_is_live(request_id) {
+            self.pending_hooks.remove(request_id);
+            self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+            return self.write_hook_pass(&native, request_id, deadline).await;
+        }
+        // Recheck the monotonic deadline, cancellation (pending-map membership),
+        // generation and exact invocation-to-turn binding immediately before
+        // the only native write that can carry additionalContext.
+        if !self.hook_callback_is_live(request_id) {
+            self.pending_hooks.remove(request_id);
+            self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+            return self.write_hook_pass(&native, request_id, deadline).await;
+        }
+        let response = HookCallbackResponse::with_context(formatted);
+        match native
+            .respond_hook_callback(request_id, response, deadline)
+            .await
+        {
+            Ok(()) => {}
+            Err(error) if native_no_write(&error.code) => {
+                self.pending_hooks.remove(request_id);
+                self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+                return self.write_hook_pass(&native, request_id, deadline).await;
+            }
+            Err(_) => {
+                self.pending_hooks.remove(request_id);
+                self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+                return Err(Error::new(
+                    "unknown",
+                    "Claude hook response write outcome is unknown",
+                ));
+            }
+        }
+        let Some(pending) = self.pending_hooks.remove(request_id) else {
+            return Err(Error::new(
+                "unknown",
+                "Claude hook binding disappeared after the native response write",
+            ));
+        };
+        if !self.hook_context_was_claimed(&context, &pending) {
+            self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
+            return Err(Error::new(
+                "unknown",
+                "Claude hook context was written without an exact live binding",
+            ));
+        }
+        self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
+        let Some(session_id) = self.status.session_id.as_deref() else {
+            return Err(Error::new(
+                "unknown",
+                "Claude session identity disappeared after the hook response write",
+            ));
+        };
+        let outcome = ContextOutcome {
+            mechanism: "hook_callback".to_owned(),
+            application_point: InjectPoint::TurnSafePoint,
+            consumer_id: pending.consumer_id.clone(),
+        };
+        let context_outcome = serde_json::to_value(outcome)
+            .map_err(|_| Error::new("internal", "Claude context outcome could not be encoded"))?;
+        let data = json!({
+            "turn_id": pending.turn_id,
+            "consumer_id": pending.consumer_id,
+            "context_outcome": context_outcome,
+        });
+        let native_id = format!(
+            "claude:{session_id}:{}:hook.before_tool:{}",
+            pending.turn_id, pending.consumer_id
+        );
+        self.commit_event("hook.before_tool", native_id, data).await
+    }
+
+    fn hook_callback_is_live(&self, request_id: &str) -> bool {
+        let Some(pending) = self.pending_hooks.get(request_id) else {
+            return false;
+        };
+        Instant::now() < pending.deadline
+            && pending.generation == self.generation
+            && self.status.active_turn_id.as_deref() == Some(pending.turn_id.as_str())
+            && self.status.failure.is_none()
+            && !self.status.stopped
+            && self
+                .tool_use_turns
+                .get(&pending.tool_use_id)
+                .is_some_and(|binding| {
+                    binding.turn_id == pending.turn_id
+                        && binding.hook_state == HookConsumerState::InFlight
+                        && binding.active_consumer_id.as_deref()
+                            == Some(pending.consumer_id.as_str())
+                })
+    }
+
+    fn hook_context_was_claimed(
+        &self,
+        context: &[ContextItem],
+        pending: &PendingHookCallback,
+    ) -> bool {
+        !context.is_empty()
+            && pending.generation == self.generation
+            && self
+                .tool_use_turns
+                .get(&pending.tool_use_id)
+                .is_some_and(|binding| {
+                    binding.turn_id == pending.turn_id
+                        && binding.hook_state == HookConsumerState::InFlight
+                        && binding.active_consumer_id.as_deref()
+                            == Some(pending.consumer_id.as_str())
+                })
+            && pending.consumer_id.trim() != ""
+    }
+
+    fn finish_tool_use_hook(&mut self, tool_use_id: &str, consumer_id: &str) {
+        if let Some(binding) = self.tool_use_turns.get_mut(tool_use_id)
+            && binding.active_consumer_id.as_deref() == Some(consumer_id)
+        {
+            binding.hook_state = HookConsumerState::Finished;
+            binding.active_consumer_id = None;
+        }
+    }
+
+    fn finish_available_tool_use_hook(&mut self, tool_use_id: &str) {
+        if let Some(binding) = self.tool_use_turns.get_mut(tool_use_id)
+            && binding.hook_state == HookConsumerState::Available
+        {
+            binding.hook_state = HookConsumerState::Finished;
+        }
+    }
+
+    async fn write_hook_pass(
+        &self,
+        native: &ClaudeClient,
+        request_id: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
+        match native
+            .respond_hook_callback(request_id, HookCallbackResponse::default(), deadline)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if native_no_write(&error.code) => Ok(()),
+            Err(_) => Err(Error::new(
+                "unknown",
+                "Claude hook pass response outcome is unknown",
+            )),
+        }
+    }
+
+    fn cancel_hook_callback(&mut self, record: &Value) {
+        let Ok(cancel) = serde_json::from_value::<ControlCancelRequest>(record.clone()) else {
+            return;
+        };
+        if cancel.kind != "control_cancel_request" || cancel.request_id.trim().is_empty() {
+            return;
+        }
+        if let Some(pending) = self.pending_hooks.remove(&cancel.request_id) {
+            pending.task.abort();
+            self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
+        }
+    }
+
+    fn cancel_hook_callbacks_for_turn(&mut self, turn_id: &str) {
+        let request_ids: Vec<String> = self
+            .pending_hooks
+            .iter()
+            .filter(|(_, pending)| pending.turn_id == turn_id)
+            .map(|(request_id, _)| request_id.clone())
+            .collect();
+        for request_id in request_ids {
+            if let Some(pending) = self.pending_hooks.remove(&request_id) {
+                pending.task.abort();
+                self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
+            }
+        }
+    }
+
+    fn cancel_all_hook_callbacks(&mut self) {
+        let pending_hooks: Vec<PendingHookCallback> = self
+            .pending_hooks
+            .drain()
+            .map(|(_, pending)| pending)
+            .collect();
+        for pending in pending_hooks {
+            pending.task.abort();
+            self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
+        }
+    }
+
     /// One CLI `control_request`: only the `can_use_tool` permission ask is
     /// connected. It binds to the exact active turn and opens a retained
     /// request under the CLI's exact native `request_id`; any other subtype
     /// is an explicit gap, as before.
     async fn observe_control_request(&mut self, record: &Value) -> Result<()> {
+        if record
+            .get("request")
+            .and_then(|request| request.get("subtype"))
+            .and_then(Value::as_str)
+            == Some("hook_callback")
+        {
+            return self.observe_hook_callback(record).await;
+        }
         let body = record
             .get("request")
             .cloned()
@@ -1564,6 +2057,7 @@ impl EventProcessor {
                 .record_gap("Claude terminal record did not match the exact active turn")
                 .await;
         };
+        self.cancel_hook_callbacks_for_turn(&turn_id);
         // Unanswered asks die with their turn: close them before the terminal
         // commit, without a command binding.
         self.close_pending_requests(Some(&turn_id)).await?;
@@ -1611,6 +2105,8 @@ impl EventProcessor {
         });
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
+        self.tool_use_turns.clear();
+        self.tool_use_tracking_fenced = false;
         self.publish_now();
         self.commit_event("turn.completed", native_id, data).await?;
         Ok(())
@@ -1634,6 +2130,7 @@ impl EventProcessor {
 
     async fn note_frames_drained(&mut self) {
         self.frames_drained = true;
+        self.cancel_all_hook_callbacks();
         if self.planned_stop || self.closed {
             // A sticky record-local fault survives planned stop: flush its
             // gap before end-stop settlement instead of erasing it.
@@ -1789,7 +2286,7 @@ impl EventProcessor {
             generation: self.generation,
             harness: "Claude",
             id_prefix: "claude",
-            families: &["session", "turn", "message", "request"],
+            families: &["session", "turn", "message", "request", "tool"],
             writes_blocked: &mut self.writes_blocked,
             gap_reported: &mut self.gap_reported,
             gap_number: &mut self.gap_number,
@@ -1798,6 +2295,38 @@ impl EventProcessor {
             failure: &mut self.status.failure,
         }
     }
+}
+
+fn is_main_thread_assistant(record: &Value) -> bool {
+    let message = record.get("message");
+    [
+        record.get("parent_tool_use_id"),
+        record.get("agent_id"),
+        message.and_then(|message| message.get("parent_tool_use_id")),
+        message.and_then(|message| message.get("agent_id")),
+    ]
+    .into_iter()
+    .all(|field| field.is_none_or(Value::is_null))
+}
+
+fn assistant_prompt_id(record: &Value) -> Option<String> {
+    record
+        .get("prompt_id")
+        .or_else(|| {
+            record
+                .get("message")
+                .and_then(|message| message.get("prompt_id"))
+        })
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn hook_deadline(deadline_ms: Option<u64>) -> Instant {
+    let timeout_ms = deadline_ms
+        .unwrap_or(HOOK_CALLBACK_TIMEOUT_MS)
+        .min(HOOK_CALLBACK_TIMEOUT_MS);
+    Instant::now() + Duration::from_millis(timeout_ms)
 }
 
 #[cfg(test)]

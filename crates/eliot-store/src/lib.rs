@@ -12,6 +12,7 @@ mod scripts;
 pub use attribution::WhoWorkerRow;
 pub use capacity::{RecordedProcess, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, history_expired};
+pub use context::ContextDispatch;
 pub use coordination::{NoticeClaim, NoticeKind, NoticePending, NoticeState};
 pub use goals::{
     GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundCommit, GoalRoundCommitResult,
@@ -91,6 +92,7 @@ macro_rules! db {
 mod admission;
 mod attribution;
 mod command_children;
+mod context;
 mod coordination;
 mod dispatch;
 mod git;
@@ -490,9 +492,35 @@ impl Store {
                 events: change.events,
             });
         }
-        let result = self.dispatch_inner(id, now, None);
+        let result = self.dispatch_inner(id, now, None, None);
         self.fault_on_persistence_error(&result);
         result
+    }
+
+    /// Dispatch a normal send and claim its FIFO next_input context in the
+    /// same transaction. The returned command retains its original args.
+    pub fn dispatch_with_context(&mut self, id: &str, now: i64) -> Result<Change<ContextDispatch>> {
+        self.ensure_writer_healthy()?;
+        let command = self
+            .get_command(id)?
+            .ok_or_else(|| Error::new("not_found", format!("command {id} was not found")))?;
+        if command.verb != "send" {
+            return Err(Error::new(
+                "bad_state",
+                "context can be claimed only with a send dispatch",
+            ));
+        }
+        let mut context_items = Vec::new();
+        let result = self.dispatch_inner(id, now, None, Some(&mut context_items));
+        self.fault_on_persistence_error(&result);
+        let change = result?;
+        Ok(Change {
+            value: ContextDispatch {
+                command: change.value,
+                context_items,
+            },
+            events: change.events,
+        })
     }
 
     /// Append the verified store to an unchanged launch target in the same
@@ -505,7 +533,7 @@ impl Store {
         binding: &NativeStoreBinding,
     ) -> Result<Change<Command>> {
         self.ensure_writer_healthy()?;
-        let result = self.dispatch_inner(id, now, Some((expected_agent, binding)));
+        let result = self.dispatch_inner(id, now, Some((expected_agent, binding)), None);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -813,7 +841,7 @@ impl Store {
         ));
         let mut dispatched_statement = tx
             .prepare(
-                "SELECT id, target, generation FROM commands
+                "SELECT id, target, generation, verb, outcome FROM commands
                  WHERE state = 'dispatched' ORDER BY created_at, rowid",
             )
             .map_err(sql_error)?;
@@ -823,6 +851,8 @@ impl Store {
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<i64>>(1)?,
                     row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             })
             .map_err(sql_error)?;
@@ -835,8 +865,13 @@ impl Store {
         let mut events = Vec::new();
         recover_workspaces(&tx, now, &mut events)?;
         Self::recover_lost_native_children_tx(&tx, now, &mut events)?;
-        for (command_id, target, generation) in dispatched_commands {
-            let outcome = json!({"reason": "daemon_restart"});
+        for (command_id, target, generation, verb, encoded_outcome) in dispatched_commands {
+            let previous_outcome = encoded_outcome.as_deref().map(decode_json).transpose()?;
+            let outcome = if verb == "inject" {
+                context::unknown_claim_outcome(previous_outcome.as_ref(), "daemon_restart")
+            } else {
+                json!({"reason": "daemon_restart"})
+            };
             update_command_state(
                 &tx,
                 &command_id,
@@ -3357,7 +3392,7 @@ fn source_families_for_harness(harness: &str) -> Result<&'static [&'static str]>
     match harness {
         "codex" => Ok(&["session", "turn", "message", "tool", "request"]),
         "muse" => Ok(&["session", "turn", "message", "request"]),
-        "claude" => Ok(&["session", "turn", "message", "request"]),
+        "claude" => Ok(&["session", "turn", "message", "tool", "request"]),
         "opencode" => Ok(&["session", "turn", "message", "request"]),
         "antigravity" => Ok(&["session", "turn", "message", "tool"]),
         other => Err(Error::new(
@@ -3372,7 +3407,7 @@ fn family_for_kind(kind: &str) -> Result<&'static str> {
         "session.ready" | "session.ended" => Ok("session"),
         "turn.started" | "turn.completed" => Ok("turn"),
         "message.completed" => Ok("message"),
-        "tool.started" | "tool.completed" => Ok("tool"),
+        "tool.started" | "tool.completed" | "hook.before_tool" => Ok("tool"),
         "request.opened" | "request.resolved" | "request.closed" => Ok("request"),
         other => Err(Error::new(
             "unsupported",
@@ -3949,14 +3984,18 @@ fn terminalize_generation_commands(
 ) -> Result<()> {
     let mut statement = tx
         .prepare(
-            "SELECT id, verb FROM commands
+            "SELECT id, verb, outcome FROM commands
              WHERE target = ?1 AND generation = ?2 AND state = 'dispatched'
              ORDER BY created_at, rowid",
         )
         .map_err(sql_error)?;
     let rows = statement
         .query_map(params![agent, generation], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })
         .map_err(sql_error)?;
     let mut dispatched = Vec::new();
@@ -3964,7 +4003,7 @@ fn terminalize_generation_commands(
         dispatched.push(row.map_err(sql_error)?);
     }
     drop(statement);
-    for (id, verb) in dispatched {
+    for (id, verb, encoded_outcome) in dispatched {
         // A committed session.ended boundary proves the session stopped, but it
         // does not bind that end to an in-flight stop RPC. Keep a dispatched
         // stop pending for its exact agent.stop reply. Generic loss/restart
@@ -3973,7 +4012,8 @@ fn terminalize_generation_commands(
         if preserve_dispatched_stop && verb == "stop" {
             continue;
         }
-        let outcome = json!({"reason": reason});
+        let previous = encoded_outcome.as_deref().map(decode_json).transpose()?;
+        let outcome = context::unknown_claim_outcome(previous.as_ref(), reason);
         update_command_state(tx, &id, CommandState::Unknown, Some(&outcome), None, now)?;
     }
     for id in pending_command_ids(tx, agent, generation)? {

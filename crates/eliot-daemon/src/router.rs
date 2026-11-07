@@ -1,6 +1,7 @@
 mod attribution;
 mod auth;
 mod command;
+mod context;
 mod coordination;
 mod goals;
 mod hierarchy;
@@ -472,7 +473,7 @@ impl Router {
                 .insert(admission.command.id.clone());
         }
 
-        if admission.is_new {
+        if admission.is_new && admission.command.verb != "inject" {
             self.schedule_admission(&admission);
         }
         self.signal_progress();
@@ -1239,7 +1240,7 @@ impl Router {
             normalize_resume(&mut request)?;
         } else if matches!(
             request.verb.as_str(),
-            "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
+            "send" | "steer" | "inject" | "interrupt" | "approve" | "deny" | "answer"
         ) {
             validate_plugin_command_args(&request)?;
         }
@@ -3887,7 +3888,7 @@ fn validate_plugin_command_args(request: &SubmitCommand) -> Result<()> {
         .args
         .as_object()
         .ok_or_else(|| Error::new("invalid", "command args must be an object"))?;
-    for reserved in ["expected_turn_id", "turn_id", "request_id"] {
+    for reserved in ["expected_turn_id", "turn_id", "request_id", "context_items"] {
         if args.contains_key(reserved) {
             return Err(Error::new(
                 "invalid",

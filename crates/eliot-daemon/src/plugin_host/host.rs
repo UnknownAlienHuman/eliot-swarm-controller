@@ -9,10 +9,15 @@ use crate::common::{now_ms, secure_eq, valid_environment_name};
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
 use eliot_core::{
-    Agent, AgentStartParams, Command, Error, Result, SecretPolicy, SourceBatch, SourceGap,
-    SourceGapAck, StderrSource,
+    Agent, AgentStartParams, Command, ContextItem, Error, Result, SecretPolicy, SourceBatch,
+    SourceGap, SourceGapAck, StderrSource,
 };
-use eliot_plugin::{PluginManifest, StderrCapture, StderrView, spawn_stderr, sync::LockExt};
+use eliot_plugin::{
+    PluginManifest, StderrCapture, StderrView,
+    protocol::{HookEvent, HookResponse},
+    spawn_stderr,
+    sync::LockExt,
+};
 use serde_json::{Map, Value, json};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1238,19 +1243,9 @@ async fn run_agent_inner(
                     } => {
                         last_command_id = command.id.clone();
                         let verb = command.verb.clone();
-                        let result = match plugin_command_args(&command) {
+                        let result = match agent_command_params(&agent, &command, dispatch_seq) {
                             Err(error) => Err(error),
-                            Ok(args) => {
-                                let params = json!({
-                                    "agent_id": agent.id,
-                                    "generation": agent.generation,
-                                    "command_id": command.id,
-                                    "verb": verb.clone(),
-                                    "turn_id": command.turn_id,
-                                    "request_id": command.request_id,
-                                    "args": args,
-                                    "dispatch_seq": dispatch_seq,
-                                });
+                            Ok(params) => {
                                 client.call("agent.command", params, deadline()).await
                                     .map_err(|error| redact_native_error(error, &source_credentials))
                                     .and_then(|mut value| {
@@ -1570,10 +1565,11 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                 | "source.state"
                 | "process.put"
                 | "child"
+                | "hook.event"
         ) {
             Err(Error::new(
                 "unsupported",
-                "plugin host only accepts events.put, source.gap, source.handoff, source.health, source.state, process.put, and child",
+                "plugin host only accepts events.put, source.gap, source.handoff, source.health, source.state, process.put, child, and hook.event",
             ))
         } else {
             let mut params = request.params;
@@ -1867,6 +1863,58 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                                 request_deadline,
                             )
                             .await
+                        }
+                    }
+                    "hook.event" => {
+                        if observation.is_some() {
+                            Err(Error::new(
+                                "not_allowed",
+                                "observer callbacks cannot claim turn context",
+                            ))
+                        } else {
+                            match serde_json::from_value::<HookEvent>(params) {
+                                Err(_) => {
+                                    Err(Error::new("invalid", "hook.event params are malformed"))
+                                }
+                                Ok(event)
+                                    if event.hook != "before_tool"
+                                        || event.turn_id.trim().is_empty()
+                                        || event.consumer_id.trim().is_empty() =>
+                                {
+                                    Err(Error::new(
+                                        "invalid",
+                                        "hook.event requires before_tool with an exact turn and consumer",
+                                    ))
+                                }
+                                Ok(event) => match timeout_at(request_deadline, store.lock()).await
+                                {
+                                    Ok(mut store) => match store.claim_turn_safe_point_context(
+                                        &agent_id,
+                                        generation,
+                                        &event.turn_id,
+                                        &event.consumer_id,
+                                        now_ms(),
+                                    ) {
+                                        Ok(change) => {
+                                            bus.publish(&change.events);
+                                            serde_json::to_value(HookResponse {
+                                                context: change.value,
+                                            })
+                                            .map_err(|_| {
+                                                Error::new(
+                                                    "internal",
+                                                    "hook context response could not be encoded",
+                                                )
+                                            })
+                                        }
+                                        Err(error) => Err(error),
+                                    },
+                                    Err(_) => Err(Error::new(
+                                        "busy",
+                                        "hook context claim Store deadline elapsed",
+                                    )),
+                                },
+                            }
                         }
                     }
                     _ => Err(Error::new(
@@ -2179,6 +2227,40 @@ fn plugin_command_args(command: &Command) -> Result<Value> {
         }
     }
     Ok(Value::Object(args))
+}
+
+/// Build the `agent.command` wire params for one dispatched command, relaying
+/// Store-committed FIFO `next_input` items as top-level `context` (omitted
+/// when empty). The reserved `context_items` member is stripped so `args`
+/// stays the original send input.
+fn agent_command_params(
+    agent: &Agent,
+    command: &Command,
+    dispatch_seq: Option<i64>,
+) -> Result<Value> {
+    let mut args = plugin_command_args(command)?;
+    let context = args
+        .as_object_mut()
+        .and_then(|object| object.remove("context_items"))
+        .map(serde_json::from_value::<Vec<ContextItem>>)
+        .transpose()
+        .map_err(|_| Error::new("source_integrity", "send context_items are malformed"))?
+        .unwrap_or_default();
+    let mut params = json!({
+        "agent_id": agent.id,
+        "generation": agent.generation,
+        "command_id": command.id,
+        "verb": command.verb,
+        "turn_id": command.turn_id,
+        "request_id": command.request_id,
+        "args": args,
+        "dispatch_seq": dispatch_seq,
+    });
+    if !context.is_empty() {
+        params["context"] = serde_json::to_value(&context)
+            .map_err(|_| Error::new("internal", "context items could not be encoded"))?;
+    }
+    Ok(params)
 }
 
 fn validate_agent_command_result(value: Value, verb: &str) -> Result<Value> {

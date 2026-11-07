@@ -67,6 +67,10 @@ impl Store {
             json!({"command_id": id, "state": state_name, "outcome": outcome}),
         )?);
 
+        if record.command.verb == "send" && state != CommandState::Applied {
+            context::settle_send_claims_tx(&tx, &record, state, now, &mut events)?;
+        }
+
         if matches!(record.command.verb.as_str(), "attach" | "detach") {
             observer::settle_failure(&tx, &record.command, now, &mut events)?;
         }
@@ -636,7 +640,8 @@ pub(super) fn transition_lost_tx(
 
     let dispatched = command_ids_in_state(tx, agent_num, generation, "dispatched")?;
     for command_id in dispatched {
-        let outcome = json!({"reason": reason});
+        let prior = load_command_record(tx, &command_id)?.and_then(|record| record.command.outcome);
+        let outcome = context::unknown_claim_outcome(prior.as_ref(), reason);
         update_command_state(
             tx,
             &command_id,
@@ -817,7 +822,9 @@ fn stop_agent_tx(
         if dispatched_id == command_id {
             continue;
         }
-        let outcome = json!({"reason": "generation_stopped"});
+        let prior =
+            load_command_record(tx, &dispatched_id)?.and_then(|record| record.command.outcome);
+        let outcome = context::unknown_claim_outcome(prior.as_ref(), "generation_stopped");
         update_command_state(
             tx,
             &dispatched_id,

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
+use eliot_core::ContextItem;
 pub use eliot_core::limits::{
     MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES, MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES,
 };
@@ -194,6 +195,31 @@ pub struct AgentCommandParams {
     pub request_id: Option<String>,
     #[serde(default)]
     pub dispatch_seq: Option<i64>,
+    /// FIFO `next_input` items claimed for this send. Empty (omitted) when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<ContextItem>,
+}
+
+/// Plugin-initiated system-context callback on the authenticated instance channel.
+/// The connection credential binds the Agent generation; the callback carries no identity.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookEvent {
+    /// Native hook point; currently only `before_tool`.
+    pub hook: String,
+    /// Exact native turn requesting context.
+    pub turn_id: String,
+    /// Opaque native consumer identity for this callback.
+    pub consumer_id: String,
+}
+
+/// Synchronous hook response: already-claimed context for this callback only.
+/// Empty means no context; a late response is discarded, never replayed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookResponse {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<ContextItem>,
 }
 
 #[derive(Deserialize)]

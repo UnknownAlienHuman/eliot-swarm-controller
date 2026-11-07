@@ -5,7 +5,7 @@ use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, MAX_TEXT_BYTES,
     PeerClient,
     native_transport::{NativeChild, NativeLaunch, StreamState, encode_frame},
-    session::{native_no_write, register_native_process, unknown_snapshot},
+    session::{native_no_write, register_native_process, unknown_snapshot, with_claimed_context},
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -275,7 +275,8 @@ impl Session {
                 "Antigravity session readiness is unresolved",
             ));
         }
-        let encoded = encode_frame("Antigravity", &UserInput::new(text))?;
+        let combined = with_claimed_context(text, &params.context, "Antigravity")?;
+        let encoded = encode_frame("Antigravity", &UserInput::new(&combined))?;
         let turn = format!("agy-{}", ulid::Ulid::new());
         let associated = self
             .state
