@@ -154,6 +154,21 @@ impl Session {
             TIMEOUT,
         )
         .await?;
+        // The continuous ordered event processor must own the frame
+        // channel before any fenced dispatch: the load reply (and its
+        // preceding history) is consumed here, in wire order. For a
+        // fresh session the conversation id binds after creation; for
+        // resume it binds before load dispatch below.
+        let frames = self
+            .frames
+            .take()
+            .ok_or_else(|| Error::new("internal", "Antigravity reader disappeared"))?;
+        self.task = Some(events::spawn(
+            frames,
+            self.stream.clone(),
+            self.state.clone(),
+            self.client.clone(),
+        ));
         let deadline = Instant::now() + TIMEOUT;
         let init_value = self
             .client
@@ -318,16 +333,6 @@ impl Session {
             state.conversation = self.conversation.clone();
             state.ready(&self.scope, effective.clone()).await?;
         }
-        let frames = self
-            .frames
-            .take()
-            .ok_or_else(|| Error::new("internal", "Antigravity reader disappeared"))?;
-        self.task = Some(events::spawn(
-            frames,
-            self.stream.clone(),
-            self.state.clone(),
-            self.client.clone(),
-        ));
         self.ready = true;
         Ok(
             json!({"agent_id": self.agent, "generation": self.generation,

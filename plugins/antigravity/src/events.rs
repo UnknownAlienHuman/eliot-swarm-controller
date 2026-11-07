@@ -613,8 +613,16 @@ impl State {
     pub async fn lose(&mut self, reason: &str) {
         self.source_unknown = true;
         self.clear_fenced();
-        self.loading = false;
-        self.load_guard = None;
+        if self.loading {
+            // Stream loss during load: publish the failure to the load
+            // waiter instead of letting startup hang to its deadline.
+            self.loading = false;
+            self.load_guard = None;
+            let _ = self.load_tx.send_replace(Some(Err(Error::new(
+                "unknown",
+                "Antigravity ACP load failed with the stream",
+            ))));
+        }
         if let Some(pending) = self.pending.as_ref() {
             self.settlement = Some((pending.turn.clone(), "unknown".to_owned()));
         }
