@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 27;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 28;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
