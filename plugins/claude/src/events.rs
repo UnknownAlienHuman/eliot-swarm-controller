@@ -746,7 +746,9 @@ async fn dispatch_control(
             processor.planned_stop = true;
             processor.accept_frames = false;
             processor.cancel_all_hook_callbacks();
-            processor.fail_pending_steer(SteerOutcome::Unknown(
+            // Still-queued here proves never written (same as cancel): the
+            // serial actor settles every taken steer before this control runs.
+            processor.fail_pending_steer(SteerOutcome::Rejected(
                 "Claude stopped before PreToolUse confirmed steer".to_owned(),
             ));
             publish(processor, status);
@@ -769,7 +771,7 @@ async fn dispatch_control(
         Control::Close { reply } => {
             processor.closed = true;
             processor.cancel_all_hook_callbacks();
-            processor.fail_pending_steer(SteerOutcome::Unknown(
+            processor.fail_pending_steer(SteerOutcome::Rejected(
                 "Claude event task closed before PreToolUse confirmed steer".to_owned(),
             ));
             processor.finish_pending_end_stop().await;
@@ -2644,9 +2646,9 @@ impl EventProcessor {
         self.cancel_all_hook_callbacks();
         // No hook will ever confirm a queued steer after the drain: planned
         // stop already settled it at BeginStop; an unplanned loss settles it
-        // unknown here, never replayed.
+        // rejected here (still queued proves never written), never replayed.
         if !self.planned_stop && !self.closed {
-            self.fail_pending_steer(SteerOutcome::Unknown(
+            self.fail_pending_steer(SteerOutcome::Rejected(
                 "Claude event stream was lost before PreToolUse confirmed steer".to_owned(),
             ));
         }
@@ -2769,7 +2771,7 @@ impl EventProcessor {
             self.settle_pending(pending, TurnOutcome::Unknown);
         }
         // BeginStop already settled this; the take is a no-op then.
-        self.fail_pending_steer(SteerOutcome::Unknown(
+        self.fail_pending_steer(SteerOutcome::Rejected(
             "Claude stopped before PreToolUse confirmed steer".to_owned(),
         ));
         self.status.stopped = true;
