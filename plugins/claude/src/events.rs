@@ -8,8 +8,8 @@ use eliot_plugin::{
     protocol::{HookEvent, HookResponse},
     session::{
         EVENT_DEADLINE, StreamSource, approval_reply_args, attach_final_text, native_no_write,
-        next_input_outcomes,
-        rejected_control, request_event_id, unknown_control, with_claimed_context,
+        next_input_outcomes, rejected_control, request_event_id, unknown_control,
+        with_claimed_context,
     },
 };
 use serde::Serialize;
@@ -1501,11 +1501,56 @@ impl EventProcessor {
         let deadline = pending.deadline;
         let tool_use_id = pending.tool_use_id.clone();
         let consumer_id = pending.consumer_id.clone();
-        let context = result.unwrap_or_default();
+        let context = match result {
+            Ok(context) => context,
+            Err(_) => {
+                self.pending_hooks.remove(request_id);
+                self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+                return self.write_hook_pass(&native, request_id, deadline).await;
+            }
+        };
         if context.is_empty() {
-            self.pending_hooks.remove(request_id);
-            self.finish_tool_use_hook(&tool_use_id, &consumer_id);
-            return self.write_hook_pass(&native, request_id, deadline).await;
+            if !self.hook_callback_is_live(request_id) {
+                self.pending_hooks.remove(request_id);
+                self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+                return self.write_hook_pass(&native, request_id, deadline).await;
+            }
+            match native
+                .respond_hook_callback(request_id, HookCallbackResponse::default(), deadline)
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if native_no_write(&error.code) => {
+                    self.pending_hooks.remove(request_id);
+                    self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.pending_hooks.remove(request_id);
+                    self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+                    return Err(Error::new(
+                        "unknown",
+                        "Claude hook pass response write outcome is unknown",
+                    ));
+                }
+            }
+            let Some(pending) = self.pending_hooks.remove(request_id) else {
+                return Err(Error::new(
+                    "unknown",
+                    "Claude hook binding disappeared after the native pass write",
+                ));
+            };
+            if !self.hook_empty_selection_was_claimed(&pending) {
+                self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
+                return Err(Error::new(
+                    "unknown",
+                    "Claude empty hook selection lost its exact callback binding",
+                ));
+            }
+            self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
+            return self
+                .commit_empty_hook_event(pending.turn_id, pending.consumer_id)
+                .await;
         }
         let formatted = match with_claimed_context("", &context, "Claude") {
             Ok(text) => text.strip_suffix("\n\n").unwrap_or(&text).to_owned(),
@@ -1624,6 +1669,42 @@ impl EventProcessor {
                             == Some(pending.consumer_id.as_str())
                 })
             && pending.consumer_id.trim() != ""
+    }
+
+    fn hook_empty_selection_was_claimed(&self, pending: &PendingHookCallback) -> bool {
+        pending.generation == self.generation
+            && self.status.active_turn_id.as_deref() == Some(pending.turn_id.as_str())
+            && self.status.failure.is_none()
+            && !self.status.stopped
+            && self
+                .tool_use_turns
+                .get(&pending.tool_use_id)
+                .is_some_and(|binding| {
+                    binding.turn_id == pending.turn_id
+                        && binding.hook_state == HookConsumerState::InFlight
+                        && binding.active_consumer_id.as_deref()
+                            == Some(pending.consumer_id.as_str())
+                })
+            && !pending.consumer_id.trim().is_empty()
+    }
+
+    async fn commit_empty_hook_event(
+        &mut self,
+        turn_id: String,
+        consumer_id: String,
+    ) -> Result<()> {
+        let Some(session_id) = self.status.session_id.as_deref() else {
+            return Err(Error::new(
+                "unknown",
+                "Claude session identity disappeared after the native pass write",
+            ));
+        };
+        let data = json!({
+            "turn_id": turn_id,
+            "consumer_id": consumer_id,
+        });
+        let native_id = format!("claude:{session_id}:{turn_id}:hook.before_tool:{consumer_id}");
+        self.commit_event("hook.before_tool", native_id, data).await
     }
 
     fn finish_tool_use_hook(&mut self, tool_use_id: &str, consumer_id: &str) {

@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) struct PendingCommandEvent {
     pub(super) command_id: String,
+    pub(super) state: CommandState,
     pub(super) data: Value,
 }
 
@@ -185,6 +186,7 @@ fn persist_turn_associated(
     ));
     let mut command_events = vec![PendingCommandEvent {
         command_id: command_id.to_owned(),
+        state: CommandState::Applied,
         data: json!({
             "command_id": command_id, "state": "applied", "outcome": outcome,
         }),

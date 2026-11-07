@@ -22,6 +22,15 @@ struct ContextClaim {
     application_point: InjectPoint,
 }
 
+struct ClaimedContextRecord {
+    command_id: String,
+    target: i64,
+    generation: i64,
+    turn_id: Option<String>,
+    state: CommandState,
+    claim: ContextClaim,
+}
+
 #[derive(Clone, Copy)]
 struct ContextConsumer<'a> {
     id: &'a str,
@@ -454,6 +463,7 @@ pub(super) fn apply_next_input_claims_tx(
         generation,
         consumer_id,
         InjectPoint::NextInput,
+        Some(turn_id),
     )?;
     let receipts = native_event
         .data
@@ -514,6 +524,7 @@ pub(super) fn settle_turn_safe_point_claims_tx(
         generation,
         &consumer_id,
         InjectPoint::TurnSafePoint,
+        Some(&turn_id),
     )?;
     let encoded_outcome = native_event.data.get("context_outcome");
     if claims.is_empty() {
@@ -523,6 +534,13 @@ pub(super) fn settle_turn_safe_point_claims_tx(
                 "hook.before_tool reports context without a matching Store claim",
             ));
         }
+        require_recorded_empty_safe_point_selection(
+            tx,
+            agent_num,
+            generation,
+            &turn_id,
+            &consumer_id,
+        )?;
         return Ok(Vec::new());
     }
     let outcome = encoded_outcome
@@ -547,7 +565,7 @@ pub(super) fn settle_turn_safe_point_claims_tx(
     let mut events = Vec::with_capacity(claims.len());
     for record in &claims {
         let claim = require_context_claim(record)?;
-        if record.command.turn_id.as_deref() != Some(turn_id.as_str()) {
+        if record.turn_id.as_deref() != Some(turn_id.as_str()) {
             return Err(Error::new(
                 "source_integrity",
                 "hook context claim does not match the reported turn",
@@ -559,6 +577,65 @@ pub(super) fn settle_turn_safe_point_claims_tx(
         )?);
     }
     Ok(events)
+}
+
+fn require_recorded_empty_safe_point_selection(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    turn_id: &str,
+    consumer_id: &str,
+) -> Result<()> {
+    let agent = load_agent_by_num(tx, agent_num)?
+        .ok_or_else(|| Error::new("not_found", "context target Agent was not found"))?;
+    if agent.generation != generation
+        || agent.active_turn.as_deref() != Some(turn_id)
+        || !matches!(agent.state, AgentState::Busy | AgentState::Waiting)
+    {
+        return Err(Error::new(
+            "stale_generation",
+            "empty context callback does not match the exact current turn",
+        ));
+    }
+
+    let principal = format!("agent:{}:{generation}", agent.id);
+    let payload = json!({
+        "agent_id": agent.id,
+        "generation": generation,
+        "hook": "before_tool",
+        "turn_id": turn_id,
+        "consumer_id": consumer_id,
+    });
+    let payload_digest = canonical::digest(&payload)?;
+    let Some((stored_principal, stored_method, stored_digest, stored_result)) =
+        write_binding(tx, consumer_id)?
+    else {
+        return Err(Error::new(
+            "source_integrity",
+            "hook.before_tool has no recorded empty context selection",
+        ));
+    };
+    if stored_principal != principal
+        || stored_method != "hook.event"
+        || stored_digest != payload_digest
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "empty context selection does not match its exact callback binding",
+        ));
+    }
+    let marker = decode_json(&stored_result)?;
+    let empty_marker = json!({
+        "count": 0,
+        "command_ids_digest": canonical::digest(&json!([]))?,
+    });
+    if marker != empty_marker {
+        return Err(Error::new(
+            "source_integrity",
+            "hook.before_tool omitted the receipt for a nonempty context selection",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn settle_send_claims_tx(
@@ -585,18 +662,13 @@ pub(super) fn settle_send_claims_tx(
         generation,
         &send.command.id,
         InjectPoint::NextInput,
+        send.command.turn_id.as_deref(),
     )? {
-        if !matches!(
-            record.state,
-            CommandState::Dispatched | CommandState::Unknown
-        ) {
-            continue;
-        }
         let claim = require_context_claim(&record)?;
         let outcome = json!({"claim": claim, "reason": "consumer_input_unconfirmed"});
         update_command_state(
             tx,
-            &record.command.id,
+            &record.command_id,
             context_state,
             Some(&outcome),
             None,
@@ -609,8 +681,12 @@ pub(super) fn settle_send_claims_tx(
             &format!("command.{state_name}"),
             Some(target),
             Some(generation),
-            &record.command.id,
-            json!({"command_id": record.command.id, "state": state_name, "outcome": outcome}),
+            &record.command_id,
+            json!({
+                "command_id": record.command_id,
+                "state": state_name,
+                "outcome": outcome,
+            }),
         )?);
     }
     Ok(())
@@ -636,6 +712,7 @@ pub(super) fn cancel_turn_safe_point_tx(
         )?;
         events.push(super::native_events::PendingCommandEvent {
             command_id: command_id.clone(),
+            state: CommandState::Cancelled,
             data: json!({
                 "command_id": command_id,
                 "state": "cancelled",
@@ -658,6 +735,7 @@ pub(super) fn cancel_turn_safe_point_tx(
         )?;
         events.push(super::native_events::PendingCommandEvent {
             command_id: command_id.clone(),
+            state: CommandState::Unknown,
             data: json!({
                 "command_id": command_id,
                 "state": "unknown",
@@ -802,35 +880,91 @@ fn claimed_context_commands(
     generation: i64,
     consumer_id: &str,
     point: InjectPoint,
-) -> Result<Vec<CommandRecord>> {
-    let mut statement = tx
-        .prepare(
-            "SELECT id FROM commands
-             WHERE target = ?1 AND generation = ?2 AND verb = 'inject'
-               AND state IN ('dispatched', 'unknown')
-             ORDER BY created_at, rowid",
+    turn_id: Option<&str>,
+) -> Result<Vec<ClaimedContextRecord>> {
+    let (sql, required_turn_id) = match point {
+        InjectPoint::NextInput => (
+            "SELECT c.id, c.turn_id, c.state, c.outcome
+             FROM commands AS c INDEXED BY commands_target
+             WHERE c.target = ?1 AND c.generation = ?2 AND c.verb = 'inject'
+               AND c.state IN ('dispatched', 'unknown') AND c.turn_id IS NULL
+               AND json_extract(c.outcome, '$.claim.consumer_id') = ?3
+               AND json_extract(c.outcome, '$.claim.application_point') = 'next_input'
+               AND EXISTS(
+                   SELECT 1 FROM commands AS send
+                   WHERE send.id = ?3 AND send.target = ?1 AND send.generation = ?2
+                     AND send.verb = 'send' AND send.turn_id IS ?4
+               )
+             ORDER BY c.created_at, c.rowid",
+            false,
+        ),
+        InjectPoint::TurnSafePoint => (
+            "SELECT c.id, c.turn_id, c.state, c.outcome
+             FROM commands AS c INDEXED BY commands_target
+             WHERE c.target = ?1 AND c.generation = ?2 AND c.verb = 'inject'
+               AND c.state IN ('dispatched', 'unknown') AND c.turn_id = ?4
+               AND json_extract(c.outcome, '$.claim.consumer_id') = ?3
+               AND json_extract(c.outcome, '$.claim.application_point') = 'turn_safe_point'
+             ORDER BY c.created_at, c.rowid",
+            true,
+        ),
+    };
+    if required_turn_id && turn_id.is_none() {
+        return Err(Error::new(
+            "source_integrity",
+            "turn-safe-point claim lookup has no exact turn",
+        ));
+    }
+    let mut statement = tx.prepare(sql).map_err(sql_error)?;
+    let rows = statement
+        .query_map(
+            params![agent_num, generation, consumer_id, turn_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
         )
         .map_err(sql_error)?;
-    let rows = statement
-        .query_map(params![agent_num, generation], |row| {
-            row.get::<_, String>(0)
-        })
-        .map_err(sql_error)?;
-    let mut ids = Vec::new();
-    for row in rows {
-        ids.push(row.map_err(sql_error)?);
-    }
-    drop(statement);
     let mut claims = Vec::new();
-    for id in ids {
-        let record = load_command_record(tx, &id)?
-            .ok_or_else(|| Error::new("source_integrity", "context claim disappeared"))?;
-        let Some(claim) = context_claim(record.command.outcome.as_ref())? else {
-            continue;
+    for row in rows {
+        let (command_id, stored_turn_id, state, encoded_outcome) = row.map_err(sql_error)?;
+        let state = match state.as_str() {
+            "dispatched" => CommandState::Dispatched,
+            "unknown" => CommandState::Unknown,
+            _ => {
+                return Err(Error::new(
+                    "source_integrity",
+                    "context claim query returned an invalid state",
+                ));
+            }
         };
-        if claim.consumer_id == consumer_id && claim.application_point == point {
-            claims.push(record);
+        let encoded_outcome = encoded_outcome
+            .ok_or_else(|| Error::new("source_integrity", "context claim has no stored outcome"))?;
+        let outcome = decode_json(&encoded_outcome)?;
+        let claim = context_claim(Some(&outcome))?.ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "context claim has no durable claim marker",
+            )
+        })?;
+        if claim.consumer_id != consumer_id || claim.application_point != point {
+            return Err(Error::new(
+                "source_integrity",
+                "context claim metadata differs from its indexed selection",
+            ));
         }
+        claims.push(ClaimedContextRecord {
+            command_id,
+            target: agent_num,
+            generation,
+            turn_id: stored_turn_id,
+            state,
+            claim,
+        });
     }
     Ok(claims)
 }
@@ -892,32 +1026,28 @@ fn context_claim(outcome: Option<&Value>) -> Result<Option<ContextClaim>> {
         .map_err(|_| Error::new("source_integrity", "persisted context claim is malformed"))
 }
 
-fn require_context_claim(record: &CommandRecord) -> Result<ContextClaim> {
-    if record.command.verb != "inject"
-        || !matches!(
-            record.state,
-            CommandState::Dispatched | CommandState::Unknown
-        )
-    {
+fn require_context_claim(record: &ClaimedContextRecord) -> Result<ContextClaim> {
+    if !matches!(
+        record.state,
+        CommandState::Dispatched | CommandState::Unknown
+    ) {
         return Err(Error::new(
             "bad_state",
             "context command is not an unsettled consumer claim",
         ));
     }
-    context_claim(record.command.outcome.as_ref())?
-        .ok_or_else(|| Error::new("source_integrity", "context command has no durable claim"))
+    Ok(record.claim.clone())
 }
 
 fn validate_context_receipt(
-    record: &CommandRecord,
+    record: &ClaimedContextRecord,
     generation: i64,
     turn_id: &str,
     claim: &ContextClaim,
     outcome: &ContextOutcome,
 ) -> Result<()> {
-    if record.command.generation != Some(generation)
+    if record.generation != generation
         || record
-            .command
             .turn_id
             .as_deref()
             .is_some_and(|stored| stored != turn_id)
@@ -936,24 +1066,26 @@ fn validate_context_receipt(
 
 fn validate_context_consumer_tx(
     tx: &Transaction<'_>,
-    record: &CommandRecord,
+    record: &ClaimedContextRecord,
     generation: i64,
     turn_id: &str,
     claim: &ContextClaim,
 ) -> Result<()> {
-    let target = record
-        .target
-        .ok_or_else(|| Error::new("source_integrity", "context claim has no Agent target"))?;
+    let target = record.target;
     match claim.application_point {
         InjectPoint::NextInput => {
-            let send = load_command_record(tx, &claim.consumer_id)?
-                .ok_or_else(|| Error::new("stale_generation", "context consumer send is absent"))?;
-            if send.target != Some(target)
-                || send.command.generation != Some(generation)
-                || send.command.verb != "send"
-                || send.state != CommandState::Applied
-                || send.command.turn_id.as_deref() != Some(turn_id)
-            {
+            let send_matches = tx
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM commands
+                         WHERE id = ?1 AND target = ?2 AND generation = ?3
+                           AND verb = 'send' AND state = 'applied' AND turn_id = ?4
+                     )",
+                    params![claim.consumer_id, target, generation, turn_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sql_error)?;
+            if !send_matches {
                 return Err(Error::new(
                     "stale_generation",
                     "context receipt is not bound to its exact applied send turn",
@@ -979,7 +1111,7 @@ fn validate_context_consumer_tx(
 
 fn apply_context_receipt_tx(
     tx: &Transaction<'_>,
-    record: &CommandRecord,
+    record: &ClaimedContextRecord,
     turn_id: &str,
     outcome: &ContextOutcome,
     now: i64,
@@ -988,7 +1120,7 @@ fn apply_context_receipt_tx(
         .map_err(|_| Error::new("internal", "context outcome could not be encoded"))?;
     update_command_state(
         tx,
-        &record.command.id,
+        &record.command_id,
         CommandState::Applied,
         Some(&serialized),
         None,
@@ -996,12 +1128,13 @@ fn apply_context_receipt_tx(
     )?;
     db!(tx.execute(
         "UPDATE commands SET turn_id = ?1 WHERE id = ?2",
-        params![turn_id, record.command.id],
+        params![turn_id, record.command_id],
     ));
     Ok(super::native_events::PendingCommandEvent {
-        command_id: record.command.id.clone(),
+        command_id: record.command_id.clone(),
+        state: CommandState::Applied,
         data: json!({
-            "command_id": record.command.id,
+            "command_id": record.command_id,
             "state": "applied",
             "outcome": serialized,
         }),
