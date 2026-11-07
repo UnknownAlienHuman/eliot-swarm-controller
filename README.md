@@ -84,7 +84,7 @@ $agent = 'AGENT_ID_FROM_OUTPUT'
 & $swarm --data-dir $dataDir daemon stop --drain  # or --force
 ```
 
-On Unix, the built binary is `./target/debug/eliot`; pass the same `--data-dir` to each
+On Unix, the built binary is `./target/debug/swarm`; pass the same `--data-dir` to each
 invocation.
 
 `launch` requires a named explicit profile for one of the five native
@@ -132,7 +132,10 @@ For command approvals set profile `approval_policy = "on-request"`. For native q
 set optional `collaboration_mode = "plan"`; the question exercise used
 `permissions = "read-only"`. Clearing pending requests during interrupt/stop or closing
 a source proves cleanup, not acknowledgement of an answer.
-`inject` and `configure` are currently unsupported.
+`inject` supports system context at `next_input`, `turn_safe_point`, and `active_turn`;
+adapter capabilities determine which application points are supported. Acceptance is
+not application: see the [injection contract](docs/spec/api.md) for exact turn binding
+and outcomes. `configure` remains unsupported.
 
 An optional managed checkout uses the source repository as `--workspace`:
 
