@@ -1,7 +1,9 @@
-//! Periodic physical-retention maintenance. Each tick reloads the daemon
-//! retention settings and runs one bounded Store cleanup pass through the one
-//! Store writer. Pruning is silent and never replays an effect; only counts
-//! are logged.
+//! Periodic physical-retention maintenance. Each hourly wake reloads the
+//! daemon retention settings, then runs bounded retention epochs through
+//! the one Store writer until an epoch drains: an epoch that exhausts its
+//! budgets while still deleting rows continues cooperatively instead of
+//! leaving eligible backlog until the next hour. Pruning is silent and
+//! never replays an effect; only counts are logged.
 
 use crate::{common::now_ms, config, logging};
 use eliot_core::{Result, SecretPolicy};
@@ -11,8 +13,8 @@ use tokio::sync::{Mutex, watch};
 
 /// Hourly cleanup is plenty for day-granularity retention windows.
 pub(crate) const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
-/// One tick loops bounded passes until a pass deletes nothing or a budget
-/// runs out.
+/// One retention epoch loops bounded passes until a pass deletes nothing
+/// or a budget runs out.
 pub(crate) const RETENTION_TICK_ROW_BUDGET: i64 = 10_000;
 pub(crate) const RETENTION_TICK_TIME_BUDGET: Duration = Duration::from_secs(30);
 
@@ -53,14 +55,29 @@ pub(crate) async fn run(
                 );
             }
         }
-        match run_once(&store, &config.retention, now_ms()).await {
-            Ok(report)
-                if report.events_deleted
-                    + report.commands_deleted
-                    + report.writes_deleted
-                    + report.mail_deleted
-                    > 0 =>
-            {
+        // Retention catch-up: while an epoch spends a budget, run another
+        // instead of leaving eligible backlog until the next hourly wake.
+        // Only retention repeats here; the config reload above stays hourly.
+        loop {
+            // Shutdown is checked at the top of every epoch, so a signal
+            // arriving during the inter-epoch yield below still stops the
+            // wake before another deletion epoch runs.
+            if shutdown.has_changed().is_err() || *shutdown.borrow() {
+                return Ok(());
+            }
+            let epoch_start = std::time::Instant::now();
+            let report = match run_once(&store, &config.retention, now_ms()).await {
+                Ok(report) => report,
+                Err(error) => {
+                    logging::record(&policy, "daemon.retention_failed", &[], Some(&error));
+                    break;
+                }
+            };
+            let rows = report.events_deleted
+                + report.commands_deleted
+                + report.writes_deleted
+                + report.mail_deleted;
+            if rows > 0 {
                 let events = report.events_deleted.to_string();
                 let pruned_through = report.pruned_through.to_string();
                 let commands = report.commands_deleted.to_string();
@@ -79,17 +96,21 @@ pub(crate) async fn run(
                     None,
                 );
             }
-            Ok(_) => {}
-            Err(error) => {
-                logging::record(&policy, "daemon.retention_failed", &[], Some(&error));
+            // Zero rows always means drained, even if lock waits pushed
+            // elapsed time past the budget. Otherwise a spent budget means
+            // more retention may be pending; a final empty epoch is harmless.
+            let exhausted = rows >= RETENTION_TICK_ROW_BUDGET
+                || epoch_start.elapsed() >= RETENTION_TICK_TIME_BUDGET;
+            if rows == 0 || !exhausted {
+                break;
             }
+            tokio::task::yield_now().await;
         }
     }
 }
 
-/// Run one retention tick now: bounded passes under the tick row and time
-/// budgets. This is the maintenance tick body; the loop above only
-/// schedules it.
+/// Run one retention epoch now: bounded passes under the tick row and
+/// time budgets.
 pub(crate) async fn run_once(
     store: &Mutex<Store>,
     retention: &config::RetentionConfig,
@@ -108,7 +129,7 @@ pub(crate) async fn run_once(
 /// Run bounded passes until a pass deletes nothing or the tick budgets run
 /// out. At least one pass always runs. `now` stays fixed so every pass
 /// shares the same cutoffs. The Store lock is taken per bounded pass and
-/// released between passes, so one tick never holds the lock for the whole
+/// released between passes, so one epoch never holds the lock for the whole
 /// time budget.
 pub(crate) async fn run_once_with_budgets(
     store: &Mutex<Store>,
