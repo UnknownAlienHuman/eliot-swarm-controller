@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use eliot_core::{ContextItem, Error, Result, SecretPolicy, SourceHealthUpdate};
 use eliot_plugin::{
@@ -22,6 +25,15 @@ pub(crate) type Shared = Arc<Mutex<State>>;
 /// tail is dropped and the turn carries `final_text_unavailable` instead
 /// of an unbounded payload.
 const MAX_TURN_TEXT_BYTES: usize = 256 * 1024;
+const MAX_UNBOUND_UPDATES: usize = 32;
+const MAX_UNBOUND_UPDATE_BYTES: usize = 256 * 1024;
+
+pub(crate) type LoadOutcome = (String, Result<Value>);
+
+struct QueuedUpdate {
+    session_id: String,
+    update: AcpUpdate,
+}
 
 #[derive(Clone, Serialize)]
 pub(crate) struct TurnFacts {
@@ -62,15 +74,19 @@ pub(crate) struct State {
     /// Held until the actual in-band terminal reply, an error, a stream
     /// fault, stop, or drop — stream silence alone never expires it.
     fenced_guard: Option<FencedGuard>,
-    /// True from fenced `session/load` dispatch until its ordered reply
-    /// frame is consumed. Matching-session updates in this window are
-    /// validated load history and are discarded, never republished.
-    loading: bool,
+    /// Exact fenced `session/load` request whose ordered reply is pending.
+    /// Matching-session updates in this window are validated history and
+    /// discarded, never republished.
+    load_request_id: Option<String>,
     /// RAII registration of the outstanding fenced load call.
     load_guard: Option<FencedGuard>,
     /// Ordered load outcome for `Session::start`, published exactly once
     /// by the event task when the fenced load reply is consumed.
-    load_tx: watch::Sender<Option<Result<Value>>>,
+    load_tx: watch::Sender<Option<LoadOutcome>>,
+    /// Updates received before `session/new` returns its session id. They
+    /// are validated and applied in wire order once that exact id is known.
+    unbound_updates: VecDeque<QueuedUpdate>,
+    unbound_update_bytes: usize,
     text_accum: String,
     text_truncated: bool,
     writes_blocked: bool,
@@ -114,9 +130,11 @@ impl State {
             tool_emitted: std::collections::HashSet::new(),
             tools: HashMap::new(),
             fenced_guard: None,
-            loading: false,
+            load_request_id: None,
             load_guard: None,
             load_tx,
+            unbound_updates: VecDeque::new(),
+            unbound_update_bytes: 0,
             text_accum: String::new(),
             text_truncated: false,
             writes_blocked: false,
@@ -142,27 +160,76 @@ impl State {
             .map(|(_, status)| status.as_str())
     }
 
-    /// A fresh receiver for the ordered load outcome published by the
-    /// event task. `Session::start` waits on this, never on the RPC
-    /// return alone.
-    pub fn load_receiver(&self) -> watch::Receiver<Option<Result<Value>>> {
-        self.load_tx.subscribe()
+    /// Bind the exact session identity, then validate and apply any updates
+    /// that arrived before the `session/new` reply in their original order.
+    pub async fn bind_conversation(&mut self, conversation: &str) -> Result<()> {
+        if conversation.trim().is_empty() {
+            return Err(Error::new(
+                "native_protocol",
+                "Antigravity session id is empty",
+            ));
+        }
+        if self.source_unknown || self.failure.is_some() {
+            return Err(Error::new(
+                "unknown",
+                "Antigravity session identity is unresolved",
+            ));
+        }
+        if !self.conversation.is_empty() && self.conversation != conversation {
+            return Err(Error::new(
+                "source_integrity",
+                "Antigravity session identity changed during startup",
+            ));
+        }
+        self.conversation = conversation.to_owned();
+        let queued = std::mem::take(&mut self.unbound_updates);
+        self.unbound_update_bytes = 0;
+        for queued in queued {
+            self.apply_update(queued.session_id, queued.update).await?;
+        }
+        Ok(())
     }
 
-    /// Arm the load gate before fenced dispatch: validated history for
-    /// the retained session is discarded until the ordered load reply
-    /// is consumed.
-    pub fn begin_load(&mut self, guard: FencedGuard) {
-        self.load_guard = Some(guard);
-        self.loading = true;
+    /// Bind the retained session and arm both the exact load filter and
+    /// its outcome watcher before the caller starts the native write.
+    pub async fn arm_load(
+        &mut self,
+        request_id: String,
+        conversation: &str,
+    ) -> Result<watch::Receiver<Option<LoadOutcome>>> {
+        self.bind_conversation(conversation).await?;
+        if self.load_request_id.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Antigravity already has a pending load call",
+            ));
+        }
+        self.load_tx.send_replace(None);
+        let receiver = self.load_tx.subscribe();
+        self.load_request_id = Some(request_id);
+        Ok(receiver)
+    }
+
+    /// Take the registration only while its exact load remains pending.
+    /// A reply consumed during the native write clears the id first, so a
+    /// late returned guard is dropped immediately here.
+    pub fn attach_load_guard(&mut self, request_id: &str, guard: FencedGuard) {
+        if self.failure.is_none()
+            && !self.source_unknown
+            && self.load_request_id.as_deref() == Some(request_id)
+        {
+            self.load_guard = Some(guard);
+        }
     }
 
     /// Retire a load that never reached the ordered reply (dispatch
     /// failure or start timeout): loading mode ends without history
     /// having been validated, so startup fails instead of going live.
-    pub fn abort_load(&mut self) {
-        self.loading = false;
-        self.load_guard = None;
+    pub fn abort_load(&mut self, request_id: &str) {
+        if self.load_request_id.as_deref() == Some(request_id) {
+            self.load_request_id = None;
+            self.load_guard = None;
+        }
     }
 
     /// Take ownership of the fenced prompt registration — but only if
@@ -311,10 +378,16 @@ impl State {
             // update ahead of it on the wire. Publish the outcome for
             // `Session::start` and leave loading mode; nothing here
             // republishes history or creates a turn.
-            AgyFrame::LoadResponse(result) => {
-                self.loading = false;
+            AgyFrame::LoadResponse { request_id, result } => {
+                if self.load_request_id.as_deref() != Some(request_id.as_str()) {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "Antigravity load reply did not match its armed request",
+                    ));
+                }
+                self.load_request_id = None;
                 self.load_guard = None;
-                let _ = self.load_tx.send_replace(Some(result));
+                let _ = self.load_tx.send_replace(Some((request_id, result)));
                 Ok(())
             }
             // The fenced terminal reply, consumed in wire order behind
@@ -374,12 +447,31 @@ impl State {
                 "Antigravity session/update did not match its envelope",
             ));
         };
+        if self.conversation.is_empty() {
+            let bytes = params.to_string().len();
+            if self.unbound_updates.len() >= MAX_UNBOUND_UPDATES
+                || self.unbound_update_bytes.saturating_add(bytes) > MAX_UNBOUND_UPDATE_BYTES
+            {
+                return Err(Error::new(
+                    "frame_too_large",
+                    "Antigravity pre-session updates exceeded their startup bound",
+                ));
+            }
+            self.unbound_update_bytes += bytes;
+            self.unbound_updates
+                .push_back(QueuedUpdate { session_id, update });
+            return Ok(());
+        }
+        self.apply_update(session_id, update).await
+    }
+
+    async fn apply_update(&mut self, session_id: String, update: AcpUpdate) -> Result<()> {
         self.check_conversation(&session_id)?;
         // Validated load history: matching-session updates before the
         // ordered load reply are history, not live output. Discard them
         // without association, republication, or turn creation. Live
         // updates after the reply take the normal path below.
-        if self.loading {
+        if self.load_request_id.is_some() {
             return Ok(());
         }
         match update {
@@ -583,8 +675,13 @@ impl State {
 
     pub async fn ended(&mut self) -> Result<()> {
         self.clear_fenced();
-        self.loading = false;
-        self.load_guard = None;
+        if let Some(request_id) = self.load_request_id.take() {
+            self.load_guard = None;
+            let _ = self.load_tx.send_replace(Some((
+                request_id,
+                Err(Error::new("unknown", "Antigravity ACP load ended")),
+            )));
+        }
         if !self.stopped {
             if self.pending.is_some() {
                 self.lose("Antigravity stopped with an unresolved input")
@@ -613,15 +710,17 @@ impl State {
     pub async fn lose(&mut self, reason: &str) {
         self.source_unknown = true;
         self.clear_fenced();
-        if self.loading {
+        if let Some(request_id) = self.load_request_id.take() {
             // Stream loss during load: publish the failure to the load
             // waiter instead of letting startup hang to its deadline.
-            self.loading = false;
             self.load_guard = None;
-            let _ = self.load_tx.send_replace(Some(Err(Error::new(
-                "unknown",
-                "Antigravity ACP load failed with the stream",
-            ))));
+            let _ = self.load_tx.send_replace(Some((
+                request_id,
+                Err(Error::new(
+                    "unknown",
+                    "Antigravity ACP load failed with the stream",
+                )),
+            )));
         }
         if let Some(pending) = self.pending.as_ref() {
             self.settlement = Some((pending.turn.clone(), "unknown".to_owned()));

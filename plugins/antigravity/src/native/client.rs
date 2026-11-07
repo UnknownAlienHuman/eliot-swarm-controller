@@ -61,7 +61,10 @@ pub(crate) enum AgyFrame {
     PromptResponse(Result<Value>),
     /// The reply of a fenced `session/load` call: everything before it
     /// on the wire is validated load history, everything after is live.
-    LoadResponse(Result<Value>),
+    LoadResponse {
+        request_id: String,
+        result: Result<Value>,
+    },
     /// An agent-to-client request (permission, terminal, fs, elicitation).
     ServerRequest {
         id: Value,
@@ -81,6 +84,22 @@ pub(crate) struct FencedGuard {
     _guard: PendingGuard,
     fenced: Arc<StdMutex<HashMap<String, FencedKind>>>,
     id: String,
+}
+
+/// A locally registered fenced call whose native write has not started.
+/// The caller can arm the corresponding event state with `request_id`
+/// before dispatching it.
+pub(crate) struct PreparedFencedCall {
+    id: String,
+    method: String,
+    encoded: String,
+    registration: FencedGuard,
+}
+
+impl PreparedFencedCall {
+    pub fn request_id(&self) -> &str {
+        &self.id
+    }
 }
 
 impl Drop for FencedGuard {
@@ -237,6 +256,19 @@ impl AgyClient {
         deadline: Instant,
         kind: FencedKind,
     ) -> Result<(String, FencedGuard)> {
+        let prepared = self.prepare_fenced(method, params, kind)?;
+        self.dispatch_fenced(prepared, deadline).await
+    }
+
+    /// Reserve the exact request id and its ordered response route without
+    /// writing to the native process. Load callers use this to arm the
+    /// event-state filter before any `session/load` I/O.
+    pub fn prepare_fenced(
+        &self,
+        method: &str,
+        params: Value,
+        kind: FencedKind,
+    ) -> Result<PreparedFencedCall> {
         if method.trim().is_empty() || !params.is_object() {
             return Err(Error::new(
                 "invalid",
@@ -263,6 +295,26 @@ impl AgyClient {
             fenced: Arc::clone(&self.fenced),
             id: id.clone(),
         };
+        Ok(PreparedFencedCall {
+            id,
+            method: method.to_owned(),
+            encoded,
+            registration,
+        })
+    }
+
+    /// Start a previously registered fenced call's native write.
+    pub async fn dispatch_fenced(
+        &self,
+        prepared: PreparedFencedCall,
+        deadline: Instant,
+    ) -> Result<(String, FencedGuard)> {
+        let PreparedFencedCall {
+            id,
+            method,
+            encoded,
+            registration,
+        } = prepared;
         match self.write_encoded(encoded, deadline).await {
             Ok(()) => Ok((id, registration)),
             Err(error) => {
@@ -433,7 +485,10 @@ fn classify_agy_frame(
         if let Some(kind) = kind {
             return PumpAction::Emit(match kind {
                 FencedKind::Prompt => AgyFrame::PromptResponse(result),
-                FencedKind::Load => AgyFrame::LoadResponse(result),
+                FencedKind::Load => AgyFrame::LoadResponse {
+                    request_id: key,
+                    result,
+                },
             });
         }
         return PumpAction::Route { key, result };

@@ -21,7 +21,7 @@ use crate::{
     host::TIMEOUT,
     native::{
         AgyClient, AgyFrame, AgyProcess, FencedKind, InitializeResult, LoadSessionResult,
-        SessionResult, SetConfigOptionResult, StreamState, prompt_params,
+        PreparedFencedCall, SessionResult, SetConfigOptionResult, StreamState, prompt_params,
     },
     profile::Plan,
 };
@@ -80,7 +80,6 @@ pub(crate) struct Session {
     state: Shared,
     frames: Option<mpsc::Receiver<AgyFrame>>,
     stream: watch::Receiver<StreamState>,
-    load_rx: watch::Receiver<Option<Result<Value>>>,
     task: Option<JoinHandle<()>>,
     ready: bool,
     highwater_seq: i64,
@@ -114,7 +113,6 @@ impl Session {
             plan.policy.clone(),
             String::new(),
         )));
-        let load_rx = state.lock().await.load_receiver();
         Ok(Self {
             agent: params.agent_id.clone(),
             generation: params.generation,
@@ -126,7 +124,6 @@ impl Session {
             state,
             frames: Some(frames),
             stream,
-            load_rx,
             task: None,
             ready: false,
             highwater_seq: 0,
@@ -198,28 +195,37 @@ impl Session {
             // matching-session history until that reply is consumed, and
             // only then publishes the outcome here. Never gate on the
             // bare RPC return, which can overtake queued history.
-            {
+            let prepared: PreparedFencedCall = self.client.prepare_fenced(
+                "session/load",
+                json!({"cwd": plan.launch.cwd, "mcpServers": [], "sessionId": resume}),
+                FencedKind::Load,
+            )?;
+            let request_id = prepared.request_id().to_owned();
+            let mut load_rx = {
                 let mut state = self.state.lock().await;
-                state.conversation = resume.to_owned();
-            }
-            let dispatched = self
-                .client
-                .call_fenced(
-                    "session/load",
-                    json!({"cwd": plan.launch.cwd, "mcpServers": [], "sessionId": resume}),
-                    deadline,
-                    FencedKind::Load,
-                )
-                .await;
+                state.arm_load(request_id.clone(), resume).await?
+            };
+            let dispatched = self.client.dispatch_fenced(prepared, deadline).await;
             let registration = match dispatched {
-                Ok((_, registration)) => registration,
+                Ok((dispatched_id, registration)) if dispatched_id == request_id => registration,
+                Ok((_, registration)) => {
+                    drop(registration);
+                    self.state.lock().await.abort_load(&request_id);
+                    return Err(Error::new(
+                        "source_integrity",
+                        "Antigravity load registration changed request identity",
+                    ));
+                }
                 Err(error) => {
-                    self.state.lock().await.abort_load();
+                    self.state.lock().await.abort_load(&request_id);
                     return Err(error);
                 }
             };
-            self.state.lock().await.begin_load(registration);
-            let load_wait = timeout_at(deadline, self.load_rx.changed())
+            self.state
+                .lock()
+                .await
+                .attach_load_guard(&request_id, registration);
+            let load_wait = timeout_at(deadline, load_rx.changed())
                 .await
                 .map_err(|_| Error::new("unknown", "Antigravity ACP load reply deadline elapsed"))
                 .and_then(|changed| {
@@ -228,12 +234,21 @@ impl Session {
                     })
                 });
             if let Err(error) = load_wait {
-                self.state.lock().await.abort_load();
+                self.state.lock().await.abort_load(&request_id);
                 return Err(error);
             }
-            let loaded = self.load_rx.borrow().clone().ok_or_else(|| {
-                Error::new("unknown", "Antigravity ACP load outcome is unknown")
-            })??;
+            let (outcome_id, loaded) = load_rx
+                .borrow()
+                .clone()
+                .ok_or_else(|| Error::new("unknown", "Antigravity ACP load outcome is unknown"))?;
+            if outcome_id != request_id {
+                self.state.lock().await.abort_load(&request_id);
+                return Err(Error::new(
+                    "source_integrity",
+                    "Antigravity load outcome changed request identity",
+                ));
+            }
+            let loaded = loaded?;
             // `session/load` returns no session id by design: the exact
             // retained id is the one from this correlated request.
             let loaded: LoadSessionResult = serde_json::from_value(loaded).map_err(|_| {
@@ -265,6 +280,10 @@ impl Session {
         };
         let mut effective = plan.check_session(&init, &session)?;
         self.conversation = session.session_id.clone();
+        {
+            let mut state = self.state.lock().await;
+            state.bind_conversation(&self.conversation).await?;
+        }
         // Verify each required config write by its echoed current value.
         for (config_id, value) in plan.config_writes() {
             let echoed = self
@@ -330,7 +349,6 @@ impl Session {
         }
         {
             let mut state = self.state.lock().await;
-            state.conversation = self.conversation.clone();
             state.ready(&self.scope, effective.clone()).await?;
         }
         self.ready = true;
@@ -631,7 +649,11 @@ impl Session {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 };
                 match settled.as_deref() {
-                    Some("cancelled") => Ok(json!({"state": "applied", "turn_id": turn_id})),
+                    Some("cancelled") => Ok(json!({
+                        "state": "applied",
+                        "command_id": params.command_id.clone(),
+                        "turn_id": turn_id,
+                    })),
                     Some(_) => Err(Error::new(
                         "unknown",
                         "Antigravity interrupt raced natural turn completion",
