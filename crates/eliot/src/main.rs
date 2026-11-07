@@ -1197,6 +1197,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 cadence_ms,
             } => {
                 let request = GoalSetRequest {
+                    id: mutation_id(id)?,
                     agent,
                     mode: goal_mode(&mode)?,
                     definition: GoalDefinition {
@@ -1239,6 +1240,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 reason,
             } => {
                 let request = GoalPauseRequest {
+                    id: mutation_id(id)?,
                     agent,
                     mode: goal_mode(&mode)?,
                     reason,
@@ -1260,6 +1262,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             }
             GoalCommand::Clear { agent, mode } => {
                 let request = GoalClearRequest {
+                    id: mutation_id(id)?,
                     agent,
                     mode: goal_mode(&mode)?,
                 };
@@ -1280,6 +1283,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             }
             GoalCommand::Resume { agent, mode } => {
                 let request = GoalResumeRequest {
+                    id: mutation_id(id)?,
                     agent,
                     mode: goal_mode(&mode)?,
                 };

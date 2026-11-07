@@ -367,6 +367,7 @@ impl GoalView {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoalSetRequest {
+    pub id: String,
     pub agent: String,
     #[serde(default = "default_mode")]
     pub mode: GoalMode,
@@ -382,6 +383,9 @@ fn default_mode() -> GoalMode {
 
 impl GoalSetRequest {
     pub fn validate(&self) -> Result<()> {
+        if self.id.trim().is_empty() || self.id.len() > MAX_TEXT_BYTES {
+            return Err(Error::new("invalid", "goal set id must be nonempty"));
+        }
         validate_agent(&self.agent)?;
         if self.max_cost.is_some() {
             return Err(Error::new(
@@ -445,6 +449,7 @@ impl GoalGetRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoalPauseRequest {
+    pub id: String,
     pub agent: String,
     #[serde(default = "default_mode")]
     pub mode: GoalMode,
@@ -454,6 +459,9 @@ pub struct GoalPauseRequest {
 
 impl GoalPauseRequest {
     pub fn validate(&self) -> Result<()> {
+        if self.id.trim().is_empty() || self.id.len() > MAX_TEXT_BYTES {
+            return Err(Error::new("invalid", "goal pause id must be nonempty"));
+        }
         validate_agent(&self.agent)?;
         if let Some(reason) = &self.reason
             && (reason.trim().is_empty() || reason.len() > MAX_GOAL_OBSERVATION_BYTES)
@@ -484,6 +492,7 @@ impl GoalPauseRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoalClearRequest {
+    pub id: String,
     pub agent: String,
     #[serde(default = "default_mode")]
     pub mode: GoalMode,
@@ -491,6 +500,9 @@ pub struct GoalClearRequest {
 
 impl GoalClearRequest {
     pub fn validate(&self) -> Result<()> {
+        if self.id.trim().is_empty() || self.id.len() > MAX_TEXT_BYTES {
+            return Err(Error::new("invalid", "goal clear id must be nonempty"));
+        }
         validate_agent(&self.agent)
     }
 
@@ -512,6 +524,7 @@ impl GoalClearRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoalResumeRequest {
+    pub id: String,
     pub agent: String,
     #[serde(default = "default_mode")]
     pub mode: GoalMode,
@@ -519,6 +532,9 @@ pub struct GoalResumeRequest {
 
 impl GoalResumeRequest {
     pub fn validate(&self) -> Result<()> {
+        if self.id.trim().is_empty() || self.id.len() > MAX_TEXT_BYTES {
+            return Err(Error::new("invalid", "goal resume id must be nonempty"));
+        }
         validate_agent(&self.agent)
     }
 
@@ -795,6 +811,7 @@ mod tests {
     #[test]
     fn goal_set_detects_cost_limits_and_binds_its_response() {
         let request = GoalSetRequest {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
             agent: "a1".to_owned(),
             mode: GoalMode::Eliot,
             definition: definition(),
@@ -835,6 +852,7 @@ mod tests {
             ..definition()
         };
         let request = GoalSetRequest {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
             agent: "a1".to_owned(),
             mode: GoalMode::Eliot,
             definition: unbounded,
@@ -897,6 +915,7 @@ mod tests {
             .is_err()
         );
         let pause = GoalPauseRequest {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
             agent: "a1".to_owned(),
             mode: GoalMode::Eliot,
             reason: Some("waiting".to_owned()),
@@ -909,12 +928,14 @@ mod tests {
         };
         assert!(blank_reason.validate().is_err());
         GoalClearRequest {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
             agent: "a1".to_owned(),
             mode: GoalMode::Eliot,
         }
         .validate_response(&view())
         .unwrap();
         GoalResumeRequest {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
             agent: "a1".to_owned(),
             mode: GoalMode::Eliot,
         }
