@@ -444,6 +444,22 @@ Contain owned children before tools run; use absolute deadlines. Drain buffered 
 output before declaring loss. Plugin replacement never rebinds an uncertain old call.
 Persisted facts backpressure; ephemeral telemetry may drop with visible lag.
 
+Native reader faults split by proven line boundary. Fatal reader end (EOF,
+codec/UTF-8/IO fault, oversize without a proven line boundary, exit-drain
+deadline) atomically closes response-router registration and the write
+boundary: new RPC/notifications are rejected `native_not_dispatched` before
+any write, while requests already queued or written remain `unknown` — never
+silently dropped, retried, or restarted automatically. A bounded UTF-8
+NDJSON line whose JSON or envelope is invalid is record-local: the typed
+`NativeStreamFault` label is recorded as a gap, current pending calls fail
+`unknown`, and the same reader keeps routing later well-formed records.
+The recorded fault is sticky: EOF, exit-drain, and stop handling never
+overwrite it with a healthy-looking closure, so a busy consumer cannot miss
+it. Frame/codec/UTF-8/IO errors never continue without a proven line boundary.
+Owner drop/cancel fences writer and response router before aborting either
+task (no await in `Drop`, no lock held over IO): already-written calls
+resolve `unknown`, fresh writes are refused `native_not_dispatched`.
+
 Add hooks only for a missing native fact/decision. Config is session-scoped; decisions
 bind exact generation/request/deadline. Timeout uses the safe native default; late
 approval is discarded, not queued. Hooks do not duplicate the authoritative stream.

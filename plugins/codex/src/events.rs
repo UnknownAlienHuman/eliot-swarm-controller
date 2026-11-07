@@ -174,7 +174,7 @@ struct EventProcessor {
     gap_number: u64,
     accept_frames: bool,
     planned_stop: bool,
-    loss_reason: Option<&'static str>,
+    loss_reason: Option<String>,
     frames_drained: bool,
     pending_end_stop: Option<oneshot::Sender<Result<()>>>,
     writes_blocked: bool,
@@ -693,8 +693,11 @@ impl EventProcessor {
                 self.defer_gap("Codex app-server event queue overflowed");
                 self.transport_loss = true;
             }
-            StreamState::Malformed(_) => {
-                self.defer_gap("Codex app-server stream contained an invalid frame");
+            StreamState::Malformed(fault) => {
+                self.defer_gap(format!(
+                    "Codex app-server stream contained an invalid frame ({})",
+                    fault.label()
+                ));
                 self.transport_loss = true;
             }
             StreamState::Open => {}
@@ -767,9 +770,9 @@ impl EventProcessor {
         }
     }
 
-    fn defer_gap(&mut self, reason: &'static str) {
+    fn defer_gap(&mut self, reason: impl Into<String>) {
         if self.loss_reason.is_none() {
-            self.loss_reason = Some(reason);
+            self.loss_reason = Some(reason.into());
         }
     }
 
@@ -777,9 +780,9 @@ impl EventProcessor {
         if queue_empty
             && !self.gap_reported
             && !self.writes_blocked
-            && let Some(reason) = self.loss_reason
+            && let Some(reason) = self.loss_reason.clone()
         {
-            let _ = self.record_gap(reason).await;
+            let _ = self.record_gap(&reason).await;
         }
         if queue_empty && self.transport_loss {
             self.mark_source_stale().await;

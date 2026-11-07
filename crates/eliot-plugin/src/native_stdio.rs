@@ -220,6 +220,19 @@ impl<C: NativeStdioConfig> StdioProcess<C> {
     }
 }
 
+impl<C> Drop for StdioProcess<C> {
+    fn drop(&mut self) {
+        // Owner drop/cancel: fence the writer+router before the transport's
+        // own Drop aborts reader/waiter. In-flight calls resolve Unknown now;
+        // fresh writes are refused `native_not_dispatched` by the shared
+        // closed flag. No await here; fail_all only drains the pending map.
+        self.client.pending.fail_all(Error::new(
+            "unknown",
+            "native process dropped with an outcome pending",
+        ));
+    }
+}
+
 impl<C: NativeStdioConfig> StdioClient<C> {
     pub async fn call(&self, method: &str, params: Value, deadline: Instant) -> Result<Value> {
         self.call_inner(method, params, deadline)
@@ -272,6 +285,12 @@ impl<C: NativeStdioConfig> StdioClient<C> {
                 )
             })?;
 
+        if self.pending.is_closed() {
+            return Err(Error::new(
+                "native_not_dispatched",
+                format!("{} response router closed before dispatch", C::SHORT),
+            ));
+        }
         let (_guard, response_rx) = self.pending.insert(id);
         if let Err(error) = self.write_encoded(encoded, deadline).await {
             if error.code == "native_not_dispatched" {

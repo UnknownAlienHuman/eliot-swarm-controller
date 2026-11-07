@@ -243,6 +243,9 @@ struct EventProcessor {
     pending_end_stop: Option<oneshot::Sender<Result<()>>>,
     writes_blocked: bool,
     gap_reported: bool,
+    /// Sticky first record-local fault awaiting its gap (planned-stop drain
+    /// must not erase it if the immediate record was blocked).
+    pending_fault_gap: Option<String>,
     final_text: Option<String>,
     closed: bool,
     native: Option<ClaudeClient>,
@@ -449,6 +452,7 @@ async fn run(
     // so `EndStop`/`Close` are still served. This is separate from
     // `accept_frames`, which only diverts trailing records into the buffer.
     let mut frames_open = true;
+    let mut stream_open = true;
     loop {
         // Frames win over controls: a queued terminal settles before any
         // `CheckTurn` behind it is answered.
@@ -475,7 +479,10 @@ async fn run(
                     processor.buffer_record(record);
                 }
             }
-            _ = stream.changed(), if frames_open => {
+            changed = stream.changed(), if frames_open && stream_open => {
+                if changed.is_err() {
+                    stream_open = false;
+                }
                 let state: StreamState = *stream.borrow();
                 processor.note_stream_state(state).await;
             }
@@ -606,6 +613,7 @@ impl EventProcessor {
             pending_end_stop: None,
             writes_blocked: false,
             gap_reported: false,
+            pending_fault_gap: None,
             final_text: None,
             closed: false,
             native: None,
@@ -1627,6 +1635,14 @@ impl EventProcessor {
     async fn note_frames_drained(&mut self) {
         self.frames_drained = true;
         if self.planned_stop || self.closed {
+            // A sticky record-local fault survives planned stop: flush its
+            // gap before end-stop settlement instead of erasing it.
+            if let Some(reason) = self.pending_fault_gap.take()
+                && !self.gap_reported
+                && !self.writes_blocked
+            {
+                let _ = self.record_gap(&reason).await;
+            }
             self.finish_pending_end_stop().await;
             return;
         }
@@ -1644,9 +1660,11 @@ impl EventProcessor {
             if let Some(pending) = self.pending_turn.take() {
                 self.settle_pending(pending, TurnOutcome::Unknown);
             }
-            let _ = self
-                .record_gap("Claude event stream closed outside a planned stop")
-                .await;
+            let reason = self
+                .pending_fault_gap
+                .take()
+                .unwrap_or_else(|| "Claude event stream closed outside a planned stop".to_owned());
+            let _ = self.record_gap(&reason).await;
         } else if let Some(pending) = self.pending_turn.take() {
             self.settle_pending(pending, TurnOutcome::Unknown);
         }
@@ -1677,7 +1695,22 @@ impl EventProcessor {
                         .await;
                 }
             }
-            StreamState::Closed | StreamState::Malformed(_) => {
+            StreamState::Malformed(fault) => {
+                // Active record-local fault: record its gap immediately with
+                // the safe typed label; keep it sticky for the planned-stop
+                // drain in case this immediate record is blocked.
+                let reason = format!(
+                    "Claude stream contained an invalid frame ({})",
+                    fault.label()
+                );
+                if self.pending_fault_gap.is_none() {
+                    self.pending_fault_gap = Some(reason.clone());
+                }
+                if !self.gap_reported && !self.writes_blocked {
+                    let _ = self.record_gap(&reason).await;
+                }
+            }
+            StreamState::Closed => {
                 // Settlement happens in `note_frames_drained` once the
                 // buffered tail is processed.
             }
