@@ -115,7 +115,7 @@ CPU/Git/mail/health noise does not. Stale source means progress unknown.
 whether the reader is attached: successful identity attachment can leave native status
 unknown, and a detached row retains that status. Reader-local `notLoaded` is not native
 idle or stopped evidence. Observation failure and restart retain unknown/stale coverage;
-they do not take the controlled-generation `session.lost` transition.
+they do not take the controlled-generation `agent.lost` transition.
 
 Observe attachment records `origin=external`, `observe_only=true`, `own_identity=false`
 and no token. The generation/source fence commits before reader I/O. Owner-issued native
@@ -215,7 +215,7 @@ cause JSON for rule parents and children, each bound to that row's own command I
 
 Native families are session/turn/message/tool/request/child/goal/usage/provider/edit.
 Exactly one source owns each implemented family per Agent generation. Daemon-owned
-Agent/command/mail/rule/Git/process facts and `session.lost` cannot be supplied as
+Agent/command/mail/rule/Git/process facts and `agent.lost` cannot be supplied as
 arbitrary plugin lifecycle. Persist bounded final facts; deltas/samples stay ephemeral.
 Mask known secrets in native output; reject known secrets in caller durable text.
 

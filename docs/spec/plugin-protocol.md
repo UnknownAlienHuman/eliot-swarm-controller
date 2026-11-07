@@ -301,7 +301,7 @@ state; it does not republish history. With neither stable record id nor cursor, 
 acknowledgement is a gap/reconciliation case, not a speculative batch retry.
 
 Plugins publish only assigned native families. Agent/command/rule/mail/Git/process
-lifecycle, `session.lost` and owner resolutions are daemon facts, not arbitrary plugin
+lifecycle, `agent.lost` and owner resolutions are daemon facts, not arbitrary plugin
 notifications.
 
 ### Gap and handoff
