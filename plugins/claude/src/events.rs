@@ -1787,7 +1787,7 @@ impl EventProcessor {
             combined = context_text.clone();
             response = HookCallbackResponse::with_context(combined.clone());
         }
-        if context.is_empty() {
+        if context.is_empty() && steer.is_none() {
             return self
                 .finish_hook_pass(request_id, &native, deadline, &tool_use_id, &consumer_id)
                 .await;

@@ -1084,13 +1084,22 @@ impl ClaudePlugin {
         let outcome = match arrived {
             Some(outcome) => outcome,
             None => {
-                let result = self.post_process(
-                    "agent.command",
-                    Err(Error::new(
-                        "unknown",
-                        "Claude steer outcome was lost; it will not be repeated",
-                    )),
-                );
+                // Cancellation drops the queued sender before its ack is
+                // observed. Retain the exact command/turn/text binding before
+                // replying so replay cannot enqueue the same steer again.
+                let result =
+                    unknown_control("Claude steer outcome was lost; it will not be repeated");
+                if let Some(session) = self.session.as_mut() {
+                    session.steer_outcomes.insert(
+                        command_id.clone(),
+                        SteerRecord {
+                            turn_id: turn_id.clone(),
+                            text: text.clone(),
+                            result: result.clone(),
+                        },
+                    );
+                }
+                let result = self.post_process("agent.command", Ok(result));
                 return respond_deferred(client, request_id, result).await;
             }
         };
