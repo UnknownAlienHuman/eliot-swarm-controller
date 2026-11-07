@@ -239,6 +239,10 @@ struct EventProcessor {
     /// from the inbox-list readback, the removal proof that lets a
     /// missed steer settle without latching the session.
     seen_cancelled: HashSet<String>,
+    /// Exact turn each delivered input joined, retained across terminal
+    /// handling: a steer watch registering after its turn's terminal
+    /// still verdicts from this binding instead of forgetting it.
+    delivered_turn: HashMap<String, String>,
     /// Steer watches by command id. Lane-less: unlike the send `pending`
     /// lane, watches never open turns, never block each other, and never
     /// touch the next-input association.
@@ -576,6 +580,7 @@ impl EventProcessor {
             seen_inbox: HashSet::new(),
             seen_delivered: HashSet::new(),
             seen_cancelled: HashSet::new(),
+            delivered_turn: HashMap::new(),
             steer_watches: HashMap::new(),
             stashed_started: None,
             expected_seq: None,
@@ -1026,8 +1031,12 @@ impl EventProcessor {
             ));
         }
         let (reply, verdict) = oneshot::channel();
-        if self.seen_delivered.contains(&inbox_id)
-            && self.status.active_turn_id.as_deref() == Some(turn_id.as_str())
+        // Retained proof first: the input was delivered while this exact
+        // turn was active, even if the terminal has since fenced it.
+        if self
+            .delivered_turn
+            .get(&inbox_id)
+            .is_some_and(|turn| turn == &turn_id)
         {
             let _ = reply.send(SteerVerdict::Applied);
             return Ok(verdict);
@@ -1293,6 +1302,12 @@ impl EventProcessor {
         self.seen_inbox.insert(inbox.inbox_id.clone());
         if delivered {
             self.seen_delivered.insert(inbox.inbox_id.clone());
+            // Bind the delivery to the running turn, if any: a delivery
+            // with no active turn belongs to future work, never to a
+            // fenced one.
+            if let Some(active) = self.status.active_turn_id.clone() {
+                self.delivered_turn.insert(inbox.inbox_id.clone(), active);
+            }
             self.settle_delivered_steers(&inbox.inbox_id);
         }
         if self.seen_inbox.len() > 1024 {
@@ -1300,6 +1315,7 @@ impl EventProcessor {
             self.seen_inbox.clear();
             self.seen_delivered.clear();
             self.seen_cancelled.clear();
+            self.delivered_turn.clear();
         }
         self.try_open_turn().await
     }
@@ -1405,27 +1421,30 @@ impl EventProcessor {
         let Some((command_id, turn_id)) = self.resolve_terminal_turn().await? else {
             return Ok(());
         };
+        // Fence the captured turn the moment its terminal is observed,
+        // independent of readback success: controls interleaving with
+        // the readback await below must never see it active again, and
+        // watches still naming it can never apply.
+        self.status.active_turn_id = None;
+        self.status.active_command_id = None;
+        self.miss_ended_steers(&turn_id);
         let status = match envelope.event_type.as_str() {
             "session.execution.succeeded" => "completed",
             "session.execution.failed" => "failed",
             _ => "interrupted",
         };
-        let readback = match self.read_terminal_messages(&terminal.session_id).await {
-            Ok(readback) => readback,
-            Err(error) => {
-                // The terminal was observed even though its readback
-                // failed: watches on this turn can never apply.
-                self.miss_ended_steers(&turn_id);
-                return Err(Error::new(
+        let readback = self
+            .read_terminal_messages(&terminal.session_id)
+            .await
+            .map_err(|error| {
+                Error::new(
                     "unknown",
                     format!("OpenCode terminal readback failed: {}", error.message),
-                ));
-            }
-        };
+                )
+            })?;
         if readback.outcome != status {
             self.record_gap("OpenCode terminal event disagreed with its idle message")
                 .await?;
-            self.miss_ended_steers(&turn_id);
             return Err(Error::new(
                 "unknown",
                 "OpenCode turn outcome is contradictory",
@@ -1500,7 +1519,6 @@ impl EventProcessor {
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
         self.open_inbox_id = None;
-        self.miss_ended_steers(&turn_id);
         Ok(())
     }
 
@@ -1669,6 +1687,7 @@ impl EventProcessor {
         self.steer_watches.clear();
         self.seen_delivered.clear();
         self.seen_cancelled.clear();
+        self.delivered_turn.clear();
         Ok(())
     }
 
