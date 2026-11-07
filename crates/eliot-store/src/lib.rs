@@ -993,16 +993,7 @@ impl Store {
         // Replay must report pruned history instead of silently omitting it.
         // Live rule cursors always stay above this floor, so the rule worker
         // never trips here; client-supplied replay cursors do.
-        let retained: i64 = self
-            .connection
-            .query_row(
-                "SELECT pruned_through FROM rule_history_coverage WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql_error)?
-            .ok_or_else(|| Error::new("source_integrity", "rule history coverage is absent"))?;
+        let retained = retention::coverage_pruned_through(&self.connection)?;
         if after < retained {
             return Err(Error::new(
                 "history_gap",
@@ -1027,6 +1018,13 @@ impl Store {
         }
         enforce_page_bytes(&mut events)?;
         Ok(events)
+    }
+
+    pub fn event_bounds(&self) -> Result<core::api::EventsBoundsResponse> {
+        Ok(core::api::EventsBoundsResponse {
+            pruned_through: retention::coverage_pruned_through(&self.connection)?,
+            hi: self.high_water()?,
+        })
     }
 
     pub fn high_water(&self) -> Result<i64> {

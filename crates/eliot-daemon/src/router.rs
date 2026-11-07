@@ -34,8 +34,8 @@ use eliot_core::{
         AgentResultRequest, AgentResultResponse, AgentStatsRequest, AgentStatsResponse,
         CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest, CommandSubmitRequest,
         CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
-        DaemonStatusResponse, DiscoverPage, EmitDefinitionArgs, EventsFilter, EventsReadRequest,
-        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
+        DaemonStatusResponse, DiscoverPage, EmitDefinitionArgs, EventsBoundsRequest, EventsFilter,
+        EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
         GitFetchDefinitionArgs, GitView, MAX_OBSERVATION_PAGE_BYTES, NotifyDefinitionArgs,
         ObservationPage, ObservationQuery, ObservationView, ProcessPageCursor,
         ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest,
@@ -259,6 +259,7 @@ impl Router {
             "agent.edits" => self.agent_edits(&params, &principal).await,
             "turn.get" => self.turn_get(&params, &principal).await,
             "turn.resolve" => self.turn_resolve(&params, &principal).await,
+            "events.bounds" => self.events_bounds(&params, &principal).await,
             "events.read" => self.events_read(&params, &principal).await,
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
             "project.get" => self.project_get(&params, &principal).await,
@@ -2452,6 +2453,17 @@ impl Router {
             .await?;
         serde_json::to_value(turn)
             .map_err(|error| Error::new("internal", format!("encode turn: {error}")))
+    }
+
+    async fn events_bounds(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        let request: EventsBoundsRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "events.bounds params are invalid"))?;
+        request.validate()?;
+        authorize_event_filter(request.filter, principal)?;
+        let bounds = self.inner.store.lock().await.event_bounds()?;
+        bounds.validate()?;
+        serde_json::to_value(bounds)
+            .map_err(|_| Error::new("internal", "event bounds could not be encoded"))
     }
 
     async fn events_read(&self, params: &Value, principal: &Principal) -> Result<Value> {

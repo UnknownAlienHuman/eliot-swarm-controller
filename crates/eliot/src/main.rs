@@ -11,18 +11,18 @@ use eliot_core::{
         ClaimSetResponse, CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest,
         CommandResolution, CommandResolveRequest, CommandResolveResponse, CommandSubmitResponse,
         DEFAULT_GOAL_CHECK_TIMEOUT_MS, DaemonShutdownRequest, DaemonShutdownResponse,
-        DaemonStatusRequest, DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest,
-        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, GoalClearRequest,
-        GoalDefinition, GoalGetRequest, GoalMode, GoalPauseRequest, GoalResumeRequest,
-        GoalRoundRequest, GoalRoundResponse, GoalSetRequest, GoalView, MailAckRequest,
-        MailAckResponse, MailDelivery, MailInboxRequest, MailInboxResponse, MailMode,
-        MailReadRequest, MailSendRequest, MailSendResponse, ObservationPage,
-        ProjectRegistrationView, ProviderClearHoldRequest, ProviderClearHoldResponse,
-        ProviderCorrectiveEvidence, ProviderHoldsRequest, ProviderHoldsResponse,
-        RuleCatchUpRequest, RuleGetRequest, RuleStateView, ShutdownMode, TimerGetRequest,
-        TimerRunRequest, TimerStateView, TurnGetRequest, TurnResolveRequest, TurnResolveResponse,
-        TurnResolveStatus, VarGetRequest, VarGetResponse, VarSetRequest, VarSetResponse,
-        WhoRequest, WhoResponse,
+        DaemonStatusRequest, DaemonStatusResponse, DiscoverPage, EventsBoundsRequest,
+        EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
+        EventsSubscribeRequest, EventsSubscribeResponse, GoalClearRequest, GoalDefinition,
+        GoalGetRequest, GoalMode, GoalPauseRequest, GoalResumeRequest, GoalRoundRequest,
+        GoalRoundResponse, GoalSetRequest, GoalView, MailAckRequest, MailAckResponse, MailDelivery,
+        MailInboxRequest, MailInboxResponse, MailMode, MailReadRequest, MailSendRequest,
+        MailSendResponse, ObservationPage, ProjectRegistrationView, ProviderClearHoldRequest,
+        ProviderClearHoldResponse, ProviderCorrectiveEvidence, ProviderHoldsRequest,
+        ProviderHoldsResponse, RuleCatchUpRequest, RuleGetRequest, RuleStateView, ShutdownMode,
+        TimerGetRequest, TimerRunRequest, TimerStateView, TurnGetRequest, TurnResolveRequest,
+        TurnResolveResponse, TurnResolveStatus, VarGetRequest, VarGetResponse, VarSetRequest,
+        VarSetResponse, WhoRequest, WhoResponse,
     },
 };
 use serde_json::{Value, json};
@@ -336,8 +336,13 @@ enum CliCommand {
         #[command(flatten)]
         page: PageArgs,
     },
-    /// Follow committed events. With an Agent argument, filter to that Agent.
-    Watch { agent: Option<String> },
+    /// Follow new committed events; use --after to replay retained history.
+    Watch {
+        agent: Option<String>,
+        /// Exclusive replay cursor. Omitted: start at the current journal tip.
+        #[arg(long, value_name = "SEQ")]
+        after: Option<i64>,
+    },
     /// Read an Agent's retained turn results.
     Result {
         agent: String,
@@ -1695,7 +1700,9 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             };
             read_and_print!("agent.edits", params, AgentEditsResponse)
         }
-        CliCommand::Watch { agent } => watch(&data_dir, agent.as_deref(), json_output).await,
+        CliCommand::Watch { agent, after } => {
+            watch(&data_dir, agent.as_deref(), after, json_output).await
+        }
         CliCommand::Result {
             agent,
             generation: GenerationArgs { generation },
@@ -2539,17 +2546,41 @@ fn turn_value(turn: CoreTurn) -> Result<Value, Failure> {
     serde_json::to_value(turn).map_err(|_| Failure::new(4, "turn readback is unavailable"))
 }
 
-async fn watch(data_dir: &Path, agent: Option<&str>, json_output: bool) -> Result<u8, Failure> {
-    let mut after = 0_i64;
+async fn watch(
+    data_dir: &Path,
+    agent: Option<&str>,
+    after: Option<i64>,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    let filter = EventsFilter {
+        agents: agent.into_iter().map(str::to_owned).collect(),
+        ..EventsFilter::default()
+    };
+    let mut after = match after {
+        Some(after) => after,
+        None => {
+            let params = EventsBoundsRequest {
+                filter: filter.clone(),
+            };
+            params
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let bounds: EventsBoundsResponse =
+                eliot_daemon::client_call_typed(data_dir, "events.bounds", &params)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            bounds
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            bounds.hi
+        }
+    };
     loop {
         let params = EventsSubscribeRequest {
             after,
             limit: PAGE_SIZE,
             wait_ms: 1_000,
-            filter: EventsFilter {
-                agents: agent.into_iter().map(str::to_owned).collect(),
-                ..EventsFilter::default()
-            },
+            filter: filter.clone(),
         };
         params
             .validate()

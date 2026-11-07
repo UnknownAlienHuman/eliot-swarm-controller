@@ -565,6 +565,7 @@ pub async fn client_call_typed<P: Serialize + ?Sized, R: DeserializeOwned>(
 fn decode_client_result<R: DeserializeOwned>(method: &str, result: Result<Value>) -> Result<R> {
     let result = result?;
     let context = match method {
+        "events.bounds" => "events.bounds returned a malformed typed result",
         "events.read" => "events.read returned a malformed typed result",
         "events.subscribe" => "events.subscribe returned a malformed typed result",
         _ => "daemon returned a malformed typed result",

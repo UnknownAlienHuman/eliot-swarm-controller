@@ -84,6 +84,10 @@ $agent = 'AGENT_ID_FROM_OUTPUT'
 & $swarm --data-dir $dataDir daemon stop --drain  # or --force
 ```
 
+`watch` starts at the current journal tip. Use `watch [AGENT] --after SEQ` to replay
+retained events after an exact exclusive cursor. A pruned cursor returns `history_gap`
+and is never clamped; see [event replay](docs/spec/api.md#event-replay).
+
 On Unix, the built binary is `./target/debug/swarm`; pass the same `--data-dir` to each
 invocation.
 
