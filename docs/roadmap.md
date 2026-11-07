@@ -248,27 +248,25 @@ Codex or for unrelated adapters.
       Done. Completion: a stalled agent produces a delivered supervisor/agent diagnosis
       notification and leaves the uncertain outcome explicit.
 
-- [ ] **L6.6 R5 system context control.** Connect typed `inject` through the existing
+- [x] **L6.6 R5 system context control.** Connect typed `inject` through the existing
       command rows and router: FIFO `next_input` context is prepended inside the same
       native SEND and applies only with its exact turn association; `turn_safe_point`
       binds the captured turn and commits its context claim before the authenticated
       plugin hook response; `active_turn` dispatches directly as the plugin's
       `agent.command` inject through the actual native turn/steer effect
       (`codex.turn/steer`, `muse.turn/steer`) with expiry and exact-turn validation
-      at dispatch, remaining unqualified until installed-agent runtime proof.
-      Normalize `hook.before_tool` through the existing event bus
+      at dispatch. Normalize `hook.before_tool` through the existing event bus
       and `on.event` rules. Preserve exact-turn steer/interrupt and existing approval
       callbacks; adapters report the actual mechanism/application point or `unsupported`,
       never substitute a weaker SEND. Claude Code 2.1.278
       `PreToolUse.additionalContext` was the first native consumer. Antigravity
       supports `before_model`, `turn_safe_point`, and exact-turn steer/interrupt.
-      Remaining work: Claude hook-steer qualification and integration (PR342
-      standalone steer and controls-while-pending). Do not mark complete until the
-      connected path has real installed-agent runtime qualification and is integrated
-      at the root.
+      Delivered: Claude exact-turn hook steer with controls served while a steer
+      reply is pending, proven no-effect refusals settled `rejected`, and actual
+      FIFO/safepoint/active-turn contexts consumed on installed-agent runtime.
 
-The selected local scope remains in progress while L6.6 and the applicable L7
-qualification are incomplete; do not describe it as feature complete.
+The selected local scope remains in progress while the applicable L7
+qualification is incomplete; do not describe it as feature complete.
 
 ## L7 — Qualification, repair and release
 

@@ -48,5 +48,4 @@ owning specs; do not reproduce them in every page. Existing IDs remain stable fo
 
 Direct Codex first; configured native model only. Optional vendors do not block the
 selected release. Git identity is per Agent unless `git_identity="inherit"`. Native
-children without isolated environment have no independent CLI principal. Remote,
-multi-host, GUI and Memory OS are outside current scope.
+children without isolated environment have no independent CLI principal. Owner cloud MCP is current L6.7; multi-host service continuity, GUI and Memory OS remain later.
