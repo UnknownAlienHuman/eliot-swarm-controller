@@ -69,7 +69,7 @@ covers their fate.
 | Eliot verb | Mechanism / limitation |
 | --- | --- |
 | launch/send | stdin `control_request initialize` with the pre-assigned session id, then one stdin `user` record per send; the Eliot-minted `uuid` echoed in `command_lifecycle` is the exact turn association, not local pipe acceptance |
-| steer | unsupported: no exact-current-turn mechanism exists |
+| steer | exact captured turn via the installed 2.1.278 PreToolUse `additionalContext` hook response (no named native steer method; mechanism `claude.PreToolUse.additionalContext` on the applied ack): queues behind any terminal frame for the live turn only (one waiter; a second is `busy`), rides the next live callback for that turn after FIFO hook context; a standalone steer with empty FIFO context writes its prepared response, never the empty pass. Preflight the complete encoded native `control_response` frame, including newline, against 1 MiB. If the combined response is too large, reject the steer and deliver the full context-only response when it fits; if context alone is too large, fail before writing without an empty pass or context receipt. Applied is retained only after the confirmed native response; a turn that ends first drops the text as `stale_turn` (never leaked into another turn), and an uncertain write settles `unknown` without replay. At the RPC deadline, keep the outcome receiver while exact-command withdrawal is queued asynchronously through the event task; keep serving controls, let a confirmed outcome win, and retain `unknown` only after withdrawal acknowledgement or event-task closure with no outcome. A closed outcome is retained under the exact command/turn/text binding before replying, so replay stays stable. Permission callbacks are unaffected; native qualification pending a live run with a tool call after the steer queues |
 | inject | `next_input` prepended directly inside same user SEND with exact native turn association; `turn_safe_point` uses authenticated HookEvent `before_tool` → PreToolUse hookSpecificOutput.additionalContext → confirmed response write + hook.before_tool receipt, captured generation/turn, no drift/replay; `active_turn` inject unsupported for this CLI |
 | interrupt | stdin `control_request interrupt` for the bound active turn uuid, with the `still_queued` readback; the terminal follows and unknown is not repeated |
 | stop | drop stdin (the CLI exits on EOF) and kill only the direct CLI child by handle; does not merely detach observation; grandchildren are reaped by the generation Job on Windows / process group on Unix, not the plugin (see Transport) |
@@ -79,8 +79,11 @@ covers their fate.
 | configure | applied at start, not a runtime verb: `--model` / `--permission-mode` argv on a fresh start, `set_model` / `set_permission_mode` realign on resume; requested vs effective settings are reported before readiness, with `effective.model` null at readiness (the CLI never reads the active model back in `initialize`; `models[]` membership proves availability/membership only, never which model is actually serving). A non-empty `message.model` reported by an actual native `assistant` record is carried on its `message.completed` fact and merged as the only change into `Agent.effective.model`, preserving pid/permissions/session fields and the requested profile alias; missing/null stays unobserved and a reported model change is not a gap |
 | goal | no native goal mechanism; goal selection stays in Eliot |
 
-If a turn ends before queued hook context is consumed, do not deliver it to a later
-turn. A delayed hook is inject, never advertised as exact steer.
+If a turn ends before queued hook context or a queued steer is consumed, do not
+deliver it to a later turn: the steer settles `stale_turn` and the text is
+dropped. A delayed hook carrying only FIFO context is inject; steer is the
+separate verb above with its own exact-turn queue and mechanism. Neither is
+`active_turn` inject, which stays unsupported for this CLI.
 
 ## Source ownership and recovery
 
