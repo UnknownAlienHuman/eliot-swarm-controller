@@ -73,12 +73,16 @@ pub struct DataEnvelope<T> {
 // Prompts and inbox
 // ---------------------------------------------------------------------------
 
-/// `POST /api/session/{id}/prompt` (`session.prompt`) body. PR1 sends text
-/// only; `delivery` stays server-default (`steer` on an idle session).
+/// `POST /api/session/{id}/prompt` (`session.prompt`) body. `delivery` is
+/// the installed `Session.Inbox.Delivery` (`steer`|`queue`): `None` leaves
+/// the native default (`steer`, applied in `SessionPrompt.prepare`), while
+/// the steer path sets explicit `steer` so the write states its contract.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptRequest {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<String>,
 }
 
 /// Installed `Session.Inbox.User`: the prompt response. Its `id` is the user

@@ -1,5 +1,5 @@
 use crate::{
-    events::{EventConfig, EventHandle, EventStatus, TurnFacts},
+    events::{EventConfig, EventHandle, EventStatus, InboxRecord, SteerVerdict, TurnFacts},
     native::{
         AuthSetup, HttpOutcome, IntegrationSelector, OpenCodeHttp, OwnedServer, ServerLaunch,
         types::{InboxUser, ModelRef, SessionInfo},
@@ -23,7 +23,10 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
 };
-use tokio::{sync::mpsc, time::Instant};
+use tokio::{
+    sync::mpsc,
+    time::{Instant, timeout_at},
+};
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -1207,6 +1210,7 @@ impl OpenCodePlugin {
         )?;
         match params.verb.as_str() {
             "send" => self.send_command(params).await,
+            "steer" => self.steer_command(params).await,
             "interrupt" => self.interrupt_command(params).await,
             "approve" | "deny" | "answer" => self.reply_command(params).await,
             _ => Err(Error::new(
@@ -1563,6 +1567,238 @@ impl OpenCodePlugin {
                     format!("OpenCode interrupt outcome is unresolved ({reason})"),
                 ))
             }
+        }
+    }
+
+    /// Steer the exact active turn: one `session.prompt` write with
+    /// explicit `delivery: steer`, then the event task proves the input
+    /// was delivered while the exact turn stayed active. Native joins
+    /// such an input to the running turn at a step boundary; the write
+    /// never opens a turn here (`command_turns` untouched, no send-lane
+    /// association) and never emulates interruption. A finished turn is
+    /// stale without a write; anything that cannot prove consumption is
+    /// unknown, and a missed input is cancelled by exact id with removal
+    /// proven by inbox-list absence plus a stream-observed cancel —
+    /// anything unproven latches the session unknown so no later send
+    /// dispatches behind the unresolved input.
+    async fn steer_command(&mut self, params: AgentCommandParams) -> Result<Value> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| Error::new("bad_state", "OpenCode Agent session has not started"))?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "OpenCode",
+        )?;
+        if session.phase != SessionPhase::Ready || native_io_blocked(session) {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode session or event source outcome is unresolved",
+            ));
+        }
+        let admitted = match Self::admit_control_command(session, &params, false)? {
+            ControlAdmission::Replay(value) => return Ok(value),
+            ControlAdmission::New {
+                command_id,
+                turn_id,
+                ..
+            } => (command_id, turn_id),
+        };
+        let (command_id, turn_id) = admitted;
+        let text = match params.args.get("text").and_then(Value::as_str) {
+            Some(text) => text.to_owned(),
+            None => {
+                Self::abandon_control(session, &command_id);
+                return Err(Error::new("invalid", "OpenCode steer requires args.text"));
+            }
+        };
+        if text.len() > MAX_TEXT_BYTES {
+            Self::abandon_control(session, &command_id);
+            return Err(Error::new(
+                "frame_too_large",
+                "OpenCode input exceeds 512 KiB",
+            ));
+        }
+        let Some(turn_id) = turn_id else {
+            Self::abandon_control(session, &command_id);
+            return Err(Error::new(
+                "stale_turn",
+                "OpenCode steer requires the exact turn id",
+            ));
+        };
+        let live = match session.events.check_turn(&turn_id).await {
+            Ok(live) => live,
+            // The gate itself is unresolved (the event task is gone): the
+            // turn may still be live, so this is unknown, never stale.
+            Err(_) => {
+                Self::abandon_control(session, &command_id);
+                return Err(Error::new(
+                    "unknown",
+                    "OpenCode steer turn check is unresolved",
+                ));
+            }
+        };
+        if !live {
+            Self::abandon_control(session, &command_id);
+            return Err(Error::new(
+                "stale_turn",
+                "OpenCode steer named a finished turn",
+            ));
+        }
+        let session_id = session
+            .session_id
+            .clone()
+            .ok_or_else(|| Error::new("unknown", "OpenCode session identity is unresolved"))?;
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        let inbox = match session
+            .http
+            .prompt_with_delivery(&session_id, &text, Some("steer"), deadline)
+            .await
+        {
+            Ok(inbox) => {
+                if inbox.session_id != session_id || inbox.id.trim().is_empty() {
+                    session.unknown_commands.insert(command_id.clone());
+                    session.phase = SessionPhase::Unknown;
+                    return Err(Error::new(
+                        "unknown",
+                        "OpenCode steer answered for another session",
+                    ));
+                }
+                inbox
+            }
+            Err(HttpOutcome::Rejected { reason, .. })
+            | Err(HttpOutcome::NotDispatched { reason }) => {
+                let result = json!({
+                    "state": "rejected",
+                    "command_id": command_id,
+                    "turn_id": turn_id,
+                    "reason": reason,
+                });
+                Self::settle_control(session, &command_id, result.clone());
+                return Ok(result);
+            }
+            Err(HttpOutcome::Unknown { reason }) => {
+                // The input may have been admitted without an inbox id to
+                // watch or cancel: latch unknown like the send path and
+                // never re-send (the control binding stays).
+                session.unknown_commands.insert(command_id.clone());
+                session.phase = SessionPhase::Unknown;
+                return Err(Error::new(
+                    "unknown",
+                    format!("OpenCode steer outcome is unresolved ({reason})"),
+                ));
+            }
+        };
+        let verdict = match session
+            .events
+            .watch_steer(command_id.clone(), turn_id.clone(), inbox.id.clone())
+            .await
+        {
+            Ok(verdict) => verdict,
+            Err(_) => {
+                return Err(Self::settle_steer_unproven(
+                    session,
+                    &session_id,
+                    &inbox.id,
+                    &command_id,
+                    "OpenCode steer was admitted but its consumption cannot be proven",
+                )
+                .await);
+            }
+        };
+        match timeout_at(deadline, verdict).await {
+            Ok(Ok(SteerVerdict::Applied)) => {
+                let result = json!({
+                    "state": "applied",
+                    "command_id": command_id,
+                    "turn_id": turn_id,
+                });
+                Self::settle_control(session, &command_id, result.clone());
+                Ok(result)
+            }
+            Ok(Ok(SteerVerdict::Missed)) => Err(Self::settle_steer_unproven(
+                session,
+                &session_id,
+                &inbox.id,
+                &command_id,
+                "OpenCode steer missed its turn; the input did not join the exact turn",
+            )
+            .await),
+            Ok(Err(_)) | Err(_) => {
+                session.events.abandon_steer(command_id.clone()).await;
+                Err(Self::settle_steer_unproven(
+                    session,
+                    &session_id,
+                    &inbox.id,
+                    &command_id,
+                    "OpenCode steer consumption is unproven",
+                )
+                .await)
+            }
+        }
+    }
+
+    /// Settle a steer whose exact-turn consumption is unproven: cancel the
+    /// exact inbox id (best effort; the native 204 also covers the
+    /// no-op), then prove removal before letting the session continue.
+    /// Removal is proven only by absence from the inbox-list readback
+    /// plus a stream-observed cancel with no delivery. Anything else —
+    /// still pending, delivered into later work, failed readback, or an
+    /// unanswered stream record — latches the session unknown so the
+    /// router cannot dispatch a later send or Goal behind the unresolved
+    /// native input. The steer itself is always unknown.
+    async fn settle_steer_unproven(
+        session: &mut AgentSession,
+        session_id: &str,
+        inbox_id: &str,
+        command_id: &str,
+        message: &str,
+    ) -> Error {
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        let _ = session
+            .http
+            .cancel_inbox(session_id, inbox_id, deadline)
+            .await;
+        let removed = Self::steer_input_removed(session, session_id, inbox_id).await;
+        session.unknown_commands.insert(command_id.to_owned());
+        if removed {
+            Error::new("unknown", message.to_owned())
+        } else {
+            session.phase = SessionPhase::Unknown;
+            Error::new(
+                "unknown",
+                format!("{message}; the session is latched unknown behind the unresolved input"),
+            )
+        }
+    }
+
+    /// Removal proof for one steered inbox id: absent from the pending
+    /// list, never delivered on the stream, and cancelled on the stream.
+    /// Every other combination (including any failed read) is unproven.
+    async fn steer_input_removed(session: &AgentSession, session_id: &str, inbox_id: &str) -> bool {
+        let pending = match session
+            .http
+            .list_inbox(session_id, Instant::now() + RPC_TIMEOUT)
+            .await
+        {
+            Ok(items) => items,
+            Err(_) => return false,
+        };
+        if pending
+            .iter()
+            .any(|item| item.get("id").and_then(Value::as_str) == Some(inbox_id))
+        {
+            return false;
+        }
+        match session.events.check_inbox(inbox_id).await {
+            Ok(InboxRecord {
+                delivered: false,
+                cancelled: true,
+            }) => true,
+            Ok(_) | Err(_) => false,
         }
     }
 
@@ -2189,6 +2425,7 @@ fn opencode_manifest() -> PluginManifest {
             "launch".to_owned(),
             "resume".to_owned(),
             "send".to_owned(),
+            "steer".to_owned(),
             "interrupt".to_owned(),
             "approve".to_owned(),
             "deny".to_owned(),
@@ -2233,6 +2470,7 @@ mod tests {
                 "launch",
                 "resume",
                 "send",
+                "steer",
                 "interrupt",
                 "approve",
                 "deny",
