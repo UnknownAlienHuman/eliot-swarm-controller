@@ -1,155 +1,239 @@
-//! AGY 1.5.0 NDJSON, observed with gemini-3.8-flash-high on 2026-11-04.
-//! Input/result have no request or turn id: correlation is single-flight,
-//! confined to this uninterrupted process, never across a resumed generation.
+//! AGY 1.5.2 ACP (Agent Client Protocol v1) wire types, observed against the
+//! pinned schema `v1-7ec5185c.json` and the installed `agy acp` server.
+//!
+//! The ACP server speaks JSON-RPC over stdio: requests are correlated by id
+//! through the shared native transport, turn progress arrives as
+//! `session/update` notifications, and the `session/prompt` response
+//! (`stopReason`) is the terminal turn fact. There is no request or turn id
+//! on the wire for a prompt: correlation is single-flight, confined to this
+//! uninterrupted process and the exact Eliot turn prepared before dispatch,
+//! never across a resumed generation.
+//!
+//! Hooks, steer and inject are NOT ACP methods (the pinned schema has no
+//! such `x-method`); the later hook-callback increment will add its own
+//! binding. This module stays strictly inside the pinned ACP surface.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde_json::{Value, json};
 
+/// `initialize` result. Only the negotiated version and the advertised
+/// capability object are consumed; `authMethods` and `_meta` are never
+/// decoded into owned state.
 #[derive(Debug, Deserialize)]
-#[serde(tag = "event")]
-pub(crate) enum AgyFrame {
-    #[serde(rename = "init")]
-    Init { conversation_id: String, init: Init },
-    #[serde(rename = "step_update")]
-    StepUpdate { step_update: StepUpdate },
-    #[serde(rename = "result")]
-    Result { result: ResultRecord },
-    #[serde(other)]
-    Unknown,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct Init {
-    pub model: String,
-    pub cwd: String,
-    pub permission_mode: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct StepUpdate {
-    pub conversation_id: String,
-    pub step_index: u64,
-    pub state: String,
-    pub step_type: String,
-    pub tool_name: Option<String>,
-    pub tool_info: Option<ToolInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ToolInfo {
-    pub error: Option<ToolError>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ToolError {
-    pub r#type: String,
-    pub message: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ResultRecord {
-    pub conversation_id: String,
-    pub status: String,
-    pub response: String,
-    pub error: Option<String>,
-    pub finished_reason: Option<String>,
-    pub num_turns: Option<u64>,
-    pub usage: Option<Usage>,
+pub(crate) struct InitializeResult {
+    #[serde(rename = "protocolVersion")]
+    pub protocol_version: u64,
     #[serde(default)]
-    pub denied_actions: Vec<DeniedAction>,
+    pub agent_capabilities: Value,
 }
 
-impl ResultRecord {
+/// `session/new` / `session/load` result.
+#[derive(Debug, Deserialize)]
+pub(crate) struct SessionResult {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(default)]
+    pub modes: Option<ModeState>,
+    #[serde(default)]
+    #[serde(rename = "configOptions")]
+    pub config_options: Option<Vec<ConfigOption>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ModeState {
+    #[serde(rename = "currentModeId")]
+    pub current_mode_id: String,
+    #[serde(default)]
+    pub available_modes: Vec<SessionMode>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SessionMode {
+    pub id: String,
+}
+
+/// One `configOptions` entry. `options` stays a raw value because the schema
+/// permits both a flat option array and grouped arrays; flattening happens
+/// in [`ConfigOption::option_values`].
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConfigOption {
+    pub id: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default, rename = "currentValue")]
+    pub current_value: Value,
+    #[serde(default)]
+    pub options: Option<Value>,
+}
+
+impl ConfigOption {
+    /// Flattened `(value, name)` pairs for a select option, in wire order.
+    /// Grouped entries contribute their members with the group name folded
+    /// into the label; structural surprises yield no pairs, never defaults.
+    pub fn option_values(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let Some(options) = self.options.as_ref().and_then(Value::as_array) else {
+            return out;
+        };
+        for entry in options {
+            if let (Some(value), Some(name)) = (
+                entry.get("value").and_then(Value::as_str),
+                entry.get("name").and_then(Value::as_str),
+            ) {
+                out.push((value.to_owned(), name.to_owned()));
+            } else if let Some(members) = entry.get("options").and_then(Value::as_array) {
+                let group = entry.get("name").and_then(Value::as_str).unwrap_or("");
+                for member in members {
+                    if let (Some(value), Some(name)) = (
+                        member.get("value").and_then(Value::as_str),
+                        member.get("name").and_then(Value::as_str),
+                    ) {
+                        out.push((
+                            value.to_owned(),
+                            if group.is_empty() {
+                                name.to_owned()
+                            } else {
+                                format!("{group}: {name}")
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The current value as a plain string, when the option is a select.
+    pub fn current_value_str(&self) -> Option<&str> {
+        self.current_value.as_str()
+    }
+}
+
+/// `session/set_config_option` result: the full echoed option set.
+#[derive(Debug, Deserialize)]
+pub(crate) struct SetConfigOptionResult {
+    #[serde(rename = "configOptions")]
+    pub config_options: Vec<ConfigOption>,
+}
+
+/// `session/prompt` result: the terminal turn fact.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PromptResult {
+    #[serde(rename = "stopReason")]
+    pub stop_reason: String,
+}
+
+impl PromptResult {
+    /// Map the pinned `StopReason` vocabulary onto Eliot turn statuses.
+    /// `end_turn`/`max_tokens`/`max_turn_requests` end the turn normally,
+    /// `cancelled` is the interrupt settlement, `refusal` fails the turn,
+    /// and anything else is a native protocol violation.
     pub fn terminal_status(&self) -> eliot_core::Result<Option<&'static str>> {
-        match self.status.as_str() {
-            "SUCCESS" => Ok(Some("completed")),
-            "ERROR" | "INVALID" => Ok(Some("failed")),
-            "CANCELED" | "INTERRUPTED" => Ok(Some("cancelled")),
-            "WAITING" | "RUNNING" => Ok(None),
+        match self.stop_reason.as_str() {
+            "end_turn" | "max_tokens" | "max_turn_requests" => Ok(Some("completed")),
+            "cancelled" => Ok(Some("cancelled")),
+            "refusal" => Ok(Some("failed")),
             _ => Err(eliot_core::Error::new(
                 "native_protocol",
-                "Antigravity result status is unknown",
+                "Antigravity prompt stop reason is unknown",
             )),
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct Usage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub thinking_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub total_tokens: u64,
+/// One classified `session/update` notification body.
+#[derive(Debug)]
+pub(crate) enum AcpUpdate {
+    /// Assistant text chunk; appended to the current turn's final text.
+    MessageChunk { text: String },
+    /// Thought chunk: bookkeeping, never assistant output.
+    ThoughtChunk,
+    /// Echo of the user's own input: bookkeeping.
+    UserChunk,
+    /// A new tool call started.
+    ToolCall { tool_call_id: String, title: String },
+    /// A tool call state change.
+    ToolCallUpdate {
+        tool_call_id: String,
+        title: Option<String>,
+        status: String,
+    },
+    /// Known metadata updates this adapter does not model (plan, mode,
+    /// config, usage, notices, …): handled without input association.
+    Ignored,
+    /// A `sessionUpdate` kind outside the pinned vocabulary.
+    Unknown(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct DeniedAction {
-    pub action: String,
-    pub display_name: String,
-}
-
-#[derive(Serialize)]
-pub(crate) struct UserInput<'a> {
-    event: &'static str,
-    message: UserMessage<'a>,
-}
-
-#[derive(Serialize)]
-struct UserMessage<'a> {
-    role: &'static str,
-    content: &'a str,
-}
-
-impl<'a> UserInput<'a> {
-    pub fn new(text: &'a str) -> Self {
-        Self {
-            event: "user",
-            message: UserMessage {
-                role: "user",
-                content: text,
+/// Classify one `session/update` params object. Returns `None` when the
+/// envelope itself (session id / update kind) is structurally invalid.
+pub(crate) fn classify_update(params: &Value) -> Option<(String, AcpUpdate)> {
+    let session_id = params.get("sessionId")?.as_str()?.to_owned();
+    let update = params.get("update")?;
+    let kind = update.get("sessionUpdate")?.as_str()?;
+    let content_text = || {
+        update
+            .get("content")
+            .and_then(|content| content.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let tool_call_id = || {
+        update
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    Some((
+        session_id,
+        match kind {
+            "agent_message_chunk" => AcpUpdate::MessageChunk {
+                text: content_text(),
             },
-        }
-    }
+            "agent_thought_chunk" => AcpUpdate::ThoughtChunk,
+            "user_message_chunk" => AcpUpdate::UserChunk,
+            "tool_call" => AcpUpdate::ToolCall {
+                tool_call_id: tool_call_id(),
+                title: update
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            },
+            "tool_call_update" => AcpUpdate::ToolCallUpdate {
+                tool_call_id: tool_call_id(),
+                title: update
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                status: update
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            },
+            "plan"
+            | "available_commands_update"
+            | "current_mode_update"
+            | "config_option_update"
+            | "session_info_update"
+            | "usage_update"
+            | "notice"
+            | "compaction_update"
+            | "compaction_summary_chunk" => AcpUpdate::Ignored,
+            other => AcpUpdate::Unknown(other.to_owned()),
+        },
+    ))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn observed_denial_does_not_turn_success_into_failure() {
-        // Recorded stdout3.ndjson; only the conversation id and cwd are sanitized.
-        let frames: Vec<AgyFrame> =
-            include_str!("../../tests/fixtures/agy-1.5.0-soft-denial.ndjson")
-                .lines()
-                .map(|line| serde_json::from_str(line).expect("recorded frame"))
-                .collect();
-        let error = frames
-            .iter()
-            .find_map(|frame| match frame {
-                AgyFrame::StepUpdate { step_update } if step_update.state == "ERROR" => {
-                    step_update.tool_info.as_ref()?.error.as_ref()
-                }
-                _ => None,
-            })
-            .expect("recorded tool denial");
-        assert!(error.message.contains("user denied permission"));
-        let AgyFrame::Result { result } = frames.last().expect("result") else {
-            panic!("result envelope")
-        };
-        assert_eq!(result.terminal_status().unwrap(), Some("completed"));
-        assert_eq!(result.denied_actions[0].action, "command");
-        assert_eq!(result.response, "");
-        assert_eq!(result.usage.as_ref().unwrap().total_tokens, 9451);
-    }
-
-    #[test]
-    fn input_has_exact_observed_envelope_and_json_escaping() {
-        let text = "quote \" and newline\n and backslash \\";
-        let raw = serde_json::to_value(UserInput::new(text)).unwrap();
-        assert_eq!(
-            raw,
-            serde_json::json!({"event":"user","message":{"role":"user","content":text}})
-        );
-    }
+/// Build the exact `session/prompt` params for one text input.
+pub(crate) fn prompt_params(session_id: &str, text: &str) -> Value {
+    json!({
+        "sessionId": session_id,
+        "prompt": [{"type": "text", "text": text}],
+    })
 }

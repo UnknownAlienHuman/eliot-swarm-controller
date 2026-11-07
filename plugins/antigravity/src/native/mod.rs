@@ -1,5 +1,8 @@
 mod client;
 mod types;
 
-pub(crate) use client::spawn;
-pub(crate) use types::{AgyFrame, Init, ResultRecord, StepUpdate, Usage, UserInput};
+pub(crate) use client::{NativeClient, NativeFrame, NativeProcess, StreamState};
+pub(crate) use types::{
+    AcpUpdate, InitializeResult, PromptResult, SessionResult, SetConfigOptionResult,
+    classify_update, prompt_params,
+};

@@ -3,10 +3,10 @@ use std::{collections::HashMap, sync::Arc};
 use eliot_core::{ContextItem, Error, Result, SecretPolicy, SourceHealthUpdate};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
+    native_stdio::NativeFrame,
     native_transport::StreamState,
     session::{
-        EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error, event_id,
-        next_input_outcomes,
+        EVENT_DEADLINE, StreamSource, attach_final_text, event_id, next_input_outcomes,
     },
 };
 use serde::Serialize;
@@ -16,13 +16,15 @@ use tokio::{
     time::Instant,
 };
 
-use crate::native::{AgyFrame, ResultRecord, StepUpdate};
+use crate::native::{AcpUpdate, NativeClient, PromptResult, classify_update};
 
 pub(crate) const FAMILIES: &[&str] = &["session", "turn", "message", "tool"];
 pub(crate) type Shared = Arc<Mutex<State>>;
 
-#[cfg(test)]
-type CapturedEvents = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+/// Upper bound on accumulated assistant text per turn. Beyond this the
+/// tail is dropped and the turn carries `final_text_unavailable` instead
+/// of an unbounded payload.
+const MAX_TURN_TEXT_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Serialize)]
 pub(crate) struct TurnFacts {
@@ -51,6 +53,8 @@ pub(crate) struct State {
     pub conversation: String,
     pending: Option<Pending>,
     tool_events: HashMap<String, Value>,
+    text_accum: String,
+    text_truncated: bool,
     writes_blocked: bool,
     gap_reported: bool,
     gap_number: u64,
@@ -63,9 +67,11 @@ pub(crate) struct State {
     pub stopping: bool,
     pub stopped: bool,
     pub last_turn: Option<TurnFacts>,
-    pub usage: Option<crate::native::Usage>,
-    #[cfg(test)]
-    pub(crate) test_recorder: Option<CapturedEvents>,
+    /// Terminal settlement of the most recent prepared turn:
+    /// `(turn_id, status)` where status is the mapped turn status or
+    /// `"unknown"`. Interrupt waits on this instead of trusting its own
+    /// notification write.
+    pub settlement: Option<(String, String)>,
 }
 
 impl State {
@@ -87,6 +93,8 @@ impl State {
             conversation,
             pending: None,
             tool_events: HashMap::new(),
+            text_accum: String::new(),
+            text_truncated: false,
             writes_blocked: false,
             gap_reported: false,
             gap_number: 0,
@@ -99,10 +107,15 @@ impl State {
             stopping: false,
             stopped: false,
             last_turn: None,
-            usage: None,
-            #[cfg(test)]
-            test_recorder: None,
+            settlement: None,
         }
+    }
+
+    pub fn settlement_for(&self, turn: &str) -> Option<&str> {
+        self.settlement
+            .as_ref()
+            .filter(|(settled, _)| settled == turn)
+            .map(|(_, status)| status.as_str())
     }
 
     pub fn active_turn(&self) -> Option<&str> {
@@ -134,6 +147,8 @@ impl State {
             reply: Some(reply),
         });
         self.tool_events.clear();
+        self.text_accum.clear();
+        self.text_truncated = false;
         Ok(result)
     }
 
@@ -207,21 +222,29 @@ impl State {
         result
     }
 
-    async fn observe(&mut self, frame: AgyFrame) -> Result<()> {
+    async fn observe(&mut self, frame: NativeFrame, client: &NativeClient) -> Result<()> {
         if self.failure.is_some() {
             return Ok(());
         }
         match frame {
-            AgyFrame::StepUpdate { step_update } => self.step(step_update).await,
-            AgyFrame::Result { result } => self.complete(result).await,
-            AgyFrame::Init { .. } => Err(Error::new(
-                "source_integrity",
-                "Antigravity sent a second init",
-            )),
-            AgyFrame::Unknown => Err(Error::new(
-                "native_protocol",
-                "Antigravity event is unconnected",
-            )),
+            NativeFrame::Notification { method, params } if method == "session/update" => {
+                self.update(&params).await
+            }
+            NativeFrame::Notification { .. } => Ok(()),
+            NativeFrame::Request { id, method, params } => {
+                // No approve/answer channel is connected on this route, so
+                // every agent request is an explicit unsupported rejection
+                // (never an auto-approval). A failed reply means the stream
+                // itself is broken and the turn outcome is unknown.
+                client
+                    .reject_unsupported_request(
+                        id,
+                        &method,
+                        &params,
+                        Instant::now() + EVENT_DEADLINE,
+                    )
+                    .await
+            }
         }
     }
 
@@ -235,83 +258,106 @@ impl State {
         ))
     }
 
-    async fn step(&mut self, step: StepUpdate) -> Result<()> {
-        self.check_conversation(&step.conversation_id)?;
-        // Native bookkeeping may arrive before input, including on resume.
-        // It supplies neither an input acknowledgement nor assistant output.
-        if step.step_type == "system_message" {
-            return Ok(());
-        }
-        if step.step_type == "checkpoint" {
-            if step.tool_name.is_some() || step.tool_info.is_some() {
-                return Err(self.unsupported_step_error(&step));
-            }
-            return Ok(());
-        }
-        match step.step_type.as_str() {
-            "user_input" | "agent_response" => {
+    async fn update(&mut self, params: &Value) -> Result<()> {
+        let Some((session_id, update)) = classify_update(params) else {
+            return Err(Error::new(
+                "native_protocol",
+                "Antigravity session/update did not match its envelope",
+            ));
+        };
+        self.check_conversation(&session_id)?;
+        match update {
+            AcpUpdate::MessageChunk { text } => {
                 self.associate().await?;
+                if !self.text_truncated {
+                    if self.text_accum.len().saturating_add(text.len()) > MAX_TURN_TEXT_BYTES {
+                        self.text_truncated = true;
+                    } else {
+                        self.text_accum.push_str(&text);
+                    }
+                }
                 Ok(())
             }
-            "tool" => self.tool(step).await,
-            _ => Err(self.unsupported_step_error(&step)),
+            // Bookkeeping: neither input acknowledgement nor assistant output.
+            AcpUpdate::ThoughtChunk | AcpUpdate::UserChunk | AcpUpdate::Ignored => Ok(()),
+            AcpUpdate::ToolCall {
+                tool_call_id,
+                title,
+            } => {
+                self.tool_event(&tool_call_id, "tool.started", "running", &title, None)
+                    .await
+            }
+            AcpUpdate::ToolCallUpdate {
+                tool_call_id,
+                title,
+                status,
+            } => match status.as_str() {
+                "pending" => Ok(()),
+                "in_progress" => {
+                    self.tool_event(
+                        &tool_call_id,
+                        "tool.started",
+                        "running",
+                        title.as_deref().unwrap_or(""),
+                        None,
+                    )
+                    .await
+                }
+                "completed" => {
+                    self.tool_event(
+                        &tool_call_id,
+                        "tool.completed",
+                        "completed",
+                        title.as_deref().unwrap_or(""),
+                        None,
+                    )
+                    .await
+                }
+                "failed" => {
+                    self.tool_event(
+                        &tool_call_id,
+                        "tool.completed",
+                        "failed",
+                        title.as_deref().unwrap_or(""),
+                        None,
+                    )
+                    .await
+                }
+                _ => Err(Error::new(
+                    "native_protocol",
+                    "Antigravity tool call status is unknown",
+                )),
+            },
+            AcpUpdate::Unknown(kind) => Err(Error::new(
+                "native_protocol",
+                format!("Antigravity session update is unconnected: {kind}"),
+            )),
         }
     }
 
-    fn unsupported_step_error(&self, step: &StepUpdate) -> Error {
-        let bounded = |value: &str| {
-            let redacted = self.policy.redact_text(value);
-            let mut chars = redacted.chars();
-            let mut value: String = chars.by_ref().take(96).collect();
-            if chars.next().is_some() {
-                value.push_str("[TRUNCATED]");
-            }
-            value
-        };
-        // This reason reaches source.gap through lose(). Keep only structural
-        // fields; never serialize the frame, prompt, response, or tool args.
-        let details = json!({
-            "event": "step_update",
-            "conversation_id": bounded(&step.conversation_id),
-            "step_index": step.step_index,
-            "state": bounded(&step.state),
-            "step_type": bounded(&step.step_type),
-        });
-        Error::new(
-            "native_protocol",
-            format!("Antigravity step type is unconnected: {details}"),
-        )
-    }
-
-    async fn tool(&mut self, step: StepUpdate) -> Result<()> {
-        let (kind, status) = match step.state.as_str() {
-            "ACTIVE" => ("tool.started", "running"),
-            "DONE" => ("tool.completed", "completed"),
-            "ERROR" => ("tool.completed", "failed"),
-            _ => {
-                return Err(Error::new(
-                    "native_protocol",
-                    "Antigravity tool state is unknown",
-                ));
-            }
-        };
-        let tool = step
-            .tool_name
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| Error::new("native_protocol", "Antigravity tool name is absent"))?;
+    async fn tool_event(
+        &mut self,
+        tool_call_id: &str,
+        kind: &str,
+        status: &str,
+        title: &str,
+        _error: Option<()>,
+    ) -> Result<()> {
+        if tool_call_id.trim().is_empty() {
+            return Err(Error::new(
+                "native_protocol",
+                "Antigravity tool call id is absent",
+            ));
+        }
         self.associate().await?;
         let pending = self
             .pending
             .as_ref()
             .ok_or_else(|| Error::new("unknown", "Antigravity turn is absent"))?;
         let turn = pending.turn.clone();
-        let item = format!("step-{}", step.step_index);
+        let item = format!("tool-{tool_call_id}");
         let mut data = json!({"command_id": pending.command, "turn_id": turn,
-            "item_id": item, "tool": tool, "status": status, "native_status": step.state});
-        if let Some(error) = step.tool_info.and_then(|info| info.error) {
-            data["native_error_type"] = json!(self.policy.redact_text(&error.r#type));
-            attach_native_error(&mut data, Some(&error.message), &self.policy);
-        }
+            "item_id": item, "tool": title, "status": status});
         self.policy.redact_values(&mut data);
         let key = format!("{item}:{kind}");
         if let Some(old) = self.tool_events.get(&key) {
@@ -329,58 +375,95 @@ impl State {
         Ok(())
     }
 
-    async fn complete(&mut self, result: ResultRecord) -> Result<()> {
-        self.check_conversation(&result.conversation_id)?;
+    /// Settle the prepared turn from the terminal `session/prompt`
+    /// response. Only the actual stop reason settles the turn: `cancelled`
+    /// is the interrupt settlement and is never inferred from silence.
+    pub async fn complete_prompt(&mut self, stop_reason: &str) {
+        if self.failure.is_some() {
+            return;
+        }
+        let result = PromptResult {
+            stop_reason: stop_reason.to_owned(),
+        };
+        match self.settle_prompt(&result).await {
+            Ok(()) => {}
+            Err(error) => self.lose(&error.message).await,
+        }
+    }
+
+    async fn settle_prompt(&mut self, result: &PromptResult) -> Result<()> {
         let Some(status) = result.terminal_status()? else {
             return Ok(());
         };
-        // A result alone suffices: no intermediate step or native turn id is required.
+        // A terminal response alone suffices: no intermediate update is
+        // required, matching the old stream-json rule.
         self.associate().await?;
         let pending = self
             .pending
             .as_ref()
             .ok_or_else(|| Error::new("unknown", "Antigravity turn is absent"))?;
         let (command, turn) = (pending.command.clone(), pending.turn.clone());
-        let failed = result.status != "SUCCESS";
-        let text = self.policy.redact_text(&result.response);
+        let failed = status == "failed";
+        let text = self.policy.redact_text(&self.text_accum);
+        let truncated = self.text_truncated;
         let mut data = json!({"command_id": command, "turn_id": turn,
-            "status": status, "native_status": result.status, "denied_actions": result.denied_actions,
-            "usage": result.usage, "num_turns": result.num_turns,
-            "finished_reason": result.finished_reason});
+            "status": status, "native_status": result.stop_reason});
         self.policy.redact_values(&mut data);
-        attach_native_error(&mut data, result.error.as_deref(), &self.policy);
-        attach_final_text(&mut data, &text, failed, &self.policy);
-        let text_omitted = failed && data.get("final_text").is_none();
-        if !text.is_empty() && !text_omitted {
+        if !text.is_empty() && !truncated {
             self.commit(
                 "message.completed",
                 &turn,
                 "response",
-                json!({
-                    "command_id": command, "turn_id": turn, "text": text,
-                }),
+                json!({"command_id": command, "turn_id": turn, "text": text}),
             )
             .await?;
         }
+        if truncated {
+            data["final_text_unavailable"] = json!("event_budget");
+        }
+        if failed && data.get("final_text").is_none() && !text.is_empty() && !truncated {
+            attach_final_text(&mut data, &text, true, &self.policy);
+        }
         self.commit("turn.completed", &turn, "completed", data.clone())
             .await?;
-        if result.usage.is_some() {
-            self.usage = result.usage; // Replace; never add cumulative results.
-        }
         let final_text = data
             .get("final_text")
             .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
+            .map(str::to_owned);
         self.last_turn = Some(TurnFacts {
             command_id: command,
-            turn_id: turn,
+            turn_id: turn.clone(),
             status: status.to_owned(),
-            final_text,
+            final_text: final_text.unwrap_or_default(),
             terminal: true,
         });
+        self.settlement = Some((turn, status.to_owned()));
         self.pending = None;
         Ok(())
+    }
+
+    /// Settle a failed `session/prompt` call. An unassociated dispatch
+    /// failure (e.g. rejected before admission) withdraws the pending turn
+    /// and reports that exact error; anything after association loses the
+    /// stream honestly instead of inventing a terminal fact.
+    pub async fn fail_prompt(&mut self, error: Error) {
+        if self.failure.is_some() {
+            return;
+        }
+        let unassociated = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !pending.associated);
+        if unassociated {
+            if let Some(mut pending) = self.pending.take()
+                && let Some(reply) = pending.reply.take()
+            {
+                self.settlement = Some((pending.turn.clone(), "unknown".to_owned()));
+                let _ = reply.send(Err(error));
+            }
+            return;
+        }
+        self.lose(&error.message).await;
     }
 
     pub async fn ended(&mut self) -> Result<()> {
@@ -406,16 +489,14 @@ impl State {
             ));
         }
         let id = event_id(&self.conversation, turn, item, kind, "agy", "Antigravity")?;
-        #[cfg(test)]
-        if let Some(recorder) = &self.test_recorder {
-            recorder.lock().unwrap().push((kind.to_owned(), data));
-            return Ok(());
-        }
         self.source().commit_event(kind, id, data).await
     }
 
     pub async fn lose(&mut self, reason: &str) {
         self.source_unknown = true;
+        if let Some(pending) = self.pending.as_ref() {
+            self.settlement = Some((pending.turn.clone(), "unknown".to_owned()));
+        }
         let health_deadline = Instant::now() + EVENT_DEADLINE;
         if !self.gap_reported && !self.writes_blocked {
             let mut source = self.source();
@@ -502,9 +583,10 @@ impl State {
 }
 
 pub(crate) fn spawn(
-    mut frames: mpsc::Receiver<AgyFrame>,
+    mut frames: mpsc::Receiver<NativeFrame>,
     mut stream: watch::Receiver<StreamState>,
     state: Shared,
+    client: NativeClient,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Observe watch faults while active, including with no incoming
@@ -552,7 +634,7 @@ pub(crate) fn spawn(
                 }
                 _ => {}
             }
-            if let Err(error) = state.observe(frame).await {
+            if let Err(error) = state.observe(frame, &client).await {
                 state.lose(&error.message).await;
             }
         }
@@ -569,240 +651,4 @@ pub(crate) fn spawn(
                 .await;
         }
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use eliot_plugin::Peer;
-
-    fn test_state() -> State {
-        let peer = Peer::stdio();
-        State::new(
-            peer.client(),
-            "test-credential".to_owned(),
-            "test-agent".to_owned(),
-            1,
-            SecretPolicy::default(),
-            "conv-1".to_owned(),
-        )
-    }
-
-    #[tokio::test]
-    async fn unknown_step_leaves_input_ack_unknown() {
-        let mut state = test_state();
-        let mut reply_rx = state
-            .prepare("cmd-1".to_owned(), "turn-1".to_owned())
-            .expect("prepared input");
-        let step = StepUpdate {
-            conversation_id: "conv-1".to_owned(),
-            step_index: 1,
-            state: "RUNNING".to_owned(),
-            step_type: "unknown_future_step".to_owned(),
-            tool_name: None,
-            tool_info: None,
-        };
-        let error = state
-            .step(step)
-            .await
-            .expect_err("unknown step type rejects");
-        assert_eq!(error.code, "native_protocol");
-        assert!(!state.pending.as_ref().unwrap().associated);
-        assert!(state.pending.as_ref().unwrap().reply.is_some());
-
-        state.writes_blocked = true;
-        // This unit test has no host responder for the independent health RPC.
-        state.source_health_attempted = true;
-        state.lose(&error.message).await;
-        let ack = reply_rx.try_recv().expect("reply received");
-        assert_eq!(ack.expect_err("no ACK on unknown step").code, "unknown");
-    }
-
-    #[tokio::test]
-    async fn system_message_stays_before_association() {
-        let mut state = test_state();
-        let step = StepUpdate {
-            conversation_id: "conv-1".to_owned(),
-            step_index: 0,
-            state: "RUNNING".to_owned(),
-            step_type: "system_message".to_owned(),
-            tool_name: None,
-            tool_info: None,
-        };
-        state.step(step).await.expect("system message ignored");
-        assert!(state.pending.is_none());
-    }
-
-    #[tokio::test]
-    async fn checkpoint_metadata_recognized_without_associating() {
-        let mut state = test_state();
-        let step = StepUpdate {
-            conversation_id: "conv-1".to_owned(),
-            step_index: 292,
-            state: "DONE".to_owned(),
-            step_type: "checkpoint".to_owned(),
-            tool_name: None,
-            tool_info: None,
-        };
-        state
-            .step(step)
-            .await
-            .expect("checkpoint recognized as metadata");
-        assert!(state.pending.is_none());
-    }
-
-    #[tokio::test]
-    async fn checkpoint_with_unexpected_payload_rejects() {
-        let mut state = test_state();
-        let step = StepUpdate {
-            conversation_id: "conv-1".to_owned(),
-            step_index: 292,
-            state: "DONE".to_owned(),
-            step_type: "checkpoint".to_owned(),
-            tool_name: Some("unexpected_tool".to_owned()),
-            tool_info: None,
-        };
-        let error = state
-            .step(step)
-            .await
-            .expect_err("checkpoint with semantic tool payload must reject");
-        assert_eq!(error.code, "native_protocol");
-    }
-
-    #[tokio::test]
-    async fn checkpoint_during_turn_preserves_association_state() {
-        let mut state = test_state();
-        let _reply_rx = state
-            .prepare("cmd-1".to_owned(), "turn-1".to_owned())
-            .expect("prepared input");
-        let step = StepUpdate {
-            conversation_id: "conv-1".to_owned(),
-            step_index: 292,
-            state: "DONE".to_owned(),
-            step_type: "checkpoint".to_owned(),
-            tool_name: None,
-            tool_info: None,
-        };
-        state
-            .step(step)
-            .await
-            .expect("checkpoint recognized during turn");
-        assert!(!state.pending.as_ref().unwrap().associated);
-    }
-
-    #[tokio::test]
-    async fn oversized_failed_terminal_omits_message_and_continues_lane() {
-        let recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut state = test_state();
-        state.test_recorder = Some(Arc::clone(&recorder));
-        let mut reply_rx = state
-            .prepare("cmd-1".to_owned(), "turn-1".to_owned())
-            .expect("prepared input");
-
-        let oversize_response = "E".repeat(80 * 1024);
-        let result = ResultRecord {
-            conversation_id: "conv-1".to_owned(),
-            status: "ERROR".to_owned(),
-            response: oversize_response,
-            error: Some("process failed with error".to_owned()),
-            finished_reason: Some("error".to_owned()),
-            num_turns: Some(1),
-            usage: None,
-            denied_actions: Vec::new(),
-        };
-
-        state
-            .complete(result)
-            .await
-            .expect("oversized failed terminal settles without bound error");
-
-        let ack = reply_rx.try_recv().expect("ack received");
-        assert!(ack.is_ok());
-
-        assert!(state.pending.is_none());
-        assert_eq!(state.active_turn(), None);
-        assert!(state.failure.is_none());
-        assert!(!state.source_unknown);
-        let last_turn = state.last_turn.as_ref().expect("last turn facts recorded");
-        assert_eq!(last_turn.status, "failed");
-        assert_eq!(last_turn.final_text, "");
-        assert!(last_turn.terminal);
-
-        let commits = recorder.lock().unwrap().clone();
-        let kinds: Vec<&str> = commits.iter().map(|(kind, _)| kind.as_str()).collect();
-        assert_eq!(kinds, vec!["turn.started", "turn.completed"]);
-
-        let turn_completed = &commits[1].1;
-        assert_eq!(
-            turn_completed.get("final_text_unavailable"),
-            Some(&Value::String("event_budget".to_owned()))
-        );
-        assert!(turn_completed.get("final_text").is_none());
-    }
-
-    #[tokio::test]
-    async fn oversized_success_preserves_bound_failure() {
-        let recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut state = test_state();
-        state.test_recorder = Some(Arc::clone(&recorder));
-        let _reply_rx = state
-            .prepare("cmd-1".to_owned(), "turn-1".to_owned())
-            .expect("prepared input");
-
-        let oversize_response = "S".repeat(80 * 1024);
-        let result = ResultRecord {
-            conversation_id: "conv-1".to_owned(),
-            status: "SUCCESS".to_owned(),
-            response: oversize_response,
-            error: None,
-            finished_reason: Some("stop".to_owned()),
-            num_turns: Some(1),
-            usage: None,
-            denied_actions: Vec::new(),
-        };
-
-        let error = state
-            .complete(result)
-            .await
-            .expect_err("oversized success must fail bound");
-        assert_eq!(error.code, "frame_too_large");
-    }
-
-    #[tokio::test]
-    async fn small_failed_terminal_retains_message_and_final_text() {
-        let recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut state = test_state();
-        state.test_recorder = Some(Arc::clone(&recorder));
-        let _reply_rx = state
-            .prepare("cmd-1".to_owned(), "turn-1".to_owned())
-            .expect("prepared input");
-
-        let result = ResultRecord {
-            conversation_id: "conv-1".to_owned(),
-            status: "ERROR".to_owned(),
-            response: "syntax error on line 42".to_owned(),
-            error: Some("syntax error".to_owned()),
-            finished_reason: Some("error".to_owned()),
-            num_turns: Some(1),
-            usage: None,
-            denied_actions: Vec::new(),
-        };
-
-        state
-            .complete(result)
-            .await
-            .expect("small failed terminal completes");
-        let commits = recorder.lock().unwrap().clone();
-        let kinds: Vec<&str> = commits.iter().map(|(kind, _)| kind.as_str()).collect();
-        assert_eq!(
-            kinds,
-            vec!["turn.started", "message.completed", "turn.completed"]
-        );
-        let turn_completed = &commits[2].1;
-        assert_eq!(
-            turn_completed.get("final_text"),
-            Some(&Value::String("syntax error on line 42".to_owned()))
-        );
-        assert!(turn_completed.get("final_text_unavailable").is_none());
-    }
 }

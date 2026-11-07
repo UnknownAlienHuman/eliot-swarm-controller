@@ -87,7 +87,7 @@ impl Plugin {
                     "Antigravity",
                 )?;
                 let session = self.bound(&params.agent_id, params.generation)?;
-                session.send(params).await
+                session.command(params).await
             }
             "agent.snapshot" => {
                 let params: AgentSnapshotParams =
@@ -173,10 +173,10 @@ impl Plugin {
             name: "antigravity".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             protocol: "eliot-plugin/1".into(),
-            harness_version: "1.5.0".into(),
+            harness_version: "1.5.2".into(),
             available: true,
             mode: "per_agent".into(),
-            verbs: ["launch", "resume", "send", "stop"]
+            verbs: ["launch", "resume", "send", "interrupt", "stop"]
                 .map(str::to_owned)
                 .to_vec(),
             child_verbs: vec![],
