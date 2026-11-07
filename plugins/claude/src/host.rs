@@ -1669,7 +1669,7 @@ fn live_session_snapshot(
     };
     let result_known = last_turn
         .as_ref()
-        .is_some_and(|turn| turn.final_text.is_some());
+        .is_some_and(|turn| turn.final_text.is_some() && turn.final_text_unavailable.is_none());
     Ok(json!({
         "agent_id": params.agent_id.clone(),
         "generation": params.generation,
