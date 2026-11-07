@@ -82,12 +82,16 @@ mod process_birth {
 
     use eliot_core::{Error, Result};
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, FARPROC, HANDLE, HMODULE, STATUS_INFO_LENGTH_MISMATCH},
+        Foundation::{
+            CloseHandle, FARPROC, HANDLE, HMODULE, STATUS_BUFFER_OVERFLOW,
+            STATUS_INFO_LENGTH_MISMATCH,
+        },
         System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
     };
 
     const PROCESS_TELEMETRY_ID_INFORMATION_CLASS: i32 = 64;
     const MAX_PROCESS_TELEMETRY_BUFFER_BYTES: usize = 1024 * 1024;
+    const MAX_PROCESS_TELEMETRY_QUERY_ATTEMPTS: usize = 3;
 
     // Microsoft documents this NT telemetry record, but ships no public SDK
     // header for it. Keep the local C-layout declaration aligned with that
@@ -194,85 +198,77 @@ mod process_birth {
 
         let record_size = size_of::<ProcessTelemetryIdInformation>();
         let mut output = vec![0u64; record_size.div_ceil(size_of::<u64>())];
-        // HeaderSize is initialized to the documented record size; the query
-        // may replace it with the version actually returned by Windows.
-        // SAFETY: the aligned buffer has at least the complete record size.
-        unsafe {
-            output
-                .as_mut_ptr()
-                .cast::<u32>()
-                .write(u32::try_from(record_size).expect("telemetry record fits u32"));
-        }
-        let mut returned = 0u32;
-        // SAFETY: the buffer is writable, aligned, and its exact length is
-        // passed; `returned` is a valid output pointer.
-        let mut status = unsafe {
-            query(
-                handle,
-                PROCESS_TELEMETRY_ID_INFORMATION_CLASS,
-                output.as_mut_ptr().cast(),
-                u32::try_from(output.len() * size_of::<u64>())
-                    .expect("bounded telemetry buffer fits u32"),
-                &mut returned,
-            )
-        };
 
-        if status == STATUS_INFO_LENGTH_MISMATCH {
-            let required = usize::try_from(returned)
-                .map_err(|_| unsupported("Windows telemetry record size is invalid"))?;
-            if required < record_size || required > MAX_PROCESS_TELEMETRY_BUFFER_BYTES {
-                return Err(unsupported(
-                    "Windows process birth ordering has an unsupported telemetry record size",
-                ));
-            }
-            output.resize(required.div_ceil(size_of::<u64>()), 0);
-            // SAFETY: resizing preserves the aligned writable buffer and the
-            // full record header fits in the bounded allocation.
-            unsafe {
-                output
-                    .as_mut_ptr()
-                    .cast::<u32>()
-                    .write(u32::try_from(record_size).expect("telemetry record fits u32"));
-            }
-            returned = 0;
-            // SAFETY: the resized buffer length and output pointer are valid.
-            status = unsafe {
+        for attempt in 0..MAX_PROCESS_TELEMETRY_QUERY_ATTEMPTS {
+            output.fill(0);
+            // ProcessInformation is output-only; leave HeaderSize zeroed for
+            // Windows to report the fixed header actually returned.
+            let buffer_size = output.len() * size_of::<u64>();
+            let mut returned = 0u32;
+            // SAFETY: the buffer is writable/aligned, its length is passed, and
+            // `returned` is a valid output pointer.
+            let status = unsafe {
                 query(
                     handle,
                     PROCESS_TELEMETRY_ID_INFORMATION_CLASS,
                     output.as_mut_ptr().cast(),
-                    u32::try_from(output.len() * size_of::<u64>())
-                        .expect("bounded telemetry buffer fits u32"),
+                    u32::try_from(buffer_size).expect("bounded telemetry buffer fits u32"),
                     &mut returned,
                 )
             };
+
+            if status >= 0 {
+                let returned = usize::try_from(returned).unwrap_or(0);
+                if returned < size_of::<ProcessTelemetryBirthPrefix>() || returned > buffer_size {
+                    return Err(unsupported(
+                        "Windows process telemetry returned an invalid length",
+                    ));
+                }
+
+                // SAFETY: success and ReturnLength prove the prefix is initialized
+                // in this aligned u64-backed buffer.
+                let birth =
+                    unsafe { ptr::read(output.as_ptr().cast::<ProcessTelemetryBirthPrefix>()) };
+                let returned_header_size = usize::try_from(birth.header_size).unwrap_or(0);
+                let minimum_header_size = size_of::<ProcessTelemetryBirthPrefix>();
+                if returned_header_size < minimum_header_size || returned_header_size > returned {
+                    return Err(unsupported(
+                        "Windows process telemetry returned an invalid HeaderSize",
+                    ));
+                }
+                if birth.process_id != pid {
+                    return Err(unsupported(
+                        "Windows process telemetry returned a different process identity",
+                    ));
+                }
+                return Ok((
+                    birth.create_unbiased_interrupt_time,
+                    birth.process_start_key,
+                ));
+            }
+
+            if status != STATUS_BUFFER_OVERFLOW && status != STATUS_INFO_LENGTH_MISMATCH {
+                return Err(unsupported(format!(
+                    "Windows process birth ordering is unavailable (NtQueryInformationProcess status 0x{:08X})",
+                    status as u32
+                )));
+            }
+
+            let required = usize::try_from(returned)
+                .map_err(|_| unsupported("Windows telemetry record size is invalid"))?;
+            if required <= buffer_size || required > MAX_PROCESS_TELEMETRY_BUFFER_BYTES {
+                return Err(unsupported(
+                    "Windows process birth ordering has an invalid required telemetry size",
+                ));
+            }
+            if attempt + 1 == MAX_PROCESS_TELEMETRY_QUERY_ATTEMPTS {
+                break;
+            }
+            output.resize(required.div_ceil(size_of::<u64>()), 0);
         }
 
-        if status < 0 {
-            return Err(unsupported(format!(
-                "Windows process birth ordering is unavailable (NtQueryInformationProcess status 0x{:08X})",
-                status as u32
-            )));
-        }
-        let returned = usize::try_from(returned).unwrap_or(0);
-        let buffer_size = output.len() * size_of::<u64>();
-        if returned < size_of::<ProcessTelemetryBirthPrefix>() || returned > buffer_size {
-            return Err(unsupported(
-                "Windows process telemetry omitted the birth identity fields",
-            ));
-        }
-
-        // SAFETY: success and ReturnLength prove the full prefix is initialized
-        // in this aligned u64-backed buffer.
-        let birth = unsafe { ptr::read(output.as_ptr().cast::<ProcessTelemetryBirthPrefix>()) };
-        if birth.process_id != pid {
-            return Err(unsupported(
-                "Windows process telemetry returned a different process identity",
-            ));
-        }
-        Ok((
-            birth.create_unbiased_interrupt_time,
-            birth.process_start_key,
+        Err(unsupported(
+            "Windows process birth telemetry did not fit after bounded ReturnLength retries",
         ))
     }
 
