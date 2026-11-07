@@ -453,7 +453,12 @@ silently dropped, retried, or restarted automatically. A bounded UTF-8
 NDJSON line whose JSON or envelope is invalid is record-local: the typed
 `NativeStreamFault` label is recorded as a gap, current pending calls fail
 `unknown`, and the same reader keeps routing later well-formed records.
-Frame/codec/UTF-8/IO errors never continue without a proven line boundary.
+The recorded fault is sticky: EOF, exit-drain, and stop handling never
+overwrite it with a healthy-looking closure, so a busy consumer cannot miss
+it. Frame/codec/UTF-8/IO errors never continue without a proven line boundary.
+Owner drop/cancel fences writer and response router before aborting either
+task (no await in `Drop`, no lock held over IO): already-written calls
+resolve `unknown`, fresh writes are refused `native_not_dispatched`.
 
 Add hooks only for a missing native fact/decision. Config is session-scoped; decisions
 bind exact generation/request/deadline. Timeout uses the safe native default; late

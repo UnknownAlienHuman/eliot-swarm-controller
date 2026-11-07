@@ -460,6 +460,10 @@ impl NativeChild {
 
 impl Drop for NativeChild {
     fn drop(&mut self) {
+        // Fence every cloned writer (and, via the shared flag, the pending
+        // router) before aborting either task: fresh writes are refused
+        // `native_not_dispatched`, already-written calls stay Unknown.
+        self.writer.mark_reader_closed();
         if let Some(reader) = &self.output_reader {
             reader.abort();
         }
@@ -493,6 +497,12 @@ impl NativeWriter {
 
     pub fn reader_closed(&self) -> bool {
         self.reader_closed.load(Ordering::Acquire)
+    }
+
+    /// The shared reader-closed flag. `PendingCalls` is bound to the same
+    /// flag so writer fencing and response-router closure are one boundary.
+    pub(crate) fn reader_closed_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.reader_closed)
     }
 
     fn mark_process_exited(&self) {
@@ -646,11 +656,11 @@ impl NativeWriter {
 }
 
 impl PendingCalls {
-    pub fn new(id_prefix: &'static str, labels: NativeLabels) -> Self {
+    pub fn new(id_prefix: &'static str, labels: NativeLabels, closed: Arc<AtomicBool>) -> Self {
         Self {
             calls: Arc::new(StdMutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(0)),
-            closed: Arc::new(AtomicBool::new(false)),
+            closed,
             id_prefix,
             labels,
         }
@@ -778,7 +788,7 @@ where
 {
     let (mut transport, stdout) = NativeChild::spawn(launch, policy, labels).await?;
     let process_exit = transport.process_exit_signal();
-    let pending = PendingCalls::new(id_prefix, labels);
+    let pending = PendingCalls::new(id_prefix, labels, transport.writer().reader_closed_flag());
     let (frame_tx, frame_rx) = native_frame_channel();
     let (stream_tx, stream_rx) = watch::channel(StreamState::Open);
     let output_reader = tokio::spawn(pump_framed_lines(
@@ -801,6 +811,7 @@ fn finish_exit_drain_deadline(
     pending: &PendingCalls,
     writer: &NativeWriter,
     server: &str,
+    recorded_fault: bool,
 ) -> Result<()> {
     writer.mark_reader_closed();
     if overflowed {
@@ -812,7 +823,11 @@ fn finish_exit_drain_deadline(
         pending.fail_all(error.clone());
         return Err(error);
     }
-    stream.send_replace(StreamState::Malformed(NativeStreamFault::Drain));
+    // Keep a sticky record-local fault: drain must not erase it with a
+    // Drain overwrite before a busy consumer observes it.
+    if !recorded_fault {
+        stream.send_replace(StreamState::Malformed(NativeStreamFault::Drain));
+    }
     pending.fail_all(Error::new(
         "unknown",
         format!("{server} stdout remained open after its process exit drain deadline"),
@@ -910,12 +925,18 @@ where
         exit_deadline = Some(Instant::now() + NATIVE_EXIT_DRAIN);
     }
     let mut post_deadline_ready_lines = 0;
+    let mut recorded_fault = false;
     loop {
         let line = match exit_deadline {
             Some(deadline) if Instant::now() >= deadline => {
                 if post_deadline_ready_lines >= NATIVE_EVENT_QUEUE {
                     return finish_exit_drain_deadline(
-                        overflowed, &stream, &pending, &writer, server,
+                        overflowed,
+                        &stream,
+                        &pending,
+                        &writer,
+                        server,
+                        recorded_fault,
                     );
                 }
                 match reader.next().now_or_never() {
@@ -925,7 +946,12 @@ where
                     }
                     None => {
                         return finish_exit_drain_deadline(
-                            overflowed, &stream, &pending, &writer, server,
+                            overflowed,
+                            &stream,
+                            &pending,
+                            &writer,
+                            server,
+                            recorded_fault,
                         );
                     }
                 }
@@ -983,6 +1009,7 @@ where
                     NativeStreamFault::Json,
                     &format!("{server} stream contained invalid JSON"),
                 );
+                recorded_fault = true;
                 continue;
             }
         };
@@ -1018,6 +1045,7 @@ where
                 // invalid JSON above; record typed fault, fail current
                 // pending Unknown, continue with later well-formed records.
                 record_stream_fault(&stream, &pending, NativeStreamFault::Envelope, &message);
+                recorded_fault = true;
             }
             PumpAction::Skip => {}
         }
@@ -1040,7 +1068,12 @@ where
     }
 
     writer.mark_reader_closed();
-    stream.send_replace(StreamState::Closed);
+    // Sticky fault: EOF must not overwrite a recorded record-local fault
+    // with Closed before a busy consumer observes it (planned-stop
+    // consumers suppress Closed gaps, which would erase the fault).
+    if !recorded_fault {
+        stream.send_replace(StreamState::Closed);
+    }
     pending.fail_all(Error::new(
         "unknown",
         format!("{server} stream closed while an outcome may be pending"),
