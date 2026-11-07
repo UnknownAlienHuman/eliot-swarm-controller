@@ -330,6 +330,7 @@ fn public_approval_details(details: &Map<String, Value>) -> Result<Value> {
                 id: choice.choice_id.clone(),
                 label: choice.label.clone(),
                 decision,
+                feedback_allowed: choice.accepts_feedback,
             })
         })
         .collect::<Vec<_>>();

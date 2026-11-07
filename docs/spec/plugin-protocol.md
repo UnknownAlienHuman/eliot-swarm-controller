@@ -428,6 +428,16 @@ Native-private request metadata stays in the existing plugin pending objects; pl
 normalize public event details and kinds only. There are no vendor-public
 compatibility formats.
 
+Vendor fields without a verified value-submission operation — notably a native
+external form field that is applied by opening its URL outside the plugin — are
+normalized as a neutral `QuestionKind::Resource` question with the field and form
+title/description as descriptive context. The native URL itself is not persisted
+in public details. The committed pending form remains owned by the plugin, so the
+owner can still deny-cancel it, and ordinary partial answers omitting the resource
+field remain available; a value submission for the resource is `unsupported` until
+a verified operation exists. This preserves cancel and partial-answer behavior; it
+does not claim a full external workflow.
+
 ## Lifecycle, hooks and qualification
 
 Contain owned children before tools run; use absolute deadlines. Drain buffered native

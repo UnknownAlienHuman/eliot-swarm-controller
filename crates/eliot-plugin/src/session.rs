@@ -1024,19 +1024,28 @@ impl StreamSource<'_> {
     }
 }
 
-/// Approval reply args: an object holding only `choice_id` and `feedback`.
-pub fn approval_reply_args(args: &Value) -> Result<&serde_json::Map<String, Value>> {
-    const SHAPE: &str = "approval reply args must be an object with only choice_id and feedback";
-    let args = args
-        .as_object()
-        .ok_or_else(|| Error::new("invalid", SHAPE))?;
-    if args
-        .keys()
-        .any(|key| key != "choice_id" && key != "feedback")
+/// Approval reply args: parsed with the shared `ApprovalArgs` syntax, then
+/// re-encoded as an owned map so explicitly null fields are omitted
+/// consistently. Present non-string or empty `choice_id` rejects at the
+/// shared parse instead of degrading into an absent default downstream.
+pub fn approval_reply_args(args: &Value) -> Result<serde_json::Map<String, Value>> {
+    let parsed = eliot_core::requests::ApprovalArgs::parse(args)?;
+    if parsed
+        .choice_id
+        .as_deref()
+        .is_some_and(|choice_id| choice_id.trim().is_empty())
     {
-        return Err(Error::new("invalid", SHAPE));
+        return Err(Error::new(
+            "invalid",
+            "approval choice_id must be a non-empty string",
+        ));
     }
-    Ok(args)
+    let value = serde_json::to_value(&parsed)
+        .map_err(|_| Error::new("internal", "approval reply args could not be encoded"))?;
+    value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| Error::new("internal", "approval reply args could not be encoded"))
 }
 
 /// A native request field that must not be blank.

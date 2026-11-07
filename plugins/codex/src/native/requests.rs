@@ -388,9 +388,9 @@ fn decode_params<T: for<'de> Deserialize<'de>>(params: &Value, message: &str) ->
 
 fn require_approval_args(args: &Value, approve: bool) -> Result<()> {
     let args = eliot_plugin::session::approval_reply_args(args)?;
-    if let Some(choice_id) = args.get("choice_id").and_then(Value::as_str) {
+    if let Some(choice_id) = args.get("choice_id") {
         let wanted = if approve { "approve" } else { "deny" };
-        if choice_id != wanted {
+        if choice_id.as_str() != Some(wanted) {
             return Err(Error::new(
                 "invalid",
                 "approval choice_id does not match the reply verb",
@@ -480,11 +480,13 @@ pub(crate) fn public_request_view(request: &CorePending) -> Result<(String, Valu
                         id: "approve".to_owned(),
                         label: "Approve".to_owned(),
                         decision: ApprovalDecision::Approve,
+                        feedback_allowed: false,
                     },
                     ApprovalChoice {
                         id: "deny".to_owned(),
                         label: "Deny".to_owned(),
                         decision: ApprovalDecision::Deny,
+                        feedback_allowed: false,
                     },
                 ],
                 feedback_allowed: false,

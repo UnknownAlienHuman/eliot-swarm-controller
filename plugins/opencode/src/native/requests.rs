@@ -72,16 +72,19 @@ fn public_approval_details(details: &Map<String, Value>) -> Result<Value> {
                 id: "once".to_owned(),
                 label: "Approve once".to_owned(),
                 decision: ApprovalDecision::Approve,
+                feedback_allowed: true,
             },
             ApprovalChoice {
                 id: "always".to_owned(),
                 label: "Approve always".to_owned(),
                 decision: ApprovalDecision::Approve,
+                feedback_allowed: true,
             },
             ApprovalChoice {
                 id: "reject".to_owned(),
                 label: "Reject".to_owned(),
                 decision: ApprovalDecision::Deny,
+                feedback_allowed: true,
             },
         ],
         feedback_allowed: true,
@@ -104,12 +107,7 @@ fn public_question_details(details: &Map<String, Value>) -> Result<Value> {
                 "number" | "integer" => (QuestionKind::Number, false),
                 "boolean" => (QuestionKind::Boolean, false),
                 "multiselect" => (QuestionKind::Multiple, field.custom),
-                "external" => {
-                    return Err(Error::new(
-                        "source_integrity",
-                        "pending request carries an unsupported external field",
-                    ));
-                }
+                "external" => (QuestionKind::Resource, false),
                 _ if !field.options.is_empty() => (QuestionKind::Single, field.custom),
                 _ => (QuestionKind::Text, true),
             };
@@ -449,7 +447,7 @@ fn native_value(field: &crate::native::types::FormField, answers: &[String]) -> 
         }
         "external" => Err(Error::new(
             "unsupported",
-            "external form field cannot be answered",
+            "external form field has no verified value submission; the form can still be denied or partially answered without it",
         )),
         _ => {
             let one = single(answers)?;

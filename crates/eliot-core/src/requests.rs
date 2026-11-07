@@ -20,6 +20,7 @@ pub enum QuestionKind {
     Multiple,
     Number,
     Boolean,
+    Resource,
 }
 
 /// One offered universal option. Answers name `id`; where the native offer
@@ -102,6 +103,28 @@ impl AnswerArgs {
     }
 }
 
+/// Universal approve/deny command args (optional choice_id/feedback).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct ApprovalArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
+}
+
+impl ApprovalArgs {
+    /// Owning syntax parse for approve/deny command args.
+    pub fn parse(args: &Value) -> Result<Self> {
+        serde_json::from_value(args.clone()).map_err(|_| {
+            Error::new(
+                "invalid",
+                "approval reply args must be an object with only optional string choice_id and feedback",
+            )
+        })
+    }
+}
+
 /// Which reply verb decides one universal approval choice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -117,6 +140,10 @@ pub struct ApprovalChoice {
     pub id: String,
     pub label: String,
     pub decision: ApprovalDecision,
+    /// Whether this specific choice accepts feedback. The per-choice value
+    /// is authoritative; the request-level aggregate is only a summary.
+    #[serde(default)]
+    pub feedback_allowed: bool,
 }
 
 /// Universal public details of an approval request.

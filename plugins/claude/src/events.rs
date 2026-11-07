@@ -1261,11 +1261,13 @@ impl EventProcessor {
                     id: APPROVE_CHOICE_ID.to_owned(),
                     label: "Approve".to_owned(),
                     decision: ApprovalDecision::Approve,
+                    feedback_allowed: false,
                 },
                 ApprovalChoice {
                     id: DENY_CHOICE_ID.to_owned(),
                     label: "Deny".to_owned(),
                     decision: ApprovalDecision::Deny,
+                    feedback_allowed: false,
                 },
             ],
             feedback_allowed: false,
