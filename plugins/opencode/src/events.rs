@@ -2839,7 +2839,9 @@ mod tests {
     /// the control queue — never a stale published watch value.
     #[tokio::test]
     async fn snapshot_status_reads_current_processor_state() {
-        let http = crate::native::client::OpenCodeHttp::new(1, "pw".to_owned()).expect("client");
+        let directory = std::env::current_dir().expect("current directory");
+        let http = crate::native::client::OpenCodeHttp::new(1, "pw".to_owned(), &directory)
+            .expect("client");
         let peer = eliot_plugin::Peer::stdio();
         let mut processor = EventProcessor::new(
             http,
@@ -2936,7 +2938,9 @@ mod tests {
     /// the lost frames could have carried exactly that activity.
     #[tokio::test]
     async fn resume_ready_refuses_a_deferred_native_frame_loss() {
-        let http = crate::native::client::OpenCodeHttp::new(1, "pw".to_owned()).expect("client");
+        let directory = std::env::current_dir().expect("current directory");
+        let http = crate::native::client::OpenCodeHttp::new(1, "pw".to_owned(), &directory)
+            .expect("client");
         let peer = eliot_plugin::Peer::stdio();
         let mut processor = EventProcessor::new(
             http,

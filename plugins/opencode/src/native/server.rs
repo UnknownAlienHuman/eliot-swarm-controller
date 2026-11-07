@@ -34,7 +34,11 @@ use tokio::{
     time::{Instant, sleep, timeout_at},
 };
 
-use crate::native::{AuthSetup, AuthTransfer, client::OpenCodeHttp, transfer_selected_integration};
+use crate::native::{
+    AuthSetup, AuthTransfer,
+    client::{OpenCodeHttp, server_native_directory},
+    transfer_selected_integration,
+};
 
 const READINESS_POLL: Duration = Duration::from_millis(250);
 
@@ -99,6 +103,15 @@ impl OwnedServer {
         secrets: &[String],
         auth_deadline: Instant,
     ) -> Result<Self> {
+        // OpenCode keeps plugin and session contexts per directory. Use the
+        // same server-native spelling for cwd, session location, and HTTP
+        // directory headers so a Windows verbatim alias cannot split routing.
+        let native_directory = server_native_directory(&launch.workspace).map_err(|_| {
+            Error::new(
+                "native_spawn",
+                "OpenCode workspace directory could not be canonicalized",
+            )
+        })?;
         let config_root = launch.instance_dir.join("config");
         let config_dir = config_root.join("opencode");
         let data_dir = stable_store_dir(&launch.store_root, &launch.agent_id)?;
@@ -189,6 +202,7 @@ impl OwnedServer {
         let mut capture = secrets.to_vec();
         capture.push(password.clone());
         let capture = SecretPolicy::new(capture);
+        let http = OpenCodeHttp::new(port, password.clone(), &native_directory)?;
 
         let mut command = Command::new(&launch.program);
         command
@@ -197,7 +211,7 @@ impl OwnedServer {
             .arg("127.0.0.1")
             .arg("--port")
             .arg(port.to_string())
-            .current_dir(&launch.workspace)
+            .current_dir(&native_directory)
             .envs(launch.environment)
             .env("OPENCODE_PASSWORD", &password)
             .env("XDG_CONFIG_HOME", &config_root)
@@ -228,7 +242,6 @@ impl OwnedServer {
         let stdout = spawn_stderr(stdout, capture.clone());
         let stderr = spawn_stderr(stderr, capture);
 
-        let http = OpenCodeHttp::new(port, password)?;
         let mut server = Self {
             child,
             stdout: Some(stdout),
