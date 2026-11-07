@@ -60,6 +60,16 @@ pub(crate) struct PluginConnection {
     requests: mpsc::Receiver<RpcRequest>,
 }
 
+/// A request whose frame has been written and whose correlated response is
+/// still owned by the caller.
+pub(crate) struct PendingCall {
+    inner: Arc<ClientInner>,
+    key: String,
+    method: String,
+    response: oneshot::Receiver<Result<RpcResponse>>,
+    registered: bool,
+}
+
 impl PluginConnection {
     pub(crate) fn new<R, W>(reader: R, writer: W) -> Self
     where
@@ -114,14 +124,15 @@ impl PluginClient {
         self.inner.reader_closed.load(Ordering::Acquire)
     }
 
-    /// Send one host request and await its matching plugin response while the
-    /// independent reader continues routing plugin requests and other responses.
-    pub(crate) async fn call(
+    /// Enqueue one host request and return only after the writer confirms the
+    /// complete frame was sent. Its response stays in the shared reader's
+    /// bounded pending map until `PendingCall::finish` or drop.
+    pub(crate) async fn begin_call(
         &self,
         method: &str,
         params: Value,
         deadline: Instant,
-    ) -> Result<Value> {
+    ) -> Result<PendingCall> {
         if method.trim().is_empty() || !params.is_object() {
             return Err(Error::new(
                 "invalid",
@@ -166,43 +177,33 @@ impl PluginClient {
             pending.insert(key.clone(), response_tx);
         }
 
+        let mut call = PendingCall {
+            inner: Arc::clone(&self.inner),
+            key,
+            method: method.to_owned(),
+            response: response_rx,
+            registered: true,
+        };
         if let Err(error) = self.send_frame(frame, deadline).await {
-            self.inner.pending.lock().await.remove(&key);
+            call.remove_pending().await;
             return Err(error);
         }
 
-        let response = match timeout_at(deadline, response_rx).await {
-            Ok(Ok(Ok(response))) => response,
-            Ok(Ok(Err(error))) => {
-                self.inner.pending.lock().await.remove(&key);
-                return Err(unknown_transport_error(error));
-            }
-            Ok(Err(_)) => {
-                self.inner.pending.lock().await.remove(&key);
-                return Err(Error::new(
-                    "unknown",
-                    "plugin connection ended while a native outcome was pending",
-                ));
-            }
-            Err(_) => {
-                self.inner.pending.lock().await.remove(&key);
-                return Err(Error::new(
-                    "unknown",
-                    format!("plugin method {method} timed out after dispatch"),
-                ));
-            }
-        };
+        Ok(call)
+    }
 
-        if let Some(error) = response.error {
-            return Err(error_from_reply(error));
-        }
-
-        response.result.ok_or_else(|| {
-            Error::new(
-                "unknown",
-                "plugin outcome unknown: plugin_response_missing_result",
-            )
-        })
+    /// Send one host request and await its matching plugin response while the
+    /// independent reader continues routing plugin requests and other responses.
+    pub(crate) async fn call(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value> {
+        self.begin_call(method, params, deadline)
+            .await?
+            .finish(Some(deadline))
+            .await
     }
 
     pub(crate) async fn respond(
@@ -314,6 +315,74 @@ impl PluginClient {
         // Once queued, the writer may have sent any prefix or the whole frame.
         // A framing/connection failure cannot prove that native I/O did not occur.
         result.map_err(unknown_transport_error)
+    }
+}
+
+impl PendingCall {
+    /// Wait for the exact correlated response. `None` has no response timeout;
+    /// reader loss still resolves it through the existing pending map.
+    pub(crate) async fn finish(mut self, response_deadline: Option<Instant>) -> Result<Value> {
+        let response = match response_deadline {
+            Some(deadline) => match timeout_at(deadline, &mut self.response).await {
+                Ok(response) => response,
+                Err(_) => {
+                    self.remove_pending().await;
+                    return Err(Error::new(
+                        "unknown",
+                        format!("plugin method {} timed out after dispatch", self.method),
+                    ));
+                }
+            },
+            None => (&mut self.response).await,
+        };
+        self.remove_pending().await;
+
+        let response = match response {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return Err(unknown_transport_error(error)),
+            Err(_) => {
+                return Err(Error::new(
+                    "unknown",
+                    "plugin connection ended while a native outcome was pending",
+                ));
+            }
+        };
+
+        if let Some(error) = response.error {
+            return Err(error_from_reply(error));
+        }
+
+        response.result.ok_or_else(|| {
+            Error::new(
+                "unknown",
+                "plugin outcome unknown: plugin_response_missing_result",
+            )
+        })
+    }
+
+    async fn remove_pending(&mut self) {
+        if self.registered {
+            self.inner.pending.lock().await.remove(&self.key);
+            self.registered = false;
+        }
+    }
+}
+
+impl Drop for PendingCall {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+
+        let inner = Arc::clone(&self.inner);
+        let key = self.key.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                inner.pending.lock().await.remove(&key);
+            });
+        } else if let Ok(mut pending) = self.inner.pending.try_lock() {
+            pending.remove(&self.key);
+        }
     }
 }
 

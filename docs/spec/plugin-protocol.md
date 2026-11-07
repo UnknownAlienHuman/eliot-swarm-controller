@@ -98,6 +98,13 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 | `profile.store` (L3) | shared [`ProfileStoreParams`](../../crates/eliot-plugin/src/protocol.rs) | Return the effective [`NativeStoreBinding`](../../crates/eliot-core/src/native_store.rs) using the caller's actual prepared workspace and a bounded, owned metadata reader; success requires confirmed reader cleanup. It creates no model or thread, performs no native control and publishes no Agent events. This is outside the L1/L2 first-harness subset. |
 | `shutdown` | none | close owned paths, drain, exit; never kill an adopted service |
 
+Steer uses an ordered, bounded write followed by a correlated response wait: the host
+writes its `agent.command` frame in dispatch order under the writer deadline, then keeps
+the exact response pending without a native/model-turn response deadline while continuing
+to process `interrupt`, `stop`, `agent.snapshot`, and lifecycle messages. The response,
+or transport/generation teardown, settles the wait; unresolved teardown remains `unknown`
+and is never replayed. Other RPC deadlines are unchanged.
+
 An optional shared Core `RouteBinding` travels inside the frozen profile snapshot; it
 does not add a service RPC or a new harness. The controlled Codex process must apply the
 explicit named-provider override and read back its effective configuration before
