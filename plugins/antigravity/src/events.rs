@@ -477,14 +477,54 @@ impl State {
 
 pub(crate) fn spawn(
     mut frames: mpsc::Receiver<AgyFrame>,
-    stream: watch::Receiver<StreamState>,
+    mut stream: watch::Receiver<StreamState>,
     state: Shared,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(frame) = frames.recv().await {
+        // Observe watch faults while active, including with no incoming
+        // frames: a record-local Malformed keeps the reader open, so an
+        // EOF-only check would let it vanish while later facts commit.
+        let mut stream_open = true;
+        loop {
+            let frame = tokio::select! {
+                frame = frames.recv() => frame,
+                changed = stream.changed(), if stream_open => {
+                    if changed.is_err() {
+                        stream_open = false;
+                    }
+                    let current = *stream.borrow();
+                    let mut state = state.lock().await;
+                    match current {
+                        StreamState::Overflow => {
+                            state.lose("Antigravity native queue overflowed").await;
+                        }
+                        StreamState::Malformed(fault) => {
+                            state.lose(&format!(
+                                "Antigravity stream contained an invalid frame ({})",
+                                fault.label()
+                            )).await;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+            };
+            let Some(frame) = frame else { break };
+            let current = *stream.borrow();
             let mut state = state.lock().await;
-            if *stream.borrow() == StreamState::Overflow {
-                state.lose("Antigravity native queue overflowed").await;
+            match current {
+                StreamState::Overflow => {
+                    state.lose("Antigravity native queue overflowed").await;
+                }
+                StreamState::Malformed(fault) => {
+                    state
+                        .lose(&format!(
+                            "Antigravity stream contained an invalid frame ({})",
+                            fault.label()
+                        ))
+                        .await;
+                }
+                _ => {}
             }
             if let Err(error) = state.observe(frame).await {
                 state.lose(&error.message).await;
