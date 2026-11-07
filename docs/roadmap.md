@@ -232,13 +232,15 @@ Codex or for unrelated adapters.
 - [x] **L6.5 MCP stdio for an owner-selected caller.** Add one local `swarm mcp`
       server through the existing authenticated API and its bounded query/history surface.
 
-- [ ] **L6.7 Cloud MCP caller.** Connect cloud Dot/MuseAgent as a remote MCP caller via
+- [x] **L6.7 Cloud MCP caller.** Connect cloud Dot/MuseAgent as a remote MCP caller via
       the local StreamableHTTP MCP server exposed through `cloudflared` at
       `swarm.iuriilisenkov.cloud`. Preserve remote identity/connection/call binding
       through the existing router/bus and authenticate the endpoint with Cloudflare
       Access Managed OAuth/native JWT validation per the existing account documentation.
       Distinguish this caller from a controlled local native harness/PID. Completion:
       a cloud caller can perform an authenticated MCP call without local process custody.
+      The selected caller is MuseAgent (qualified by its actual authenticated end-to-end
+      MCP chain), not Dot.
 
 - [x] **L6.8 Stalled/unhealthy-agent diagnosis and notification.** Automatically detect
       stalled/unhealthy agents from read-only native/process/turn/event facts, without
