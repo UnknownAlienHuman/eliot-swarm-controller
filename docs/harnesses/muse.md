@@ -14,6 +14,11 @@ Subject: `(canonical Muse host/store/account scope, exact native session id)`.
 MSP uses JSON-RPC NDJSON over stdio. Resume opens the retained session in a new Eliot
 generation; callbacks carry that generation. Native children need exact provenance and
 remain parent-attributed unless an isolated child environment can actually be installed.
+Resume requests `excludeItems=true` so it receives only session metadata and live resume
+state; the installed stable and experimental schemas define this history-exclusion option.
+After an uncertain start/resume reply, Muse reports `native_endpoint_exited` only when
+its owned process exit, closed reader and completed reader task are all observed. The
+daemon keeps the command `unknown` and settles Agent loss only after owner cleanup.
 
 Obtain the native command id before writing: use caller-selected `commandId` or an SDK
 operation exposing its generated id before send. Text/time/list position is not identity.

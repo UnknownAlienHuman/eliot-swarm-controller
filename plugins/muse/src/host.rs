@@ -617,6 +617,24 @@ impl MusePlugin {
                 return Err(self.retain_failed_start(&params, error));
             }
             Err(error) => {
+                let native_endpoint_exited = session.native.transport.process_exit_observed()
+                    && session.native.transport.writer().reader_closed();
+                if native_endpoint_exited {
+                    // Wait for the closed reader task and let the event
+                    // processor commit its sticky gap before daemon cleanup.
+                    let _ = session
+                        .native
+                        .await_output_drained(Instant::now() + RPC_TIMEOUT)
+                        .await;
+                    if session.native.transport.output_reader_finished() {
+                        session.events.close().await;
+                        self.session = Some(session);
+                        return Err(Error::new(
+                            eliot_plugin::native_stdio::NATIVE_ENDPOINT_EXITED,
+                            "Muse native endpoint exited after start/resume dispatch; outcome remains unknown",
+                        ));
+                    }
+                }
                 self.session = Some(session);
                 return Err(contextual_error(
                     error,

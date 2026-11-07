@@ -67,6 +67,11 @@ pub enum NativeFrame {
     },
 }
 
+/// Internal startup signal: the owned native endpoint exited after a
+/// dispatched start/resume effect, so the operation remains unknown while the
+/// daemon settles plugin custody and Agent loss.
+pub const NATIVE_ENDPOINT_EXITED: &str = "native_endpoint_exited";
+
 /// Minimal JSON-RPC error body decoded from native responses.
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct NativeJsonRpcErrorBody {
