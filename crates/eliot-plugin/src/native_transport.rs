@@ -19,7 +19,7 @@ use std::{
 };
 
 use futures_util::{FutureExt, SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     process::{ChildStdin, ChildStdout, Command},
@@ -35,6 +35,349 @@ use crate::{StderrCapture, StderrView, spawn_stderr, sync::LockExt};
 const MAX_NATIVE_FRAME_BYTES: usize = 1024 * 1024;
 const NATIVE_EVENT_QUEUE: usize = 64;
 const NATIVE_EXIT_DRAIN: Duration = Duration::from_secs(1);
+
+/// Kernel process birth identity. `start_time` is measured in the same OS
+/// clock domain as [`process_birth_boundary`]. On Windows, `process_start_key`
+/// preserves unique process identity independently of that ordering clock.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessBirthIdentity {
+    pub pid: u32,
+    pub start_time: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_key: Option<u64>,
+}
+
+/// Read this process's immutable kernel birth identity.
+pub fn current_process_birth_identity() -> Result<ProcessBirthIdentity> {
+    process_birth_identity(std::process::id())
+}
+
+/// Read a live process's kernel birth identity for the given PID.
+pub fn process_birth_identity(pid: u32) -> Result<ProcessBirthIdentity> {
+    if pid == 0 {
+        return Err(Error::new(
+            "process_identity",
+            "process id must be positive",
+        ));
+    }
+    let (start_time, process_start_key) = process_birth::birth(pid)?;
+    Ok(ProcessBirthIdentity {
+        pid,
+        start_time,
+        process_start_key,
+    })
+}
+
+/// Capture a prompt opening boundary in the same OS clock domain as process
+/// birth identities, before dispatching the native prompt request.
+pub fn process_birth_boundary() -> Result<u64> {
+    process_birth::boundary()
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod process_birth {
+    use std::{ffi::c_void, mem::size_of, ptr};
+
+    use eliot_core::{Error, Result};
+    use windows_sys::Win32::{
+        Foundation::{
+            CloseHandle, FARPROC, HANDLE, HMODULE, STATUS_BUFFER_OVERFLOW,
+            STATUS_INFO_LENGTH_MISMATCH,
+        },
+        System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+
+    const PROCESS_TELEMETRY_ID_INFORMATION_CLASS: i32 = 64;
+    const MAX_PROCESS_TELEMETRY_BUFFER_BYTES: usize = 1024 * 1024;
+    const MAX_PROCESS_TELEMETRY_QUERY_ATTEMPTS: usize = 3;
+
+    // Microsoft documents this NT telemetry record, but ships no public SDK
+    // header for it. Keep the local C-layout declaration aligned with that
+    // documented field order; use only the process key and birth-time prefix.
+    #[repr(C)]
+    #[derive(Default)]
+    #[allow(dead_code)]
+    struct ProcessTelemetryIdInformation {
+        header_size: u32,
+        process_id: u32,
+        process_start_key: u64,
+        create_time: u64,
+        create_interrupt_time: u64,
+        create_unbiased_interrupt_time: u64,
+        process_sequence_number: u64,
+        session_create_time: u64,
+        session_id: u32,
+        boot_id: u32,
+        image_checksum: u32,
+        image_time_date_stamp: u32,
+        user_sid_offset: u32,
+        image_path_offset: u32,
+        package_name_offset: u32,
+        relative_app_name_offset: u32,
+        command_line_offset: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    #[allow(dead_code)]
+    struct ProcessTelemetryBirthPrefix {
+        header_size: u32,
+        process_id: u32,
+        process_start_key: u64,
+        create_time: u64,
+        create_interrupt_time: u64,
+        create_unbiased_interrupt_time: u64,
+    }
+
+    type FarProc = unsafe extern "system" fn() -> isize;
+    type NtQueryInformationProcess =
+        unsafe extern "system" fn(HANDLE, i32, *mut c_void, u32, *mut u32) -> i32;
+    type QueryUnbiasedInterruptTime = unsafe extern "system" fn(*mut u64) -> i32;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "LoadLibraryW"]
+        fn load_library_w(name: *const u16) -> HMODULE;
+        #[link_name = "FreeLibrary"]
+        fn free_library(module: HMODULE) -> i32;
+        #[link_name = "GetProcAddress"]
+        fn get_proc_address(module: HMODULE, name: *const u8) -> FARPROC;
+    }
+
+    struct OwnedModule(HMODULE);
+
+    impl Drop for OwnedModule {
+        fn drop(&mut self) {
+            // SAFETY: LoadLibraryW returned the reference owned by this value.
+            unsafe { free_library(self.0) };
+        }
+    }
+
+    struct OwnedProcess(HANDLE);
+
+    impl Drop for OwnedProcess {
+        fn drop(&mut self) {
+            // SAFETY: this handle is uniquely owned by `OwnedProcess`.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn unsupported(message: impl Into<String>) -> Error {
+        Error::new("unsupported", message)
+    }
+
+    fn load_module(name: &str) -> Result<OwnedModule> {
+        let mut wide_name: Vec<u16> = name.encode_utf16().collect();
+        wide_name.push(0);
+        // SAFETY: `wide_name` is NUL-terminated and remains alive for the call.
+        let module = unsafe { load_library_w(wide_name.as_ptr()) };
+        if module.is_null() {
+            return Err(unsupported(format!("Windows module {name} is unavailable")));
+        }
+        Ok(OwnedModule(module))
+    }
+
+    fn resolve_proc(module: HMODULE, name: &'static [u8], label: &str) -> Result<FarProc> {
+        // SAFETY: `name` is a NUL-terminated export name.
+        unsafe { get_proc_address(module, name.as_ptr()) }
+            .ok_or_else(|| unsupported(format!("Windows {label} export is unavailable")))
+    }
+
+    fn query_process_telemetry(handle: HANDLE, pid: u32) -> Result<(u64, u64)> {
+        let ntdll = load_module("ntdll.dll")?;
+        let raw = resolve_proc(
+            ntdll.0,
+            b"NtQueryInformationProcess\0",
+            "NtQueryInformationProcess",
+        )?;
+        // SAFETY: winternl.h and windows-sys declare this exact system ABI; the
+        // function is resolved dynamically as Microsoft requires for ntdll.
+        let query: NtQueryInformationProcess = unsafe { std::mem::transmute(raw) };
+
+        let record_size = size_of::<ProcessTelemetryIdInformation>();
+        let mut output = vec![0u64; record_size.div_ceil(size_of::<u64>())];
+
+        for attempt in 0..MAX_PROCESS_TELEMETRY_QUERY_ATTEMPTS {
+            output.fill(0);
+            // ProcessInformation is output-only; leave HeaderSize zeroed for
+            // Windows to report the fixed header actually returned.
+            let buffer_size = output.len() * size_of::<u64>();
+            let mut returned = 0u32;
+            // SAFETY: the buffer is writable/aligned, its length is passed, and
+            // `returned` is a valid output pointer.
+            let status = unsafe {
+                query(
+                    handle,
+                    PROCESS_TELEMETRY_ID_INFORMATION_CLASS,
+                    output.as_mut_ptr().cast(),
+                    u32::try_from(buffer_size).expect("bounded telemetry buffer fits u32"),
+                    &mut returned,
+                )
+            };
+
+            if status >= 0 {
+                let returned = usize::try_from(returned).unwrap_or(0);
+                if returned < size_of::<ProcessTelemetryBirthPrefix>() || returned > buffer_size {
+                    return Err(unsupported(
+                        "Windows process telemetry returned an invalid length",
+                    ));
+                }
+
+                // SAFETY: success and ReturnLength prove the prefix is initialized
+                // in this aligned u64-backed buffer.
+                let birth =
+                    unsafe { ptr::read(output.as_ptr().cast::<ProcessTelemetryBirthPrefix>()) };
+                let returned_header_size = usize::try_from(birth.header_size).unwrap_or(0);
+                let minimum_header_size = size_of::<ProcessTelemetryBirthPrefix>();
+                if returned_header_size < minimum_header_size || returned_header_size > returned {
+                    return Err(unsupported(
+                        "Windows process telemetry returned an invalid HeaderSize",
+                    ));
+                }
+                if birth.process_id != pid {
+                    return Err(unsupported(
+                        "Windows process telemetry returned a different process identity",
+                    ));
+                }
+                return Ok((
+                    birth.create_unbiased_interrupt_time,
+                    birth.process_start_key,
+                ));
+            }
+
+            if status != STATUS_BUFFER_OVERFLOW && status != STATUS_INFO_LENGTH_MISMATCH {
+                return Err(unsupported(format!(
+                    "Windows process birth ordering is unavailable (NtQueryInformationProcess status 0x{:08X})",
+                    status as u32
+                )));
+            }
+
+            let required = usize::try_from(returned)
+                .map_err(|_| unsupported("Windows telemetry record size is invalid"))?;
+            if required <= buffer_size || required > MAX_PROCESS_TELEMETRY_BUFFER_BYTES {
+                return Err(unsupported(
+                    "Windows process birth ordering has an invalid required telemetry size",
+                ));
+            }
+            if attempt + 1 == MAX_PROCESS_TELEMETRY_QUERY_ATTEMPTS {
+                break;
+            }
+            output.resize(required.div_ceil(size_of::<u64>()), 0);
+        }
+
+        Err(unsupported(
+            "Windows process birth telemetry did not fit after bounded ReturnLength retries",
+        ))
+    }
+
+    pub fn birth(pid: u32) -> Result<(u64, Option<u64>)> {
+        // SAFETY: no pointers are passed; only query rights are requested.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return Err(Error::new(
+                "process_identity",
+                "could not open process to verify its birth identity",
+            ));
+        }
+        let handle = OwnedProcess(handle);
+        let (start_time, process_start_key) = query_process_telemetry(handle.0, pid)?;
+        Ok((start_time, Some(process_start_key)))
+    }
+
+    pub fn boundary() -> Result<u64> {
+        let kernel32 = load_module("kernel32.dll")?;
+        let raw = resolve_proc(
+            kernel32.0,
+            b"QueryUnbiasedInterruptTime\0",
+            "QueryUnbiasedInterruptTime",
+        )?;
+        // SAFETY: the function's documented ABI takes one writable u64 and
+        // returns BOOL; the address came from kernel32's named export.
+        let query: QueryUnbiasedInterruptTime = unsafe { std::mem::transmute(raw) };
+        let mut time = 0u64;
+        // SAFETY: `time` is a valid writable output value.
+        if unsafe { query(&mut time) } == 0 {
+            return Err(unsupported(
+                "Windows unbiased interrupt-time boundary is unavailable",
+            ));
+        }
+        Ok(time)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+mod process_birth {
+    use std::{fs, io};
+
+    use eliot_core::{Error, Result};
+
+    pub fn birth(pid: u32) -> Result<(u64, Option<u64>)> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map_err(|_| Error::new("process_identity", "could not read process birth identity"))?;
+        let fields = stat
+            .rfind(')')
+            .and_then(|end| stat.get(end + 1..))
+            .ok_or_else(|| Error::new("process_identity", "process stat is malformed"))?;
+        let start_time = fields
+            .split_whitespace()
+            .nth(19)
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| Error::new("process_identity", "process start time is unavailable"))?;
+        Ok((start_time, None))
+    }
+
+    pub fn boundary() -> Result<u64> {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime initializes the writable timespec. CLOCK_BOOTTIME
+        // uses the same boot-relative clock as Linux /proc starttime.
+        if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut time) } != 0 {
+            return Err(Error::new(
+                "process_identity",
+                io::Error::last_os_error().to_string(),
+            ));
+        }
+        // SAFETY: sysconf takes no pointers and reports the kernel USER_HZ.
+        let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if ticks_per_second <= 0 {
+            return Err(Error::new(
+                "process_identity",
+                "kernel process clock rate is unavailable",
+            ));
+        }
+        let seconds = u64::try_from(time.tv_sec)
+            .map_err(|_| Error::new("process_identity", "boot clock is invalid"))?;
+        let nanos = u64::try_from(time.tv_nsec)
+            .map_err(|_| Error::new("process_identity", "boot clock is invalid"))?;
+        Ok(seconds
+            .saturating_mul(ticks_per_second as u64)
+            .saturating_add(nanos.saturating_mul(ticks_per_second as u64) / 1_000_000_000))
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+mod process_birth {
+    use eliot_core::{Error, Result};
+
+    pub fn birth(_pid: u32) -> Result<(u64, Option<u64>)> {
+        Err(Error::new(
+            "unsupported",
+            "kernel process birth identity is unavailable on this platform",
+        ))
+    }
+
+    pub fn boundary() -> Result<u64> {
+        Err(Error::new(
+            "unsupported",
+            "kernel process birth boundary is unavailable on this platform",
+        ))
+    }
+}
 
 /// Display nouns for transport diagnostics, e.g. `("Muse", "Muse session
 /// host")`. The protocol layers pass their exact historical labels so

@@ -487,6 +487,7 @@ version = "0.2.0-dev"
 dependencies = [
  "eliot-core",
  "futures-util",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
