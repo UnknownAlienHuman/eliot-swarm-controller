@@ -15,7 +15,7 @@ use tokio::{
     time::Instant,
 };
 
-use crate::native::{AcpUpdate, AgyClient, AgyFrame, PromptResult, classify_update};
+use crate::native::{AcpUpdate, AgyClient, AgyFrame, FencedGuard, PromptResult, classify_update};
 
 pub(crate) const FAMILIES: &[&str] = &["session", "turn", "message", "tool"];
 pub(crate) type Shared = Arc<Mutex<State>>;
@@ -24,6 +24,12 @@ pub(crate) type Shared = Arc<Mutex<State>>;
 /// tail is dropped and the turn carries `final_text_unavailable` instead
 /// of an unbounded payload.
 const MAX_TURN_TEXT_BYTES: usize = 256 * 1024;
+
+/// Bounded wait for the fenced terminal reply of one prompt. The
+/// process lifetime and stream loss settle earlier; this only bounds a
+/// missing reply from leaving the turn stuck busy forever.
+pub(crate) const PROMPT_TERMINAL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
 
 #[derive(Clone, Serialize)]
 pub(crate) struct TurnFacts {
@@ -51,11 +57,20 @@ pub(crate) struct State {
     policy: SecretPolicy,
     pub conversation: String,
     pending: Option<Pending>,
-    tool_events: HashMap<String, Value>,
+    /// Lifecycle transitions already emitted per tool call, keyed
+    /// `"{tool_call_id}:{kind}"`. Each transition is emitted once;
+    /// later metadata deltas never re-emit.
+    tool_emitted: std::collections::HashSet<String>,
     /// Partial tool-call deltas merged per vendor id before any event is
     /// derived: `(title, status)` as last known. Updates may omit either
     /// field, so absence alone is never a protocol gap.
     tools: HashMap<String, (String, String)>,
+    /// RAII registration of the outstanding fenced prompt call. Exactly
+    /// one owner (this state); clearing it retires both transport maps.
+    fenced_guard: Option<FencedGuard>,
+    /// Absolute deadline for the fenced terminal reply, while a prompt
+    /// is outstanding.
+    prompt_expiry: Option<Instant>,
     text_accum: String,
     text_truncated: bool,
     writes_blocked: bool,
@@ -95,8 +110,10 @@ impl State {
             policy,
             conversation,
             pending: None,
-            tool_events: HashMap::new(),
+            tool_emitted: std::collections::HashSet::new(),
             tools: HashMap::new(),
+            fenced_guard: None,
+            prompt_expiry: None,
             text_accum: String::new(),
             text_truncated: false,
             writes_blocked: false,
@@ -120,6 +137,46 @@ impl State {
             .as_ref()
             .filter(|(settled, _)| settled == turn)
             .map(|(_, status)| status.as_str())
+    }
+
+    /// Take ownership of the fenced prompt registration and arm its
+    /// terminal expiry — but only if the expected prepared turn is still
+    /// pending and live. The fenced reply may have settled (or the
+    /// stream may have been lost) while the dispatch write was in flight;
+    /// in that case the guard is retired immediately by drop and no
+    /// stale expiry is ever armed for a finished or other turn. The
+    /// associated oneshot already proves association, so a confirmed
+    /// terminal settlement is never downgraded by a late guard.
+    pub fn arm_fenced(&mut self, guard: FencedGuard, expected_turn: &str) {
+        let live = self.failure.is_none()
+            && !self.source_unknown
+            && self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.turn == expected_turn);
+        if live {
+            self.fenced_guard = Some(guard);
+            self.prompt_expiry = Some(Instant::now() + PROMPT_TERMINAL_TIMEOUT);
+        }
+    }
+
+    fn clear_fenced(&mut self) {
+        self.fenced_guard = None;
+        self.prompt_expiry = None;
+    }
+
+    /// Bounded terminal expiry from the event loop: a missing fenced
+    /// reply settles Unknown, never a stuck busy turn and never a replay.
+    pub async fn expire_prompt(&mut self) {
+        if self.pending.is_some() {
+            self.fail_prompt(Error::new(
+                "unknown",
+                "Antigravity prompt terminal reply deadline elapsed",
+            ))
+            .await;
+        } else {
+            self.clear_fenced();
+        }
     }
 
     pub fn active_turn(&self) -> Option<&str> {
@@ -150,8 +207,10 @@ impl State {
             associated: false,
             reply: Some(reply),
         });
-        self.tool_events.clear();
+        self.tool_emitted.clear();
         self.tools.clear();
+        self.fenced_guard = None;
+        self.prompt_expiry = None;
         self.text_accum.clear();
         self.text_truncated = false;
         Ok(result)
@@ -372,6 +431,13 @@ impl State {
                 "Antigravity tool call id is absent",
             ));
         }
+        // Each lifecycle transition is emitted once per tool call. A
+        // later delta for an already-emitted transition is metadata
+        // only (already merged) and never re-emits or poisons the
+        // retained comparison.
+        if !self.tool_emitted.insert(format!("{tool_call_id}:{kind}")) {
+            return Ok(());
+        }
         self.associate().await?;
         let pending = self
             .pending
@@ -387,20 +453,7 @@ impl State {
         let mut data = json!({"command_id": pending.command, "turn_id": turn,
             "item_id": item, "tool": title, "status": status});
         self.policy.redact_values(&mut data);
-        let key = format!("{item}:{kind}");
-        if let Some(old) = self.tool_events.get(&key) {
-            return if old == &data {
-                Ok(())
-            } else {
-                Err(Error::new(
-                    "source_integrity",
-                    "Antigravity tool step changed after commitment",
-                ))
-            };
-        }
-        self.commit(kind, &turn, &item, data.clone()).await?;
-        self.tool_events.insert(key, data);
-        Ok(())
+        self.commit(kind, &turn, &item, data).await
     }
 
     /// Settle the prepared turn from the terminal `session/prompt`
@@ -466,6 +519,7 @@ impl State {
             terminal: true,
         });
         self.settlement = Some((turn, status.to_owned()));
+        self.clear_fenced();
         self.pending = None;
         Ok(())
     }
@@ -478,6 +532,7 @@ impl State {
         if self.failure.is_some() {
             return;
         }
+        self.clear_fenced();
         let unassociated = self
             .pending
             .as_ref()
@@ -495,6 +550,7 @@ impl State {
     }
 
     pub async fn ended(&mut self) -> Result<()> {
+        self.clear_fenced();
         if !self.stopped {
             if self.pending.is_some() {
                 self.lose("Antigravity stopped with an unresolved input")
@@ -522,6 +578,7 @@ impl State {
 
     pub async fn lose(&mut self, reason: &str) {
         self.source_unknown = true;
+        self.clear_fenced();
         if let Some(pending) = self.pending.as_ref() {
             self.settlement = Some((pending.turn.clone(), "unknown".to_owned()));
         }
@@ -622,6 +679,11 @@ pub(crate) fn spawn(
         // EOF-only check would let it vanish while later facts commit.
         let mut stream_open = true;
         loop {
+            // Bounded terminal expiry for the outstanding fenced prompt,
+            // armed by the event loop itself (no sleep heuristic for
+            // ordering: the fenced reply is in-band; this only bounds a
+            // missing reply).
+            let expiry = state.lock().await.prompt_expiry;
             let frame = tokio::select! {
                 frame = frames.recv() => frame,
                 changed = stream.changed(), if stream_open => {
@@ -642,6 +704,11 @@ pub(crate) fn spawn(
                         }
                         _ => {}
                     }
+                    continue;
+                }
+                _ = tokio::time::sleep_until(expiry.unwrap_or_else(|| Instant::now() + PROMPT_TERMINAL_TIMEOUT)), if expiry.is_some() => {
+                    let mut state = state.lock().await;
+                    state.expire_prompt().await;
                     continue;
                 }
             };

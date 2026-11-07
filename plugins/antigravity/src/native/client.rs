@@ -25,8 +25,8 @@ use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
 use eliot_plugin::{
     StderrView,
     native_transport::{
-        NativeChild, NativeLabels, NativeLaunch, NativeWriter, PendingCalls, PumpAction, PumpMode,
-        encode_frame, spawn_pumped,
+        NativeChild, NativeLabels, NativeLaunch, NativeWriter, PendingCalls, PendingGuard,
+        PumpAction, PumpMode, encode_frame, spawn_pumped,
     },
 };
 use serde::Serialize;
@@ -56,6 +56,28 @@ pub(crate) enum AgyFrame {
         method: String,
         params: Value,
     },
+}
+
+/// RAII registration for one fenced prompt call. Exactly one owner (the
+/// event state) holds it from dispatch until the terminal frame,
+/// expiry, stream loss, or drop retires it; dropping removes both the
+/// pending-map entry (via [`PendingGuard`]) and the fenced id. Never
+/// `mem::forget`-ed: the reply channel receiver is dropped at dispatch
+/// because the reply travels as an ordered frame instead.
+pub(crate) struct FencedGuard {
+    /// Held for its `Drop` only: removes the pending-map entry.
+    _guard: PendingGuard,
+    fenced: Arc<StdMutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for FencedGuard {
+    fn drop(&mut self) {
+        self.fenced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
 }
 
 #[derive(Clone)]
@@ -193,14 +215,15 @@ impl AgyClient {
     }
 
     /// Dispatch one request whose reply must be consumed in wire order
-    /// behind preceding stream records. Returns the request id; the reply
-    /// arrives as [`AgyFrame::PromptResponse`] on the event channel.
+    /// behind preceding stream records. Returns the request id plus the
+    /// RAII registration guard; the reply arrives as
+    /// [`AgyFrame::PromptResponse`] on the event channel.
     pub async fn call_fenced(
         &self,
         method: &str,
         params: Value,
         deadline: Instant,
-    ) -> Result<String> {
+    ) -> Result<(String, FencedGuard)> {
         if method.trim().is_empty() || !params.is_object() {
             return Err(Error::new(
                 "invalid",
@@ -222,16 +245,15 @@ impl AgyClient {
             .unwrap_or_else(|e| e.into_inner())
             .insert(id.clone());
         let (guard, _receiver) = self.pending.insert(id.clone());
+        let registration = FencedGuard {
+            _guard: guard,
+            fenced: Arc::clone(&self.fenced),
+            id: id.clone(),
+        };
         match self.write_encoded(encoded, deadline).await {
-            Ok(()) => {
-                std::mem::forget(guard);
-                Ok(id)
-            }
+            Ok(()) => Ok((id, registration)),
             Err(error) => {
-                self.fenced
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&id);
+                // `registration` drops here and retires both maps.
                 if error.code == "native_not_dispatched" {
                     return Err(error);
                 }

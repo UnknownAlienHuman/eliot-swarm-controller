@@ -212,7 +212,7 @@ impl Session {
                 )
             })?
         };
-        let effective = plan.check_session(&init, &session)?;
+        let mut effective = plan.check_session(&init, &session)?;
         self.conversation = session.session_id.clone();
         // Verify each required config write by its echoed current value.
         for (config_id, value) in plan.config_writes() {
@@ -265,6 +265,10 @@ impl Session {
                     deadline,
                 )
                 .await?;
+            // Report the actually applied mode, never the pre-set value.
+            if let Some(object) = effective.as_object_mut() {
+                object.insert("mode".to_owned(), json!(mode));
+            }
         }
         let effective = with_context_points(effective, &[InjectPoint::NextInput]);
         if *self.stream.borrow() != StreamState::Open {
@@ -411,32 +415,40 @@ impl Session {
         // before; a slow first update keeps the retained `unknown`
         // outcome while the fenced reply still settles the turn in order.
         let prompt = prompt_params(&self.conversation, &combined);
-        if let Err(error) = self
+        let dispatched = self
             .client
             .call_fenced("session/prompt", prompt, Instant::now() + TIMEOUT)
-            .await
-        {
-            if native_no_write(&error.code) {
-                self.state
-                    .lock()
-                    .await
-                    .withdraw_unwritten(&params.command_id)?;
-                let result = Ok(
-                    json!({"state": "rejected", "reason": "Antigravity input was not dispatched"}),
-                );
+            .await;
+        let registration = match dispatched {
+            Ok((_, registration)) => registration,
+            Err(error) => {
+                if native_no_write(&error.code) {
+                    self.state
+                        .lock()
+                        .await
+                        .withdraw_unwritten(&params.command_id)?;
+                    let result = Ok(
+                        json!({"state": "rejected", "reason": "Antigravity input was not dispatched"}),
+                    );
+                    if let Some(retained) = self.retained.as_mut().filter(|r| r.seq == seq) {
+                        retained.outcome = result.clone();
+                    }
+                    return result;
+                }
+                let mut state = self.state.lock().await;
+                state.fail_prompt(error).await;
+                let result = unknown;
                 if let Some(retained) = self.retained.as_mut().filter(|r| r.seq == seq) {
                     retained.outcome = result.clone();
                 }
                 return result;
             }
-            let mut state = self.state.lock().await;
-            state.fail_prompt(error).await;
-            let result = unknown;
-            if let Some(retained) = self.retained.as_mut().filter(|r| r.seq == seq) {
-                retained.outcome = result.clone();
-            }
-            return result;
-        }
+        };
+        // Exactly one owner for the registration from here on: the event
+        // state, which retires it on settlement, expiry, loss, or drop —
+        // unless this exact turn already settled while the write was in
+        // flight, in which case `arm_fenced` retires it immediately.
+        self.state.lock().await.arm_fenced(registration, &turn);
         let result = match timeout_at(Instant::now() + TIMEOUT, associated).await {
             Ok(Ok(Ok(()))) => Ok(json!({"state": "applied", "turn_id": turn})),
             Ok(Ok(Err(error))) if native_no_write(&error.code) => {
