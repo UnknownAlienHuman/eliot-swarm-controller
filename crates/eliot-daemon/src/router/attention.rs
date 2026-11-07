@@ -667,9 +667,12 @@ async fn retire_superseded_incidents(
         agents
     };
     for agent_id in agents {
-        let current_generation = {
+        let (current_generation, current_state) = {
             let store = router.inner.store.lock().await;
-            store.get_agent(&agent_id)?.map(|agent| agent.generation)
+            store
+                .get_agent(&agent_id)?
+                .map(|agent| (Some(agent.generation), Some(agent.state)))
+                .unwrap_or((None, None))
         };
         let obsolete = {
             let state = state.lock().unwrap_or_else(|error| error.into_inner());
@@ -677,47 +680,92 @@ async fn retire_superseded_incidents(
                 .active
                 .iter()
                 .filter(|(key, _)| {
-                    key.agent == agent_id && Some(key.generation) != current_generation
+                    key.agent == agent_id
+                        && (Some(key.generation) != current_generation
+                            || (key.kind == IncidentKind::SourceUnhealthy
+                                && current_state == Some(AgentState::Stopped)))
                 })
-                .map(|(key, incident)| (key.clone(), incident.clone()))
+                .map(|(key, incident)| {
+                    let stopped_source = Some(key.generation) == current_generation
+                        && key.kind == IncidentKind::SourceUnhealthy
+                        && current_state == Some(AgentState::Stopped);
+                    (key.clone(), incident.clone(), stopped_source)
+                })
                 .collect::<Vec<_>>()
         };
-        for (key, incident) in obsolete {
-            let mut incident_settled = incident.incident_delivery.is_none();
-            if let Some(delivery) = &incident.incident_delivery {
-                match persist_and_notify(router, delivery).await {
-                    Ok(()) => incident_settled = true,
-                    Err(error) => record_obsolete_delivery(&key, "incident", &error),
-                }
-            }
-            if incident_settled {
-                if let Some(delivery) = &incident.recovery_delivery
-                    && let Err(error) = persist_and_notify(router, delivery).await
-                {
-                    record_obsolete_delivery(&key, "recovery", &error);
-                }
-            } else if incident.recovery_delivery.is_some() {
-                let error = Error::new(
-                    "unknown",
-                    "obsolete incident delivery was not confirmed; recovery was not dispatched",
-                );
-                record_obsolete_delivery(&key, "recovery", &error);
-            }
-            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-            if state
-                .active
-                .get(&key)
-                .is_some_and(|current| current.incident_id == incident.incident_id)
-            {
-                state.active.remove(&key);
-            }
-            state.pending_checks.remove(&AgentKey {
-                agent: key.agent.clone(),
-                generation: key.generation,
-            });
+        for (key, incident, stopped_source) in obsolete {
+            retire_obsolete_incident(router, state, key, incident, stopped_source).await;
         }
     }
     Ok(())
+}
+
+async fn retire_stopped_source_incidents(
+    router: &Router,
+    state: &Arc<Mutex<AttentionState>>,
+    captured: &CapturedAgent,
+) {
+    if captured.agent.state != AgentState::Stopped {
+        return;
+    }
+    let obsolete = {
+        let state = state.lock().unwrap_or_else(|error| error.into_inner());
+        state
+            .active
+            .iter()
+            .filter(|(key, _)| {
+                key.agent == captured.agent.id
+                    && key.generation == captured.agent.generation
+                    && key.kind == IncidentKind::SourceUnhealthy
+            })
+            .map(|(key, incident)| (key.clone(), incident.clone()))
+            .collect::<Vec<_>>()
+    };
+    for (key, incident) in obsolete {
+        retire_obsolete_incident(router, state, key, incident, true).await;
+    }
+}
+
+async fn retire_obsolete_incident(
+    router: &Router,
+    state: &Arc<Mutex<AttentionState>>,
+    key: IncidentKey,
+    incident: ActiveIncident,
+    suppress_recovery: bool,
+) {
+    let mut incident_settled = incident.incident_delivery.is_none();
+    if let Some(delivery) = &incident.incident_delivery {
+        match persist_and_notify(router, delivery).await {
+            Ok(()) => incident_settled = true,
+            Err(error) => record_obsolete_delivery(&key, "incident", &error),
+        }
+    }
+    if incident_settled && !suppress_recovery {
+        if let Some(delivery) = &incident.recovery_delivery
+            && let Err(error) = persist_and_notify(router, delivery).await
+        {
+            record_obsolete_delivery(&key, "recovery", &error);
+        }
+    } else if incident.recovery_delivery.is_some() {
+        let message = if suppress_recovery {
+            "Stopped source-unhealthy state retired without dispatching recovery"
+        } else {
+            "obsolete incident delivery was not confirmed; recovery was not dispatched"
+        };
+        record_obsolete_delivery(&key, "recovery", &Error::new("unknown", message));
+    }
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    if state
+        .active
+        .get(&key)
+        .is_some_and(|current| current.incident_id == incident.incident_id)
+    {
+        state.active.remove(&key);
+    }
+    state.pending_checks.remove(&AgentKey {
+        agent: key.agent.clone(),
+        generation: key.generation,
+    });
 }
 
 fn record_obsolete_delivery(key: &IncidentKey, phase: &str, error: &Error) {
@@ -959,7 +1007,7 @@ async fn inspect_lost_agent(
     let Some(captured) = capture_agent(router, agent_id, generation).await? else {
         return Ok(());
     };
-    if captured.agent.observe_only {
+    if captured.agent.observe_only || captured.agent.state == AgentState::Stopped {
         return Ok(());
     }
     let key = IncidentKey {
@@ -1033,6 +1081,7 @@ async fn report_cleared_incidents(
     captured: &CapturedAgent,
     suspicion_window: Duration,
 ) -> Result<()> {
+    retire_stopped_source_incidents(router, state, captured).await;
     let mut candidates = recovery_candidates(state, captured);
     if candidates.is_empty() {
         return Ok(());
@@ -1127,15 +1176,15 @@ fn incident_condition_cleared(
     incident: &ActiveIncident,
     captured: &CapturedAgent,
 ) -> bool {
-    if captured.agent.state == AgentState::Stopped {
-        return true;
-    }
     match key.kind {
         IncidentKind::SourceUnhealthy => {
             captured.source_healthy == Some(true)
                 && !source_is_unhealthy(captured.agent.state, &captured.source_states)
         }
         IncidentKind::NoProgress => {
+            if captured.agent.state == AgentState::Stopped {
+                return true;
+            }
             let progressed =
                 timestamp_advanced(captured.progress_basis_at, incident.baseline_progress_at)
                     || timestamp_advanced(
@@ -1387,7 +1436,9 @@ fn desired_incident(
     captured: &CapturedAgent,
     suspicion_window: Duration,
 ) -> Option<(IncidentKey, String)> {
-    if source_is_unhealthy(captured.agent.state, &captured.source_states) {
+    if captured.agent.state != AgentState::Stopped
+        && source_is_unhealthy(captured.agent.state, &captured.source_states)
+    {
         return Some((
             IncidentKey {
                 agent: captured.agent.id.clone(),

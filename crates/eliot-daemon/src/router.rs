@@ -11,6 +11,7 @@ mod rules;
 
 pub(crate) use attention::run_attention;
 use auth::{authorize_command, authorize_rpc_method};
+pub(crate) use coordination::run_mail_reoffer;
 pub(crate) use goals::{real_goal_check, run_goal_driver};
 
 use crate::{

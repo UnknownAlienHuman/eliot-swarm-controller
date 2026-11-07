@@ -15,7 +15,7 @@ use super::{
     Change, Error, MAX_EVENT_BYTES, Result, Store, canonical, command_binding, commit_transaction,
     decode_json, encode_json, enforce_page_bytes, has_pending_send_input, has_unknown_gate,
     history_expired, insert_daemon_event, load_agent_by_num, load_command_record, provider_holds,
-    sql_error, validate_id_age, write_binding,
+    sql_error, validate_id_age, validate_limit, write_binding,
 };
 use eliot_core::{
     Agent, AgentState, CommandState,
@@ -332,6 +332,51 @@ impl Store {
         let result = self.notice_release_inner(recipient, notice_command);
         self.fault_on_persistence_error(&result);
         result
+    }
+
+    /// Page recipient ids due a normal mail notice: current `idle`,
+    /// non-observer, generation >= 1 agents holding unread mail whose
+    /// `mail_notices` row is absent or past the normal notice cooldown.
+    /// Read-only candidate scan: the caller must still `notice_claim` each
+    /// recipient, which stays authoritative for open commands, holds and
+    /// races. Open notice commands are deliberately not consulted here.
+    pub fn due_mail_notice_recipients(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+        now: i64,
+    ) -> Result<Vec<String>> {
+        validate_limit(limit)?;
+        let after_num = after.map(parse_agent_id).transpose()?.unwrap_or(0);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT a.id FROM agents a
+                 LEFT JOIN mail_notices mn ON mn.recipient = a.id
+                 WHERE a.id > ?1
+                   AND a.state = 'idle'
+                   AND a.observe_only = 0
+                   AND a.generation >= 1
+                   AND (mn.last_notice_at IS NULL
+                        OR (mn.last_notice_at <= ?2 AND ?2 - mn.last_notice_at >= ?3))
+                   AND EXISTS (
+                           SELECT 1 FROM messages m
+                           WHERE m.recipient = a.id AND m.read_at IS NULL
+                       )
+                 ORDER BY a.id LIMIT ?4",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![after_num, now, MAIL_NOTICE_COOLDOWN_MS, limit as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sql_error)?;
+        let mut recipients = Vec::new();
+        for row in rows {
+            recipients.push(mailbox_name(row.map_err(sql_error)?));
+        }
+        Ok(recipients)
     }
 
     fn resolve_mailbox(&self, principal: &str, agent: Option<&str>) -> Result<i64> {

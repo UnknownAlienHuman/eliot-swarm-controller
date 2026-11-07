@@ -487,6 +487,8 @@ Those triggers do not wait for the no-progress window. A busy Agent with a
 healthy authoritative source becomes a no-progress suspicion after
 `daemon.attention_suspicion_secs` (default 900 seconds). This is a diagnostic
 threshold, never a timeout verdict that the Agent died.
+Stopped Agents do not open source-unhealthy incidents; existing ones retire
+without a recovery claim, while no-progress may still recover on explicit stop.
 
 Before reporting, capture the Agent generation, active turn, pending requests,
 source owners/health, and model-progress time from Store; release Store before
@@ -511,8 +513,11 @@ indefinitely: if that observation remains unchanged through the configured
 window, emit an advisory `active_tool` diagnosis with progress `unknown`. This
 diagnosis never proves death. Tool coverage that is missing, gapped, or
 truncated remains unknown and cannot be called stalled.
-Only one report is emitted per active incident, followed by one recovery report
-when its condition clears. The bounded transient incident set is in-memory;
+Only one report is emitted per active incident. Recovery requires positive
+progress or state evidence; loss of observability or an unhealthy/unknown source
+alone does not produce recovery. Superseded-generation incident state retires
+without asserting recovery; any obsolete delivery that cannot be confirmed
+remains explicitly unconfirmed. The bounded transient incident set is in-memory;
 there is no separate status registry. Each incident/phase freezes its report
 and ULID mutation IDs until event and notice delivery settle, so retries reuse
 the same facts and command bindings. Inbox/owner notices carry a short bounded
