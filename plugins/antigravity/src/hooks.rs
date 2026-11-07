@@ -3,7 +3,7 @@
 //! Antigravity (AGY 1.5.2) supports lifecycle hooks declared in `hooks.json`.
 //! During `PreInvocation`, AGY invokes the configured command hook over stdio,
 //! passing camelCase JSON (`conversationId`, `invocationNum`, `initialNumSteps`)
-//! and expecting JSON output containing `injectSteps` with `ephemeralMessage`.
+//! and expecting `injectSteps` entries with a nested `systemMessage` payload.
 //!
 //! This module provides:
 //! 1. Typed wire representations for Antigravity hook I/O (`HookInput`, `HookOutput`).
@@ -105,27 +105,33 @@ impl HookOutput {
         }
     }
 
-    pub fn with_ephemeral(message: impl Into<String>) -> Self {
+    pub fn with_system_message(message: impl Into<String>) -> Self {
         Self {
-            inject_steps: vec![HookStep::ephemeral(message)],
+            inject_steps: vec![HookStep::system_message(message)],
         }
     }
 }
 
 /// Individual step injected before model invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum HookStep {
-    EphemeralMessage {
-        #[serde(rename = "ephemeralMessage")]
-        ephemeral_message: String,
-    },
+#[serde(rename_all = "camelCase")]
+pub struct HookStep {
+    pub system_message: HookSystemMessage,
+}
+
+/// The nested message payload supported by the current PreInvocation schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookSystemMessage {
+    pub system_message: String,
 }
 
 impl HookStep {
-    pub fn ephemeral(message: impl Into<String>) -> Self {
-        Self::EphemeralMessage {
-            ephemeral_message: message.into(),
+    pub fn system_message(message: impl Into<String>) -> Self {
+        Self {
+            system_message: HookSystemMessage {
+                system_message: message.into(),
+            },
         }
     }
 }

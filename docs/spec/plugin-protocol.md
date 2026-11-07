@@ -559,8 +559,9 @@ helper command. When the vendor runner executes the hook, the helper connects to
 loopback listener and proves its kernel birth identity. The plugin claims FIFO `turn_safe_point`
 context through the existing authenticated `hook.event` channel, combines it with any pending
 exact-turn steer retained inside the plugin, and packages both into one `HookOutput` with native
-`injectSteps` (`ephemeralMessage`). Only confirmed helper stdout write acknowledgment commits
-`hook.before_model` with `ContextOutcome` (mechanism `antigravity.PreInvocation.injectSteps.ephemeralMessage`).
+`injectSteps` entries using nested `systemMessage.systemMessage`. Only confirmed helper stdout
+write acknowledgment commits
+`hook.before_model` with `ContextOutcome` (mechanism `antigravity.PreInvocation.injectSteps.systemMessage`).
 A retained exact-turn steer waits for this callback while other control requests remain serviceable;
 this is native `PreInvocation`, not an `active_turn` inject or a new SEND. See [Antigravity harness](../harnesses/antigravity.md)
 for native details.

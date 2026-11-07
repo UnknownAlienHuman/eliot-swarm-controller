@@ -31,7 +31,7 @@ use crate::{
 use ulid::Ulid;
 
 pub(crate) const FAMILIES: &[&str] = &["session", "turn", "message", "tool"];
-pub(crate) const STEER_MECHANISM: &str = "antigravity.PreInvocation.injectSteps.ephemeralMessage";
+pub(crate) const STEER_MECHANISM: &str = "antigravity.PreInvocation.injectSteps.systemMessage";
 pub(crate) type Shared = Arc<Mutex<State>>;
 
 /// Upper bound on accumulated assistant text per turn. Beyond this the
@@ -1212,7 +1212,7 @@ async fn handle_hook_callback(
     };
 
     // The authenticated Core response fits MAX_FRAME_BYTES. Converting its
-    // ContextItems to ephemeral steps removes each command id and expiry
+    // ContextItems to system-message steps removes each command id and expiry
     // field, so the context portion remains within that same shared bound.
     // Steer was independently preflighted against MAX_FRAME_BYTES before it
     // was armed. The private frame reserves both complete bounds plus the
@@ -1222,7 +1222,7 @@ async fn handle_hook_callback(
     if let Some(pending) = &steer {
         output
             .inject_steps
-            .push(HookStep::ephemeral(pending.text.clone()));
+            .push(HookStep::system_message(pending.text.clone()));
     }
     if !hook_ipc_response_fits(&output) {
         if let Some(pending) = steer.take() {
@@ -1316,7 +1316,7 @@ fn context_hook_output(context: &[ContextItem]) -> HookOutput {
     HookOutput {
         inject_steps: context
             .iter()
-            .map(|item| HookStep::ephemeral(item.text.clone()))
+            .map(|item| HookStep::system_message(item.text.clone()))
             .collect(),
     }
 }

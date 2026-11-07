@@ -661,7 +661,7 @@ impl Session {
                 "Antigravity steer contains a known credential",
             ));
         }
-        let output = HookOutput::with_ephemeral(text.to_owned());
+        let output = HookOutput::with_system_message(text.to_owned());
         if serde_json::to_vec(&output).map_or(true, |bytes| {
             bytes.len().saturating_add(1) > MAX_FRAME_BYTES
         }) {

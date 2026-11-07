@@ -104,9 +104,10 @@ approve, deny and answer remain `unsupported`.
 The Antigravity CLI hooks documentation (accessed 2026-11-07; adapter
 version metadata is 1.5.2) defines named hook groups. `PreInvocation` input
 includes `conversationId`, zero-indexed `invocationNum`, and
-`initialNumSteps` (trajectory step count); output `injectSteps` accepts
-`ephemeralMessage`. The plugin writes one named group
-(`eliot-system-context`) to the generation's private `.agents/hooks.json`
+`initialNumSteps` (trajectory step count). The current recommended output is
+`{"injectSteps":[{"systemMessage":{"systemMessage":"..."}}]}`;
+`ephemeralMessage` and `hookEphemeralMessage` are deprecated. The plugin
+writes one named group (`eliot-system-context`) to the generation's private `.agents/hooks.json`
 and passes that private directory with `--add-dir`; the real workspace
 remains the ACP cwd. The adapter does not write global or user-project hook
 files, copy authentication, or change login/native-store paths. The private
@@ -129,7 +130,8 @@ first without changing the daemon or other providers' environment.
 
 Supported system inject: `next_input` context is claimed FIFO at send
 and prepended to the prompt; `turn_safe_point` context is claimed FIFO at a
-live `PreInvocation` and applied as `injectSteps` `ephemeralMessage` steps.
+live `PreInvocation` and applied as nested `injectSteps` `systemMessage`
+steps.
 Direct `active_turn` inject is unsupported.
 
 The helper captures its kernel `ProcessBirthIdentity { pid, start_time }` at
@@ -155,9 +157,9 @@ is included only when claimed context was written.
 for a live `PreInvocation` in that prompt. Its host response is deferred while
 the same host continues to serve interrupt, stop, shutdown, and other control
 requests; an outer RPC timeout does not cancel the retained waiter. Steer
-uses a separate `ephemeralMessage` step, reports `applied` only after helper
+uses a `systemMessage` step, reports `applied` only after helper
 stdout confirmation, and reports the mechanism
-`antigravity.PreInvocation.injectSteps.ephemeralMessage`. If the turn ends
+`antigravity.PreInvocation.injectSteps.systemMessage`. If the turn ends
 first, the retained result is stale or unknown and is never resent. This is
 the native PreInvocation point, not an ACP steer method or an `active_turn`
 inject. Controlled families remain session/turn/message/tool, with
