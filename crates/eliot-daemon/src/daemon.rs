@@ -163,7 +163,9 @@ async fn run_owned(
     }
     let mut recovery = JoinSet::new();
     let recovery_router = router.clone();
-    recovery.spawn(async move { recovery_router.recover_workspaces().await });
+    recovery.spawn(async move { ("workspace", recovery_router.recover_workspaces().await) });
+    let recovery_router = router.clone();
+    recovery.spawn(async move { ("command", recovery_router.recover_accepted_commands().await) });
     // Dropped with this function, which aborts a recheck still waiting.
     let mut capacity_recheck = JoinSet::new();
     if !retained.is_empty() {
@@ -294,8 +296,11 @@ async fn run_owned(
             }
             joined = recovery.join_next(), if !recovery.is_empty() => {
                 match joined {
-                    Some(Ok(Ok(()))) => {}
-                    Some(Ok(Err(error))) => {
+                    Some(Ok((_, Ok(())))) => {}
+                    Some(Ok(("command", Err(error)))) => {
+                        logging::record(&policy, "daemon.command_recovery_failed", &[], Some(&error));
+                    }
+                    Some(Ok((_, Err(error)))) => {
                         logging::record(&policy, "daemon.workspace_recovery_failed", &[], Some(&error));
                         router.note_workspace_recovery_failure(&error.code);
                     }

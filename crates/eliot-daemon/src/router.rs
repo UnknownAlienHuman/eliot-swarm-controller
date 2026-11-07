@@ -442,6 +442,26 @@ impl Router {
         Ok(())
     }
 
+    pub(crate) async fn recover_accepted_commands(&self) -> Result<()> {
+        let mut after = None;
+        loop {
+            let admissions = {
+                let store = self.inner.store.lock().await;
+                store.recover_accepted_commands(after, STATUS_BLOCKER_MAX)?
+            };
+            if admissions.is_empty() {
+                return Ok(());
+            }
+            for (rowid, admission) in admissions {
+                after = Some((admission.command.created_at, rowid));
+                if command_needs_worker(&admission.command) {
+                    self.schedule_admission(&admission);
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     pub(crate) fn note_workspace_recovery_failure(&self, code: &str) {
         *self.inner.workspace_recovery_error.lock_recover() = Some(code.to_owned());
         self.signal_progress();
@@ -550,10 +570,7 @@ impl Router {
                 .insert(admission.command.id.clone());
         }
 
-        let kicks_worker = admission.command.verb != "inject"
-            || serde_json::from_value::<eliot_core::InjectArgs>(admission.command.args.clone())
-                .is_ok_and(|args| args.point == eliot_core::InjectPoint::ActiveTurn);
-        if admission.is_new && kicks_worker {
+        if admission.is_new && command_needs_worker(&admission.command) {
             self.schedule_admission(&admission);
         }
         self.signal_progress();
@@ -3374,6 +3391,12 @@ fn freeze_attach_profile(data_root: &std::path::Path, request: &mut SubmitComman
     }
     crate::config::capture_native_store_inputs(&mut snapshot, |name| std::env::var_os(name))?;
     install_frozen_profile(request, &harness, snapshot, true)
+}
+
+fn command_needs_worker(command: &Command) -> bool {
+    command.verb != "inject"
+        || serde_json::from_value::<eliot_core::InjectArgs>(command.args.clone())
+            .is_ok_and(|args| args.point == eliot_core::InjectPoint::ActiveTurn)
 }
 
 fn rule_admission_dispatch_plan(

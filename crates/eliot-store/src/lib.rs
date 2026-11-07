@@ -811,6 +811,75 @@ impl Store {
         Ok(commands)
     }
 
+    /// Page unattempted ordinary Owner admissions in the unsettled index's order.
+    /// Rule actions, linked inputs and managed starts retain their own recovery.
+    /// The rowid cursor remains usable if an earlier page settles or is pruned.
+    pub fn recover_accepted_commands(
+        &self,
+        after: Option<(i64, i64)>,
+        limit: usize,
+    ) -> Result<Vec<(i64, Admission)>> {
+        self.ensure_writer_healthy()?;
+        validate_limit(limit)?;
+        let (created_at, rowid) = after.unwrap_or((i64::MIN, i64::MIN));
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT rowid, id FROM commands
+                 WHERE state IN ('accepted', 'queued', 'dispatched', 'unknown')
+                   AND state = 'accepted' AND principal = 'owner' AND parent_command IS NULL
+                   AND selector IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM workspaces w
+                       WHERE w.agent = commands.target AND w.start_command_id = commands.id)
+                   AND (created_at, rowid) > (?1, ?2)
+                 ORDER BY created_at, rowid LIMIT ?3",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![created_at, rowid, limit as i64], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql_error)?;
+        let mut admissions = Vec::new();
+        let mut bytes = 2_usize;
+        for row in rows {
+            let (rowid, id) = row.map_err(sql_error)?;
+            let command = load_command(&self.connection, &id)?
+                .ok_or_else(|| Error::new("internal", "recovery command disappeared"))?;
+            let linked_command = load_linked_command(&self.connection, &id)?.filter(|linked| {
+                matches!(linked.state, CommandState::Accepted | CommandState::Queued)
+            });
+            let entry_bytes = encode_json(&command)?.len().saturating_add(
+                linked_command
+                    .as_ref()
+                    .map(encode_json)
+                    .transpose()?
+                    .map_or(0, |encoded| encoded.len()),
+            );
+            let next_bytes = bytes.saturating_add(entry_bytes).saturating_add(64);
+            if next_bytes > MAX_PAGE_BYTES {
+                if admissions.is_empty() {
+                    return Err(Error::new(
+                        "frame_too_large",
+                        "one recovered admission exceeds the page byte bound",
+                    ));
+                }
+                break;
+            }
+            bytes = next_bytes;
+            admissions.push((
+                rowid,
+                Admission {
+                    command,
+                    linked_command,
+                    events: Vec::new(),
+                    is_new: false,
+                },
+            ));
+        }
+        Ok(admissions)
+    }
+
     /// Count all Agents without truncating at a page limit.
     pub fn agent_count(&self) -> Result<i64> {
         self.connection
