@@ -515,22 +515,24 @@ async fn raw_client_call(
             .send(frame)
             .await
             .map_err(|_| Error::new("unavailable", "daemon RPC write failed"))?;
+        // The request is written: a local reply-integrity failure cannot prove
+        // non-execution. Matching, decoded daemon errors keep their domain code.
         let line = framed
             .next()
             .await
-            .ok_or_else(|| Error::new("unavailable", "daemon closed the RPC connection"))?
-            .map_err(|_| Error::new("frame_too_large", "daemon response frame is invalid"))?;
+            .ok_or_else(|| Error::new("unknown", "daemon closed the RPC connection"))?
+            .map_err(|_| Error::new("unknown", "daemon response frame is invalid"))?;
         if line.len().saturating_add(1) > MAX_RPC_FRAME_BYTES {
             return Err(Error::new(
-                "frame_too_large",
+                "unknown",
                 "daemon response exceeds the 4 MiB frame limit",
             ));
         }
         let response: RpcResponse = serde_json::from_str(&line)
-            .map_err(|_| Error::new("invalid", "daemon response is malformed"))?;
+            .map_err(|_| Error::new("unknown", "daemon response is malformed"))?;
         if response.jsonrpc != "2.0" || response.id != id {
             return Err(Error::new(
-                "invalid",
+                "unknown",
                 "daemon response does not match the request",
             ));
         }
@@ -538,7 +540,7 @@ async fn raw_client_call(
             (Some(value), None) => Ok(value),
             (None, Some(error)) => Err(core_error(error, policy)),
             _ => Err(Error::new(
-                "invalid",
+                "unknown",
                 "daemon response must contain exactly one result or error",
             )),
         }

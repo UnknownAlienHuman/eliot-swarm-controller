@@ -135,6 +135,10 @@ nonnegative response generation without requiring universal equality to
 `<id>/send` link. Shutdown validates the retained mode and reply shape; a mismatch is
 `unknown` (exit 4), and even `applied` does not prove the daemon exited.
 
+After a request is written, local response read/integrity failures are `unknown`
+(mutation exit 4), never proof of non-execution. Pre-send validation and a valid,
+matching daemon domain rejection retain their own codes; no automatic retry occurs.
+
 Commands store the binding directly; other writes use:
 
 ```sql
