@@ -297,6 +297,18 @@ async fn serve_request(
     let is_shutdown = request.method == "shutdown";
     match plugin.dispatch(&request, client).await {
         DispatchOutcome::Ready(result) => {
+            if is_shutdown && let Some(mut waiter) = plugin.deferred_steer.take() {
+                // Shutdown serializes BeginStop behind any hook write that
+                // may have just confirmed Applied: the outcome receiver is
+                // now ready. Settle and reply the known deferred result
+                // before the shutdown ack so Applied is not discarded with
+                // the session; unknown only when truly empty/closed.
+                let arrived = waiter.outcome.try_recv().ok();
+                let settled = plugin.settle_deferred_steer(client, waiter, arrived).await;
+                if matches!(settled, Serve::End(_)) {
+                    return Serve::End(false);
+                }
+            }
             let response = client
                 .respond(request.id, result, Instant::now() + RPC_TIMEOUT)
                 .await;
@@ -1088,8 +1100,10 @@ impl ClaudePlugin {
         // queue slot, so a second steer waits for this one's reply instead
         // of queueing behind an unanswered waiter.
         if self.deferred_steer.is_some() {
-            return ready(Err(Error::new(
-                "busy",
+            // Proven no-effect: never queued, so the authoritative refusal is
+            // `rejected`, not an error Core would classify Unknown. Transient:
+            // a later command id may steer once this reply settles.
+            return ready(Ok(rejected_control(
                 "Claude already has a steer reply deferred",
             )));
         }
@@ -1184,13 +1198,13 @@ impl ClaudePlugin {
             })),
             SteerOutcome::Rejected(reason) => Ok(rejected_control(&reason)),
             SteerOutcome::Unknown(reason) => Ok(unknown_control(&reason)),
-            SteerOutcome::Stale => Err(Error::new(
-                "stale_turn",
+            SteerOutcome::Stale => Ok(rejected_control(
                 "Claude turn ended before the steer applied",
             )),
         };
-        // Applied, rejected, and unknown settle into retention; stale is a
-        // refusal like the pre-queue stale, retained by nothing.
+        // Applied, rejected (including the stale-turn no-effect refusal),
+        // and unknown settle into retention with their exact
+        // command/turn/text binding.
         if let Ok(value) = result.as_ref()
             && let Some(session) = self.session.as_mut()
         {

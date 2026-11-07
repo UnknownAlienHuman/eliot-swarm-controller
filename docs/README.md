@@ -17,6 +17,7 @@ contract is not a requirement to implement every feature in the first layer.
 | [automation](spec/automation.md) | Rules, timers, scripts and Goals using normal commands |
 | [coordination](spec/coordination.md) | Mail, variables, hierarchy, who and advisory claims |
 | [configuration](spec/configuration.md) | Profiles, environment, routes and services |
+| [cloud MCP](spec/cloud-mcp.md) | Local HTTP MCP child and dedicated Cloudflare Tunnel lifecycle |
 | [harnesses](harnesses/README.md) | Native capability notes; Codex first |
 | [donors](reference/donors.md) | Dependency/extract/pattern map with source and target paths |
 
