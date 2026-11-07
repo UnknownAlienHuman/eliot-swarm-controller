@@ -20,17 +20,12 @@ use crate::{
     events::{self, Shared},
     host::TIMEOUT,
     native::{
-        InitializeResult, NativeClient, NativeFrame, NativeProcess, PromptResult, SessionResult,
+        AgyClient, AgyFrame, AgyProcess, InitializeResult, LoadSessionResult, SessionResult,
         SetConfigOptionResult, StreamState, prompt_params,
     },
     profile::Plan,
 };
 
-/// Bounded deadline for the terminal `session/prompt` response. Unlike the
-/// acceptance-only RPCs elsewhere (30 s), a prompt response is the turn's
-/// terminal fact, so it gets a long but finite bound; process termination
-/// settles it earlier via the transport's pending-call failure.
-const PROMPT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Best-effort deadline for the graceful `session/close` on terminate.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -80,13 +75,12 @@ pub(crate) struct Session {
     start_command: String,
     scope: String,
     conversation: String,
-    native: NativeProcess,
-    client: NativeClient,
+    native: AgyProcess,
+    client: AgyClient,
     state: Shared,
-    frames: Option<mpsc::Receiver<NativeFrame>>,
+    frames: Option<mpsc::Receiver<AgyFrame>>,
     stream: watch::Receiver<StreamState>,
     task: Option<JoinHandle<()>>,
-    prompt_task: Option<JoinHandle<()>>,
     ready: bool,
     highwater_seq: i64,
     retained: Option<RetainedCommand>,
@@ -107,7 +101,7 @@ impl Session {
             cwd: plan.launch.cwd.clone(),
             environment: plan.launch.environment.clone(),
         };
-        let mut native = NativeProcess::spawn(launch, plan.policy.clone()).await?;
+        let mut native = AgyProcess::spawn(launch, plan.policy.clone()).await?;
         let client = native.client();
         let frames = native.take_frames()?;
         let stream = native.stream_state();
@@ -131,7 +125,6 @@ impl Session {
             frames: Some(frames),
             stream,
             task: None,
-            prompt_task: None,
             ready: false,
             highwater_seq: 0,
             retained: None,
@@ -181,29 +174,44 @@ impl Session {
                 "Antigravity ACP initialize response did not match its envelope",
             )
         })?;
-        let session_value = if let Some(resume) = plan.resume() {
-            self.client
+        let session = if let Some(resume) = plan.resume() {
+            let loaded = self
+                .client
                 .call(
                     "session/load",
                     json!({"cwd": plan.launch.cwd, "mcpServers": [], "sessionId": resume}),
                     deadline,
                 )
-                .await?
+                .await?;
+            // `session/load` returns no session id by design: the exact
+            // retained id is the one from this correlated request.
+            let loaded: LoadSessionResult = serde_json::from_value(loaded).map_err(|_| {
+                Error::new(
+                    "unknown",
+                    "Antigravity ACP load response did not match its envelope",
+                )
+            })?;
+            SessionResult {
+                session_id: resume.to_owned(),
+                modes: loaded.modes,
+                config_options: loaded.config_options,
+            }
         } else {
-            self.client
+            let created = self
+                .client
                 .call(
                     "session/new",
                     json!({"cwd": plan.launch.cwd, "mcpServers": []}),
                     deadline,
                 )
-                .await?
+                .await?;
+            serde_json::from_value(created).map_err(|_| {
+                Error::new(
+                    "unknown",
+                    "Antigravity ACP session response did not match its envelope",
+                )
+            })?
         };
-        let session: SessionResult = serde_json::from_value(session_value).map_err(|_| {
-            Error::new(
-                "unknown",
-                "Antigravity ACP session response did not match its envelope",
-            )
-        })?;
         let effective = plan.check_session(&init, &session)?;
         self.conversation = session.session_id.clone();
         // Verify each required config write by its echoed current value.
@@ -235,15 +243,21 @@ impl Session {
                 ));
             }
         }
-        // Session mode is a launch-profile fact only when it names an ACP
-        // mode the server actually advertised; anything else (e.g. CLI
-        // `auto`) leaves the server's current mode and records it as-is.
-        if let Some(mode) = plan.mode().filter(|mode| *mode != "auto")
-            && session
+        // A requested session mode must be one the server actually
+        // advertised for this session; anything else (including CLI
+        // `auto`, which has no ACP mode id) fails startup clearly
+        // instead of being silently ignored.
+        if let Some(mode) = plan.mode() {
+            let advertised = session
                 .modes
                 .as_ref()
-                .is_some_and(|modes| modes.available_modes.iter().any(|m| m.id == *mode))
-        {
+                .is_some_and(|modes| modes.available_modes.iter().any(|m| m.id == mode));
+            if !advertised {
+                return Err(Error::new(
+                    "unsupported",
+                    "Antigravity requested session mode is not advertised by the ACP session",
+                ));
+            }
             self.client
                 .call(
                     "session/set_mode",
@@ -391,34 +405,38 @@ impl Session {
             turn: turn.clone(),
             outcome: unknown.clone(),
         });
-        // The terminal `session/prompt` response settles the turn from a
-        // owned task; this send only waits for the first association, as
-        // before. A slow first update keeps the retained `unknown` outcome
-        // while the task still completes the turn through the event state.
-        let client = self.client.clone();
-        let state = self.state.clone();
-        let session_id = self.conversation.clone();
-        let prompt = prompt_params(&session_id, &combined);
-        self.prompt_task = Some(tokio::spawn(async move {
-            let result = client
-                .call("session/prompt", prompt, Instant::now() + PROMPT_TIMEOUT)
-                .await;
-            let mut state = state.lock().await;
-            match result {
-                Ok(value) => match serde_json::from_value::<PromptResult>(value) {
-                    Ok(prompt) => state.complete_prompt(&prompt.stop_reason).await,
-                    Err(_) => {
-                        state
-                            .fail_prompt(Error::new(
-                                "unknown",
-                                "Antigravity prompt response did not match its envelope",
-                            ))
-                            .await;
-                    }
-                },
-                Err(error) => state.fail_prompt(error).await,
+<        // The terminal reply is fenced into the ordered frame channel, so
+        // the event task settles this exact turn behind every preceding
+        // update. This send only waits for the first association, as
+        // before; a slow first update keeps the retained `unknown`
+        // outcome while the fenced reply still settles the turn in order.
+        let prompt = prompt_params(&self.conversation, &combined);
+        if let Err(error) = self
+            .client
+            .call_fenced("session/prompt", prompt, Instant::now() + TIMEOUT)
+            .await
+        {
+            if native_no_write(&error.code) {
+                self.state
+                    .lock()
+                    .await
+                    .withdraw_unwritten(&params.command_id)?;
+                let result = Ok(
+                    json!({"state": "rejected", "reason": "Antigravity input was not dispatched"}),
+                );
+                if let Some(retained) = self.retained.as_mut().filter(|r| r.seq == seq) {
+                    retained.outcome = result.clone();
+                }
+                return result;
             }
-        }));
+            let mut state = self.state.lock().await;
+            state.fail_prompt(error).await;
+            let result = unknown;
+            if let Some(retained) = self.retained.as_mut().filter(|r| r.seq == seq) {
+                retained.outcome = result.clone();
+            }
+            return result;
+        }
         let result = match timeout_at(Instant::now() + TIMEOUT, associated).await {
             Ok(Ok(Ok(()))) => Ok(json!({"state": "applied", "turn_id": turn})),
             Ok(Ok(Err(error))) if native_no_write(&error.code) => {
@@ -693,9 +711,6 @@ impl Session {
             .terminate(force, deadline)
             .await
             .map_err(|error| self.client.diagnostic_error(error.with_code("unknown")))?;
-        if let Some(task) = self.prompt_task.take() {
-            let _ = timeout_at(deadline, task).await;
-        }
         if let Some(task) = self.task.as_mut() {
             timeout_at(deadline, task)
                 .await

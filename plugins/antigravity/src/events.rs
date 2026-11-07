@@ -3,7 +3,6 @@ use std::{collections::HashMap, sync::Arc};
 use eliot_core::{ContextItem, Error, Result, SecretPolicy, SourceHealthUpdate};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
-    native_stdio::NativeFrame,
     native_transport::StreamState,
     session::{
         EVENT_DEADLINE, StreamSource, attach_final_text, event_id, next_input_outcomes,
@@ -16,7 +15,7 @@ use tokio::{
     time::Instant,
 };
 
-use crate::native::{AcpUpdate, NativeClient, PromptResult, classify_update};
+use crate::native::{AcpUpdate, AgyClient, AgyFrame, PromptResult, classify_update};
 
 pub(crate) const FAMILIES: &[&str] = &["session", "turn", "message", "tool"];
 pub(crate) type Shared = Arc<Mutex<State>>;
@@ -53,6 +52,10 @@ pub(crate) struct State {
     pub conversation: String,
     pending: Option<Pending>,
     tool_events: HashMap<String, Value>,
+    /// Partial tool-call deltas merged per vendor id before any event is
+    /// derived: `(title, status)` as last known. Updates may omit either
+    /// field, so absence alone is never a protocol gap.
+    tools: HashMap<String, (String, String)>,
     text_accum: String,
     text_truncated: bool,
     writes_blocked: bool,
@@ -93,6 +96,7 @@ impl State {
             conversation,
             pending: None,
             tool_events: HashMap::new(),
+            tools: HashMap::new(),
             text_accum: String::new(),
             text_truncated: false,
             writes_blocked: false,
@@ -147,6 +151,7 @@ impl State {
             reply: Some(reply),
         });
         self.tool_events.clear();
+        self.tools.clear();
         self.text_accum.clear();
         self.text_truncated = false;
         Ok(result)
@@ -222,16 +227,36 @@ impl State {
         result
     }
 
-    async fn observe(&mut self, frame: NativeFrame, client: &NativeClient) -> Result<()> {
+    async fn observe(&mut self, frame: AgyFrame, client: &AgyClient) -> Result<()> {
         if self.failure.is_some() {
             return Ok(());
         }
         match frame {
-            NativeFrame::Notification { method, params } if method == "session/update" => {
-                self.update(&params).await
-            }
-            NativeFrame::Notification { .. } => Ok(()),
-            NativeFrame::Request { id, method, params } => {
+            AgyFrame::Update(params) => self.update(&params).await,
+            // The fenced terminal reply, consumed in wire order behind
+            // every preceding update: it settles the prepared turn only
+            // after those updates have been applied.
+            AgyFrame::PromptResponse(result) => match result {
+                Ok(value) => match serde_json::from_value::<PromptResult>(value) {
+                    Ok(prompt) => {
+                        self.complete_prompt(&prompt.stop_reason).await;
+                        Ok(())
+                    }
+                    Err(_) => {
+                        self.fail_prompt(Error::new(
+                            "unknown",
+                            "Antigravity prompt response did not match its envelope",
+                        ))
+                        .await;
+                        Ok(())
+                    }
+                },
+                Err(error) => {
+                    self.fail_prompt(error).await;
+                    Ok(())
+                }
+            },
+            AgyFrame::ServerRequest { id, method, params } => {
                 // No approve/answer channel is connected on this route, so
                 // every agent request is an explicit unsupported rejection
                 // (never an auto-approval). A failed reply means the stream
@@ -283,51 +308,39 @@ impl State {
             AcpUpdate::ToolCall {
                 tool_call_id,
                 title,
+                status,
             } => {
-                self.tool_event(&tool_call_id, "tool.started", "running", &title, None)
+                self.merge_tool(&tool_call_id, &title, &status);
+                self.tool_event(&tool_call_id, "tool.started", "running")
                     .await
             }
             AcpUpdate::ToolCallUpdate {
                 tool_call_id,
                 title,
                 status,
-            } => match status.as_str() {
-                "pending" => Ok(()),
-                "in_progress" => {
-                    self.tool_event(
-                        &tool_call_id,
-                        "tool.started",
-                        "running",
-                        title.as_deref().unwrap_or(""),
-                        None,
-                    )
-                    .await
+            } => {
+                self.merge_tool(&tool_call_id, title.as_deref().unwrap_or(""), &status);
+                let (_, merged_status) = self.tools.get(&tool_call_id).cloned().unwrap_or_default();
+                match merged_status.as_str() {
+                    "pending" => Ok(()),
+                    "in_progress" => {
+                        self.tool_event(&tool_call_id, "tool.started", "running")
+                            .await
+                    }
+                    "completed" => {
+                        self.tool_event(&tool_call_id, "tool.completed", "completed")
+                            .await
+                    }
+                    "failed" => {
+                        self.tool_event(&tool_call_id, "tool.completed", "failed")
+                            .await
+                    }
+                    _ => Err(Error::new(
+                        "native_protocol",
+                        "Antigravity tool call status is unknown",
+                    )),
                 }
-                "completed" => {
-                    self.tool_event(
-                        &tool_call_id,
-                        "tool.completed",
-                        "completed",
-                        title.as_deref().unwrap_or(""),
-                        None,
-                    )
-                    .await
-                }
-                "failed" => {
-                    self.tool_event(
-                        &tool_call_id,
-                        "tool.completed",
-                        "failed",
-                        title.as_deref().unwrap_or(""),
-                        None,
-                    )
-                    .await
-                }
-                _ => Err(Error::new(
-                    "native_protocol",
-                    "Antigravity tool call status is unknown",
-                )),
-            },
+            }
             AcpUpdate::Unknown(kind) => Err(Error::new(
                 "native_protocol",
                 format!("Antigravity session update is unconnected: {kind}"),
@@ -335,14 +348,24 @@ impl State {
         }
     }
 
-    async fn tool_event(
-        &mut self,
-        tool_call_id: &str,
-        kind: &str,
-        status: &str,
-        title: &str,
-        _error: Option<()>,
-    ) -> Result<()> {
+    /// Merge one partial tool-call delta into the known per-id state.
+    /// Empty title/status mean "unchanged", never "cleared": an update
+    /// that omits a field inherits the last known value, so only a delta
+    /// that still has no known status is a real protocol gap.
+    fn merge_tool(&mut self, tool_call_id: &str, title: &str, status: &str) {
+        if tool_call_id.trim().is_empty() {
+            return;
+        }
+        let known = self.tools.entry(tool_call_id.to_owned()).or_default();
+        if !title.is_empty() {
+            known.0 = title.to_owned();
+        }
+        if !status.is_empty() {
+            known.1 = status.to_owned();
+        }
+    }
+
+    async fn tool_event(&mut self, tool_call_id: &str, kind: &str, status: &str) -> Result<()> {
         if tool_call_id.trim().is_empty() {
             return Err(Error::new(
                 "native_protocol",
@@ -355,6 +378,11 @@ impl State {
             .as_ref()
             .ok_or_else(|| Error::new("unknown", "Antigravity turn is absent"))?;
         let turn = pending.turn.clone();
+        let title = self
+            .tools
+            .get(tool_call_id)
+            .map(|(title, _)| title.clone())
+            .unwrap_or_default();
         let item = format!("tool-{tool_call_id}");
         let mut data = json!({"command_id": pending.command, "turn_id": turn,
             "item_id": item, "tool": title, "status": status});
@@ -583,10 +611,10 @@ impl State {
 }
 
 pub(crate) fn spawn(
-    mut frames: mpsc::Receiver<NativeFrame>,
+    mut frames: mpsc::Receiver<AgyFrame>,
     mut stream: watch::Receiver<StreamState>,
     state: Shared,
-    client: NativeClient,
+    client: AgyClient,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Observe watch faults while active, including with no incoming

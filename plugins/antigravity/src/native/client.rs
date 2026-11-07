@@ -1,53 +1,412 @@
-//! Antigravity native transport: AGY ACP over the shared JSON-RPC client.
+//! Antigravity native transport: AGY ACP over the shared child transport.
 //!
-//! The stdio NDJSON JSON-RPC transport lives in
-//! [`eliot_plugin::native_stdio`]; this module only binds the Antigravity
-//! host labels, the ACP response-error mapping, and the notification filter.
-//! Only `session/update` notifications are consumed by the event task;
-//! server requests and responses always pass through untouched.
+//! The process, pump and correlation machinery live in
+//! [`eliot_plugin::native_transport`]; this module is the ACP framing on
+//! top, following the Claude plugin's custom-client precedent instead of
+//! the shared JSON-RPC client. The one protocol-specific piece is the
+//! **fenced prompt call**: a `session/prompt` response is the turn's
+//! terminal fact, so it must be processed behind every `session/update`
+//! that preceded it on the wire. A normal correlated reply would route
+//! straight to the awaiting task and could settle the turn before queued
+//! updates are consumed (dropping pending text and misattributing late
+//! chunks). Fenced replies therefore re-enter the ordered frame channel
+//! as [`AgyFrame::PromptResponse`] and are consumed by the same event
+//! task, in wire order. Ordinary calls keep the nonblocking
+//! lossy-overflow reply contract: routing never waits behind the emit
+//! queue, and an overflow latches the existing stream-fault gap.
 
-use eliot_core::{Error, Result};
-use eliot_plugin::native_stdio::{
-    NativeJsonRpcErrorBody, NativeStdioConfig, StdioClient, StdioProcess,
+use std::{
+    collections::HashSet,
+    process::ExitStatus,
+    sync::{Arc, Mutex as StdMutex},
 };
+
+use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
+use eliot_plugin::{
+    StderrView,
+    native_transport::{
+        NativeChild, NativeLabels, NativeLaunch, NativeWriter, PendingCalls, PumpAction, PumpMode,
+        encode_frame, spawn_pumped,
+    },
+};
+use serde::Serialize;
 use serde_json::Value;
+use tokio::{
+    sync::{mpsc, watch},
+    time::{Instant, timeout_at},
+};
 
-#[derive(Clone, Debug)]
-pub(crate) struct AgyStdioConfig;
+const LABELS: NativeLabels = NativeLabels {
+    short: "Antigravity",
+    server: "Antigravity ACP server",
+};
+pub(crate) use eliot_plugin::native_transport::StreamState;
+const ID_PREFIX: &str = "agy";
 
-impl NativeStdioConfig for AgyStdioConfig {
-    const SERVER: &'static str = "Antigravity ACP server";
-    const SHORT: &'static str = "Antigravity";
-    const ID_PREFIX: &'static str = "agy";
+/// One ACP stream record for the event task, in wire order.
+#[derive(Debug)]
+pub(crate) enum AgyFrame {
+    /// A `session/update` notification body.
+    Update(Value),
+    /// The terminal reply of a fenced `session/prompt` call.
+    PromptResponse(Result<Value>),
+    /// An agent-to-client request (permission, terminal, fs, elicitation).
+    ServerRequest {
+        id: Value,
+        method: String,
+        params: Value,
+    },
+}
 
-    fn map_response_error(error: NativeJsonRpcErrorBody) -> Result<Value> {
-        // Standard JSON-RPC validation errors prove the request never
-        // reached admission. Anything else — internal errors, cancellation,
-        // extension codes — leaves an admitted write unruled-out, so it is
-        // unknown, never rejected. The native message is never surfaced.
-        if matches!(error.code, -32602..=-32600) {
-            Err(Error::new("native_rejected", error.message))
-        } else {
-            Err(Error::new(
-                "unknown",
-                format!(
-                    "Antigravity ACP call failed with native code {}",
-                    error.code
-                ),
-            ))
-        }
+#[derive(Clone)]
+pub(crate) struct AgyClient {
+    writer: NativeWriter,
+    pending: PendingCalls,
+    fenced: Arc<StdMutex<HashSet<String>>>,
+    stderr: StderrView,
+    policy: SecretPolicy,
+}
+
+pub(crate) struct AgyProcess {
+    pub transport: NativeChild,
+    client: AgyClient,
+    frames: Option<mpsc::Receiver<AgyFrame>>,
+    stream: watch::Receiver<StreamState>,
+}
+
+#[derive(Serialize)]
+struct OutboundRequest<'a> {
+    jsonrpc: &'static str,
+    id: String,
+    method: &'a str,
+    params: Value,
+}
+
+#[derive(Serialize)]
+struct OutboundNotification<'a> {
+    jsonrpc: &'static str,
+    method: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<Value>,
+}
+
+#[derive(Serialize)]
+struct OutboundResponse {
+    jsonrpc: &'static str,
+    id: Value,
+    error: NativeRpcError,
+}
+
+#[derive(Serialize)]
+struct NativeRpcError {
+    code: i64,
+    message: &'static str,
+}
+
+impl AgyProcess {
+    pub async fn spawn(launch: NativeLaunch, policy: SecretPolicy) -> Result<Self> {
+        let fenced = Arc::new(StdMutex::new(HashSet::new()));
+        let fenced_classify = Arc::clone(&fenced);
+        // JSON-RPC: keep nonblocking routing; a pending reply must never
+        // wait behind a saturated emit queue.
+        let (transport, pending, frame_rx, stream_rx) = spawn_pumped(
+            launch,
+            policy.clone(),
+            LABELS,
+            ID_PREFIX,
+            PumpMode::LossyOverflow,
+            move |value| classify_agy_frame(value, &fenced_classify),
+        )
+        .await?;
+        let client = AgyClient {
+            writer: transport.writer(),
+            pending,
+            fenced,
+            stderr: transport.stderr_view(),
+            policy,
+        };
+        Ok(Self {
+            transport,
+            client,
+            frames: Some(frame_rx),
+            stream: stream_rx,
+        })
     }
 
-    /// The exact notification methods the Antigravity event task consumes
-    /// today (`session/update` in `events.rs`). Every other well-formed
-    /// notification is already ignored there, so dropping it at the pump
-    /// preserves semantics while keeping ignored traffic out of the bounded
-    /// queue. Server requests and responses always pass through untouched.
-    fn consumes_notification(method: &str) -> bool {
-        method == "session/update"
+    /// The actual ACP child PID; birth and custody are verified by the host.
+    pub fn pid(&self) -> Option<u32> {
+        self.transport.pid()
+    }
+
+    pub fn client(&self) -> AgyClient {
+        self.client.clone()
+    }
+
+    pub fn take_frames(&mut self) -> Result<mpsc::Receiver<AgyFrame>> {
+        self.frames.take().ok_or_else(|| {
+            Error::new(
+                "bad_state",
+                "Antigravity native event reader already has an owner",
+            )
+        })
+    }
+
+    pub fn stream_state(&self) -> watch::Receiver<StreamState> {
+        self.stream.clone()
+    }
+
+    pub async fn terminate(&mut self, force: bool, deadline: Instant) -> Result<ExitStatus> {
+        self.transport.terminate(force, deadline).await
     }
 }
 
-pub(crate) type NativeClient = StdioClient<AgyStdioConfig>;
-pub(crate) type NativeProcess = StdioProcess<AgyStdioConfig>;
-pub(crate) use eliot_plugin::native_stdio::{NativeFrame, StreamState};
+impl AgyClient {
+    /// One correlated ACP request/response round trip.
+    pub async fn call(&self, method: &str, params: Value, deadline: Instant) -> Result<Value> {
+        self.call_inner(method, params, deadline)
+            .await
+            .map_err(|error| self.diagnostic_error(error))
+    }
+
+    /// One ACP notification (no reply is expected or awaited).
+    pub async fn notify(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        deadline: Instant,
+    ) -> Result<()> {
+        if method.trim().is_empty() || params.as_ref().is_some_and(|value| !value.is_object()) {
+            return Err(Error::new(
+                "invalid",
+                "Antigravity notification has invalid method or params",
+            ));
+        }
+        let encoded = encode_frame(
+            LABELS.server,
+            &OutboundNotification {
+                jsonrpc: "2.0",
+                method,
+                params,
+            },
+        )?;
+        self.write_encoded(encoded, deadline).await
+    }
+
+    /// Dispatch one request whose reply must be consumed in wire order
+    /// behind preceding stream records. Returns the request id; the reply
+    /// arrives as [`AgyFrame::PromptResponse`] on the event channel.
+    pub async fn call_fenced(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<String> {
+        if method.trim().is_empty() || !params.is_object() {
+            return Err(Error::new(
+                "invalid",
+                "Antigravity fenced call requires a method and object params",
+            ));
+        }
+        let id = self.pending.mint_id()?;
+        let encoded = encode_frame(
+            LABELS.server,
+            &OutboundRequest {
+                jsonrpc: "2.0",
+                id: id.clone(),
+                method,
+                params,
+            },
+        )?;
+        self.fenced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.clone());
+        let (guard, _receiver) = self.pending.insert(id.clone());
+        match self.write_encoded(encoded, deadline).await {
+            Ok(()) => {
+                std::mem::forget(guard);
+                Ok(id)
+            }
+            Err(error) => {
+                self.fenced
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
+                if error.code == "native_not_dispatched" {
+                    return Err(error);
+                }
+                Err(Error::new(
+                    "unknown",
+                    format!("Antigravity {method} dispatch outcome is unknown"),
+                ))
+            }
+        }
+    }
+
+    /// Reject one agent-to-client request as unsupported. There is no
+    /// approve/answer channel on this route, so every such request is an
+    /// explicit rejection, never an auto-approval.
+    pub async fn reject_unsupported_request(
+        &self,
+        id: Value,
+        method: &str,
+        params: &Value,
+        deadline: Instant,
+    ) -> Result<()> {
+        let (code, message) = if method.trim().is_empty() || !params.is_object() {
+            (-32600, "unsupported native request envelope")
+        } else {
+            (-32601, "unsupported")
+        };
+        let encoded = encode_frame(
+            LABELS.server,
+            &OutboundResponse {
+                jsonrpc: "2.0",
+                id,
+                error: NativeRpcError { code, message },
+            },
+        )?;
+        self.write_encoded(encoded, deadline).await
+    }
+
+    pub fn stderr_snapshot(&self) -> StderrSnapshot {
+        self.stderr.snapshot()
+    }
+
+    pub fn diagnostic_error(&self, mut error: Error) -> Error {
+        error.message = self.policy.redact_text(&error.message);
+        error.with_stderr(StderrSource::Harness, self.stderr_snapshot())
+    }
+
+    async fn call_inner(&self, method: &str, params: Value, deadline: Instant) -> Result<Value> {
+        if method.trim().is_empty() || !params.is_object() {
+            return Err(Error::new(
+                "invalid",
+                "Antigravity call requires a method and object params",
+            ));
+        }
+        let id = self.pending.mint_id()?;
+        let encoded = encode_frame(
+            LABELS.server,
+            &OutboundRequest {
+                jsonrpc: "2.0",
+                id: id.clone(),
+                method,
+                params,
+            },
+        )?;
+        let (_guard, response_rx) = self.pending.insert(id);
+        if let Err(error) = self.write_encoded(encoded, deadline).await {
+            if error.code == "native_not_dispatched" {
+                return Err(error);
+            }
+            return Err(Error::new(
+                "unknown",
+                format!("Antigravity {method} dispatch outcome is unknown"),
+            ));
+        }
+        timeout_at(deadline, response_rx)
+            .await
+            .map_err(|_| {
+                Error::new(
+                    "unknown",
+                    format!("Antigravity {method} response is unknown"),
+                )
+            })?
+            .map_err(|_| {
+                Error::new(
+                    "unknown",
+                    format!("Antigravity {method} response channel closed"),
+                )
+            })?
+    }
+
+    async fn write_encoded(&self, encoded: String, deadline: Instant) -> Result<()> {
+        self.writer
+            .send(encoded, deadline)
+            .await
+            .map_err(|error| self.diagnostic_error(error))
+    }
+}
+
+/// Map a native JSON-RPC error body to a call outcome: standard validation
+/// errors prove non-admission; anything else leaves an admitted write
+/// unruled-out and stays unknown. The message is never surfaced.
+fn map_response_error(code: i64, message: String) -> Result<Value> {
+    if matches!(code, -32602..=-32600) {
+        Err(Error::new("native_rejected", message))
+    } else {
+        Err(Error::new(
+            "unknown",
+            format!("Antigravity ACP call failed with native code {code}"),
+        ))
+    }
+}
+
+fn classify_agy_frame(
+    value: Value,
+    fenced: &Arc<StdMutex<HashSet<String>>>,
+) -> PumpAction<AgyFrame> {
+    if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return PumpAction::Malformed(
+            "Antigravity stream contained an invalid JSON-RPC version".to_owned(),
+        );
+    }
+    if let Some(id) = value.get("id").cloned() {
+        if value.get("method").is_some() {
+            let method = value
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            return PumpAction::Emit(AgyFrame::ServerRequest {
+                id,
+                method,
+                params: value.get("params").cloned().unwrap_or(Value::Null),
+            });
+        }
+        let result = match (value.get("result").cloned(), value.get("error").cloned()) {
+            (Some(result), None) => Ok(result),
+            (None, Some(error)) => match (
+                error.get("code").and_then(Value::as_i64),
+                error.get("message").and_then(Value::as_str),
+            ) {
+                (Some(code), Some(message)) => map_response_error(code, message.to_owned()),
+                _ => Err(Error::new(
+                    "unknown",
+                    "Antigravity ACP error response did not match its envelope",
+                )),
+            },
+            _ => {
+                return PumpAction::Malformed(
+                    "Antigravity ACP response did not contain exactly one result or error"
+                        .to_owned(),
+                );
+            }
+        };
+        let key = id
+            .as_str()
+            .map(ToOwned::to_owned)
+            .or_else(|| serde_json::to_string(&id).ok());
+        let Some(key) = key else {
+            return PumpAction::Skip;
+        };
+        let is_fenced = fenced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        if is_fenced {
+            return PumpAction::Emit(AgyFrame::PromptResponse(result));
+        }
+        return PumpAction::Route { key, result };
+    }
+    match value.get("method").and_then(Value::as_str) {
+        Some("session/update") => PumpAction::Emit(AgyFrame::Update(
+            value.get("params").cloned().unwrap_or(Value::Null),
+        )),
+        Some(_) => PumpAction::Skip,
+        None => {
+            PumpAction::Malformed("Antigravity frame was not a notification or response".to_owned())
+        }
+    }
+}

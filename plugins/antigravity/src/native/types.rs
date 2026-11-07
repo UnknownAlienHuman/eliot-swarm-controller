@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 pub(crate) struct InitializeResult {
     #[serde(rename = "protocolVersion")]
     pub protocol_version: u64,
-    #[serde(default)]
+    #[serde(default, rename = "agentCapabilities")]
     pub agent_capabilities: Value,
 }
 
@@ -43,8 +43,19 @@ pub(crate) struct SessionResult {
 pub(crate) struct ModeState {
     #[serde(rename = "currentModeId")]
     pub current_mode_id: String,
-    #[serde(default)]
+    #[serde(default, rename = "availableModes")]
     pub available_modes: Vec<SessionMode>,
+}
+
+/// `session/load` result. The pinned schema deliberately returns no
+/// session id here: the caller retains the exact id from its correlated
+/// request and validates it against the resume subject.
+#[derive(Debug, Deserialize)]
+pub(crate) struct LoadSessionResult {
+    #[serde(default)]
+    pub modes: Option<ModeState>,
+    #[serde(default, rename = "configOptions")]
+    pub config_options: Option<Vec<ConfigOption>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,7 +164,11 @@ pub(crate) enum AcpUpdate {
     /// Echo of the user's own input: bookkeeping.
     UserChunk,
     /// A new tool call started.
-    ToolCall { tool_call_id: String, title: String },
+    ToolCall {
+        tool_call_id: String,
+        title: String,
+        status: String,
+    },
     /// A tool call state change.
     ToolCallUpdate {
         tool_call_id: String,
@@ -200,6 +215,11 @@ pub(crate) fn classify_update(params: &Value) -> Option<(String, AcpUpdate)> {
                 tool_call_id: tool_call_id(),
                 title: update
                     .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                status: update
+                    .get("status")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),

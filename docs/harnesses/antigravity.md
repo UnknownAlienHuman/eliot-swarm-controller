@@ -26,10 +26,13 @@ controls are not ACP facts and are not claimed here.
 
 The adapter uses `start_requires_input = false`: spawn, `initialize`
 (protocol 1), then `session/new` — or `session/load` with the exact
-retained session id on resume, which sends no input by itself. Both paths
-validate the returned session id, modes and `model`/`thought_level`
-selectors, then verify every config write by its echoed current value
-before committing `session.ready`.
+retained session id on resume, which sends no input by itself. The
+pinned `session/load` response deliberately carries no session id, so
+the adapter retains the exact id from its correlated request and
+validates it against the resume subject. Both paths validate the
+returned modes and `model`/`thought_level` selectors, then verify every
+config write by its echoed current value before committing
+`session.ready`.
 
 ## Model and permission mapping
 
@@ -39,28 +42,35 @@ model (`gemini-3.8-flash-high`) translates to base `gemini-3.8-flash` plus
 are verified against the server's advertised options and echoed values —
 an unadvertised id fails startup instead of being guessed. Session mode
 is applied only when the profile mode names an actually advertised ACP
-mode (`plan`, `accept-edits`); CLI `auto` leaves the server's current
-mode and records it as-is. The launch-time permission posture remains
+mode; any other requested mode (including CLI `auto`, which has no ACP
+mode id) fails startup with a clear `unsupported` instead of being
+silently ignored. The launch-time permission posture remains
 `--dangerously-skip-permissions`; cwd is a launch fact (the server is
 spawned in the workspace), since the session response echoes no cwd.
 
 ## Native mapping
 
 Launch establishes the session before input; send dispatches one
-`session/prompt` (`{sessionId, prompt:[{type:"text"}]}`) from an owned
-task and returns `applied` on the first associated update — the terminal
-`stopReason` settles the turn through the event state, never from the
-send ack alone. `end_turn`/`max_tokens`/`max_turn_requests` complete the
+`session/prompt` (`{sessionId, prompt:[{type:"text"}]}`) as a **fenced**
+call: its terminal reply re-enters the ordered frame channel behind every
+preceding `session/update`, so the exact prepared turn settles only
+after those updates have been consumed — never from a direct pending
+route, a sleep, or silence. Send returns `applied` on the first
+associated update; the terminal `stopReason` settles the turn through
+the event state, never from the send ack alone. `end_turn`/`max_tokens`/`max_turn_requests` complete the
 turn, `cancelled` settles an interrupt, `refusal` fails it, and any other
 stop reason is a native protocol gap. Assistant text is accumulated from
 `agent_message_chunk` updates (bounded at 256 KiB, then
 `final_text_unavailable:"event_budget"`); thought and user chunks are
 bookkeeping. Tool calls map from `tool_call`/`tool_call_update` with the
-vendor `toolCallId` as the item id.
+vendor `toolCallId` as the item id. Tool updates are partial deltas:
+title and status merge into the known per-id state before any event is
+derived, so an omitted field inherits the last known value and only a
+delta with no known status at all is a protocol gap.
 
 **Interrupt** is the ACP `session/cancel` notification scoped to the exact
 active Eliot turn (turn id required, stale turns reject). The command
-proves dispatch, then waits (bounded) for the prompt task's actual
+proves dispatch, then waits (bounded) for the fenced reply's actual
 settlement of that exact turn: only `stopReason = cancelled` proves the
 interrupt and returns `applied`; natural completion, failure, or a
 missing settlement stay `unknown` (retained, never resent). Generation,
