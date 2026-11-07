@@ -346,8 +346,8 @@ fn spawn_owner_notify_task(
             let mut authorized = true;
             for event in &response.events {
                 if !lease
-                    .current_expiry()
-                    .is_some_and(|exp| exp > origin_auth::now_seconds())
+                    .current_authorization()
+                    .is_some_and(|authorization| !authorization.expired)
                 {
                     authorized = false;
                     break;
@@ -415,8 +415,11 @@ async fn session_read<R: serde::de::DeserializeOwned>(
         if peer.is_transport_closed() {
             return None;
         }
-        let expires_at = (*renewals.borrow_and_update())?;
-        if expires_at <= origin_auth::now_seconds() {
+        // Latch expiration before reading the current watch generation. A
+        // verified concurrent renewal remains observable by changed().
+        lease.current_authorization()?;
+        let authorization = (*renewals.borrow_and_update())?;
+        if authorization.expired {
             tokio::select! {
                 () = shutdown.cancelled() => return None,
                 changed = renewals.changed() => { changed.ok()?; },
@@ -425,18 +428,16 @@ async fn session_read<R: serde::de::DeserializeOwned>(
             continue;
         }
         let mut current = remote.clone();
-        current.expires_at = expires_at;
-        let remaining =
-            std::time::Duration::from_secs(expires_at.saturating_sub(origin_auth::now_seconds()));
+        current.expires_at = authorization.expires_at;
         tokio::select! {
             () = shutdown.cancelled() => return None,
             changed = renewals.changed() => { changed.ok()?; },
-            () = tokio::time::sleep(remaining) => {},
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(authorization.deadline)) => { lease.current_authorization(); },
             result = remote_read(data_dir, method, params, Some(&current)) => {
                 match result {
                     Ok(response) => return Some(response),
-                    Err(_) if lease.current_expiry().is_some_and(|exp| exp > expires_at)
-                        || expires_at <= origin_auth::now_seconds() => {},
+                    Err(_) if lease.current_authorization().is_some_and(|latest|
+                        latest.expires_at > authorization.expires_at || latest.expired) => {},
                     Err(_) => return None,
                 }
             },

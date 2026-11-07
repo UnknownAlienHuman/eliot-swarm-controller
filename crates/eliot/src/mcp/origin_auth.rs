@@ -67,25 +67,39 @@ pub(super) struct VerifiedRequest {
     slot: Option<Arc<OwnedSemaphorePermit>>,
 }
 
-/// Shared only with the SDK session's existing notification task. Some(exp)
-/// advances monotonically on verified same-identity requests; None means closed.
+/// Shared only with the SDK session's existing notification task. Renewal is
+/// possible only through a verified later assertion; None means closed.
 pub(super) struct SessionLease {
-    expiry: watch::Sender<Option<u64>>,
+    expiry: watch::Sender<Option<LeaseAuthorization>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct LeaseAuthorization {
+    pub expires_at: u64,
+    pub deadline: Instant,
+    pub expired: bool,
 }
 
 impl SessionLease {
-    fn new(expires_at: u64) -> Self {
+    fn new(expires_at: u64, deadline: Instant) -> Self {
         Self {
-            expiry: watch::channel(Some(expires_at)).0,
+            expiry: watch::channel(Some(LeaseAuthorization {
+                expires_at,
+                deadline,
+                expired: false,
+            }))
+            .0,
         }
     }
 
-    fn extend(&self, expires_at: u64) {
+    fn extend(&self, expires_at: u64, deadline: Instant) {
         self.expiry.send_if_modified(|current| {
             if let Some(current) = current
-                && expires_at > *current
+                && expires_at > current.expires_at
             {
-                *current = expires_at;
+                current.expires_at = expires_at;
+                current.deadline = current.deadline.max(deadline);
+                current.expired = false;
                 true
             } else {
                 false
@@ -93,11 +107,24 @@ impl SessionLease {
         });
     }
 
-    pub fn current_expiry(&self) -> Option<u64> {
+    pub fn current_authorization(&self) -> Option<LeaseAuthorization> {
+        // Expiry is sticky: a later wall-clock rollback cannot revive this
+        // authorization. Only extend(), after verified renewal, can rearm it.
+        self.expiry.send_if_modified(|current| {
+            if let Some(current) = current
+                && !current.expired
+                && (Instant::now() >= current.deadline || now_seconds() >= current.expires_at)
+            {
+                current.expired = true;
+                true
+            } else {
+                false
+            }
+        });
         *self.expiry.borrow()
     }
 
-    pub fn subscribe(&self) -> watch::Receiver<Option<u64>> {
+    pub fn subscribe(&self) -> watch::Receiver<Option<LeaseAuthorization>> {
         self.expiry.subscribe()
     }
 
@@ -249,6 +276,16 @@ impl OriginAuth {
         }
         let assertion = values[0].to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
         let claims = self.verify(assertion).await?;
+        let observed_at = Instant::now();
+        let epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        let remaining = Duration::from_secs(claims.exp)
+            .checked_sub(epoch)
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        let deadline = observed_at
+            .checked_add(remaining)
+            .ok_or(StatusCode::UNAUTHORIZED)?;
         let identity = RemoteIdentity {
             issuer: self.issuer.clone(),
             audience: self.audience.clone(),
@@ -262,21 +299,24 @@ impl OriginAuth {
         if headers.get_all("mcp-session-id").iter().count() > 1 {
             return Err(StatusCode::UNAUTHORIZED);
         }
-        let mut sessions = self.sessions.lock().await;
         let (connection_id, lease, slot) = if let Some(id) = &session_id {
+            let mut sessions = self.sessions.lock().await;
             let session = sessions.get_mut(id).ok_or(StatusCode::NOT_FOUND)?;
             if session.identity != identity {
                 return Err(StatusCode::FORBIDDEN);
             }
-            if session.lease.current_expiry().is_none() {
+            if session.lease.current_authorization().is_none() {
                 return Err(StatusCode::NOT_FOUND);
             }
-            session.lease.extend(claims.exp);
+            session.lease.extend(claims.exp, deadline);
             (session.connection_id.clone(), session.lease.clone(), None)
         } else {
             if method != Method::POST {
                 return Err(StatusCode::UNAUTHORIZED);
             }
+            // Reclaim a bounded batch before taking a new-session permit.
+            // Otherwise a full set of abandoned expired sessions cannot GC.
+            self.reap_expired_sessions().await;
             let slot = self
                 .slots
                 .clone()
@@ -284,11 +324,10 @@ impl OriginAuth {
                 .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
             (
                 ulid::Ulid::new().to_string(),
-                Arc::new(SessionLease::new(claims.exp)),
+                Arc::new(SessionLease::new(claims.exp, deadline)),
                 Some(Arc::new(slot)),
             )
         };
-        drop(sessions);
         // SDK request Parts must never retain bearer material.
         for name in [
             "cf-access-jwt-assertion",
@@ -312,7 +351,9 @@ impl OriginAuth {
         context.validate().map_err(|_| StatusCode::UNAUTHORIZED)?;
         // Refresh the addressed session before reaping, so a valid renewed
         // assertion can continue its existing SDK session after the old expiry.
-        self.reap_expired_sessions().await;
+        if context.session_id.is_some() {
+            self.reap_expired_sessions().await;
+        }
         Ok(VerifiedRequest {
             context,
             lease,
@@ -331,8 +372,8 @@ impl OriginAuth {
             .filter(|(_, session)| {
                 session
                     .lease
-                    .current_expiry()
-                    .is_none_or(|exp| exp <= now_seconds())
+                    .current_authorization()
+                    .is_none_or(|authorization| authorization.expired)
             })
             .take(64)
             .map(|(id, _)| id.clone())
@@ -347,8 +388,8 @@ impl OriginAuth {
                 };
                 if session
                     .lease
-                    .current_expiry()
-                    .is_some_and(|exp| exp > now_seconds())
+                    .current_authorization()
+                    .is_some_and(|authorization| !authorization.expired)
                 {
                     continue;
                 }

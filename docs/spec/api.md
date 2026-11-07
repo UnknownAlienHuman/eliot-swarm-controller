@@ -102,7 +102,11 @@ verified identity binds each stateful SDK session; a different subject cannot us
 its POST/GET/DELETE. Verified same-identity refresh monotonically extends the
 session lease; an older concurrent assertion cannot shorten it. The existing
 notification task retains its cursor, pauses polls while its lease is expired,
-and uses the renewed expiry for subsequent authenticated reads. Each GET stream
+and uses the renewed expiry for subsequent authenticated reads. Its authorization
+has a monotonic deadline and sticky expiry; wall-clock rollback cannot resume
+polling without verified renewal. Expired sessions are reaped in bounded batches
+before a new session acquires capacity; existing-session renewal precedes reaping.
+Each GET stream
 still ends at that GET's own authorizing assertion expiry. Stateless
 requests carry fresh server-generated connection/call correlation without inventing
 a session. `clientInfo` is untrusted and unused. No local Agent/PID or generation
@@ -114,7 +118,8 @@ revalidates its configured issuer/AUD, expiry and RPC call-id binding, applies t
 existing Owner authority, and echoes the context with the RPC result; HTTP tool
 results expose it as `structuredContent.remote_call`. This is provenance for the
 existing owner-only app, not additional roles or per-user permissions. Standard
-`command.submit` admission persists the context in the existing command/event cause
+`command.submit` admission persists the context in the existing command cause and
+every associated new admission event (including `agent.created`)
 before commit and publication; retries retain their original admitted cause. Reads
 do not create an audit event, and other RPC results carry call context without
 claiming command-cause attribution. JWTs, OAuth tokens, cookies and owner credentials
