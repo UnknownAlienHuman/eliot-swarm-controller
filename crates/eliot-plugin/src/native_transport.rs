@@ -315,6 +315,21 @@ impl NativeChild {
                 .is_some_and(|reader| reader.is_finished())
     }
 
+    /// Positively observe this child exit, then wait for its owned stdout
+    /// reader to finish. Each wait is bounded by the existing exit-drain
+    /// window; this never terminates the child or infers exit from silence.
+    pub async fn confirm_exit_and_output_drained(&mut self) -> bool {
+        match timeout_at(Instant::now() + NATIVE_EXIT_DRAIN, self.wait_process_exit()).await {
+            Ok(Ok(_status)) => {}
+            Ok(Err(_)) | Err(_) => return false,
+        }
+
+        let _ = self
+            .await_output_drained(Instant::now() + NATIVE_EXIT_DRAIN)
+            .await;
+        self.process_exit_observed() && self.writer.reader_closed() && self.output_reader_finished()
+    }
+
     pub fn stderr_snapshot(&self) -> StderrSnapshot {
         self.stderr_view.snapshot()
     }
