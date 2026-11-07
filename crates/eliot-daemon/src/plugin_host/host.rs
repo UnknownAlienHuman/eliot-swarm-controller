@@ -9,8 +9,8 @@ use crate::common::{now_ms, secure_eq, valid_environment_name};
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
 use eliot_core::{
-    Agent, AgentStartParams, Command, ContextItem, Error, Result, SecretPolicy, SourceBatch,
-    SourceGap, SourceGapAck, StderrSource,
+    Agent, AgentStartParams, Command, ContextItem, Error, InjectArgs, InjectPoint, Result,
+    SecretPolicy, SourceBatch, SourceGap, SourceGapAck, StderrSource,
 };
 use eliot_plugin::{
     PluginManifest, StderrCapture, StderrView,
@@ -2226,6 +2226,26 @@ fn plugin_command_args(command: &Command) -> Result<Value> {
                 Error::new("stale_generation", "turn control has no captured turn id")
             })?;
         }
+        "inject" => {
+            // Direct active_turn inject: keep the original typed payload and the
+            // captured turn. Any builder failure here is known before plugin
+            // I/O, so it classifies native_not_dispatched (Rejected), never
+            // a generic unsupported Unknown.
+            let typed: InjectArgs = serde_json::from_value(command.args.clone())
+                .map_err(|_| Error::new("native_not_dispatched", "inject args are malformed"))?;
+            if typed.point != InjectPoint::ActiveTurn {
+                return Err(Error::new(
+                    "native_not_dispatched",
+                    "inject point is not a direct active_turn command",
+                ));
+            }
+            command.turn_id.as_ref().ok_or_else(|| {
+                Error::new(
+                    "native_not_dispatched",
+                    "active_turn inject has no captured turn id",
+                )
+            })?;
+        }
         "approve" | "deny" | "answer" => {
             command
                 .turn_id
@@ -2364,6 +2384,7 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         "approve",
         "deny",
         "answer",
+        "inject",
         "attach",
         "detach",
     ];

@@ -217,7 +217,7 @@ write. A lost Eliot event acknowledgement follows the common last-batch rule.
 | launch | `thread/start`; readiness proves a session, not prompt execution |
 | send | `turn/start`; bind command to exact turn, then track completion separately |
 | steer | `turn/steer` with `expectedTurnId`; stale turn rejects |
-| inject | unsupported in the current slice |
+| inject | next_input via the next SEND prepend; active_turn via `turn/steer` on the exact captured turn, mechanism `codex.turn/steer`; other points unsupported, never a weaker SEND |
 | interrupt | `turn/interrupt` for the captured turn; no blind retry |
 | stop | end this Agent's owned session/process |
 | resume | new Eliot generation/app-server plus `thread/resume` of retained thread; no old input replay |

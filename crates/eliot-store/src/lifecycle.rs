@@ -161,6 +161,13 @@ fn check_settle_verb_guards(
             "use typed workspace removal settlement",
         ));
     }
+    if record.target.is_some() && record.command.verb == "inject" && state == CommandState::Applied
+    {
+        let args = context::decode_inject_args(&record.command.args)?;
+        if args.point == InjectPoint::ActiveTurn {
+            context::validate_active_turn_applied_outcome(record, outcome.as_ref())?;
+        }
+    }
     if let Some(agent_num) = record.target
         && let Some(workspace) = workspace::load_workspace(tx, agent_num)?
         && ((workspace.start_command_id == id

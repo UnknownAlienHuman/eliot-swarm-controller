@@ -284,21 +284,31 @@ verbs are not advertised. No fake success or compatibility executor.
 The canonical `InjectArgs`, `InjectPoint`, `ContextItem` and `ContextOutcome` DTOs are
 defined in [Core context types](../../crates/eliot-core/src/context.rs); this spec owns
 their command and effect semantics. `inject` uses the existing `SubmitCommand` with
-`args` decoded as `InjectArgs`. The point is `next_input` or `turn_safe_point`, and
-`expires_at_ms` is optional.
+`args` decoded as `InjectArgs`. The point is `next_input`, `turn_safe_point`, or
+`active_turn`, and `expires_at_ms` is optional.
 
 Store binds each admitted context command to the target's current generation. A
-`turn_safe_point` command also captures the exact active turn at admission; it cannot
-float to another turn or fall back to a send. `next_input` has no turn binding and is
-eligible only for the next send in that same generation. Pending contexts are claimed
-FIFO from existing command rows; they do not add a table or journal. Admission or queue
-acceptance is not application.
+`turn_safe_point` or `active_turn` command also captures the exact active turn at
+admission; it cannot float to another turn or fall back to a send. `next_input` has
+no turn binding and is eligible only for the next send in that same generation.
+Queued pending contexts (`next_input`, `turn_safe_point`) are claimed FIFO from
+existing command rows; they do not add a table or journal. An `active_turn`
+command is dispatched directly through the ordinary router: one command is one
+immediate native effect with no queue consumer. Admission or queue acceptance is
+not application.
 
 For `next_input`, the router claims eligible, unexpired items as part of dispatching the
 next ordinary SEND and the adapter prepends them inside that same native send. Context
 commands become applied only when that original send is associated with its exact native
 turn. For `turn_safe_point`, an authenticated native hook claims eligible items for the
-captured turn; application is reported only at the requested native point. The retained
+captured turn; application is reported only at the requested native point. For
+`active_turn`, the command itself dispatches through the ordinary router to the
+plugin's `agent.command` inject, which applies the text through the adapter's actual
+native turn/steer on the captured exact turn (not a hook callback and never labeled
+`turn_safe_point`). The exact-turn ack carries the retained typed outcome
+(`codex.turn/steer` or `muse.turn/steer`, application point `active_turn`, consumer
+the original inject command id), and the command settles with the standard
+Applied/Rejected/Unknown readback. The retained
 typed outcome identifies the mechanism, actual application point and opaque consumer;
 it is not a second receipt. A missing native mechanism returns `unsupported`, never a
 weaker SEND.

@@ -473,7 +473,10 @@ impl Router {
                 .insert(admission.command.id.clone());
         }
 
-        if admission.is_new && admission.command.verb != "inject" {
+        let kicks_worker = admission.command.verb != "inject"
+            || serde_json::from_value::<eliot_core::InjectArgs>(admission.command.args.clone())
+                .is_ok_and(|args| args.point == eliot_core::InjectPoint::ActiveTurn);
+        if admission.is_new && kicks_worker {
             self.schedule_admission(&admission);
         }
         self.signal_progress();

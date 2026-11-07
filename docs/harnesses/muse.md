@@ -25,7 +25,7 @@ Use supported typed APIs, not an inferred method list from a different host vers
 | --- | --- |
 | launch/send | session/start then turn/start; readiness, input association and result separate |
 | steer/interrupt | steer is turn/steer with the exact expected turn; interrupt is turn/cancel on the exact turn (halt running, keep queue; turn/unqueue targets queued submits, never used here) |
-| inject | exact supported steer or explicit next-send prepend, mechanism reported |
+| inject | exact supported steer or explicit next-send prepend, mechanism reported; active_turn uses the actual turn/steer mechanism with the exact expected turn (`muse.turn/steer`), other points unsupported here |
 | stop/resume | clear/pause native Goal as necessary and close owned host; resume exact session without old input |
 | approve/deny/answer | exact session/child request id and offered choice/requirement; public details are the shared ApprovalRequest/QuestionRequest, answers are the universal answers map |
 | configure | model/reasoning/approval setters followed by effective readback |

@@ -213,7 +213,7 @@ enum CliCommand {
         agent: String,
         #[arg(value_name = "TEXT", allow_hyphen_values = true)]
         text: String,
-        #[arg(long, value_parser = ["next_input", "turn_safe_point"], default_value = "next_input")]
+        #[arg(long, value_parser = ["next_input", "turn_safe_point", "active_turn"], default_value = "next_input")]
         point: String,
         #[command(flatten)]
         generation: GenerationArgs,
@@ -1500,10 +1500,11 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             let point = match point.as_str() {
                 "next_input" => InjectPoint::NextInput,
                 "turn_safe_point" => InjectPoint::TurnSafePoint,
+                "active_turn" => InjectPoint::ActiveTurn,
                 _ => {
                     return Err(Failure::new(
                         2,
-                        "inject point must be next_input or turn_safe_point",
+                        "inject point must be next_input, turn_safe_point, or active_turn",
                     ));
                 }
             };
