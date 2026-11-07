@@ -244,9 +244,12 @@ Codex or for unrelated adapters.
       and `on.event` rules. Preserve exact-turn steer/interrupt and existing approval
       callbacks; adapters report the actual mechanism/application point or `unsupported`,
       never substitute a weaker SEND. Claude Code 2.1.278
-      `PreToolUse.additionalContext` is the first native consumer (source schema
-      confirmed, runtime application pending). Do not mark complete until the connected
-      path has real installed-agent runtime qualification and is integrated at the root.
+      `PreToolUse.additionalContext` was the first native consumer. Antigravity
+      supports `before_model`, `turn_safe_point`, and exact-turn steer/interrupt.
+      Remaining work: Claude hook-steer qualification and integration (PR342
+      standalone steer and controls-while-pending). Do not mark complete until the
+      connected path has real installed-agent runtime qualification and is integrated
+      at the root.
 
 The selected local scope remains in progress while L6.6 and the applicable L7
 qualification are incomplete; do not describe it as feature complete.
