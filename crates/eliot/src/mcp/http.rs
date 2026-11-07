@@ -95,6 +95,7 @@ pub async fn run_http(
         .with_allowed_origins(allowed_origins)
         .with_cancellation_token(cancel.clone());
     let factory_shutdown = cancel.clone();
+    #[allow(deprecated)] // SEP-2577: LoggingLevel default is deprecated but functional in rmcp 3.9.
     let service = StreamableHttpService::new(
         move || {
             Ok(EliotMcpHandler {

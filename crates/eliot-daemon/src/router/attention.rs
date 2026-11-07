@@ -81,6 +81,8 @@ struct AttentionState {
 #[derive(Clone)]
 struct ActiveIncident {
     incident_id: String,
+    baseline_progress_at: Option<i64>,
+    baseline_model_progress_at: Option<i64>,
     incident_delivery: Option<FrozenReport>,
     recovery_delivery: Option<FrozenReport>,
 }
@@ -606,6 +608,7 @@ async fn reconcile_attention_state(
     state: Arc<Mutex<AttentionState>>,
     suspicion_window: Duration,
 ) -> Result<()> {
+    retire_superseded_incidents(router, &state).await?;
     retry_pending_deliveries(router, Arc::clone(&state)).await;
     let reconcile_all = {
         let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
@@ -645,6 +648,90 @@ async fn reconcile_attention_state(
     }
     while checks.join_next().await.is_some() {}
     Ok(())
+}
+
+async fn retire_superseded_incidents(
+    router: &Router,
+    state: &Arc<Mutex<AttentionState>>,
+) -> Result<()> {
+    let agents = {
+        let state = state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut agents = state
+            .active
+            .keys()
+            .map(|key| key.agent.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        agents.sort();
+        agents
+    };
+    for agent_id in agents {
+        let current_generation = {
+            let store = router.inner.store.lock().await;
+            store.get_agent(&agent_id)?.map(|agent| agent.generation)
+        };
+        let obsolete = {
+            let state = state.lock().unwrap_or_else(|error| error.into_inner());
+            state
+                .active
+                .iter()
+                .filter(|(key, _)| {
+                    key.agent == agent_id && Some(key.generation) != current_generation
+                })
+                .map(|(key, incident)| (key.clone(), incident.clone()))
+                .collect::<Vec<_>>()
+        };
+        for (key, incident) in obsolete {
+            let mut incident_settled = incident.incident_delivery.is_none();
+            if let Some(delivery) = &incident.incident_delivery {
+                match persist_and_notify(router, delivery).await {
+                    Ok(()) => incident_settled = true,
+                    Err(error) => record_obsolete_delivery(&key, "incident", &error),
+                }
+            }
+            if incident_settled {
+                if let Some(delivery) = &incident.recovery_delivery
+                    && let Err(error) = persist_and_notify(router, delivery).await
+                {
+                    record_obsolete_delivery(&key, "recovery", &error);
+                }
+            } else if incident.recovery_delivery.is_some() {
+                let error = Error::new(
+                    "unknown",
+                    "obsolete incident delivery was not confirmed; recovery was not dispatched",
+                );
+                record_obsolete_delivery(&key, "recovery", &error);
+            }
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            if state
+                .active
+                .get(&key)
+                .is_some_and(|current| current.incident_id == incident.incident_id)
+            {
+                state.active.remove(&key);
+            }
+            state.pending_checks.remove(&AgentKey {
+                agent: key.agent.clone(),
+                generation: key.generation,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn record_obsolete_delivery(key: &IncidentKey, phase: &str, error: &Error) {
+    let generation = key.generation.to_string();
+    crate::logging::record(
+        &eliot_core::SecretPolicy::default(),
+        "daemon.attention_obsolete_delivery_unconfirmed",
+        &[
+            ("agent", key.agent.as_str()),
+            ("generation", generation.as_str()),
+            ("phase", phase),
+        ],
+        Some(error),
+    );
 }
 
 fn reserve_pending_deliveries(
@@ -729,14 +816,13 @@ async fn retry_pending_deliveries(router: &Router, state: Arc<Mutex<AttentionSta
             }
             if recovery {
                 state.active.remove(&key);
-            } else if let Some(incident) = state.active.get_mut(&key) {
-                if incident
+            } else if let Some(incident) = state.active.get_mut(&key)
+                && incident
                     .incident_delivery
                     .as_ref()
                     .is_some_and(|current| current.emit_command_id == delivery.emit_command_id)
-                {
-                    incident.incident_delivery = None;
-                }
+            {
+                incident.incident_delivery = None;
             }
         });
     }
@@ -809,14 +895,7 @@ async fn inspect_agent(
         return Ok(());
     }
     let desired = desired_incident(&captured, suspicion_window);
-    report_cleared_incidents(
-        router,
-        &state,
-        &captured,
-        desired.as_ref(),
-        suspicion_window,
-    )
-    .await?;
+    report_cleared_incidents(router, &state, &captured, suspicion_window).await?;
 
     let Some((key, _activity)) = desired else {
         return Ok(());
@@ -854,10 +933,14 @@ async fn inspect_agent(
     );
     let frozen = freeze_report(report);
     let incident_id = frozen.report.incident_id.clone();
+    let baseline_progress_at = frozen.report.progress_basis_at;
+    let baseline_model_progress_at = frozen.report.last_model_progress_at;
     reservation.commit(
         key.clone(),
         ActiveIncident {
             incident_id,
+            baseline_progress_at,
+            baseline_model_progress_at,
             incident_delivery: Some(frozen),
             recovery_delivery: None,
         },
@@ -928,10 +1011,14 @@ async fn inspect_lost_agent(
     );
     let frozen = freeze_report(report);
     let incident_id = frozen.report.incident_id.clone();
+    let baseline_progress_at = frozen.report.progress_basis_at;
+    let baseline_model_progress_at = frozen.report.last_model_progress_at;
     reservation.commit(
         key.clone(),
         ActiveIncident {
             incident_id,
+            baseline_progress_at,
+            baseline_model_progress_at,
             incident_delivery: Some(frozen),
             recovery_delivery: None,
         },
@@ -944,10 +1031,9 @@ async fn report_cleared_incidents(
     router: &Router,
     state: &Arc<Mutex<AttentionState>>,
     captured: &CapturedAgent,
-    desired: Option<&(IncidentKey, String)>,
     suspicion_window: Duration,
 ) -> Result<()> {
-    let mut candidates = recovery_candidates(state, captured, desired);
+    let mut candidates = recovery_candidates(state, captured);
     if candidates.is_empty() {
         return Ok(());
     }
@@ -958,7 +1044,7 @@ async fn report_cleared_incidents(
         }
     }
 
-    candidates = recovery_candidates(state, captured, desired);
+    candidates = recovery_candidates(state, captured);
     if candidates.is_empty() {
         return Ok(());
     }
@@ -1021,7 +1107,6 @@ async fn report_cleared_incidents(
 fn recovery_candidates(
     state: &Arc<Mutex<AttentionState>>,
     captured: &CapturedAgent,
-    desired: Option<&(IncidentKey, String)>,
 ) -> Vec<(IncidentKey, ActiveIncident)> {
     let state = state.lock().unwrap_or_else(|error| error.into_inner());
     state
@@ -1031,10 +1116,58 @@ fn recovery_candidates(
             key.agent == captured.agent.id
                 && key.generation == captured.agent.generation
                 && (incident.recovery_delivery.is_some()
-                    || desired.is_none_or(|(desired_key, _)| desired_key != *key))
+                    || incident_condition_cleared(key, incident, captured))
         })
         .map(|(key, incident)| (key.clone(), incident.clone()))
         .collect()
+}
+
+fn incident_condition_cleared(
+    key: &IncidentKey,
+    incident: &ActiveIncident,
+    captured: &CapturedAgent,
+) -> bool {
+    if captured.agent.state == AgentState::Stopped {
+        return true;
+    }
+    match key.kind {
+        IncidentKind::SourceUnhealthy => {
+            captured.source_healthy == Some(true)
+                && !source_is_unhealthy(captured.agent.state, &captured.source_states)
+        }
+        IncidentKind::NoProgress => {
+            let progressed =
+                timestamp_advanced(captured.progress_basis_at, incident.baseline_progress_at)
+                    || timestamp_advanced(
+                        captured.last_model_progress_at,
+                        incident.baseline_model_progress_at,
+                    );
+            if progressed {
+                return true;
+            }
+            if captured.source_healthy != Some(true) {
+                return false;
+            }
+            let waiting =
+                captured.agent.state == AgentState::Waiting || !captured.agent.pending.is_empty();
+            let idle =
+                captured.agent.state == AgentState::Idle && captured.agent.active_turn.is_none();
+            let turn_changed = captured
+                .agent
+                .active_turn
+                .as_deref()
+                .is_some_and(|turn_id| key.turn_id.as_deref() != Some(turn_id));
+            waiting || idle || turn_changed
+        }
+    }
+}
+
+fn timestamp_advanced(current: Option<i64>, baseline: Option<i64>) -> bool {
+    match (current, baseline) {
+        (Some(current), Some(baseline)) => current > baseline,
+        (Some(_), None) => true,
+        _ => false,
+    }
 }
 
 fn reserve_incident(
@@ -1810,10 +1943,7 @@ async fn send_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
     let mut delivery_errors = Vec::with_capacity(2);
     match serde_json::to_value(affected) {
         Ok(affected) => {
-            if let Err(error) = router
-                .mail_send_attention_queue(&affected, &Principal::Owner)
-                .await
-            {
+            if let Err(error) = router.mail_send(&affected, &Principal::Owner).await {
                 delivery_errors.push(format!("affected_mail:{}", error.code));
             }
         }

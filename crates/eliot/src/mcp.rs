@@ -71,6 +71,7 @@ struct ToolArgs {
 /// MCP stdio entry point. The `data_dir` already comes from `--data-dir` /
 /// `ELIOT_HOME` resolution in `main.rs`; no daemon is started here.
 pub async fn run_stdio(data_dir: PathBuf) -> Result<(), String> {
+    #[allow(deprecated)] // SEP-2577: LoggingLevel default is deprecated but functional in rmcp 3.9.
     let handler = EliotMcpHandler {
         data_dir,
         notify_owner_events: false,
@@ -105,6 +106,7 @@ struct EliotMcpHandler {
     notify_spawned: Arc<AtomicBool>,
     /// Per-session `logging/setLevel` minimum severity (default `Info`).
     /// Written by `set_level`, read by the session notify task.
+    #[allow(deprecated)] // SEP-2577: LoggingLevel is deprecated but functional in rmcp 3.9.
     log_level: Arc<RwLock<LoggingLevel>>,
 }
 
