@@ -25,8 +25,8 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, ChildStdin, ChildStdout},
-    process::Command,
+    io::AsyncReadExt,
+    process::{ChildStdin, ChildStdout, Command},
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
@@ -555,7 +555,7 @@ async fn settle_child(
     if !reaped {
         let terminate_error = child.terminate().err();
         match timeout(REAP_TIMEOUT, child.wait()).await {
-            Ok(Ok(_)) => reaped = true,
+            Ok(Ok(_)) => {}
             Ok(Err(error)) => return Err(error),
             Err(_) => {
                 return Err(terminate_error.or(wait_error).unwrap_or_else(|| {
@@ -634,10 +634,10 @@ impl StatusGuard {
 
 impl Drop for StatusGuard {
     fn drop(&mut self) {
-        if !self.completed {
-            if let Some(snapshot) = current_slot().lock_recover().as_mut() {
-                snapshot.health = CloudMcpHealth::Failed;
-            }
+        if !self.completed
+            && let Some(snapshot) = current_slot().lock_recover().as_mut()
+        {
+            snapshot.health = CloudMcpHealth::Failed;
         }
     }
 }

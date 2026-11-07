@@ -41,15 +41,18 @@ use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerConfig, ServerNotification, Tool,
-    ToolAnnotations,
+    PaginatedRequestParams, ServerCapabilities, ServerConfig, ServerNotification,
+    SetLevelRequestMethod, Tool, ToolAnnotations,
 };
 #[allow(deprecated)] // SEP-2577: logging is deprecated but functional in rmcp 3.9.
-use rmcp::model::{LoggingLevel, LoggingMessageNotification, LoggingMessageNotificationParam};
+use rmcp::model::{
+    LoggingLevel, LoggingMessageNotification, LoggingMessageNotificationParam,
+    SetLevelRequestParams,
+};
 use rmcp::service::{MaybeSendFuture, NotificationContext, Peer, RequestContext, RoleServer};
 use serde_json::{Map, Value, json};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
 
 const TOOL_NAME: &str = "swarm";
@@ -73,6 +76,7 @@ pub async fn run_stdio(data_dir: PathBuf) -> Result<(), String> {
         notify_owner_events: false,
         shutdown: CancellationToken::new(),
         notify_spawned: Arc::new(AtomicBool::new(false)),
+        log_level: Arc::new(RwLock::new(LoggingLevel::Info)),
     };
     let (stdin, stdout) = rmcp::transport::io::stdio();
     let stdout = bounded_io::BoundedLineWriter::new(stdout, eliot_daemon::MAX_RPC_FRAME_BYTES);
@@ -99,6 +103,9 @@ struct EliotMcpHandler {
     /// Guards the one-task-per-session invariant against repeated
     /// `notifications/initialized` deliveries.
     notify_spawned: Arc<AtomicBool>,
+    /// Per-session `logging/setLevel` minimum severity (default `Info`).
+    /// Written by `set_level`, read by the session notify task.
+    log_level: Arc<RwLock<LoggingLevel>>,
 }
 
 impl ServerHandler for EliotMcpHandler {
@@ -112,9 +119,35 @@ impl ServerHandler for EliotMcpHandler {
         context: NotificationContext<RoleServer>,
     ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
         if self.notify_owner_events && !self.notify_spawned.swap(true, Ordering::SeqCst) {
-            spawn_owner_notify_task(self.data_dir.clone(), context.peer, self.shutdown.clone());
+            spawn_owner_notify_task(
+                self.data_dir.clone(),
+                context.peer,
+                self.shutdown.clone(),
+                self.log_level.clone(),
+            );
         }
         std::future::ready(())
+    }
+
+    #[allow(deprecated)] // SEP-2577: setLevel is deprecated but functional in rmcp 3.9.
+    fn set_level(
+        &self,
+        request: SetLevelRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + MaybeSendFuture + '_ {
+        if !self.notify_owner_events {
+            return std::future::ready(Err(McpError::method_not_found::<SetLevelRequestMethod>()));
+        }
+        match self.log_level.write() {
+            Ok(mut level) => {
+                *level = request.level;
+                std::future::ready(Ok(()))
+            }
+            Err(_) => std::future::ready(Err(McpError::internal_error(
+                "logging level unavailable",
+                None,
+            ))),
+        }
     }
 
     fn list_tools(
@@ -215,7 +248,13 @@ fn server_capabilities(notify_owner_events: bool) -> ServerCapabilities {
 /// event still ends promptly (at most one in-flight long-poll past the
 /// disconnect). It never retries: a dead task stays dead until the client
 /// opens a new session.
-fn spawn_owner_notify_task(data_dir: PathBuf, peer: Peer<RoleServer>, shutdown: CancellationToken) {
+#[allow(deprecated)] // SEP-2577: LoggingLevel is deprecated but functional in rmcp 3.9.
+fn spawn_owner_notify_task(
+    data_dir: PathBuf,
+    peer: Peer<RoleServer>,
+    shutdown: CancellationToken,
+    log_level: Arc<RwLock<LoggingLevel>>,
+) {
     tokio::spawn(async move {
         let Some(mut after) = current_tip(&data_dir).await else {
             return;
@@ -248,8 +287,13 @@ fn spawn_owner_notify_task(data_dir: PathBuf, peer: Peer<RoleServer>, shutdown: 
             if response.validate(after).is_err() {
                 return;
             }
+            let minimum = log_level
+                .read()
+                .map(|level| *level)
+                .unwrap_or(LoggingLevel::Info);
             for event in &response.events {
                 if let Some((level, data)) = normalize_owner_event(event)
+                    && severity(&level) >= severity(&minimum)
                     && peer
                         .send_notification(owner_notification(level, data))
                         .await
@@ -365,6 +409,23 @@ fn normalize_owner_event(event: &Event) -> Option<(LoggingLevel, Value)> {
             Some((level, payload))
         }
         _ => None,
+    }
+}
+
+/// Syslog severity rank for [`LoggingLevel`]: higher is more severe. Only
+/// `Info`/`Warning` are ever emitted; the full rank keeps client minimums
+/// (e.g. `warning`) filtering exactly.
+#[allow(deprecated)] // SEP-2577: LoggingLevel is deprecated but functional in rmcp 3.9.
+fn severity(level: &LoggingLevel) -> u8 {
+    match level {
+        LoggingLevel::Debug => 0,
+        LoggingLevel::Info => 1,
+        LoggingLevel::Notice => 2,
+        LoggingLevel::Warning => 3,
+        LoggingLevel::Error => 4,
+        LoggingLevel::Critical => 5,
+        LoggingLevel::Alert => 6,
+        LoggingLevel::Emergency => 7,
     }
 }
 

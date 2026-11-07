@@ -99,16 +99,22 @@ Exact limitations: rmcp binds transport sessions to their request/response strea
 only. Router receives the existing Owner authority with no new local Agent/PID, and
 no remote subject or session metadata is persisted into semantic Store data.
 
-Transport sessions are in-memory only (rmcp `LocalSessionManager`, legacy session
-mode off). Each initialized HTTP session advertises `logging` and starts exactly
-one bounded owner-event delivery task
+Session handling is native rmcp negotiation with no override: pre-2026 clients get
+stateful in-memory SDK sessions (`LocalSessionManager`); clients negotiating
+2026-07-28 or later are always served statelessly per SEP-2567, with no session ID
+and no standalone SSE/DELETE session. Each initialized stateful session advertises
+`logging` and starts exactly one bounded owner-event delivery task
 ([mcp.rs](../../crates/eliot/src/mcp.rs) `spawn_owner_notify_task`). The task
 long-polls `events.subscribe` from the current committed tip (limit 100, about 1 s
 wait), so history is never replayed, and sends only normalized
 `x.user.notify` and `x.user.agent.attention` payloads as `notifications/message`.
-Delivery is best-effort and unacknowledged: a send failure, closed transport or
-daemon error ends the task for that session without retry, and successful delivery
-does not imply that the client consumed the notice.
+Unsolicited stream delivery exists only for supported persistent-session clients:
+delivery is best-effort and unacknowledged (a send failure, closed transport or
+daemon error ends the task without retry), and nothing here promises to wake a
+stateless cloud LLM. `logging/setLevel` sets the session minimum severity
+(default `info`); only `info`/`warning` owner notices are emitted, so `warning`
+narrows the stream to attention incidents. Stdio neither advertises nor
+implements it.
 
 ## Mutation ids
 

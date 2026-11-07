@@ -1476,13 +1476,18 @@ async fn run_agent_inner(
                         } else {
                             pending_snapshots.push(snapshot_future(
                                 client.clone(),
-                                agent_id,
-                                generation,
-                                command_id,
                                 turn_id,
                                 stderr.clone(),
                                 Arc::clone(&source_credentials),
-                                reply,
+                                PluginSnapshotCompletion {
+                                    agent_id,
+                                    generation,
+                                    command_id,
+                                    reply,
+                                    // Identity pre-built by the caller; the future
+                                    // fills the diagnosed result before resolving.
+                                    result: Err(Error::new("internal", "snapshot result unset")),
+                                },
                             ));
                         }
                     }
@@ -1749,19 +1754,16 @@ async fn run_agent_inner(
 
 fn snapshot_future(
     client: PluginClient,
-    agent_id: String,
-    generation: i64,
-    command_id: String,
     turn_id: Option<String>,
     stderr: StderrView,
     source_credentials: Arc<[String]>,
-    reply: oneshot::Sender<Result<Value>>,
+    mut completion: PluginSnapshotCompletion,
 ) -> PendingSnapshotFuture {
     Box::pin(async move {
         let params = json!({
-            "agent_id": agent_id.clone(),
-            "generation": generation,
-            "command_id": command_id.clone(),
+            "agent_id": completion.agent_id.clone(),
+            "generation": completion.generation,
+            "command_id": completion.command_id.clone(),
             "turn_id": turn_id,
         });
         let result = client
@@ -1772,13 +1774,8 @@ fn snapshot_future(
                 crate::redaction::redact_outcome(&mut value, &source_credentials);
                 value
             });
-        PluginSnapshotCompletion {
-            agent_id,
-            generation,
-            command_id,
-            reply,
-            result: diagnose_result(result, &stderr, &source_credentials),
-        }
+        completion.result = diagnose_result(result, &stderr, &source_credentials);
+        completion
     })
 }
 

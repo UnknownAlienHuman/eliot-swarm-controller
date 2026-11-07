@@ -23,8 +23,11 @@
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{Arc, RwLock, atomic::AtomicBool},
 };
+
+#[allow(deprecated)] // SEP-2577: logging is deprecated but functional in rmcp 3.9.
+use rmcp::model::LoggingLevel;
 
 use axum::{
     Router,
@@ -84,8 +87,9 @@ pub async fn run_http(
         allowed_origins.push(public.origin.clone());
     }
     let cancel = CancellationToken::new();
+    // Native rmcp session negotiation (SDK default, no override): stateful
+    // sessions for pre-2026 clients, stateless for 2026-07-28+ per SEP-2567.
     let config = StreamableHttpServerConfig::default()
-        .with_legacy_session_mode(false)
         .with_max_request_body_bytes(eliot_daemon::MAX_RPC_FRAME_BYTES)
         .with_allowed_hosts(allowed_hosts)
         .with_allowed_origins(allowed_origins)
@@ -98,6 +102,7 @@ pub async fn run_http(
                 notify_owner_events: true,
                 shutdown: factory_shutdown.clone(),
                 notify_spawned: Arc::new(AtomicBool::new(false)),
+                log_level: Arc::new(RwLock::new(LoggingLevel::Info)),
             })
         },
         Arc::new(LocalSessionManager::default()),

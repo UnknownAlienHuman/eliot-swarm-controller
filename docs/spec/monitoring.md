@@ -481,7 +481,8 @@ plans, file edits and exact request/answer transitions.
 ## Automatic attention
 
 The daemon emits a typed `x.user.agent.attention` report when an authoritative
-native lifecycle source becomes unhealthy or a `session.lost` fact is committed.
+native lifecycle source becomes unhealthy or a validated `agent.lost` event is
+committed.
 Those triggers do not wait for the no-progress window. A busy Agent with a
 healthy authoritative source becomes a no-progress suspicion after
 `daemon.attention_suspicion_secs` (default 900 seconds). This is a diagnostic
@@ -503,9 +504,13 @@ cached process observations; CPU activity is not model-progress evidence.
 Failed, preempted, stale, or binding-mismatched native readback remains unknown
 and never changes Agent state.
 
-Pending approvals/questions are reported as waiting. A known active tool is
-reported as active and suppresses a no-progress suspicion. Tool coverage that
-is missing, gapped, or truncated remains unknown and cannot be called stalled.
+Pending approvals/questions remain `waiting`; waiting for a user response alone
+is not a no-progress suspicion. A known active tool is reported as
+`active_tool` with progress `unknown`. It does not suppress suspicion
+indefinitely: if that observation remains unchanged through the configured
+window, emit an advisory `active_tool` diagnosis with progress `unknown`. This
+diagnosis never proves death. Tool coverage that is missing, gapped, or
+truncated remains unknown and cannot be called stalled.
 Only one report is emitted per active incident, followed by one recovery report
 when its condition clears. The bounded transient incident set is in-memory;
 there is no separate status registry. Each incident/phase freezes its report
