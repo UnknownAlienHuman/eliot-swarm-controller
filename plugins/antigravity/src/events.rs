@@ -631,15 +631,16 @@ impl State {
         }
         self.commit("turn.completed", &turn, "completed", data.clone())
             .await?;
-        let final_text = data
-            .get("final_text")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let final_text = match data.get("final_text").and_then(Value::as_str) {
+            Some(final_text) => final_text.to_owned(),
+            None if !failed && !truncated => text,
+            None => String::new(),
+        };
         self.last_turn = Some(TurnFacts {
             command_id: command,
             turn_id: turn.clone(),
             status: status.to_owned(),
-            final_text: final_text.unwrap_or_default(),
+            final_text,
             terminal: true,
         });
         self.settlement = Some((turn, status.to_owned()));
