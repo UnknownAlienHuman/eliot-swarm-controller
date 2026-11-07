@@ -21,8 +21,9 @@ calls, a bounded frame queue, and output drained before any loss
 conclusion. Turn progress arrives as `session/update` notifications;
 agent-to-client requests (`fs/*`, `terminal/*`, `session/request_permission`,
 `elicitation/create`) are always explicitly rejected as unsupported — never
-auto-approved. The schema has no steer, inject or hooks method; those
-controls are not ACP facts and are not claimed here.
+auto-approved. ACP has no steer, inject or hook method. The system-context
+and steer paths below use the separate native CLI `PreInvocation` hook;
+they are not ACP operations. `active_turn` injection remains unsupported.
 
 The adapter uses `start_requires_input = false`: spawn, `initialize`
 (protocol 1), then `session/new` — or `session/load` with the exact
@@ -91,14 +92,54 @@ Stop sends a best-effort `session/close` for the retained session, then
 closes stdin and drains stdout before settling the session; force targets
 only owned custody. Resume creates a new Agent generation loading the
 exact retained session id, without replaying the old prompt. Connected
-verbs are launch/resume/send/interrupt/stop; steer, inject, configure,
-approve, deny and answer remain `unsupported` on this increment. The
-planned plugin hook-callback increment (exact-turn hook safe-boundary
-steering and turn-safe inject) will bind later through the existing
-`session/update` / `session/cancel` entry points; until then no hook
-claim is made. Controlled families are session/turn/message/tool with no
-request family. `profile.store` is unsupported: launch carries no native
-store binding.
+verbs are launch/resume/send/steer/interrupt/stop. Inject (including
+`active_turn`), configure, approve, deny and answer remain `unsupported`.
+`profile.store` is unsupported: launch carries no native store binding.
+
+## System context and steer hooks
+
+The Antigravity CLI hooks documentation (accessed 2026-11-07; adapter
+version metadata is 1.5.2) defines workspace hooks in `.agents/hooks.json`. Its
+`PreInvocation` input includes `conversationId`, zero-indexed
+`invocationNum`, and `initialNumSteps` (trajectory step count); output
+`injectSteps` accepts `ephemeralMessage`. Eliot writes one named hook group
+under the plugin's private instance directory at `.agents/hooks.json`,
+adds that directory with native `--add-dir`, and invokes the hidden
+`swarm plugin antigravity-hook` helper. The real workspace remains the ACP
+cwd; the plugin does not edit project/global hooks, copy authentication,
+or change login/native-store paths.
+
+The hook helper uses a bounded, per-generation loopback IPC endpoint and
+random token; the plugin's authenticated instance channel binds generation.
+The owning plugin requires `conversationId` to equal its exact retained ACP
+session id and captures the pending Eliot turn when it accepts the callback,
+then rechecks that same binding before responding. A mismatch or stale
+callback receives empty output. No native turn id is invented. The plugin
+sends `hook.event` with `hook:"before_model"` over the existing authenticated
+channel.
+FIFO `turn_safe_point` claims are returned as an ephemeral system message.
+After the helper confirms that its stdout response was written, the plugin
+commits `hook.before_model` with the exact Eliot turn and callback consumer
+on the existing event path. A context outcome is included only when claimed
+context was written. Stale callbacks and unconfirmed writes produce no
+applied receipt; claims are never replayed or moved to another turn.
+
+`steer` retains its command id and captured turn while waiting for the next
+live `PreInvocation` in that prompt. It writes a separate
+`ephemeralMessage` step in the same callback response, returns `applied`
+only after the helper confirms stdout, and reports the mechanism
+`antigravity.PreInvocation.injectSteps.ephemeralMessage`. If the turn ends
+first, steer settles stale; an uncertain response stays unknown and is
+never resent. This is the native PreInvocation point, not an ACP steer
+method or an `active_turn` inject.
+
+The native CLI option exists, but actual discovery/activation of the
+private customization directory under `agy acp` is not qualified. The
+scope/repetition behavior of `invocationNum` is also unverified, so it is
+not used as turn identity. Root must prove activation and callback-to-prompt
+binding with an installed Antigravity agent before claiming runtime
+support. Controlled families remain session/turn/message/tool, with
+`hook.before_model` owned by the existing turn family.
 
 ## Facts and recovery
 

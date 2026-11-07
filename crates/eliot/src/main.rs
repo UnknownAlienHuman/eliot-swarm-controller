@@ -750,6 +750,9 @@ enum PluginCommand {
     /// Internal Antigravity plugin entry point (hidden).
     #[command(hide = true)]
     Antigravity,
+    /// Internal Antigravity command-hook entry point (hidden).
+    #[command(name = "antigravity-hook", hide = true)]
+    AntigravityHook,
 }
 
 struct Failure {
@@ -2065,6 +2068,12 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             }
             PluginCommand::Antigravity => {
                 eliot_plugin_antigravity::run()
+                    .await
+                    .map_err(|error| Failure::new(1, error.to_string()))?;
+                Ok(0)
+            }
+            PluginCommand::AntigravityHook => {
+                eliot_plugin_antigravity::run_hook_helper()
                     .await
                     .map_err(|error| Failure::new(1, error.to_string()))?;
                 Ok(0)

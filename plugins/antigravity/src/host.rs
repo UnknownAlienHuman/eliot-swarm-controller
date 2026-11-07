@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use eliot_core::{Error, Result};
 use eliot_plugin::{
@@ -13,7 +13,7 @@ use tokio::{
     time::{Duration, Instant},
 };
 
-use crate::{events::FAMILIES, session::Session};
+use crate::{events::FAMILIES, hooks::HookServer, session::Session};
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -157,6 +157,13 @@ impl Plugin {
                 "Antigravity requires protocol, private instance directory and credential",
             ));
         }
+        let instance_dir = PathBuf::from(&params.instance_dir);
+        if !instance_dir.is_absolute() || !instance_dir.is_dir() {
+            return Err(Error::new(
+                "invalid",
+                "Antigravity requires an existing absolute private instance directory",
+            ));
+        }
         if let Some(existing) = &self.initialized {
             if existing.instance_dir != params.instance_dir
                 || existing.credential != params.credential
@@ -176,7 +183,7 @@ impl Plugin {
             harness_version: "1.5.2".into(),
             available: true,
             mode: "per_agent".into(),
-            verbs: ["launch", "resume", "send", "interrupt", "stop"]
+            verbs: ["launch", "resume", "send", "steer", "interrupt", "stop"]
                 .map(str::to_owned)
                 .to_vec(),
             child_verbs: vec![],
@@ -211,6 +218,8 @@ impl Plugin {
             .initialized
             .as_ref()
             .ok_or_else(|| not_initialized("Antigravity"))?;
+        let credential = initialized.credential.clone();
+        let instance_dir = PathBuf::from(&initialized.instance_dir);
         let identity = serde_json::to_value(&params)
             .map_err(|_| Error::new("internal", "Could not encode Antigravity start binding"))?;
         if let Some((previous, outcome)) = &self.start {
@@ -222,7 +231,8 @@ impl Plugin {
             }
             return outcome.clone();
         }
-        let plan = crate::profile::Plan::new(&params, &initialized.credential)?;
+        let hooks = HookServer::bind().await?;
+        let plan = crate::profile::Plan::new(&params, &credential, hooks.token(), &instance_dir)?;
         // Latch before creating a native conversation. Any failure after spawn
         // is retained; this generation never starts a second process on retry.
         self.start = Some((
@@ -232,25 +242,26 @@ impl Plugin {
                 "Antigravity start is unresolved; it will not be replayed",
             )),
         ));
-        let result = match Session::spawn(&params, &plan, peer, &initialized.credential).await {
-            Ok(session) => {
-                self.session = Some(session);
-                let session = self
-                    .session
-                    .as_mut()
-                    .ok_or_else(|| Error::new("internal", "Antigravity session disappeared"))?;
-                let result = session.start(&plan, peer, &initialized.credential).await;
-                if result.is_err() && session.terminate(true).await.is_err() {
-                    Err(Error::new(
-                        "unknown",
-                        "Antigravity start failed and owned cleanup is unconfirmed",
-                    ))
-                } else {
-                    result
+        let result =
+            match Session::spawn(&params, &plan, peer, &credential, &instance_dir, hooks).await {
+                Ok(session) => {
+                    self.session = Some(session);
+                    let session = self
+                        .session
+                        .as_mut()
+                        .ok_or_else(|| Error::new("internal", "Antigravity session disappeared"))?;
+                    let result = session.start(&plan, peer, &credential).await;
+                    if result.is_err() && session.terminate(true).await.is_err() {
+                        Err(Error::new(
+                            "unknown",
+                            "Antigravity start failed and owned cleanup is unconfirmed",
+                        ))
+                    } else {
+                        result
+                    }
                 }
-            }
-            Err(error) => Err(error),
-        };
+                Err(error) => Err(error),
+            };
         self.start = Some((identity, result.clone()));
         result
     }

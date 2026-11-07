@@ -3,10 +3,13 @@ use std::{
     sync::Arc,
 };
 
-use eliot_core::{ContextItem, Error, Result, SecretPolicy, SourceHealthUpdate};
+use eliot_core::{
+    ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy, SourceHealthUpdate,
+};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     native_transport::StreamState,
+    protocol::{HookEvent, HookResponse},
     session::{EVENT_DEADLINE, StreamSource, attach_final_text, event_id, next_input_outcomes},
 };
 use serde::Serialize;
@@ -16,9 +19,14 @@ use tokio::{
     time::Instant,
 };
 
-use crate::native::{AcpUpdate, AgyClient, AgyFrame, FencedGuard, PromptResult, classify_update};
+use crate::{
+    hooks::{HookCallback, HookInput, HookOutput, HookServer, HookStep, MAX_HOOK_FRAME_BYTES},
+    native::{AcpUpdate, AgyClient, AgyFrame, FencedGuard, PromptResult, classify_update},
+};
+use ulid::Ulid;
 
 pub(crate) const FAMILIES: &[&str] = &["session", "turn", "message", "tool"];
+pub(crate) const STEER_MECHANISM: &str = "antigravity.PreInvocation.injectSteps.ephemeralMessage";
 pub(crate) type Shared = Arc<Mutex<State>>;
 
 /// Upper bound on accumulated assistant text per turn. Beyond this the
@@ -52,6 +60,24 @@ struct Pending {
     reply: Option<oneshot::Sender<Result<()>>>,
 }
 
+struct PendingSteer {
+    command_id: String,
+    turn_id: String,
+    text: String,
+    reply: oneshot::Sender<Result<Value>>,
+}
+
+#[derive(Clone)]
+struct HookTurnBinding {
+    conversation: String,
+    turn: String,
+}
+
+struct AcceptedHook {
+    callback: HookCallback,
+    binding: Option<HookTurnBinding>,
+}
+
 pub(crate) struct State {
     host: PeerClient,
     sink: CommitSink,
@@ -61,6 +87,7 @@ pub(crate) struct State {
     policy: SecretPolicy,
     pub conversation: String,
     pending: Option<Pending>,
+    pending_steer: Option<PendingSteer>,
     /// Lifecycle transitions already emitted per tool call, keyed
     /// `"{tool_call_id}:{kind}"`. Each transition is emitted once;
     /// later metadata deltas never re-emit.
@@ -127,6 +154,7 @@ impl State {
             policy,
             conversation,
             pending: None,
+            pending_steer: None,
             tool_emitted: std::collections::HashSet::new(),
             tools: HashMap::new(),
             fenced_guard: None,
@@ -257,6 +285,95 @@ impl State {
 
     pub fn active_turn(&self) -> Option<&str> {
         self.pending.as_ref().map(|p| p.turn.as_str())
+    }
+
+    pub fn contains_secret(&self, text: &str) -> bool {
+        self.policy.contains_text(text)
+    }
+
+    fn capture_hook_turn(&self, input: &HookInput) -> Option<String> {
+        if self.conversation != input.conversation_id || input.conversation_id.trim().is_empty() {
+            return None;
+        }
+        if self.failure.is_some()
+            || self.source_unknown
+            || self.batch_unknown
+            || self.writes_blocked
+            || self.stopping
+            || self.stopped
+        {
+            return None;
+        }
+        self.pending.as_ref().map(|pending| pending.turn.clone())
+    }
+
+    fn hook_turn_is_live(&self, conversation: &str, turn: &str) -> bool {
+        self.conversation == conversation
+            && self.failure.is_none()
+            && !self.source_unknown
+            && !self.batch_unknown
+            && !self.writes_blocked
+            && !self.stopping
+            && !self.stopped
+            && self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.turn == turn)
+    }
+
+    pub fn arm_steer(
+        &mut self,
+        command_id: String,
+        turn_id: String,
+        text: String,
+    ) -> Result<oneshot::Receiver<Result<Value>>> {
+        if self.pending_steer.is_some() {
+            return Err(Error::new(
+                "busy",
+                "Antigravity already has a steer waiting for PreInvocation",
+            ));
+        }
+        if !self.hook_turn_is_live(&self.conversation, &turn_id) {
+            return Err(Error::new(
+                "stale_turn",
+                "Antigravity steer does not match the exact active prompt",
+            ));
+        }
+        let (reply, receiver) = oneshot::channel();
+        self.pending_steer = Some(PendingSteer {
+            command_id,
+            turn_id,
+            text,
+            reply,
+        });
+        Ok(receiver)
+    }
+
+    fn take_pending_steer(&mut self, turn_id: &str) -> Option<PendingSteer> {
+        if self
+            .pending_steer
+            .as_ref()
+            .is_some_and(|steer| steer.turn_id == turn_id)
+        {
+            self.pending_steer.take()
+        } else {
+            None
+        }
+    }
+
+    pub fn cancel_pending_steer(&mut self) {
+        if let Some(steer) = self.pending_steer.take() {
+            let _ = steer.reply.send(Err(Error::new(
+                "unknown",
+                "Antigravity stopped before PreInvocation confirmed steer",
+            )));
+        }
+    }
+
+    fn fail_pending_steer(&mut self, error: Error) {
+        if let Some(steer) = self.pending_steer.take() {
+            let _ = steer.reply.send(Err(error));
+        }
     }
 
     /// Register correlation before the write. This local turn id is never
@@ -631,6 +748,10 @@ impl State {
         }
         self.commit("turn.completed", &turn, "completed", data.clone())
             .await?;
+        self.fail_pending_steer(Error::new(
+            "stale_turn",
+            "Antigravity turn ended before its next PreInvocation steer point",
+        ));
         let final_text = match data.get("final_text").and_then(Value::as_str) {
             Some(final_text) => final_text.to_owned(),
             None if !failed && !truncated => text,
@@ -662,6 +783,14 @@ impl State {
             .pending
             .as_ref()
             .is_some_and(|pending| !pending.associated);
+        self.fail_pending_steer(Error::new(
+            if unassociated {
+                "stale_turn"
+            } else {
+                "unknown"
+            },
+            "Antigravity prompt ended before PreInvocation confirmed steer",
+        ));
         if unassociated {
             if let Some(mut pending) = self.pending.take()
                 && let Some(reply) = pending.reply.take()
@@ -710,6 +839,10 @@ impl State {
 
     pub async fn lose(&mut self, reason: &str) {
         self.source_unknown = true;
+        self.fail_pending_steer(Error::new(
+            "unknown",
+            format!("Antigravity stream was lost before PreInvocation steer settled: {reason}"),
+        ));
         self.clear_fenced();
         if let Some(request_id) = self.load_request_id.take() {
             // Stream loss during load: publish the failure to the load
@@ -816,8 +949,37 @@ pub(crate) fn spawn(
     mut stream: watch::Receiver<StreamState>,
     state: Shared,
     client: AgyClient,
+    hooks: HookServer,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let (hook_tx, mut hook_rx) = mpsc::channel(1);
+        let hook_state = state.clone();
+        let hook_accept_task = tokio::spawn(async move {
+            loop {
+                let callback = match hooks.accept().await {
+                    Ok(callback) => callback,
+                    Err(_) => break,
+                };
+                let input = callback.input().clone();
+                let binding = {
+                    hook_state
+                        .lock()
+                        .await
+                        .capture_hook_turn(&input)
+                        .map(|turn| HookTurnBinding {
+                            conversation: input.conversation_id,
+                            turn,
+                        })
+                };
+                if hook_tx
+                    .send(AcceptedHook { callback, binding })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         // Observe watch faults while active, including with no incoming
         // frames: a record-local Malformed keeps the reader open, so an
         // EOF-only check would let it vanish while later facts commit.
@@ -826,11 +988,24 @@ pub(crate) fn spawn(
         // terminal reply, an error, a stream fault, stop, or drop are the
         // only settlements.
         let mut stream_open = true;
+        let mut hooks_open = true;
         loop {
-            let frame = tokio::select! {
-                frame = frames.recv() => frame,
+            enum Next {
+                Frame(Option<AgyFrame>),
+                StreamClosed(bool),
+                Hook(Option<AcceptedHook>),
+            }
+            let next = tokio::select! {
+                biased;
+                frame = frames.recv() => Next::Frame(frame),
                 changed = stream.changed(), if stream_open => {
-                    if changed.is_err() {
+                    Next::StreamClosed(changed.is_err())
+                }
+                callback = hook_rx.recv(), if hooks_open => Next::Hook(callback),
+            };
+            match next {
+                Next::StreamClosed(closed) => {
+                    if closed {
                         stream_open = false;
                     }
                     let current = *stream.borrow();
@@ -840,37 +1015,55 @@ pub(crate) fn spawn(
                             state.lose("Antigravity native queue overflowed").await;
                         }
                         StreamState::Malformed(fault) => {
-                            state.lose(&format!(
-                                "Antigravity stream contained an invalid frame ({})",
-                                fault.label()
-                            )).await;
+                            state
+                                .lose(&format!(
+                                    "Antigravity stream contained an invalid frame ({})",
+                                    fault.label()
+                                ))
+                                .await;
                         }
                         _ => {}
                     }
                     continue;
                 }
-            };
-            let Some(frame) = frame else { break };
-            let current = *stream.borrow();
-            let mut state = state.lock().await;
-            match current {
-                StreamState::Overflow => {
-                    state.lose("Antigravity native queue overflowed").await;
+                Next::Hook(Some(callback)) => {
+                    if let Err(error) =
+                        handle_hook_callback(callback.callback, callback.binding, &state).await
+                    {
+                        state.lock().await.lose(&error.message).await;
+                    }
+                    continue;
                 }
-                StreamState::Malformed(fault) => {
-                    state
-                        .lose(&format!(
-                            "Antigravity stream contained an invalid frame ({})",
-                            fault.label()
-                        ))
-                        .await;
+                Next::Hook(None) => {
+                    hooks_open = false;
+                    continue;
                 }
-                _ => {}
-            }
-            if let Err(error) = state.observe(frame, &client).await {
-                state.lose(&error.message).await;
+                Next::Frame(None) => break,
+                Next::Frame(Some(frame)) => {
+                    let current = *stream.borrow();
+                    let mut state = state.lock().await;
+                    match current {
+                        StreamState::Overflow => {
+                            state.lose("Antigravity native queue overflowed").await;
+                        }
+                        StreamState::Malformed(fault) => {
+                            state
+                                .lose(&format!(
+                                    "Antigravity stream contained an invalid frame ({})",
+                                    fault.label()
+                                ))
+                                .await;
+                        }
+                        _ => {}
+                    }
+                    if let Err(error) = state.observe(frame, &client).await {
+                        state.lose(&error.message).await;
+                    }
+                }
             }
         }
+        hook_accept_task.abort();
+        let _ = hook_accept_task.await;
         // All queued stdout is consumed before concluding loss or planned EOF.
         let mut state = state.lock().await;
         if matches!(
@@ -883,5 +1076,186 @@ pub(crate) fn spawn(
                 .lose("Antigravity stream closed outside a planned stop")
                 .await;
         }
+    })
+}
+
+async fn handle_hook_callback(
+    callback: HookCallback,
+    binding: Option<HookTurnBinding>,
+    state: &Shared,
+) -> Result<()> {
+    let Some(binding) = binding else {
+        let _ = callback.respond(HookOutput::empty()).await;
+        return Ok(());
+    };
+    let live_binding = {
+        let mut state = state.lock().await;
+        if state.hook_turn_is_live(&binding.conversation, &binding.turn) {
+            Some((
+                state.take_pending_steer(&binding.turn),
+                state.host.clone(),
+                state.credential.clone(),
+            ))
+        } else {
+            None
+        }
+    };
+    let Some((steer, host, credential)) = live_binding else {
+        let _ = callback.respond(HookOutput::empty()).await;
+        return Ok(());
+    };
+
+    let consumer_id = Ulid::new().to_string();
+    let event = HookEvent {
+        hook: "before_model".to_owned(),
+        turn_id: binding.turn.clone(),
+        consumer_id: consumer_id.clone(),
+    };
+    let mut params = match serde_json::to_value(event) {
+        Ok(params) => params,
+        Err(_) => {
+            let _ = callback.respond(HookOutput::empty()).await;
+            return Ok(());
+        }
+    };
+    let Some(params) = params.as_object_mut() else {
+        let _ = callback.respond(HookOutput::empty()).await;
+        return Ok(());
+    };
+    params.insert(
+        "credential".to_owned(),
+        serde_json::Value::String(credential),
+    );
+
+    let (context, selection_known) = match host
+        .call(
+            "hook.event",
+            serde_json::Value::Object(std::mem::take(params)),
+            Instant::now() + EVENT_DEADLINE,
+        )
+        .await
+    {
+        Ok(response) => match serde_json::from_value::<HookResponse>(response) {
+            Ok(response) => (response.context, true),
+            Err(_) => (Vec::new(), false),
+        },
+        Err(_) => (Vec::new(), false),
+    };
+
+    let context_message = if context.is_empty() {
+        None
+    } else {
+        match eliot_plugin::session::with_claimed_context("", &context, "Antigravity") {
+            Ok(text) => {
+                let message = text.strip_suffix("\n\n").unwrap_or(&text).to_owned();
+                (!message.is_empty()).then_some(message)
+            }
+            Err(_) => None,
+        }
+    };
+
+    let mut include_context = context_message.is_some();
+    let mut output = HookOutput::empty();
+    if let Some(message) = &context_message {
+        output
+            .inject_steps
+            .push(HookStep::ephemeral(message.clone()));
+    }
+    if let Some(steer) = &steer {
+        output
+            .inject_steps
+            .push(HookStep::ephemeral(steer.text.clone()));
+    }
+    if serde_json::to_vec(&output).map_or(true, |bytes| bytes.len() > MAX_HOOK_FRAME_BYTES) {
+        include_context = false;
+        output = HookOutput::empty();
+        if let Some(steer) = &steer {
+            output
+                .inject_steps
+                .push(HookStep::ephemeral(steer.text.clone()));
+        }
+    }
+    if serde_json::to_vec(&output).map_or(true, |bytes| bytes.len() > MAX_HOOK_FRAME_BYTES) {
+        let _ = callback.respond(HookOutput::empty()).await;
+        if let Some(steer) = steer {
+            let _ = steer.reply.send(Err(Error::new(
+                "frame_too_large",
+                "Antigravity PreInvocation steer response exceeds its frame bound",
+            )));
+        }
+        return Ok(());
+    }
+
+    let live = state
+        .lock()
+        .await
+        .hook_turn_is_live(&binding.conversation, &binding.turn);
+    if !live {
+        let _ = callback.respond(HookOutput::empty()).await;
+        if let Some(steer) = steer {
+            let _ = steer.reply.send(Err(Error::new(
+                "stale_turn",
+                "Antigravity prompt ended before PreInvocation applied steer",
+            )));
+        }
+        return Ok(());
+    }
+    if callback.respond(output).await.is_err() {
+        if let Some(steer) = steer {
+            let result = unknown_steer_result(
+                &steer,
+                "Antigravity helper did not confirm its stdout response",
+            );
+            let _ = steer.reply.send(Ok(result));
+        }
+        return Ok(());
+    }
+
+    if let Some(steer) = steer {
+        let result = serde_json::json!({
+            "state": "applied",
+            "command_id": steer.command_id,
+            "turn_id": steer.turn_id,
+            "mechanism": STEER_MECHANISM,
+            "native_hook": "PreInvocation",
+        });
+        let _ = steer.reply.send(Ok(result));
+    }
+
+    if !selection_known || (!context.is_empty() && !include_context) {
+        return Ok(());
+    }
+
+    let mut data = serde_json::json!({
+        "turn_id": binding.turn.clone(),
+        "consumer_id": consumer_id.clone(),
+    });
+    if !context.is_empty() {
+        let outcome = ContextOutcome {
+            mechanism: STEER_MECHANISM.to_owned(),
+            application_point: InjectPoint::TurnSafePoint,
+            consumer_id: consumer_id.clone(),
+        };
+        let outcome = serde_json::to_value(outcome)
+            .map_err(|_| Error::new("internal", "Antigravity hook outcome could not be encoded"))?;
+        data.as_object_mut()
+            .ok_or_else(|| Error::new("internal", "Antigravity hook receipt is not an object"))?
+            .insert("context_outcome".to_owned(), outcome);
+    }
+    state
+        .lock()
+        .await
+        .commit("hook.before_model", &binding.turn, &consumer_id, data)
+        .await
+}
+
+fn unknown_steer_result(steer: &PendingSteer, reason: &str) -> Value {
+    serde_json::json!({
+        "state": "unknown",
+        "command_id": steer.command_id,
+        "turn_id": steer.turn_id,
+        "mechanism": STEER_MECHANISM,
+        "native_hook": "PreInvocation",
+        "reason": reason,
     })
 }
