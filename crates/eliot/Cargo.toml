@@ -33,3 +33,6 @@ rmcp = { version = "3.9.0", default-features = false, features = ["server", "tra
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tokio-util.workspace = true
 tower-service = "0.3"
+reqwest.workspace = true
+futures-util.workspace = true
+jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["aws_lc_rs"] }

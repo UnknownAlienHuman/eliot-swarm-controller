@@ -25,6 +25,8 @@ pub(crate) mod test_support;
 mod workspace_git;
 mod workspaces;
 
+pub use config::load_cloud_access_config;
+pub use daemon::client_call_with_remote_context;
 pub use daemon::{
     MAX_RPC_FRAME_BYTES, client_call, client_call_typed, client_call_with_owner_credential, run,
 };

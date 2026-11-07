@@ -137,6 +137,7 @@ impl Store {
             let child_cause = core::EventCause {
                 command_id: child_id.clone(),
                 rule: Some(origin.rule.clone()),
+                remote_call: origin.cause.remote_call.clone(),
                 depth: origin.cause.depth,
             };
             let mut child_events = admission.events;
@@ -1080,6 +1081,7 @@ mod tests {
         let forged_rule_cause = core::EventCause {
             command_id: send.id.clone(),
             rule: Some("forged-rule".to_owned()),
+            remote_call: None,
             depth: send_cause.depth,
         };
         let event2 = insert_event(

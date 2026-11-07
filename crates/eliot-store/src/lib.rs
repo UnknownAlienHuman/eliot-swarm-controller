@@ -283,6 +283,74 @@ impl Store {
         result
     }
 
+    /// Preserve authenticated HTTP call provenance in the existing command
+    /// cause and admission events, in the original admission transaction.
+    /// A retained retry keeps its original provenance and never rewrites history.
+    pub fn submit_with_remote_context(
+        &mut self,
+        principal: &str,
+        request: SubmitCommand,
+        preparation: Option<WorkspacePreparationInput>,
+        remote: Option<&core::RemoteCallContext>,
+        now: i64,
+    ) -> Result<Admission> {
+        let Some(remote) = remote else {
+            return self.submit_inner_checked(principal, request, preparation, now);
+        };
+        remote.validate()?;
+        if principal != "owner" {
+            return Err(Error::new(
+                "not_allowed",
+                "remote provenance requires the authenticated owner bridge",
+            ));
+        }
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let mut admission = admission::submit_tx(
+                &tx,
+                principal,
+                request,
+                preparation,
+                now,
+                false,
+                self.hierarchy_limits,
+            )?;
+            if admission.is_new {
+                for event in &mut admission.events {
+                    if event.kind.starts_with("command.")
+                        && let Some(cause) = &event.cause
+                    {
+                        let mut cause = cause.clone();
+                        cause.remote_call = Some(remote.clone());
+                        let id = cause.command_id.clone();
+                        annotate_new_command_cause_tx(&tx, &id, event, cause)?;
+                    }
+                }
+            }
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(admission)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn submit_inner_checked(
+        &mut self,
+        principal: &str,
+        request: SubmitCommand,
+        preparation: Option<WorkspacePreparationInput>,
+        now: i64,
+    ) -> Result<Admission> {
+        self.ensure_writer_healthy()?;
+        let result = self.submit_inner(principal, request, preparation, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     /// Resolve a targetless Git fetch retry using only its caller-authored
     /// selectors and normalized timeout. Frozen remote/OID snapshots are not
     /// consulted until a genuinely new command is prepared.
@@ -2978,6 +3046,7 @@ fn ordinary_command_cause(command_id: &str) -> core::EventCause {
     core::EventCause {
         command_id: command_id.to_owned(),
         rule: None,
+        remote_call: None,
         depth: 0,
     }
 }
@@ -3008,6 +3077,7 @@ fn annotate_new_command_cause_tx(
     let default_cause = core::EventCause {
         command_id: command_id.to_owned(),
         rule: None,
+        remote_call: None,
         depth: 0,
     };
     let default_json = encode_json(&default_cause)?;

@@ -1,11 +1,9 @@
 //! Loopback-only StreamableHTTP frontend reusing the existing MCP handler.
 //!
-//! Same single `swarm` tool and the same `eliot_daemon::client_call`
-//! path/identity as the stdio frontend; only the transport differs.
-//! The listener binds 127.0.0.1 only. This is a dedicated service for one
-//! owner: the intended deployment sits behind Cloudflare Access
-//! (ManagedOAuth) with the required cloudflared native JWT validation in
-//! front, bound to the owner HTTP service principal after that edge auth.
+//! Same single `swarm` tool and existing authenticated daemon path as stdio.
+//! The listener binds 127.0.0.1 only, with signed Access-assertion validation
+//! before every SDK request, including initialization. Cloudflared's JWT
+//! check protects its route separately; loopback is not an auth boundary.
 //! This module builds no OAuth or principal framework, and never treats
 //! `clientInfo` (an untrusted client label) as authentication. Request
 //! bodies keep the daemon 4 MiB frame bound.
@@ -42,6 +40,7 @@ use rmcp::transport::streamable_http_server::{
 use tokio_util::sync::CancellationToken;
 
 use super::EliotMcpHandler;
+use super::origin_auth::{OriginAuth, VerifiedRequest, now_seconds};
 
 /// MCP route served locally; the owner-managed tunnel maps the public URL
 /// onto it. Single route by design: no arbitrary routes. Also the required
@@ -51,6 +50,12 @@ const MCP_HTTP_PATH: &str = "/mcp";
 const HTTPS_DEFAULT_PORT: u16 = 443;
 
 type HttpMcpService = StreamableHttpService<EliotMcpHandler, LocalSessionManager>;
+
+#[derive(Clone)]
+struct HttpState {
+    service: HttpMcpService,
+    auth: Arc<OriginAuth>,
+}
 
 /// Serve the shared MCP handler over StreamableHTTP on 127.0.0.1:`port`
 /// (`0` selects an ephemeral port; the actual address is printed in the
@@ -65,6 +70,8 @@ pub async fn run_http(
     managed_child: bool,
     public_url: Option<String>,
 ) -> Result<(), String> {
+    let sessions = Arc::new(LocalSessionManager::default());
+    let auth = Arc::new(OriginAuth::load(&data_dir, sessions.clone()).await?);
     let public = public_url.as_deref().map(parse_public_url).transpose()?;
     let listener =
         tokio::net::TcpListener::bind(SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)))
@@ -106,7 +113,7 @@ pub async fn run_http(
                 log_level: Arc::new(RwLock::new(LoggingLevel::Info)),
             })
         },
-        Arc::new(LocalSessionManager::default()),
+        sessions,
         config,
     );
     // Direct route (never nested: nesting can drop the `Host` header the
@@ -117,7 +124,7 @@ pub async fn run_http(
             MCP_HTTP_PATH,
             post(serve_mcp).get(serve_mcp).delete(serve_mcp),
         )
-        .with_state(service);
+        .with_state(HttpState { service, auth });
     let frame = McpHttpReady {
         address: bound.to_string(),
     }
@@ -178,11 +185,21 @@ fn parse_public_url(raw: &str) -> Result<PublicEndpoint, String> {
 }
 
 async fn serve_mcp(
-    State(service): State<HttpMcpService>,
-    request: Request<axum::body::Body>,
+    State(state): State<HttpState>,
+    mut request: Request<axum::body::Body>,
 ) -> Response<axum::body::Body> {
+    let method = request.method().clone();
+    let verified: VerifiedRequest = match state
+        .auth
+        .authenticate(request.headers_mut(), &method)
+        .await
+    {
+        Ok(verified) => verified,
+        Err(status) => return rejected(status),
+    };
+    request.extensions_mut().insert(verified.clone());
     use tower_service::Service as _;
-    let mut service = service;
+    let mut service = state.service;
     let ready = std::future::poll_fn(|context| {
         <HttpMcpService as tower_service::Service<Request<axum::body::Body>>>::poll_ready(
             &mut service,
@@ -194,9 +211,37 @@ async fn serve_mcp(
         return internal_error();
     }
     match service.call(request).await {
-        Ok(response) => response.map(axum::body::Body::new),
+        Ok(response) => {
+            if let Err(status) = state
+                .auth
+                .finish(&verified, &method, response.status(), response.headers())
+                .await
+            {
+                return rejected(status);
+            }
+            // A persistent GET stream must not outlive the credential that
+            // authorized that HTTP request, even if its MCP session survives.
+            use futures_util::StreamExt as _;
+            let lifetime = std::time::Duration::from_secs(
+                verified.context.expires_at.saturating_sub(now_seconds()),
+            );
+            response.map(|body| {
+                axum::body::Body::from_stream(
+                    axum::body::Body::new(body)
+                        .into_data_stream()
+                        .take_until(tokio::time::sleep(lifetime)),
+                )
+            })
+        }
         Err(error) => match error {},
     }
+}
+
+fn rejected(status: axum::http::StatusCode) -> Response<axum::body::Body> {
+    Response::builder()
+        .status(status)
+        .body(axum::body::Body::empty())
+        .unwrap_or_default()
 }
 
 async fn shutdown_signal(managed_child: bool, cancel: CancellationToken) {

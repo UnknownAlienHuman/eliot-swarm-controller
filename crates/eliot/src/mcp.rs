@@ -27,6 +27,7 @@
 
 mod bounded_io;
 mod http;
+mod origin_auth;
 
 pub use http::run_http;
 
@@ -120,12 +121,23 @@ impl ServerHandler for EliotMcpHandler {
         &self,
         context: NotificationContext<RoleServer>,
     ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
-        if self.notify_owner_events && !self.notify_spawned.swap(true, Ordering::SeqCst) {
+        let verified = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<origin_auth::VerifiedRequest>())
+            .cloned();
+        if self.notify_owner_events
+            && let Some(verified) = verified
+            && verified.context.session_id.is_some()
+            && !self.notify_spawned.swap(true, Ordering::SeqCst)
+        {
             spawn_owner_notify_task(
                 self.data_dir.clone(),
                 context.peer,
                 self.shutdown.clone(),
                 self.log_level.clone(),
+                verified.context,
+                verified.lease,
             );
         }
         std::future::ready(())
@@ -163,10 +175,21 @@ impl ServerHandler for EliotMcpHandler {
     fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResponse, McpError>> + MaybeSendFuture + '_ {
         let data_dir = self.data_dir.clone();
+        let remote = verified_remote(
+            &context.extensions,
+            Some(serde_json::to_value(&context.id).unwrap_or(Value::Null)),
+        );
+        let http = self.notify_owner_events;
         async move {
+            if http && remote.is_none() {
+                return Err(McpError::invalid_request(
+                    "verified HTTP identity is missing",
+                    None,
+                ));
+            }
             if request.name.as_ref() != TOOL_NAME {
                 return Err(McpError::invalid_params("tool not found", None));
             }
@@ -188,11 +211,29 @@ impl ServerHandler for EliotMcpHandler {
                 )])
                 .into());
             }
-            match eliot_daemon::client_call(Path::new(&data_dir), &parsed.method, params).await {
-                Ok(value) => Ok(CallToolResult::structured(
-                    json!({ "method": parsed.method, "result": value }),
-                )
-                .into()),
+            let result = match remote.as_ref() {
+                Some(remote) => {
+                    eliot_daemon::client_call_with_remote_context(
+                        Path::new(&data_dir),
+                        &parsed.method,
+                        params,
+                        remote,
+                    )
+                    .await
+                }
+                None => {
+                    eliot_daemon::client_call(Path::new(&data_dir), &parsed.method, params).await
+                }
+            };
+            match result {
+                Ok(value) => {
+                    let output = if http {
+                        json!({"method": parsed.method, "result": value["result"], "remote_call": value["remote_call"]})
+                    } else {
+                        json!({"method": parsed.method, "result": value})
+                    };
+                    Ok(CallToolResult::structured(output).into())
+                }
                 Err(error) => Ok(CallToolResult::structured_error(json!({
                     "code": error.code,
                     "message": error.message,
@@ -248,17 +289,22 @@ fn server_capabilities(notify_owner_events: bool) -> ServerCapabilities {
 /// peer/transport closure, or daemon error. Peer closure is probed every
 /// poll cycle through the SDK channel, so an idle session with no matching
 /// event still ends promptly (at most one in-flight long-poll past the
-/// disconnect). It never retries: a dead task stays dead until the client
-/// opens a new session.
+/// disconnect). Assertion expiry pauses reads until verified session renewal;
+/// it does not destroy the existing task or cursor. Other daemon/transport
+/// failures end the task until the client opens a new session.
 #[allow(deprecated)] // SEP-2577: LoggingLevel is deprecated but functional in rmcp 3.9.
 fn spawn_owner_notify_task(
     data_dir: PathBuf,
     peer: Peer<RoleServer>,
     shutdown: CancellationToken,
     log_level: Arc<RwLock<LoggingLevel>>,
+    remote: eliot_core::RemoteCallContext,
+    lease: Arc<origin_auth::SessionLease>,
 ) {
     tokio::spawn(async move {
-        let Some(mut after) = current_tip(&data_dir).await else {
+        let Some(mut after) =
+            current_tip_remote(&data_dir, &remote, &lease, &peer, &shutdown).await
+        else {
             return;
         };
         loop {
@@ -277,14 +323,18 @@ fn spawn_owner_notify_task(
             if params.validate().is_err() {
                 return;
             }
-            let response: EventsSubscribeResponse = tokio::select! {
-                result = eliot_daemon::client_call_typed(&data_dir, "events.subscribe", &params) => {
-                    match result {
-                        Ok(response) => response,
-                        Err(_) => return,
-                    }
-                }
-                () = shutdown.cancelled() => return,
+            let Some(response) = session_read::<EventsSubscribeResponse>(
+                &data_dir,
+                "events.subscribe",
+                &params,
+                &remote,
+                &lease,
+                &peer,
+                &shutdown,
+            )
+            .await
+            else {
+                return;
             };
             if response.validate(after).is_err() {
                 return;
@@ -293,7 +343,15 @@ fn spawn_owner_notify_task(
                 .read()
                 .map(|level| *level)
                 .unwrap_or(LoggingLevel::Info);
+            let mut authorized = true;
             for event in &response.events {
+                if !lease
+                    .current_expiry()
+                    .is_some_and(|exp| exp > origin_auth::now_seconds())
+                {
+                    authorized = false;
+                    break;
+                }
                 if let Some((level, data)) = normalize_owner_event(event)
                     && severity(&level) >= severity(&minimum)
                     && peer
@@ -304,24 +362,121 @@ fn spawn_owner_notify_task(
                     return;
                 }
             }
-            after = response.next;
+            if authorized {
+                after = response.next;
+            }
         }
     });
 }
 
 /// Read the allocated journal tip once so a new session delivers live events
 /// only. `None` (daemon error or invalid response) aborts the task.
-async fn current_tip(data_dir: &Path) -> Option<i64> {
+async fn current_tip_remote(
+    data_dir: &Path,
+    remote: &eliot_core::RemoteCallContext,
+    lease: &origin_auth::SessionLease,
+    peer: &Peer<RoleServer>,
+    shutdown: &CancellationToken,
+) -> Option<i64> {
     let params = EventsBoundsRequest::default();
     if params.validate().is_err() {
         return None;
     }
-    let response: EventsBoundsResponse =
-        eliot_daemon::client_call_typed(data_dir, "events.bounds", &params)
-            .await
-            .ok()?;
+    let response: EventsBoundsResponse = session_read(
+        data_dir,
+        "events.bounds",
+        &params,
+        remote,
+        lease,
+        peer,
+        shutdown,
+    )
+    .await?;
     response.validate().ok()?;
     Some(response.hi)
+}
+
+/// Renew only the existing notification task's read-only polls. Cancellation,
+/// expiry or renewal leaves its cursor unchanged; no write is retried here.
+async fn session_read<R: serde::de::DeserializeOwned>(
+    data_dir: &Path,
+    method: &str,
+    params: &impl serde::Serialize,
+    remote: &eliot_core::RemoteCallContext,
+    lease: &origin_auth::SessionLease,
+    peer: &Peer<RoleServer>,
+    shutdown: &CancellationToken,
+) -> Option<R> {
+    if !matches!(method, "events.bounds" | "events.subscribe") {
+        return None;
+    }
+    let mut renewals = lease.subscribe();
+    loop {
+        if peer.is_transport_closed() {
+            return None;
+        }
+        let expires_at = (*renewals.borrow_and_update())?;
+        if expires_at <= origin_auth::now_seconds() {
+            tokio::select! {
+                () = shutdown.cancelled() => return None,
+                changed = renewals.changed() => { changed.ok()?; },
+                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
+            }
+            continue;
+        }
+        let mut current = remote.clone();
+        current.expires_at = expires_at;
+        let remaining =
+            std::time::Duration::from_secs(expires_at.saturating_sub(origin_auth::now_seconds()));
+        tokio::select! {
+            () = shutdown.cancelled() => return None,
+            changed = renewals.changed() => { changed.ok()?; },
+            () = tokio::time::sleep(remaining) => {},
+            result = remote_read(data_dir, method, params, Some(&current)) => {
+                match result {
+                    Ok(response) => return Some(response),
+                    Err(_) if lease.current_expiry().is_some_and(|exp| exp > expires_at)
+                        || expires_at <= origin_auth::now_seconds() => {},
+                    Err(_) => return None,
+                }
+            },
+        }
+    }
+}
+
+fn verified_remote(
+    extensions: &rmcp::model::Extensions,
+    request_id: Option<Value>,
+) -> Option<eliot_core::RemoteCallContext> {
+    let parts = extensions.get::<axum::http::request::Parts>()?;
+    let verified = parts.extensions.get::<origin_auth::VerifiedRequest>()?;
+    let mut context = verified.context.clone();
+    context.mcp_request_id = request_id;
+    context.call_id = ulid::Ulid::new().to_string();
+    context.validate().ok()?;
+    (context.expires_at > origin_auth::now_seconds()).then_some(context)
+}
+
+async fn remote_read<R: serde::de::DeserializeOwned>(
+    data_dir: &Path,
+    method: &str,
+    params: &impl serde::Serialize,
+    remote: Option<&eliot_core::RemoteCallContext>,
+) -> eliot_core::Result<R> {
+    match remote {
+        None => eliot_daemon::client_call_typed(data_dir, method, params).await,
+        Some(context) => {
+            let mut context = context.clone();
+            context.call_id = ulid::Ulid::new().to_string();
+            let params = serde_json::to_value(params)
+                .map_err(|_| eliot_core::Error::new("invalid", "invalid remote query"))?;
+            let response =
+                eliot_daemon::client_call_with_remote_context(data_dir, method, params, &context)
+                    .await?;
+            serde_json::from_value(response["result"].clone())
+                .map_err(|_| eliot_core::Error::new("unknown", "remote query response is invalid"))
+        }
+    }
 }
 
 /// Map one committed event to its owner-facing logging level and payload,
@@ -333,7 +488,7 @@ fn normalize_owner_event(event: &Event) -> Option<(LoggingLevel, Value)> {
     if !NOTIFY_EVENT_KINDS.contains(&event.kind.as_str()) {
         return None;
     }
-    match event.kind.as_str() {
+    let (level, mut payload) = match event.kind.as_str() {
         "x.user.notify" => {
             let message = event.data.get("message")?.as_str()?;
             let mut payload = json!({
@@ -407,7 +562,16 @@ fn normalize_owner_event(event: &Event) -> Option<(LoggingLevel, Value)> {
             Some((level, payload))
         }
         _ => None,
+    }?;
+    if let Some(remote) = event
+        .cause
+        .as_ref()
+        .and_then(|cause| cause.remote_call.as_ref())
+    {
+        remote.validate().ok()?;
+        payload["remote_call"] = serde_json::to_value(remote).ok()?;
     }
+    Some((level, payload))
 }
 
 /// Syslog severity rank for [`LoggingLevel`]: higher is more severe. Only
@@ -429,7 +593,7 @@ fn severity(level: &LoggingLevel) -> u8 {
 
 /// Build one `notifications/message` envelope for the session peer.
 /// `clientInfo` is never read: the peer is the owner service principal by
-/// deployment design (Cloudflare Access plus cloudflared JWT at the edge),
+/// verified origin identity and the owner-only Access application,
 /// and the logger name is fixed.
 #[allow(deprecated)] // SEP-2577: deprecated but functional in rmcp 3.9.
 fn owner_notification(level: LoggingLevel, data: Value) -> ServerNotification {

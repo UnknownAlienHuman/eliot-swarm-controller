@@ -54,6 +54,24 @@ impl Router {
         match kind {
             "owner" => {
                 if secure_eq(credential, &self.inner.owner_token) {
+                    if let Some(remote) = auth.get("remote_call") {
+                        let remote: eliot_core::RemoteCallContext =
+                            serde_json::from_value(remote.clone())
+                                .map_err(|_| Error::new("not_allowed", "invalid remote context"))?;
+                        remote.validate()?;
+                        let (issuer, audience) =
+                            crate::config::load_cloud_access_config(&self.inner.data_root)?;
+                        if remote.identity.issuer != issuer
+                            || remote.identity.audience != audience
+                            || remote.expires_at.saturating_mul(1_000)
+                                <= crate::common::now_ms().max(0) as u64
+                        {
+                            return Err(Error::new(
+                                "not_allowed",
+                                "remote context is expired or has a different Access binding",
+                            ));
+                        }
+                    }
                     Ok((Principal::Owner, payload))
                 } else {
                     Err(Error::new("not_allowed", "owner credential is invalid"))
@@ -158,6 +176,9 @@ pub(super) fn authorize_rpc_method(principal: &Principal, method: &str) -> Resul
 }
 
 fn auth_fields_are_exact(auth: &serde_json::Map<String, Value>, kind: &str) -> bool {
+    if kind == "owner" && auth.contains_key("remote_call") {
+        return auth.len() == 3 && auth.contains_key("credential");
+    }
     let fields: &[&str] = match kind {
         "owner" => &["kind", "credential"],
         "agent" => &["kind", "agent_id", "generation", "credential"],

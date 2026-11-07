@@ -587,6 +587,35 @@ pub async fn client_call_with_owner_credential(
     raw_client_call(&info.endpoint, method, params, auth, &policy).await
 }
 
+/// HTTP bridge only: signed identity has already been checked at the origin.
+/// The private Owner credential authenticates this context to the local Router.
+pub async fn client_call_with_remote_context(
+    path: &Path,
+    method: &str,
+    params: Value,
+    remote: &eliot_core::RemoteCallContext,
+) -> Result<Value> {
+    remote.validate()?;
+    if method.trim().is_empty() || !params.is_object() {
+        return Err(Error::new("invalid", "invalid remote RPC"));
+    }
+    let data_dir = DataDir::open_existing(path)?;
+    let info = data_dir
+        .read_daemon_info()?
+        .ok_or_else(|| Error::new("unavailable", "daemon is not running"))?;
+    let token = data_dir.read_owner_token()?;
+    let policy = SecretPolicy::new([token.as_str()]);
+    let auth = json!({"kind":"owner", "credential": token, "remote_call": remote});
+    let result = raw_client_call(&info.endpoint, method, params, auth, &policy).await?;
+    let echoed: eliot_core::RemoteCallContext =
+        serde_json::from_value(result["remote_call"].clone())
+            .map_err(|_| Error::new("unknown", "daemon omitted verified remote call binding"))?;
+    if &echoed != remote || result.get("result").is_none() {
+        return Err(Error::new("unknown", "daemon remote call binding differs"));
+    }
+    Ok(result)
+}
+
 async fn raw_client_call(
     endpoint: &str,
     method: &str,
@@ -595,10 +624,14 @@ async fn raw_client_call(
     policy: &SecretPolicy,
 ) -> Result<Value> {
     let mut envelope = serde_json::Map::new();
+    let id = auth
+        .get("remote_call")
+        .and_then(|remote| remote.get("call_id"))
+        .cloned()
+        .unwrap_or_else(|| Value::String(Ulid::new().to_string()));
     envelope.insert("_auth".to_owned(), auth);
     envelope.insert("_payload".to_owned(), params.clone());
 
-    let id = Value::String(Ulid::new().to_string());
     let request = RpcRequest {
         jsonrpc: "2.0".to_owned(),
         id: id.clone(),
@@ -695,7 +728,7 @@ async fn serve_connection(stream: IpcStream, router: Router, policy: Arc<SecretP
             match decode_request(&line) {
                 Ok(request) => {
                     let is_shutdown = request.method == "daemon.shutdown";
-                    match router.handle(&request.method, request.params).await {
+                    match router.handle_rpc(&request).await {
                         Ok(result) => {
                             arm_shutdown = is_shutdown;
                             RpcResponse {

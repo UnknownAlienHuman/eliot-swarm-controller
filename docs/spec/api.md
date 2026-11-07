@@ -88,16 +88,37 @@ JSON-RPC: it signals managed-child readiness (local listener bound), never publi
 tunnel or auth readiness. See [cloud MCP runtime](cloud-mcp.md) for the tunnel,
 Access and child-lifecycle rules.
 
-Authority is the local Owner service principal by design. The deployment is an
-owner-only Access app: Cloudflare Access plus cloudflared native JWT validation
-authenticate the owner at the edge ([cloud-mcp.md](cloud-mcp.md)), and the child
-forwards each call through the existing local owner-token path. It never creates,
-accepts or reports a local Agent, Agent/PID, or Agent generation, and `clientInfo`
-is never read as evidence: it is untrusted and unused.
+The deployment is an owner-only Access app. Every origin POST/GET/DELETE validates
+the signed `Cf-Access-Jwt-Assertion` before MCP initialization or SDK dispatch.
+Managed OAuth's opaque client access token is not that assertion. The verifier uses
+the configured team issuer, fixed team signing-key endpoint, application AUD, RS256
+signature, expiry/not-before, application-token type and nonempty subject. Missing
+or invalid authentication is refused; key lookup failure fails closed. Manual HTTP
+requires the same `[cloud_mcp]` Access configuration; stdio/local IPC are unchanged.
+Host/Origin checks and cloudflared's own JWT validation remain additional checks.
 
-Exact limitations: rmcp binds transport sessions to their request/response streams
-only. Router receives the existing Owner authority with no new local Agent/PID, and
-no remote subject or session metadata is persisted into semantic Store data.
+Credential headers are stripped before request parts enter SDK extensions. The
+verified identity binds each stateful SDK session; a different subject cannot use
+its POST/GET/DELETE. Verified same-identity refresh monotonically extends the
+session lease; an older concurrent assertion cannot shorten it. The existing
+notification task retains its cursor, pauses polls while its lease is expired,
+and uses the renewed expiry for subsequent authenticated reads. Each GET stream
+still ends at that GET's own authorizing assertion expiry. Stateless
+requests carry fresh server-generated connection/call correlation without inventing
+a session. `clientInfo` is untrusted and unused. No local Agent/PID or generation
+is created for a remote caller.
+
+The private owner credential authenticates the bridge's typed
+[`RemoteCallContext`](../../crates/eliot-core/src/remote_call.rs) to Router. Router
+revalidates its configured issuer/AUD, expiry and RPC call-id binding, applies the
+existing Owner authority, and echoes the context with the RPC result; HTTP tool
+results expose it as `structuredContent.remote_call`. This is provenance for the
+existing owner-only app, not additional roles or per-user permissions. Standard
+`command.submit` admission persists the context in the existing command/event cause
+before commit and publication; retries retain their original admitted cause. Reads
+do not create an audit event, and other RPC results carry call context without
+claiming command-cause attribution. JWTs, OAuth tokens, cookies and owner credentials
+never enter that context or semantic data.
 
 Session handling is native rmcp negotiation with no override: pre-2026 clients get
 stateful in-memory SDK sessions (`LocalSessionManager`); clients negotiating

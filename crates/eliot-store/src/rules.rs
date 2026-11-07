@@ -296,6 +296,10 @@ impl<'a> RuleFiringKey<'a> {
         Ok(core::EventCause {
             command_id: command_id.to_owned(),
             rule: Some(self.state.id.clone()),
+            remote_call: self
+                .trigger_cause
+                .as_ref()
+                .and_then(|cause| cause.remote_call.clone()),
             depth,
         })
     }
@@ -2837,6 +2841,7 @@ fn admit_rule_action_tx(
             core::EventCause {
                 command_id: linked_command.id.clone(),
                 rule: child_cause.rule.clone(),
+                remote_call: child_cause.remote_call.clone(),
                 depth: child_cause.depth,
             },
         )?;
@@ -4280,6 +4285,7 @@ mod tests {
         let trigger_cause = core::EventCause {
             command_id: Ulid::new().to_string(),
             rule: Some("upstream".to_owned()),
+            remote_call: None,
             depth: 5,
         };
         let event_seq =
@@ -4306,6 +4312,7 @@ mod tests {
         let cause_five = core::EventCause {
             command_id: Ulid::new().to_string(),
             rule: Some("upstream".to_owned()),
+            remote_call: None,
             depth: 5,
         };
         let event_five =
@@ -4360,6 +4367,7 @@ mod tests {
         let cause_four = core::EventCause {
             command_id: Ulid::new().to_string(),
             rule: Some("upstream".to_owned()),
+            remote_call: None,
             depth: 4,
         };
         let event_four =
@@ -7438,6 +7446,7 @@ mod tests {
                 Some(core::EventCause {
                     command_id: child.id.clone(),
                     rule: Some("stop-rule".to_owned()),
+                    remote_call: None,
                     depth: 1,
                 })
             );
@@ -7469,6 +7478,7 @@ mod tests {
                 Some(core::EventCause {
                     command_id: parent.id.clone(),
                     rule: Some("stop-rule".to_owned()),
+                    remote_call: None,
                     depth: 1,
                 })
             );

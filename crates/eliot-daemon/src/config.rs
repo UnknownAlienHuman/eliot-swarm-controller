@@ -954,6 +954,21 @@ pub(crate) fn load_cloud_mcp_config(
     Ok(Some(config))
 }
 
+/// Public, nonsecret settings used by the HTTP origin verifier. Manual and
+/// managed HTTP share the existing owner-configured Access application.
+pub fn load_cloud_access_config(data_root: &Path) -> core::Result<(String, String)> {
+    let config = load_cloud_mcp_config(data_root)?.ok_or_else(|| {
+        core::Error::new(
+            "profile_error",
+            "HTTP MCP requires configured cloud_mcp Access authentication",
+        )
+    })?;
+    Ok((
+        format!("https://{}.cloudflareaccess.com", config.access_team_name),
+        config.access_audience_tag,
+    ))
+}
+
 pub(crate) fn load_mail_config(data_root: &Path) -> core::Result<MailConfig> {
     let Some((config, _)) = read_config(data_root)? else {
         return Ok(MailConfig::default());
