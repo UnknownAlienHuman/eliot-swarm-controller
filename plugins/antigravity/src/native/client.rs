@@ -1,6 +1,6 @@
 use eliot_core::{Result, SecretPolicy};
 use eliot_plugin::native_transport::{
-    NativeChild, NativeLabels, NativeLaunch, PumpAction, StreamState, spawn_pumped,
+    NativeChild, NativeLabels, NativeLaunch, PumpAction, PumpMode, StreamState, spawn_pumped,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -14,6 +14,8 @@ pub(crate) async fn spawn(
     mpsc::Receiver<AgyFrame>,
     watch::Receiver<StreamState>,
 )> {
+    // AGY stream-json has no native RPC replies (init/step_update/result
+    // only), so bounded backpressure cannot deadlock a reply.
     let (child, _, frames, stream) = spawn_pumped(
         launch,
         policy,
@@ -22,6 +24,7 @@ pub(crate) async fn spawn(
             server: "Antigravity",
         },
         "agy",
+        PumpMode::LosslessBackpressure,
         |value| match serde_json::from_value(value) {
             Ok(frame) => PumpAction::Emit(frame),
             Err(_) => {

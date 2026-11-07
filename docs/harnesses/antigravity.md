@@ -33,6 +33,15 @@ A checkpoint carrying modeled tool payload ([`StepUpdate` DTO](../../plugins/ant
 or unknown step type still produces an explicit gap with bounded, redacted structural
 diagnostics.
 
+Transport backpressure: the bounded 64-frame queue delivers AGY records
+losslessly — the pump waits for queue space holding at most one frame,
+respecting receiver closure and the existing exit-drain deadlines, so a slow
+serial Store-ack consumer slows the native stdout reader instead of latching
+an overflow gap. This is safe only because the AGY protocol has no native RPC
+replies or callbacks (init/step_update/result only); JSON-RPC adapters keep
+the nonblocking lossy-overflow mode so reply routing can never deadlock
+behind emitted frames.
+
 ## Native mapping
 
 Launch establishes the session before input; send writes one user record to that warm

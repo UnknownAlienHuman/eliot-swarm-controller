@@ -20,7 +20,7 @@ use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
 use eliot_plugin::{
     StderrView,
     native_transport::{
-        NativeChild, NativeLabels, NativeLaunch, NativeWriter, PendingCalls, PumpAction,
+        NativeChild, NativeLabels, NativeLaunch, NativeWriter, PendingCalls, PumpAction, PumpMode,
         StreamState, encode_frame, spawn_pumped,
     },
 };
@@ -58,11 +58,14 @@ pub(crate) struct ClaudeProcess {
 
 impl ClaudeProcess {
     pub async fn spawn(launch: NativeLaunch, policy: SecretPolicy) -> Result<Self> {
+        // JSON-RPC: keep nonblocking routing; a pending reply must never
+        // wait behind a saturated emit queue.
         let (transport, pending, frame_rx, stream_rx) = spawn_pumped(
             launch,
             policy.clone(),
             LABELS,
             ID_PREFIX,
+            PumpMode::LossyOverflow,
             classify_claude_frame,
         )
         .await?;
