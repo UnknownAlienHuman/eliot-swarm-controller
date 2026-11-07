@@ -62,6 +62,15 @@ pub(crate) struct State {
     /// Held until the actual in-band terminal reply, an error, a stream
     /// fault, stop, or drop — stream silence alone never expires it.
     fenced_guard: Option<FencedGuard>,
+    /// True from fenced `session/load` dispatch until its ordered reply
+    /// frame is consumed. Matching-session updates in this window are
+    /// validated load history and are discarded, never republished.
+    loading: bool,
+    /// RAII registration of the outstanding fenced load call.
+    load_guard: Option<FencedGuard>,
+    /// Ordered load outcome for `Session::start`, published exactly once
+    /// by the event task when the fenced load reply is consumed.
+    load_tx: watch::Sender<Option<Result<Value>>>,
     text_accum: String,
     text_truncated: bool,
     writes_blocked: bool,
@@ -92,6 +101,7 @@ impl State {
         policy: SecretPolicy,
         conversation: String,
     ) -> Self {
+        let (load_tx, _) = watch::channel(None);
         Self {
             sink: CommitSink::new(host.clone(), credential.clone()),
             host,
@@ -104,6 +114,9 @@ impl State {
             tool_emitted: std::collections::HashSet::new(),
             tools: HashMap::new(),
             fenced_guard: None,
+            loading: false,
+            load_guard: None,
+            load_tx,
             text_accum: String::new(),
             text_truncated: false,
             writes_blocked: false,
@@ -127,6 +140,29 @@ impl State {
             .as_ref()
             .filter(|(settled, _)| settled == turn)
             .map(|(_, status)| status.as_str())
+    }
+
+    /// A fresh receiver for the ordered load outcome published by the
+    /// event task. `Session::start` waits on this, never on the RPC
+    /// return alone.
+    pub fn load_receiver(&self) -> watch::Receiver<Option<Result<Value>>> {
+        self.load_tx.subscribe()
+    }
+
+    /// Arm the load gate before fenced dispatch: validated history for
+    /// the retained session is discarded until the ordered load reply
+    /// is consumed.
+    pub fn begin_load(&mut self, guard: FencedGuard) {
+        self.load_guard = Some(guard);
+        self.loading = true;
+    }
+
+    /// Retire a load that never reached the ordered reply (dispatch
+    /// failure or start timeout): loading mode ends without history
+    /// having been validated, so startup fails instead of going live.
+    pub fn abort_load(&mut self) {
+        self.loading = false;
+        self.load_guard = None;
     }
 
     /// Take ownership of the fenced prompt registration — but only if
@@ -222,6 +258,12 @@ impl State {
     }
 
     pub async fn ready(&mut self, scope: &str, effective: Value) -> Result<()> {
+        if self.source_unknown || self.failure.is_some() {
+            return Err(Error::new(
+                "unknown",
+                "Antigravity session state is unresolved before startup",
+            ));
+        }
         self.commit(
             "session.ready",
             "session",
@@ -265,6 +307,16 @@ impl State {
         }
         match frame {
             AgyFrame::Update(params) => self.update(&params).await,
+            // The ordered load boundary: consumed after every history
+            // update ahead of it on the wire. Publish the outcome for
+            // `Session::start` and leave loading mode; nothing here
+            // republishes history or creates a turn.
+            AgyFrame::LoadResponse(result) => {
+                self.loading = false;
+                self.load_guard = None;
+                let _ = self.load_tx.send_replace(Some(result));
+                Ok(())
+            }
             // The fenced terminal reply, consumed in wire order behind
             // every preceding update: it settles the prepared turn only
             // after those updates have been applied.
@@ -323,6 +375,13 @@ impl State {
             ));
         };
         self.check_conversation(&session_id)?;
+        // Validated load history: matching-session updates before the
+        // ordered load reply are history, not live output. Discard them
+        // without association, republication, or turn creation. Live
+        // updates after the reply take the normal path below.
+        if self.loading {
+            return Ok(());
+        }
         match update {
             AcpUpdate::MessageChunk { text } => {
                 self.associate().await?;
@@ -524,6 +583,8 @@ impl State {
 
     pub async fn ended(&mut self) -> Result<()> {
         self.clear_fenced();
+        self.loading = false;
+        self.load_guard = None;
         if !self.stopped {
             if self.pending.is_some() {
                 self.lose("Antigravity stopped with an unresolved input")
@@ -552,6 +613,8 @@ impl State {
     pub async fn lose(&mut self, reason: &str) {
         self.source_unknown = true;
         self.clear_fenced();
+        self.loading = false;
+        self.load_guard = None;
         if let Some(pending) = self.pending.as_ref() {
             self.settlement = Some((pending.turn.clone(), "unknown".to_owned()));
         }

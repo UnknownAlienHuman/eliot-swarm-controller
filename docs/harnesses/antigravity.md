@@ -27,6 +27,11 @@ controls are not ACP facts and are not claimed here.
 The adapter uses `start_requires_input = false`: spawn, `initialize`
 (protocol 1), then `session/new` — or `session/load` with the exact
 retained session id on resume, which sends no input by itself. The
+load reply is fenced in wire order behind the history replay: validated
+matching-session updates before the reply are discarded (never
+republished, never turned into live output), and only the ordered reply
+publishes the startup outcome. `session.ready` is refused when the
+stream already went unknown during startup. The
 pinned `session/load` response deliberately carries no session id, so
 the adapter retains the exact id from its correlated request and
 validates it against the resume subject. Both paths validate the

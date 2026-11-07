@@ -16,7 +16,7 @@
 //! queue, and an overflow latches the existing stream-fault gap.
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     process::ExitStatus,
     sync::{Arc, Mutex as StdMutex},
 };
@@ -43,6 +43,15 @@ const LABELS: NativeLabels = NativeLabels {
 pub(crate) use eliot_plugin::native_transport::StreamState;
 const ID_PREFIX: &str = "agy";
 
+/// Which ordered fence a fenced reply belongs to. The classifier emits
+/// the frame variant matching the pending call's kind, so a load reply
+/// can never be mistaken for a prompt terminal (or vice versa).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FencedKind {
+    Prompt,
+    Load,
+}
+
 /// One ACP stream record for the event task, in wire order.
 #[derive(Debug)]
 pub(crate) enum AgyFrame {
@@ -50,6 +59,9 @@ pub(crate) enum AgyFrame {
     Update(Value),
     /// The terminal reply of a fenced `session/prompt` call.
     PromptResponse(Result<Value>),
+    /// The reply of a fenced `session/load` call: everything before it
+    /// on the wire is validated load history, everything after is live.
+    LoadResponse(Result<Value>),
     /// An agent-to-client request (permission, terminal, fs, elicitation).
     ServerRequest {
         id: Value,
@@ -67,7 +79,7 @@ pub(crate) enum AgyFrame {
 pub(crate) struct FencedGuard {
     /// Held for its `Drop` only: removes the pending-map entry.
     _guard: PendingGuard,
-    fenced: Arc<StdMutex<HashSet<String>>>,
+    fenced: Arc<StdMutex<HashMap<String, FencedKind>>>,
     id: String,
 }
 
@@ -84,7 +96,7 @@ impl Drop for FencedGuard {
 pub(crate) struct AgyClient {
     writer: NativeWriter,
     pending: PendingCalls,
-    fenced: Arc<StdMutex<HashSet<String>>>,
+    fenced: Arc<StdMutex<HashMap<String, FencedKind>>>,
     stderr: StderrView,
     policy: SecretPolicy,
 }
@@ -127,7 +139,7 @@ struct NativeRpcError {
 
 impl AgyProcess {
     pub async fn spawn(launch: NativeLaunch, policy: SecretPolicy) -> Result<Self> {
-        let fenced = Arc::new(StdMutex::new(HashSet::new()));
+        let fenced = Arc::new(StdMutex::new(HashMap::new()));
         let fenced_classify = Arc::clone(&fenced);
         // JSON-RPC: keep nonblocking routing; a pending reply must never
         // wait behind a saturated emit queue.
@@ -216,13 +228,14 @@ impl AgyClient {
 
     /// Dispatch one request whose reply must be consumed in wire order
     /// behind preceding stream records. Returns the request id plus the
-    /// RAII registration guard; the reply arrives as
-    /// [`AgyFrame::PromptResponse`] on the event channel.
+    /// RAII registration guard; the reply arrives as the matching
+    /// [`AgyFrame`] variant on the event channel.
     pub async fn call_fenced(
         &self,
         method: &str,
         params: Value,
         deadline: Instant,
+        kind: FencedKind,
     ) -> Result<(String, FencedGuard)> {
         if method.trim().is_empty() || !params.is_object() {
             return Err(Error::new(
@@ -243,7 +256,7 @@ impl AgyClient {
         self.fenced
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id.clone());
+            .insert(id.clone(), kind);
         let (guard, _receiver) = self.pending.insert(id.clone());
         let registration = FencedGuard {
             _guard: guard,
@@ -367,7 +380,7 @@ fn map_response_error(code: i64, message: String) -> Result<Value> {
 
 fn classify_agy_frame(
     value: Value,
-    fenced: &Arc<StdMutex<HashSet<String>>>,
+    fenced: &Arc<StdMutex<HashMap<String, FencedKind>>>,
 ) -> PumpAction<AgyFrame> {
     if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return PumpAction::Malformed(
@@ -413,12 +426,15 @@ fn classify_agy_frame(
         let Some(key) = key else {
             return PumpAction::Skip;
         };
-        let is_fenced = fenced
+        let kind = fenced
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&key);
-        if is_fenced {
-            return PumpAction::Emit(AgyFrame::PromptResponse(result));
+        if let Some(kind) = kind {
+            return PumpAction::Emit(match kind {
+                FencedKind::Prompt => AgyFrame::PromptResponse(result),
+                FencedKind::Load => AgyFrame::LoadResponse(result),
+            });
         }
         return PumpAction::Route { key, result };
     }

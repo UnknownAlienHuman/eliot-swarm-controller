@@ -20,8 +20,8 @@ use crate::{
     events::{self, Shared},
     host::TIMEOUT,
     native::{
-        AgyClient, AgyFrame, AgyProcess, InitializeResult, LoadSessionResult, SessionResult,
-        SetConfigOptionResult, StreamState, prompt_params,
+        AgyClient, AgyFrame, AgyProcess, FencedKind, InitializeResult, LoadSessionResult,
+        SessionResult, SetConfigOptionResult, StreamState, prompt_params,
     },
     profile::Plan,
 };
@@ -80,6 +80,7 @@ pub(crate) struct Session {
     state: Shared,
     frames: Option<mpsc::Receiver<AgyFrame>>,
     stream: watch::Receiver<StreamState>,
+    load_rx: watch::Receiver<Option<Result<Value>>>,
     task: Option<JoinHandle<()>>,
     ready: bool,
     highwater_seq: i64,
@@ -113,6 +114,7 @@ impl Session {
             plan.policy.clone(),
             String::new(),
         )));
+        let load_rx = state.lock().await.load_receiver();
         Ok(Self {
             agent: params.agent_id.clone(),
             generation: params.generation,
@@ -124,6 +126,7 @@ impl Session {
             state,
             frames: Some(frames),
             stream,
+            load_rx,
             task: None,
             ready: false,
             highwater_seq: 0,
@@ -175,14 +178,47 @@ impl Session {
             )
         })?;
         let session = if let Some(resume) = plan.resume() {
-            let loaded = self
+            // The load reply is fenced in wire order behind the history
+            // replay it precedes: the event task discards validated
+            // matching-session history until that reply is consumed, and
+            // only then publishes the outcome here. Never gate on the
+            // bare RPC return, which can overtake queued history.
+            {
+                let mut state = self.state.lock().await;
+                state.conversation = resume.to_owned();
+            }
+            let dispatched = self
                 .client
-                .call(
+                .call_fenced(
                     "session/load",
                     json!({"cwd": plan.launch.cwd, "mcpServers": [], "sessionId": resume}),
                     deadline,
+                    FencedKind::Load,
                 )
-                .await?;
+                .await;
+            let registration = match dispatched {
+                Ok((_, registration)) => registration,
+                Err(error) => {
+                    self.state.lock().await.abort_load();
+                    return Err(error);
+                }
+            };
+            self.state.lock().await.begin_load(registration);
+            let load_wait = timeout_at(deadline, self.load_rx.changed())
+                .await
+                .map_err(|_| Error::new("unknown", "Antigravity ACP load reply deadline elapsed"))
+                .and_then(|changed| {
+                    changed.map_err(|_| {
+                        Error::new("unknown", "Antigravity ACP load outcome is unknown")
+                    })
+                });
+            if let Err(error) = load_wait {
+                self.state.lock().await.abort_load();
+                return Err(error);
+            }
+            let loaded = self.load_rx.borrow().clone().ok_or_else(|| {
+                Error::new("unknown", "Antigravity ACP load outcome is unknown")
+            })??;
             // `session/load` returns no session id by design: the exact
             // retained id is the one from this correlated request.
             let loaded: LoadSessionResult = serde_json::from_value(loaded).map_err(|_| {
@@ -417,7 +453,12 @@ impl Session {
         let prompt = prompt_params(&self.conversation, &combined);
         let dispatched = self
             .client
-            .call_fenced("session/prompt", prompt, Instant::now() + TIMEOUT)
+            .call_fenced(
+                "session/prompt",
+                prompt,
+                Instant::now() + TIMEOUT,
+                FencedKind::Prompt,
+            )
             .await;
         let registration = match dispatched {
             Ok((_, registration)) => registration,
