@@ -221,7 +221,7 @@ write. A lost Eliot event acknowledgement follows the common last-batch rule.
 | interrupt | `turn/interrupt` for the captured turn; no blind retry |
 | stop | end this Agent's owned session/process |
 | resume | new Eliot generation/app-server plus `thread/resume` of retained thread; no old input replay |
-| approve/deny/answer | reply to the exact offered native request and choice schema |
+| approve/deny/answer | reply to the exact offered native request; public details are the shared ApprovalRequest/QuestionRequest, answers are the universal answers map |
 | configure | unsupported in the current slice |
 | fork / native Goal / child control | later optional methods verified against installed schema, not advertised until implemented |
 

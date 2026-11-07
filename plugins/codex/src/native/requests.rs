@@ -4,6 +4,10 @@ use crate::native::types::{
     NativeFileChangeRequestApprovalResponse, NativeRequestId, NativeToolRequestUserInputAnswer,
     NativeToolRequestUserInputParams, NativeToolRequestUserInputResponse,
 };
+use eliot_core::requests::{
+    AnswerArgs, ApprovalChoice, ApprovalDecision, ApprovalRequest, Question, QuestionKind,
+    QuestionOption, QuestionRequest,
+};
 use eliot_core::{Error, PendingRequest, Result};
 use eliot_plugin::{MAX_EVENT_BYTES, protocol::MAX_COMMAND_ID_BYTES};
 use serde::Deserialize;
@@ -210,25 +214,25 @@ pub(crate) fn describe_request(
 pub(crate) fn reply_for(request: &CorePending, verb: &str, args: &Value) -> Result<Value> {
     match (request.kind.as_str(), verb) {
         ("command_execution_approval", "approve") => {
-            require_empty_args(args)?;
+            require_approval_args(args, true)?;
             encode_response(NativeCommandExecutionRequestApprovalResponse {
                 decision: NativeApprovalDecision::Accept,
             })
         }
         ("command_execution_approval", "deny") => {
-            require_empty_args(args)?;
+            require_approval_args(args, false)?;
             encode_response(NativeCommandExecutionRequestApprovalResponse {
                 decision: NativeApprovalDecision::Decline,
             })
         }
         ("file_change_approval", "approve") => {
-            require_empty_args(args)?;
+            require_approval_args(args, true)?;
             encode_response(NativeFileChangeRequestApprovalResponse {
                 decision: NativeApprovalDecision::Accept,
             })
         }
         ("file_change_approval", "deny") => {
-            require_empty_args(args)?;
+            require_approval_args(args, false)?;
             encode_response(NativeFileChangeRequestApprovalResponse {
                 decision: NativeApprovalDecision::Decline,
             })
@@ -242,14 +246,7 @@ pub(crate) fn reply_for(request: &CorePending, verb: &str, args: &Value) -> Resu
 }
 
 fn reply_to_user_input(request: &CorePending, args: &Value) -> Result<Value> {
-    let args = args
-        .as_object()
-        .filter(|args| args.len() == 1)
-        .ok_or_else(|| Error::new("invalid", "answer args must contain only answers"))?;
-    let answers = args
-        .get("answers")
-        .and_then(Value::as_object)
-        .ok_or_else(|| Error::new("invalid", "answer args.answers must be an object"))?;
+    let args = AnswerArgs::parse(args)?;
     let questions: Vec<OfferedQuestion> = request
         .details
         .get("questions")
@@ -267,7 +264,7 @@ fn reply_to_user_input(request: &CorePending, args: &Value) -> Result<Value> {
         .collect::<BTreeMap<_, _>>();
 
     let mut response_answers = BTreeMap::new();
-    for (question_id, answer) in answers {
+    for (question_id, answer) in &args.answers {
         let question = offered
             .get(question_id)
             .ok_or_else(|| Error::new("invalid", "answer names a question that was not offered"))?;
@@ -277,31 +274,18 @@ fn reply_to_user_input(request: &CorePending, args: &Value) -> Result<Value> {
                 "answers to secret Codex questions are unsupported",
             ));
         }
-        let answer = answer
-            .as_object()
-            .filter(|answer| answer.len() == 1)
-            .ok_or_else(|| {
-                Error::new("invalid", "each answer must contain only an answers array")
-            })?;
-        let values = answer
-            .get("answers")
-            .and_then(Value::as_array)
-            .ok_or_else(|| Error::new("invalid", "each answer must contain an answers array"))?;
-        let mut strings = Vec::with_capacity(values.len());
-        for value in values {
-            let value = value
-                .as_str()
-                .ok_or_else(|| Error::new("invalid", "answers must be strings"))?;
+        let mut strings = Vec::with_capacity(answer.answers.len());
+        for value in &answer.answers {
             if !question.allows(value) {
                 return Err(Error::new(
                     "invalid",
                     "answer is not among the offered options or allowed freeform choice",
                 ));
             }
-            strings.push(value.to_owned());
+            strings.push(value.clone());
         }
         response_answers.insert(
-            question_id.clone(),
+            question_id.to_owned(),
             NativeToolRequestUserInputAnswer { answers: strings },
         );
     }
@@ -311,9 +295,13 @@ fn reply_to_user_input(request: &CorePending, args: &Value) -> Result<Value> {
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct OfferedQuestion {
     id: String,
+    #[serde(default)]
+    header: Option<String>,
+    #[serde(default)]
+    question: Option<String>,
     #[serde(default)]
     is_secret: bool,
     #[serde(default)]
@@ -398,18 +386,138 @@ fn decode_params<T: for<'de> Deserialize<'de>>(params: &Value, message: &str) ->
     serde_json::from_value(params.clone()).map_err(|_| Error::new("native_protocol", message))
 }
 
-fn require_empty_args(args: &Value) -> Result<()> {
-    if args.as_object().is_some_and(Map::is_empty) {
-        Ok(())
-    } else {
+fn require_approval_args(args: &Value, approve: bool) -> Result<()> {
+    let args = eliot_plugin::session::approval_reply_args(args)?;
+    if let Some(choice_id) = args.get("choice_id") {
+        let wanted = if approve { "approve" } else { "deny" };
+        if choice_id.as_str() != Some(wanted) {
+            return Err(Error::new(
+                "invalid",
+                "approval choice_id does not match the reply verb",
+            ));
+        }
+    }
+    if args.contains_key("feedback") {
         Err(Error::new(
             "unsupported",
-            "approval replies do not accept session or amendment options",
+            "Codex approvals do not accept feedback",
         ))
+    } else {
+        Ok(())
     }
 }
 
 fn encode_response<T: serde::Serialize>(response: T) -> Result<Value> {
     serde_json::to_value(response)
         .map_err(|_| Error::new("internal", "native request response could not be encoded"))
+}
+/// Project the retained native offer to its public `request.opened` kind and details.
+pub(crate) fn public_request_view(request: &CorePending) -> Result<(String, Value)> {
+    let details = request.details.as_object().ok_or_else(|| {
+        Error::new(
+            "source_integrity",
+            "pending request details are not an object",
+        )
+    })?;
+    match request.kind.as_str() {
+        "user_input" => {
+            let offered: Vec<OfferedQuestion> = details
+                .get("questions")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .ok_or_else(|| {
+                    Error::new(
+                        "source_integrity",
+                        "pending request omitted question offers",
+                    )
+                })?;
+            let questions = offered
+                .into_iter()
+                .map(|question| {
+                    let options = question
+                        .options
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|option| QuestionOption {
+                            id: option.label.clone(),
+                            label: option.label,
+                            description: if option.description.trim().is_empty() {
+                                None
+                            } else {
+                                Some(option.description)
+                            },
+                        })
+                        .collect::<Vec<_>>();
+                    let kind = if options.is_empty() || question.is_other {
+                        QuestionKind::Text
+                    } else {
+                        QuestionKind::Single
+                    };
+                    Question {
+                        id: question.id.clone(),
+                        kind,
+                        title: question.header,
+                        prompt: question.question,
+                        options,
+                        free_entry: question.is_other || question.is_secret,
+                        is_secret: question.is_secret,
+                        min_selections: None,
+                        max_selections: None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let details = serde_json::to_value(QuestionRequest { questions }).map_err(|_| {
+                Error::new("internal", "question public details could not be encoded")
+            })?;
+            Ok(("question".to_owned(), details))
+        }
+        "command_execution_approval" | "file_change_approval" => {
+            let summary = approval_summary(request.kind.as_str(), details);
+            let details = serde_json::to_value(ApprovalRequest {
+                summary,
+                choices: vec![
+                    ApprovalChoice {
+                        id: "approve".to_owned(),
+                        label: "Approve".to_owned(),
+                        decision: ApprovalDecision::Approve,
+                        feedback_allowed: false,
+                    },
+                    ApprovalChoice {
+                        id: "deny".to_owned(),
+                        label: "Deny".to_owned(),
+                        decision: ApprovalDecision::Deny,
+                        feedback_allowed: false,
+                    },
+                ],
+                feedback_allowed: false,
+            })
+            .map_err(|_| Error::new("internal", "approval public details could not be encoded"))?;
+            Ok(("approval".to_owned(), details))
+        }
+        _ => Err(Error::new(
+            "source_integrity",
+            "pending request kind is neither approval nor user input",
+        )),
+    }
+}
+
+fn approval_summary(kind: &str, details: &Map<String, Value>) -> String {
+    let mut summary = match kind {
+        "command_execution_approval" => "Command execution approval",
+        _ => "File change approval",
+    }
+    .to_owned();
+    if let Some(command) = details.get("command").and_then(Value::as_str) {
+        summary.push_str(": ");
+        summary.push_str(command);
+    }
+    if let Some(cwd) = details.get("cwd").and_then(Value::as_str) {
+        summary.push_str(" in ");
+        summary.push_str(cwd);
+    }
+    if let Some(reason) = details.get("reason").and_then(Value::as_str) {
+        summary.push_str(" — ");
+        summary.push_str(reason);
+    }
+    summary
 }

@@ -420,6 +420,24 @@ After dispatch, only explicit `native_not_dispatched` proves no native I/O; any 
 generic error defaults to `unknown`. A validated authoritative plugin result state is
 handled separately from generic error classification.
 
+Public requests and answers are universal: `request.opened` details and kinds use the
+shared [`eliot_core::requests`](../../crates/eliot-core/src/requests.rs) shapes
+(`QuestionRequest`/`ApprovalRequest`), and `answer` args use `AnswerArgs`. Only the
+plugin translates between these shapes and its vendor format in both directions.
+Native-private request metadata stays in the existing plugin pending objects; plugins
+normalize public event details and kinds only. There are no vendor-public
+compatibility formats.
+
+Vendor fields without a verified value-submission operation — notably a native
+external form field that is applied by opening its URL outside the plugin — are
+normalized as a neutral `QuestionKind::Resource` question with the field and form
+title/description as descriptive context. The native URL itself is not persisted
+in public details. The committed pending form remains owned by the plugin, so the
+owner can still deny-cancel it, and ordinary partial answers omitting the resource
+field remain available; a value submission for the resource is `unsupported` until
+a verified operation exists. This preserves cancel and partial-answer behavior; it
+does not claim a full external workflow.
+
 ## Lifecycle, hooks and qualification
 
 Contain owned children before tools run; use absolute deadlines. Drain buffered native

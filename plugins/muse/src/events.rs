@@ -27,8 +27,8 @@ use self::workflow_child::{
 use crate::native::{
     NativeClient, NativeFrame, StreamState, native_error_code,
     requests::{
-        CorePending, describe_request, is_newer_approval_requirement, refresh_offer_from_raw,
-        reply_for, same_approval_offer,
+        CorePending, describe_request, is_newer_approval_requirement, public_request_view,
+        refresh_offer_from_raw, reply_for, same_approval_offer,
     },
     types::{
         NativeApprovalDecideResult, NativeApprovalResolvedNotification,
@@ -1170,12 +1170,16 @@ impl EventProcessor {
             .clone()
             .ok_or_else(|| Error::new("unknown", "Muse request has no Eliot send command"))?;
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
+        let Ok((public_kind, public_details)) = public_request_view(&request) else {
+            self.defer_gap("Muse public request view could not be normalized");
+            return Ok(());
+        };
         let data = json!({
             "command_id": command_id,
             "request_id": request.id,
             "turn_id": request.turn_id,
-            "kind": request.kind,
-            "details": redact_request_details_for_commit(&request.details, &policy),
+            "kind": public_kind,
+            "details": redact_request_details_for_commit(&public_details, &policy),
         });
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
             self.defer_gap("Muse normalized request exceeded the persisted-event bound");
@@ -1858,12 +1862,16 @@ impl EventProcessor {
             return Ok(());
         };
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
+        let Ok((public_kind, public_details)) = public_request_view(&entry) else {
+            self.defer_gap("Muse public request view could not be normalized");
+            return Ok(());
+        };
         let data = json!({
             "command_id": command_id,
             "request_id": entry.id,
             "turn_id": entry.turn_id,
-            "kind": entry.kind,
-            "details": redact_request_details_for_commit(&entry.details, &policy),
+            "kind": public_kind,
+            "details": redact_request_details_for_commit(&public_details, &policy),
         });
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
             self.defer_gap("Muse pulled request exceeded the persisted-event bound");
@@ -3030,12 +3038,17 @@ impl EventProcessor {
             return Ok(false);
         }
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
+        let Ok((public_kind, public_details)) = public_request_view(refreshed) else {
+            self.record_gap("Muse refreshed public offer could not be normalized")
+                .await?;
+            return Ok(false);
+        };
         let data = json!({
             "command_id": command_id,
             "request_id": refreshed.id,
             "turn_id": refreshed.turn_id,
-            "kind": refreshed.kind,
-            "details": redact_request_details_for_commit(&refreshed.details, &policy),
+            "kind": public_kind,
+            "details": redact_request_details_for_commit(&public_details, &policy),
         });
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
             self.defer_gap("Muse refreshed offer exceeded the persisted-event bound");
@@ -3284,15 +3297,15 @@ fn orphan_request_id(method: &str, params: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Redact the free-text offer fields of a described request for the committed
-/// `request.opened` event: the approval `subject` (including its `command`
-/// string), `questions` and `available_choices`. The in-memory offer stays raw
-/// so choice/requirement matching and re-issue comparison keep working on
-/// exact native values; only the persisted copy is redacted.
+/// Redact the free-text offer fields of a normalized public request view for
+/// the committed `request.opened` event: the approval `summary`, `questions`
+/// and approval `choices`. The in-memory offer stays raw so choice/
+/// requirement matching and re-issue comparison keep working on exact native
+/// values; only the persisted copy is redacted.
 fn redact_request_details_for_commit(details: &Value, policy: &SecretPolicy) -> Value {
     let mut redacted = details.clone();
     if let Some(fields) = redacted.as_object_mut() {
-        for key in ["subject", "questions", "available_choices"] {
+        for key in ["summary", "questions", "choices"] {
             if let Some(field) = fields.get_mut(key) {
                 policy.redact_values(field);
             }

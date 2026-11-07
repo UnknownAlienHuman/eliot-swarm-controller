@@ -279,7 +279,11 @@ outcome and linked-command values; `fanout` is not part of the current response.
 selector parent reply carries no agent, generation, or linked command. A
 `verb:"run"` request is targetless: `target`, generation/turn/request bindings are absent
 or `null`, and `probe` is false. Its script inputs stay in `args` and follow the owning
-[automation contract](automation.md#frozen-script-inputs).
+[automation contract](automation.md#frozen-script-inputs). A `verb:"answer"` request
+carries its replies in `args` as the shared
+[`AnswerArgs`](../../crates/eliot-core/src/requests.rs); Store admission parses that
+shape before persisting the command, so foreign answer shapes reject as `invalid` and
+raw callers cannot bypass answer syntax.
 
 Resolve the target and validate principal/capability/state before persisting the command
 binding and events. Each verb checks `expected_generation` at its defined admission or

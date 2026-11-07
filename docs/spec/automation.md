@@ -248,8 +248,11 @@ and `deny` accept optional `choice` (whole-value template allowed, rendered to `
 optional `feedback` (text template allowed, rendered to `feedback`); neither defaults to any
 choice. `answer` accepts a literal answers map, passes it unchanged
 under `SubmitCommand.args.answers`, and does not template-expand question ids or values.
-Each question id maps to an object containing its native `answers` array. For one answer,
+Each question id maps to an object containing its universal `answers` array under the
+shared [`Answers`](../../crates/eliot-core/src/requests.rs) shape. For one answer,
 `SubmitCommand.args` is `{"answers":{"question-id":{"answers":["Continue"]}}}`.
+Store admission parses the shared `AnswerArgs` before persistence, so rules cannot
+bypass answer syntax; each plugin translates the universal answer to its native write.
 
 ```toml
 [[rule]]
