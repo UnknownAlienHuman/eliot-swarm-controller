@@ -25,6 +25,16 @@ On 2026-10-27 the owner clarified the immediate sequence: core/bus, one useful h
 [Roadmap](roadmap.md) is the single current schedule. A first usable Codex path must not
 wait for the complete adapter catalogue or automation architecture.
 
+On 2026-11-07 the owner additionally clarified that a cloud Dot/MuseAgent must be able to
+connect as an MCP caller through the local StreamableHTTP MCP server, exposed via
+`cloudflared` at `swarm.iuriilisenkov.cloud`, and that Swarm must automatically detect
+and diagnose stalled or unhealthy agents and notify the supervisor/agent. The cloud MCP
+caller is a remote identity/connection/call principal, not a controlled local native
+harness or PID; native process statistics alone do not prove model progress. The cloud
+endpoint is authenticated with Cloudflare Access Managed OAuth and native JWT validation
+per the existing account documentation, while the local One OS user trust boundary
+remains. This clarification replaces the earlier treatment of remote access as Later.
+
 ## What Eliot is
 
 A small local Rust controller that launches vendor coding harnesses, observes native/
@@ -55,7 +65,8 @@ proof packets, readiness registers or operational document-hash ceremony. Protoc
 acknowledgement and mutation idempotency are ordinary implementation correctness, not
 permission to construct a generic receipt/provenance platform.
 
-One OS user is the local trust boundary. Remote access would require a separate design.
+One OS user is the local trust boundary for local control; the cloud endpoint is an
+authenticated owner MCP caller, distinct from a locally controlled native harness.
 A large logical fleet does not mean one machine can run a million vendor processes.
 
 ## Product acceptance
@@ -77,3 +88,6 @@ The complete selected local product must demonstrate on the owner's Windows mach
 These are final qualification goals, not conditions that must all be implemented before
 one useful Codex session runs. [L7](roadmap.md#l7--qualification-repair-and-release)
 qualifies the connected product; compilation or documentation review alone does not.
+
+The cloud MCP caller contour and the stalled/unhealthy-agent diagnosis and notification
+contour are required product contours, tracked as unchecked roadmap increments, not Later.

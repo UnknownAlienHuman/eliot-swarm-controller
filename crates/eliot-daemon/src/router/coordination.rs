@@ -60,6 +60,25 @@ fn notice_text(kind: NoticeKind, count: i64) -> String {
 
 impl Router {
     pub(super) async fn mail_send(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        self.mail_send_with_wake(params, principal, true).await
+    }
+
+    /// Persist an attention notice in the affected Agent's inbox without
+    /// generating a new send/wake prompt for that Agent.
+    pub(super) async fn mail_send_attention_queue(
+        &self,
+        params: &Value,
+        principal: &Principal,
+    ) -> Result<Value> {
+        self.mail_send_with_wake(params, principal, false).await
+    }
+
+    async fn mail_send_with_wake(
+        &self,
+        params: &Value,
+        principal: &Principal,
+        wake_recipients: bool,
+    ) -> Result<Value> {
         let request: MailSendRequest = decode_coordination_request(
             params,
             &self.inner.secrets,
@@ -76,7 +95,9 @@ impl Router {
         };
         self.signal_progress();
         request.validate_response(&change.value)?;
-        self.wake_recipients(&change.value).await;
+        if wake_recipients {
+            self.wake_recipients(&change.value).await;
+        }
         serde_json::to_value(change.value)
             .map_err(|_| Error::new("internal", "mail delivery could not be encoded"))
     }

@@ -249,6 +249,41 @@ that margin regardless of `mail_days`, so a removed delivery admitted with a
 skew-bounded write id reads `history_gap` on its own mailbox's read paths;
 a retried ack over it succeeds as already acked.
 
+The automatic attention no-progress suspicion window is optional:
+
+```toml
+[daemon]
+attention_suspicion_secs = 900
+```
+
+It defaults to 900 seconds and must be a positive signed 64-bit integer whose
+millisecond value fits in `i64`. This setting only controls when a busy Agent
+with a healthy native source and no known request/tool activity is diagnosed;
+source-health failures are diagnosed promptly regardless of this window.
+
+Cloud MCP is disabled when `[cloud_mcp]` is absent. When present, all fields are
+required. The HTTP MCP executable is the running daemon executable (`current_exe`);
+it is not a separate setting. The hostname is a bare DNS host; Eliot constructs
+`https://<hostname>/mcp`. Tunnel and credential values are metadata only: Eliot
+does not read the credential file contents. Cloudflared reads that file when it
+starts.
+
+```toml
+[cloud_mcp]
+cloudflared_executable = "C:/Program Files (x86)/cloudflared/cloudflared.exe"
+tunnel_id = "00000000-0000-4000-8000-000000000000" # replace with the provisioned tunnel UUID
+credentials_file = "C:/Users/OWNER/.cloudflared/00000000-0000-4000-8000-000000000000.json"
+hostname = "swarm.example.com"
+access_team_name = "owner-team"
+access_audience_tag = "0000000000000000000000000000000000000000000000000000000000000000"
+```
+
+`cloudflared_executable` and `credentials_file` must be absolute paths.
+`tunnel_id` must be a UUID, `hostname` a lowercase DNS hostname,
+`access_team_name` a lowercase Access team label, and
+`access_audience_tag` a 64-character hexadecimal tag. These example identifiers
+are placeholders, not a usable tunnel configuration.
+
 The implemented unread mailbox bounds are a root-level mail table:
 
 ```toml

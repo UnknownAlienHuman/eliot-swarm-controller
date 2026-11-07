@@ -478,6 +478,42 @@ plans, file edits and exact request/answer transitions.
 | bare provider HTTP 429 | no restriction inferred without a typed native variant |
 | old generation fact | historical diagnostic only |
 
+## Automatic attention
+
+The daemon emits a typed `x.user.agent.attention` report when an authoritative
+native lifecycle source becomes unhealthy or a `session.lost` fact is committed.
+Those triggers do not wait for the no-progress window. A busy Agent with a
+healthy authoritative source becomes a no-progress suspicion after
+`daemon.attention_suspicion_secs` (default 900 seconds). This is a diagnostic
+threshold, never a timeout verdict that the Agent died.
+
+Before reporting, capture the Agent generation, active turn, pending requests,
+source owners/health, and model-progress time from Store; release Store before
+the exact-generation `agent.snapshot` readback; then recheck the generation and
+turn before publishing. Readback is read-only and preemptible by a subsequent
+host control. The daemon copies observation basis and freshness only when the
+plugin explicitly supplies them and the exact generation/turn binding matches;
+otherwise it reports `plugin_snapshot` and `freshness_unspecified` without
+inferring semantics from the adapter name. A validated `process_exited` fact is
+retained only from that exact snapshot binding.
+
+Reports also reuse the existing current-generation monitor view for bounded OS
+process records, sample age, completeness, coverage, and truncation. These are
+cached process observations; CPU activity is not model-progress evidence.
+Failed, preempted, stale, or binding-mismatched native readback remains unknown
+and never changes Agent state.
+
+Pending approvals/questions are reported as waiting. A known active tool is
+reported as active and suppresses a no-progress suspicion. Tool coverage that
+is missing, gapped, or truncated remains unknown and cannot be called stalled.
+Only one report is emitted per active incident, followed by one recovery report
+when its condition clears. The bounded transient incident set is in-memory;
+there is no separate status registry. Each incident/phase freezes its report
+and ULID mutation IDs until event and notice delivery settle, so retries reuse
+the same facts and command bindings. Inbox/owner notices carry a short bounded
+diagnosis and link to the structured report. Attention does not call a model,
+replay work, or restart a harness.
+
 ## Restart reconciliation
 
 Callbacks and timers only enqueue stable keys. Deduplicated reconciliation reads Store

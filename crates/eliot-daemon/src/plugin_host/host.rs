@@ -43,6 +43,7 @@ use ulid::Ulid;
 const RPC_DEADLINE: Duration = Duration::from_secs(30);
 const RPC_GRACE: Duration = Duration::from_secs(2);
 const STOP_GRACE: Duration = Duration::from_secs(5);
+const MAX_PENDING_SNAPSHOT_READS: usize = 1;
 
 #[derive(Clone, Copy)]
 struct StopDeadlines {
@@ -109,6 +110,7 @@ struct AgentKey {
 
 struct RuntimeEntry {
     sender: mpsc::Sender<RuntimeMessage>,
+    start_command_id: String,
     verbs: HashSet<String>,
     stderr: StderrView,
     source_credentials: Arc<[String]>,
@@ -124,7 +126,7 @@ enum RuntimeMessage {
         agent_id: String,
         generation: i64,
         command_id: String,
-        turn_id: String,
+        turn_id: Option<String>,
         reply: oneshot::Sender<Result<Value>>,
     },
     Stop {
@@ -187,7 +189,16 @@ struct PluginCommandCompletion {
     result: Result<Value>,
 }
 
+struct PluginSnapshotCompletion {
+    agent_id: String,
+    generation: i64,
+    command_id: String,
+    reply: oneshot::Sender<Result<Value>>,
+    result: Result<Value>,
+}
+
 type PendingSteerFuture = Pin<Box<dyn Future<Output = PluginCommandCompletion> + Send>>;
+type PendingSnapshotFuture = Pin<Box<dyn Future<Output = PluginSnapshotCompletion> + Send>>;
 
 struct EventSource {
     store: StoreHandle,
@@ -495,6 +506,7 @@ impl PluginHost {
                 actor_key.clone(),
                 RuntimeEntry {
                     sender: message_tx,
+                    start_command_id: command.id.clone(),
                     verbs: ["launch", "send", "stop"]
                         .into_iter()
                         .map(str::to_owned)
@@ -678,7 +690,7 @@ impl PluginHost {
                 agent_id: agent.id.clone(),
                 generation: agent.generation,
                 command_id: command_id.to_owned(),
-                turn_id: turn_id.to_owned(),
+                turn_id: Some(turn_id.to_owned()),
                 reply,
             }),
         )
@@ -694,6 +706,67 @@ impl PluginHost {
             Err(_) => Err(Error::new(
                 "unknown",
                 "Agent plugin snapshot exceeded its absolute deadline",
+            )),
+        };
+        result.map_err(|error| diagnose_error(error, &stderr, &credentials))
+    }
+
+    /// Low-priority read-only status probe. A full runtime queue returns
+    /// `busy` immediately so a diagnosis cannot delay a user control.
+    pub(crate) async fn probe_snapshot(
+        &self,
+        agent: &Agent,
+        turn: Option<(&str, &str)>,
+    ) -> Result<Value> {
+        let key = AgentKey {
+            id: agent.id.clone(),
+            generation: agent.generation,
+        };
+        let (sender, command_id, stderr, credentials) = {
+            let running = self.state.running.lock_recover();
+            let entry = running.get(&key).ok_or_else(|| {
+                Error::new(
+                    "not_found",
+                    format!(
+                        "no owned plugin exists for {} generation {}",
+                        key.id, key.generation
+                    ),
+                )
+            })?;
+            (
+                entry.sender.clone(),
+                turn.map(|(command_id, _)| command_id.to_owned())
+                    .unwrap_or_else(|| entry.start_command_id.clone()),
+                entry.stderr.clone(),
+                Arc::clone(&entry.source_credentials),
+            )
+        };
+        let (reply, response) = oneshot::channel();
+        sender
+            .try_send(RuntimeMessage::Snapshot {
+                agent_id: agent.id.clone(),
+                generation: agent.generation,
+                command_id,
+                turn_id: turn.map(|(_, turn_id)| turn_id.to_owned()),
+                reply,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    Error::new("busy", "Agent plugin command queue is full")
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    Error::new("unknown", "owned Agent plugin is no longer available")
+                }
+            })?;
+        let result = match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, response).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(Error::new(
+                "unknown",
+                "Agent plugin ended before the status snapshot was returned",
+            )),
+            Err(_) => Err(Error::new(
+                "unknown",
+                "Agent plugin status snapshot exceeded its absolute deadline",
             )),
         };
         result.map_err(|error| diagnose_error(error, &stderr, &credentials))
@@ -1203,6 +1276,7 @@ async fn run_agent_inner(
     let mut last_command_id = start_command.id.clone();
     let mut planned_exit = false;
     let mut pending_steers: FuturesUnordered<PendingSteerFuture> = FuturesUnordered::new();
+    let mut pending_snapshots: FuturesUnordered<PendingSnapshotFuture> = FuturesUnordered::new();
     loop {
         tokio::select! {
             status = child.wait() => {
@@ -1272,6 +1346,20 @@ async fn run_agent_inner(
                 planned_exit = true;
                 break;
             }
+            completion = pending_snapshots.next(), if !pending_snapshots.is_empty() => {
+                if let Some(completion) = completion {
+                    if let Err(error) = &completion.result {
+                        record_plugin_error(
+                            error,
+                            &completion.agent_id,
+                            completion.generation,
+                            &completion.command_id,
+                            &source_credentials,
+                        );
+                    }
+                    let _ = completion.reply.send(completion.result);
+                }
+            }
             completion = pending_steers.next(), if !pending_steers.is_empty() => {
                 if let Some(completion) = completion {
                     complete_plugin_command(
@@ -1317,7 +1405,9 @@ async fn run_agent_inner(
                                 client.reader_closed(),
                             ),
                             Ok(params) if command.verb == "steer" => {
-                                if pending_steers.len() >= MAX_PENDING_CALLS {
+                                let pending_steer_limit =
+                                    MAX_PENDING_CALLS.saturating_sub(pending_snapshots.len() + 1);
+                                if pending_steers.len() >= pending_steer_limit {
                                     complete_plugin_command(
                                         PluginCommandCompletion {
                                             command,
@@ -1378,26 +1468,23 @@ async fn run_agent_inner(
                         }
                     }
                     RuntimeMessage::Snapshot { agent_id, generation, command_id, turn_id, reply } => {
-                        let params = json!({
-                            "agent_id": agent_id,
-                            "generation": generation,
-                            "command_id": command_id,
-                            "turn_id": turn_id,
-                        });
-                        let result = client.call("agent.snapshot", params, deadline()).await
-                            .map_err(|error| redact_native_error(error, &source_credentials))
-                            .map(|mut value| {
-                                crate::redaction::redact_outcome(
-                                    &mut value,
-                                    &source_credentials,
-                                );
-                                value
-                            });
-                        let result = diagnose_result(result, &stderr, &source_credentials);
-                        if let Err(error) = &result {
-                            record_plugin_error(error, &agent.id, agent.generation, &command_id, &source_credentials);
+                        if pending_snapshots.len() >= MAX_PENDING_SNAPSHOT_READS {
+                            let _ = reply.send(Err(Error::new(
+                                "busy",
+                                "Agent status snapshot is already in flight",
+                            )));
+                        } else {
+                            pending_snapshots.push(snapshot_future(
+                                client.clone(),
+                                agent_id,
+                                generation,
+                                command_id,
+                                turn_id,
+                                stderr.clone(),
+                                Arc::clone(&source_credentials),
+                                reply,
+                            ));
                         }
-                        let _ = reply.send(result);
                     }
                     RuntimeMessage::Stop { command, force, deadlines, reply } => {
                         let params = json!({
@@ -1632,6 +1719,9 @@ async fn run_agent_inner(
             }
         }
     }
+    // These read-only futures are actor-owned. Dropping them cancels every
+    // pending snapshot RPC before actor cleanup; they cannot outlive the child.
+    drop(pending_snapshots);
     cleanup_actor(&state, &key, &plugin_credential, planned_exit).await;
     if !pending_steers.is_empty() {
         // Stop/force/source custody above owns teardown. Only then wait for the
@@ -1655,6 +1745,41 @@ async fn run_agent_inner(
             );
         }
     }
+}
+
+fn snapshot_future(
+    client: PluginClient,
+    agent_id: String,
+    generation: i64,
+    command_id: String,
+    turn_id: Option<String>,
+    stderr: StderrView,
+    source_credentials: Arc<[String]>,
+    reply: oneshot::Sender<Result<Value>>,
+) -> PendingSnapshotFuture {
+    Box::pin(async move {
+        let params = json!({
+            "agent_id": agent_id.clone(),
+            "generation": generation,
+            "command_id": command_id.clone(),
+            "turn_id": turn_id,
+        });
+        let result = client
+            .call("agent.snapshot", params, deadline())
+            .await
+            .map_err(|error| redact_native_error(error, &source_credentials))
+            .map(|mut value| {
+                crate::redaction::redact_outcome(&mut value, &source_credentials);
+                value
+            });
+        PluginSnapshotCompletion {
+            agent_id,
+            generation,
+            command_id,
+            reply,
+            result: diagnose_result(result, &stderr, &source_credentials),
+        }
+    })
 }
 
 async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSource) {

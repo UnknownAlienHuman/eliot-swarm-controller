@@ -80,6 +80,23 @@ L3 adds monitoring/worktrees and the optional OpenCodex route. L4 adds automatio
 Codex; L5 adds communication between two Codex Agents; L6 adds other harnesses. Neither
 mail nor timers require a second vendor. Unimplemented features are not advertised.
 
+## Cloud MCP caller and agent-health diagnosis
+
+A cloud Dot/MuseAgent reaches Swarm only as a remote MCP caller through the local
+StreamableHTTP MCP server exposed via `cloudflared` at
+`swarm.iuriilisenkov.cloud`. It is authenticated with Cloudflare Access Managed OAuth
+and native JWT validation per the existing account documentation; no new OAuth code is
+required here. The cloud caller carries a remote identity, connection and call binding
+through the existing router/bus. It is not a controlled local native harness and has no
+PID, process custody or local lifecycle of its own. The local One OS user trust boundary
+remains for local control.
+
+Stalled or unhealthy agents are detected and diagnosed from read-only native, process,
+turn and event facts. Native process statistics alone do not prove model progress, and
+silence is not completion. An unhealthy or no-progress result triggers read-only
+diagnosis and actual delivery through the existing router/bus mail/notify path to the
+supervisor/agent. It never authorizes automatic resend of a job or a false Done result.
+
 ## State and effects
 
 Core owns the pure Agent reducer and pure command-transition/error-classification

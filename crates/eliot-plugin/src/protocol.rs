@@ -285,6 +285,69 @@ pub struct ChildParams {
     pub registration: eliot_core::ChildRegistration,
 }
 
+/// Maximum encoded bytes of one [`McpHttpReady`] stdout frame (JSON line
+/// plus its trailing newline).
+pub const MAX_MCP_HTTP_READY_BYTES: usize = 256;
+
+/// Ready frame emitted exactly once on stdout by `swarm mcp --http` after
+/// its loopback listener binds. The managed parent reads one line and
+/// parses it with [`McpHttpReady::decode_frame`]. Loopback-only: the
+/// address must parse as a loopback socket address. This frame proves a
+/// local listener, never public tunnel/auth readiness. Address-only by
+/// design: the managed parent owns the child PID and already knows the route.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpHttpReady {
+    /// Actual bound address, e.g. `127.0.0.1:4317`.
+    pub address: String,
+}
+
+impl McpHttpReady {
+    pub fn validate(&self) -> eliot_core::Result<()> {
+        let address: std::net::SocketAddr = self.address.parse().map_err(|_| {
+            eliot_core::Error::new("invalid", "MCP HTTP ready address is not a socket address")
+        })?;
+        if !address.ip().is_loopback() {
+            return Err(eliot_core::Error::new(
+                "invalid",
+                "MCP HTTP ready address is not loopback",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Encode the single stdout line, trailing `\n` included.
+    pub fn encode_frame(&self) -> eliot_core::Result<String> {
+        self.validate()?;
+        let mut line = serde_json::to_string(self).map_err(|_| {
+            eliot_core::Error::new("internal", "MCP HTTP ready frame cannot be encoded")
+        })?;
+        line.push('\n');
+        if line.len() > MAX_MCP_HTTP_READY_BYTES {
+            return Err(eliot_core::Error::new(
+                "frame_too_large",
+                "MCP HTTP ready frame exceeds its bound",
+            ));
+        }
+        Ok(line)
+    }
+
+    /// Decode one stdout line; a trailing newline is tolerated.
+    pub fn decode_frame(line: &str) -> eliot_core::Result<Self> {
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        if line.len() > MAX_MCP_HTTP_READY_BYTES {
+            return Err(eliot_core::Error::new(
+                "frame_too_large",
+                "MCP HTTP ready frame exceeds its bound",
+            ));
+        }
+        let ready: Self = serde_json::from_str(line)
+            .map_err(|_| eliot_core::Error::new("invalid", "MCP HTTP ready frame is malformed"))?;
+        ready.validate()?;
+        Ok(ready)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

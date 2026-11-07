@@ -154,37 +154,71 @@ pub(crate) async fn run() -> Result<()> {
     let mut completed_shutdown = false;
     let mut live_ticks = interval(LIVE_POLL_INTERVAL);
     live_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut pending_request = None;
     loop {
-        let request = tokio::select! {
-            biased;
-            request = requests.recv() => request,
-            _ = live_ticks.tick(), if plugin.observer.as_ref().is_some_and(ObserverSession::live_poll_enabled) => {
-                let initialized = plugin
-                    .initialized
-                    .as_ref()
-                    .ok_or_else(|| not_initialized("Codex"))?;
-                let observer = plugin
-                    .observer
-                    .as_mut()
-                    .ok_or_else(|| not_initialized("Codex"))?;
-                let until = Instant::now() + LIVE_POLL_DEADLINE;
-                // Cancelling this future leaves owned file I/O and pending
-                // publication in the observer/publisher for settlement or close.
-                tokio::select! {
-                    biased;
-                    request = requests.recv() => request,
-                    result = timeout_at(until, observer.poll_live(&client, &initialized.credential, until)) => {
-                        if result.is_err() {
-                            observer.live_poll_timed_out();
+        let request = if let Some(request) = pending_request.take() {
+            Some(request)
+        } else {
+            tokio::select! {
+                biased;
+                request = requests.recv() => request,
+                _ = live_ticks.tick(), if plugin.observer.as_ref().is_some_and(ObserverSession::live_poll_enabled) => {
+                    let initialized = plugin
+                        .initialized
+                        .as_ref()
+                        .ok_or_else(|| not_initialized("Codex"))?;
+                    let observer = plugin
+                        .observer
+                        .as_mut()
+                        .ok_or_else(|| not_initialized("Codex"))?;
+                    let until = Instant::now() + LIVE_POLL_DEADLINE;
+                    // Cancelling this future leaves owned file I/O and pending
+                    // publication in the observer/publisher for settlement or close.
+                    tokio::select! {
+                        biased;
+                        request = requests.recv() => request,
+                        result = timeout_at(until, observer.poll_live(&client, &initialized.credential, until)) => {
+                            if result.is_err() {
+                                observer.live_poll_timed_out();
+                            }
+                            continue;
                         }
-                        continue;
                     }
                 }
             }
         };
         let Some(request) = request else { break };
         let is_shutdown = request.method == "shutdown";
-        let result = plugin.dispatch(&request, &client).await;
+        let result = if request.method == "agent.snapshot" {
+            match eliot_plugin::preemptible_snapshot(
+                &mut requests,
+                plugin.dispatch(&request, &client),
+            )
+            .await
+            {
+                eliot_plugin::SnapshotDispatch::Ready(result) => result,
+                eliot_plugin::SnapshotDispatch::Preempted(next) => {
+                    let preempted = client
+                        .respond(
+                            request.id.clone(),
+                            Err(Error::new(
+                                "busy",
+                                "status snapshot was preempted by a host request",
+                            )),
+                            Instant::now() + RPC_TIMEOUT,
+                        )
+                        .await;
+                    if preempted.is_err() {
+                        break;
+                    }
+                    let Some(next) = next else { break };
+                    pending_request = Some(next);
+                    continue;
+                }
+            }
+        } else {
+            plugin.dispatch(&request, &client).await
+        };
         let response = client
             .respond(request.id, result, Instant::now() + RPC_TIMEOUT)
             .await;

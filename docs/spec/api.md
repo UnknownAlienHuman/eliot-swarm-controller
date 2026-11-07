@@ -74,6 +74,42 @@ The stdio transport MUST bound each frame to [`MAX_RPC_FRAME_BYTES`](../../crate
 results retain the existing API frame, pagination and encoded-response bounds. `--json`
 is invalid with this command: stdout is MCP protocol only; diagnostics go to stderr.
 
+### MCP StreamableHTTP server
+
+`swarm mcp --http --port 0 [--public-url URL]` serves the same single `swarm` tool
+and the same `method`/`params` argument contract over StreamableHTTP on loopback
+`127.0.0.1` at `/mcp` ([http.rs](../../crates/eliot/src/mcp/http.rs)). It reuses the
+shared handler, `eliot_daemon::client_call` path and existing methods and DTOs, and adds
+no new method catalogue or authentication framework. POST carries JSON-RPC, GET is the
+SSE stream and DELETE closes a session; request bodies are capped at
+`MAX_RPC_FRAME_BYTES`. `--json` remains invalid; stdout carries exactly one
+`McpHttpReady` frame after the local bind and nothing else. The frame is not MCP
+JSON-RPC: it signals managed-child readiness (local listener bound), never public
+tunnel or auth readiness. See [cloud MCP runtime](cloud-mcp.md) for the tunnel,
+Access and child-lifecycle rules.
+
+Authority is the local Owner service principal by design. The deployment is an
+owner-only Access app: Cloudflare Access plus cloudflared native JWT validation
+authenticate the owner at the edge ([cloud-mcp.md](cloud-mcp.md)), and the child
+forwards each call through the existing local owner-token path. It never creates,
+accepts or reports a local Agent, Agent/PID, or Agent generation, and `clientInfo`
+is never read as evidence: it is untrusted and unused.
+
+Exact limitations: rmcp binds transport sessions to their request/response streams
+only. Router receives the existing Owner authority with no new local Agent/PID, and
+no remote subject or session metadata is persisted into semantic Store data.
+
+Transport sessions are in-memory only (rmcp `LocalSessionManager`, legacy session
+mode off). Each initialized HTTP session advertises `logging` and starts exactly
+one bounded owner-event delivery task
+([mcp.rs](../../crates/eliot/src/mcp.rs) `spawn_owner_notify_task`). The task
+long-polls `events.subscribe` from the current committed tip (limit 100, about 1 s
+wait), so history is never replayed, and sends only normalized
+`x.user.notify` and `x.user.agent.attention` payloads as `notifications/message`.
+Delivery is best-effort and unacknowledged: a send failure, closed transport or
+daemon error ends the task for that session without retry, and successful delivery
+does not imply that the client consumed the notice.
+
 ## Mutation ids
 
 External writes carry a ULID generated/printed before send. Bind it to principal,

@@ -1,3 +1,4 @@
+mod attention;
 mod attribution;
 mod auth;
 mod command;
@@ -8,6 +9,7 @@ mod hierarchy;
 mod resolution;
 mod rules;
 
+pub(crate) use attention::run_attention;
 use auth::{authorize_command, authorize_rpc_method};
 pub(crate) use goals::{real_goal_check, run_goal_driver};
 
@@ -2654,6 +2656,7 @@ impl Router {
             discovery_readers: self.inner.plugin_host.reader_count(),
             workspace_custody,
             workspace_recovery_error: self.inner.workspace_recovery_error.lock_recover().clone(),
+            cloud_mcp: crate::cloud_mcp::service_snapshot(),
             unknown_commands_count,
             unknown_commands,
             unknown_commands_truncated,

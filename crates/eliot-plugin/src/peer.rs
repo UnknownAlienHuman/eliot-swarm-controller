@@ -10,6 +10,7 @@ use eliot_core::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::future::Future;
 use std::{
     collections::HashMap,
     sync::{
@@ -28,6 +29,28 @@ use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 const WRITE_QUEUE_CAPACITY: usize = 16;
 const MAX_PENDING_CALLS: usize = 16;
 const INVALID_FRAME_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Outcome of a low-priority snapshot that yields to the next host request.
+pub enum SnapshotDispatch<T> {
+    Ready(T),
+    Preempted(Option<RpcRequest>),
+}
+
+/// Poll one snapshot concurrently with the host request queue. A control
+/// arriving first cancels the readback future so the adapter can serve it.
+pub async fn preemptible_snapshot<F>(
+    requests: &mut mpsc::Receiver<RpcRequest>,
+    snapshot: F,
+) -> SnapshotDispatch<F::Output>
+where
+    F: Future,
+{
+    tokio::select! {
+        biased;
+        request = requests.recv() => SnapshotDispatch::Preempted(request),
+        result = snapshot => SnapshotDispatch::Ready(result),
+    }
+}
 
 type PendingCalls = Arc<StdMutex<HashMap<String, oneshot::Sender<Result<Value>>>>>;
 

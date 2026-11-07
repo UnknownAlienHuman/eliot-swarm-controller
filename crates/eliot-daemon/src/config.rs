@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 const MAX_CONFIG_BYTES: usize = 128 * 1024;
 const MAX_PROFILE_NAME_LEN: usize = 128;
 const MAX_PROFILES: usize = 256;
@@ -143,6 +143,19 @@ struct FileConfig {
     daemon: DaemonConfig,
     #[serde(default)]
     mail: MailConfig,
+    #[serde(default)]
+    cloud_mcp: Option<CloudMcpSettings>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CloudMcpSettings {
+    cloudflared_executable: PathBuf,
+    tunnel_id: String,
+    credentials_file: PathBuf,
+    hostname: String,
+    access_team_name: String,
+    access_audience_tag: String,
 }
 
 /// Owner-approved interpreter and action-environment grant shared by project
@@ -294,7 +307,7 @@ fn default_max_unread_messages_per_agent() -> i64 {
     core::api::DEFAULT_MAX_UNREAD_MESSAGES_PER_AGENT
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DaemonConfig {
     #[serde(default)]
@@ -305,6 +318,24 @@ pub(crate) struct DaemonConfig {
     /// unset value keeps its coordination-contract default.
     #[serde(default)]
     pub(crate) limits: core::api::HierarchyLimits,
+    /// Healthy-source no-progress window before an attention diagnosis. See
+    /// docs/spec/monitoring.md; this is advisory and never infers agent death.
+    #[serde(default = "default_attention_suspicion_secs")]
+    pub(crate) attention_suspicion_secs: i64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            retention: RetentionConfig::default(),
+            limits: core::api::HierarchyLimits::default(),
+            attention_suspicion_secs: default_attention_suspicion_secs(),
+        }
+    }
+}
+
+fn default_attention_suspicion_secs() -> i64 {
+    15 * 60
 }
 
 impl DaemonConfig {
@@ -312,9 +343,16 @@ impl DaemonConfig {
         self.limits.validate().map_err(|error| {
             core::Error::new("profile_error", format!("config.toml: {}", error.message))
         })?;
+        if self.attention_suspicion_secs <= 0 || self.attention_suspicion_secs > i64::MAX / 1_000 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.attention_suspicion_secs must be a positive integer whose millisecond value fits in i64",
+            ));
+        }
         Ok(Self {
             retention: self.retention.validate()?,
             limits: self.limits,
+            attention_suspicion_secs: self.attention_suspicion_secs,
         })
     }
 }
@@ -886,6 +924,34 @@ pub(crate) fn load_daemon_config(data_root: &Path) -> core::Result<DaemonConfig>
         return Ok(DaemonConfig::default());
     };
     config.daemon.validate()
+}
+
+pub(crate) fn load_cloud_mcp_config(
+    data_root: &Path,
+) -> core::Result<Option<crate::cloud_mcp::CloudMcpConfig>> {
+    let Some((config, _)) = read_config(data_root)? else {
+        return Ok(None);
+    };
+    let Some(settings) = config.cloud_mcp else {
+        return Ok(None);
+    };
+    let http_mcp_executable = std::env::current_exe().map_err(|_| {
+        core::Error::new(
+            "platform_io",
+            "cannot locate the daemon executable for cloud MCP",
+        )
+    })?;
+    let config = crate::cloud_mcp::CloudMcpConfig {
+        http_mcp_executable,
+        cloudflared_executable: settings.cloudflared_executable,
+        tunnel_id: settings.tunnel_id,
+        credentials_file: settings.credentials_file,
+        hostname: settings.hostname,
+        access_team_name: settings.access_team_name,
+        access_audience_tag: settings.access_audience_tag,
+    };
+    crate::cloud_mcp::validate_config(&config)?;
+    Ok(Some(config))
 }
 
 pub(crate) fn load_mail_config(data_root: &Path) -> core::Result<MailConfig> {
@@ -2432,6 +2498,7 @@ mod tests {
                     mail_days: Some(21),
                 },
                 limits: core::api::HierarchyLimits::default(),
+                attention_suspicion_secs: 15 * 60,
             }
         );
 
@@ -2445,6 +2512,7 @@ mod tests {
                     mail_days: None,
                 },
                 limits: core::api::HierarchyLimits::default(),
+                attention_suspicion_secs: 15 * 60,
             }
         );
     }
