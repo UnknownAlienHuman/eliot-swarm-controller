@@ -70,7 +70,7 @@ covers their fate.
 | --- | --- |
 | launch/send | stdin `control_request initialize` with the pre-assigned session id, then one stdin `user` record per send; the Eliot-minted `uuid` echoed in `command_lifecycle` is the exact turn association, not local pipe acceptance |
 | steer | unsupported: no exact-current-turn mechanism exists |
-| inject | unsupported: no inject verb; a turn never receives another turn's queued context |
+| inject | `next_input` prepended directly inside same user SEND with exact native turn association; `turn_safe_point` uses authenticated HookEvent `before_tool` → PreToolUse hookSpecificOutput.additionalContext → confirmed response write + hook.before_tool receipt, captured generation/turn, no drift/replay; `active_turn` inject unsupported for this CLI |
 | interrupt | stdin `control_request interrupt` for the bound active turn uuid, with the `still_queued` readback; the terminal follows and unknown is not repeated |
 | stop | drop stdin (the CLI exits on EOF) and kill only the direct CLI child by handle; does not merely detach observation; grandchildren are reaped by the generation Job on Windows / process group on Unix, not the plugin (see Transport) |
 | resume | new plugin/CLI with `--resume` and the exact retained session id; never resend prior prompt; the frozen model is re-applied via `set_model` on the idle preflight, and a drifted permission mode via `set_permission_mode` (drift path unverified live: no live resume has drifted yet) |
