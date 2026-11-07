@@ -474,6 +474,8 @@ pub(crate) fn load_project_registration_config(
                         | "deny"
                         | "answer"
                         | "run"
+                        | "notify"
+                        | "emit"
                 )
             },
         )?;
@@ -684,7 +686,7 @@ fn normalize_project_allowlist(
                 offset,
                 &format!("projects.{project_id}.{field}"),
                 if field == "actions" {
-                    "only implemented launch, resume, stop, send, git.fetch, steer, interrupt, approve, deny, answer and run actions may be approved"
+                    "only implemented launch, resume, stop, send, git.fetch, steer, interrupt, approve, deny, answer, run, notify and emit actions may be approved"
                 } else {
                     "must name an existing global profile"
                 },

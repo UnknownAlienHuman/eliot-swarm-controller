@@ -47,6 +47,18 @@ impl CommandSubmitRequest {
                 "git.fetch is targetless and has no Agent bindings",
             ));
         }
+        if matches!(self.verb.as_str(), "notify" | "emit")
+            && (self.target.is_some()
+                || self.expected_generation.is_some()
+                || self.expected_turn_id.is_some()
+                || self.request_id.is_some()
+                || self.probe)
+        {
+            return Err(Error::new(
+                "invalid",
+                "notify/emit are targetless and have no Agent bindings",
+            ));
+        }
         Ok(())
     }
 }

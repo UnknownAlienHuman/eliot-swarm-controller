@@ -1,8 +1,8 @@
 use eliot_core::{
     Error, Event, SubmitCommand,
     api::{
-        CatchUp, CommandSubmitRequest, GitFetchDefinitionArgs, RuleLimit, RuleLimitScope,
-        RunDefinitionArgs, TimerSchedule,
+        CatchUp, CommandSubmitRequest, EmitDefinitionArgs, GitFetchDefinitionArgs,
+        NotifyDefinitionArgs, RuleLimit, RuleLimitScope, RunDefinitionArgs, TimerSchedule,
     },
     canonical_json_sha256,
     limits::{MAX_EVENT_BYTES, MAX_TEXT_BYTES},
@@ -141,6 +141,8 @@ enum ActionDefinition {
     Agent(AgentActionDefinition),
     Run { definition: RunDefinitionArgs },
     GitFetch { definition: GitFetchDefinitionArgs },
+    Notify { definition: NotifyDefinitionArgs },
+    Emit { definition: EmitDefinitionArgs },
 }
 
 impl<'de> Deserialize<'de> for ActionDefinition {
@@ -170,6 +172,20 @@ impl<'de> Deserialize<'de> for ActionDefinition {
             let definition =
                 serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
             return Ok(Self::GitFetch { definition });
+        }
+        if action == "notify" {
+            let mut fields = object.clone();
+            fields.remove("action");
+            let definition =
+                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+            return Ok(Self::Notify { definition });
+        }
+        if action == "emit" {
+            let mut fields = object.clone();
+            fields.remove("action");
+            let definition =
+                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+            return Ok(Self::Emit { definition });
         }
         serde_json::from_value::<AgentActionDefinition>(value)
             .map(Self::Agent)
@@ -208,6 +224,32 @@ impl Serialize for ActionDefinition {
                         }
                     };
                 fields.insert("action".to_owned(), Value::String("run".to_owned()));
+                Value::Object(fields).serialize(serializer)
+            }
+            Self::Notify { definition } => {
+                let mut fields =
+                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
+                        Value::Object(fields) => fields,
+                        _ => {
+                            return Err(serde::ser::Error::custom(
+                                "notify definition must serialize as an object",
+                            ));
+                        }
+                    };
+                fields.insert("action".to_owned(), Value::String("notify".to_owned()));
+                Value::Object(fields).serialize(serializer)
+            }
+            Self::Emit { definition } => {
+                let mut fields =
+                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
+                        Value::Object(fields) => fields,
+                        _ => {
+                            return Err(serde::ser::Error::custom(
+                                "emit definition must serialize as an object",
+                            ));
+                        }
+                    };
+                fields.insert("action".to_owned(), Value::String("emit".to_owned()));
                 Value::Object(fields).serialize(serializer)
             }
         }
@@ -575,6 +617,12 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         ActionDefinition::GitFetch { definition } => {
             return submit_git_fetch_command(definition).map(Some);
         }
+        ActionDefinition::Notify { definition } => {
+            return submit_notify_command(definition).map(Some);
+        }
+        ActionDefinition::Emit { definition } => {
+            return submit_emit_command(definition).map(Some);
+        }
         ActionDefinition::Agent(action) => action,
     };
     let roots = TemplateRoots {
@@ -742,6 +790,26 @@ fn validate_git_fetch_definition(definition: &GitFetchDefinitionArgs) -> Result<
     Ok(())
 }
 
+fn submit_notify_command(definition: &NotifyDefinitionArgs) -> Result<SubmitCommand, Error> {
+    definition.validate()?;
+    let args = serde_json::to_value(definition)
+        .map_err(|_| Error::new("invalid", "notify definition cannot be encoded"))?;
+    let mut command = CommandSubmitRequest::new(String::new(), "notify");
+    command.args = args;
+    command.validate()?;
+    Ok(command)
+}
+
+fn submit_emit_command(definition: &EmitDefinitionArgs) -> Result<SubmitCommand, Error> {
+    definition.validate()?;
+    let args = serde_json::to_value(definition)
+        .map_err(|_| Error::new("invalid", "emit definition cannot be encoded"))?;
+    let mut command = CommandSubmitRequest::new(String::new(), "emit");
+    command.args = args;
+    command.validate()?;
+    Ok(command)
+}
+
 fn submit_git_fetch_command(definition: &GitFetchDefinitionArgs) -> Result<SubmitCommand, Error> {
     validate_git_fetch_definition(definition)?;
     let args = serde_json::to_value(definition)
@@ -842,6 +910,8 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
                                     | "resume"
                                     | "run"
                                     | "git.fetch"
+                                    | "notify"
+                                    | "emit"
                             )
                         })
                 })
@@ -1005,6 +1075,8 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
         ActionDefinition::GitFetch { definition } => {
             return validate_git_fetch_definition(definition);
         }
+        ActionDefinition::Notify { definition } => return definition.validate(),
+        ActionDefinition::Emit { definition } => return definition.validate(),
         ActionDefinition::Agent(action) => action,
     };
     if let AgentActionDefinition::Launch {
@@ -1139,6 +1211,8 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
     let action = match action {
         ActionDefinition::Run { definition } => return submit_run_command(definition),
         ActionDefinition::GitFetch { definition } => return submit_git_fetch_command(definition),
+        ActionDefinition::Notify { definition } => return submit_notify_command(definition),
+        ActionDefinition::Emit { definition } => return submit_emit_command(definition),
         ActionDefinition::Agent(action) => action,
     };
     let (target_value, generation_value, args) = match action {

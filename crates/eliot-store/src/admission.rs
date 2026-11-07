@@ -389,6 +389,35 @@ pub(super) fn submit_tx(
             )?);
             None
         }
+        "notify" | "emit" => {
+            if request.target.is_some()
+                || request.expected_generation.is_some()
+                || request.expected_turn_id.is_some()
+                || request.request_id.is_some()
+                || request.probe
+                || preparation.is_some()
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "notify/emit are targetless commands without Agent bindings",
+                ));
+            }
+            if request.verb == "notify" {
+                serde_json::from_value::<core::api::NotifyDefinitionArgs>(request.args.clone())
+                    .map_err(|_| Error::new("invalid", "notify definition is malformed"))?
+                    .validate()?;
+            } else {
+                serde_json::from_value::<core::api::EmitDefinitionArgs>(request.args.clone())
+                    .map_err(|_| Error::new("invalid", "emit definition is malformed"))?
+                    .validate()?;
+            }
+            events.push(admit_command(
+                tx,
+                &CommandInsert::targetless_admitted(principal, &request, &payload_digest, now),
+                json!({"command_id": request.id, "verb": request.verb}),
+            )?);
+            None
+        }
         "launch" => {
             if request.target.is_some() {
                 return Err(Error::new("invalid", "launch does not take a target"));

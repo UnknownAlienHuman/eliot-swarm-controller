@@ -535,6 +535,39 @@ impl Store {
         result
     }
 
+    /// Persist one local user event for an existing dispatched command.
+    /// The command must already exist (ordinary admission committed it);
+    /// settlement remains the caller's separate `settle` step.
+    pub fn commit_user_event(
+        &mut self,
+        command_id: &str,
+        kind: &str,
+        data: Value,
+        now: i64,
+    ) -> Result<Change<Event>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            load_command_record(&tx, command_id)?
+                .ok_or_else(|| Error::new("not_found", "user-event command was not found"))?;
+            let event = insert_daemon_event_for_command(
+                &tx,
+                command_id,
+                DaemonEventInput::new(now, kind, "user", None, None, data),
+            )?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(Change {
+                value: event,
+                events: vec![],
+            })
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     pub fn get_agent(&self, id: &str) -> Result<Option<Agent>> {
         let agent_num = parse_agent_id(id)?;
         load_agent_by_num(&self.connection, agent_num)

@@ -213,6 +213,30 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
             }
             return Ok(());
         }
+        if matches!(request.verb.as_str(), "notify" | "emit") {
+            if !registration
+                .actions
+                .iter()
+                .any(|action| action == &request.verb)
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "project rule is not approved for this action",
+                ));
+            }
+            if request.target.is_some()
+                || request.expected_generation.is_some()
+                || request.expected_turn_id.is_some()
+                || request.request_id.is_some()
+                || request.probe
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "notify/emit command must be targetless and unbound",
+                ));
+            }
+            return Ok(());
+        }
         if request.verb == "launch" {
             return validate_rule_launch_action(request, Some(registration));
         }

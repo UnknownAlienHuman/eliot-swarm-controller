@@ -73,6 +73,49 @@ impl Store {
                 events,
             });
         }
+        if matches!(command.command.verb.as_str(), "notify" | "emit") {
+            if command.target.is_some()
+                || command.command.generation.is_some()
+                || command.command.expected_generation.is_some()
+                || command.command.turn_id.is_some()
+                || command.command.request_id.is_some()
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "stored notify/emit command has an Agent binding",
+                ));
+            }
+            projects::validate_project_command_dispatch_tx(&tx, &command)?;
+            match rules::gate_rule_action_dispatch_tx(&tx, id, now, &mut events)? {
+                rules::RuleActionDispatchGate::Ready => {}
+                rules::RuleActionDispatchGate::Held | rules::RuleActionDispatchGate::Cancelled => {
+                    let command = load_command(&tx, id)?
+                        .ok_or_else(|| Error::new("internal", "gated command disappeared"))?;
+                    commit_transaction(tx, &self.write_faulted)?;
+                    return Ok(Change {
+                        value: command,
+                        events,
+                    });
+                }
+            }
+            update_command_state(&tx, id, CommandState::Dispatched, None, None, now)?;
+            events.push(insert_daemon_command_event(
+                &tx,
+                now,
+                "command.dispatched",
+                None,
+                None,
+                id,
+                json!({"command_id": id, "verb": command.command.verb}),
+            )?);
+            let command = load_command(&tx, id)?
+                .ok_or_else(|| Error::new("internal", "dispatched notify/emit disappeared"))?;
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(Change {
+                value: command,
+                events,
+            });
+        }
         if command.command.verb == "git.fetch" {
             if command.target.is_some()
                 || command.command.generation.is_some()
