@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 const CONTEXT_ITEMS_ARG: &str = "context_items";
 const MAX_CONTEXT_QUERY_ROWS: usize = 32;
 const MAX_CONTEXT_QUERY_BYTES: usize = MAX_FRAME_BYTES;
+type ContextCursor = (i64, i64);
+type ContextPage = (Vec<CommandRecord>, Option<ContextCursor>);
 
 /// One send dispatch and the FIFO context items committed to that send.
 #[derive(Clone, Debug, PartialEq)]
@@ -165,65 +167,47 @@ pub(super) fn claim_next_input_tx(
 ) -> Result<Vec<ContextItem>> {
     let mut selected = Vec::new();
     let mut selected_ids = Vec::new();
-    for record in pending_context_batch(
-        tx,
-        agent_num,
-        agent.generation,
-        InjectPoint::NextInput,
-        None,
-    )? {
-        let args = decode_inject_args(&record.command.args)?;
-        if args.point != InjectPoint::NextInput {
-            continue;
+    let mut cursor = None;
+    loop {
+        let (records, next_cursor) = pending_context_batch_page(
+            tx,
+            agent_num,
+            agent.generation,
+            InjectPoint::NextInput,
+            None,
+            cursor,
+        )?;
+        if records.is_empty() {
+            break;
         }
-        if args
-            .expires_at_ms
-            .is_some_and(|expires_at| expires_at <= now)
-        {
-            reject_pending_context(
-                tx,
-                &record,
-                agent_num,
-                agent.generation,
-                "expired",
-                now,
-                events,
-            )?;
-            continue;
-        }
-        let item = ContextItem {
-            command_id: record.command.id.clone(),
-            text: args.text,
-            expires_at_ms: args.expires_at_ms,
-        };
-        let mut candidate = selected.clone();
-        candidate.push(item.clone());
-        if combined_send_text_len(&send.args, &candidate)? > MAX_INPUT_BYTES {
-            reject_pending_context(
-                tx,
-                &record,
-                agent_num,
-                agent.generation,
-                "frame_too_large",
-                now,
-                events,
-            )?;
-            continue;
-        }
-        let candidate_args = send_args(&send.args, &candidate)?;
-        let frame = json!({
-            "agent_id": agent.id,
-            "generation": agent.generation,
-            "command_id": send.id,
-            "verb": "send",
-            "args": candidate_args,
-        });
-        match check_rpc_frame("agent.command", &frame) {
-            Ok(()) => {
-                selected = candidate;
-                selected_ids.push(record.command.id.clone());
+        for record in records {
+            let args = decode_inject_args(&record.command.args)?;
+            if args.point != InjectPoint::NextInput {
+                continue;
             }
-            Err(error) if error.code == "frame_too_large" => {
+            if args
+                .expires_at_ms
+                .is_some_and(|expires_at| expires_at <= now)
+            {
+                reject_pending_context(
+                    tx,
+                    &record,
+                    agent_num,
+                    agent.generation,
+                    "expired",
+                    now,
+                    events,
+                )?;
+                continue;
+            }
+            let item = ContextItem {
+                command_id: record.command.id.clone(),
+                text: args.text,
+                expires_at_ms: args.expires_at_ms,
+            };
+            let mut candidate = selected.clone();
+            candidate.push(item.clone());
+            if combined_send_text_len(&send.args, &candidate)? > MAX_INPUT_BYTES {
                 reject_pending_context(
                     tx,
                     &record,
@@ -233,9 +217,36 @@ pub(super) fn claim_next_input_tx(
                     now,
                     events,
                 )?;
+                continue;
             }
-            Err(error) => return Err(error),
+            let candidate_args = send_args(&send.args, &candidate)?;
+            let frame = json!({
+                "agent_id": agent.id,
+                "generation": agent.generation,
+                "command_id": send.id,
+                "verb": "send",
+                "args": candidate_args,
+            });
+            match check_rpc_frame("agent.command", &frame) {
+                Ok(()) => {
+                    selected = candidate;
+                    selected_ids.push(record.command.id.clone());
+                }
+                Err(error) if error.code == "frame_too_large" => {
+                    reject_pending_context(
+                        tx,
+                        &record,
+                        agent_num,
+                        agent.generation,
+                        "frame_too_large",
+                        now,
+                        events,
+                    )?;
+                }
+                Err(error) => return Err(error),
+            }
         }
+        cursor = next_cursor;
     }
 
     for command_id in selected_ids {
@@ -753,12 +764,12 @@ pub(super) fn unknown_claim_outcome(outcome: Option<&Value>, reason: &str) -> Va
     }
 }
 
-/// Read a bounded FIFO prefix of contexts for one real consumer point.
+/// Read one bounded FIFO page of contexts for one real consumer point.
 ///
 /// The `(created_at, rowid)` keyset walks the partial context index without
 /// OFFSET or scanning unrelated command history. Row count and total stored
-/// args bytes cap work while the write transaction is held. Rows beyond a
-/// budget stay pending in FIFO order for a later consumer request.
+/// args bytes cap each page while the write transaction is held. The caller
+/// may continue from the returned key without deferring the remaining queue.
 fn pending_context_batch(
     tx: &Transaction<'_>,
     agent_num: i64,
@@ -766,6 +777,18 @@ fn pending_context_batch(
     point: InjectPoint,
     turn_id: Option<&str>,
 ) -> Result<Vec<CommandRecord>> {
+    pending_context_batch_page(tx, agent_num, generation, point, turn_id, None)
+        .map(|(records, _)| records)
+}
+
+fn pending_context_batch_page(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    point: InjectPoint,
+    turn_id: Option<&str>,
+    after: Option<ContextCursor>,
+) -> Result<ContextPage> {
     const FIRST_SQL: &str = "SELECT id, created_at, rowid, length(CAST(args AS BLOB))
          FROM commands INDEXED BY commands_context_pending
          WHERE target = ?1 AND generation = ?2 AND verb = 'inject'
@@ -782,7 +805,7 @@ fn pending_context_batch(
     let mut first_statement = tx.prepare(FIRST_SQL).map_err(sql_error)?;
     let mut after_statement = tx.prepare(AFTER_SQL).map_err(sql_error)?;
     let point_name = inject_point_name(point);
-    let mut cursor = None;
+    let mut cursor = after;
     let mut visited = 0;
     let mut materialized_bytes = 0_usize;
     let mut records = Vec::with_capacity(MAX_CONTEXT_QUERY_ROWS);
@@ -804,9 +827,6 @@ fn pending_context_batch(
         let Some((id, created_at, rowid, args_bytes)) = candidate else {
             break;
         };
-        visited += 1;
-        cursor = Some((created_at, rowid));
-
         let args_bytes = usize::try_from(args_bytes).map_err(|_| {
             Error::new(
                 "source_integrity",
@@ -827,9 +847,11 @@ fn pending_context_batch(
             load_command_record(tx, &id)?
                 .ok_or_else(|| Error::new("source_integrity", "context command disappeared"))?,
         );
+        visited += 1;
+        cursor = Some((created_at, rowid));
     }
 
-    Ok(records)
+    Ok((records, cursor))
 }
 
 fn read_pending_context_candidate(
