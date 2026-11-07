@@ -147,35 +147,22 @@ impl ProviderHold {
     }
 }
 
-/// Resolve the hold scope from the Agent's frozen route/account/profile only.
+/// Resolve the hold scope from the Agent's frozen account or profile only.
+/// A shared adopted proxy (`route_binding`/`proxy`) is a capacity scope, never
+/// a provider-hold scope: a per-turn restriction proves only the admitted
+/// account/profile restriction, not that the whole proxy service is held.
 pub fn frozen_provider_scope(agent: &Agent) -> Result<String> {
     let snapshot = agent
         .profile_snapshot
         .as_object()
         .ok_or_else(invalid_provider_scope)?;
 
-    let scope = if let Some(binding) = snapshot.get("route_binding") {
-        let binding: RouteBinding =
-            serde_json::from_value(binding.clone()).map_err(|_| invalid_provider_scope())?;
-        binding.validate().map_err(|_| invalid_provider_scope())?;
-        if snapshot
-            .get("proxy")
-            .is_some_and(|proxy| proxy.as_str() != Some(binding.name.as_str()))
-        {
-            return Err(invalid_provider_scope());
-        }
-        format!("proxy:{}", binding.name)
-    } else {
-        if snapshot.contains_key("proxy") {
-            return Err(invalid_provider_scope());
-        }
-        match snapshot.get("account") {
-            Some(account) => format!(
-                "account:{}",
-                account.as_str().ok_or_else(invalid_provider_scope)?
-            ),
-            None => format!("profile:{}", agent.profile),
-        }
+    let scope = match snapshot.get("account") {
+        Some(account) => format!(
+            "account:{}",
+            account.as_str().ok_or_else(invalid_provider_scope)?
+        ),
+        None => format!("profile:{}", agent.profile),
     };
 
     CapacityScope {
@@ -406,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_scope_uses_only_frozen_route_account_then_profile() {
+    fn provider_scope_uses_only_frozen_account_then_profile() {
         let mut agent = Agent::new("a1", "project", "codex", "codex-luna", 0);
         let binding = route();
         agent.profile_snapshot = json!({
@@ -414,7 +401,7 @@ mod tests {
             "account":"main",
             "route_binding":binding
         });
-        assert_eq!(frozen_provider_scope(&agent).unwrap(), "proxy:opencodex");
+        assert_eq!(frozen_provider_scope(&agent).unwrap(), "account:main");
 
         agent.profile_snapshot = json!({"account":"main"});
         assert_eq!(frozen_provider_scope(&agent).unwrap(), "account:main");
@@ -423,7 +410,7 @@ mod tests {
         assert_eq!(frozen_provider_scope(&agent).unwrap(), "profile:codex-luna");
 
         agent.profile_snapshot = json!({"proxy":"opencodex"});
-        assert!(frozen_provider_scope(&agent).is_err());
+        assert_eq!(frozen_provider_scope(&agent).unwrap(), "profile:codex-luna");
     }
 
     #[test]
