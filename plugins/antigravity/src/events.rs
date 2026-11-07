@@ -428,6 +428,22 @@ impl State {
         }
     }
 
+    fn reject_pending_steer(&mut self, reason: &str) {
+        if let Some(steer) = self.pending_steer.take() {
+            let outcome = json!({
+                "state": "rejected",
+                "command_id": steer.command_id,
+                "generation": self.generation,
+                "turn_id": steer.turn_id,
+                "mechanism": STEER_MECHANISM,
+                "native_hook": "PreInvocation",
+                "reason_code": "stale_turn",
+                "reason": reason,
+            });
+            let _ = steer.reply.send(Ok(outcome));
+        }
+    }
+
     /// Register correlation before the write. This local turn id is never
     /// sent to AGY or presented as a vendor-supplied id.
     pub fn prepare(
@@ -802,10 +818,9 @@ impl State {
         }
         self.commit("turn.completed", &turn, "completed", data.clone())
             .await?;
-        self.fail_pending_steer(Error::new(
-            "stale_turn",
+        self.reject_pending_steer(
             "Antigravity turn ended before its next PreInvocation steer point",
-        ));
+        );
         let final_text = match data.get("final_text").and_then(Value::as_str) {
             Some(final_text) => final_text.to_owned(),
             None if !failed && !truncated => text,
