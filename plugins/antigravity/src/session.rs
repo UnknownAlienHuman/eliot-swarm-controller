@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
-use eliot_core::{Error, Result, canonical_json_sha256};
+use eliot_core::{Error, InjectPoint, Result, canonical_json_sha256};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, MAX_TEXT_BYTES,
     PeerClient,
     native_transport::{NativeChild, NativeLaunch, StreamState, encode_frame},
-    session::{native_no_write, register_native_process, unknown_snapshot, with_claimed_context},
+    session::{
+        native_no_write, register_native_process, unknown_snapshot, with_claimed_context,
+        with_context_points,
+    },
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -163,6 +166,7 @@ impl Session {
             ));
         };
         let effective = plan.check_init(&conversation_id, &init)?;
+        let effective = with_context_points(effective, &[InjectPoint::NextInput]);
         if *self.stream.borrow() != StreamState::Open {
             return Err(Error::new(
                 "unknown",
@@ -278,11 +282,12 @@ impl Session {
         let combined = with_claimed_context(text, &params.context, "Antigravity")?;
         let encoded = encode_frame("Antigravity", &UserInput::new(&combined))?;
         let turn = format!("agy-{}", ulid::Ulid::new());
-        let associated = self
-            .state
-            .lock()
-            .await
-            .prepare(params.command_id.clone(), turn.clone())?;
+        let associated = {
+            let mut state = self.state.lock().await;
+            let associated = state.prepare(params.command_id.clone(), turn.clone())?;
+            state.attach_context(&params.command_id, params.context.clone())?;
+            associated
+        };
         self.highwater_seq = seq;
         let unknown = Err(Error::new(
             "unknown",

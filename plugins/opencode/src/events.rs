@@ -10,11 +10,14 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use eliot_core::{Error, Result, SecretPolicy, TurnUsage};
+use eliot_core::{ContextItem, Error, Result, SecretPolicy, TurnUsage};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     native_stdio::StreamState,
-    session::{EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error, event_id},
+    session::{
+        EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error, event_id,
+        next_input_outcomes,
+    },
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -109,6 +112,7 @@ enum Control {
     AssociateInbox {
         command_id: String,
         inbox_id: String,
+        context: Vec<ContextItem>,
         reply: oneshot::Sender<Result<()>>,
     },
     AbandonAssociation {
@@ -137,6 +141,7 @@ struct BufferedEnvelope {
 
 struct PendingInbox {
     command_id: String,
+    context: Vec<ContextItem>,
     inbox_id: String,
 }
 
@@ -241,10 +246,16 @@ impl EventHandle {
         .await
     }
 
-    pub async fn associate_inbox(&self, command_id: String, inbox_id: String) -> Result<()> {
+    pub async fn associate_inbox(
+        &self,
+        command_id: String,
+        inbox_id: String,
+        context: Vec<ContextItem>,
+    ) -> Result<()> {
         self.send(|reply| Control::AssociateInbox {
             command_id,
             inbox_id,
+            context,
             reply,
         })
         .await
@@ -503,9 +514,10 @@ impl EventProcessor {
             Control::AssociateInbox {
                 command_id,
                 inbox_id,
+                context,
                 reply,
             } => {
-                let result = self.associate_inbox(command_id, inbox_id).await;
+                let result = self.associate_inbox(command_id, inbox_id, context).await;
                 let _ = reply.send(result);
                 true
             }
@@ -806,7 +818,12 @@ impl EventProcessor {
         Ok(())
     }
 
-    async fn associate_inbox(&mut self, command_id: String, inbox_id: String) -> Result<()> {
+    async fn associate_inbox(
+        &mut self,
+        command_id: String,
+        inbox_id: String,
+        context: Vec<ContextItem>,
+    ) -> Result<()> {
         if !self.status.ready
             || self.status.session_id.is_none()
             || command_id.trim().is_empty()
@@ -831,6 +848,7 @@ impl EventProcessor {
         }
         self.pending = Some(PendingInbox {
             command_id,
+            context,
             inbox_id,
         });
         self.saw_send = true;
@@ -853,6 +871,7 @@ impl EventProcessor {
         };
         self.stashed_started = None;
         let command_id = pending.command_id.clone();
+        let context = pending.context.clone();
         self.open_inbox_id = Some(pending.inbox_id.clone());
         self.status.active_command_id = Some(command_id.clone());
         self.status.active_turn_id = Some(turn_id.clone());
@@ -866,12 +885,11 @@ impl EventProcessor {
             "opencode",
             "OpenCode",
         )?;
-        self.commit_event(
-            "turn.started",
-            native_id,
-            json!({"command_id": command_id, "turn_id": turn_id}),
-        )
-        .await
+        let mut data = json!({"command_id": command_id, "turn_id": turn_id});
+        if !context.is_empty() {
+            data["context_outcomes"] = json!(next_input_outcomes(&context, &command_id));
+        }
+        self.commit_event("turn.started", native_id, data).await
     }
 
     async fn flush_buffer(&mut self) -> Result<()> {

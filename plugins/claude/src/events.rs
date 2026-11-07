@@ -8,6 +8,7 @@ use eliot_plugin::{
     protocol::{HookEvent, HookResponse},
     session::{
         EVENT_DEADLINE, StreamSource, approval_reply_args, attach_final_text, native_no_write,
+        next_input_outcomes,
         rejected_control, request_event_id, unknown_control, with_claimed_context,
     },
 };
@@ -96,6 +97,7 @@ enum Control {
     ExpectTurn {
         command_id: String,
         turn_id: String,
+        context: Vec<ContextItem>,
         registered: oneshot::Sender<Result<()>>,
         outcome: oneshot::Sender<TurnOutcome>,
     },
@@ -140,6 +142,7 @@ struct BufferedRecord {
 struct PendingTurn {
     command_id: String,
     turn_id: String,
+    context: Vec<ContextItem>,
     outcome: Option<oneshot::Sender<TurnOutcome>>,
 }
 
@@ -274,6 +277,7 @@ struct EventProcessor {
     gap_number: u64,
     pending_turn: Option<PendingTurn>,
     pending_requests: HashMap<String, PendingNativeRequest>,
+    cancelled_hook_requests: HashSet<String>,
     tool_use_turns: HashMap<String, ToolUseBinding>,
     tool_use_tracking_fenced: bool,
     deny_uncertain: HashSet<String>,
@@ -374,6 +378,7 @@ impl EventHandle {
         &self,
         command_id: String,
         turn_id: String,
+        context: Vec<ContextItem>,
     ) -> Result<oneshot::Receiver<TurnOutcome>> {
         let (registered_tx, registered_rx) = oneshot::channel();
         let (outcome_tx, outcome_rx) = oneshot::channel();
@@ -381,6 +386,7 @@ impl EventHandle {
             .send(Control::ExpectTurn {
                 command_id,
                 turn_id,
+                context,
                 registered: registered_tx,
                 outcome: outcome_tx,
             })
@@ -581,10 +587,21 @@ async fn dispatch_control(
         Control::ExpectTurn {
             command_id,
             turn_id,
+            context,
             registered,
             outcome,
         } => {
-            let result = processor.register_turn(command_id, turn_id, outcome);
+            let mut result = processor.register_turn(command_id, turn_id, outcome);
+            if result.is_ok() {
+                if let Some(pending) = processor.pending_turn.as_mut() {
+                    pending.context = context;
+                } else {
+                    result = Err(Error::new(
+                        "internal",
+                        "Claude pending turn disappeared during context registration",
+                    ));
+                }
+            }
             publish(processor, status);
             let _ = registered.send(result);
         }
@@ -672,6 +689,7 @@ impl EventProcessor {
             gap_number: 0,
             pending_turn: None,
             pending_requests: HashMap::new(),
+            cancelled_hook_requests: HashSet::new(),
             tool_use_turns: HashMap::new(),
             tool_use_tracking_fenced: false,
             deny_uncertain: HashSet::new(),
@@ -806,6 +824,7 @@ impl EventProcessor {
         self.pending_turn = Some(PendingTurn {
             command_id,
             turn_id,
+            context: Vec::new(),
             outcome: Some(outcome),
         });
         Ok(())
@@ -1016,6 +1035,7 @@ impl EventProcessor {
         let PendingTurn {
             command_id,
             turn_id,
+            context,
             outcome,
         } = pending;
         let settle = |outcome: Option<oneshot::Sender<TurnOutcome>>, settled: TurnOutcome| {
@@ -1038,10 +1058,14 @@ impl EventProcessor {
                 self.publish_now();
                 let session_id = self.status.session_id.as_deref().unwrap_or_default();
                 let native_id = format!("claude:{session_id}:{turn_id}:turn.started");
-                let data = json!({
+                let context_outcomes = next_input_outcomes(&context, &command_id);
+                let mut data = json!({
                     "command_id": command_id,
                     "turn_id": turn_id,
                 });
+                if !context_outcomes.is_empty() {
+                    data["context_outcomes"] = json!(context_outcomes);
+                }
                 if let Err(error) = self.commit_event("turn.started", native_id, data).await {
                     settle(outcome, TurnOutcome::Unknown);
                     return Err(error);
@@ -1319,6 +1343,9 @@ impl EventProcessor {
                     "Claude hook_callback omitted its exact native request id",
                 )
             })?;
+        if self.cancelled_hook_requests.contains(request_id) {
+            return Ok(());
+        }
         if self.pending_hooks.contains_key(request_id) {
             return Ok(());
         }
@@ -1406,13 +1433,24 @@ impl EventProcessor {
             turn_id: turn_id.clone(),
             consumer_id: consumer_id.clone(),
         };
-        let params = match serde_json::to_value(event) {
+        let mut params = match serde_json::to_value(event) {
             Ok(params) => params,
             Err(_) => {
                 self.finish_available_tool_use_hook(&tool_use_id);
                 return self.write_hook_pass(&native, request_id, deadline).await;
             }
         };
+        let Some(params_object) = params.as_object_mut() else {
+            self.finish_available_tool_use_hook(&tool_use_id);
+            return self.write_hook_pass(&native, request_id, deadline).await;
+        };
+        // This private IPC envelope field is stripped by the host before the
+        // shared HookEvent DTO is decoded. It never enters native input or
+        // persisted event data.
+        params_object.insert(
+            "credential".to_owned(),
+            Value::String(self.credential.clone()),
+        );
         if let Some(binding) = self.tool_use_turns.get_mut(&tool_use_id) {
             binding.hook_state = HookConsumerState::InFlight;
             binding.active_consumer_id = Some(consumer_id.clone());
@@ -1634,10 +1672,32 @@ impl EventProcessor {
         if cancel.kind != "control_cancel_request" || cancel.request_id.trim().is_empty() {
             return;
         }
+        self.cancelled_hook_requests
+            .insert(cancel.request_id.clone());
+        self.remove_buffered_hook_callback(&cancel.request_id);
         if let Some(pending) = self.pending_hooks.remove(&cancel.request_id) {
             pending.task.abort();
             self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
         }
+    }
+
+    fn remove_buffered_hook_callback(&mut self, request_id: &str) {
+        let mut removed_bytes = 0_usize;
+        self.buffer.retain(|frame| {
+            let request = frame.record.get("request");
+            let cancelled = frame.record.get("type").and_then(Value::as_str)
+                == Some("control_request")
+                && frame.record.get("request_id").and_then(Value::as_str) == Some(request_id)
+                && request
+                    .and_then(|request| request.get("subtype"))
+                    .and_then(Value::as_str)
+                    == Some("hook_callback");
+            if cancelled {
+                removed_bytes = removed_bytes.saturating_add(frame.size);
+            }
+            !cancelled
+        });
+        self.buffer_bytes = self.buffer_bytes.saturating_sub(removed_bytes);
     }
 
     fn cancel_hook_callbacks_for_turn(&mut self, turn_id: &str) {
@@ -1648,6 +1708,7 @@ impl EventProcessor {
             .map(|(request_id, _)| request_id.clone())
             .collect();
         for request_id in request_ids {
+            self.cancelled_hook_requests.insert(request_id.clone());
             if let Some(pending) = self.pending_hooks.remove(&request_id) {
                 pending.task.abort();
                 self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
@@ -1656,12 +1717,10 @@ impl EventProcessor {
     }
 
     fn cancel_all_hook_callbacks(&mut self) {
-        let pending_hooks: Vec<PendingHookCallback> = self
-            .pending_hooks
-            .drain()
-            .map(|(_, pending)| pending)
-            .collect();
-        for pending in pending_hooks {
+        let pending_hooks: Vec<(String, PendingHookCallback)> =
+            self.pending_hooks.drain().collect();
+        for (request_id, pending) in pending_hooks {
+            self.cancelled_hook_requests.insert(request_id);
             pending.task.abort();
             self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
         }

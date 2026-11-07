@@ -22,7 +22,7 @@ use crate::{
         },
     },
 };
-use eliot_core::{Error, Result, SecretPolicy};
+use eliot_core::{Error, InjectPoint, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -31,7 +31,7 @@ use eliot_plugin::{
         TargetEnvironment, decode, known_command, native_no_write, not_initialized,
         optional_profile_text, parse_resume_subject, paths_equal, register_native_process,
         rejected_control, target_environment, unknown_control, unknown_snapshot, validate_binding,
-        validate_identity, validate_source_plan, with_claimed_context,
+        validate_identity, validate_source_plan, with_claimed_context, with_context_points,
     },
 };
 use serde_json::{Value, json};
@@ -1071,6 +1071,7 @@ impl MusePlugin {
             "permissions_verified": false,
             "schema_fingerprint": initialized_native.fingerprint.clone(),
         });
+        let effective = with_context_points(effective, &[InjectPoint::NextInput]);
         // The effective settings are checked BEFORE readiness: on any
         // mismatch no `session.ready` is published and no session is kept.
         let effort_match = initialized_native.effort.is_none() || effort_verified;
@@ -1425,7 +1426,7 @@ impl MusePlugin {
             .insert(command_id.clone(), turn_id.clone());
         if session
             .events
-            .associate_turn(command_id.clone(), turn_id.clone())
+            .associate_turn(command_id.clone(), turn_id.clone(), params.context.clone())
             .await
             .is_err()
         {

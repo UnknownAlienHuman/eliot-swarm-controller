@@ -5,7 +5,7 @@ use crate::{
         types::{InitializeReadback, OutboundUserInput, OutboundUserMessage},
     },
 };
-use eliot_core::{Error, Result, SecretPolicy};
+use eliot_core::{ContextItem, Error, InjectPoint, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -15,6 +15,7 @@ use eliot_plugin::{
         self, contextual_error, decode, native_no_write, not_initialized, optional_profile_text,
         parse_resume_subject, register_native_process, unknown_control, unknown_snapshot,
         validate_binding, validate_identity, validate_source_plan, with_claimed_context,
+        with_context_points,
     },
 };
 use serde_json::{Value, json};
@@ -599,15 +600,16 @@ impl ClaudePlugin {
         // reported on an actual native assistant record (message.completed).
         // Requested vs effective permission mode is reported, never forced:
         // launching with `manual` reads back `default` on the installed CLI.
-        Ok((
-            session,
+        let effective = with_context_points(
             json!({
                 "model": null,
                 "permission_mode": effective_mode,
                 "session_state": readback.session_state,
                 "pid": readback.pid,
             }),
-        ))
+            &[InjectPoint::NextInput, InjectPoint::TurnSafePoint],
+        );
+        Ok((session, effective))
     }
 
     /// Commit `session.ready` and retain the ready session. If readiness is
@@ -731,16 +733,17 @@ impl ClaudePlugin {
                 "Claude session or event source outcome is unresolved",
             ));
         }
+        let context = params.context.clone();
         let text = send_text(&params)?;
         if let Some(replay) = replay_send(session, &params.command_id, text) {
             return replay;
         }
         check_send_ready(session)?;
-        let native_content = with_claimed_context(text, &params.context, "Claude")?;
+        let native_content = with_claimed_context(text, &context, "Claude")?;
         session
             .command_inputs
             .insert(params.command_id.clone(), text.to_owned());
-        dispatch_send(session, &params.command_id, native_content).await
+        dispatch_send(session, &params.command_id, native_content, context).await
     }
 
     async fn interrupt_command(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -1228,11 +1231,12 @@ async fn dispatch_send(
     session: &mut AgentSession,
     command_id: &str,
     content: String,
+    context: Vec<ContextItem>,
 ) -> Result<Value> {
     let turn_id = new_uuid();
     let outcome = match session
         .events
-        .expect_turn(command_id.to_owned(), turn_id.clone())
+        .expect_turn(command_id.to_owned(), turn_id.clone(), context)
         .await
     {
         Ok(outcome) => outcome,

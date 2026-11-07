@@ -15,8 +15,8 @@
 use std::{collections::HashMap, ffi::OsString, path::Path, time::Duration};
 
 use eliot_core::{
-    ContextItem, Error, NativeEvent, ProcessRecord, ProcessState, Result, SecretPolicy,
-    SourceBatch, SourceGap,
+    ContextItem, ContextOutcome, Error, InjectPoint, NativeEvent, ProcessRecord, ProcessState,
+    Result, SecretPolicy, SourceBatch, SourceGap,
 };
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
@@ -188,6 +188,37 @@ pub fn with_claimed_context(text: &str, context: &[ContextItem], harness: &str) 
         ));
     }
     Ok(combined)
+}
+
+/// Build one [`ContextOutcome`] per FIFO-claimed `next_input` item, in claim
+/// order, for the exact send (`consumer_id`) that applied them inside its
+/// native input. Matches the Store `turn.started.data.context_outcomes`
+/// receipt shape: Store zips these positionally against its FIFO claims and
+/// checks the exact count and consumer binding. Empty in, empty out: the
+/// caller omits the key when nothing was claimed. Pure: no I/O, no replay.
+pub fn next_input_outcomes(items: &[ContextItem], consumer_id: &str) -> Vec<ContextOutcome> {
+    items
+        .iter()
+        .map(|_| ContextOutcome {
+            mechanism: "send".to_owned(),
+            application_point: InjectPoint::NextInput,
+            consumer_id: consumer_id.to_owned(),
+        })
+        .collect()
+}
+
+/// Project normalized supported context points into a `session.ready`
+/// effective object. Admission reads `Agent.effective.context_points` as
+/// `Vec<InjectPoint>`; each adapter declares only the points it actually
+/// consumes. Non-objects pass through unchanged.
+pub fn with_context_points(mut effective: Value, points: &[InjectPoint]) -> Value {
+    if let Some(object) = effective.as_object_mut() {
+        object.insert(
+            "context_points".to_owned(),
+            serde_json::to_value(points).unwrap_or(Value::Null),
+        );
+    }
+    effective
 }
 
 /// `bad_state` for a request that arrived before `initialize`.

@@ -5,6 +5,8 @@ use eliot_core::{ContextItem, ContextOutcome, InjectArgs, InjectPoint};
 use serde::{Deserialize, Serialize};
 
 const CONTEXT_ITEMS_ARG: &str = "context_items";
+const MAX_CONTEXT_QUERY_ROWS: usize = 32;
+const MAX_CONTEXT_QUERY_BYTES: usize = MAX_FRAME_BYTES;
 
 /// One send dispatch and the FIFO context items committed to that send.
 #[derive(Clone, Debug, PartialEq)]
@@ -74,6 +76,7 @@ pub(super) fn admit_tx(
             "inject requires a live Agent generation",
         ));
     }
+    require_context_point_available(&agent, args.point)?;
 
     let turn_id = match args.point {
         InjectPoint::NextInput => None,
@@ -153,7 +156,13 @@ pub(super) fn claim_next_input_tx(
 ) -> Result<Vec<ContextItem>> {
     let mut selected = Vec::new();
     let mut selected_ids = Vec::new();
-    for record in pending_context_commands(tx, agent_num, agent.generation)? {
+    for record in pending_context_batch(
+        tx,
+        agent_num,
+        agent.generation,
+        InjectPoint::NextInput,
+        None,
+    )? {
         let args = decode_inject_args(&record.command.args)?;
         if args.point != InjectPoint::NextInput {
             continue;
@@ -341,7 +350,13 @@ impl Store {
         let mut events = Vec::new();
         let mut selected = Vec::new();
         let mut selected_ids = Vec::new();
-        for record in pending_context_commands(&tx, agent_num, generation)? {
+        for record in pending_context_batch(
+            &tx,
+            agent_num,
+            generation,
+            InjectPoint::TurnSafePoint,
+            Some(turn_id),
+        )? {
             let args = decode_inject_args(&record.command.args)?;
             if args.point != InjectPoint::TurnSafePoint
                 || record.command.turn_id.as_deref() != Some(turn_id)
@@ -609,51 +624,42 @@ pub(super) fn cancel_turn_safe_point_tx(
     now: i64,
 ) -> Result<Vec<super::native_events::PendingCommandEvent>> {
     let mut events = Vec::new();
-    for record in pending_context_commands(tx, agent_num, generation)? {
-        let args = decode_inject_args(&record.command.args)?;
-        if args.point != InjectPoint::TurnSafePoint
-            || record.command.turn_id.as_deref() != Some(turn_id)
-        {
-            continue;
-        }
+    for command_id in pending_turn_safe_point_command_ids(tx, agent_num, generation, turn_id)? {
         let outcome = json!({"reason": "captured_turn_ended"});
         update_command_state(
             tx,
-            &record.command.id,
+            &command_id,
             CommandState::Cancelled,
             Some(&outcome),
             None,
             now,
         )?;
         events.push(super::native_events::PendingCommandEvent {
-            command_id: record.command.id.clone(),
+            command_id: command_id.clone(),
             data: json!({
-                "command_id": record.command.id,
+                "command_id": command_id,
                 "state": "cancelled",
                 "outcome": outcome,
             }),
         });
     }
-    for record in claimed_turn_safe_point_commands(tx, agent_num, generation, turn_id)? {
-        if record.state != CommandState::Dispatched {
-            continue;
-        }
-        let outcome = unknown_claim_outcome(
-            record.command.outcome.as_ref(),
-            "captured_turn_ended_without_receipt",
-        );
+    for (command_id, prior_outcome) in
+        dispatched_turn_safe_point_claims(tx, agent_num, generation, turn_id)?
+    {
+        let outcome =
+            unknown_claim_outcome(Some(&prior_outcome), "captured_turn_ended_without_receipt");
         update_command_state(
             tx,
-            &record.command.id,
+            &command_id,
             CommandState::Unknown,
             Some(&outcome),
             None,
             now,
         )?;
         events.push(super::native_events::PendingCommandEvent {
-            command_id: record.command.id.clone(),
+            command_id: command_id.clone(),
             data: json!({
-                "command_id": record.command.id,
+                "command_id": command_id,
                 "state": "unknown",
                 "outcome": outcome,
             }),
@@ -669,35 +675,125 @@ pub(super) fn unknown_claim_outcome(outcome: Option<&Value>, reason: &str) -> Va
     }
 }
 
-fn pending_context_commands(
+/// Read a bounded FIFO prefix of contexts for one real consumer point.
+///
+/// The `(created_at, rowid)` keyset walks the partial context index without
+/// OFFSET or scanning unrelated command history. Row count and total stored
+/// args bytes cap work while the write transaction is held. Rows beyond a
+/// budget stay pending in FIFO order for a later consumer request.
+fn pending_context_batch(
     tx: &Transaction<'_>,
     agent_num: i64,
     generation: i64,
+    point: InjectPoint,
+    turn_id: Option<&str>,
 ) -> Result<Vec<CommandRecord>> {
+    const FIRST_SQL: &str = "SELECT id, created_at, rowid, length(CAST(args AS BLOB))
+         FROM commands INDEXED BY commands_context_pending
+         WHERE target = ?1 AND generation = ?2 AND verb = 'inject'
+           AND state IN ('accepted', 'queued')
+           AND json_extract(args, '$.point') = ?3 AND turn_id IS ?4
+         ORDER BY created_at, rowid LIMIT 1";
+    const AFTER_SQL: &str = "SELECT id, created_at, rowid, length(CAST(args AS BLOB))
+         FROM commands INDEXED BY commands_context_pending
+         WHERE target = ?1 AND generation = ?2 AND verb = 'inject'
+           AND state IN ('accepted', 'queued')
+           AND json_extract(args, '$.point') = ?3 AND turn_id IS ?4
+           AND (created_at, rowid) > (?5, ?6)
+         ORDER BY created_at, rowid LIMIT 1";
+    let mut first_statement = tx.prepare(FIRST_SQL).map_err(sql_error)?;
+    let mut after_statement = tx.prepare(AFTER_SQL).map_err(sql_error)?;
+    let point_name = inject_point_name(point);
+    let mut cursor = None;
+    let mut visited = 0;
+    let mut materialized_bytes = 0_usize;
+    let mut records = Vec::with_capacity(MAX_CONTEXT_QUERY_ROWS);
+
+    while visited < MAX_CONTEXT_QUERY_ROWS {
+        let candidate = if let Some((created_at, rowid)) = cursor {
+            let mut rows = after_statement
+                .query(params![
+                    agent_num, generation, point_name, turn_id, created_at, rowid,
+                ])
+                .map_err(sql_error)?;
+            read_pending_context_candidate(&mut rows)?
+        } else {
+            let mut rows = first_statement
+                .query(params![agent_num, generation, point_name, turn_id])
+                .map_err(sql_error)?;
+            read_pending_context_candidate(&mut rows)?
+        };
+        let Some((id, created_at, rowid, args_bytes)) = candidate else {
+            break;
+        };
+        visited += 1;
+        cursor = Some((created_at, rowid));
+
+        let args_bytes = usize::try_from(args_bytes).map_err(|_| {
+            Error::new(
+                "source_integrity",
+                "pending context has an invalid stored argument length",
+            )
+        })?;
+        if args_bytes > MAX_CONTEXT_QUERY_BYTES {
+            return Err(Error::new(
+                "source_integrity",
+                "pending context exceeds the maximum command frame size",
+            ));
+        }
+        if args_bytes > MAX_CONTEXT_QUERY_BYTES.saturating_sub(materialized_bytes) {
+            break;
+        }
+        materialized_bytes += args_bytes;
+        records.push(
+            load_command_record(tx, &id)?
+                .ok_or_else(|| Error::new("source_integrity", "context command disappeared"))?,
+        );
+    }
+
+    Ok(records)
+}
+
+fn read_pending_context_candidate(
+    rows: &mut rusqlite::Rows<'_>,
+) -> Result<Option<(String, i64, i64, i64)>> {
+    let Some(row) = rows.next().map_err(sql_error)? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        row.get::<_, String>(0).map_err(sql_error)?,
+        row.get::<_, i64>(1).map_err(sql_error)?,
+        row.get::<_, i64>(2).map_err(sql_error)?,
+        row.get::<_, i64>(3).map_err(sql_error)?,
+    )))
+}
+
+fn pending_turn_safe_point_command_ids(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    turn_id: &str,
+) -> Result<Vec<String>> {
     let mut statement = tx
         .prepare(
-            "SELECT id FROM commands
+            "SELECT id FROM commands INDEXED BY commands_context_pending
              WHERE target = ?1 AND generation = ?2 AND verb = 'inject'
                AND state IN ('accepted', 'queued')
+               AND json_extract(args, '$.point') = 'turn_safe_point'
+               AND turn_id = ?3
              ORDER BY created_at, rowid",
         )
         .map_err(sql_error)?;
     let rows = statement
-        .query_map(params![agent_num, generation], |row| {
+        .query_map(params![agent_num, generation, turn_id], |row| {
             row.get::<_, String>(0)
         })
         .map_err(sql_error)?;
-    let mut ids = Vec::new();
+    let mut command_ids = Vec::new();
     for row in rows {
-        ids.push(row.map_err(sql_error)?);
+        command_ids.push(row.map_err(sql_error)?);
     }
-    drop(statement);
-    ids.into_iter()
-        .map(|id| {
-            load_command_record(tx, &id)?
-                .ok_or_else(|| Error::new("source_integrity", "context command disappeared"))
-        })
-        .collect()
+    Ok(command_ids)
 }
 
 fn claimed_context_commands(
@@ -739,42 +835,50 @@ fn claimed_context_commands(
     Ok(claims)
 }
 
-fn claimed_turn_safe_point_commands(
+fn dispatched_turn_safe_point_claims(
     tx: &Transaction<'_>,
     agent_num: i64,
     generation: i64,
     turn_id: &str,
-) -> Result<Vec<CommandRecord>> {
+) -> Result<Vec<(String, Value)>> {
     let mut statement = tx
         .prepare(
-            "SELECT id FROM commands
+            "SELECT id, outcome FROM commands INDEXED BY commands_target
              WHERE target = ?1 AND generation = ?2 AND verb = 'inject'
-               AND state IN ('dispatched', 'unknown')
+               AND state = 'dispatched'
+               AND turn_id = ?3
+               AND json_extract(outcome, '$.claim.application_point') = 'turn_safe_point'
              ORDER BY created_at, rowid",
         )
         .map_err(sql_error)?;
     let rows = statement
-        .query_map(params![agent_num, generation], |row| {
-            row.get::<_, String>(0)
+        .query_map(params![agent_num, generation, turn_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })
         .map_err(sql_error)?;
-    let mut ids = Vec::new();
-    for row in rows {
-        ids.push(row.map_err(sql_error)?);
-    }
-    drop(statement);
     let mut claims = Vec::new();
-    for id in ids {
-        let record = load_command_record(tx, &id)?
-            .ok_or_else(|| Error::new("source_integrity", "context claim disappeared"))?;
-        let Some(claim) = context_claim(record.command.outcome.as_ref())? else {
-            continue;
-        };
-        if claim.application_point == InjectPoint::TurnSafePoint
-            && record.command.turn_id.as_deref() == Some(turn_id)
-        {
-            claims.push(record);
+    for row in rows {
+        let (id, encoded_outcome) = row.map_err(sql_error)?;
+        let encoded_outcome = encoded_outcome.ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "dispatched context claim has no outcome",
+            )
+        })?;
+        let outcome = decode_json(&encoded_outcome)?;
+        let claim = context_claim(Some(&outcome))?.ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "dispatched context claim has no claim marker",
+            )
+        })?;
+        if claim.application_point != InjectPoint::TurnSafePoint {
+            return Err(Error::new(
+                "source_integrity",
+                "captured-turn context claim has the wrong application point",
+            ));
         }
+        claims.push((id, outcome));
     }
     Ok(claims)
 }
@@ -983,6 +1087,41 @@ fn reject_pending_context(
         json!({"command_id": record.command.id, "state": "rejected", "outcome": outcome}),
     )?);
     Ok(())
+}
+
+fn require_context_point_available(agent: &Agent, point: InjectPoint) -> Result<()> {
+    let Some(context_points) = agent
+        .effective
+        .as_ref()
+        .and_then(|effective| effective.get("context_points"))
+    else {
+        return Err(Error::new(
+            "unsupported",
+            "Agent has no consumer for this context application point",
+        ));
+    };
+    let context_points = serde_json::from_value::<Vec<InjectPoint>>(context_points.clone())
+        .map_err(|_| {
+            Error::new(
+                "source_integrity",
+                "Agent effective context points are malformed",
+            )
+        })?;
+    if context_points.contains(&point) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "unsupported",
+            "Agent has no consumer for this context application point",
+        ))
+    }
+}
+
+fn inject_point_name(point: InjectPoint) -> &'static str {
+    match point {
+        InjectPoint::NextInput => "next_input",
+        InjectPoint::TurnSafePoint => "turn_safe_point",
+    }
 }
 
 fn decode_inject_args(value: &Value) -> Result<InjectArgs> {

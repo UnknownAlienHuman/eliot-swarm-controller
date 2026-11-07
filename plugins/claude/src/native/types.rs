@@ -94,7 +94,7 @@ pub(crate) struct ControlCancelRequest {
 /// `hook_callback` success payload. Empty means pass with no override.
 #[derive(Clone, Debug, Default, Serialize)]
 pub(crate) struct HookCallbackResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "hookSpecificOutput", skip_serializing_if = "Option::is_none")]
     pub hook_specific_output: Option<PreToolUseHookOutput>,
 }
 
