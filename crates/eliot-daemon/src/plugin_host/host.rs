@@ -1140,10 +1140,19 @@ async fn run_agent_inner(
         }
         Err(error) => {
             let error = redact_native_error(error, &actor.source_credentials);
+            let native_endpoint_exited =
+                error.code == eliot_plugin::native_stdio::NATIVE_ENDPOINT_EXITED;
+            let error = if native_endpoint_exited {
+                // Endpoint death settles Agent lifecycle, not the dispatched
+                // native effect: the caller still receives Unknown.
+                error.with_code("unknown")
+            } else {
+                error
+            };
             let uncertain = error.code == "unknown";
             let proven_no_dispatch = error.code == "native_not_dispatched";
             let _ = started.send(Err(error));
-            if !uncertain {
+            if !uncertain || native_endpoint_exited {
                 cleanup_startup(
                     &actor,
                     child,

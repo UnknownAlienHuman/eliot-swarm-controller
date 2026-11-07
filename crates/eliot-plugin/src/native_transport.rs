@@ -26,7 +26,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
 };
-use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
+use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 
 use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
 
@@ -64,8 +64,12 @@ pub enum StreamState {
 /// Fixed classes only: no frame bytes, bodies, or credentials cross here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeStreamFault {
-    /// Framed-line codec failure or oversize past the transport bound.
-    Frame,
+    /// Tokio's bounded line codec rejected a line over its configured limit.
+    FrameOversized,
+    /// The line codec returned `Io(InvalidData)`, including its UTF-8 decoder path.
+    FrameInvalidData,
+    /// The line codec returned an I/O error other than `InvalidData`.
+    FrameIo,
     /// A framed line was not valid JSON.
     Json,
     /// A parsed record did not match its protocol envelope.
@@ -79,7 +83,9 @@ pub enum NativeStreamFault {
 impl NativeStreamFault {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Frame => "invalid_or_oversized",
+            Self::FrameOversized => "frame_oversized",
+            Self::FrameInvalidData => "frame_invalid_data",
+            Self::FrameIo => "frame_io",
             Self::Json => "invalid_json",
             Self::Envelope => "invalid_envelope",
             Self::Drain => "exit_drain",
@@ -297,6 +303,31 @@ impl NativeChild {
     /// True only after the owned child waiter observed its OS exit status.
     pub fn process_exit_observed(&self) -> bool {
         self.process_exit.borrow().is_some()
+    }
+
+    /// True once the stdout reader task has ended, whether it ended cleanly or
+    /// with a typed stream fault. Callers can require this before owner cleanup.
+    pub fn output_reader_finished(&self) -> bool {
+        self.output_reader_result.is_some()
+            || self
+                .output_reader
+                .as_ref()
+                .is_some_and(|reader| reader.is_finished())
+    }
+
+    /// Positively observe this child exit, then wait for its owned stdout
+    /// reader to finish. Each wait is bounded by the existing exit-drain
+    /// window; this never terminates the child or infers exit from silence.
+    pub async fn confirm_exit_and_output_drained(&mut self) -> bool {
+        match timeout_at(Instant::now() + NATIVE_EXIT_DRAIN, self.wait_process_exit()).await {
+            Ok(Ok(_status)) => {}
+            Ok(Err(_)) | Err(_) => return false,
+        }
+
+        let _ = self
+            .await_output_drained(Instant::now() + NATIVE_EXIT_DRAIN)
+            .await;
+        self.process_exit_observed() && self.writer.reader_closed() && self.output_reader_finished()
     }
 
     pub fn stderr_snapshot(&self) -> StderrSnapshot {
@@ -987,13 +1018,23 @@ where
         };
         let line = match line {
             Ok(line) if line.len().saturating_add(1) <= MAX_NATIVE_FRAME_BYTES => line,
-            _ => {
+            Ok(_) => {
                 return Err(mark_stream_malformed(
                     stream,
                     pending,
                     &writer,
-                    NativeStreamFault::Frame,
-                    &format!("{server} stream ended on an invalid or oversized frame"),
+                    NativeStreamFault::FrameOversized,
+                    &format!("{server} stream ended on a frame over the configured limit"),
+                ));
+            }
+            Err(error) => {
+                let fault = native_codec_fault(error);
+                return Err(mark_stream_malformed(
+                    stream,
+                    pending,
+                    &writer,
+                    fault,
+                    &format!("{server} line codec failed ({})", fault.label()),
                 ));
             }
         };
@@ -1079,6 +1120,16 @@ where
         format!("{server} stream closed while an outcome may be pending"),
     ));
     Ok(())
+}
+
+fn native_codec_fault(error: LinesCodecError) -> NativeStreamFault {
+    match error {
+        LinesCodecError::MaxLineLengthExceeded => NativeStreamFault::FrameOversized,
+        LinesCodecError::Io(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            NativeStreamFault::FrameInvalidData
+        }
+        LinesCodecError::Io(_) => NativeStreamFault::FrameIo,
+    }
 }
 
 fn mark_stream_malformed(

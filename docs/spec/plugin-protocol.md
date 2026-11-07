@@ -475,6 +475,14 @@ After dispatch, only explicit `native_not_dispatched` proves no native I/O; any 
 generic error defaults to `unknown`. A validated authoritative plugin result state is
 handled separately from generic error classification.
 
+During controlled startup, a plugin may return the internal
+`native_endpoint_exited` signal only after its owned native process waiter observed an
+exit, its native reader closed, and that reader task finished. The daemon still settles
+the dispatched start/resume command as `unknown`; it drains the plugin event source and
+confirms owned plugin-tree cleanup before marking the Agent `lost`. The signal does not
+resolve the native effect or permit replay. Without all three native-exit facts, the
+ordinary unknown-start behavior remains in force.
+
 Public requests and answers are universal: `request.opened` details and kinds use the
 shared [`eliot_core::requests`](../../crates/eliot-core/src/requests.rs) shapes
 (`QuestionRequest`/`ApprovalRequest`), and `answer` args use `AnswerArgs`. Only the

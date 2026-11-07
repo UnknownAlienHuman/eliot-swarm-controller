@@ -115,6 +115,12 @@ and final native events:
    tail;
 5. only then emit `session.lost` when exact/shared readback proves control is gone.
 
+For a controlled start/resume, a plugin may report a positively observed native endpoint
+exit after its reader has closed and finished. The daemon preserves the command outcome
+as `unknown`, drains the plugin source, and marks the Agent `lost` only after the owned
+plugin process tree is confirmed cleaned up. An unconfirmed endpoint or cleanup leaves
+the generation starting/unknown.
+
 Closing or losing the Codex observer's held rollout reader is not native thread-terminal
 evidence and does not emit `session.ended` or `session.lost`. Controlled owned-process
 loss still drains its captured generation and finalizes it through the controlled path;

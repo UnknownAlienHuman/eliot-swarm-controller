@@ -679,7 +679,7 @@ impl EventProcessor {
             }
             StreamState::Malformed(fault) => {
                 self.defer_gap(format!(
-                    "Muse session host stream contained an invalid frame ({})",
+                    "Muse session host stream fault ({})",
                     fault.label()
                 ));
                 self.transport_loss = true;
