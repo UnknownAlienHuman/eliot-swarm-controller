@@ -445,16 +445,22 @@ impl Router {
     pub(crate) async fn recover_accepted_commands(&self) -> Result<()> {
         let mut after = None;
         loop {
-            let admissions = {
+            let keys = {
                 let store = self.inner.store.lock().await;
-                store.recover_accepted_commands(after, STATUS_BLOCKER_MAX)?
+                store.recover_accepted_command_keys(after, STATUS_BLOCKER_MAX)?
             };
-            if admissions.is_empty() {
+            if keys.is_empty() {
                 return Ok(());
             }
-            for (rowid, admission) in admissions {
-                after = Some((admission.command.created_at, rowid));
-                if command_needs_worker(&admission.command) {
+            for (id, created_at, rowid) in keys {
+                after = Some((created_at, rowid));
+                let admission = {
+                    let store = self.inner.store.lock().await;
+                    store.recover_accepted_admission(&id)?
+                };
+                if let Some(admission) = admission
+                    && command_needs_worker(&admission.command)
+                {
                     self.schedule_admission(&admission);
                 }
             }
