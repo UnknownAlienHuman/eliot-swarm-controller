@@ -121,6 +121,12 @@ shell metacharacters. Other command paths remain unsupported until the
 vendor executor's quoting behavior is proven. With no managed
 endpoint/token, the helper writes `{}` and exits successfully.
 
+On Windows, the Antigravity native child receives a `PATH` with the host's
+`SystemRoot\System32` first, followed by the existing effective entries. A
+controlled run showed the original npm-first `cmd` resolution sent hook shell
+commands to Command Code; this child-only order resolves Windows `cmd.exe`
+first without changing the daemon or other providers' environment.
+
 Supported system inject: `next_input` context is claimed FIFO at send
 and prepended to the prompt; `turn_safe_point` context is claimed FIFO at a
 live `PreInvocation` and applied as `injectSteps` `ephemeralMessage` steps.

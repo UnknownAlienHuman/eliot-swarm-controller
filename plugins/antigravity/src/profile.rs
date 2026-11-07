@@ -28,6 +28,45 @@ pub(crate) struct Plan {
     skip_permissions: bool,
 }
 
+#[cfg(windows)]
+fn prepend_system32_to_path(environment: &mut Vec<(OsString, OsString)>) -> Result<()> {
+    let system_root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .ok_or_else(|| {
+            Error::new(
+                "unavailable",
+                "Antigravity Windows system root is unavailable",
+            )
+        })?;
+    let system32 = PathBuf::from(system_root).join("System32");
+    if !system32.is_absolute() || !system32.is_dir() {
+        return Err(Error::new(
+            "unavailable",
+            "Antigravity Windows System32 directory is unavailable",
+        ));
+    }
+
+    let path_index = environment
+        .iter()
+        .position(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("PATH"));
+    let existing_path = match path_index {
+        Some(index) => Some(environment[index].1.clone()),
+        None => std::env::var_os("PATH"),
+    };
+    let mut path_entries = vec![system32];
+    if let Some(existing_path) = existing_path.filter(|path| !path.is_empty()) {
+        path_entries.extend(std::env::split_paths(&existing_path));
+    }
+    let path = std::env::join_paths(path_entries)
+        .map_err(|_| Error::new("invalid", "Antigravity Windows child PATH is invalid"))?;
+    if let Some(index) = path_index {
+        environment[index].1 = path;
+    } else {
+        environment.push((OsString::from("PATH"), path));
+    }
+    Ok(())
+}
+
 impl Plan {
     pub fn new(
         params: &AgentStartParams,
@@ -103,6 +142,12 @@ impl Plan {
             profile.get("pass_env"),
             "Antigravity",
         )?;
+        #[cfg(windows)]
+        let environment = {
+            let mut environment = environment;
+            prepend_system32_to_path(&mut environment.variables)?;
+            environment
+        };
         let mut secrets = environment.secrets;
         secrets.push(credential.to_owned());
         secrets.push(hook_token.to_owned());
