@@ -1689,6 +1689,35 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                                         .await
                                     {
                                         Ok(mut store) => {
+                                            let batch_policy =
+                                                SecretPolicy::new(source_credentials.iter());
+                                            let batch_source = batch_policy
+                                                .redact_text(&batch.source)
+                                                .chars()
+                                                .take(256)
+                                                .collect::<String>();
+                                            let batch_id = batch_policy
+                                                .redact_text(&batch.batch_id)
+                                                .chars()
+                                                .take(256)
+                                                .collect::<String>();
+                                            let event_kind = batch
+                                                .events
+                                                .iter()
+                                                .take(4)
+                                                .map(|event| {
+                                                    batch_policy
+                                                        .redact_text(&event.kind)
+                                                        .chars()
+                                                        .take(48)
+                                                        .collect::<String>()
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join(",");
+                                            let rejection_key = AgentKey {
+                                                id: agent_id.clone(),
+                                                generation,
+                                            };
                                             let result = match subject {
                                                 Some(subject) => store.put_observed_batch(
                                                     batch,
@@ -1719,9 +1748,19 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                                                             safe_cause_code(&error.code)
                                                         )
                                                     };
-                                                    Err(late_batch_error(
+                                                    let unknown = late_batch_error(
                                                         &state, &agent_id, generation, &cause,
-                                                    ))
+                                                    );
+                                                    record_store_batch_rejection(
+                                                        &source_credentials,
+                                                        &rejection_key,
+                                                        &batch_source,
+                                                        &batch_id,
+                                                        &event_kind,
+                                                        &cause,
+                                                        &error,
+                                                    );
+                                                    Err(unknown)
                                                 }
                                             }
                                         }
@@ -1902,13 +1941,15 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                                     Err(Error::new("invalid", "hook.event params are malformed"))
                                 }
                                 Ok(event)
-                                    if event.hook != "before_tool"
-                                        || event.turn_id.trim().is_empty()
+                                    if !matches!(
+                                        event.hook.as_str(),
+                                        "before_tool" | "before_model"
+                                    ) || event.turn_id.trim().is_empty()
                                         || event.consumer_id.trim().is_empty() =>
                                 {
                                     Err(Error::new(
                                         "invalid",
-                                        "hook.event requires before_tool with an exact turn and consumer",
+                                        "hook.event requires before_tool or before_model with an exact turn and consumer",
                                     ))
                                 }
                                 Ok(event) => match timeout_at(request_deadline, store.lock()).await
@@ -1918,6 +1959,7 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                                         generation,
                                         &event.turn_id,
                                         &event.consumer_id,
+                                        &event.hook,
                                         now_ms(),
                                     ) {
                                         Ok(change) => {
@@ -1976,6 +2018,63 @@ fn late_batch_error(
         );
     }
     Error::new("unknown", format!("events.put outcome unknown: {cause}"))
+}
+
+fn record_store_batch_rejection(
+    credentials: &[String],
+    key: &AgentKey,
+    source: &str,
+    batch_id: &str,
+    event_kind: &str,
+    cause: &str,
+    error: &Error,
+) {
+    let policy = SecretPolicy::new(credentials.iter());
+    let generation = key.generation.to_string();
+    let code = format!("events_put_{}", safe_cause_code(cause));
+    let validation = safe_store_validation_reason(error);
+    crate::logging::record(
+        &policy,
+        &code,
+        &[
+            ("agent_id", &key.id),
+            ("generation", &generation),
+            ("source", source),
+            ("batch_id", batch_id),
+            ("event_kind", event_kind),
+            ("validation", &validation),
+        ],
+        None,
+    );
+}
+
+fn safe_store_validation_reason(error: &Error) -> String {
+    if error.code != "invalid" {
+        return "store_error".to_owned();
+    }
+    let message = error.message.as_str();
+    if message == "native batch must contain an event" {
+        return "empty_batch".to_owned();
+    }
+    if message == "unknown Agent state requires observe_only" {
+        return "unknown_agent_state".to_owned();
+    }
+    if message == "request.closed must not acknowledge a command" {
+        return "request_closed_command_id_present".to_owned();
+    }
+    if message.contains(" requires non-empty string field ") {
+        return "required_field_missing".to_owned();
+    }
+    if message.ends_with(" must be a string") {
+        return "field_not_string".to_owned();
+    }
+    if message.ends_with(" must be an object") || message.ends_with(" must be a usage object") {
+        return "field_shape_invalid".to_owned();
+    }
+    if message.ends_with(" must be a non-empty string") {
+        return "field_value_invalid".to_owned();
+    }
+    "invalid_unclassified".to_owned()
 }
 
 fn safe_cause_code(code: &str) -> String {

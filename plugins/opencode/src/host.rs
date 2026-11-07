@@ -689,7 +689,16 @@ impl OpenCodePlugin {
             "model_verified": model_verified,
             "cwd": created.location.as_ref().map(|location| location.directory.clone()),
         });
-        let effective = with_context_points(effective, &[InjectPoint::NextInput]);
+        let context_bound =
+            bind_context_hooks(&session.http, &created.id, Instant::now() + RPC_TIMEOUT).await;
+        let effective = if context_bound {
+            with_context_points(
+                effective,
+                &[InjectPoint::NextInput, InjectPoint::TurnSafePoint],
+            )
+        } else {
+            with_context_points(effective, &[InjectPoint::NextInput])
+        };
         if !model_verified || !location_ok {
             let kill = session
                 .http
@@ -765,7 +774,15 @@ impl OpenCodePlugin {
                 }
                 Err(error) => return Err(self.fail_resume(&parsed, session, error).await),
             };
-        let effective = with_context_points(effective, &[InjectPoint::NextInput]);
+        let context_bound = bind_context_hooks(&session.http, &retained.id, deadline).await;
+        let effective = if context_bound {
+            with_context_points(
+                effective,
+                &[InjectPoint::NextInput, InjectPoint::TurnSafePoint],
+            )
+        } else {
+            with_context_points(effective, &[InjectPoint::NextInput])
+        };
         if let Err(error) = session
             .events
             .resume_ready(
@@ -2380,6 +2397,33 @@ async fn discard_unstarted(session: &mut AgentSession) {
 async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error {
     discard_unstarted(session).await;
     session.server.diagnostic_error(error)
+}
+
+/// Prove the v1 context-hook binding for one exact session. Only a
+/// verified `version == 1` match may advertise `turn_safe_point`; every
+/// refusal, mismatch or transport loss degrades to `next_input` only
+/// without failing readiness. `bind` is idempotent per session id, so
+/// an uncertain attempt may be repeated boundedly within this deadline.
+async fn bind_context_hooks(
+    http: &crate::native::OpenCodeHttp,
+    session_id: &str,
+    deadline: Instant,
+) -> bool {
+    for _ in 0..3 {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        match http.eliot_context_bind(session_id, deadline).await {
+            Ok(output) => {
+                return crate::context_hooks::bind_verified(&output, session_id);
+            }
+            Err(HttpOutcome::Rejected { .. }) => return false,
+            Err(HttpOutcome::Unknown { .. } | HttpOutcome::NotDispatched { .. }) => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    false
 }
 
 /// The first slash separates `providerID`; the full remaining id stays intact.

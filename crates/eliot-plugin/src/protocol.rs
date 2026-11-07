@@ -205,7 +205,8 @@ pub struct AgentCommandParams {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookEvent {
-    /// Native hook point; currently only `before_tool`.
+    /// Native hook point: `before_tool` (Claude Code `PreToolUse`) or
+    /// `before_model` (OpenCode `context` hook).
     pub hook: String,
     /// Exact native turn requesting context.
     pub turn_id: String,

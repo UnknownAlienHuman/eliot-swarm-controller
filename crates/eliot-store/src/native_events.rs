@@ -36,7 +36,10 @@ pub(super) fn persist_effects(
     };
     let mut command_events = Vec::new();
     let mut provider_events = Vec::new();
-    if native_event.kind == "hook.before_tool" {
+    if matches!(
+        native_event.kind.as_str(),
+        "hook.before_tool" | "hook.before_model"
+    ) {
         command_events.extend(context::settle_turn_safe_point_claims_tx(
             tx,
             agent_num,

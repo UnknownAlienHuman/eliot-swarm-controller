@@ -10,15 +10,20 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use eliot_core::{ContextItem, Error, Result, SecretPolicy, TurnUsage};
+use eliot_core::{
+    ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy, TurnUsage,
+};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     native_stdio::StreamState,
+    protocol::{HookEvent, HookResponse},
     session::{
         EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error, event_id,
-        next_input_outcomes,
+        next_input_outcomes, with_claimed_context,
     },
 };
+
+use crate::context_hooks::{self, ContextHookSignal};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::{
@@ -34,10 +39,10 @@ use crate::native::{
     },
     sse::SseFrame,
     types::{
-        AgentSelectedData, AssistantContent, AssistantTokens, ExecutionEventData,
-        FormCancelledData, FormCreatedData, FormRepliedData, InboxEventData, Message,
-        ModelSelectedData, PermissionAskedData, PermissionRepliedData, SessionLifecycleData,
-        SseEnvelope, StructuredError,
+        AgentSelectedData, AssistantContent, AssistantTokens, EliotContextHook,
+        EliotContextResolveInput, ExecutionEventData, FormCancelledData, FormCreatedData,
+        FormRepliedData, InboxEventData, Message, ModelSelectedData, PermissionAskedData,
+        PermissionRepliedData, SessionLifecycleData, SseEnvelope, StructuredError,
     },
 };
 
@@ -146,6 +151,39 @@ enum Control {
     SnapshotStatus {
         reply: oneshot::Sender<EventStatus>,
     },
+}
+
+/// Messages flowing from the context poll task and claim/resolve workers
+/// into the single event loop. Only this loop commits durable facts, so
+/// hook receipts share the `StreamSource` counter with every other event.
+pub(crate) enum ContextHookMsg {
+    Arrived(ContextHookSignal),
+    Done(ContextHookDone),
+}
+
+/// The vendor resolve verdict for one hook. Only `Applied`/`Empty` confirm
+/// a native effect and produce a durable receipt; everything else leaves
+/// claimed items frozen (never requeued, never applied on a later turn).
+enum HookResolveOutcome {
+    Applied,
+    Empty,
+    NoReceipt,
+}
+
+pub(crate) struct ContextHookDone {
+    hook_id: String,
+    turn_id: String,
+    consumer_id: String,
+    claimed: Vec<ContextItem>,
+    outcome: HookResolveOutcome,
+}
+
+/// One offered context hook waiting for its exact inbox-to-turn binding.
+/// The vendor hook expires on its own deadline; an unbound hook is
+/// cancelled, never claimed and never applied.
+struct PendingContextHook {
+    hook: EliotContextHook,
+    deadline: Instant,
 }
 
 #[derive(Clone)]
@@ -268,6 +306,21 @@ struct EventProcessor {
     resumed: bool,
     /// True once a send associated in this generation.
     saw_send: bool,
+    /// Context-hook channel into this loop: the poll task forwards offers
+    /// and claim/resolve workers report verdicts. The processor keeps one
+    /// sender alive so the receiver never closes mid-generation.
+    context_tx: mpsc::Sender<ContextHookMsg>,
+    context_rx: Option<mpsc::Receiver<ContextHookMsg>>,
+    /// Owned-generation context poll task; aborted at stop/drop.
+    context_poll_abort: Option<tokio::task::AbortHandle>,
+    /// The one offered hook awaiting its exact binding (at most one).
+    pending_context_hook: Option<PendingContextHook>,
+    /// Hooks with a claim/resolve worker in flight, by hook id.
+    context_hook_workers: HashMap<String, tokio::task::AbortHandle>,
+    /// Hooks whose receipt already settled (bounded): a duplicate offer
+    /// never re-claims or re-resolves.
+    settled_hook_ids: HashSet<String>,
+    settled_hook_order: VecDeque<String>,
 }
 
 pub(crate) fn spawn(
@@ -556,6 +609,7 @@ impl EventHandle {
 impl EventProcessor {
     fn new(http: OpenCodeHttp, host: PeerClient, config: EventConfig) -> Self {
         let sink = CommitSink::new(host.clone(), config.credential.clone());
+        let (context_tx, context_rx) = mpsc::channel(16);
         Self {
             http,
             host,
@@ -589,6 +643,13 @@ impl EventProcessor {
             resolved_native_order: VecDeque::new(),
             resumed: false,
             saw_send: false,
+            context_tx,
+            context_rx: Some(context_rx),
+            context_poll_abort: None,
+            pending_context_hook: None,
+            context_hook_workers: HashMap::new(),
+            settled_hook_ids: HashSet::new(),
+            settled_hook_order: VecDeque::new(),
         }
     }
 
@@ -676,6 +737,7 @@ impl EventProcessor {
             }
             Control::BeginStop { reply } => {
                 self.planned_stop = true;
+                self.abort_context_hooks();
                 let _ = reply.send(Ok(()));
                 true
             }
@@ -694,6 +756,7 @@ impl EventProcessor {
                 true
             }
             Control::Close { reply } => {
+                self.abort_context_hooks();
                 if let Some(pending) = self.pending_end_stop.take() {
                     let _ = pending.send(Err(Error::new(
                         "unknown",
@@ -937,6 +1000,10 @@ impl EventProcessor {
         }
         self.status.session_id = Some(session_id.clone());
         self.expected_seq = expected_seq;
+        let advertises_turn_safe = effective
+            .get("context_points")
+            .and_then(|points| serde_json::from_value::<Vec<InjectPoint>>(points.clone()).ok())
+            .is_some_and(|points| points.contains(&InjectPoint::TurnSafePoint));
         let native_id = format!("opencode:{session_id}:session.ready");
         self.commit_event(
             "session.ready",
@@ -949,6 +1016,9 @@ impl EventProcessor {
         )
         .await?;
         self.status.ready = true;
+        if advertises_turn_safe {
+            self.start_context_poll();
+        }
         if self.status.failure.is_some() {
             return Err(Error::new(
                 "unknown",
@@ -1133,9 +1203,16 @@ impl EventProcessor {
         self.stashed_started = None;
         let command_id = pending.command_id.clone();
         let context = pending.context.clone();
-        self.open_inbox_id = Some(pending.inbox_id.clone());
+        let inbox_id = pending.inbox_id.clone();
+        self.open_inbox_id = Some(inbox_id.clone());
         self.status.active_command_id = Some(command_id.clone());
         self.status.active_turn_id = Some(turn_id.clone());
+        // A delivery observed before the turn opened still bound the exact
+        // input to this turn: retain it so context hooks can prove the
+        // binding through actual delivery, never copy a message id blindly.
+        if self.seen_delivered.contains(&inbox_id) {
+            self.delivered_turn.insert(inbox_id, turn_id.clone());
+        }
         self.pending = None;
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = event_id(
@@ -1151,6 +1228,268 @@ impl EventProcessor {
             data["context_outcomes"] = json!(next_input_outcomes(&context, &command_id));
         }
         self.commit_event("turn.started", native_id, data).await
+    }
+
+    /// Start the owned-generation context poll once readiness proved the
+    /// v1 binding. Only bound sessions poll; unbound ones never advertise
+    /// `turn_safe_point` and this stays idle.
+    fn start_context_poll(&mut self) {
+        if self.context_poll_abort.is_some() {
+            return;
+        }
+        let Some(session_id) = self.status.session_id.clone() else {
+            return;
+        };
+        let handle = context_hooks::spawn_context_poll(
+            self.http.clone(),
+            session_id,
+            self.context_tx.clone(),
+        );
+        self.context_poll_abort = Some(handle.abort_handle());
+    }
+
+    /// Abort every context task (poll and in-flight claim/resolve workers)
+    /// and drop any unbound pending hook without claiming. Called at stop
+    /// and before the event loop ends so no task outlives its generation.
+    fn abort_context_hooks(&mut self) {
+        if let Some(abort) = self.context_poll_abort.take() {
+            abort.abort();
+        }
+        for (_, abort) in self.context_hook_workers.drain() {
+            abort.abort();
+        }
+        self.pending_context_hook = None;
+    }
+
+    /// Handle one poll or worker message in this loop.
+    async fn handle_context_msg(&mut self, message: ContextHookMsg) {
+        match message {
+            ContextHookMsg::Arrived(signal) => self.offer_context_hook(signal.hook),
+            ContextHookMsg::Done(done) => self.settle_context_hook(done).await,
+        }
+    }
+
+    /// Accept one offered hook, unless one is already pending/in flight or
+    /// this exact hook already settled. At most one hook is ever in flight;
+    /// a second concurrent offer is dropped (the producer safe-passes it).
+    fn offer_context_hook(&mut self, hook: EliotContextHook) {
+        if !self.status.ready || self.status.stopped || self.writes_blocked {
+            // An unclaimed offer expires on its own vendor deadline.
+            return;
+        }
+        if hook.session_id.trim().is_empty()
+            || hook.hook_id.trim().is_empty()
+            || hook.message_id.trim().is_empty()
+        {
+            return;
+        }
+        if self.status.session_id.as_deref() != Some(hook.session_id.as_str()) {
+            return;
+        }
+        if self.settled_hook_ids.contains(&hook.hook_id) {
+            return;
+        }
+        if self.pending_context_hook.is_some() || !self.context_hook_workers.is_empty() {
+            return;
+        }
+        let ttl_ms = hook.expires_in_ms.clamp(0, 10_000) as u64;
+        self.pending_context_hook = Some(PendingContextHook {
+            hook,
+            deadline: Instant::now() + std::time::Duration::from_millis(ttl_ms),
+        });
+        self.try_advance_pending_hook();
+    }
+
+    /// The exact inbox-to-current-turn binding for one hook message id,
+    /// proven only through actual delivery (`delivered_turn`). A missing
+    /// entry, an ended turn, or a delivery for future work never binds.
+    fn bound_turn_for_message(&self, message_id: &str) -> Option<String> {
+        if !self.status.ready || self.status.stopped || self.status.failure.is_some() {
+            return None;
+        }
+        let turn_id = self.delivered_turn.get(message_id)?;
+        if self.status.active_turn_id.as_deref() == Some(turn_id.as_str()) {
+            Some(turn_id.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Advance the pending hook: claim when bound, keep waiting while
+    /// unbound inside its deadline, cancel once the deadline passes.
+    fn try_advance_pending_hook(&mut self) {
+        if self.pending_context_hook.is_none() {
+            return;
+        }
+        let Some(pending) = self.pending_context_hook.as_ref() else {
+            return;
+        };
+        let message_id = pending.hook.message_id.clone();
+        let deadline = pending.deadline;
+        match self.bound_turn_for_message(&message_id) {
+            Some(turn_id) => {
+                let hook = self
+                    .pending_context_hook
+                    .take()
+                    .expect("pending hook retained")
+                    .hook;
+                self.spawn_context_claim(hook, turn_id, deadline);
+            }
+            None if Instant::now() >= deadline => {
+                let hook = self
+                    .pending_context_hook
+                    .take()
+                    .expect("pending hook retained")
+                    .hook;
+                self.spawn_context_cancel(hook);
+            }
+            None => {}
+        }
+    }
+
+    /// Expire every unbound pending hook whose deadline has passed. Called
+    /// on each loop iteration so a hook never waits past its bound even
+    /// when no delivery frame arrives.
+    fn expire_pending_hooks(&mut self) {
+        self.try_advance_pending_hook();
+    }
+
+    /// Spawn the one Store claim, vendor resolve, and report back through
+    /// this loop. The worker never retries an ambiguous resolve and never
+    /// commits; the receipt below is the only durable write.
+    fn spawn_context_claim(&mut self, hook: EliotContextHook, turn_id: String, deadline: Instant) {
+        let hook_id = hook.hook_id.clone();
+        let consumer_id = ulid::Ulid::new().to_string();
+        let http = self.http.clone();
+        let host = self.host.clone();
+        let credential = self.credential.clone();
+        let done_tx = self.context_tx.clone();
+        let pending_hook_id = hook_id.clone();
+        let task = tokio::spawn(async move {
+            let done =
+                run_context_claim(http, host, credential, hook, turn_id, consumer_id, deadline)
+                    .await;
+            let _ = done_tx
+                .send(ContextHookMsg::Done(ContextHookDone {
+                    hook_id: pending_hook_id,
+                    turn_id: done.turn_id,
+                    consumer_id: done.consumer_id,
+                    claimed: done.claimed,
+                    outcome: done.outcome,
+                }))
+                .await;
+        });
+        self.context_hook_workers
+            .insert(hook_id, task.abort_handle());
+    }
+
+    /// Spawn a best-effort unblock for a hook that never bound: one cancel
+    /// resolve, never retried, with no receipt. The vendor hook expires on
+    /// its own deadline even if this write is lost.
+    fn spawn_context_cancel(&mut self, hook: EliotContextHook) {
+        let hook_id = hook.hook_id.clone();
+        let http = self.http.clone();
+        let done_tx = self.context_tx.clone();
+        let cancel_deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let done_hook_id = hook_id.clone();
+        let task = tokio::spawn(async move {
+            let input = EliotContextResolveInput {
+                hook_id: hook.hook_id.clone(),
+                session_id: hook.session_id.clone(),
+                message_id: hook.message_id.clone(),
+                context: None,
+                cancel: Some(true),
+            };
+            let _ = http.eliot_context_resolve(input, cancel_deadline).await;
+            let _ = done_tx
+                .send(ContextHookMsg::Done(ContextHookDone {
+                    hook_id: done_hook_id,
+                    turn_id: String::new(),
+                    consumer_id: String::new(),
+                    claimed: Vec::new(),
+                    outcome: HookResolveOutcome::NoReceipt,
+                }))
+                .await;
+        });
+        self.context_hook_workers
+            .insert(hook_id, task.abort_handle());
+    }
+
+    /// Commit the receipt for one settled hook through the shared source.
+    /// `Applied` carries its outcome; `Empty` carries none and requires the
+    /// persisted empty selection; anything else commits nothing and leaves
+    /// claimed items frozen.
+    async fn settle_context_hook(&mut self, done: ContextHookDone) {
+        self.context_hook_workers.remove(&done.hook_id);
+        if self.settled_hook_ids.contains(&done.hook_id) {
+            return;
+        }
+        self.remember_settled_hook(done.hook_id.clone());
+        match done.outcome {
+            HookResolveOutcome::NoReceipt => {}
+            HookResolveOutcome::Applied => {
+                if done.claimed.is_empty()
+                    || done.turn_id.trim().is_empty()
+                    || done.consumer_id.trim().is_empty()
+                {
+                    return;
+                }
+                let Some(session_id) = self.status.session_id.clone() else {
+                    return;
+                };
+                let outcome = ContextOutcome {
+                    mechanism: "context_hook".to_owned(),
+                    application_point: InjectPoint::TurnSafePoint,
+                    consumer_id: done.consumer_id.clone(),
+                };
+                let context_outcome = match serde_json::to_value(&outcome) {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let native_id = format!(
+                    "opencode:{session_id}:{}:hook.before_model:{}",
+                    done.turn_id, done.consumer_id
+                );
+                let data = json!({
+                    "turn_id": done.turn_id,
+                    "consumer_id": done.consumer_id,
+                    "context_outcome": context_outcome,
+                });
+                let _ = self
+                    .commit_event("hook.before_model", native_id, data)
+                    .await;
+            }
+            HookResolveOutcome::Empty => {
+                if done.turn_id.trim().is_empty() || done.consumer_id.trim().is_empty() {
+                    return;
+                }
+                let Some(session_id) = self.status.session_id.clone() else {
+                    return;
+                };
+                let native_id = format!(
+                    "opencode:{session_id}:{}:hook.before_model:{}",
+                    done.turn_id, done.consumer_id
+                );
+                let data = json!({
+                    "turn_id": done.turn_id,
+                    "consumer_id": done.consumer_id,
+                });
+                let _ = self
+                    .commit_event("hook.before_model", native_id, data)
+                    .await;
+            }
+        }
+    }
+
+    fn remember_settled_hook(&mut self, hook_id: String) {
+        if self.settled_hook_ids.insert(hook_id.clone()) {
+            self.settled_hook_order.push_back(hook_id);
+        }
+        while self.settled_hook_order.len() > 128 {
+            if let Some(evicted) = self.settled_hook_order.pop_front() {
+                self.settled_hook_ids.remove(&evicted);
+            }
+        }
     }
 
     async fn flush_buffer(&mut self) -> Result<()> {
@@ -1682,6 +2021,7 @@ impl EventProcessor {
         self.open_inbox_id = None;
         self.stashed_started = None;
         self.pending_requests.clear();
+        self.abort_context_hooks();
         // Dropping the senders settles every steer waiter as unknown on
         // the host side; no verdict is knowable after the source ends.
         self.steer_watches.clear();
@@ -2244,6 +2584,180 @@ fn final_message_usage(
     })
 }
 
+/// One Store claim plus one vendor resolve for a bound hook. The Store
+/// claim commits before the vendor resolve; the resolve runs exactly once
+/// and is never retried on an uncertain outcome. Only a confirmed
+/// `applied`/`empty` vendor status produces a receipt; expiry, cancel,
+/// mismatch, closure, transport loss and claim failure produce none.
+async fn run_context_claim(
+    http: OpenCodeHttp,
+    host: PeerClient,
+    credential: String,
+    hook: EliotContextHook,
+    turn_id: String,
+    consumer_id: String,
+    deadline: Instant,
+) -> ContextHookDone {
+    let hook_id = hook.hook_id.clone();
+    let claimed = match claim_context_for_hook(&host, &credential, &turn_id, &consumer_id, deadline)
+        .await
+    {
+        Ok(claimed) => claimed,
+        Err(_) => {
+            // No Store claim: one cancel unblocks the vendor hook; no
+            // receipt and no applied claim ever follow.
+            let input = EliotContextResolveInput {
+                hook_id: hook.hook_id.clone(),
+                session_id: hook.session_id.clone(),
+                message_id: hook.message_id.clone(),
+                context: None,
+                cancel: Some(true),
+            };
+            let _ = http
+                .eliot_context_resolve(input, Instant::now() + std::time::Duration::from_secs(30))
+                .await;
+            return ContextHookDone {
+                hook_id,
+                turn_id,
+                consumer_id,
+                claimed: Vec::new(),
+                outcome: HookResolveOutcome::NoReceipt,
+            };
+        }
+    };
+    if claimed.is_empty() {
+        let input = EliotContextResolveInput {
+            hook_id: hook.hook_id.clone(),
+            session_id: hook.session_id.clone(),
+            message_id: hook.message_id.clone(),
+            context: None,
+            cancel: None,
+        };
+        return match http.eliot_context_resolve(input, deadline).await {
+            Ok(output) if output.status == "empty" => ContextHookDone {
+                hook_id,
+                turn_id,
+                consumer_id,
+                claimed,
+                outcome: HookResolveOutcome::Empty,
+            },
+            _ => ContextHookDone {
+                hook_id,
+                turn_id,
+                consumer_id,
+                claimed,
+                outcome: HookResolveOutcome::NoReceipt,
+            },
+        };
+    }
+    let formatted = match with_claimed_context("", &claimed, "OpenCode") {
+        Ok(text) => text.strip_suffix("\n\n").unwrap_or(&text).to_owned(),
+        Err(_) => {
+            let input = EliotContextResolveInput {
+                hook_id: hook.hook_id.clone(),
+                session_id: hook.session_id.clone(),
+                message_id: hook.message_id.clone(),
+                context: None,
+                cancel: None,
+            };
+            let _ = http
+                .eliot_context_resolve(input, Instant::now() + std::time::Duration::from_secs(30))
+                .await;
+            return ContextHookDone {
+                hook_id,
+                turn_id,
+                consumer_id,
+                claimed,
+                outcome: HookResolveOutcome::NoReceipt,
+            };
+        }
+    };
+    if formatted.trim().is_empty() {
+        let input = EliotContextResolveInput {
+            hook_id: hook.hook_id.clone(),
+            session_id: hook.session_id.clone(),
+            message_id: hook.message_id.clone(),
+            context: None,
+            cancel: None,
+        };
+        return match http.eliot_context_resolve(input, deadline).await {
+            Ok(output) if output.status == "empty" => ContextHookDone {
+                hook_id,
+                turn_id,
+                consumer_id,
+                claimed: Vec::new(),
+                outcome: HookResolveOutcome::Empty,
+            },
+            _ => ContextHookDone {
+                hook_id,
+                turn_id,
+                consumer_id,
+                claimed: Vec::new(),
+                outcome: HookResolveOutcome::NoReceipt,
+            },
+        };
+    }
+    let input = EliotContextResolveInput {
+        hook_id: hook.hook_id.clone(),
+        session_id: hook.session_id.clone(),
+        message_id: hook.message_id.clone(),
+        context: Some(formatted),
+        cancel: None,
+    };
+    match http.eliot_context_resolve(input, deadline).await {
+        Ok(output) if output.status == "applied" => ContextHookDone {
+            hook_id,
+            turn_id,
+            consumer_id,
+            claimed,
+            outcome: HookResolveOutcome::Applied,
+        },
+        _ => ContextHookDone {
+            hook_id,
+            turn_id,
+            consumer_id,
+            claimed,
+            outcome: HookResolveOutcome::NoReceipt,
+        },
+    }
+}
+
+/// Claim exactly this callback's queued context through the authenticated
+/// private hook channel. `hook=before_model` with the captured turn and
+/// this consumer's own ULID: Store commits the FIFO claim before the
+/// vendor resolve runs.
+async fn claim_context_for_hook(
+    host: &PeerClient,
+    credential: &str,
+    turn_id: &str,
+    consumer_id: &str,
+    deadline: Instant,
+) -> Result<Vec<ContextItem>> {
+    let event = HookEvent {
+        hook: "before_model".to_owned(),
+        turn_id: turn_id.to_owned(),
+        consumer_id: consumer_id.to_owned(),
+    };
+    let mut params = serde_json::to_value(&event)
+        .map_err(|_| Error::new("internal", "OpenCode hook claim could not be encoded"))?;
+    let Some(params_object) = params.as_object_mut() else {
+        return Err(Error::new(
+            "internal",
+            "OpenCode hook claim could not be encoded",
+        ));
+    };
+    // Same private IPC envelope as the harness callbacks: stripped by the
+    // host before the shared DTO is decoded, never persisted.
+    params_object.insert(
+        "credential".to_owned(),
+        serde_json::Value::String(credential.to_owned()),
+    );
+    let response = host.call("hook.event", params, deadline).await?;
+    let claimed: HookResponse = serde_json::from_value(response)
+        .map_err(|_| Error::new("invalid", "OpenCode hook claim response was malformed"))?;
+    Ok(claimed.context)
+}
+
 async fn run(
     mut frames: mpsc::Receiver<SseFrame>,
     mut stream: watch::Receiver<StreamState>,
@@ -2273,6 +2787,17 @@ async fn run(
                 processor.handle_stream_state(current).await;
                 processor.report_gap_if_queue_empty(frames.is_empty()).await;
             }
+            message = async {
+                match processor.context_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(message) = message {
+                    processor.handle_context_msg(message).await;
+                }
+                processor.report_gap_if_queue_empty(frames.is_empty()).await;
+            }
             control = controls.recv() => {
                 match control {
                     Some(control) => {
@@ -2285,8 +2810,10 @@ async fn run(
                 }
             }
         }
+        processor.expire_pending_hooks();
         let _ = status_tx.send(processor.status.clone());
     }
+    processor.abort_context_hooks();
     // Keep the host/client alive until the task ends; dropping them here
     // would close shared connection state early.
     let _ = (&processor.host, &processor.http);
@@ -2312,7 +2839,9 @@ mod tests {
     /// the control queue — never a stale published watch value.
     #[tokio::test]
     async fn snapshot_status_reads_current_processor_state() {
-        let http = crate::native::client::OpenCodeHttp::new(1, "pw".to_owned()).expect("client");
+        let directory = std::env::current_dir().expect("current directory");
+        let http = crate::native::client::OpenCodeHttp::new(1, "pw".to_owned(), &directory)
+            .expect("client");
         let peer = eliot_plugin::Peer::stdio();
         let mut processor = EventProcessor::new(
             http,
@@ -2409,7 +2938,9 @@ mod tests {
     /// the lost frames could have carried exactly that activity.
     #[tokio::test]
     async fn resume_ready_refuses_a_deferred_native_frame_loss() {
-        let http = crate::native::client::OpenCodeHttp::new(1, "pw".to_owned()).expect("client");
+        let directory = std::env::current_dir().expect("current directory");
+        let http = crate::native::client::OpenCodeHttp::new(1, "pw".to_owned(), &directory)
+            .expect("client");
         let peer = eliot_plugin::Peer::stdio();
         let mut processor = EventProcessor::new(
             http,

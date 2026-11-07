@@ -279,16 +279,21 @@ impl Store {
         generation: i64,
         turn_id: &str,
         consumer_id: &str,
+        hook: &str,
         now: i64,
     ) -> Result<Change<Vec<ContextItem>>> {
         self.ensure_writer_healthy()?;
         require_nonempty(consumer_id, "consumer_id")?;
         require_nonempty(turn_id, "turn_id")?;
+        if !matches!(hook, "before_tool" | "before_model") {
+            return Err(Error::new("invalid", "context hook is not supported"));
+        }
         let result = self.claim_turn_safe_point_context_inner(
             agent_id,
             generation,
             turn_id,
             consumer_id,
+            hook,
             now,
         );
         self.fault_on_persistence_error(&result);
@@ -301,6 +306,7 @@ impl Store {
         generation: i64,
         turn_id: &str,
         consumer_id: &str,
+        hook: &str,
         now: i64,
     ) -> Result<Change<Vec<ContextItem>>> {
         let agent_num = parse_agent_id(agent_id)?;
@@ -329,7 +335,7 @@ impl Store {
         let payload = json!({
             "agent_id": agent_id,
             "generation": generation,
-            "hook": "before_tool",
+            "hook": hook,
             "turn_id": turn_id,
             "consumer_id": consumer_id,
         });
@@ -533,6 +539,7 @@ pub(super) fn settle_turn_safe_point_claims_tx(
 ) -> Result<Vec<super::native_events::PendingCommandEvent>> {
     let turn_id = required_string(&native_event.data, "turn_id")?;
     let consumer_id = required_string(&native_event.data, "consumer_id")?;
+    let hook = hook_kind_for_event(&native_event.kind)?;
     let claims = claimed_context_commands(
         tx,
         agent_num,
@@ -546,7 +553,7 @@ pub(super) fn settle_turn_safe_point_claims_tx(
         if encoded_outcome.is_some() {
             return Err(Error::new(
                 "source_integrity",
-                "hook.before_tool reports context without a matching Store claim",
+                format!("hook.{hook} reports context without a matching Store claim"),
             ));
         }
         require_recorded_empty_safe_point_selection(
@@ -555,6 +562,7 @@ pub(super) fn settle_turn_safe_point_claims_tx(
             generation,
             &turn_id,
             &consumer_id,
+            hook,
         )?;
         return Ok(Vec::new());
     }
@@ -563,7 +571,7 @@ pub(super) fn settle_turn_safe_point_claims_tx(
         .ok_or_else(|| {
             Error::new(
                 "source_integrity",
-                "hook.before_tool omitted the claimed context outcome",
+                format!("hook.{hook} omitted the claimed context outcome"),
             )
         })
         .and_then(|value| {
@@ -587,11 +595,28 @@ pub(super) fn settle_turn_safe_point_claims_tx(
             ));
         }
         validate_context_receipt(record, generation, &turn_id, &claim, &outcome)?;
+        if !receipt_turn_reconciles(tx, agent_num, generation, &turn_id)? {
+            return Err(Error::new(
+                "stale_generation",
+                "hook context receipt does not match the exact captured turn",
+            ));
+        }
         events.push(apply_context_receipt_tx(
             tx, record, &turn_id, &outcome, now,
         )?);
     }
     Ok(events)
+}
+
+fn hook_kind_for_event(kind: &str) -> Result<&'static str> {
+    match kind {
+        "hook.before_tool" => Ok("before_tool"),
+        "hook.before_model" => Ok("before_model"),
+        other => Err(Error::new(
+            "unsupported",
+            format!("unsupported hook event kind: {other}"),
+        )),
+    }
 }
 
 fn require_recorded_empty_safe_point_selection(
@@ -600,16 +625,22 @@ fn require_recorded_empty_safe_point_selection(
     generation: i64,
     turn_id: &str,
     consumer_id: &str,
+    hook: &str,
 ) -> Result<()> {
     let agent = load_agent_by_num(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", "context target Agent was not found"))?;
-    if agent.generation != generation
-        || agent.active_turn.as_deref() != Some(turn_id)
-        || !matches!(agent.state, AgentState::Busy | AgentState::Waiting)
-    {
+    if agent.generation != generation {
         return Err(Error::new(
             "stale_generation",
-            "empty context callback does not match the exact current turn",
+            "empty context callback does not match the current generation",
+        ));
+    }
+    let active_matches = agent.active_turn.as_deref() == Some(turn_id)
+        && matches!(agent.state, AgentState::Busy | AgentState::Waiting);
+    if !active_matches && !captured_turn_exists(tx, agent_num, generation, turn_id)? {
+        return Err(Error::new(
+            "stale_generation",
+            "empty context callback does not match the exact captured turn",
         ));
     }
 
@@ -617,7 +648,7 @@ fn require_recorded_empty_safe_point_selection(
     let payload = json!({
         "agent_id": agent.id,
         "generation": generation,
-        "hook": "before_tool",
+        "hook": hook,
         "turn_id": turn_id,
         "consumer_id": consumer_id,
     });
@@ -627,7 +658,7 @@ fn require_recorded_empty_safe_point_selection(
     else {
         return Err(Error::new(
             "source_integrity",
-            "hook.before_tool has no recorded empty context selection",
+            format!("hook.{hook} has no recorded empty context selection"),
         ));
     };
     if stored_principal != principal
@@ -647,10 +678,51 @@ fn require_recorded_empty_safe_point_selection(
     if marker != empty_marker {
         return Err(Error::new(
             "source_integrity",
-            "hook.before_tool omitted the receipt for a nonempty context selection",
+            format!("hook.{hook} omitted the receipt for a nonempty context selection"),
         ));
     }
     Ok(())
+}
+
+fn captured_turn_exists(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    turn_id: &str,
+) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM turns
+             WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3
+         )",
+        params![agent_num, generation, turn_id],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(sql_error)
+}
+
+/// A confirmed receipt reconciles when its exact turn is still the active
+/// captured turn, or when that turn was already captured in this generation
+/// and has since ended. Selection (claim) always requires the active turn;
+/// only the receipt path uses this late allowance, and it never binds to a
+/// new turn because the claim filter pins the exact turn and consumer.
+fn receipt_turn_reconciles(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    turn_id: &str,
+) -> Result<bool> {
+    let agent = load_agent_by_num(tx, agent_num)?
+        .ok_or_else(|| Error::new("not_found", "context target Agent was not found"))?;
+    if agent.generation != generation {
+        return Ok(false);
+    }
+    if agent.active_turn.as_deref() == Some(turn_id)
+        && matches!(agent.state, AgentState::Busy | AgentState::Waiting)
+    {
+        return Ok(true);
+    }
+    captured_turn_exists(tx, agent_num, generation, turn_id)
 }
 
 pub(super) fn settle_send_claims_tx(
@@ -1167,7 +1239,22 @@ fn validate_context_consumer_tx(
                 ));
             }
         }
-        InjectPoint::TurnSafePoint | InjectPoint::ActiveTurn => {
+        InjectPoint::TurnSafePoint => {
+            // Hook receipts (`before_tool`/`before_model`) may confirm after
+            // the native terminal won the race: an exact active turn or an
+            // already-captured historical turn in this generation reconciles.
+            // Selection never uses this allowance.
+            if !receipt_turn_reconciles(tx, target, generation, turn_id)? {
+                return Err(Error::new(
+                    "stale_generation",
+                    "context receipt does not match the exact captured turn",
+                ));
+            }
+        }
+        InjectPoint::ActiveTurn => {
+            // Immediate native dispatch keeps its strict armor: only the
+            // exact active turn of a live Agent may validate, with no late
+            // or historical allowance.
             let agent = load_agent_by_num(tx, target)?
                 .ok_or_else(|| Error::new("not_found", "context target Agent was not found"))?;
             if agent.generation != generation
@@ -1176,7 +1263,7 @@ fn validate_context_consumer_tx(
             {
                 return Err(Error::new(
                     "stale_generation",
-                    "context receipt does not match the current captured turn",
+                    "context receipt does not match the exact captured turn",
                 ));
             }
         }

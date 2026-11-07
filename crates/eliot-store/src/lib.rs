@@ -3572,6 +3572,7 @@ fn family_for_kind(kind: &str) -> Result<&'static str> {
         "turn.started" | "turn.completed" => Ok("turn"),
         "message.completed" => Ok("message"),
         "tool.started" | "tool.completed" | "hook.before_tool" => Ok("tool"),
+        "hook.before_model" => Ok("turn"),
         "request.opened" | "request.resolved" | "request.closed" => Ok("request"),
         other => Err(Error::new(
             "unsupported",

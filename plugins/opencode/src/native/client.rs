@@ -7,9 +7,11 @@
 //! is the server's `OPENCODE_PASSWORD`. The client never retries (a repeat
 //! would be a second native write) and never follows redirects.
 
+use std::path::{Path, PathBuf};
+
 use eliot_core::{Error, Result};
 use eliot_plugin::native_stdio::{NativeStreamFault, StreamState};
-use reqwest::{Client, redirect, retry};
+use reqwest::{Client, header::HeaderValue, redirect, retry};
 use tokio::{
     sync::{mpsc, watch},
     time::{Instant, timeout_at},
@@ -29,6 +31,47 @@ use crate::native::{
 /// anything larger is a protocol violation, never truncated into a decision.
 const MAX_HTTP_BYTES: usize = 1024 * 1024;
 const SSE_QUEUE: usize = 64;
+// OpenCode 2.0.32 uses this header to select the native directory context.
+const OPENCODE_DIRECTORY_HEADER: &str = "x-opencode-directory";
+
+pub(crate) fn server_native_directory(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        const VERBATIM_PREFIX: [u16; 4] = [92, 92, 63, 92];
+        let wide: Vec<u16> = canonical.as_os_str().encode_wide().collect();
+        if wide.starts_with(&VERBATIM_PREFIX) {
+            let is_unc = wide.len() >= 8
+                && wide[4] <= 0x7f
+                && (wide[4] as u8).eq_ignore_ascii_case(&b'U')
+                && wide[5] <= 0x7f
+                && (wide[5] as u8).eq_ignore_ascii_case(&b'N')
+                && wide[6] <= 0x7f
+                && (wide[6] as u8).eq_ignore_ascii_case(&b'C')
+                && wide[7] == 92;
+            if is_unc {
+                let mut native = vec![92, 92];
+                native.extend_from_slice(&wide[8..]);
+                return Ok(PathBuf::from(std::ffi::OsString::from_wide(&native)));
+            }
+            let is_drive = wide.len() >= 7
+                && wide[4] <= 0x7f
+                && (wide[4] as u8).is_ascii_alphabetic()
+                && wide[5] == 58
+                && wide[6] == 92;
+            if is_drive {
+                return Ok(PathBuf::from(std::ffi::OsString::from_wide(&wide[4..])));
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "OpenCode workspace has no server-native Windows spelling",
+            ));
+        }
+    }
+    Ok(canonical)
+}
 
 /// Classified native HTTP outcome. `Rejected` is authoritative
 /// non-admission (a complete error body proving no effect);
@@ -57,17 +100,30 @@ impl HttpOutcome {
     }
 }
 
-/// Typed client bound to one owned server. `Clone` shares the connection
-/// pool; the password travels only in the auth header, never in logs.
+/// Typed client bound to one owned server and its server-native directory.
+/// `Clone` shares the connection pool; the password travels only in the auth
+/// header, never in logs.
 #[derive(Clone)]
 pub struct OpenCodeHttp {
     client: Client,
     base: String,
     password: String,
+    directory: String,
+    directory_header: HeaderValue,
 }
 
 impl OpenCodeHttp {
-    pub fn new(port: u16, password: String) -> Result<Self> {
+    /// Bind every native request to the server-native directory used for cwd.
+    pub fn new(port: u16, password: String, directory: &Path) -> Result<Self> {
+        let directory = server_native_directory(directory)
+            .map_err(|_| Error::new("invalid", "OpenCode directory could not be canonicalized"))?;
+        let directory = directory.to_string_lossy().into_owned();
+        let directory_header = HeaderValue::from_bytes(directory.as_bytes()).map_err(|_| {
+            Error::new(
+                "invalid",
+                "OpenCode directory cannot be used as an HTTP header",
+            )
+        })?;
         let client = Client::builder()
             .no_proxy()
             .redirect(redirect::Policy::none())
@@ -78,6 +134,8 @@ impl OpenCodeHttp {
             client,
             base: format!("http://127.0.0.1:{port}"),
             password,
+            directory,
+            directory_header,
         })
     }
 
@@ -103,11 +161,23 @@ impl OpenCodeHttp {
         directory: &str,
         deadline: Instant,
     ) -> std::result::Result<SessionInfo, HttpOutcome> {
+        let path = server_native_directory(Path::new(directory)).map_err(|_| {
+            HttpOutcome::NotDispatched {
+                reason: "OpenCode session directory could not be canonicalized".to_owned(),
+            }
+        })?;
+        let location_directory = path.to_string_lossy().into_owned();
+        if location_directory != self.directory {
+            return Err(HttpOutcome::NotDispatched {
+                reason: "OpenCode session directory did not match the owned server location"
+                    .to_owned(),
+            });
+        }
         let body = serde_json::to_value(SessionCreateRequest {
             title: Some(title.to_owned()),
             model: Some(model.clone()),
             location: Some(LocationRef {
-                directory: directory.to_owned(),
+                directory: location_directory,
             }),
         })
         .map_err(|_| HttpOutcome::unknown("OpenCode session/create params could not be encoded"))?;
@@ -564,6 +634,83 @@ impl OpenCodeHttp {
         Err(readback_error("message list", &response))
     }
 
+    /// `POST /api/rpc/eliot-context/bind` over the existing authenticated
+    /// transport. Idempotent per session id; a foreign id echoes the bound
+    /// one so the caller detects the mismatch by comparison. Classified
+    /// like a write so an uncertain bind never advertises `turn_safe_point`.
+    pub async fn eliot_context_bind(
+        &self,
+        session_id: &str,
+        deadline: Instant,
+    ) -> std::result::Result<crate::native::types::EliotContextBindOutput, HttpOutcome> {
+        let input = crate::native::types::EliotContextBindInput {
+            session_id: session_id.to_owned(),
+        };
+        self.eliot_context_rpc("bind", input, deadline).await
+    }
+
+    /// `POST /api/rpc/eliot-context/next`: long-poll for the next bound-
+    /// session context hook. A poll carries no native effect, so a lost
+    /// reply is retried by the caller's loop; it never latches unknown.
+    pub async fn eliot_context_next(
+        &self,
+        session_id: &str,
+        wait_ms: i64,
+        deadline: Instant,
+    ) -> std::result::Result<crate::native::types::EliotContextNextOutput, HttpOutcome> {
+        let input = crate::native::types::EliotContextNextInput {
+            session_id: session_id.to_owned(),
+            wait_ms,
+        };
+        self.eliot_context_rpc("next", input, deadline).await
+    }
+
+    /// `POST /api/rpc/eliot-context/resolve`: settle exactly one pending
+    /// hook. The caller must invoke this at most once per hook and never
+    /// retry an uncertain outcome (a repeat risks a second effect).
+    pub async fn eliot_context_resolve(
+        &self,
+        input: crate::native::types::EliotContextResolveInput,
+        deadline: Instant,
+    ) -> std::result::Result<crate::native::types::EliotContextResolveOutput, HttpOutcome> {
+        self.eliot_context_rpc("resolve", input, deadline).await
+    }
+
+    /// One `POST /api/rpc/eliot-context/{method}` round trip. Success is
+    /// `200 {output}`; 400/401/404 prove non-admission (`Rejected`), any
+    /// other outcome after dispatch is ambiguous (`Unknown`). The client
+    /// never retries: a repeat would be a second native write.
+    async fn eliot_context_rpc<T, U>(
+        &self,
+        method: &str,
+        input: T,
+        deadline: Instant,
+    ) -> std::result::Result<U, HttpOutcome>
+    where
+        T: serde::Serialize,
+        U: for<'de> serde::Deserialize<'de>,
+    {
+        let path = format!("/api/rpc/eliot-context/{method}");
+        let body = serde_json::json!({"input": input});
+        let response = self
+            .send(reqwest::Method::POST, &path, &[], Some(body), deadline)
+            .await?;
+        if response.status == 200 {
+            let envelope: serde_json::Value = serde_json::from_slice(&response.body)
+                .map_err(|_| HttpOutcome::unknown("OpenCode context RPC returned no output"))?;
+            let output = envelope
+                .get("output")
+                .cloned()
+                .ok_or_else(|| HttpOutcome::unknown("OpenCode context RPC returned no output"))?;
+            return serde_json::from_value::<U>(output)
+                .map_err(|_| HttpOutcome::unknown("OpenCode context RPC output was invalid"));
+        }
+        Err(map_write_error(
+            &format!("eliot-context/{method}"),
+            &response,
+        ))
+    }
+
     /// `GET /api/event`: subscribe to the broadcast event stream. Returns
     /// once the response headers arrive (the subscription is live before
     /// any session create/input that follows); frames flow to the channel.
@@ -575,7 +722,8 @@ impl OpenCodeHttp {
         let request = self
             .client
             .get(url)
-            .basic_auth("opencode", Some(&self.password));
+            .basic_auth("opencode", Some(&self.password))
+            .header(OPENCODE_DIRECTORY_HEADER, self.directory_header.clone());
         let response = timeout_at(deadline, request.send())
             .await
             .map_err(|_| Error::new("native_readback", "OpenCode event subscribe timed out"))?
@@ -634,7 +782,8 @@ impl OpenCodeHttp {
         let mut request = self
             .client
             .request(method, url)
-            .basic_auth("opencode", Some(&self.password));
+            .basic_auth("opencode", Some(&self.password))
+            .header(OPENCODE_DIRECTORY_HEADER, self.directory_header.clone());
         if let Some(body) = body {
             // The workspace reqwest has no `json` feature; encode manually.
             let encoded = serde_json::to_vec(&body)
@@ -928,14 +1077,19 @@ mod tests {
         let port = listener.local_addr().expect("local addr").port();
         drop(listener);
 
-        let http = OpenCodeHttp::new(port, "test-password".to_owned()).expect("client");
+        let directory = std::env::current_dir().expect("current directory");
+        let directory_text = directory.to_string_lossy().into_owned();
+        let http = OpenCodeHttp::new(port, "test-password".to_owned(), &directory).expect("client");
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         let model = ModelRef {
             id: "test-model".to_owned(),
             provider_id: "test-provider".to_owned(),
             variant: None,
         };
-        match http.create_session("test", &model, "/tmp", deadline).await {
+        match http
+            .create_session("test", &model, &directory_text, deadline)
+            .await
+        {
             Err(HttpOutcome::NotDispatched { reason }) => {
                 assert!(reason.contains("not dispatched"), "reason={reason}");
                 assert!(reason.contains("connect"), "reason={reason}");
@@ -1014,14 +1168,19 @@ mod tests {
             }
         });
 
-        let http = OpenCodeHttp::new(port, "test-password".to_owned()).expect("client");
+        let directory = std::env::current_dir().expect("current directory");
+        let directory_text = directory.to_string_lossy().into_owned();
+        let http = OpenCodeHttp::new(port, "test-password".to_owned(), &directory).expect("client");
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         let model = ModelRef {
             id: "test-model".to_owned(),
             provider_id: "test-provider".to_owned(),
             variant: None,
         };
-        match http.create_session("test", &model, "/tmp", deadline).await {
+        match http
+            .create_session("test", &model, &directory_text, deadline)
+            .await
+        {
             Err(HttpOutcome::Unknown { reason }) => {
                 assert!(reason.contains("after dispatch"), "reason={reason}");
                 assert!(reason.contains("unknown"), "reason={reason}");

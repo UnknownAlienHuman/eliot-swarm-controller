@@ -106,6 +106,9 @@ fn encode_record(
                 | "turn_id"
                 | "request_id"
                 | "source"
+                | "batch_id"
+                | "event_kind"
+                | "validation"
                 | "boot_id"
                 | "pid"
         ) {

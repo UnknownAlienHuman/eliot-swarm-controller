@@ -1097,6 +1097,14 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             // Pure watch facts: exact active-turn binding only, no state change.
             require_live_turn(agent, event)?;
         }
+        "hook.before_model" => {
+            // Receipt authority stays in Store settlement: selection
+            // (claim) requires the exact active turn, but a confirmed
+            // receipt may reconcile a claimed Unknown after its native
+            // terminal won the race. Store proves the exact claim,
+            // generation and captured turn record; no projection change.
+            required_text(event, "turn_id")?;
+        }
         kind => {
             return Err(Error::new(
                 "unsupported",
