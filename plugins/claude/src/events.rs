@@ -5,6 +5,7 @@ use eliot_core::{
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, MAX_TEXT_BYTES, PeerClient,
     native_stdio::StreamState,
+    native_transport::encode_frame,
     protocol::{HookEvent, HookResponse},
     session::{
         EVENT_DEADLINE, StreamSource, approval_reply_args, attach_final_text, native_no_write,
@@ -28,8 +29,9 @@ use crate::native::{
     ClaudeClient, ClaudeFrame,
     types::{
         CanUseToolBody, CommandLifecycle, ControlCancelRequest, HookCallbackBody,
-        HookCallbackResponse, PermissionResult, ResultRecord, assistant_model, assistant_text,
-        assistant_tool_use_ids, result_usage,
+        HookCallbackResponse, OutboundControlResponse, OutboundControlResponseBody,
+        PermissionResult, ResultRecord, assistant_model, assistant_text, assistant_tool_use_ids,
+        result_usage,
     },
 };
 
@@ -481,23 +483,25 @@ impl EventHandle {
         Ok(outcome_rx)
     }
 
-    /// Withdraw a queued steer that will never be answered (its waiter timed
-    /// out), so a later hook cannot apply text the caller already settled as
-    /// unknown. Only the exact queued command is cleared.
-    pub async fn cancel_steer(&self, command_id: String) {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .control
-            .send(Control::CancelSteer {
-                command_id,
-                reply: reply_tx,
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let _ = reply_rx.await;
+    /// Queue exact-command steer withdrawal on the event task without making
+    /// the host control dispatcher wait behind a native callback write/receipt.
+    /// The returned receiver resolves when that task processes the request.
+    pub fn request_cancel_steer(&self, command_id: String) -> oneshot::Receiver<bool> {
+        let control = self.control.clone();
+        let (completed_tx, completed_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let completed = control
+                .send(Control::CancelSteer {
+                    command_id,
+                    reply: reply_tx,
+                })
+                .await
+                .is_ok()
+                && reply_rx.await.is_ok();
+            let _ = completed_tx.send(completed);
+        });
+        completed_rx
     }
 
     /// Whether `turn_id` is the exact live turn, answered behind any queued
@@ -1732,7 +1736,7 @@ impl EventProcessor {
             .pending_steer
             .as_ref()
             .is_some_and(|steer| steer.turn_id == hook_turn_id);
-        if context_text.trim().is_empty() && !steer_waiting {
+        if context.is_empty() && !steer_waiting {
             return self
                 .finish_hook_pass(request_id, &native, deadline, &tool_use_id, &consumer_id)
                 .await;
@@ -1747,8 +1751,8 @@ impl EventProcessor {
         }
         // Take the queued steer only now, immediately before the only native
         // write that can carry additionalContext. FIFO context comes first,
-        // then the steer text; an oversized combination rejects the steer
-        // and the hook proceeds context-only, never dropping FIFO items.
+        // then the steer text; a raw-text or complete-frame overflow rejects
+        // the steer and keeps the full FIFO context when its frame fits.
         let mut steer = self.take_pending_steer(&hook_turn_id);
         let mut combined = context_text.clone();
         if let Some(waiting) = steer.as_ref() {
@@ -1769,10 +1773,32 @@ impl EventProcessor {
                 combined = context_text.clone();
             }
         }
-        if combined.trim().is_empty() {
+        let mut response = HookCallbackResponse::with_context(combined.clone());
+        if !hook_callback_response_fits(request_id, &response)
+            && let Some(waiting) = steer.take()
+        {
+            Self::settle_steer(
+                waiting,
+                SteerOutcome::Rejected(
+                    "Claude steer with hook context exceeds the 1 MiB encoded response bound"
+                        .to_owned(),
+                ),
+            );
+            combined = context_text.clone();
+            response = HookCallbackResponse::with_context(combined.clone());
+        }
+        if context.is_empty() {
             return self
                 .finish_hook_pass(request_id, &native, deadline, &tool_use_id, &consumer_id)
                 .await;
+        }
+        if !hook_callback_response_fits(request_id, &response) {
+            self.pending_hooks.remove(request_id);
+            self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+            return Err(Error::new(
+                "frame_too_large",
+                "Claude FIFO hook context exceeds the 1 MiB encoded response bound",
+            ));
         }
         // Recheck the monotonic deadline, cancellation (pending-map membership),
         // generation and exact invocation-to-turn binding immediately before
@@ -1793,7 +1819,6 @@ impl EventProcessor {
             self.finish_tool_use_hook(&tool_use_id, &consumer_id);
             return self.write_hook_pass(&native, request_id, deadline).await;
         }
-        let response = HookCallbackResponse::with_context(combined);
         match native
             .respond_hook_callback(request_id, response, deadline)
             .await
@@ -2814,6 +2839,21 @@ fn hook_deadline(deadline_ms: Option<u64>) -> Instant {
         .unwrap_or(HOOK_CALLBACK_TIMEOUT_MS)
         .min(HOOK_CALLBACK_TIMEOUT_MS);
     Instant::now() + Duration::from_millis(timeout_ms)
+}
+
+fn hook_callback_response_fits(request_id: &str, response: &HookCallbackResponse) -> bool {
+    encode_frame(
+        "Claude",
+        &OutboundControlResponse {
+            kind: "control_response",
+            response: OutboundControlResponseBody {
+                subtype: "success",
+                request_id: request_id.to_owned(),
+                response: response.clone(),
+            },
+        },
+    )
+    .is_ok()
 }
 
 #[cfg(test)]

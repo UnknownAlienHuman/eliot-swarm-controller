@@ -133,6 +133,7 @@ struct DeferredSteer {
     text: String,
     outcome: oneshot::Receiver<SteerOutcome>,
     deadline: Instant,
+    cancel_ack: Option<oneshot::Receiver<bool>>,
 }
 
 /// What one dispatch produced: an immediate reply, or a deferred steer reply
@@ -148,6 +149,7 @@ enum SteerWake {
     Request(Option<RpcRequest>),
     Outcome(Option<SteerOutcome>),
     Deadline,
+    CancelAcknowledged(bool),
 }
 
 /// Serve one request (or settle one deferred steer), then continue the loop
@@ -195,10 +197,20 @@ pub(crate) async fn run() -> Result<()> {
         // snapshot, and shutdown are never blocked behind the hook wait.
         // The select resolves to a value first so no waiter borrow crosses
         // the settling code below.
-        let wake = tokio::select! {
-            request = requests.recv() => SteerWake::Request(request),
-            outcome = &mut waiter.outcome => SteerWake::Outcome(outcome.ok()),
-            _ = tokio::time::sleep_until(waiter.deadline) => SteerWake::Deadline,
+        let wake = if let Some(cancel_ack) = waiter.cancel_ack.as_mut() {
+            tokio::select! {
+                request = requests.recv() => SteerWake::Request(request),
+                outcome = &mut waiter.outcome => SteerWake::Outcome(outcome.ok()),
+                acknowledged = cancel_ack => {
+                    SteerWake::CancelAcknowledged(acknowledged.unwrap_or(false))
+                },
+            }
+        } else {
+            tokio::select! {
+                request = requests.recv() => SteerWake::Request(request),
+                outcome = &mut waiter.outcome => SteerWake::Outcome(outcome.ok()),
+                _ = tokio::time::sleep_until(waiter.deadline) => SteerWake::Deadline,
+            }
         };
         let serve = match wake {
             SteerWake::Request(request) => {
@@ -209,7 +221,26 @@ pub(crate) async fn run() -> Result<()> {
             SteerWake::Outcome(outcome) => {
                 plugin.settle_deferred_steer(&client, waiter, outcome).await
             }
-            SteerWake::Deadline => plugin.settle_deferred_deadline(&client, waiter).await,
+            SteerWake::Deadline => {
+                if let Some(session) = plugin.session.as_ref() {
+                    waiter.cancel_ack = Some(
+                        session
+                            .events
+                            .request_cancel_steer(waiter.command_id.clone()),
+                    );
+                    plugin.deferred_steer = Some(waiter);
+                    Serve::Continue
+                } else {
+                    plugin
+                        .settle_deferred_deadline(&client, waiter, false)
+                        .await
+                }
+            }
+            SteerWake::CancelAcknowledged(acknowledged) => {
+                plugin
+                    .settle_deferred_deadline(&client, waiter, acknowledged)
+                    .await
+            }
         };
         match serve {
             Serve::Continue => {}
@@ -1029,6 +1060,7 @@ impl ClaudePlugin {
             text: text.to_owned(),
             outcome,
             deadline: Instant::now() + RPC_TIMEOUT,
+            cancel_ack: None,
         })
     }
 
@@ -1094,14 +1126,23 @@ impl ClaudePlugin {
         respond_deferred(client, request_id, result).await
     }
 
-    /// Settle a deferred steer whose deadline passed first: withdraw the
-    /// queue so a later hook cannot apply text already settled as unknown,
-    /// retain that unknown, and reply. The loop never blocked on this wait.
+    /// Settle after the deadline withdrawal was processed by the event task.
+    /// The host kept both receivers live while continuing to serve controls;
+    /// a confirmed steer outcome wins before a timeout is retained.
     async fn settle_deferred_deadline(
         &mut self,
         client: &PeerClient,
-        waiter: DeferredSteer,
+        mut waiter: DeferredSteer,
+        cancellation_acknowledged: bool,
     ) -> Serve {
+        // The event task serializes cancellation behind any callback write.
+        // Its outcome sender runs before the cancellation acknowledgement, so
+        // inspect the still-live receiver before retaining a timeout result.
+        if let Ok(outcome) = waiter.outcome.try_recv() {
+            return self
+                .settle_deferred_steer(client, waiter, Some(outcome))
+                .await;
+        }
         let DeferredSteer {
             request_id,
             command_id,
@@ -1110,10 +1151,12 @@ impl ClaudePlugin {
             ..
         } = waiter;
         if let Some(session) = self.session.as_mut() {
-            session.events.cancel_steer(command_id.clone()).await;
-            let result = unknown_control(
-                "Claude steer was not confirmed before its deadline; it will not be repeated",
-            );
+            let reason = if cancellation_acknowledged {
+                "Claude steer was not confirmed before its deadline; it will not be repeated"
+            } else {
+                "Claude steer withdrawal was not confirmed before its deadline; it will not be repeated"
+            };
+            let result = unknown_control(reason);
             session.steer_outcomes.insert(
                 command_id,
                 SteerRecord {
