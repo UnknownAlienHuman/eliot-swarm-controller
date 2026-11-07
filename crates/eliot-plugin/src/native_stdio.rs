@@ -272,6 +272,12 @@ impl<C: NativeStdioConfig> StdioClient<C> {
                 )
             })?;
 
+        if self.pending.is_closed() {
+            return Err(Error::new(
+                "native_not_dispatched",
+                format!("{} response router closed before dispatch", C::SHORT),
+            ));
+        }
         let (_guard, response_rx) = self.pending.insert(id);
         if let Err(error) = self.write_encoded(encoded, deadline).await {
             if error.code == "native_not_dispatched" {
