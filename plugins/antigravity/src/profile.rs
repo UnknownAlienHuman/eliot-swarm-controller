@@ -1,4 +1,7 @@
-use std::{ffi::OsString, path::PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 use eliot_core::{Error, Result, SecretPolicy};
 use eliot_plugin::{
@@ -26,7 +29,12 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    pub fn new(params: &AgentStartParams, credential: &str, hook_token: &str) -> Result<Self> {
+    pub fn new(
+        params: &AgentStartParams,
+        credential: &str,
+        hook_token: &str,
+        instance_dir: &Path,
+    ) -> Result<Self> {
         if params.initial.is_some() {
             return Err(Error::new(
                 "unsupported",
@@ -122,7 +130,13 @@ impl Plan {
             ));
         }
         let resume = resume.map(|subject| subject.native_ref);
-        let args = native_args(&model, mode.as_deref(), skip_permissions, resume.as_deref());
+        let args = native_args(
+            &model,
+            mode.as_deref(),
+            skip_permissions,
+            resume.as_deref(),
+            instance_dir,
+        );
         Ok(Self {
             launch: NativeLaunch {
                 program: program.into(),
@@ -314,15 +328,19 @@ fn native_args(
     _mode: Option<&str>,
     skip_permissions: bool,
     _resume: Option<&str>,
+    instance_dir: &Path,
 ) -> Vec<OsString> {
     // One ACP stdio server per generation. Model, thought level, session
     // mode and resume are ACP session facts now (set_config_option /
-    // set_mode / session load), not CLI flags. Permission posture remains
-    // the only launch selector on this ACP route.
-    [
+    // set_mode / session load), not CLI flags. Permission posture and the
+    // private hook-discovery directory are process launch flags.
+    let mut args = [
         OsString::from("acp"),
         OsString::from("--stdio"),
         format!("--dangerously-skip-permissions={skip_permissions}").into(),
     ]
-    .to_vec()
+    .to_vec();
+    args.push(OsString::from("--add-dir"));
+    args.push(instance_dir.as_os_str().to_owned());
+    args
 }

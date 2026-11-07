@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use eliot_core::{Error, InjectPoint, Result, canonical_json_sha256};
 use eliot_plugin::{
@@ -36,6 +42,21 @@ struct RetainedCommand {
     payload_sha256: [u8; 32],
     turn: String,
     outcome: Result<Value>,
+}
+
+struct OwnedHookConfig {
+    path: PathBuf,
+    remove_agents_dir: bool,
+}
+
+struct HookConfigGuard(Option<OwnedHookConfig>);
+
+impl Drop for HookConfigGuard {
+    fn drop(&mut self) {
+        if let Some(config) = &self.0 {
+            remove_hook_config(config);
+        }
+    }
 }
 
 pub(crate) struct DeferredSteer {
@@ -96,6 +117,7 @@ pub(crate) struct Session {
     stream: watch::Receiver<StreamState>,
     task: Option<JoinHandle<()>>,
     hooks: Option<HookServer>,
+    hook_config: Option<OwnedHookConfig>,
     ready: bool,
     highwater_seq: i64,
     retained: Option<RetainedCommand>,
@@ -111,6 +133,7 @@ impl Session {
         plan: &Plan,
         peer: &PeerClient,
         credential: &str,
+        instance_dir: &Path,
         hooks: HookServer,
     ) -> Result<Self> {
         let reserved = [
@@ -136,6 +159,11 @@ impl Session {
                 "Eliot hook helper path is not an existing absolute executable",
             ));
         }
+        let mut hook_config = HookConfigGuard(Some(install_hook_config(
+            instance_dir,
+            &plan.launch.cwd,
+            &helper,
+        )?));
         let mut environment = plan.launch.environment.clone();
         environment.extend(hooks.endpoint_env());
         environment.push((hooks::ENV_HOOK_HELPER.into(), helper.into_os_string()));
@@ -170,6 +198,7 @@ impl Session {
             stream,
             task: None,
             hooks: Some(hooks),
+            hook_config: hook_config.0.take(),
             ready: false,
             highwater_seq: 0,
             retained: None,
@@ -1073,6 +1102,9 @@ impl Session {
                 .map_err(|_| Error::new("unknown", "Antigravity event reader failed"))?;
             self.task = None;
         }
+        if let Some(config) = self.hook_config.take() {
+            remove_hook_config(&config);
+        }
         if self.ready {
             let mut state = self.state.lock().await;
             state.ended().await?;
@@ -1091,6 +1123,149 @@ pub(crate) fn unknown_steer(command_id: &str, turn_id: &str, reason: &str) -> Va
         "native_hook": "PreInvocation",
         "reason": reason,
     })
+}
+
+fn install_hook_config(
+    instance_dir: &Path,
+    workspace: &Path,
+    helper: &Path,
+) -> Result<OwnedHookConfig> {
+    let command = hook_command(helper)?;
+    let private_root = fs::canonicalize(instance_dir).map_err(|_| {
+        Error::new(
+            "invalid",
+            "Antigravity private instance directory is unavailable",
+        )
+    })?;
+    let workspace = fs::canonicalize(workspace)
+        .map_err(|_| Error::new("profile_error", "Antigravity workspace is unavailable"))?;
+    if private_root.starts_with(&workspace) || workspace.starts_with(&private_root) {
+        return Err(Error::new(
+            "invalid",
+            "Antigravity private instance directory overlaps its workspace",
+        ));
+    }
+
+    let agents_dir = private_root.join(".agents");
+    let remove_agents_dir = match fs::create_dir(&agents_dir) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(_) => {
+            return Err(Error::new(
+                "io_error",
+                "Could not create the private Antigravity hooks directory",
+            ));
+        }
+    };
+    let agents_dir = match fs::canonicalize(&agents_dir) {
+        Ok(path) if path.is_dir() && path.starts_with(&private_root) => path,
+        _ => {
+            if remove_agents_dir {
+                let _ = fs::remove_dir(&agents_dir);
+            }
+            return Err(Error::new(
+                "invalid",
+                "Antigravity hooks directory is not contained by its private instance",
+            ));
+        }
+    };
+
+    let config = hooks::hooks_json(hooks::DEFAULT_HOOK_NAME, &command);
+    let mut bytes = match serde_json::to_vec(&config) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            if remove_agents_dir {
+                let _ = fs::remove_dir(&agents_dir);
+            }
+            return Err(Error::new(
+                "internal",
+                "Could not encode Antigravity hook config",
+            ));
+        }
+    };
+    bytes.push(b'\n');
+    let path = agents_dir.join("hooks.json");
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(file) => file,
+        Err(_) => {
+            if remove_agents_dir {
+                let _ = fs::remove_dir(&agents_dir);
+            }
+            return Err(Error::new(
+                "io_error",
+                "Could not create the owned Antigravity hook config",
+            ));
+        }
+    };
+    if file.write_all(&bytes).and_then(|()| file.flush()).is_err() {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        if remove_agents_dir {
+            let _ = fs::remove_dir(&agents_dir);
+        }
+        return Err(Error::new(
+            "io_error",
+            "Could not write the owned Antigravity hook config",
+        ));
+    }
+    Ok(OwnedHookConfig {
+        path,
+        remove_agents_dir,
+    })
+}
+
+fn hook_command(helper: &Path) -> Result<String> {
+    let executable = helper
+        .to_str()
+        .ok_or_else(|| Error::new("invalid", "Eliot hook helper path is not UTF-8"))?;
+    // The pinned AGY Windows log shows literal `\"...\"` tokens are not
+    // recognized by its command executor. Emit an unquoted bare path only
+    // when it has no whitespace or shell metacharacters; other paths stay
+    // explicitly unsupported until the vendor's quoting rules are proven.
+    let unsafe_token = executable.chars().any(|character| {
+        character.is_whitespace()
+            || if cfg!(windows) {
+                matches!(
+                    character,
+                    '&' | '|' | '<' | '>' | '^' | '%' | '!' | '(' | ')' | '"'
+                )
+            } else {
+                matches!(
+                    character,
+                    '&' | '|'
+                        | '<'
+                        | '>'
+                        | ';'
+                        | '$'
+                        | '`'
+                        | '\''
+                        | '"'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '#'
+                        | '('
+                        | ')'
+                )
+            }
+    });
+    if unsafe_token {
+        return Err(Error::new(
+            "unsupported",
+            "Antigravity hook executable path contains unqualified command characters",
+        ));
+    }
+    Ok(format!("{executable} plugin antigravity-hook"))
+}
+
+fn remove_hook_config(config: &OwnedHookConfig) {
+    let _ = fs::remove_file(&config.path);
+    if config.remove_agents_dir
+        && let Some(parent) = config.path.parent()
+    {
+        let _ = fs::remove_dir(parent);
+    }
 }
 
 #[cfg(test)]

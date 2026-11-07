@@ -102,20 +102,30 @@ The Antigravity CLI hooks documentation (accessed 2026-11-07; adapter
 version metadata is 1.5.2) defines named hook groups. `PreInvocation` input
 includes `conversationId`, zero-indexed `invocationNum`, and
 `initialNumSteps` (trajectory step count); output `injectSteps` accepts
-`ephemeralMessage`. The builtin user configuration is
-`~/.gemini/config/hooks.json`; Root owns adding one Eliot group there. The
-plugin never edits that file or a user project. It does not use `--add-dir`
-as a hook loader or move authentication/native-store data.
+`ephemeralMessage`. The plugin writes one named group to the generation's
+private `.agents/hooks.json` and passes that private directory with
+`--add-dir`; the real workspace remains the ACP cwd. Root's version-pinned
+ACP log shows both the private Eliot group and a temporary probe group
+loaded, then shows the helper command failing because backslash-escaped
+quotes around the executable were not recognized. The log does not establish
+which layer introduced those codepoints; Root is inspecting the frozen
+binary's generated command. This proves customization loading for the tested
+`agy acp` path, but not helper execution or event receipt. Root removed the
+temporary global probe configuration; the adapter
+does not write global or user-project hook files, copy authentication, or
+change login/native-store paths.
 
 Each managed ACP generation receives `ELIOT_AGY_HOOK_HELPER` pointing to the
 current Eliot executable plus its own loopback endpoint and random token.
-The global hook command invokes that helper. With no managed endpoint/token,
-the helper writes `{}` and exits successfully. A Root live probe of the
-version-pinned adapter completed a native source-review task but emitted zero
+The private hook command invokes that same executable as a bare token when
+its path contains no whitespace or shell metacharacters. Other command paths
+remain unsupported until the vendor executor's quoting behavior is proven.
+With no managed endpoint/token, the helper writes `{}` and exits successfully.
+The Root probe completed a native source-review task but emitted zero
 `hook.before_model` events; no context or steer was queued, and Root found no
-native source gap. Therefore global hook loading and activation remain
-unqualified until Root's builtin-config probe observes the event path. No
-`Ready` result or generated hook file is activation proof.
+native source gap. The remaining runtime gate is a confirmed private-helper
+receipt after correcting the command token; hook load messages alone do not
+prove helper execution.
 
 The helper captures its kernel `ProcessBirthIdentity { pid, start_time }` at
 entry. The plugin verifies that tuple against the OS and accepts it only when

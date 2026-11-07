@@ -357,6 +357,7 @@ impl Plugin {
             .as_ref()
             .ok_or_else(|| not_initialized("Antigravity"))?;
         let credential = initialized.credential.clone();
+        let instance_dir = PathBuf::from(&initialized.instance_dir);
         let identity = serde_json::to_value(&params)
             .map_err(|_| Error::new("internal", "Could not encode Antigravity start binding"))?;
         if let Some((previous, outcome)) = &self.start {
@@ -369,7 +370,7 @@ impl Plugin {
             return outcome.clone();
         }
         let hooks = HookServer::bind().await?;
-        let plan = crate::profile::Plan::new(&params, &credential, hooks.token())?;
+        let plan = crate::profile::Plan::new(&params, &credential, hooks.token(), &instance_dir)?;
         // Latch before creating a native conversation. Any failure after spawn
         // is retained; this generation never starts a second process on retry.
         self.start = Some((
@@ -379,25 +380,26 @@ impl Plugin {
                 "Antigravity start is unresolved; it will not be replayed",
             )),
         ));
-        let result = match Session::spawn(&params, &plan, peer, &credential, hooks).await {
-            Ok(session) => {
-                self.session = Some(session);
-                let session = self
-                    .session
-                    .as_mut()
-                    .ok_or_else(|| Error::new("internal", "Antigravity session disappeared"))?;
-                let result = session.start(&plan, peer, &credential).await;
-                if result.is_err() && session.terminate(true).await.is_err() {
-                    Err(Error::new(
-                        "unknown",
-                        "Antigravity start failed and owned cleanup is unconfirmed",
-                    ))
-                } else {
-                    result
+        let result =
+            match Session::spawn(&params, &plan, peer, &credential, &instance_dir, hooks).await {
+                Ok(session) => {
+                    self.session = Some(session);
+                    let session = self
+                        .session
+                        .as_mut()
+                        .ok_or_else(|| Error::new("internal", "Antigravity session disappeared"))?;
+                    let result = session.start(&plan, peer, &credential).await;
+                    if result.is_err() && session.terminate(true).await.is_err() {
+                        Err(Error::new(
+                            "unknown",
+                            "Antigravity start failed and owned cleanup is unconfirmed",
+                        ))
+                    } else {
+                        result
+                    }
                 }
-            }
-            Err(error) => Err(error),
-        };
+                Err(error) => Err(error),
+            };
         self.start = Some((identity, result.clone()));
         result
     }

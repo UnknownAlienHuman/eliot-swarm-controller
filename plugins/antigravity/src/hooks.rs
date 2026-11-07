@@ -43,6 +43,23 @@ pub const ENV_HOOK_TOKEN: &str = "ELIOT_AGY_HOOK_TOKEN";
 /// Environment variable specifying the path to the Eliot hook helper executable.
 pub const ENV_HOOK_HELPER: &str = "ELIOT_AGY_HOOK_HELPER";
 
+/// Named group installed in the private per-generation `.agents/hooks.json`.
+pub const DEFAULT_HOOK_NAME: &str = "eliot-system-context";
+
+/// Build the named-group hook configuration owned by an Antigravity instance.
+pub fn hooks_json(group_name: &str, command: &str) -> serde_json::Value {
+    serde_json::json!({
+        (group_name): {
+            "PreInvocation": [
+                {
+                    "type": "command",
+                    "command": command
+                }
+            ]
+        }
+    })
+}
+
 /// Exact serialized byte overhead of the `IpcQueryResponse` wrapper and framing newline
 /// around the constituent `HookOutput` payload:
 /// `{"accepted":true,"output":...}\n` (26 bytes prefix + 1 byte closing brace + 1 byte newline).
@@ -363,7 +380,7 @@ pub async fn run_helper() -> Result<()> {
 
     let origin = current_process_birth_identity().map_err(|e| {
         Error::new(
-            "process_identity",
+            e.code.clone(),
             format!("Could not read helper process birth identity: {e}"),
         )
     })?;
