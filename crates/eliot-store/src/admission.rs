@@ -834,15 +834,9 @@ pub(super) fn submit_tx(
             let agent_num = parse_agent_id(target)?;
             let agent = load_agent_by_num(tx, agent_num)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
-            if !supports_control_verb(&agent.harness, &request.verb) {
-                return Err(Error::new(
-                    "unsupported",
-                    format!(
-                        "{} is not supported by the {} harness",
-                        request.verb, agent.harness
-                    ),
-                ));
-            }
+            // Control-verb support is owned by the PluginHost manifest check;
+            // Store admits every known control verb and retains the live
+            // generation, state, turn, and request checks below.
             if let Some(expected) = request.expected_generation
                 && expected != agent.generation
             {

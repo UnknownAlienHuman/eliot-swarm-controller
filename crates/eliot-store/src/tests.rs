@@ -67,32 +67,6 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
     agent
 }
 
-#[test]
-fn initial_source_families_match_native_harness_boundaries() {
-    assert_eq!(
-        super::source_families_for_harness("codex").unwrap(),
-        &["session", "turn", "message", "tool", "request"][..]
-    );
-    assert_eq!(
-        super::source_families_for_harness("muse").unwrap(),
-        &["session", "turn", "message", "request"][..]
-    );
-    assert_eq!(
-        super::source_families_for_harness("claude").unwrap(),
-        &["session", "turn", "message", "request"][..]
-    );
-    assert_eq!(
-        super::source_families_for_harness("opencode").unwrap(),
-        &["session", "turn", "message", "request"][..]
-    );
-    assert_eq!(
-        super::source_families_for_harness("other")
-            .unwrap_err()
-            .code,
-        "unsupported"
-    );
-}
-
 fn ready_managed_codex_agent(
     store: &mut Store,
     checkout: &str,

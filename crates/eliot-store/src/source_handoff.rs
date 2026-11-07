@@ -43,6 +43,11 @@ fn reserved_source(source: &str) -> bool {
     matches!(source, "daemon" | "os" | "git" | "workspace_process")
 }
 
+/// The generic native stream family vocabulary, independent of any harness.
+fn is_native_family(family: &str) -> bool {
+    matches!(family, "session" | "turn" | "message" | "tool" | "request")
+}
+
 impl Store {
     /// Commit the boundary, named-family owners and retained ACK before the caller
     /// publishes events. No native effect is performed or replayed by this method.
@@ -158,17 +163,9 @@ impl Store {
                 "handoff cannot revive a terminal Agent",
             ));
         }
-        let supported = source_families_for_harness(&agent.harness)?;
-        if handoff
-            .families
-            .iter()
-            .any(|family| !supported.contains(&family.as_str()))
-        {
-            return Err(Error::new(
-                "unsupported",
-                "handoff family is not implemented by this harness",
-            ));
-        }
+        // Family vocabulary is validated generically above; Committed
+        // generation ownership below (predecessor/successor bindings) is the
+        // authority for which families this handoff may move.
         let predecessor = load_source_state(&tx, agent_num, handoff.generation, &handoff.source)?
             .ok_or_else(|| {
             Error::new(
@@ -641,10 +638,12 @@ fn native_exit_gaps_tx(
     let agent = current.id.as_str();
     let agent_num = parse_agent_id(agent)?;
     let generation = current.generation;
-    let supported = source_families_for_harness(&current.harness)?;
     let mut groups = std::collections::BTreeMap::<String, Vec<String>>::new();
     for owner in owner_bindings(tx, agent_num, generation)? {
-        if supported.contains(&owner.family.as_str()) {
+        // Group actual registered native owners by their committed source.
+        // Daemon-monitor family owners (process, git, ...) are not native
+        // facts and stay out of these gaps.
+        if is_native_family(&owner.family) {
             if reserved_source(&owner.source) {
                 return Err(Error::new(
                     "source_integrity",
@@ -754,6 +753,13 @@ mod tests {
         }, now).unwrap();
         let agent = admitted.command.target.unwrap();
         store.dispatch(&command_id, now).unwrap();
+        let plan = ["session", "turn", "message", "tool", "request"]
+            .into_iter()
+            .map(|family| (family.to_owned(), "stream".to_owned()))
+            .collect();
+        store
+            .install_plugin_sources(&agent, 1, &command_id, &plan, now)
+            .unwrap();
         store
             .put_batch(
                 SourceBatch {
@@ -789,10 +795,7 @@ mod tests {
     }
 
     fn handoff_all_native_families(agent: &str) -> SourceHandoff {
-        handoff(
-            agent,
-            crate::source_families_for_harness("muse").expect("Native source plan"),
-        )
+        handoff(agent, &["session", "turn", "message", "request"][..])
     }
 
     fn with_gap(mut request: SourceHandoff) -> SourceHandoff {
@@ -1197,9 +1200,7 @@ mod tests {
     fn native_exit_gaps_group_current_owners_and_never_gap_a_zero_family_predecessor() {
         for families in [
             vec!["message"],
-            crate::source_families_for_harness("muse")
-                .expect("Native source plan")
-                .to_vec(),
+            vec!["session", "turn", "message", "request"],
         ] {
             let (mut store, agent, now) = fixture("muse");
             store

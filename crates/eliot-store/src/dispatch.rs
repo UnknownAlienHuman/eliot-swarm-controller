@@ -292,8 +292,8 @@ impl Store {
                         "resume no longer targets the captured terminal Agent generation",
                     ));
                 }
-                // Harness support was proven at admission and the harness is
-                // frozen; only generation, state and pending work are rechecked.
+                // Control-verb support is owned by the PluginHost manifest
+                // check; only generation, state and pending work are rechecked.
                 if has_pending_resume_tx(&tx, agent_num, old_generation, id)? {
                     return Err(Error::new(
                         "bad_state",
@@ -620,8 +620,8 @@ impl Store {
                         "control command targets a stale Agent generation",
                     ));
                 }
-                // Harness/verb support was proven at admission and both are
-                // frozen; only generation, state, turn and request are rechecked.
+                // Control-verb support is owned by the PluginHost manifest
+                // check; only generation, state, turn and request are rechecked.
                 if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
                     return Err(Error::new(
                         "bad_state",
