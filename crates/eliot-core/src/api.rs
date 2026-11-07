@@ -11,6 +11,7 @@ mod mutation_validation;
 mod mutations;
 mod native_pages;
 mod native_requests;
+mod notify;
 mod provider;
 mod read_validation;
 mod reads;
@@ -70,6 +71,7 @@ pub use native_pages::{
     MAX_OBSERVATION_PAGE_ENTRIES, ObservationPage, ObservationQuery,
 };
 pub use native_requests::{AgentDiscoverRequest, AgentHistoryRequest};
+pub use notify::{EmitDefinitionArgs, NotifyDefinitionArgs};
 pub use provider::{
     ProviderClearHoldRequest, ProviderClearHoldResponse, ProviderCorrectiveEvidence,
     ProviderHoldsRequest, ProviderHoldsResponse,

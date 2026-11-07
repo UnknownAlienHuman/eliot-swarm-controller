@@ -442,6 +442,14 @@ impl Router {
                             "force shutdown prevents Git fetch dispatch",
                         ))
                     }
+                    None if matches!(command.verb.as_str(), "notify" | "emit")
+                        && self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE =>
+                    {
+                        Err(Error::new(
+                            "bad_state",
+                            "force shutdown prevents local event dispatch",
+                        ))
+                    }
                     None => store.dispatch(id, now_ms()),
                 };
                 let result = match dispatched {
@@ -563,6 +571,10 @@ impl Router {
                 .await;
             return;
         }
+        if matches!(dispatched.verb.as_str(), "notify" | "emit") {
+            self.execute_user_event_command(id, dispatched).await;
+            return;
+        }
         let target = match dispatched.target.as_deref() {
             Some(target) => target.to_owned(),
             None => return,
@@ -674,6 +686,52 @@ impl Router {
         });
         if durable_match && let Some(view) = cleanup_view {
             crate::git_actions::cleanup_after_settlement(&self.inner.data_root, &view);
+        }
+        self.signal_progress();
+    }
+
+    /// Execute a dispatched local `notify`/`emit`: commit its validated DTO
+    /// as one persisted `x.user.*` event, publish it on the bus, log it, and
+    /// settle Applied with the standard command readback. No external send.
+    async fn execute_user_event_command(&self, id: &str, dispatched: Command) {
+        let (kind, mut data) = match super::user_event_kind_data(&dispatched.verb, &dispatched.args)
+        {
+            Ok(kind_data) => kind_data,
+            Err(error) => {
+                self.settle(
+                    id,
+                    CommandState::Rejected,
+                    Some(json!({"code": error.code})),
+                )
+                .await;
+                self.signal_progress();
+                return;
+            }
+        };
+        self.redact_native_value(&mut data);
+        let committed = {
+            let mut store = self.inner.store.lock().await;
+            store.commit_user_event(id, &kind, data.clone(), now_ms())
+        };
+        match committed {
+            Ok(change) => {
+                let event = change.value.clone();
+                self.publish_locked(std::slice::from_ref(&event));
+                self.settle(
+                    id,
+                    CommandState::Applied,
+                    Some(json!({"kind": kind, "seq": event.seq})),
+                )
+                .await;
+            }
+            Err(error) => {
+                self.settle(
+                    id,
+                    CommandState::Unknown,
+                    Some(json!({"code": error.code, "cause": "user_event_commit_failed"})),
+                )
+                .await;
+            }
         }
         self.signal_progress();
     }

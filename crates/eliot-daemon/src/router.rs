@@ -30,12 +30,13 @@ use eliot_core::{
         AgentResultRequest, AgentResultResponse, AgentStatsRequest, AgentStatsResponse,
         CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest, CommandSubmitRequest,
         CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
-        DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
-        EventsSubscribeRequest, EventsSubscribeResponse, GitFetchDefinitionArgs, GitView,
-        MAX_OBSERVATION_PAGE_BYTES, ObservationPage, ObservationQuery, ObservationView,
-        ProcessPageCursor, ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest,
-        RuleGetRequest, RuleStateView, ShutdownMode, SourceState, StatusBlocker, TimerGetRequest,
-        TimerStateView, TurnGetRequest, UnsettledCommandSummary, WorkspaceCustodyView,
+        DaemonStatusResponse, DiscoverPage, EmitDefinitionArgs, EventsFilter, EventsReadRequest,
+        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
+        GitFetchDefinitionArgs, GitView, MAX_OBSERVATION_PAGE_BYTES, NotifyDefinitionArgs,
+        ObservationPage, ObservationQuery, ObservationView, ProcessPageCursor,
+        ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest,
+        RuleStateView, ShutdownMode, SourceState, StatusBlocker, TimerGetRequest, TimerStateView,
+        TurnGetRequest, UnsettledCommandSummary, WorkspaceCustodyView,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -422,6 +423,9 @@ impl Router {
         if request.verb == "git.fetch" {
             return self.submit_git_fetch(request, principal).await;
         }
+        if matches!(request.verb.as_str(), "notify" | "emit") {
+            Self::validate_user_event_request(&request)?;
+        }
         let prepared = self.prepare_submission(request, principal).await?;
         let PreparedSubmission {
             mut request,
@@ -556,6 +560,25 @@ impl Router {
                 "git.fetch admission result could not be encoded",
             )
         })
+    }
+
+    /// Validate one targetless local `notify`/`emit` submission. Admission
+    /// secret checks run in the shared preparation path; execution commits
+    /// exactly this validated DTO as one persisted `x.user.*` event.
+    fn validate_user_event_request(request: &SubmitCommand) -> Result<()> {
+        if request.target.is_some()
+            || request.expected_generation.is_some()
+            || request.expected_turn_id.is_some()
+            || request.request_id.is_some()
+            || request.probe
+        {
+            return Err(Error::new(
+                "invalid",
+                "notify/emit must be targetless and have no Agent or request bindings",
+            ));
+        }
+        user_event_kind_data(&request.verb, &request.args)?;
+        Ok(())
     }
 
     async fn retained_git_fetch_submit(
@@ -1220,7 +1243,15 @@ impl Router {
         ) {
             validate_plugin_command_args(&request)?;
         }
-        if contains_known_secret(&request.args, &self.inner.secrets) {
+        // Emit data is arbitrary JSON: its object keys can smuggle a known
+        // credential past the values-only check. Block keys before
+        // admission; never persist or log the offending key.
+        let secret_hit = if matches!(request.verb.as_str(), "notify" | "emit") {
+            contains_known_secret_including_keys(&request.args, &self.inner.secrets)
+        } else {
+            contains_known_secret(&request.args, &self.inner.secrets)
+        };
+        if secret_hit {
             return Err(Error::new(
                 "secret_in_payload",
                 "durable command text contains a known credential",
@@ -3821,6 +3852,34 @@ fn normalize_resume(request: &mut SubmitCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Map one validated local `notify`/`emit` DTO to its persisted event kind
+/// and bounded payload. Shared by admission and execution so both read the
+/// same DTO exactly once.
+fn user_event_kind_data(verb: &str, args: &Value) -> Result<(String, Value)> {
+    match verb {
+        "notify" => {
+            let definition = serde_json::from_value::<NotifyDefinitionArgs>(args.clone())
+                .map_err(|_| Error::new("invalid", "notify definition is malformed"))?;
+            definition.validate()?;
+            let mut data = json!({"message": definition.message});
+            if let Some(title) = definition.title {
+                data["title"] = Value::String(title);
+            }
+            Ok(("x.user.notify".to_owned(), data))
+        }
+        "emit" => {
+            let definition = serde_json::from_value::<EmitDefinitionArgs>(args.clone())
+                .map_err(|_| Error::new("invalid", "emit definition is malformed"))?;
+            definition.validate()?;
+            Ok((
+                format!("x.user.{}", definition.topic),
+                json!({"data": definition.data}),
+            ))
+        }
+        _ => Err(Error::new("invalid", "not a local user-event verb")),
+    }
 }
 
 fn validate_plugin_command_args(request: &SubmitCommand) -> Result<()> {

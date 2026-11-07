@@ -429,12 +429,12 @@ impl Router {
         } = prepared;
         if !matches!(
             action.verb.as_str(),
-            "stop" | "send" | "launch" | "resume" | "run" | "git.fetch"
+            "stop" | "send" | "launch" | "resume" | "run" | "git.fetch" | "notify" | "emit"
         ) || workspace.is_some()
         {
             return Err(Error::new(
                 "invalid",
-                "timer firing must contain one prepared stop, send, launch, resume, or Run command",
+                "timer firing must contain one prepared stop, send, launch, resume, Run, or local event command",
             ));
         }
         if action.verb == "run" {
@@ -600,12 +600,20 @@ impl Router {
             && request.verb != "git.fetch"
             && !matches!(
                 request.verb.as_str(),
-                "stop" | "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
+                "stop"
+                    | "send"
+                    | "steer"
+                    | "interrupt"
+                    | "approve"
+                    | "deny"
+                    | "answer"
+                    | "notify"
+                    | "emit"
             )
         {
             return Err(Error::new(
                 "invalid",
-                "rule firing must contain a prepared stop, send, launch, resume, steer, interrupt, reply, or Run action",
+                "rule firing must contain a prepared stop, send, launch, resume, steer, interrupt, reply, Run, or local event action",
             ));
         }
         let admission = {
