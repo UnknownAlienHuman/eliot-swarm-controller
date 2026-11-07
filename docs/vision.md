@@ -90,4 +90,4 @@ one useful Codex session runs. [L7](roadmap.md#l7--qualification-repair-and-rele
 qualifies the connected product; compilation or documentation review alone does not.
 
 The cloud MCP caller contour and the stalled/unhealthy-agent diagnosis and notification
-contour are required product contours, tracked as unchecked roadmap increments, not Later.
+contour are required product contours, tracked as roadmap increments, not Later.
