@@ -220,7 +220,7 @@ Codex or for unrelated adapters.
       tracked in L6.6.
 - [x] **L6.2 OpenCode.** Select one installed API. Shared mode only if per-session
       attribution/environment/stop are supported; otherwise per-Agent server.
-      Steer, inject, detach and fork/background stay unconnected.
+      Inject, detach and fork/background stay unconnected.
 - [x] **L6.3 Cross-harness use.** Reuse L4/L5 rules/mail against the added plugins.
       Keep each control at its actual native application point; remaining shared context
       injection and hook-event integration is tracked in L6.6. Missing semantics reject;

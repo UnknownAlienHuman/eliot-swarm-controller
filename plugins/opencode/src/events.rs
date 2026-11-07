@@ -47,6 +47,7 @@ const EARLY_EVENT_BYTES: usize = 256 * 1024;
 const MAX_MESSAGE_PAGES: usize = 4;
 const MAX_PENDING_REQUESTS: usize = 128;
 const MAX_RESOLVED_REQUESTS: usize = 128;
+const MAX_STEER_WATCHES: usize = 128;
 const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Debug, Default)]
@@ -119,6 +120,20 @@ enum Control {
         command_id: String,
         reply: oneshot::Sender<()>,
     },
+    WatchSteer {
+        command_id: String,
+        turn_id: String,
+        inbox_id: String,
+        reply: oneshot::Sender<Result<oneshot::Receiver<SteerVerdict>>>,
+    },
+    AbandonSteer {
+        command_id: String,
+        reply: oneshot::Sender<()>,
+    },
+    CheckInbox {
+        inbox_id: String,
+        reply: oneshot::Sender<InboxRecord>,
+    },
     BeginStop {
         reply: oneshot::Sender<Result<()>>,
     },
@@ -143,6 +158,29 @@ struct PendingInbox {
     command_id: String,
     context: Vec<ContextItem>,
     inbox_id: String,
+}
+
+/// Verdict for one steered input watched against its exact turn.
+/// Delivered-while-active proves native joined the input to that turn;
+/// anything else leaves consumption unproven.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SteerVerdict {
+    Applied,
+    Missed,
+}
+
+struct SteerWatch {
+    turn_id: String,
+    inbox_id: String,
+    reply: Option<oneshot::Sender<SteerVerdict>>,
+}
+
+/// Retained stream record for one inbox id: whether native delivered it
+/// into an execution or dropped it before delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InboxRecord {
+    pub delivered: bool,
+    pub cancelled: bool,
 }
 
 /// One retained open native request: the exact offered snapshot the owner
@@ -193,6 +231,22 @@ struct EventProcessor {
     /// Inbox ids observed as enqueued or delivered, by id. Bounded by the
     /// per-generation command history the host keeps.
     seen_inbox: HashSet<String>,
+    /// Inbox ids observed as delivered: the steer-consumption proof is a
+    /// delivery observed while the exact turn is still active. Cleared
+    /// with `seen_inbox` at the shared bound.
+    seen_delivered: HashSet<String>,
+    /// Inbox ids observed as cancelled before delivery: with absence
+    /// from the inbox-list readback, the removal proof that lets a
+    /// missed steer settle without latching the session.
+    seen_cancelled: HashSet<String>,
+    /// Exact turn each delivered input joined, retained across terminal
+    /// handling: a steer watch registering after its turn's terminal
+    /// still verdicts from this binding instead of forgetting it.
+    delivered_turn: HashMap<String, String>,
+    /// Steer watches by command id. Lane-less: unlike the send `pending`
+    /// lane, watches never open turns, never block each other, and never
+    /// touch the next-input association.
+    steer_watches: HashMap<String, SteerWatch>,
     /// `session.execution.started` event id waiting for its Eliot command.
     /// At most one: a second unclaimed start is unmodelled native behavior.
     stashed_started: Option<String>,
@@ -339,6 +393,69 @@ impl EventHandle {
         }
     }
 
+    /// Watch one admitted steer input against its exact turn. The returned
+    /// receiver resolves `Applied` when the input is delivered while the
+    /// exact turn is still active, or `Missed` when the turn ends (or the
+    /// input is cancelled) first. A dropped receiver is unknown on the
+    /// host side; the host abandons the watch so it cannot linger.
+    pub async fn watch_steer(
+        &self,
+        command_id: String,
+        turn_id: String,
+        inbox_id: String,
+    ) -> Result<oneshot::Receiver<SteerVerdict>> {
+        let (reply, response) = oneshot::channel();
+        timeout_at(
+            Instant::now() + EVENT_DEADLINE,
+            self.control.send(Control::WatchSteer {
+                command_id,
+                turn_id,
+                inbox_id,
+                reply,
+            }),
+        )
+        .await
+        .map_err(|_| Error::new("unknown", "OpenCode event-control queue deadline elapsed"))?
+        .map_err(|_| Error::new("unknown", "OpenCode event processor stopped"))?;
+        timeout_at(Instant::now() + EVENT_DEADLINE, response)
+            .await
+            .map_err(|_| Error::new("unknown", "OpenCode event-control outcome is unknown"))?
+            .map_err(|_| Error::new("unknown", "OpenCode event-control response was lost"))?
+    }
+
+    pub async fn abandon_steer(&self, command_id: String) {
+        let (reply, response) = oneshot::channel();
+        if self
+            .control
+            .send(Control::AbandonSteer { command_id, reply })
+            .await
+            .is_ok()
+        {
+            let _ = timeout_at(Instant::now() + EVENT_DEADLINE, response).await;
+        }
+    }
+
+    /// The event task's retained stream record for one inbox id,
+    /// serialized behind terminal and delivery handling like the
+    /// exact-turn gate.
+    pub async fn check_inbox(&self, inbox_id: &str) -> Result<InboxRecord> {
+        let (reply, response) = oneshot::channel();
+        timeout_at(
+            Instant::now() + EVENT_DEADLINE,
+            self.control.send(Control::CheckInbox {
+                inbox_id: inbox_id.to_owned(),
+                reply,
+            }),
+        )
+        .await
+        .map_err(|_| Error::new("unknown", "OpenCode event-control queue deadline elapsed"))?
+        .map_err(|_| Error::new("unknown", "OpenCode event processor stopped"))?;
+        timeout_at(Instant::now() + EVENT_DEADLINE, response)
+            .await
+            .map_err(|_| Error::new("unknown", "OpenCode event-control outcome is unknown"))?
+            .map_err(|_| Error::new("unknown", "OpenCode event-control response was lost"))
+    }
+
     pub async fn begin_stop(&self) -> Result<()> {
         self.send(|reply| Control::BeginStop { reply }).await
     }
@@ -461,6 +578,10 @@ impl EventProcessor {
             pending: None,
             open_inbox_id: None,
             seen_inbox: HashSet::new(),
+            seen_delivered: HashSet::new(),
+            seen_cancelled: HashSet::new(),
+            delivered_turn: HashMap::new(),
+            steer_watches: HashMap::new(),
             stashed_started: None,
             expected_seq: None,
             pending_requests: HashMap::new(),
@@ -529,6 +650,28 @@ impl EventProcessor {
                     self.pending = None;
                 }
                 let _ = reply.send(());
+                true
+            }
+            Control::WatchSteer {
+                command_id,
+                turn_id,
+                inbox_id,
+                reply,
+            } => {
+                let result = self.watch_steer(command_id, turn_id, inbox_id);
+                let _ = reply.send(result);
+                true
+            }
+            Control::AbandonSteer { command_id, reply } => {
+                self.steer_watches.remove(&command_id);
+                let _ = reply.send(());
+                true
+            }
+            Control::CheckInbox { inbox_id, reply } => {
+                let _ = reply.send(InboxRecord {
+                    delivered: self.seen_delivered.contains(&inbox_id),
+                    cancelled: self.seen_cancelled.contains(&inbox_id),
+                });
                 true
             }
             Control::BeginStop { reply } => {
@@ -677,7 +820,11 @@ impl EventProcessor {
                 && (self.pending.is_some() || self.stashed_started.is_some());
         }
         if event_type == "session.inbox.cancelled" {
-            return self.status.active_turn_id.is_none();
+            // A cancel buffers only while the send lane may still open
+            // its turn; a turn-less cancel with no send in flight is
+            // classifiable now (a steer-cancel confirmation or a foreign
+            // drop) and must never wait in the buffer.
+            return self.status.active_turn_id.is_none() && self.pending.is_some();
         }
         // An ask racing our send association buffers until the turn opens:
         // with a send in flight, or a started execution awaiting its
@@ -856,6 +1003,120 @@ impl EventProcessor {
         self.flush_buffer().await
     }
 
+    /// Register a steer watch, deciding immediately from retained state
+    /// when the race already settled: frames win over this control, so a
+    /// delivery or terminal that landed between the host gate and this
+    /// registration must verdict now, never hang until the host deadline.
+    fn watch_steer(
+        &mut self,
+        command_id: String,
+        turn_id: String,
+        inbox_id: String,
+    ) -> Result<oneshot::Receiver<SteerVerdict>> {
+        if !self.status.ready
+            || self.status.session_id.is_none()
+            || command_id.trim().is_empty()
+            || turn_id.trim().is_empty()
+            || inbox_id.trim().is_empty()
+        {
+            return Err(Error::new(
+                "invalid",
+                "OpenCode steer watch requires a ready exact turn and inbox",
+            ));
+        }
+        if self.steer_watches.len() >= MAX_STEER_WATCHES {
+            return Err(Error::new(
+                "busy",
+                "OpenCode already watches the maximum steered inputs",
+            ));
+        }
+        let (reply, verdict) = oneshot::channel();
+        // Retained proof first: the input was delivered while this exact
+        // turn was active, even if the terminal has since fenced it.
+        if self
+            .delivered_turn
+            .get(&inbox_id)
+            .is_some_and(|turn| turn == &turn_id)
+        {
+            let _ = reply.send(SteerVerdict::Applied);
+            return Ok(verdict);
+        }
+        if self.status.active_turn_id.as_deref() != Some(turn_id.as_str()) {
+            let _ = reply.send(SteerVerdict::Missed);
+            return Ok(verdict);
+        }
+        self.steer_watches.insert(
+            command_id,
+            SteerWatch {
+                turn_id,
+                inbox_id,
+                reply: Some(reply),
+            },
+        );
+        Ok(verdict)
+    }
+
+    /// Resolve one steer watch exactly once; a dropped host receiver is
+    /// silent (the host already settled unknown).
+    fn resolve_steer(&mut self, command_id: &str, verdict: SteerVerdict) {
+        if let Some(mut watch) = self.steer_watches.remove(command_id)
+            && let Some(reply) = watch.reply.take()
+        {
+            let _ = reply.send(verdict);
+        }
+    }
+
+    /// Settle every watch on one delivered inbox: applied when the exact
+    /// turn is still active, missed otherwise (the input joined later
+    /// work, not the named turn).
+    fn settle_delivered_steers(&mut self, inbox_id: &str) {
+        let resolved: Vec<(String, SteerVerdict)> = self
+            .steer_watches
+            .iter()
+            .filter(|(_, watch)| watch.inbox_id == inbox_id)
+            .map(|(command_id, watch)| {
+                let verdict =
+                    if self.status.active_turn_id.as_deref() == Some(watch.turn_id.as_str()) {
+                        SteerVerdict::Applied
+                    } else {
+                        SteerVerdict::Missed
+                    };
+                (command_id.clone(), verdict)
+            })
+            .collect();
+        for (command_id, verdict) in resolved {
+            self.resolve_steer(&command_id, verdict);
+        }
+    }
+
+    /// A terminal for one turn misses every watch still naming it: the
+    /// input was not delivered into that turn.
+    fn miss_ended_steers(&mut self, turn_id: &str) {
+        let ended: Vec<String> = self
+            .steer_watches
+            .iter()
+            .filter(|(_, watch)| watch.turn_id == turn_id)
+            .map(|(command_id, _)| command_id.clone())
+            .collect();
+        for command_id in ended {
+            self.resolve_steer(&command_id, SteerVerdict::Missed);
+        }
+    }
+
+    /// A cancelled inbox misses every watch naming it: native dropped the
+    /// input before any execution could consume it.
+    fn miss_cancelled_steers(&mut self, inbox_id: &str) {
+        let cancelled: Vec<String> = self
+            .steer_watches
+            .iter()
+            .filter(|(_, watch)| watch.inbox_id == inbox_id)
+            .map(|(command_id, _)| command_id.clone())
+            .collect();
+        for command_id in cancelled {
+            self.resolve_steer(&command_id, SteerVerdict::Missed);
+        }
+    }
+
     /// Open the turn once both association facts hold: our inbox was
     /// observed (enqueued or delivered) and an execution started. Either
     /// order is accepted; the turn id is the exact `started` event id.
@@ -914,9 +1175,8 @@ impl EventProcessor {
             }
             "session.created" => self.observe_session_created(&envelope.data).await,
             "session.deleted" => self.observe_session_deleted(&envelope.data).await,
-            "session.inbox.enqueued" | "session.inbox.delivered" => {
-                self.observe_inbox(&envelope.data).await
-            }
+            "session.inbox.enqueued" => self.observe_inbox(&envelope.data, false).await,
+            "session.inbox.delivered" => self.observe_inbox(&envelope.data, true).await,
             "session.inbox.cancelled" => self.observe_inbox_cancelled(&envelope.data).await,
             "session.execution.started" => self.observe_execution_started(&envelope).await,
             "session.execution.succeeded"
@@ -1027,7 +1287,7 @@ impl EventProcessor {
         ))
     }
 
-    async fn observe_inbox(&mut self, data: &Value) -> Result<()> {
+    async fn observe_inbox(&mut self, data: &Value, delivered: bool) -> Result<()> {
         let inbox: InboxEventData = serde_json::from_value(data.clone()).map_err(|_| {
             Error::new(
                 "native_protocol",
@@ -1039,10 +1299,23 @@ impl EventProcessor {
         {
             return Ok(());
         }
-        self.seen_inbox.insert(inbox.inbox_id);
+        self.seen_inbox.insert(inbox.inbox_id.clone());
+        if delivered {
+            self.seen_delivered.insert(inbox.inbox_id.clone());
+            // Bind the delivery to the running turn, if any: a delivery
+            // with no active turn belongs to future work, never to a
+            // fenced one.
+            if let Some(active) = self.status.active_turn_id.clone() {
+                self.delivered_turn.insert(inbox.inbox_id.clone(), active);
+            }
+            self.settle_delivered_steers(&inbox.inbox_id);
+        }
         if self.seen_inbox.len() > 1024 {
             // Defensive bound; a generation holds at most 32 commands.
             self.seen_inbox.clear();
+            self.seen_delivered.clear();
+            self.seen_cancelled.clear();
+            self.delivered_turn.clear();
         }
         self.try_open_turn().await
     }
@@ -1057,6 +1330,9 @@ impl EventProcessor {
         if self.status.session_id.as_deref() != Some(inbox.session_id.as_str()) {
             return Ok(());
         }
+        if !inbox.inbox_id.trim().is_empty() {
+            self.seen_cancelled.insert(inbox.inbox_id.clone());
+        }
         if self
             .pending
             .as_ref()
@@ -1069,6 +1345,7 @@ impl EventProcessor {
                 "OpenCode dropped the admitted input; its outcome is unknown",
             ));
         }
+        self.miss_cancelled_steers(&inbox.inbox_id);
         Ok(())
     }
 
@@ -1144,6 +1421,13 @@ impl EventProcessor {
         let Some((command_id, turn_id)) = self.resolve_terminal_turn().await? else {
             return Ok(());
         };
+        // Fence the captured turn the moment its terminal is observed,
+        // independent of readback success: controls interleaving with
+        // the readback await below must never see it active again, and
+        // watches still naming it can never apply.
+        self.status.active_turn_id = None;
+        self.status.active_command_id = None;
+        self.miss_ended_steers(&turn_id);
         let status = match envelope.event_type.as_str() {
             "session.execution.succeeded" => "completed",
             "session.execution.failed" => "failed",
@@ -1398,6 +1682,12 @@ impl EventProcessor {
         self.open_inbox_id = None;
         self.stashed_started = None;
         self.pending_requests.clear();
+        // Dropping the senders settles every steer waiter as unknown on
+        // the host side; no verdict is knowable after the source ends.
+        self.steer_watches.clear();
+        self.seen_delivered.clear();
+        self.seen_cancelled.clear();
+        self.delivered_turn.clear();
         Ok(())
     }
 

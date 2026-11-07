@@ -203,16 +203,33 @@ impl OpenCodeHttp {
 
     /// `POST /api/session/{id}/prompt`: admit one input. The 200 response
     /// only proves inbox admission; input-to-execution association is
-    /// observed on the event stream.
+    /// observed on the event stream. The send path leaves `delivery`
+    /// native-default.
     pub async fn prompt(
         &self,
         session_id: &str,
         text: &str,
         deadline: Instant,
     ) -> std::result::Result<InboxUser, HttpOutcome> {
+        self.prompt_with_delivery(session_id, text, None, deadline)
+            .await
+    }
+
+    /// `POST /api/session/{id}/prompt` with explicit `delivery`
+    /// (`Session.Inbox.Delivery`): the steer path names `steer` so a
+    /// running execution re-drains the input at a step boundary instead
+    /// of queueing it behind later work.
+    pub async fn prompt_with_delivery(
+        &self,
+        session_id: &str,
+        text: &str,
+        delivery: Option<&str>,
+        deadline: Instant,
+    ) -> std::result::Result<InboxUser, HttpOutcome> {
         let path = format!("/api/session/{}/prompt", verified_segment(session_id)?);
         let body = serde_json::to_value(PromptRequest {
             text: text.to_owned(),
+            delivery: delivery.map(str::to_owned),
         })
         .map_err(|_| HttpOutcome::unknown("OpenCode prompt params could not be encoded"))?;
         let response = self
@@ -254,6 +271,31 @@ impl OpenCodeHttp {
             return Ok(body.interrupted);
         }
         Err(map_write_error("session/interrupt", &response))
+    }
+
+    /// `DELETE /api/session/{id}/inbox/{inboxID}` (`session.inbox.cancel`):
+    /// drop one pending input that has not been delivered. 204 also
+    /// answers the no-op (already delivered or gone), so success never
+    /// proves removal: callers settle unknown regardless and treat the
+    /// write as best-effort orphan prevention for an exact inbox id.
+    pub async fn cancel_inbox(
+        &self,
+        session_id: &str,
+        inbox_id: &str,
+        deadline: Instant,
+    ) -> std::result::Result<(), HttpOutcome> {
+        let path = format!(
+            "/api/session/{}/inbox/{}",
+            verified_segment(session_id)?,
+            verified_segment(inbox_id)?
+        );
+        let response = self
+            .send(reqwest::Method::DELETE, &path, &[], None, deadline)
+            .await?;
+        if response.status == 204 {
+            return Ok(());
+        }
+        Err(map_write_error("session.inbox.cancel", &response))
     }
 
     /// `GET /api/session/{id}/permission` (`session.permission.list`):
