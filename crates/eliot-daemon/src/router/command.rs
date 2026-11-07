@@ -12,7 +12,7 @@ use super::{
 use crate::common::now_ms;
 use eliot_core::{
     Agent, AgentState, Command, CommandState, ContextItem, Error, Event, FrozenScriptRun,
-    NativeStoreBinding, Result, SecretPolicy,
+    InjectArgs, InjectPoint, NativeStoreBinding, Result, SecretPolicy,
     api::{FrozenGitFetch, ProjectRegistrationView},
     classify_dispatched_error,
 };
@@ -143,9 +143,16 @@ impl Router {
     ) -> Option<PreparedCommand> {
         let command = self.load_command_for_dispatch(id).await?;
         if command.verb == "inject" {
-            // Inject commands are durable pending context. Only a concrete
-            // next_input send or authenticated safe-point callback may claim them.
-            return None;
+            // Queued inject points are durable pending context: only a
+            // concrete next_input send or authenticated safe-point callback
+            // may claim them. An active_turn inject is a direct command: it
+            // dispatches to the plugin's native turn/steer effect now.
+            let point = serde_json::from_value::<InjectArgs>(command.args.clone())
+                .map(|args| args.point)
+                .ok();
+            if point != Some(InjectPoint::ActiveTurn) {
+                return None;
+            }
         }
         if !self.check_script_dispatch_gate(id, &command).await {
             return None;
@@ -626,7 +633,7 @@ impl Router {
                 )
                 .await
             }
-            "steer" | "interrupt" | "approve" | "deny" | "answer" => {
+            "steer" | "interrupt" | "approve" | "deny" | "answer" | "inject" => {
                 self.execute_control_command(&id, &agent, dispatched, Some(dispatch_seq))
                     .await
             }

@@ -236,7 +236,11 @@ Codex or for unrelated adapters.
       command rows and router: FIFO `next_input` context is prepended inside the same
       native SEND and applies only with its exact turn association; `turn_safe_point`
       binds the captured turn and commits its context claim before the authenticated
-      plugin hook response. Normalize `hook.before_tool` through the existing event bus
+      plugin hook response; `active_turn` dispatches directly as the plugin's
+      `agent.command` inject through the actual native turn/steer effect
+      (`codex.turn/steer`, `muse.turn/steer`) with expiry and exact-turn validation
+      at dispatch, remaining unqualified until installed-agent runtime proof.
+      Normalize `hook.before_tool` through the existing event bus
       and `on.event` rules. Preserve exact-turn steer/interrupt and existing approval
       callbacks; adapters report the actual mechanism/application point or `unsupported`,
       never substitute a weaker SEND. Claude Code 2.1.278

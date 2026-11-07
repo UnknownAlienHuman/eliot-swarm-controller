@@ -1864,7 +1864,8 @@ fn count_agent_commands(
         "state = 'unknown'"
     } else {
         "state IN ('accepted', 'queued', 'dispatched')
-         AND NOT (verb = 'inject' AND state IN ('accepted', 'queued') AND outcome IS NULL)"
+         AND NOT (verb = 'inject' AND state IN ('accepted', 'queued') AND outcome IS NULL
+                  AND json_extract(args, '$.point') IN ('next_input', 'turn_safe_point'))"
     };
     let sql = format!(
         "SELECT COUNT(*) FROM commands WHERE target = ?1 AND {states}

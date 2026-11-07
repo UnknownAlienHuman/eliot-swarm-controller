@@ -608,6 +608,103 @@ impl Store {
                     json!({"command_id": id, "verb": "stop"}),
                 )?);
             }
+            "inject" => {
+                let args = context::decode_inject_args(&command.command.args)?;
+                if args.point != InjectPoint::ActiveTurn {
+                    return Err(Error::new(
+                        "bad_state",
+                        "queued inject commands are claimed, not dispatched directly",
+                    ));
+                }
+                if command_generation != agent.generation
+                    || command
+                        .command
+                        .expected_generation
+                        .is_some_and(|expected| expected != agent.generation)
+                {
+                    return Err(Error::new(
+                        "stale_generation",
+                        "active_turn inject targets a stale Agent generation",
+                    ));
+                }
+                if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
+                    return Err(Error::new(
+                        "bad_state",
+                        "active_turn inject requires a busy or waiting Agent",
+                    ));
+                }
+                let turn_id = command.command.turn_id.as_deref().ok_or_else(|| {
+                    Error::new(
+                        "source_integrity",
+                        "active_turn inject has no captured turn",
+                    )
+                })?;
+                if command
+                    .expected_turn_id
+                    .as_deref()
+                    .is_some_and(|expected| expected != turn_id)
+                    || agent.active_turn.as_deref() != Some(turn_id)
+                {
+                    return Err(Error::new(
+                        "stale_generation",
+                        "active_turn inject no longer targets the exact active turn",
+                    ));
+                }
+                if command.command.request_id.is_some() {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "active_turn inject unexpectedly has a native request id",
+                    ));
+                }
+                provider_holds::require_dispatch_tx(&tx, &agent, &command.command)?;
+                if args
+                    .expires_at_ms
+                    .is_some_and(|expires_at| expires_at <= now)
+                {
+                    let outcome = json!({"code": "expired"});
+                    update_command_state(
+                        &tx,
+                        id,
+                        CommandState::Rejected,
+                        Some(&outcome),
+                        None,
+                        now,
+                    )?;
+                    events.push(insert_daemon_command_event(
+                        &tx,
+                        now,
+                        "command.rejected",
+                        Some(agent_num),
+                        Some(agent.generation),
+                        id,
+                        json!({"command_id": id, "state": "rejected", "outcome": outcome}),
+                    )?);
+                } else {
+                    check_rpc_frame(
+                        "agent.command",
+                        &json!({
+                            "agent_id": agent.id,
+                            "generation": agent.generation,
+                            "command_id": id,
+                            "verb": "inject",
+                            "turn_id": turn_id,
+                            "args": command.command.args,
+                        }),
+                    )?;
+                    context::claim_context_tx(
+                        &tx,
+                        id,
+                        context::ContextConsumer {
+                            id,
+                            point: InjectPoint::ActiveTurn,
+                        },
+                        agent_num,
+                        agent.generation,
+                        now,
+                        &mut events,
+                    )?;
+                }
+            }
             "steer" | "interrupt" | "approve" | "deny" | "answer" => {
                 if command_generation != agent.generation
                     || command

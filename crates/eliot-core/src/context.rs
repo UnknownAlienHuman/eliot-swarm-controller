@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub enum InjectPoint {
     NextInput,
     TurnSafePoint,
+    ActiveTurn,
 }
 
 /// Semantic arguments for the existing `inject` command.

@@ -141,7 +141,13 @@ send's exact turn association using `turn.started.data.context_outcomes`, with o
 `ContextOutcome` per claimed item in FIFO order. Store checks the exact claim count and
 consumer binding, then applies them in the same transaction as that turn association.
 `turn_safe_point` items are delivered through the hook callback below for their captured
-turn. The shared `ContextItem` and `ContextOutcome` types are defined in
+turn. An `active_turn` inject is dispatched directly as `agent.command` with verb
+`inject`, the captured exact turn, and the original `InjectArgs` payload; the adapter
+applies it through its actual native turn/steer effect on that turn. An applied ack
+carries `context_outcome` with mechanism `codex.turn/steer` or `muse.turn/steer`,
+application point `active_turn`, and the original inject command id as consumer.
+A rejected or unknown native result settles the command unchanged; an uncertain
+effect is never retried or carried into a later turn. The shared `ContextItem` and `ContextOutcome` types are defined in
 [Core context types](../../crates/eliot-core/src/context.rs); their DTOs own the field
 catalog.
 
@@ -444,7 +450,9 @@ reported as such. The host owns queued-send FIFO and unknown gates.
 Injection must reach the requested native application point. `next_input` is prepended
 inside the same native SEND and applies only with that SEND's exact turn association;
 `turn_safe_point` is bound to its captured turn and delivered through the authenticated
-hook callback. Report the actual native mechanism and application point in the existing
+hook callback; `active_turn` is dispatched directly as `agent.command` inject and
+applies through the native turn/steer on the captured exact turn, never reported as a
+safe point. Report the actual native mechanism and application point in the existing
 typed context outcome. Accepted/queued context is not applied, and uncertain claimed
 context is never retried or moved to a later point.
 

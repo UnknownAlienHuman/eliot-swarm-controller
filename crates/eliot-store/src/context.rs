@@ -34,9 +34,9 @@ struct ClaimedContextRecord {
 }
 
 #[derive(Clone, Copy)]
-struct ContextConsumer<'a> {
-    id: &'a str,
-    point: InjectPoint,
+pub(super) struct ContextConsumer<'a> {
+    pub(super) id: &'a str,
+    pub(super) point: InjectPoint,
 }
 
 pub(super) fn admit_tx(
@@ -91,17 +91,21 @@ pub(super) fn admit_tx(
 
     let turn_id = match args.point {
         InjectPoint::NextInput => None,
-        InjectPoint::TurnSafePoint => {
+        InjectPoint::TurnSafePoint | InjectPoint::ActiveTurn => {
+            let point_name = match args.point {
+                InjectPoint::TurnSafePoint => "turn_safe_point",
+                _ => "active_turn",
+            };
             if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
                 return Err(Error::new(
                     "bad_state",
-                    "turn_safe_point inject requires an active turn",
+                    format!("{point_name} inject requires an active turn"),
                 ));
             }
             let turn_id = agent.active_turn.as_deref().ok_or_else(|| {
                 Error::new(
                     "bad_state",
-                    "turn_safe_point inject requires an exact active turn",
+                    format!("{point_name} inject requires an exact active turn"),
                 )
             })?;
             if request
@@ -930,6 +934,16 @@ fn claimed_context_commands(
              ORDER BY c.created_at, c.rowid",
             true,
         ),
+        InjectPoint::ActiveTurn => (
+            "SELECT c.id, c.turn_id, c.state, c.outcome
+             FROM commands AS c INDEXED BY commands_target
+             WHERE c.target = ?1 AND c.generation = ?2 AND c.verb = 'inject'
+               AND c.state IN ('dispatched', 'unknown') AND c.turn_id = ?4
+               AND json_extract(c.outcome, '$.claim.consumer_id') = ?3
+               AND json_extract(c.outcome, '$.claim.application_point') = 'active_turn'
+             ORDER BY c.created_at, c.rowid",
+            true,
+        ),
     };
     if required_turn_id && turn_id.is_none() {
         return Err(Error::new(
@@ -1086,6 +1100,45 @@ fn validate_context_receipt(
     Ok(())
 }
 
+/// Validate the retained outcome of a directly dispatched `active_turn`
+/// inject before it may settle Applied: the exact-turn native steer ack
+/// must carry the typed `ContextOutcome` for this command.
+pub(super) fn validate_active_turn_applied_outcome(
+    record: &CommandRecord,
+    outcome: Option<&Value>,
+) -> Result<()> {
+    let Some(outcome) = outcome else {
+        return Err(Error::new(
+            "source_integrity",
+            "active_turn inject cannot be applied without its exact native result",
+        ));
+    };
+    let receipt = outcome.get("context_outcome").cloned().ok_or_else(|| {
+        Error::new(
+            "source_integrity",
+            "active_turn inject result has no context outcome",
+        )
+    })?;
+    let receipt: ContextOutcome = serde_json::from_value(receipt).map_err(|_| {
+        Error::new(
+            "source_integrity",
+            "active_turn context outcome is malformed",
+        )
+    })?;
+    if receipt.application_point != InjectPoint::ActiveTurn
+        || receipt.consumer_id != record.command.id
+        || receipt.mechanism.trim().is_empty()
+        || outcome.get("command_id").and_then(Value::as_str) != Some(record.command.id.as_str())
+        || outcome.get("turn_id").and_then(Value::as_str) != record.command.turn_id.as_deref()
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "active_turn result does not match its exact command, turn, and consumer binding",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_context_consumer_tx(
     tx: &Transaction<'_>,
     record: &ClaimedContextRecord,
@@ -1114,7 +1167,7 @@ fn validate_context_consumer_tx(
                 ));
             }
         }
-        InjectPoint::TurnSafePoint => {
+        InjectPoint::TurnSafePoint | InjectPoint::ActiveTurn => {
             let agent = load_agent_by_num(tx, target)?
                 .ok_or_else(|| Error::new("not_found", "context target Agent was not found"))?;
             if agent.generation != generation
@@ -1163,7 +1216,7 @@ fn apply_context_receipt_tx(
     })
 }
 
-fn claim_context_tx(
+pub(super) fn claim_context_tx(
     tx: &Transaction<'_>,
     command_id: &str,
     consumer: ContextConsumer<'_>,
@@ -1276,10 +1329,11 @@ fn inject_point_name(point: InjectPoint) -> &'static str {
     match point {
         InjectPoint::NextInput => "next_input",
         InjectPoint::TurnSafePoint => "turn_safe_point",
+        InjectPoint::ActiveTurn => "active_turn",
     }
 }
 
-fn decode_inject_args(value: &Value) -> Result<InjectArgs> {
+pub(super) fn decode_inject_args(value: &Value) -> Result<InjectArgs> {
     serde_json::from_value(value.clone())
         .map_err(|_| Error::new("source_integrity", "persisted inject args are malformed"))
 }

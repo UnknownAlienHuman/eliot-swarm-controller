@@ -22,7 +22,7 @@ use crate::{
         },
     },
 };
-use eliot_core::{Error, InjectPoint, Result, SecretPolicy};
+use eliot_core::{ContextOutcome, Error, InjectArgs, InjectPoint, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -1071,7 +1071,10 @@ impl MusePlugin {
             "permissions_verified": false,
             "schema_fingerprint": initialized_native.fingerprint.clone(),
         });
-        let effective = with_context_points(effective, &[InjectPoint::NextInput]);
+        let effective = with_context_points(
+            effective,
+            &[InjectPoint::NextInput, InjectPoint::ActiveTurn],
+        );
         // The effective settings are checked BEFORE readiness: on any
         // mismatch no `session.ready` is published and no session is kept.
         let effort_match = initialized_native.effort.is_none() || effort_verified;
@@ -1257,6 +1260,7 @@ impl MusePlugin {
         match params.verb.as_str() {
             "send" => self.send_command(params).await,
             "steer" => self.steer_command(params).await,
+            "inject" => self.inject_active_turn(params).await,
             "interrupt" => self.interrupt_command(params).await,
             "approve" | "deny" | "answer" => self.reply_request(params).await,
             _ => Err(Error::new(
@@ -1586,6 +1590,31 @@ impl MusePlugin {
                 Ok(result)
             }
         }
+    }
+
+    /// Direct `active_turn` inject: one command is one native turn/steer
+    /// effect on the captured exact turn. The applied ack carries the typed
+    /// context outcome; rejected/unknown results settle unchanged.
+    async fn inject_active_turn(&mut self, params: AgentCommandParams) -> Result<Value> {
+        let args: InjectArgs = serde_json::from_value(params.args.clone())
+            .map_err(|_| Error::new("invalid", "inject args are malformed"))?;
+        if args.point != InjectPoint::ActiveTurn {
+            return Err(Error::new(
+                "unsupported",
+                "Muse inject point is not available on the active turn",
+            ));
+        }
+        let consumer_id = params.command_id.clone();
+        let mut result = self.steer_command(params).await?;
+        if result.get("state").and_then(Value::as_str) == Some("applied") {
+            result["context_outcome"] = serde_json::to_value(ContextOutcome {
+                mechanism: "muse.turn/steer".to_owned(),
+                application_point: InjectPoint::ActiveTurn,
+                consumer_id,
+            })
+            .map_err(|_| Error::new("internal", "context outcome could not be encoded"))?;
+        }
+        Ok(result)
     }
 
     async fn interrupt_command(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -2687,6 +2716,7 @@ fn muse_manifest() -> PluginManifest {
             "approve".to_owned(),
             "deny".to_owned(),
             "answer".to_owned(),
+            "inject".to_owned(),
             "stop".to_owned(),
         ],
         child_verbs: Vec::new(),
@@ -2782,6 +2812,7 @@ mod tests {
                 "approve",
                 "deny",
                 "answer",
+                "inject",
                 "stop"
             ]
         );

@@ -2364,6 +2364,7 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         "approve",
         "deny",
         "answer",
+        "inject",
         "attach",
         "detach",
     ];

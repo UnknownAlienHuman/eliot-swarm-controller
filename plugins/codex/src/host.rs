@@ -16,7 +16,9 @@ use crate::{
     observe::ObserverSession,
     route::CodexRoute,
 };
-use eliot_core::{Error, InjectPoint, NativeStoreBinding, Result, SecretPolicy};
+use eliot_core::{
+    ContextOutcome, Error, InjectArgs, InjectPoint, NativeStoreBinding, Result, SecretPolicy,
+};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, DiscoverParams,
     InitializeParams, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObserverAttachParams, ObserverDetachParams,
@@ -939,7 +941,10 @@ impl CodexPlugin {
             "effort": readback.reasoning_effort.clone(),
             "effort_verified": effort_verified,
         });
-        let effective = with_context_points(effective, &[InjectPoint::NextInput]);
+        let effective = with_context_points(
+            effective,
+            &[InjectPoint::NextInput, InjectPoint::ActiveTurn],
+        );
         let settings_match = readback.model == requested_model
             && readback.model_provider == route.provider()
             && paths_equal(Path::new(&readback.cwd), &workspace)
@@ -1239,6 +1244,7 @@ impl CodexPlugin {
         match params.verb.as_str() {
             "send" => self.send_command(params).await,
             "steer" => self.steer(params).await,
+            "inject" => self.inject_active_turn(params).await,
             "interrupt" => self.interrupt(params).await,
             "approve" | "deny" | "answer" => self.reply_request(params).await,
             _ => Err(Error::new(
@@ -1528,6 +1534,31 @@ impl CodexPlugin {
                 Ok(result)
             }
         }
+    }
+
+    /// Direct `active_turn` inject: one command is one native turn/steer
+    /// effect on the captured exact turn. The applied ack carries the typed
+    /// context outcome; rejected/unknown results settle unchanged.
+    async fn inject_active_turn(&mut self, params: AgentCommandParams) -> Result<Value> {
+        let args: InjectArgs = serde_json::from_value(params.args.clone())
+            .map_err(|_| Error::new("invalid", "inject args are malformed"))?;
+        if args.point != InjectPoint::ActiveTurn {
+            return Err(Error::new(
+                "unsupported",
+                "Codex inject point is not available on the active turn",
+            ));
+        }
+        let consumer_id = params.command_id.clone();
+        let mut result = self.steer(params).await?;
+        if result.get("state").and_then(Value::as_str) == Some("applied") {
+            result["context_outcome"] = serde_json::to_value(ContextOutcome {
+                mechanism: "codex.turn/steer".to_owned(),
+                application_point: InjectPoint::ActiveTurn,
+                consumer_id,
+            })
+            .map_err(|_| Error::new("internal", "context outcome could not be encoded"))?;
+        }
+        Ok(result)
     }
 
     async fn interrupt(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -2507,6 +2538,7 @@ fn codex_manifest() -> PluginManifest {
             "approve".to_owned(),
             "deny".to_owned(),
             "answer".to_owned(),
+            "inject".to_owned(),
             "stop".to_owned(),
         ],
         child_verbs: Vec::new(),

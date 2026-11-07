@@ -31,11 +31,11 @@ pub use scripts::ScriptRunAdmission;
 use eliot_core::{
     self as core, Agent, AgentControl, AgentEdit, AgentState, BatchAck, Command, CommandState,
     Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage,
-    GitSnapshot, NativeEvent, NativeStoreBinding, PendingRequest, ProcessIdentity, ProcessRecord,
-    ProcessSnapshot, ProcessState, SourceBatch, SourceGap, SourceGapAck, SubmitCommand, Turn,
-    TurnState, TurnUsage, WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase,
-    WorkspacePreparation, WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupArg,
-    WorkspaceSetupOutcome, parse_agent_id,
+    GitSnapshot, InjectPoint, NativeEvent, NativeStoreBinding, PendingRequest, ProcessIdentity,
+    ProcessRecord, ProcessSnapshot, ProcessState, SourceBatch, SourceGap, SourceGapAck,
+    SubmitCommand, Turn, TurnState, TurnUsage, WorkspaceCancelOutcome, WorkspaceCreationOutcome,
+    WorkspacePhase, WorkspacePreparation, WorkspacePreparationInput, WorkspaceRemovalOutcome,
+    WorkspaceSetupArg, WorkspaceSetupOutcome, parse_agent_id,
 };
 pub use eliot_core::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};

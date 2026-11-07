@@ -289,10 +289,13 @@ raw callers cannot bypass answer syntax.
 
 For `verb:"inject"`, `args` is the canonical Core `InjectArgs` DTO
 ([definition](../../crates/eliot-core/src/context.rs)); `point` is required and is either
-`next_input` or `turn_safe_point`, with optional absolute Unix-millisecond
-`expires_at_ms`. Store freezes the target generation and, for `turn_safe_point`, the exact
-active turn at admission. A supplied `expected_turn_id` must match that turn;
-`next_input` has no turn binding and applies to the next SEND in that generation. An
+`next_input`, `turn_safe_point`, or `active_turn`, with optional absolute
+Unix-millisecond `expires_at_ms`. Store freezes the target generation and, for
+`turn_safe_point` and `active_turn`, the exact active turn at admission. A supplied
+`expected_turn_id` must match that turn; `next_input` has no turn binding and applies
+to the next SEND in that generation. An `active_turn` command dispatches directly
+as the plugin's `agent.command` inject to the native turn/steer effect on the
+captured turn, expiry being revalidated at dispatch. An
 adapter that cannot apply the requested point returns `unsupported`; it does not map
 inject to SEND. The command's acceptance/queue state means only that the context was
 admitted. `CommandSubmitResponse` retains its existing six fields; for this command its
@@ -859,7 +862,7 @@ swarm git-status A [--generation N]
 swarm edits A [--generation N] [--after PATH] [--limit N]
 swarm send A TEXT [--probe] [--wait] [--generation N]
 swarm steer A TEXT --turn ID [--generation N]
-swarm inject A TEXT --point next_input|turn_safe_point [--generation N] [--turn ID] [--expires-at-ms MS]
+swarm inject A TEXT --point next_input|turn_safe_point|active_turn [--generation N] [--turn ID] [--expires-at-ms MS]
 swarm interrupt|abort A [--generation N] [--turn ID]
 swarm stop A [--force] [--tree | --generation N]
 swarm resume A [PROMPT] [--wait]
