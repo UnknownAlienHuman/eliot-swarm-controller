@@ -59,19 +59,55 @@ pub(crate) async fn run() -> Result<()> {
     let mut shutdown_requested = false;
     let mut shutdown = false;
     let mut transport_closed = false;
+    let mut pending_request = None;
     while !shutdown_requested || deferred_count > 0 {
         enum Next {
             Request(Option<RpcRequest>),
             Deferred(Option<DeferredCompletion>),
         }
-        let next = tokio::select! {
-            request = requests.recv(), if !shutdown_requested => Next::Request(request),
-            completed = deferred_rx.recv(), if deferred_count > 0 => Next::Deferred(completed),
+        let next = if let Some(request) = pending_request.take() {
+            Next::Request(Some(request))
+        } else {
+            tokio::select! {
+                request = requests.recv(), if !shutdown_requested => Next::Request(request),
+                completed = deferred_rx.recv(), if deferred_count > 0 => Next::Deferred(completed),
+            }
         };
         match next {
             Next::Request(Some(request)) => {
                 let stopping = request.method == "shutdown";
-                match plugin.dispatch(&request, &client).await {
+                let dispatch = if request.method == "agent.snapshot" {
+                    match eliot_plugin::preemptible_snapshot(
+                        &mut requests,
+                        plugin.dispatch(&request, &client),
+                    )
+                    .await
+                    {
+                        eliot_plugin::SnapshotDispatch::Ready(result) => result,
+                        eliot_plugin::SnapshotDispatch::Preempted(next) => {
+                            let preempted = client
+                                .respond(
+                                    request.id.clone(),
+                                    Err(Error::new(
+                                        "busy",
+                                        "status snapshot was preempted by a host request",
+                                    )),
+                                    Instant::now() + TIMEOUT,
+                                )
+                                .await;
+                            if preempted.is_err() {
+                                transport_closed = true;
+                                break;
+                            }
+                            let Some(next) = next else { break };
+                            pending_request = Some(next);
+                            continue;
+                        }
+                    }
+                } else {
+                    plugin.dispatch(&request, &client).await
+                };
+                match dispatch {
                     Ok(DispatchOutcome::Immediate(result)) => {
                         if client
                             .respond(request.id, Ok(result), Instant::now() + TIMEOUT)

@@ -19,6 +19,10 @@ use eliot_core::{
 use eliot_store::{NoticeKind, NoticePending};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use tokio::{
+    sync::watch,
+    time::{Duration, MissedTickBehavior, interval},
+};
 
 pub(super) fn decode_coordination_request<T>(
     params: &Value,
@@ -256,6 +260,63 @@ impl Router {
     /// cooldown is spent unless a wake is actually claimed.
     pub(super) async fn reoffer_mail_notice(&self, recipient: &str) {
         self.offer_notice(recipient, NoticePending::Mail).await;
+    }
+}
+
+/// Normal notice cooldown re-page interval for the deferred mail wake driver.
+const MAIL_REOFFER_INTERVAL: Duration = Duration::from_secs(2);
+/// Bounded recipient page per driver tick.
+const MAIL_REOFFER_PAGE: usize = 100;
+
+/// Periodically re-offer deferred mail wakes to Idle recipients past the
+/// normal notice cooldown. Each tick pages due recipients with unread mail
+/// and re-offers through the existing atomic claim; the claim stays
+/// authoritative, so races and suppressions are harmless no-ops.
+pub(crate) async fn run_mail_reoffer(
+    router: Router,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut ticks = interval(MAIL_REOFFER_INTERVAL);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut after: Option<String> = None;
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = ticks.tick() => {}
+        }
+        let recipients = {
+            let store = router.inner.store.lock().await;
+            match store.due_mail_notice_recipients(after.as_deref(), MAIL_REOFFER_PAGE, now_ms()) {
+                Ok(recipients) => recipients,
+                Err(error) => {
+                    crate::logging::record(
+                        &eliot_core::SecretPolicy::default(),
+                        "daemon.mail_reoffer_query_failed",
+                        &[],
+                        Some(&error),
+                    );
+                    after = None;
+                    continue;
+                }
+            }
+        };
+        if recipients.is_empty() {
+            after = None;
+            continue;
+        }
+        let short = recipients.len() < MAIL_REOFFER_PAGE;
+        for recipient in &recipients {
+            router.reoffer_mail_notice(recipient).await;
+        }
+        after = if short {
+            None
+        } else {
+            recipients.last().cloned()
+        };
     }
 }
 

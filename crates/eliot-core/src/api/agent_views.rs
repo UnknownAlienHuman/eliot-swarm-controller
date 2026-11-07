@@ -372,6 +372,10 @@ impl DaemonStatusRequest {
                 && reply.unknown_commands_count != reply.unknown_commands.len()
             || reply.unsettled_commands_count != reply.unsettled_commands.len()
             || reply.workspace_custody.scope != "current_host"
+            || reply
+                .cloud_mcp
+                .as_ref()
+                .is_some_and(|status| status.validate().is_err())
             || reply.unknown_commands.iter().any(|id| text(id).is_err())
             || reply.unsettled_commands.iter().any(|command| {
                 text(&command.id).is_err()
@@ -624,6 +628,47 @@ pub enum StatusBlocker {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudMcpHealth {
+    StartingHttp,
+    StartingTunnel,
+    Running,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudMcpCustody {
+    WindowsJobExact,
+    UnixProcessGroupDegraded,
+    Unknown,
+}
+
+/// Current managed cloud MCP child-pair state. `running` proves the two child
+/// leaders are alive; it does not prove public tunnel connectivity or auth.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudMcpStatus {
+    pub public_url: String,
+    pub health: CloudMcpHealth,
+    pub custody: CloudMcpCustody,
+}
+
+impl CloudMcpStatus {
+    pub fn validate(&self) -> Result<()> {
+        if text(&self.public_url).is_err()
+            || !self.public_url.starts_with("https://")
+            || !self.public_url.ends_with("/mcp")
+        {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatusResponse {
     pub state: String,
@@ -637,6 +682,8 @@ pub struct DaemonStatusResponse {
     pub workspace_custody: WorkspaceCustodyView,
     #[serde(deserialize_with = "nullable")]
     pub workspace_recovery_error: Option<String>,
+    #[serde(deserialize_with = "nullable")]
+    pub cloud_mcp: Option<CloudMcpStatus>,
     pub unknown_commands_count: usize,
     pub unknown_commands: Vec<String>,
     pub unknown_commands_truncated: bool,
@@ -1479,7 +1526,7 @@ mod tests {
         json!({"state":"running","admission":"open","agents":0,"store_write_faulted":false,
             "owned_plugins":0,"observer_readers":0,"discovery_readers":0,
             "workspace_custody":{"scope":"current_host","capability":"unix_process_group_degraded","exact":false,"orphan_possible":true},
-            "workspace_recovery_error":null,"unknown_commands_count":1,"unknown_commands":["c1"],"unknown_commands_truncated":false,
+            "workspace_recovery_error":null,"cloud_mcp":null,"unknown_commands_count":1,"unknown_commands":["c1"],"unknown_commands_truncated":false,
             "unsettled_commands_count":1,"unsettled_commands":[{"id":"c1","agent":null,"generation":null,"verb":"launch","state":"unknown"}],
             "unsettled_commands_truncated":false,"blockers":[{"kind":"workspace_processes"},{"kind":"discovery_readers","count":1},
             {"kind":"agent_live","agent":"a1","generation":0,"state":"created"}, {"kind":"command_unsettled","command_id":"c1","state":"unknown"},

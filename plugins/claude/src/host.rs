@@ -121,12 +121,47 @@ pub(crate) async fn run() -> Result<()> {
 
     let mut plugin = ClaudePlugin::default();
     let mut completed_shutdown = false;
+    let mut pending_request = None;
     loop {
-        let Some(request) = requests.recv().await else {
+        let request = if let Some(request) = pending_request.take() {
+            Some(request)
+        } else {
+            requests.recv().await
+        };
+        let Some(request) = request else {
             break;
         };
         let is_shutdown = request.method == "shutdown";
-        let result = plugin.dispatch(&request, &client).await;
+        let result = if request.method == "agent.snapshot" {
+            match eliot_plugin::preemptible_snapshot(
+                &mut requests,
+                plugin.dispatch(&request, &client),
+            )
+            .await
+            {
+                eliot_plugin::SnapshotDispatch::Ready(result) => result,
+                eliot_plugin::SnapshotDispatch::Preempted(next) => {
+                    let preempted = client
+                        .respond(
+                            request.id.clone(),
+                            Err(Error::new(
+                                "busy",
+                                "status snapshot was preempted by a host request",
+                            )),
+                            Instant::now() + RPC_TIMEOUT,
+                        )
+                        .await;
+                    if preempted.is_err() {
+                        break;
+                    }
+                    let Some(next) = next else { break };
+                    pending_request = Some(next);
+                    continue;
+                }
+            }
+        } else {
+            plugin.dispatch(&request, &client).await
+        };
         let response = client
             .respond(request.id, result, Instant::now() + RPC_TIMEOUT)
             .await;

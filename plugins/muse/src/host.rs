@@ -137,8 +137,11 @@ pub(crate) async fn run() -> Result<()> {
     let mut plugin = MusePlugin::default();
     let mut completed_shutdown = false;
     let mut native_endpoint_retired = false;
+    let mut pending_request = None;
     loop {
-        let event = if plugin.native_endpoint_retirement_pending {
+        let event = if let Some(request) = pending_request.take() {
+            HostLoopEvent::Request(Some(request))
+        } else if plugin.native_endpoint_retirement_pending {
             if plugin.native_endpoint_exit_observed() {
                 tokio::select! {
                     request = requests.recv() => HostLoopEvent::Request(request),
@@ -179,7 +182,36 @@ pub(crate) async fn run() -> Result<()> {
             HostLoopEvent::Request(None) => break,
             HostLoopEvent::Request(Some(request)) => {
                 let is_shutdown = request.method == "shutdown";
-                let result = plugin.dispatch(&request, &client).await;
+                let result = if request.method == "agent.snapshot" {
+                    match eliot_plugin::preemptible_snapshot(
+                        &mut requests,
+                        plugin.dispatch(&request, &client),
+                    )
+                    .await
+                    {
+                        eliot_plugin::SnapshotDispatch::Ready(result) => result,
+                        eliot_plugin::SnapshotDispatch::Preempted(next) => {
+                            let preempted = client
+                                .respond(
+                                    request.id.clone(),
+                                    Err(Error::new(
+                                        "busy",
+                                        "status snapshot was preempted by a host request",
+                                    )),
+                                    Instant::now() + RPC_TIMEOUT,
+                                )
+                                .await;
+                            if preempted.is_err() {
+                                break;
+                            }
+                            let Some(next) = next else { break };
+                            pending_request = Some(next);
+                            continue;
+                        }
+                    }
+                } else {
+                    plugin.dispatch(&request, &client).await
+                };
                 let response = client
                     .respond(request.id, result, Instant::now() + RPC_TIMEOUT)
                     .await;

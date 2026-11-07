@@ -25,6 +25,7 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 use tokio_util::codec::{Framed, LinesCodec};
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 pub const MAX_RPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -106,6 +107,9 @@ async fn run_owned(
     logging::record(&policy, "daemon.capacity_reconciled", &[], None);
     let automation_config = crate::config::load_automation_config(data_dir.path())?;
     let daemon_config = crate::config::load_daemon_config(data_dir.path())?;
+    let cloud_mcp_config = crate::config::load_cloud_mcp_config(data_dir.path())?;
+    let attention_suspicion_window =
+        Duration::from_secs(daemon_config.attention_suspicion_secs as u64);
     // Install `[daemon.limits]` once, before IPC binds: every launch and
     // selector admission in this run checks these bounds.
     {
@@ -125,10 +129,38 @@ async fn run_owned(
         data_dir.publish_daemon(daemon_lock, listener.endpoint(), env!("CARGO_PKG_VERSION"))?;
     logging::record(&policy, "daemon.ready", &[("boot_id", &info.boot_id)], None);
 
+    let cloud_mcp_shutdown = CancellationToken::new();
+    let mut cloud_mcp_tasks = JoinSet::new();
+    if let Some(config) = cloud_mcp_config {
+        logging::record(&policy, "daemon.cloud_mcp_starting", &[], None);
+        let data_root = data_dir.path().to_path_buf();
+        let shutdown = cloud_mcp_shutdown.clone();
+        cloud_mcp_tasks
+            .spawn(async move { crate::cloud_mcp::run(config, &data_root, shutdown).await });
+    }
+
     let (monitor_stop, monitor_shutdown) = watch::channel(false);
     let mut background = JoinSet::new();
     let monitoring = router.monitoring();
     background.spawn(monitoring.clone().run(monitor_shutdown));
+    let (attention_stop, attention_shutdown) = watch::channel(false);
+    let mut attention_tasks = JoinSet::new();
+    let attention_router = router.clone();
+    attention_tasks.spawn(async move {
+        crate::router::run_attention(
+            attention_router,
+            attention_suspicion_window,
+            attention_shutdown,
+        )
+        .await
+    });
+    {
+        let mail_router = router.clone();
+        let mail_shutdown = attention_stop.subscribe();
+        attention_tasks.spawn(async move {
+            crate::router::run_mail_reoffer(mail_router, mail_shutdown).await
+        });
+    }
     let mut recovery = JoinSet::new();
     let recovery_router = router.clone();
     recovery.spawn(async move { recovery_router.recover_workspaces().await });
@@ -234,6 +266,17 @@ async fn run_owned(
                     }
                 }
             }
+            joined = attention_tasks.join_next(), if !attention_tasks.is_empty() => {
+                match joined {
+                    Some(Ok(Err(error))) => {
+                        logging::record(&policy, "daemon.attention_task_failed", &[], Some(&error));
+                    }
+                    Some(Err(_)) => {
+                        logging::record(&policy, "daemon.attention_task_failed", &[], None);
+                    }
+                    _ => {}
+                }
+            }
             joined = recovery.join_next(), if !recovery.is_empty() => {
                 match joined {
                     Some(Ok(Ok(()))) => {}
@@ -269,6 +312,20 @@ async fn run_owned(
                     _ => {}
                 }
             }
+            joined = cloud_mcp_tasks.join_next(), if !cloud_mcp_tasks.is_empty() => {
+                match joined {
+                    Some(Ok(Ok(()))) => {
+                        logging::record(&policy, "daemon.cloud_mcp_stopped_unexpectedly", &[], None);
+                    }
+                    Some(Ok(Err(error))) => {
+                        logging::record(&policy, "daemon.cloud_mcp_failed", &[], Some(&error));
+                    }
+                    Some(Err(_)) => {
+                        logging::record(&policy, "daemon.cloud_mcp_task_failed", &[], None);
+                    }
+                    None => {}
+                }
+            }
             joined = connections.join_next(), if !connections.is_empty() => {
                 if matches!(joined, Some(Err(_))) {
                     logging::record(&policy, "daemon.connection_task_failed", &[], None);
@@ -290,6 +347,26 @@ async fn run_owned(
 
     if outcome.is_err() {
         router.request_force().await;
+    }
+    cloud_mcp_shutdown.cancel();
+    while let Some(joined) = cloud_mcp_tasks.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                logging::record(&policy, "daemon.cloud_mcp_failed", &[], Some(&error));
+            }
+            Err(_) => logging::record(&policy, "daemon.cloud_mcp_task_failed", &[], None),
+        }
+    }
+    attention_stop.send_replace(true);
+    while let Some(joined) = attention_tasks.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                logging::record(&policy, "daemon.attention_task_failed", &[], Some(&error));
+            }
+            Err(_) => logging::record(&policy, "daemon.attention_task_failed", &[], None),
+        }
     }
     automation_stop.send_replace(true);
     while let Some(joined) = automation_tasks.join_next().await {

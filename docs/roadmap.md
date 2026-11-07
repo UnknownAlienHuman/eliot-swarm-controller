@@ -232,6 +232,22 @@ Codex or for unrelated adapters.
 - [x] **L6.5 MCP stdio for an owner-selected caller.** Add one local `swarm mcp`
       server through the existing authenticated API and its bounded query/history surface.
 
+- [ ] **L6.7 Cloud MCP caller.** Connect cloud Dot/MuseAgent as a remote MCP caller via
+      the local StreamableHTTP MCP server exposed through `cloudflared` at
+      `swarm.iuriilisenkov.cloud`. Preserve remote identity/connection/call binding
+      through the existing router/bus and authenticate the endpoint with Cloudflare
+      Access Managed OAuth/native JWT validation per the existing account documentation.
+      Distinguish this caller from a controlled local native harness/PID. Completion:
+      a cloud caller can perform an authenticated MCP call without local process custody.
+
+- [x] **L6.8 Stalled/unhealthy-agent diagnosis and notification.** Automatically detect
+      stalled/unhealthy agents from read-only native/process/turn/event facts, without
+      treating native process statistics as proof of model progress. On unhealthy or
+      no-progress, run read-only diagnosis and deliver actual mail/notify through the
+      existing router/bus to the supervisor/agent, without automatic job resend or false
+      Done. Completion: a stalled agent produces a delivered supervisor/agent diagnosis
+      notification and leaves the uncertain outcome explicit.
+
 - [ ] **L6.6 R5 system context control.** Connect typed `inject` through the existing
       command rows and router: FIFO `next_input` context is prepended inside the same
       native SEND and applies only with its exact turn association; `turn_safe_point`
@@ -284,6 +300,6 @@ of the explicitly selected release scope.
 
 ## Later
 
-Service continuity across daemon replacement, remote/multi-host operation, GUI and
-Memory OS require an actual use case. The current contracts are not instructions to
-build those products in advance.
+Service continuity across daemon replacement, GUI and Memory OS require an actual use
+case. The current contracts are not instructions to build those products in advance.
+Remote/cloud MCP access is not Later: it is the required L6.7 contour above.

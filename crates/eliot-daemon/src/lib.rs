@@ -2,6 +2,7 @@
 
 pub(crate) mod automation;
 mod bus;
+pub mod cloud_mcp;
 mod common;
 mod config;
 mod daemon;

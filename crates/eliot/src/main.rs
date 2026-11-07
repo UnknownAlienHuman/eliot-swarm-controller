@@ -93,9 +93,22 @@ enum CliCommand {
     Daemon(DaemonArgs),
     /// Read daemon state without starting a daemon.
     Status,
-    /// Serve one generic { method, params } MCP tool over stdio.
+    /// Serve one generic { method, params } MCP tool over stdio (default) or loopback StreamableHTTP.
     #[command(name = "mcp")]
-    McpStdio,
+    Mcp {
+        /// Serve StreamableHTTP on 127.0.0.1 instead of stdio.
+        #[arg(long)]
+        http: bool,
+        /// Loopback port for --http; 0 selects an ephemeral port (actual address is printed in the ready frame).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Public https tunnel URL (path /mcp) widening the --http Host/Origin checks; required with --managed-child.
+        #[arg(long, value_name = "URL")]
+        public_url: Option<String>,
+        /// Managed-child lifecycle: also exit cleanly when stdin reaches EOF.
+        #[arg(long, hide = true)]
+        managed_child: bool,
+    },
     /// Inspect provider holds or clear one with owner corrective evidence.
     Provider {
         #[command(subcommand)]
@@ -985,14 +998,34 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 }
             }
         }
-        CliCommand::McpStdio => {
+        CliCommand::Mcp {
+            http,
+            port,
+            public_url,
+            managed_child,
+        } => {
             if json_output {
                 return Err(Failure::new(
                     2,
-                    "--json is not valid with mcp stdio; stdout carries MCP protocol only",
+                    "--json is not valid with mcp; stdout carries protocol/ready output only",
                 ));
             }
-            mcp::run_stdio(data_dir)
+            if !http {
+                if port != 0 || managed_child || public_url.is_some() {
+                    return Err(Failure::new(
+                        2,
+                        "--port, --public-url and --managed-child require --http",
+                    ));
+                }
+                mcp::run_stdio(data_dir)
+                    .await
+                    .map_err(Failure::new_from_message)?;
+                return Ok(0);
+            }
+            if managed_child && public_url.is_none() {
+                return Err(Failure::new(2, "--managed-child requires --public-url"));
+            }
+            mcp::run_http(data_dir, port, managed_child, public_url)
                 .await
                 .map_err(Failure::new_from_message)?;
             Ok(0)

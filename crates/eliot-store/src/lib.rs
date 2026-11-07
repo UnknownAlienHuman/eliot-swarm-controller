@@ -174,6 +174,15 @@ pub struct Store {
     hierarchy_limits: core::api::HierarchyLimits,
 }
 
+/// Bounded evidence for tools in one exact, retained turn. Unknown includes
+/// missing turn history, a tool-family source gap, or a truncated event tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveToolCoverage {
+    Unknown,
+    Clear,
+    Active { count: usize },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StoreOpenPhase {
     ConnectionOpened,
@@ -648,6 +657,37 @@ impl Store {
         Ok(agents)
     }
 
+    /// Page only routed Agents whose current projections can need attention.
+    /// Historical and terminal rows do not consume the page limit.
+    pub fn list_attention_agents(&self, after: Option<&str>, limit: usize) -> Result<Vec<Agent>> {
+        validate_limit(limit)?;
+        let after_num = after.map(parse_agent_id).transpose()?.unwrap_or(0);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, generation, name, project, harness, profile,
+                        profile_snapshot, native_scope, native_ref, workspace, effective,
+                        pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
+                        parent, root, depth, control
+                 FROM agents
+                 WHERE id > ?1 AND observe_only = 0 AND state IN ('busy', 'waiting')
+                 ORDER BY id LIMIT ?2",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![after_num, limit as i64], agent_record_from_row)
+            .map_err(sql_error)?;
+        let mut agents = Vec::new();
+        for row in rows {
+            agents.push(agent_from_record(
+                &self.connection,
+                row.map_err(sql_error)?,
+            )?);
+        }
+        enforce_page_bytes(&mut agents)?;
+        Ok(agents)
+    }
+
     /// Return live Agent projections independently of historical-row volume.
     pub fn list_nonterminal_agents(&self, limit: usize) -> Result<Vec<Agent>> {
         validate_limit(limit)?;
@@ -709,6 +749,202 @@ impl Store {
     pub fn get_turn(&self, agent: &str, generation: i64, turn_id: &str) -> Result<Option<Turn>> {
         let agent_num = parse_agent_id(agent)?;
         load_turn(&self.connection, agent_num, generation, turn_id)
+    }
+
+    /// Return the committed command binding for an exact generation/turn.
+    /// Missing or pruned turn-start evidence stays absent.
+    pub fn turn_command_id(
+        &self,
+        agent: &str,
+        generation: i64,
+        turn_id: &str,
+    ) -> Result<Option<String>> {
+        let agent_num = parse_agent_id(agent)?;
+        self.connection
+            .query_row(
+                "SELECT json_extract(data, '$.command_id') FROM events
+                 WHERE agent = ?1 AND generation = ?2 AND kind = 'turn.started'
+                   AND json_extract(data, '$.turn_id') = ?3
+                 ORDER BY seq DESC LIMIT 1",
+                params![agent_num, generation, turn_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    /// Stable sequence for the current unhealthy source episode. The caller
+    /// first checks the current projected state; this reads only committed
+    /// source transitions and does not infer health from silence.
+    pub fn latest_unhealthy_source_event_seq(
+        &self,
+        agent: &str,
+        generation: i64,
+        source: &str,
+    ) -> Result<Option<i64>> {
+        let agent_num = parse_agent_id(agent)?;
+        self.connection
+            .query_row(
+                "SELECT seq FROM events
+                 WHERE agent = ?1 AND generation = ?2
+                   AND kind IN ('source.health', 'source.closed')
+                   AND json_extract(data, '$.source') = ?3
+                   AND (json_extract(data, '$.state') = 'closed'
+                        OR json_extract(data, '$.health') IN ('slow', 'stale', 'error'))
+                 ORDER BY seq DESC LIMIT 1",
+                params![agent_num, generation, source],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    /// Summarize exact-turn tool events only when the retained history proves
+    /// coverage. No tool names, arguments, or outputs leave Store.
+    pub fn active_tool_coverage(
+        &self,
+        agent: &str,
+        generation: i64,
+        turn_id: &str,
+    ) -> Result<ActiveToolCoverage> {
+        const MAX_TOOL_EVENTS: usize = 512;
+        const MAX_GAP_EVENTS: usize = 128;
+
+        let agent_num = parse_agent_id(agent)?;
+        let start_seq: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT seq FROM events
+                 WHERE agent = ?1 AND generation = ?2 AND kind = 'turn.started'
+                   AND json_extract(data, '$.turn_id') = ?3
+                 ORDER BY seq DESC LIMIT 1",
+                params![agent_num, generation, turn_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some(start_seq) = start_seq else {
+            return Ok(ActiveToolCoverage::Unknown);
+        };
+
+        let (tool_owners, healthy_tool_owners): (i64, i64) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(CASE
+                     WHEN s.state = 'open' AND s.health = 'ok' THEN 1 ELSE 0 END), 0)
+                 FROM source_owners o JOIN source_state s
+                   ON s.agent = o.agent AND s.generation = o.generation AND s.source = o.source
+                 WHERE o.agent = ?1 AND o.generation = ?2 AND o.family = 'tool'",
+                params![agent_num, generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sql_error)?;
+        if tool_owners == 0 || tool_owners != healthy_tool_owners {
+            return Ok(ActiveToolCoverage::Unknown);
+        }
+
+        let mut gaps = self
+            .connection
+            .prepare(
+                "SELECT data FROM events
+                 WHERE agent = ?1 AND generation = ?2 AND seq > ?3 AND kind = 'source.gap'
+                 ORDER BY seq LIMIT ?4",
+            )
+            .map_err(sql_error)?;
+        let gap_rows = gaps
+            .query_map(
+                params![
+                    agent_num,
+                    generation,
+                    start_seq,
+                    (MAX_GAP_EVENTS + 1) as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(sql_error)?;
+        let mut gap_count = 0_usize;
+        for row in gap_rows {
+            gap_count += 1;
+            if gap_count > MAX_GAP_EVENTS {
+                return Ok(ActiveToolCoverage::Unknown);
+            }
+            let data = decode_json(&row.map_err(sql_error)?)?;
+            if data
+                .get("families")
+                .and_then(Value::as_array)
+                .is_some_and(|families| {
+                    families
+                        .iter()
+                        .any(|family| family.as_str() == Some("tool"))
+                })
+            {
+                return Ok(ActiveToolCoverage::Unknown);
+            }
+        }
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT kind, data FROM events
+                 WHERE agent = ?1 AND generation = ?2 AND seq > ?3
+                   AND kind IN ('tool.started', 'tool.completed')
+                   AND json_extract(data, '$.turn_id') = ?4
+                 ORDER BY seq LIMIT ?5",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    agent_num,
+                    generation,
+                    start_seq,
+                    turn_id,
+                    (MAX_TOOL_EVENTS + 1) as i64
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(sql_error)?;
+        let mut active = HashSet::new();
+        let mut event_count = 0_usize;
+        for row in rows {
+            event_count += 1;
+            if event_count > MAX_TOOL_EVENTS {
+                return Ok(ActiveToolCoverage::Unknown);
+            }
+            let (kind, raw_data) = row.map_err(sql_error)?;
+            let data = decode_json(&raw_data)?;
+            let Some(key) = data
+                .get("item_id")
+                .or_else(|| data.get("tool_call_id"))
+                .or_else(|| data.get("tool_id"))
+                .or_else(|| data.get("call_id"))
+                .or_else(|| data.get("tool_use_id"))
+                .or_else(|| data.get("toolUseId"))
+                .or_else(|| data.get("itemId"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            else {
+                return Ok(ActiveToolCoverage::Unknown);
+            };
+            match kind.as_str() {
+                "tool.started" => {
+                    active.insert(key.to_owned());
+                }
+                "tool.completed" if active.remove(key) => {}
+                "tool.completed" => return Ok(ActiveToolCoverage::Unknown),
+                _ => return Ok(ActiveToolCoverage::Unknown),
+            }
+        }
+        if event_count == 0 {
+            return Ok(ActiveToolCoverage::Unknown);
+        }
+        Ok(if active.is_empty() {
+            ActiveToolCoverage::Clear
+        } else {
+            ActiveToolCoverage::Active {
+                count: active.len(),
+            }
+        })
     }
 
     pub fn list_turns(&self, agent: &str, generation: i64, limit: usize) -> Result<Vec<Turn>> {
