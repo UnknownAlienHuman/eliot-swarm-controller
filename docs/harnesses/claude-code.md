@@ -96,9 +96,14 @@ as usage or billing; unavailable/malformed individual counters stay null
 (other valid counters are retained), and no valid native counters means
 `data.usage` is omitted — never blocks or gaps the terminal.
 Callbacks own missing permission/question decisions; hooks never mirror the same
-lifecycle. Final text is
-persisted before exact terminal result. Distinguish content blocks/tool ids within a
-message instead of deduplicating all blocks by message id.
+lifecycle. Assistant messages remain individually bounded. Aggregate terminal text
+and retained `last_turn` use the shared `MAX_EVENT_BYTES` budget: overflow drops
+the aggregate and latches `final_text_unavailable="event_budget"` without changing
+the native terminal status or interrupting bounded message events. A partial prefix
+is never reported as the full reply; the latch resets only at exact turn activation.
+Terminal event data and snapshots retain the same bounded text or unavailable fact.
+Distinguish content blocks/tool ids within a message instead of deduplicating all
+blocks by message id.
 
 Transcript JSONL is later observe/recovery data with file identity/offset where valid,
 not a parallel live producer. No proven replay cursor means gap + exact current

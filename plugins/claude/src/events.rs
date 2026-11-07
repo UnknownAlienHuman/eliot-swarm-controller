@@ -8,9 +8,9 @@ use eliot_plugin::{
     native_transport::encode_frame,
     protocol::{HookEvent, HookResponse},
     session::{
-        EVENT_DEADLINE, StreamSource, approval_reply_args, attach_final_text, native_no_write,
-        next_input_outcomes, rejected_control, request_event_id, unknown_control,
-        with_claimed_context,
+        EVENT_DEADLINE, StreamSource, approval_reply_args, attach_final_text,
+        attach_final_text_unavailable, native_no_write, next_input_outcomes, rejected_control,
+        request_event_id, unknown_control, with_claimed_context,
     },
 };
 use serde::Serialize;
@@ -65,6 +65,8 @@ pub(crate) struct TurnFacts {
     pub turn_id: String,
     pub status: Option<String>,
     pub final_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_text_unavailable: Option<String>,
     pub terminal: bool,
 }
 
@@ -328,6 +330,7 @@ struct EventProcessor {
     /// must not erase it if the immediate record was blocked).
     pending_fault_gap: Option<String>,
     final_text: Option<String>,
+    final_text_unavailable: bool,
     closed: bool,
     native: Option<ClaudeClient>,
     status_tx: watch::Sender<EventStatus>,
@@ -814,6 +817,7 @@ impl EventProcessor {
             gap_reported: false,
             pending_fault_gap: None,
             final_text: None,
+            final_text_unavailable: false,
             closed: false,
             native: None,
             status_tx,
@@ -1275,6 +1279,7 @@ impl EventProcessor {
                 self.status.active_command_id = Some(command_id.clone());
                 self.status.active_turn_id = Some(turn_id.clone());
                 self.final_text = None;
+                self.final_text_unavailable = false;
                 self.publish_now();
                 let session_id = self.status.session_id.as_deref().unwrap_or_default();
                 let native_id = format!("claude:{session_id}:{turn_id}:turn.started");
@@ -1361,6 +1366,8 @@ impl EventProcessor {
             data["model"] = Value::String(model);
         }
         if serde_json::to_vec(&data).map_or(usize::MAX, |bytes| bytes.len()) > MAX_EVENT_BYTES {
+            self.final_text = None;
+            self.final_text_unavailable = true;
             return self
                 .record_gap("Claude completed message exceeded the persisted-event bound")
                 .await;
@@ -1368,12 +1375,37 @@ impl EventProcessor {
         self.message_seq = self.message_seq.saturating_add(1);
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = format!("claude:{session_id}:{turn_id}:message:{}", self.message_seq);
-        match &mut self.final_text {
-            Some(accumulated) => accumulated.push_str(&text),
-            None => self.final_text = Some(text),
-        }
+        self.accumulate_final_text(&text);
         self.commit_event("message.completed", native_id, data)
             .await
+    }
+
+    fn accumulate_final_text(&mut self, text: &str) {
+        if self.final_text_unavailable {
+            return;
+        }
+        let bytes = self
+            .final_text
+            .as_ref()
+            .map_or(0, String::len)
+            .saturating_add(text.len());
+        if bytes > MAX_EVENT_BYTES {
+            self.final_text = None;
+            self.final_text_unavailable = true;
+            return;
+        }
+        let accumulated = self.final_text.get_or_insert_default();
+        accumulated.push_str(text);
+        let mut data = json!({
+            "command_id": self.status.active_command_id.as_deref().unwrap_or_default(),
+            "turn_id": self.status.active_turn_id.as_deref().unwrap_or_default(),
+        });
+        let secrets = SecretPolicy::new(self.secrets.iter().cloned());
+        attach_final_text(&mut data, accumulated, true, &secrets);
+        if data.get("final_text").is_none() {
+            self.final_text = None;
+            self.final_text_unavailable = true;
+        }
     }
 
     /// Keep a bounded, generation-local association from Claude invocation
@@ -2597,10 +2629,16 @@ impl EventProcessor {
         if let Some(usage) = result_usage(record) {
             data["usage"] = serde_json::to_value(&usage).unwrap_or(Value::Null);
         }
-        if let Some(text) = self.final_text.as_ref() {
-            // Stream-json carries no failed flag: keep the PR1 omit-on-overflow
-            // behavior for every terminal by reporting the bound case as failed.
-            attach_final_text(&mut data, &secrets.redact_text(text), true, &secrets);
+        let final_text = self.final_text.take();
+        if self.final_text_unavailable {
+            attach_final_text_unavailable(&mut data, &secrets);
+        } else if let Some(text) = final_text {
+            // Use omit-on-overflow accounting for every native terminal. The
+            // helper's flag does not change the observed terminal status.
+            attach_final_text(&mut data, &secrets.redact_text(&text), true, &secrets);
+            if data.get("final_text").is_none() {
+                self.final_text_unavailable = true;
+            }
         }
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = format!("claude:{session_id}:{turn_id}:turn.completed");
@@ -2613,7 +2651,14 @@ impl EventProcessor {
             command_id,
             turn_id,
             status: Some(terminal_reason),
-            final_text: self.final_text.take(),
+            final_text: data
+                .get("final_text")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            final_text_unavailable: data
+                .get("final_text_unavailable")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             terminal: true,
         });
         self.status.active_turn_id = None;
@@ -2759,11 +2804,22 @@ impl EventProcessor {
             self.status.active_command_id.clone(),
             self.status.active_turn_id.clone(),
         ) {
+            let mut text_status = json!({});
+            if self.final_text_unavailable {
+                attach_final_text_unavailable(
+                    &mut text_status,
+                    &SecretPolicy::new(self.secrets.iter().cloned()),
+                );
+            }
             self.status.last_turn = Some(TurnFacts {
                 command_id,
                 turn_id,
                 status: None,
                 final_text: None,
+                final_text_unavailable: text_status
+                    .get("final_text_unavailable")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 terminal: false,
             });
         }
