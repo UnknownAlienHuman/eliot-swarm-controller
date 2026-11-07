@@ -1062,15 +1062,10 @@ impl ClaudePlugin {
             ) {
                 return ready(Err(error));
             }
-            if session.phase != SessionPhase::Ready {
-                return ready(Err(Error::new(
-                    "unknown",
-                    "Claude session or event source outcome is unresolved",
-                )));
-            }
             // Replays first: a settled steer answers from retention even
-            // while another steer reply is deferred, and a refused shape
-            // never overwrites a retained outcome.
+            // while another steer reply is deferred or the session outcome is
+            // unresolved, and a refused shape never overwrites a retained
+            // outcome.
             if let Some(previous) = session.steer_outcomes.get(&params.command_id) {
                 if previous.turn_id != turn_id || previous.text != text {
                     return ready(Err(Error::new(
@@ -1079,6 +1074,14 @@ impl ClaudePlugin {
                     )));
                 }
                 return ready(Ok(previous.result.clone()));
+            }
+            // Proven no-effect: a fresh steer that never queues has no native
+            // effect even when a prior session outcome is unresolved, so the
+            // authoritative refusal is `rejected`, never Unknown.
+            if session.phase != SessionPhase::Ready {
+                return ready(Ok(rejected_control(
+                    "Claude session or event source outcome is unresolved",
+                )));
             }
             if text.trim().is_empty() {
                 return ready(Err(Error::new("invalid", "Claude steer text is empty")));
@@ -1116,16 +1119,17 @@ impl ClaudePlugin {
                 )));
             }
         };
+        // Proven no-effect like the phase refusal above: the steer never
+        // queues, so a prior event-source gap refuses it as `rejected` with
+        // the exact gap reason instead of Unknown.
         if let Some(reason) = session.events.status().failure {
-            return ready(Err(Error::new("unknown", reason)));
+            return ready(Ok(rejected_control(&reason)));
         }
         // The event task answers behind any queued terminal frame, so a
         // steer racing completion refuses instead of queueing behind it.
         if !session.events.check_turn(turn_id).await {
-            return ready(Err(Error::new(
-                "stale_turn",
-                "Claude turn is not the active turn",
-            )));
+            // Proven no-effect: never queued behind the finished turn.
+            return ready(Ok(rejected_control("Claude turn is not the active turn")));
         }
         let outcome = match session
             .events
@@ -1137,6 +1141,19 @@ impl ClaudePlugin {
             .await
         {
             Ok(outcome) => outcome,
+            // Actor busy/stale/`native_not_dispatched` prove pre-insertion
+            // refusal (never queued; only register_steer emits these codes),
+            // so they refuse as `rejected` with the exact reason.
+            // Request-shape `invalid` and channel/write uncertainty keep their
+            // error codes.
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "busy" | "stale_turn" | "native_not_dispatched"
+                ) =>
+            {
+                return ready(Ok(rejected_control(&error.message)));
+            }
             Err(error) => return ready(Err(error)),
         };
         DispatchOutcome::Deferred(DeferredSteer {

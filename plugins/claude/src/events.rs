@@ -985,21 +985,24 @@ impl EventProcessor {
                 "Claude steer does not match the exact active turn",
             ));
         }
+        // All three refusals below fire before insertion, so no native write
+        // is possible: they carry the explicit `native_not_dispatched` proof
+        // (reasons preserved) instead of generic unknown.
         if self.planned_stop || self.closed {
             return Err(Error::new(
-                "unknown",
+                "native_not_dispatched",
                 "Claude session is stopping; steer will not be applied",
             ));
         }
         if self.writes_blocked {
             return Err(Error::new(
-                "unknown",
+                "native_not_dispatched",
                 "Claude event source acknowledgement is unresolved",
             ));
         }
         if self.status.failure.is_some() {
             return Err(Error::new(
-                "unknown",
+                "native_not_dispatched",
                 "Claude event source has an unresolved gap",
             ));
         }
@@ -1012,16 +1015,24 @@ impl EventProcessor {
         Ok(())
     }
 
-    /// Withdraw the exact queued steer whose waiter is gone (it timed out and
-    /// already settled unknown), so a later hook cannot apply text the caller
-    /// no longer owns. A settled or foreign command is untouched.
+    /// Withdraw the exact queued steer at the host's deadline, so a later hook
+    /// cannot apply text the caller no longer owns. The serial actor settles
+    /// every taken steer before this cancel runs, so a still-queued steer
+    /// provably never rode a hook response: its removal reports an explicit
+    /// no-effect rejection, never a dropped sender (which would misclassify as
+    /// Unknown). A settled or foreign command is untouched.
     fn cancel_steer(&mut self, command_id: &str) {
         let pending_matches = self
             .pending_steer
             .as_ref()
             .is_some_and(|pending| pending.command_id == command_id);
-        if pending_matches {
-            self.pending_steer = None;
+        if pending_matches && let Some(steer) = self.pending_steer.take() {
+            Self::settle_steer(
+                steer,
+                SteerOutcome::Rejected(
+                    "Claude steer was withdrawn before PreToolUse applied it".to_owned(),
+                ),
+            );
         }
     }
 
