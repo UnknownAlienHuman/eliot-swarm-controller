@@ -14,8 +14,8 @@ See AGENTS.md for the work loop.
 
 ## Repairs to implemented paths
 
-**Next:** the remaining current-path repairs below. Checked layers record
-delivered increments, not full crash/load qualification.
+**Next:** L7 qualification. Checked layers record delivered increments, not full
+crash/load qualification.
 
 - [x] **Restart capacity recovery.** Reconcile exact prior-generation custody and release
       or transfer the reservation under the [capacity contract](spec/configuration.md#accounts-and-configured-capacity).
