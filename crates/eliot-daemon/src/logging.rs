@@ -60,7 +60,37 @@ pub(crate) fn record(
     ids: &[(&str, &str)],
     error: Option<&Error>,
 ) {
-    let Some(bytes) = encode_record(policy, code, ids, error) else {
+    write_record(policy, code, ids, None, error)
+}
+
+/// Typed nonnegative counts for one concrete diagnostic command. Counts are
+/// encoded as JSON numbers under "counts", distinct from string ids, and are
+/// never derived from arbitrary caller text.
+pub(crate) struct Counts {
+    pub(crate) events: u64,
+    pub(crate) pruned_through: u64,
+    pub(crate) commands: u64,
+    pub(crate) writes: u64,
+    pub(crate) mail: u64,
+}
+
+pub(crate) fn record_counts(
+    policy: &SecretPolicy,
+    code: &str,
+    counts: Counts,
+    error: Option<&Error>,
+) {
+    write_record(policy, code, &[], Some(counts), error)
+}
+
+fn write_record(
+    policy: &SecretPolicy,
+    code: &str,
+    ids: &[(&str, &str)],
+    counts: Option<Counts>,
+    error: Option<&Error>,
+) {
+    let Some(bytes) = encode_record(policy, code, ids, counts, error) else {
         return;
     };
     let mut current = LOG.lock_recover();
@@ -87,6 +117,7 @@ fn encode_record(
     policy: &SecretPolicy,
     code: &str,
     ids: &[(&str, &str)],
+    counts: Option<Counts>,
     error: Option<&Error>,
 ) -> Option<Vec<u8>> {
     let ts = SystemTime::now()
@@ -120,6 +151,15 @@ fn encode_record(
     }
     if !context.is_empty() {
         value["ids"] = Value::Object(context);
+    }
+    if let Some(counts) = counts {
+        value["counts"] = json!({
+            "events": counts.events,
+            "pruned_through": counts.pruned_through,
+            "commands": counts.commands,
+            "writes": counts.writes,
+            "mail": counts.mail,
+        });
     }
     if let Some(error) = error {
         value["error_code"] = json!(bounded_text(policy, &error.code, 64));
@@ -260,8 +300,14 @@ mod tests {
                 },
             );
         }
-        let bytes =
-            encode_record(&policy, "plugin.failed", &[("agent", "a1")], Some(&error)).unwrap();
+        let bytes = encode_record(
+            &policy,
+            "plugin.failed",
+            &[("agent", "a1")],
+            None,
+            Some(&error),
+        )
+        .unwrap();
         for _ in 0..300 {
             log.write(&bytes).unwrap();
         }
@@ -302,7 +348,7 @@ mod tests {
                 },
             })
             .collect();
-        let bytes = encode_record(&policy, "operation.unknown", &[], Some(&error)).unwrap();
+        let bytes = encode_record(&policy, "operation.unknown", &[], None, Some(&error)).unwrap();
         assert!(bytes.len() <= RECORD_BYTES);
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         let diagnostics = &value["diagnostics"];
@@ -350,7 +396,8 @@ mod tests {
                 .unwrap();
         }
         let mut log = LogFile::open(&data, &lock).unwrap();
-        let record = encode_record(&SecretPolicy::default(), "daemon.starting", &[], None).unwrap();
+        let record =
+            encode_record(&SecretPolicy::default(), "daemon.starting", &[], None, None).unwrap();
         log.write(&record).unwrap();
         drop(log);
         for name in ["daemon.log", "daemon.log.1"] {
