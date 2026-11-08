@@ -14,8 +14,8 @@ See AGENTS.md for the work loop.
 
 ## Repairs to implemented paths
 
-**Next:** the remaining current-path repairs below. Checked layers record
-delivered increments, not full crash/load qualification.
+**Next:** L7 qualification. Checked layers record delivered increments, not full
+crash/load qualification.
 
 - [x] **Restart capacity recovery.** Reconcile exact prior-generation custody and release
       or transfer the reservation under the [capacity contract](spec/configuration.md#accounts-and-configured-capacity).
@@ -46,7 +46,7 @@ delivered increments, not full crash/load qualification.
       For `list_processes`, pair `(owner,host_boot_id,pid,start_time)` with separate first-page
       and cursor-range queries; the optional-cursor OR prevents a direct range seek.
       Check identical pages and near/tail cursor plans on the bundled SQLite version.
-- [ ] **Linux process sampling.** Share one bounded `/proc` enumeration per monitoring
+- [x] **Linux process sampling.** Share one bounded `/proc` enumeration per monitoring
       sweep across the current targets, instead of repeating it for each generation.
       Follow [sampling work](spec/monitoring.md#sampling-work): preserve identity checks,
       per-owner limits, incomplete samples and honest Unix custody. Measure enumeration
