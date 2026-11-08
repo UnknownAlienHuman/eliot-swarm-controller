@@ -899,10 +899,23 @@ is durably resolved to `unknown` on readback, without another check. Claim also
 preflights a bounded unknown recovery record. If the full error record exceeds
 the frame bound, abandonment retains and returns that unknown result atomically
 with the marker burn, rather than leaving a live running marker. Cancellation
-uses the existing owned-process cleanup before abandonment. A guard on the claimed
-round schedules abandonment if its future is dropped while awaiting the check or
-final Store lock; while that finalizer waits, duplicates remain `busy`. If runtime
-shutdown prevents finalization, a new holder resolves the reservation to `unknown`.
+uses the existing owned-process cleanup before abandonment. The claimed-round guard
+owns the same check future passed to the existing process supervisor. Caller/RPC
+drop signals per-round cancellation and transfers that future to the finalizer,
+which awaits process/custody settlement before burning the marker; it never starts
+another invocation. Global cancellation is forwarded to the same per-round channel.
+While the check or its cleanup remains in flight, the running marker excludes every
+other round, including another due cadence slot. If cleanup reports unproven
+quiescence, both normal completion and the drop finalizer retain the original
+request error in `writes.result` without burning the running marker. Exact retries
+return that retained error; other rounds stay excluded even across later Goal
+changes. Request outcome and process-family closure are independent. The current
+process API provides no later closure receipt after an unproven outcome, so the
+live holder conservatively keeps exclusion; returning from the supervisor is not
+closure proof. A proven closure may burn the marker without replacing the retained
+error. Drop while awaiting the final Store lock also carries the observed custody
+fact and cannot turn an unproven outcome into a release. If runtime shutdown prevents finalization,
+a new holder resolves the reservation to `unknown`; this is not cleanup proof.
 A persistence failure faults the Store and leaves the reservation unresolved; it
 never authorizes rerun. Neither a failed check nor a missing
 terminal fact authorizes replay: a refused or unknown round admits no send.

@@ -280,13 +280,11 @@ fn unknown_goal_round_error() -> Error {
     Error::new("unknown", "goal round ended without a retained result")
 }
 
-fn finish_goal_round_error_tx(
+fn retain_goal_round_error_tx(
     tx: &Transaction<'_>,
     record: &mut GoalRoundRecord,
     error: &Error,
-    now: i64,
 ) -> Result<Error> {
-    abandon_goal_marker_tx(tx, record, now)?;
     record.outcome = StoredGoalRoundOutcome::Failed(error.clone());
     if let Err(failure) = update_goal_round_tx(tx, record) {
         if failure.code != "frame_too_large" {
@@ -340,7 +338,8 @@ fn replay_goal_round_tx(
             "goal round already in flight",
         ))));
     }
-    let error = finish_goal_round_error_tx(tx, &mut record, &unknown_goal_round_error(), now)?;
+    abandon_goal_marker_tx(tx, &record, now)?;
+    let error = retain_goal_round_error_tx(tx, &mut record, &unknown_goal_round_error())?;
     Ok(Some(Err(error)))
 }
 
@@ -653,6 +652,29 @@ impl Store {
         error: &Error,
         now: i64,
     ) -> Result<Error> {
+        self.goal_finish_round_error(principal, request, error, now, true)
+    }
+
+    /// Retain the request error without releasing process single-flight.
+    /// A failed request and an unproven process-family closure are independent.
+    pub fn goal_hold_round_error(
+        &mut self,
+        principal: &str,
+        request: &GoalRoundRequest,
+        error: &Error,
+        now: i64,
+    ) -> Result<Error> {
+        self.goal_finish_round_error(principal, request, error, now, false)
+    }
+
+    fn goal_finish_round_error(
+        &mut self,
+        principal: &str,
+        request: &GoalRoundRequest,
+        error: &Error,
+        now: i64,
+        release_marker: bool,
+    ) -> Result<Error> {
         self.ensure_writer_healthy()?;
         let result = (|| {
             let tx = self
@@ -667,10 +689,15 @@ impl Store {
                 &goal_round_digest(request)?,
             )?
             .ok_or_else(|| Error::new("unknown", "goal round reservation is no longer retained"))?;
+            if release_marker && record.holder == self.goal_holder {
+                // A later proven closure may release the marker without
+                // replacing an already retained original request error.
+                abandon_goal_marker_tx(&tx, &record, now)?;
+            }
             let retained = if matches!(record.outcome, StoredGoalRoundOutcome::Running)
                 && record.holder == self.goal_holder
             {
-                finish_goal_round_error_tx(&tx, &mut record, error, now)?
+                retain_goal_round_error_tx(&tx, &mut record, error)?
             } else if let StoredGoalRoundOutcome::Failed(retained) = record.outcome {
                 retained
             } else {

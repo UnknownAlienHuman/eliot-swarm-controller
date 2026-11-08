@@ -43,9 +43,9 @@ pub(crate) type GoalCheckRunner = fn(
     watch::Receiver<bool>,
 ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>>;
 
-/// Covers cancellation/drop while awaiting the check or the final Store lock.
-/// The check future drops before this guard; process cleanup remains owned by
-/// run_owned_process. This finalizer only burns/settles the durable reservation.
+/// Own the check future as well as its reservation. Dropping the RPC requests
+/// cancellation, but keeps the same future alive until its process supervisor
+/// settles custody; only then may the finalizer release single-flight.
 struct ClaimedGoalRound {
     router: Router,
     runtime: tokio::runtime::Handle,
@@ -53,6 +53,9 @@ struct ClaimedGoalRound {
     request: GoalRoundRequest,
     error: Error,
     armed: bool,
+    cancellation: watch::Sender<bool>,
+    check: Option<Pin<Box<dyn Future<Output = ProcessOutcome> + Send>>>,
+    quiescent: bool,
 }
 
 impl ClaimedGoalRound {
@@ -73,13 +76,35 @@ impl Drop for ClaimedGoalRound {
         let router = self.router.clone();
         let principal = self.principal.clone();
         let request = self.request.clone();
-        let error = self.error.clone();
+        let mut error = self.error.clone();
+        let mut quiescent = self.quiescent;
+        self.cancellation.send_replace(true);
+        let check = self.check.take();
         self.runtime.spawn(async move {
+            if let Some(check) = check {
+                // Await this exact invocation, never reconstruct or replay it.
+                // run_owned_process retains and drains its existing supervisor.
+                let outcome = check.await;
+                quiescent = goal_check_quiescent(&outcome);
+                if !quiescent {
+                    let policy = router.secret_policy_snapshot();
+                    error = match goal_check_result(outcome, &policy) {
+                        Err(error) => error,
+                        Ok(_) => Error::new("unknown", "goal check cleanup is unproven"),
+                    };
+                    crate::logging::record(
+                        &policy,
+                        "daemon.goal_check_cleanup_unproven",
+                        &[("agent", &request.agent)],
+                        None,
+                    );
+                }
+            }
             // A previously retained terminal reply/error is never overwritten.
             // A persistence failure faults the Store; restart resolves any
             // remaining reservation under the old holder to unknown.
             let _ = router
-                .abandon_goal_round(&principal, &request, &error)
+                .settle_goal_round_error(&principal, &request, &error, quiescent)
                 .await;
         });
     }
@@ -283,7 +308,7 @@ impl Router {
         params: &Value,
         principal: &Principal,
         run_check: GoalCheckRunner,
-        cancellation: watch::Receiver<bool>,
+        mut cancellation: watch::Receiver<bool>,
     ) -> Result<Value> {
         let request: GoalRoundRequest = decode_goal_request(
             params,
@@ -342,6 +367,7 @@ impl Router {
                     .map_err(|_| Error::new("internal", "goal.round result could not be encoded"));
             }
         };
+        let (check_cancellation, check_cancelled) = watch::channel(*cancellation.borrow());
         let mut claimed = ClaimedGoalRound {
             router: self.clone(),
             runtime: tokio::runtime::Handle::current(),
@@ -349,6 +375,9 @@ impl Router {
             request: request.clone(),
             error: Error::new("unknown", "goal round task ended without a retained result"),
             armed: true,
+            cancellation: check_cancellation,
+            check: None,
+            quiescent: true,
         };
         let turns_used = probe
             .turn_count
@@ -382,12 +411,39 @@ impl Router {
             command.current_dir(cwd);
         }
         let timeout = Duration::from_millis(definition.check_timeout_ms.max(0) as u64);
-        let outcome = run_check(command, stdin, timeout, Arc::clone(&policy), cancellation).await;
+        claimed.quiescent = false;
+        claimed.check = Some(run_check(
+            command,
+            stdin,
+            timeout,
+            Arc::clone(&policy),
+            check_cancelled,
+        ));
+        let outcome = {
+            let check = claimed
+                .check
+                .as_mut()
+                .expect("claimed check was just installed");
+            tokio::select! {
+                biased;
+                _ = async { let _ = cancellation.wait_for(|cancelled| *cancelled).await; } => {
+                    claimed.cancellation.send_replace(true);
+                    check.await
+                }
+                outcome = check.as_mut() => outcome,
+            }
+        };
+        // A completed future is never polled again. Carry its independent
+        // custody fact through error retention and cancellation of that await.
+        claimed.quiescent = goal_check_quiescent(&outcome);
+        claimed.check = None;
         let check = match goal_check_result(outcome, &policy) {
             Ok(check) => check,
             Err(error) => {
                 claimed.error = error.clone();
-                let retained = self.abandon_goal_round(&principal, &request, &error).await;
+                let retained = self
+                    .settle_goal_round_error(&principal, &request, &error, claimed.quiescent)
+                    .await;
                 return claimed.complete(Err(retained));
             }
         };
@@ -454,21 +510,22 @@ impl Router {
         self.commit_goal_round(principal, request, commit).await
     }
 
-    /// Burn a claimed key and retain the sanitized error. If persistence
-    /// cannot prove that commit, return unknown and log the failure.
-    async fn abandon_goal_round(
+    /// Retain the error; only proven custody closure may release the marker.
+    /// If persistence cannot prove that commit, return unknown and log it.
+    async fn settle_goal_round_error(
         &self,
         principal: &str,
         request: &GoalRoundRequest,
         error: &Error,
+        quiescent: bool,
     ) -> Error {
-        match self
-            .inner
-            .store
-            .lock()
-            .await
-            .goal_abandon_round(principal, request, error, now_ms())
-        {
+        let mut store = self.inner.store.lock().await;
+        let retained = if quiescent {
+            store.goal_abandon_round(principal, request, error, now_ms())
+        } else {
+            store.goal_hold_round_error(principal, request, error, now_ms())
+        };
+        match retained {
             Ok(retained) => retained,
             Err(error) => {
                 let policy = self.secret_policy_snapshot();
@@ -857,6 +914,18 @@ async fn drive_goal_for_event(
             );
         }
     }
+}
+
+/// Completed/Failed captures are returned only after cleanup (or before spawn).
+/// Unknown explicitly carries whether family quiescence was established.
+fn goal_check_quiescent(outcome: &ProcessOutcome) -> bool {
+    !matches!(
+        outcome,
+        ProcessOutcome::Unknown {
+            quiescent: false,
+            ..
+        }
+    )
 }
 
 /// Interpret one owned check completion. Only a definite direct exit with
