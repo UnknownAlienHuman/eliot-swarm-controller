@@ -208,8 +208,9 @@ Read [coordination](spec/coordination.md). Use two Codex Agents initially.
 other's file area without a manager relay. Codex/Luna and OpenCode/OpenRouter exchanged queued
 findings and exact acknowledgements under their own Agent principals, advancing the project CAS
 value from version 0 to 2. A mail-notice turn consumed one next_input context; a reply notice
-woke the other Agent. No Owner body relay/manual wake.
-Raw who output, CAS conflicts, multi-item FIFO and unseen-arrival races remain unqualified.
+woke the other Agent. No Owner body relay/manual wake. A bounded two-item FIFO ordering and
+one CAS conflict case are now qualified; raw who output and unseen-arrival ack races
+remain unqualified.
 
 ## L6 — Additional harnesses and only demonstrated missing features
 
