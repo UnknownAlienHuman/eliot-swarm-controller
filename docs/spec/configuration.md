@@ -41,9 +41,11 @@ change command settlement, source acknowledgement or process cleanup.
 ## Native profiles (all five adapters)
 
 The current product has five native adapters: Codex, Claude, OpenCode, Muse
-and Antigravity. Each profile selects one `harness` explicitly with an exact
-`cmd` and `model`; there is no default profile, no builtin fake profile, and
-no automatic harness/model/route/account fallback. The harness pages
+and Antigravity. Each profile selects one `harness` explicitly and an exact
+`model`. Only Codex may omit `cmd`, in which case it launches `codex` by name;
+the other four adapters require an explicit native executable in `cmd`.
+There is no default profile, no builtin fake profile, and no automatic
+harness/model/route/account fallback. The harness pages
 ([Codex](../harnesses/codex.md), [Claude](../harnesses/claude-code.md),
 [OpenCode](../harnesses/opencode.md), [Muse](../harnesses/muse.md),
 [Antigravity](../harnesses/antigravity.md)) own their native mappings.
