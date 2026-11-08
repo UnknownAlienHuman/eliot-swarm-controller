@@ -220,6 +220,11 @@ enum StoredGoalRoundOutcome {
     Failed(Error),
 }
 
+/// Retention uses the same serialized variant as the live reservation DTO.
+pub(super) fn goal_round_running_outcome_json() -> Result<String> {
+    encode_json(&StoredGoalRoundOutcome::Running)
+}
+
 fn goal_round_digest(request: &GoalRoundRequest) -> Result<Vec<u8>> {
     canonical::digest(&json!({
         "agent": request.agent, "mode": request.mode.as_str(),
