@@ -170,36 +170,45 @@ async fn run_owned(
         capacity_recheck.spawn(restart_capacity::recheck(capacity, retained));
     }
     let (automation_stop, automation_shutdown) = watch::channel(false);
-    let mut automation_tasks = JoinSet::new();
+    let mut automation_tasks: JoinSet<(&'static str, Result<()>)> = JoinSet::new();
+    let mut automation_task_names: Vec<(tokio::task::Id, &'static str)> = Vec::new();
     let rule_router = router.clone();
     let rule_data_root = data_dir.path().to_path_buf();
     let rule_policy = Arc::clone(&policy);
-    automation_tasks.spawn(async move {
-        automation::run_global_rules(
-            rule_router,
-            automation::RuleWorkerStart {
-                global_rules,
-                project_rules: project_rule_namespaces,
-                max_event_backlog: automation_config.max_event_backlog,
-                data_root: rule_data_root,
-                policy: rule_policy,
-                initial_notices: initial_deferred_notice,
-            },
-            automation_shutdown,
-        )
-        .await
-    });
+    let rule_task_id = automation_tasks
+        .spawn(async move {
+            let outcome = automation::run_global_rules(
+                rule_router,
+                automation::RuleWorkerStart {
+                    global_rules,
+                    project_rules: project_rule_namespaces,
+                    max_event_backlog: automation_config.max_event_backlog,
+                    data_root: rule_data_root,
+                    policy: rule_policy,
+                    initial_notices: initial_deferred_notice,
+                },
+                automation_shutdown,
+            )
+            .await;
+            ("rule_worker", outcome)
+        })
+        .id();
+    automation_task_names.push((rule_task_id, "rule_worker"));
     {
         let goal_router = router.clone();
         let goal_shutdown = automation_stop.subscribe();
-        automation_tasks.spawn(async move {
-            crate::router::run_goal_driver(
-                goal_router,
-                crate::router::real_goal_check,
-                goal_shutdown,
-            )
-            .await
-        });
+        let goal_task_id = automation_tasks
+            .spawn(async move {
+                let outcome = crate::router::run_goal_driver(
+                    goal_router,
+                    crate::router::real_goal_check,
+                    goal_shutdown,
+                )
+                .await;
+                ("goal_driver", outcome)
+            })
+            .id();
+        automation_task_names.push((goal_task_id, "goal_driver"));
     }
     let (maintenance_stop, maintenance_shutdown) = watch::channel(false);
     let mut maintenance_tasks = JoinSet::new();
@@ -290,15 +299,56 @@ async fn run_owned(
                     }
                 }
             }
-            joined = automation_tasks.join_next(), if !automation_tasks.is_empty() => {
+            joined = automation_tasks.join_next_with_id(), if !automation_tasks.is_empty() => {
                 match joined {
-                    Some(Ok(Err(error))) => {
-                        logging::record(&policy, "daemon.rule_worker_failed", &[], Some(&error));
+                    Some(Ok((task_id, (name, Err(error))))) => {
+                        router.note_automation_task_stopped(name, Some(error.code.clone()));
+                        logging::record(
+                            &policy,
+                            "daemon.automation_worker_failed",
+                            &[("task", name)],
+                            Some(&error),
+                        );
+                        let _ = task_id;
                     }
-                    Some(Err(_)) => {
-                        logging::record(&policy, "daemon.rule_worker_task_failed", &[], None);
+                    Some(Ok((task_id, (name, Ok(()))))) => {
+                        let shutdown = *automation_stop.borrow();
+                        if shutdown {
+                            router.note_automation_task_stopped(name, None);
+                        } else {
+                            router.note_automation_task_stopped(name, Some("worker_exited".to_owned()));
+                            logging::record(
+                                &policy,
+                                "daemon.automation_worker_exited",
+                                &[("task", name)],
+                                None,
+                            );
+                        }
+                        let _ = task_id;
                     }
-                    _ => {}
+                    Some(Err(join_error)) => {
+                        let failed_id = join_error.id();
+                        let code = if join_error.is_panic() {
+                            "worker_panicked"
+                        } else if join_error.is_cancelled() {
+                            "worker_cancelled"
+                        } else {
+                            "worker_task_failed"
+                        };
+                        if let Some((_, name)) = automation_task_names
+                            .iter()
+                            .find(|(task_id, _)| *task_id == failed_id)
+                        {
+                            router.note_automation_task_stopped(name, Some(code.to_owned()));
+                        }
+                        logging::record(
+                            &policy,
+                            "daemon.automation_worker_task_failed",
+                            &[],
+                            None,
+                        );
+                    }
+                    None => {}
                 }
             }
             joined = maintenance_tasks.join_next(), if !maintenance_tasks.is_empty() => {
@@ -369,13 +419,39 @@ async fn run_owned(
         }
     }
     automation_stop.send_replace(true);
-    while let Some(joined) = automation_tasks.join_next().await {
+    while let Some(joined) = automation_tasks.join_next_with_id().await {
         match joined {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                logging::record(&policy, "daemon.rule_worker_failed", &[], Some(&error));
+            Ok((task_id, (name, Ok(())))) => {
+                router.note_automation_task_stopped(name, None);
+                let _ = task_id;
             }
-            Err(_) => logging::record(&policy, "daemon.rule_worker_task_failed", &[], None),
+            Ok((task_id, (name, Err(error)))) => {
+                router.note_automation_task_stopped(name, Some(error.code.clone()));
+                logging::record(
+                    &policy,
+                    "daemon.automation_worker_failed",
+                    &[("task", name)],
+                    Some(&error),
+                );
+                let _ = task_id;
+            }
+            Err(join_error) => {
+                let failed_id = join_error.id();
+                let code = if join_error.is_panic() {
+                    "worker_panicked"
+                } else if join_error.is_cancelled() {
+                    "worker_cancelled"
+                } else {
+                    "worker_task_failed"
+                };
+                if let Some((_, name)) = automation_task_names
+                    .iter()
+                    .find(|(task_id, _)| *task_id == failed_id)
+                {
+                    router.note_automation_task_stopped(name, Some(code.to_owned()));
+                }
+                logging::record(&policy, "daemon.automation_worker_task_failed", &[], None);
+            }
         }
     }
     maintenance_stop.send_replace(true);

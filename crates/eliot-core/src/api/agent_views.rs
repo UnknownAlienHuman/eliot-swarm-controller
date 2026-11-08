@@ -376,6 +376,12 @@ impl DaemonStatusRequest {
                 .cloud_mcp
                 .as_ref()
                 .is_some_and(|status| status.validate().is_err())
+            || reply.automation_tasks.is_empty()
+            || reply.automation_tasks.len() > 8
+            || reply
+                .automation_tasks
+                .iter()
+                .any(|task| task.validate().is_err())
             || reply.unknown_commands.iter().any(|id| text(id).is_err())
             || reply.unsettled_commands.iter().any(|command| {
                 text(&command.id).is_err()
@@ -670,6 +676,7 @@ impl CloudMcpStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonStatusResponse {
     pub state: String,
     pub admission: String,
@@ -684,6 +691,8 @@ pub struct DaemonStatusResponse {
     pub workspace_recovery_error: Option<String>,
     #[serde(deserialize_with = "nullable")]
     pub cloud_mcp: Option<CloudMcpStatus>,
+    #[serde(deserialize_with = "objects")]
+    pub automation_tasks: Vec<WorkerTaskStatus>,
     pub unknown_commands_count: usize,
     pub unknown_commands: Vec<String>,
     pub unknown_commands_truncated: bool,
@@ -693,6 +702,46 @@ pub struct DaemonStatusResponse {
     pub unsettled_commands_truncated: bool,
     #[serde(deserialize_with = "objects")]
     pub blockers: Vec<StatusBlocker>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerTaskHealth {
+    Starting,
+    Running,
+    Stopped,
+    Failed,
+}
+
+/// Bounded, redacted runtime status of one daemon-owned automation task.
+/// `running` means the task is alive after its startup boundary; it does
+/// not prove a rule/timer/goal delivery. `starting` means spawned but not
+/// yet initialized. `failed` carries only a bounded code, never a raw error
+/// message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerTaskStatus {
+    pub name: String,
+    pub health: WorkerTaskHealth,
+    #[serde(deserialize_with = "nullable")]
+    pub failure_code: Option<String>,
+}
+
+impl WorkerTaskStatus {
+    pub fn validate(&self) -> Result<()> {
+        if text(&self.name).is_err() {
+            return Err(invalid_response());
+        }
+        if let Some(code) = self.failure_code.as_deref()
+            && (code.is_empty() || code.len() > 128)
+        {
+            return Err(invalid_response());
+        }
+        if (self.health == WorkerTaskHealth::Failed) != self.failure_code.is_some() {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1526,7 +1575,9 @@ mod tests {
         json!({"state":"running","admission":"open","agents":0,"store_write_faulted":false,
             "owned_plugins":0,"observer_readers":0,"discovery_readers":0,
             "workspace_custody":{"scope":"current_host","capability":"unix_process_group_degraded","exact":false,"orphan_possible":true},
-            "workspace_recovery_error":null,"cloud_mcp":null,"unknown_commands_count":1,"unknown_commands":["c1"],"unknown_commands_truncated":false,
+            "workspace_recovery_error":null,"cloud_mcp":null,
+            "automation_tasks":[{"name":"rule_worker","health":"running","failure_code":null},{"name":"goal_driver","health":"running","failure_code":null}],
+            "unknown_commands_count":1,"unknown_commands":["c1"],"unknown_commands_truncated":false,
             "unsettled_commands_count":1,"unsettled_commands":[{"id":"c1","agent":null,"generation":null,"verb":"launch","state":"unknown"}],
             "unsettled_commands_truncated":false,"blockers":[{"kind":"workspace_processes"},{"kind":"discovery_readers","count":1},
             {"kind":"agent_live","agent":"a1","generation":0,"state":"created"}, {"kind":"command_unsettled","command_id":"c1","state":"unknown"},

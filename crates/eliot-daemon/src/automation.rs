@@ -899,6 +899,7 @@ pub(crate) async fn run_global_rules(
     // Register before the first high-water read so no event can fall between them.
     let mut events = router.subscribe_rule_events();
     let mut progress = router.progress_receiver();
+    router.note_automation_task_running("rule_worker");
     let mut watcher = match reload::RuleWatcher::watch(&data_root) {
         Ok(watcher) => Some(watcher),
         Err(error) => {

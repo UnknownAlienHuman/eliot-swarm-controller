@@ -40,7 +40,8 @@ use eliot_core::{
         ObservationPage, ObservationQuery, ObservationView, ProcessPageCursor,
         ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest,
         RuleStateView, ShutdownMode, SourceState, StatusBlocker, TimerGetRequest, TimerStateView,
-        TurnGetRequest, UnsettledCommandSummary, WorkspaceCustodyView,
+        TurnGetRequest, UnsettledCommandSummary, WorkerTaskHealth, WorkerTaskStatus,
+        WorkspaceCustodyView,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -103,6 +104,7 @@ struct RouterInner {
     monitoring: Monitoring,
     workspaces: WorkspaceManager,
     workspace_recovery_error: Mutex<Option<String>>,
+    automation_tasks: Mutex<Vec<(String, WorkerTaskHealth, Option<String>)>>,
     mode: AtomicU8,
     shutdown_ready: AtomicBool,
     progress: watch::Sender<u64>,
@@ -220,6 +222,10 @@ impl Router {
                 monitoring,
                 workspaces,
                 workspace_recovery_error: Mutex::new(None),
+                automation_tasks: Mutex::new(vec![
+                    ("rule_worker".to_owned(), WorkerTaskHealth::Starting, None),
+                    ("goal_driver".to_owned(), WorkerTaskHealth::Starting, None),
+                ]),
                 mode: AtomicU8::new(MODE_OPEN),
                 shutdown_ready: AtomicBool::new(false),
                 progress,
@@ -408,6 +414,31 @@ impl Router {
 
     pub(crate) fn note_workspace_recovery_failure(&self, code: &str) {
         *self.inner.workspace_recovery_error.lock_recover() = Some(code.to_owned());
+        self.signal_progress();
+    }
+
+    pub(crate) fn note_automation_task_running(&self, name: &str) {
+        for task in self.inner.automation_tasks.lock_recover().iter_mut() {
+            if task.0 == name {
+                task.1 = WorkerTaskHealth::Running;
+                task.2 = None;
+            }
+        }
+        self.signal_progress();
+    }
+
+    pub(crate) fn note_automation_task_stopped(&self, name: &str, failure_code: Option<String>) {
+        for task in self.inner.automation_tasks.lock_recover().iter_mut() {
+            if task.0 == name {
+                if let Some(code) = failure_code.clone() {
+                    task.1 = WorkerTaskHealth::Failed;
+                    task.2 = Some(code);
+                } else {
+                    task.1 = WorkerTaskHealth::Stopped;
+                    task.2 = None;
+                }
+            }
+        }
         self.signal_progress();
     }
 
@@ -2670,6 +2701,17 @@ impl Router {
             workspace_custody,
             workspace_recovery_error: self.inner.workspace_recovery_error.lock_recover().clone(),
             cloud_mcp: crate::cloud_mcp::service_snapshot(),
+            automation_tasks: self
+                .inner
+                .automation_tasks
+                .lock_recover()
+                .iter()
+                .map(|(name, health, failure_code)| WorkerTaskStatus {
+                    name: name.clone(),
+                    health: *health,
+                    failure_code: failure_code.clone(),
+                })
+                .collect(),
             unknown_commands_count,
             unknown_commands,
             unknown_commands_truncated,
