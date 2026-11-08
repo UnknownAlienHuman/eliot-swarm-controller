@@ -238,6 +238,17 @@ and accepts an empty object. Its bounded blocker/command lists retain truncation
 unknown commands remain unknown. Agent list observations appear only when requested.
 Absent source cursors and sequence/acknowledgement values remain null.
 
+`daemon.status` also reports bounded, redacted runtime status for the two
+daemon-owned automation tasks (`rule_worker` and `goal_driver`) via Core
+`WorkerTaskStatus`/`WorkerTaskHealth`. `starting` means spawned but not yet past the
+task startup boundary; `running` means alive after that boundary and does not prove
+rule/timer/goal delivery; `stopped` means the task exited without error (including
+shutdown); `failed` carries only a bounded code (`worker_panicked`, `worker_cancelled`,
+`worker_task_failed`, `worker_exited`, or the task's error code), never raw messages.
+The rule worker propagates its actual exit reason from its admission-closed
+return sites: an intentional admission/shutdown exit surfaces as `stopped`,
+while any other `Ok(())` surfaces as `failed` (`worker_exited`).
+
 `project.list` and `project.get` are owner-only readbacks of the owner-registered
 canonical checkout, repository common directory, explicit profile/action allowlists and
 optional Git fetch approval. They do not create or modify registrations. Their project

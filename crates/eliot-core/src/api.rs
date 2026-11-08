@@ -26,7 +26,8 @@ pub use agent_views::{
     AgentProcessesResponse, AgentStatsRequest, AgentStatsResponse, CloudMcpCustody, CloudMcpHealth,
     CloudMcpStatus, DaemonStatusRequest, DaemonStatusResponse, GitCredentialHelper,
     PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectGitView, ProjectRegistrationView,
-    SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary, WorkspaceCustodyView,
+    SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary, WorkerTaskHealth,
+    WorkerTaskStatus, WorkspaceCustodyView,
 };
 pub use coordination::{
     ClaimConflict, ClaimListRequest, ClaimListResponse, ClaimReleaseRequest, ClaimReleaseResponse,

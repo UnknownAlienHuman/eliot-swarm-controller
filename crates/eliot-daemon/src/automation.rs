@@ -97,6 +97,20 @@ pub(crate) struct RuleWorkerStart {
     pub initial_notices: ReloadNoticeContext,
 }
 
+/// Reason the rule worker left, propagated to the daemon supervisor so a
+/// normal drain is not misreported as an unexpected exit.
+/// AdmissionClosed covers every Ok(false) site in this module: the
+/// matched-event admission checks, prepared-submission and timer-slot
+/// closes, and admission-returns-None sites, all of which fire only
+/// when router admission is closed. Shutdown covers the supervisor's
+/// own shutdown watch. Any other Ok(()) is an unexpected exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuleWorkerExit {
+    Shutdown,
+    AdmissionClosed,
+    Exited,
+}
+
 struct RetiringRule {
     definition: RuleDefinition,
     revision: i64,
@@ -888,7 +902,7 @@ pub(crate) async fn run_global_rules(
     router: Router,
     start: RuleWorkerStart,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
+) -> Result<RuleWorkerExit> {
     let mut rules = start.global_rules;
     let mut project_rules = start.project_rules;
     let data_root = start.data_root;
@@ -899,6 +913,7 @@ pub(crate) async fn run_global_rules(
     // Register before the first high-water read so no event can fall between them.
     let mut events = router.subscribe_rule_events();
     let mut progress = router.progress_receiver();
+    router.note_automation_task_running("rule_worker");
     let mut watcher = match reload::RuleWatcher::watch(&data_root) {
         Ok(watcher) => Some(watcher),
         Err(error) => {
@@ -985,7 +1000,7 @@ pub(crate) async fn run_global_rules(
     }
     loop {
         if *shutdown.borrow() {
-            return Ok(());
+            return Ok(RuleWorkerExit::Shutdown);
         }
         if recover_rule_children {
             router
@@ -999,7 +1014,7 @@ pub(crate) async fn run_global_rules(
             if !reconcile_event_rules(&router, &mut rules, high_water, now_ms(), max_event_backlog)
                 .await?
             {
-                return Ok(());
+                return Ok(RuleWorkerExit::AdmissionClosed);
             }
             for namespace in &mut project_rules {
                 if namespace.registration_current
@@ -1012,18 +1027,18 @@ pub(crate) async fn run_global_rules(
                     )
                     .await?
                 {
-                    return Ok(());
+                    return Ok(RuleWorkerExit::AdmissionClosed);
                 }
             }
 
             if !reconcile_due_timers(&router, &mut rules, now_ms()).await? {
-                return Ok(());
+                return Ok(RuleWorkerExit::AdmissionClosed);
             }
             for namespace in &mut project_rules {
                 if namespace.registration_current
                     && !reconcile_due_timers(&router, &mut namespace.rules, now_ms()).await?
                 {
-                    return Ok(());
+                    return Ok(RuleWorkerExit::AdmissionClosed);
                 }
             }
         }
@@ -1046,12 +1061,12 @@ pub(crate) async fn run_global_rules(
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    return Ok(());
+                    return Ok(RuleWorkerExit::Shutdown);
                 }
             }
             changed = progress.changed() => {
                 if changed.is_err() {
-                    return Ok(());
+                    return Ok(RuleWorkerExit::Exited);
                 }
                 recover_rule_children = true;
             }

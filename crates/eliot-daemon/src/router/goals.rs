@@ -684,6 +684,7 @@ pub(crate) async fn run_goal_driver(
     run_check: GoalCheckRunner,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    router.note_automation_task_running("goal_driver");
     let mut events = router.subscribe_rule_events();
     let mut rounds: JoinSet<(String, i64)> = JoinSet::new();
     let mut in_flight: HashMap<String, InFlightAutoRound> = HashMap::new();
