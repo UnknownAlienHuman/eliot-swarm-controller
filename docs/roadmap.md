@@ -205,8 +205,11 @@ Read [coordination](spec/coordination.md). Use two Codex Agents initially.
       fanout limit. Parent completion is not child completion.
 
 **Result:** two Agents exchange an actual message, share one variable and identify each
-other's file area without a manager relay. Cross-vendor communication is a later check,
-not a prerequisite for mail.
+other's file area without a manager relay. Codex/Luna and OpenCode/OpenRouter exchanged queued
+findings and exact acknowledgements under their own Agent principals, advancing the project CAS
+value from version 0 to 2. A mail-notice turn consumed one next_input context; a reply notice
+woke the other Agent. No Owner body relay/manual wake.
+Raw who output, CAS conflicts, multi-item FIFO and unseen-arrival races remain unqualified.
 
 ## L6 — Additional harnesses and only demonstrated missing features
 
