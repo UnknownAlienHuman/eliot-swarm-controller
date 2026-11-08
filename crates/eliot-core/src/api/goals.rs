@@ -601,6 +601,7 @@ impl GoalRoundRequest {
 
     pub fn validate_response(&self, response: &GoalRoundResponse) -> Result<()> {
         if self.validate().is_err()
+            || response.id != self.id
             || response.view.agent != self.agent
             || response.view.mode != self.mode
             || response.view.validate().is_err()
@@ -612,7 +613,11 @@ impl GoalRoundRequest {
         }
         match response.outcome {
             GoalRoundOutcome::Continued => {
-                if response.command_id.as_deref() != Some(self.id.as_str()) {
+                if response
+                    .command_id
+                    .as_deref()
+                    .is_none_or(|id| id.trim().is_empty() || id == self.id)
+                {
                     return Err(Error::new(
                         "unknown",
                         "goal.round continuation does not match the requested mutation",
@@ -624,7 +629,11 @@ impl GoalRoundRequest {
                         "goal.round continuation omits its admitted command",
                     ));
                 };
-                if continuation.command_id != self.id {
+                if Some(continuation.command_id.as_str()) != response.command_id.as_deref()
+                    || continuation.agent.as_deref() != Some(self.agent.as_str())
+                    || continuation.generation != Some(response.view.generation)
+                    || continuation.linked_command.is_some()
+                {
                     return Err(Error::new(
                         "unknown",
                         "goal.round continuation does not match the requested mutation",
@@ -678,11 +687,13 @@ pub enum GoalRoundOutcome {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoalRoundResponse {
+    /// The original round mutation id, separate from its optional SEND id.
+    pub id: String,
     pub outcome: GoalRoundOutcome,
     /// Blocked only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// Continued only; always the requested mutation id.
+    /// Continued only; the distinct SEND id frozen when the round was claimed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_id: Option<String>,
     pub view: GoalView,
@@ -995,6 +1006,7 @@ mod tests {
         };
         request.validate().unwrap();
         let completed = GoalRoundResponse {
+            id: request.id.clone(),
             outcome: GoalRoundOutcome::Completed,
             reason: None,
             command_id: None,
@@ -1009,6 +1021,7 @@ mod tests {
             completed
         );
         let blocked = GoalRoundResponse {
+            id: request.id.clone(),
             outcome: GoalRoundOutcome::Blocked,
             reason: Some("turn_limit".to_owned()),
             command_id: None,
@@ -1023,7 +1036,7 @@ mod tests {
             blocked
         );
         let continuation = crate::api::CommandSubmitResponse {
-            command_id: request.id.clone(),
+            command_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
             agent: Some("a1".to_owned()),
             generation: Some(2),
             state: crate::CommandState::Accepted,
@@ -1031,9 +1044,10 @@ mod tests {
             linked_command: None,
         };
         let continued = GoalRoundResponse {
+            id: request.id.clone(),
             outcome: GoalRoundOutcome::Continued,
             reason: None,
-            command_id: Some(request.id.clone()),
+            command_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned()),
             view: view(),
             continuation: Some(continuation),
         };
@@ -1044,6 +1058,7 @@ mod tests {
             continued
         );
         let mismatched = GoalRoundResponse {
+            id: request.id.clone(),
             outcome: GoalRoundOutcome::Continued,
             reason: None,
             command_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned()),

@@ -3,8 +3,9 @@
 
 use super::*;
 use eliot_core::api::{
-    GOAL_COST_UNSUPPORTED, GoalCounters, GoalDefinition, GoalMarkerState, GoalMode,
-    GoalRoundMarker, GoalStatus, GoalView, MAX_GOAL_OBSERVATION_BYTES,
+    CommandSubmitResponse, GOAL_COST_UNSUPPORTED, GoalCounters, GoalDefinition, GoalMarkerState,
+    GoalMode, GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalStatus,
+    GoalView, MAX_GOAL_OBSERVATION_BYTES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -48,7 +49,7 @@ pub struct GoalContinuation {
 /// One round-key form. Idle keys name an exact idle event seq; slot keys
 /// name an anchored cadence slot index (first slot is 1). The form must
 /// match the Goal: cadenced Goals round on slots, the rest on idle seqs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GoalRoundKey {
     Idle(i64),
     Slot(i64),
@@ -76,13 +77,13 @@ impl GoalRoundKey {
 /// Binding check inside an open Immediate transaction. Returns Some(view)
 /// when this exact write id is an exact replay; the caller commits and
 /// returns it without touching Goal state. Returns None for a fresh id.
-fn replay_goal_write(
+fn replay_goal_write<T: serde::de::DeserializeOwned>(
     tx: &Transaction<'_>,
     id: &str,
     principal: &str,
     method: &str,
     payload_digest: &[u8],
-) -> Result<Option<GoalView>> {
+) -> Result<Option<T>> {
     if command_binding(tx, id)?.is_some() {
         return Err(Error::new(
             "id_conflict",
@@ -98,20 +99,20 @@ fn replay_goal_write(
             format!("{method} id is bound to another principal, method, or payload"),
         ));
     }
-    let value: GoalView = serde_json::from_value(decode_json(&old_result)?)
+    let value: T = serde_json::from_value(decode_json(&old_result)?)
         .map_err(|error| Error::new("internal", error.to_string()))?;
     Ok(Some(value))
 }
 
 /// Persist the original result alongside the already-applied mutation,
 /// still inside the caller's transaction.
-fn retain_goal_result(
+fn retain_goal_result<T: Serialize>(
     tx: &Transaction<'_>,
     id: &str,
     principal: &str,
     method: &str,
     payload_digest: &[u8],
-    view: &GoalView,
+    view: &T,
     now: i64,
 ) -> Result<()> {
     let result_json = encode_json(view)?;
@@ -135,6 +136,8 @@ fn retain_goal_result(
 
 #[derive(Clone, Debug)]
 pub struct GoalRoundCommit {
+    pub id: String,
+    pub principal: String,
     pub agent: String,
     pub mode: String,
     pub expected_generation: i64,
@@ -161,6 +164,184 @@ pub struct GoalRoundCommitResult {
     pub outcome: GoalCommitOutcome,
     pub view: GoalView,
     pub admission: Option<Admission>,
+    pub response: GoalRoundResponse,
+}
+
+impl GoalRoundCommitResult {
+    fn replay(response: GoalRoundResponse) -> Result<Self> {
+        let outcome = match response.outcome {
+            GoalRoundOutcome::Completed => GoalCommitOutcome::Completed,
+            GoalRoundOutcome::Blocked => GoalCommitOutcome::Blocked {
+                reason: response
+                    .reason
+                    .clone()
+                    .ok_or_else(|| Error::new("internal", "stored blocked round has no reason"))?,
+            },
+            GoalRoundOutcome::Continued => GoalCommitOutcome::Continued {
+                command_id: response.command_id.clone().ok_or_else(|| {
+                    Error::new("internal", "stored continued round has no command id")
+                })?,
+            },
+        };
+        Ok(Self {
+            outcome,
+            view: response.view.clone(),
+            admission: None,
+            response,
+        })
+    }
+}
+
+/// A duplicate claim returns its original reply, without another check.
+#[derive(Clone, Debug)]
+pub enum GoalRoundClaim {
+    Claimed { seq: i64, continuation_id: String },
+    Replay(Box<GoalRoundResponse>),
+}
+
+/// Private reservation and final reply in the existing writes.result column.
+/// Its captured marker binding survives Goal revisions and daemon restart.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct GoalRoundRecord {
+    request: GoalRoundRequest,
+    generation: i64,
+    revision: i64,
+    key: GoalRoundKey,
+    holder: String,
+    claim_seq: i64,
+    continuation_id: String,
+    outcome: StoredGoalRoundOutcome,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum StoredGoalRoundOutcome {
+    Running,
+    Finished(Box<GoalRoundResponse>),
+    Failed(Error),
+}
+
+fn goal_round_digest(request: &GoalRoundRequest) -> Result<Vec<u8>> {
+    canonical::digest(&json!({
+        "agent": request.agent, "mode": request.mode.as_str(),
+        "idle_seq": request.idle_seq, "slot": request.slot,
+    }))
+}
+
+fn goal_request_key(request: &GoalRoundRequest) -> Result<GoalRoundKey> {
+    request.validate()?;
+    match (request.idle_seq, request.slot) {
+        (Some(seq), None) => Ok(GoalRoundKey::Idle(seq)),
+        (None, Some(slot)) => Ok(GoalRoundKey::Slot(slot)),
+        _ => Err(Error::new("invalid", "goal round needs exactly one key")),
+    }
+}
+
+fn update_goal_round_tx(tx: &Transaction<'_>, record: &GoalRoundRecord) -> Result<()> {
+    let result = encode_json(record)?;
+    if result.len() > MAX_FRAME_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "goal.round result exceeds the frame bound",
+        ));
+    }
+    let changed = db!(tx.execute(
+        "UPDATE writes SET result = ?1 WHERE id = ?2 AND method = 'goal.round'",
+        params![result, record.request.id],
+    ));
+    if changed != 1 {
+        return Err(Error::new(
+            "unknown",
+            "goal round reservation is no longer retained",
+        ));
+    }
+    Ok(())
+}
+
+fn abandon_goal_marker_tx(tx: &Transaction<'_>, record: &GoalRoundRecord, now: i64) -> Result<()> {
+    db!(tx.execute(
+        "UPDATE goal_markers SET state = 'unknown', updated_at = ?1
+         WHERE agent = ?2 AND mode = ?3 AND generation = ?4 AND revision = ?5
+           AND round_key = ?6 AND round_key_kind = ?7 AND state = 'running' AND holder = ?8",
+        params![
+            now,
+            parse_agent_id(&record.request.agent)?,
+            record.request.mode.as_str(),
+            record.generation,
+            record.revision,
+            record.key.value(),
+            record.key.kind(),
+            record.holder
+        ],
+    ));
+    Ok(())
+}
+
+fn unknown_goal_round_error() -> Error {
+    Error::new("unknown", "goal round ended without a retained result")
+}
+
+fn finish_goal_round_error_tx(
+    tx: &Transaction<'_>,
+    record: &mut GoalRoundRecord,
+    error: &Error,
+    now: i64,
+) -> Result<Error> {
+    abandon_goal_marker_tx(tx, record, now)?;
+    record.outcome = StoredGoalRoundOutcome::Failed(error.clone());
+    if let Err(failure) = update_goal_round_tx(tx, record) {
+        if failure.code != "frame_too_large" {
+            return Err(failure);
+        }
+        // If the original error cannot fit, retain and return unknown.
+        // Claim preflights this recovery record before any external check.
+        let unknown = unknown_goal_round_error();
+        record.outcome = StoredGoalRoundOutcome::Failed(unknown.clone());
+        update_goal_round_tx(tx, record)?;
+        return Ok(unknown);
+    }
+    Ok(error.clone())
+}
+
+// Nested Result lets callers commit recovery of an abandoned reservation
+// before returning its stored error to the client.
+fn replay_goal_round_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: &GoalRoundRequest,
+    holder: &str,
+    now: i64,
+) -> Result<Option<Result<GoalRoundResponse>>> {
+    let digest = goal_round_digest(request)?;
+    let Some(mut record) =
+        replay_goal_write::<GoalRoundRecord>(tx, &request.id, principal, "goal.round", &digest)?
+    else {
+        validate_id_age(&request.id, now)?;
+        return Ok(None);
+    };
+    match &record.outcome {
+        StoredGoalRoundOutcome::Finished(response) => {
+            request.validate_response(response)?;
+            return Ok(Some(Ok(*response.clone())));
+        }
+        StoredGoalRoundOutcome::Failed(error) => return Ok(Some(Err(error.clone()))),
+        StoredGoalRoundOutcome::Running => {}
+    }
+    let marker = load_goal_marker_tx(
+        tx,
+        parse_agent_id(&request.agent)?,
+        request.mode.as_str(),
+        record.generation,
+        record.revision,
+        record.key,
+    )?;
+    if record.holder == holder && marker.is_some_and(|marker| marker.is_live(holder)) {
+        return Ok(Some(Err(Error::new(
+            "busy",
+            "goal round already in flight",
+        ))));
+    }
+    let error = finish_goal_round_error_tx(tx, &mut record, &unknown_goal_round_error(), now)?;
+    Ok(Some(Err(error)))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -419,18 +600,16 @@ impl Store {
     /// interference, crash) leaves it `unknown` and burns the key.
     pub fn goal_claim_round(
         &mut self,
-        agent: &str,
-        mode: &str,
-        key: GoalRoundKey,
+        principal: &str,
+        request: &GoalRoundRequest,
         expected_revision: i64,
         expected_spent_by_goal_continuation: bool,
         now: i64,
-    ) -> Result<i64> {
+    ) -> Result<GoalRoundClaim> {
         self.ensure_writer_healthy()?;
         let result = self.goal_claim_round_inner(
-            agent,
-            mode,
-            key,
+            principal,
+            request,
             expected_revision,
             expected_spent_by_goal_continuation,
             now,
@@ -439,41 +618,69 @@ impl Store {
         result
     }
 
-    /// Mark one claimed round `unknown` without committing any outcome. The
-    /// key stays burned: it is never rerun. Idempotent.
+    /// Resolve retained requests before probing any newer Goal state.
+    pub fn goal_round_replay(
+        &mut self,
+        principal: &str,
+        request: &GoalRoundRequest,
+        now: i64,
+    ) -> Result<Option<GoalRoundResponse>> {
+        self.ensure_writer_healthy()?;
+        require_nonempty(principal, "principal")?;
+        request.validate()?;
+        require_eliot_mode(request.mode.as_str())?;
+        validate_ulid(&request.id)?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let replay = replay_goal_round_tx(&tx, principal, request, &self.goal_holder, now)?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(replay)
+        })();
+        self.fault_on_persistence_error(&result);
+        result?.transpose()
+    }
+
+    /// Burn the marker and retain the original sanitized error atomically.
+    /// If persistence itself fails, the reservation stays unresolved; it
+    /// never authorizes a rerun, and a new holder reads it as unknown.
     pub fn goal_abandon_round(
         &mut self,
-        agent: &str,
-        mode: &str,
-        generation: i64,
-        revision: i64,
-        key: GoalRoundKey,
+        principal: &str,
+        request: &GoalRoundRequest,
+        error: &Error,
         now: i64,
-    ) -> Result<()> {
+    ) -> Result<Error> {
         self.ensure_writer_healthy()?;
-        require_eliot_mode(mode)?;
-        let agent_num = parse_agent_id(agent)?;
-        require_key_range(key)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
-        db!(tx.execute(
-            "UPDATE goal_markers SET state = 'unknown', updated_at = ?1
-             WHERE agent = ?2 AND mode = ?3 AND generation = ?4 AND revision = ?5
-               AND round_key = ?6 AND round_key_kind = ?7 AND state = 'running'",
-            params![
-                now,
-                agent_num,
-                mode,
-                generation,
-                revision,
-                key.value(),
-                key.kind()
-            ],
-        ));
-        commit_transaction(tx, &self.write_faulted)?;
-        Ok(())
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let mut record = replay_goal_write::<GoalRoundRecord>(
+                &tx,
+                &request.id,
+                principal,
+                "goal.round",
+                &goal_round_digest(request)?,
+            )?
+            .ok_or_else(|| Error::new("unknown", "goal round reservation is no longer retained"))?;
+            let retained = if matches!(record.outcome, StoredGoalRoundOutcome::Running)
+                && record.holder == self.goal_holder
+            {
+                finish_goal_round_error_tx(&tx, &mut record, error, now)?
+            } else if let StoredGoalRoundOutcome::Failed(retained) = record.outcome {
+                retained
+            } else {
+                error.clone()
+            };
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(retained)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
     }
 
     /// Apply one round outcome only if generation, revision and round still
@@ -882,20 +1089,29 @@ impl Store {
 
     fn goal_claim_round_inner(
         &mut self,
-        agent: &str,
-        mode: &str,
-        key: GoalRoundKey,
+        principal: &str,
+        request: &GoalRoundRequest,
         expected_revision: i64,
         expected_spent: bool,
         now: i64,
-    ) -> Result<i64> {
+    ) -> Result<GoalRoundClaim> {
+        let agent = request.agent.as_str();
+        let mode = request.mode.as_str();
+        let key = goal_request_key(request)?;
         require_eliot_mode(mode)?;
+        require_nonempty(principal, "principal")?;
+        validate_ulid(&request.id)?;
         require_key_range(key)?;
         let agent_num = parse_agent_id(agent)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
+        if let Some(replay) = replay_goal_round_tx(&tx, principal, request, &self.goal_holder, now)?
+        {
+            commit_transaction(tx, &self.write_faulted)?;
+            return replay.map(|response| GoalRoundClaim::Replay(Box::new(response)));
+        }
         let agent_row = load_agent_by_num(&tx, agent_num)?
             .ok_or_else(|| Error::new("not_found", "goal Agent was not found"))?;
         if agent_row.observe_only {
@@ -1059,8 +1275,46 @@ impl Store {
                 now,
             ],
         ));
+        let continuation_id = Ulid::new().to_string();
+        if command_binding(&tx, &continuation_id)?.is_some() || write_exists(&tx, &continuation_id)?
+        {
+            return Err(Error::new(
+                "id_conflict",
+                "goal continuation id is already used",
+            ));
+        }
+        let record = GoalRoundRecord {
+            request: request.clone(),
+            generation: row.generation,
+            revision: row.revision,
+            key,
+            holder: self.goal_holder.clone(),
+            claim_seq,
+            continuation_id: continuation_id.clone(),
+            outcome: StoredGoalRoundOutcome::Running,
+        };
+        let mut recovery = record.clone();
+        recovery.outcome = StoredGoalRoundOutcome::Failed(unknown_goal_round_error());
+        if encode_json(&recovery)?.len() > MAX_FRAME_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                "goal.round recovery exceeds the frame bound",
+            ));
+        }
+        retain_goal_result(
+            &tx,
+            &request.id,
+            principal,
+            "goal.round",
+            &goal_round_digest(request)?,
+            &record,
+            now,
+        )?;
         commit_transaction(tx, &self.write_faulted)?;
-        Ok(claim_seq)
+        Ok(GoalRoundClaim::Claimed {
+            seq: claim_seq,
+            continuation_id,
+        })
     }
 
     fn goal_commit_round_inner(
@@ -1068,6 +1322,19 @@ impl Store {
         commit: &GoalRoundCommit,
         now: i64,
     ) -> Result<GoalRoundCommitResult> {
+        let request = GoalRoundRequest {
+            id: commit.id.clone(),
+            agent: commit.agent.clone(),
+            mode: GoalMode::parse(&commit.mode)?,
+            idle_seq: match commit.round_key {
+                GoalRoundKey::Idle(seq) => Some(seq),
+                _ => None,
+            },
+            slot: match commit.round_key {
+                GoalRoundKey::Slot(slot) => Some(slot),
+                _ => None,
+            },
+        };
         require_eliot_mode(&commit.mode)?;
         let agent_num = parse_agent_id(&commit.agent)?;
         require_key_range(commit.round_key)?;
@@ -1108,6 +1375,39 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
+        let mut record = replay_goal_write::<GoalRoundRecord>(
+            &tx,
+            &request.id,
+            &commit.principal,
+            "goal.round",
+            &goal_round_digest(&request)?,
+        )?
+        .ok_or_else(|| Error::new("unknown", "goal round reservation is no longer retained"))?;
+        if !matches!(record.outcome, StoredGoalRoundOutcome::Running)
+            || record.holder != self.goal_holder
+        {
+            let replay =
+                replay_goal_round_tx(&tx, &commit.principal, &request, &self.goal_holder, now)?
+                    .ok_or_else(|| {
+                        Error::new("unknown", "goal round reservation is no longer retained")
+                    })?;
+            commit_transaction(tx, &self.write_faulted)?;
+            return replay.and_then(GoalRoundCommitResult::replay);
+        }
+        if record.generation != commit.expected_generation
+            || record.revision != commit.expected_revision
+            || record.claim_seq != commit.claim_seq
+            || record.key != commit.round_key
+            || commit
+                .continuation
+                .as_ref()
+                .is_some_and(|c| c.id != record.continuation_id)
+        {
+            return Err(Error::new(
+                "stale_round",
+                "goal round commit does not match its reservation",
+            ));
+        }
         let Some(row) = load_goal_row_tx(&tx, agent_num, &commit.mode)? else {
             return Err(Error::new("not_found", "goal was not found"));
         };
@@ -1263,7 +1563,21 @@ impl Store {
                     probe: false,
                 };
                 let limits = self.hierarchy_limits;
-                let send = admission::submit_tx(&tx, "owner", request, None, now, false, limits)?;
+                if command_binding(&tx, &request.id)?.is_some() || write_exists(&tx, &request.id)? {
+                    return Err(Error::new(
+                        "id_conflict",
+                        "goal continuation id is already used",
+                    ));
+                }
+                let send = admission::submit_tx(
+                    &tx,
+                    &commit.principal,
+                    request,
+                    None,
+                    now,
+                    false,
+                    limits,
+                )?;
                 let outcome = GoalCommitOutcome::Continued {
                     command_id: send.command.id.clone(),
                 };
@@ -1340,14 +1654,42 @@ impl Store {
                 row.revision,
             ],
         ));
-        commit_transaction(tx, &self.write_faulted)?;
-        let row = load_goal_row(&self.connection, agent_num, &commit.mode)?
+        let row = load_goal_row_tx(&tx, agent_num, &commit.mode)?
             .ok_or_else(|| Error::new("internal", "goal disappeared after round"))?;
-        let view = self.goal_view(row)?;
+        let view = goal_view_on(&tx, &self.goal_holder, row)?;
+        let (wire_outcome, reason, command_id) = match &outcome {
+            GoalCommitOutcome::Completed => (GoalRoundOutcome::Completed, None, None),
+            GoalCommitOutcome::Blocked { reason } => {
+                (GoalRoundOutcome::Blocked, Some(reason.clone()), None)
+            }
+            GoalCommitOutcome::Continued { command_id } => {
+                (GoalRoundOutcome::Continued, None, Some(command_id.clone()))
+            }
+        };
+        let response = GoalRoundResponse {
+            id: request.id.clone(),
+            outcome: wire_outcome,
+            reason,
+            command_id,
+            view: view.clone(),
+            continuation: admission.as_ref().map(|a| CommandSubmitResponse {
+                command_id: a.command.id.clone(),
+                agent: a.command.target.clone(),
+                generation: a.command.generation,
+                state: a.command.state,
+                outcome: a.command.outcome.clone(),
+                linked_command: None,
+            }),
+        };
+        request.validate_response(&response)?;
+        record.outcome = StoredGoalRoundOutcome::Finished(Box::new(response.clone()));
+        update_goal_round_tx(&tx, &record)?;
+        commit_transaction(tx, &self.write_faulted)?;
         Ok(GoalRoundCommitResult {
             outcome,
             view,
             admission,
+            response,
         })
     }
 }

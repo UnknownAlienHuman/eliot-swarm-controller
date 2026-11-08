@@ -15,8 +15,8 @@ pub use command_children::{CommandChildrenPage, history_expired};
 pub use context::ContextDispatch;
 pub use coordination::{NoticeClaim, NoticeKind, NoticePending, NoticeState};
 pub use goals::{
-    GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundCommit, GoalRoundCommitResult,
-    GoalRoundKey, GoalRoundProbe,
+    GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundClaim, GoalRoundCommit,
+    GoalRoundCommitResult, GoalRoundKey, GoalRoundProbe,
 };
 pub use projects::ProjectRegistrationInput;
 pub use resolution::TurnInactiveProof;

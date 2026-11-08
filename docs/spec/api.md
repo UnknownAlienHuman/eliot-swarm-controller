@@ -151,6 +151,16 @@ CREATE TABLE writes (
 The writer checks both command/write namespaces. Later linked inputs, selectors and
 rule actions have bounded derived ids. No general receipt/floor framework.
 
+`goal.round` reserves its id in this same write namespace with the durable round
+marker before running its check. Its original response or sanitized error is
+retained; exact retries resolve it before current Goal state, without repeating
+external work. A live duplicate is `busy`; an abandoned holder reads `unknown`.
+See [Goal loop](automation.md#goal-loop) and the canonical
+[Goal request/response DTOs](../../crates/eliot-core/src/api/goals.rs). The round
+response binds the original mutation id separately from the distinct continuation
+command id frozen at claim. Stored Goal responses/round records use Core
+[`MAX_FRAME_BYTES`](../../crates/eliot-core/src/limits.rs), not the event budget.
+
 ## Methods
 
 | Method | Purpose |
