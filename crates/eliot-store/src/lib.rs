@@ -78,6 +78,12 @@ const LIST_UNSETTLED_COMMANDS_SQL: &str = "SELECT id, principal, method, target,
                      AND NOT EXISTS(SELECT 1 FROM source_state s WHERE s.agent = commands.target
                          AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state = 'open'))
                  ORDER BY created_at, rowid LIMIT ?1";
+const RECOVER_ACCEPTED_COMMAND_FILTER: &str =
+    "state IN ('accepted', 'queued', 'dispatched', 'unknown')
+       AND state = 'accepted' AND principal = 'owner' AND parent_command IS NULL
+       AND selector IS NULL
+       AND NOT EXISTS (SELECT 1 FROM workspaces w
+           WHERE w.agent = commands.target AND w.start_command_id = commands.id)";
 const LIST_PROCESSES_FIRST_PAGE_SQL: &str =
     "SELECT host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at
              FROM processes WHERE owner = ?1
@@ -809,6 +815,63 @@ impl Store {
         }
         enforce_page_bytes(&mut commands)?;
         Ok(commands)
+    }
+
+    /// Page only keys for unattempted ordinary Owner admissions in index order.
+    /// Rule actions, linked inputs and managed starts retain their own recovery.
+    /// The rowid cursor remains usable if an earlier page settles or is pruned.
+    pub fn recover_accepted_command_keys(
+        &self,
+        after: Option<(i64, i64)>,
+        limit: usize,
+    ) -> Result<Vec<(String, i64, i64)>> {
+        self.ensure_writer_healthy()?;
+        validate_limit(limit)?;
+        let (created_at, rowid) = after.unwrap_or((i64::MIN, i64::MIN));
+        let sql = format!(
+            "SELECT id, created_at, rowid FROM commands
+             WHERE {RECOVER_ACCEPTED_COMMAND_FILTER}
+               AND (created_at, rowid) > (?1, ?2)
+             ORDER BY created_at, rowid LIMIT ?3"
+        );
+        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![created_at, rowid, limit as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(sql_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)
+    }
+
+    /// Recheck one key under the Store lock before handing it to the scheduler.
+    /// Full retained commands are loaded individually, not as a wire-sized page.
+    pub fn recover_accepted_admission(&self, id: &str) -> Result<Option<Admission>> {
+        self.ensure_writer_healthy()?;
+        let eligible = self
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM commands
+                     WHERE id = ?1 AND {RECOVER_ACCEPTED_COMMAND_FILTER})"
+                ),
+                [id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sql_error)?;
+        if !eligible {
+            return Ok(None);
+        }
+        let command = load_command(&self.connection, id)?
+            .ok_or_else(|| Error::new("internal", "recovery command disappeared"))?;
+        let linked_command = load_linked_command(&self.connection, id)?
+            .filter(|linked| matches!(linked.state, CommandState::Accepted | CommandState::Queued));
+        Ok(Some(Admission {
+            command,
+            linked_command,
+            events: Vec::new(),
+            is_new: false,
+        }))
     }
 
     /// Count all Agents without truncating at a page limit.
