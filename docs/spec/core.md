@@ -603,6 +603,15 @@ partly pruned expansion. Keep any set containing accepted, queued, dispatched or
 work. Retain command bindings/results in `commands` and other mutation bindings/results
 in `writes` for at least the supported retry window plus the allowed clock-skew
 margin. Cleanup must not make an accepted id look new or replay an external effect.
+An unresolved Running Goal-round reservation remains pinned in `writes` beyond
+the age cutoff: the existing round commit/error paths still need that row to
+finalize and release their marker after proven cleanup. The owning stored DTO is
+in [Store Goals](../../crates/eliot-store/src/goals.rs). Exclude these pins before
+selecting the bounded deletion page, so eligible expired replies behind them can
+still be pruned. Finished/Failed round replies use the ordinary age/retry floors;
+an unproven-custody marker independently retains single-flight even if its expired
+Failed reply is pruned. This does not extend retention of completed replies or
+change absent-id age validation.
 Once a complete expansion is gone, `command.children` returns `history_gap`.
 
 Prune acknowledged mail only: one bounded batch per pass of rows with

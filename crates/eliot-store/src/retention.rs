@@ -550,12 +550,20 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
 }
 
 fn prune_writes_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
+    // Filter pins before the page limit, so unresolved rounds cannot starve
+    // eligible replies behind them. Finalization still needs their write row.
     Ok(db!(tx.execute(
         "DELETE FROM writes WHERE id IN (
              SELECT id FROM writes WHERE created_at <= ?1
+               AND NOT (method = 'goal.round'
+                        AND json_extract(result, '$.outcome') IS json_extract(?3, '$'))
              ORDER BY created_at, id LIMIT ?2
          )",
-        params![cutoff, MAX_PAGE_ENTRIES as i64],
+        params![
+            cutoff,
+            MAX_PAGE_ENTRIES as i64,
+            super::goals::goal_round_running_outcome_json()?,
+        ],
     )) as i64)
 }
 
