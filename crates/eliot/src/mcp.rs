@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 
 use eliot_core::Event;
 use eliot_core::api::{
-    EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
+    EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsSubscribeRequest,
     EventsSubscribeResponse,
 };
 use rmcp::ErrorData as McpError;
@@ -309,23 +309,19 @@ fn spawn_owner_notify_task(
     });
 }
 
-/// Read the committed-log tip once so a new session delivers live events
+/// Read the allocated journal tip once so a new session delivers live events
 /// only. `None` (daemon error or invalid response) aborts the task.
 async fn current_tip(data_dir: &Path) -> Option<i64> {
-    let params = EventsReadRequest {
-        after: 0,
-        limit: 1,
-        filter: EventsFilter::default(),
-    };
+    let params = EventsBoundsRequest::default();
     if params.validate().is_err() {
         return None;
     }
-    let response: EventsReadResponse =
-        eliot_daemon::client_call_typed(data_dir, "events.read", &params)
+    let response: EventsBoundsResponse =
+        eliot_daemon::client_call_typed(data_dir, "events.bounds", &params)
             .await
             .ok()?;
-    response.validate(0).ok()?;
-    Some(response.high_water)
+    response.validate().ok()?;
+    Some(response.hi)
 }
 
 /// Map one committed event to its owner-facing logging level and payload,

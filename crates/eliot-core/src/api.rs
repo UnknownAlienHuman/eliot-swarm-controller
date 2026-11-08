@@ -121,6 +121,34 @@ impl EventsFilter {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventsBoundsRequest {
+    #[serde(default, deserialize_with = "object_filter")]
+    pub filter: EventsFilter,
+}
+
+impl EventsBoundsRequest {
+    pub fn validate(&self) -> Result<()> {
+        self.filter.validate()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventsBoundsResponse {
+    pub pruned_through: i64,
+    pub hi: i64,
+}
+
+impl EventsBoundsResponse {
+    pub fn validate(&self) -> Result<()> {
+        if self.pruned_through < 0 || self.hi < self.pruned_through {
+            return Err(Error::new("unknown", "event bounds response is invalid"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventsReadRequest {

@@ -168,7 +168,7 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
 | `goal.set/get/pause/clear/resume/round` | owner-only Eliot-mode Goal with explicit and automatic idle rounds plus explicit cadence slot rounds; automatic driving needs `max_turns` or `max_rounds`, native mode and cost limits are `unsupported` |
 | `provider.holds/clear_hold` | owner-only provider hold readback and constrained correction |
-| `events.read/subscribe` | persisted replay plus bounded live delivery |
+| `events.bounds/read/subscribe` | journal bounds, persisted replay and bounded live delivery |
 | `agent.discover` | owner-only native metadata discovery, without creating Agents |
 | `agent.history` | owner-only bounded history of an exact observed subject |
 | `mail.send/inbox/read/ack`, `var.set/get` | addressed queued mail with separate acknowledgement, shared variables with CAS |
@@ -710,6 +710,19 @@ resends previous input.
 
 Event requests, responses and `EventsFilter` are defined in the canonical Core API.
 
+`events.bounds` accepts `EventsBoundsRequest` and returns `EventsBoundsResponse`
+([Core DTOs](../../crates/eliot-core/src/api.rs)). Its optional `filter` has the same
+grammar and caller-scope checks as replay. The numeric bounds describe the journal,
+as does replay's `high_water`: `pruned_through` is the exclusive pruning floor and
+`hi` is the allocated sequence high-water mark, including when every event row has
+been pruned. This bounded metadata query reads no event page and requires no cursor.
+
+CLI `watch [AGENT]` reads these bounds once and starts at `hi`, delivering new events.
+`watch [AGENT] --after SEQ` instead uses that exact exclusive replay cursor. A lost
+cursor, including explicit `--after 0` after pruning, returns `history_gap`; it is
+never clamped or replaced by a new tip. MCP notification bootstrap also uses bounds
+instead of replay from zero. A later retention gap still fails explicitly.
+
 Before printing events or advancing a cursor, validate each response page against the
 effective request cursor: `0 <= after <= next <= high_water`. Event `seq` values must be
 strictly increasing, greater than `after`, and no greater than `next`. A malformed page
@@ -901,7 +914,7 @@ swarm daemon stop [--drain|--force]
 swarm status
 swarm launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [PROMPT] [--wait]
 swarm worktree remove AGENT [--generation N]
-swarm ls | show A | watch [A|SELECTOR] | top
+swarm ls | show A | watch [A|SELECTOR] [--after SEQ] | top
 swarm processes A [--scope agent|workspace] [--generation N] [--after CURSOR] [--limit N]
 swarm stats A [--generation N]
 swarm git-status A [--generation N]
