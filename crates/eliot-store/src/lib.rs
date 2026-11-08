@@ -283,6 +283,82 @@ impl Store {
         result
     }
 
+    /// Preserve authenticated HTTP call provenance in the existing command
+    /// cause and admission events, in the original admission transaction.
+    /// A retained retry keeps its original provenance and never rewrites history.
+    pub fn submit_with_remote_context(
+        &mut self,
+        principal: &str,
+        request: SubmitCommand,
+        preparation: Option<WorkspacePreparationInput>,
+        remote: Option<&core::RemoteCallContext>,
+        now: i64,
+    ) -> Result<Admission> {
+        let Some(remote) = remote else {
+            return self.submit_inner_checked(principal, request, preparation, now);
+        };
+        remote.validate()?;
+        if principal != "owner" {
+            return Err(Error::new(
+                "not_allowed",
+                "remote provenance requires the authenticated owner bridge",
+            ));
+        }
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let previous_command_rowid: i64 = tx
+                .query_row("SELECT COALESCE(MAX(rowid), 0) FROM commands", [], |row| {
+                    row.get(0)
+                })
+                .map_err(sql_error)?;
+            let mut admission = admission::submit_tx(
+                &tx,
+                principal,
+                request,
+                preparation,
+                now,
+                false,
+                self.hierarchy_limits,
+            )?;
+            if admission.is_new {
+                let root_cause =
+                    command_cause_tx(&tx, &admission.command.id)?.ok_or_else(|| {
+                        Error::new("source_integrity", "new admission has no command cause")
+                    })?;
+                for event in &mut admission.events {
+                    annotate_remote_admission_event_tx(
+                        &tx,
+                        event,
+                        &root_cause,
+                        remote,
+                        previous_command_rowid,
+                    )?;
+                }
+            }
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(admission)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn submit_inner_checked(
+        &mut self,
+        principal: &str,
+        request: SubmitCommand,
+        preparation: Option<WorkspacePreparationInput>,
+        now: i64,
+    ) -> Result<Admission> {
+        self.ensure_writer_healthy()?;
+        let result = self.submit_inner(principal, request, preparation, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     /// Resolve a targetless Git fetch retry using only its caller-authored
     /// selectors and normalized timeout. Frozen remote/OID snapshots are not
     /// consulted until a genuinely new command is prepared.
@@ -2978,6 +3054,7 @@ fn ordinary_command_cause(command_id: &str) -> core::EventCause {
     core::EventCause {
         command_id: command_id.to_owned(),
         rule: None,
+        remote_call: None,
         depth: 0,
     }
 }
@@ -3008,6 +3085,7 @@ fn annotate_new_command_cause_tx(
     let default_cause = core::EventCause {
         command_id: command_id.to_owned(),
         rule: None,
+        remote_call: None,
         depth: 0,
     };
     let default_json = encode_json(&default_cause)?;
@@ -3025,38 +3103,88 @@ fn annotate_new_command_cause_tx(
         ));
     }
 
+    annotate_admission_event_cause_tx(tx, command_event, &cause)
+}
+
+/// Common direct/rule/script admission event boundary. The caller first binds
+/// the new command row; every returned event associated with that command uses
+/// this same compare-and-swap, including events without data.command_id.
+fn annotate_admission_event_cause_tx(
+    tx: &Transaction<'_>,
+    event: &mut Event,
+    cause: &core::EventCause,
+) -> Result<()> {
+    validate_event_cause_shape(cause, Some(&cause.command_id))?;
+    if event.source != "daemon"
+        || event
+            .cause
+            .as_ref()
+            .is_some_and(|old| old.command_id != cause.command_id)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "admission event is not bound to its causal command",
+        ));
+    }
+    let original = event.cause.as_ref().map(encode_json).transpose()?;
+    let encoded = encode_json(cause)?;
     let changed = tx
         .execute(
-            "UPDATE events SET cause = ?1
-             WHERE seq = ?2 AND source = 'daemon' AND kind = ?3 AND cause = ?4
-               AND json_extract(data, '$.command_id') = ?5",
-            params![
-                cause_json,
-                command_event.seq,
-                command_event.kind,
-                default_json,
-                command_id
-            ],
+            "UPDATE events SET cause = ?1 WHERE seq = ?2 AND source = 'daemon' AND cause IS ?3",
+            params![encoded, event.seq, original],
         )
         .map_err(sql_error)?;
     if changed != 1 {
         let stored: Option<String> = tx
             .query_row(
                 "SELECT cause FROM events WHERE seq = ?1",
-                [command_event.seq],
+                [event.seq],
                 |row| row.get(0),
             )
             .optional()
             .map_err(sql_error)?
             .flatten();
-        if decode_event_cause(stored.as_deref(), Some(command_id)).as_ref() != Some(&cause) {
+        if decode_event_cause(stored.as_deref(), Some(&cause.command_id)).as_ref() != Some(cause) {
             return Err(Error::new(
                 "source_integrity",
-                "new command event cause could not be bound to its exact command",
+                "admission event cause changed before annotation",
             ));
         }
     }
-    command_event.cause = Some(cause);
+    event.cause = Some(cause.clone());
+    Ok(())
+}
+
+fn annotate_admission_command_cause_tx(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    events: &mut [Event],
+    cause: core::EventCause,
+) -> Result<()> {
+    let index = events
+        .iter()
+        .position(|event| {
+            event.kind.starts_with("command.")
+                && event.data.get("command_id").and_then(Value::as_str) == Some(command_id)
+        })
+        .ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "new admission has no matching command event",
+            )
+        })?;
+    annotate_new_command_cause_tx(tx, command_id, &mut events[index], cause.clone())?;
+    for (i, event) in events.iter_mut().enumerate() {
+        if i != index
+            && (event
+                .cause
+                .as_ref()
+                .is_some_and(|old| old.command_id == command_id)
+                || event.data.get("command_id").and_then(Value::as_str) == Some(command_id))
+        {
+            annotate_admission_event_cause_tx(tx, event, &cause)?;
+        }
+    }
     Ok(())
 }
 
@@ -3098,6 +3226,62 @@ fn annotate_new_event_cause_tx(
     }
     event.cause = Some(cause);
     Ok(())
+}
+
+/// Associate every event returned by this fresh admission, including
+/// agent.created, before its original transaction commits. Existing causal
+/// command/rule/depth fields are preserved. The rowid fence prevents this
+/// request from rewriting a command that predates the admission transaction.
+fn annotate_remote_admission_event_tx(
+    tx: &Transaction<'_>,
+    event: &mut Event,
+    root_cause: &core::EventCause,
+    remote: &core::RemoteCallContext,
+    previous_command_rowid: i64,
+) -> Result<()> {
+    if event.source != "daemon" {
+        return Err(Error::new(
+            "source_integrity",
+            "admission provenance requires a daemon event",
+        ));
+    }
+    let mut cause = event.cause.clone().unwrap_or_else(|| root_cause.clone());
+    let stored = command_cause_tx(tx, &cause.command_id)?
+        .ok_or_else(|| Error::new("source_integrity", "admission event has no bound command"))?;
+    if stored.command_id != cause.command_id
+        || stored.rule != cause.rule
+        || stored.depth != cause.depth
+        || stored
+            .remote_call
+            .as_ref()
+            .is_some_and(|known| known != remote)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "admission event differs from its command cause",
+        ));
+    }
+    cause.remote_call = Some(remote.clone());
+    validate_event_cause_shape(&cause, Some(&cause.command_id))?;
+    let encoded = encode_json(&cause)?;
+    let changed = tx
+        .execute(
+            "UPDATE commands SET cause = ?1 WHERE id = ?2 AND rowid > ?3 AND cause = ?4",
+            params![
+                encoded,
+                cause.command_id,
+                previous_command_rowid,
+                encode_json(&stored)?
+            ],
+        )
+        .map_err(sql_error)?;
+    if changed != 1 {
+        return Err(Error::new(
+            "source_integrity",
+            "remote cause does not name a newly admitted command",
+        ));
+    }
+    annotate_admission_event_cause_tx(tx, event, &cause)
 }
 
 fn admit_linked_send(

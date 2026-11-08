@@ -8483,6 +8483,7 @@ fn typed_command_cause_updates_persisted_and_returned_event_without_legacy_backf
         Some(EventCause {
             command_id: request.id.clone(),
             rule: None,
+            remote_call: None,
             depth: 0,
         })
     );
@@ -8490,6 +8491,7 @@ fn typed_command_cause_updates_persisted_and_returned_event_without_legacy_backf
     let cause = EventCause {
         command_id: request.id.clone(),
         rule: Some("stop-on-result".to_owned()),
+        remote_call: None,
         depth: 1,
     };
     super::annotate_new_command_cause_tx(
@@ -8558,6 +8560,7 @@ fn native_turn_cause_uses_exact_verified_command_and_ignores_payload_cause() {
         Some(EventCause {
             command_id: send_id.clone(),
             rule: None,
+            remote_call: None,
             depth: 0,
         })
     );
@@ -8596,6 +8599,7 @@ fn native_turn_cause_uses_exact_verified_command_and_ignores_payload_cause() {
         Some(EventCause {
             command_id: send_id,
             rule: None,
+            remote_call: None,
             depth: 0,
         })
     );

@@ -268,6 +268,13 @@ it is not a separate setting. The hostname is a bare DNS host; Eliot constructs
 does not read the credential file contents. Cloudflared reads that file when it
 starts.
 
+Manual `swarm mcp --http` also requires these configured Access settings; it
+never exposes an unauthenticated local Owner bridge. The HTTP origin verifies
+the signed Access assertion with the configured team/AUD independently of
+cloudflared. A missing verifier configuration or unavailable signing-key fetch
+fails startup before the listener/readiness frame. Stdio and private IPC retain
+their local principal resolution.
+
 ```toml
 [cloud_mcp]
 cloudflared_executable = "C:/Program Files (x86)/cloudflared/cloudflared.exe"

@@ -2957,6 +2957,7 @@ do = [{ action = 'git.fetch', repository = 'project-one', remote = 'origin', sou
         exhausted_event.cause = Some(eliot_core::EventCause {
             command_id: "stop-child".to_owned(),
             rule: Some(rule.id.clone()),
+            remote_call: None,
             depth: 5,
         });
         assert_eq!(evaluate(&rule, &exhausted_event).unwrap(), None);
@@ -2966,6 +2967,7 @@ do = [{ action = 'git.fetch', repository = 'project-one', remote = 'origin', sou
         event.cause = Some(eliot_core::EventCause {
             command_id: "prior-command".to_owned(),
             rule: Some("prior-rule".to_owned()),
+            remote_call: None,
             depth: 4,
         });
         assert_eq!(

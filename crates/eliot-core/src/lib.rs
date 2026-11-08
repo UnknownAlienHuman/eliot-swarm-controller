@@ -20,6 +20,7 @@ mod diagnostics;
 mod ids;
 mod native_child;
 mod native_store;
+mod remote_call;
 mod routing;
 mod secrets;
 mod source_handoff;
@@ -41,6 +42,7 @@ pub use native_child::{
     MUSE_NATIVE_CHILD_FAMILIES, NATIVE_CHILD_FAMILIES, native_child_families_for_harness,
 };
 pub use native_store::NativeStoreBinding;
+pub use remote_call::{RemoteCallContext, RemoteIdentity};
 pub use routing::{
     CapacityScope, ProviderHold, ProviderHoldState, ProviderRestriction, ProviderRestrictionKind,
     RouteBinding, frozen_provider_scope,
@@ -518,12 +520,17 @@ pub struct EventCause {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
     pub depth: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_call: Option<RemoteCallContext>,
 }
 
 impl EventCause {
     /// Checks the wire grammar only. Store owns proof that this command is the
     /// verified cause and applies the depth suppression policy.
     pub fn validate(&self) -> Result<()> {
+        if let Some(remote) = &self.remote_call {
+            remote.validate()?;
+        }
         if self.command_id.trim().is_empty() {
             return Err(Error::new(
                 "invalid",
@@ -1268,6 +1275,7 @@ mod live_wire_tests {
             cause: Some(EventCause {
                 command_id: "command-1".to_owned(),
                 rule: Some("stop-on-result".to_owned()),
+                remote_call: None,
                 depth: 1,
             }),
             ..event
@@ -1285,6 +1293,7 @@ mod live_wire_tests {
         let ordinary = EventCause {
             command_id: "command-ordinary".to_owned(),
             rule: None,
+            remote_call: None,
             depth: 0,
         };
         ordinary.validate().unwrap();
@@ -1303,6 +1312,7 @@ mod live_wire_tests {
         let cause = EventCause {
             command_id: "command-1".to_owned(),
             rule: Some("stop-on-result".to_owned()),
+            remote_call: None,
             depth: 6,
         };
         cause.validate().unwrap();

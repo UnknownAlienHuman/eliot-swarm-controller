@@ -236,9 +236,17 @@ impl Router {
     }
 
     pub(crate) async fn handle(&self, method: &str, wire_params: Value) -> Result<Value> {
+        let remote = wire_params
+            .get("_auth")
+            .and_then(|a| a.get("remote_call"))
+            .cloned();
         let (principal, params) = self.authenticate(wire_params).await?;
+        let remote: Option<eliot_core::RemoteCallContext> = remote
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| Error::new("not_allowed", "invalid remote context"))?;
         authorize_rpc_method(&principal, method)?;
-        match method {
+        let result = match method {
             "daemon.status" => {
                 require_owner(&principal)?;
                 let request: DaemonStatusRequest = serde_json::from_value(params)
@@ -250,7 +258,10 @@ impl Router {
                 require_owner(&principal)?;
                 self.shutdown(&params, &principal).await
             }
-            "command.submit" => self.submit(&params, &principal).await,
+            "command.submit" => {
+                self.submit_bound(&params, &principal, remote.as_ref())
+                    .await
+            }
             "command.get" => self.command_get(&params, &principal).await,
             "command.children" => self.command_children(&params, &principal).await,
             "command.resolve" => self.command_resolve(&params, &principal).await,
@@ -296,7 +307,26 @@ impl Router {
                 "unsupported",
                 format!("daemon method {method} is not implemented"),
             )),
+        }?;
+        Ok(match remote {
+            Some(remote) => json!({"result": result, "remote_call": remote}),
+            None => result,
+        })
+    }
+
+    pub(crate) async fn handle_rpc(&self, request: &eliot_plugin::RpcRequest) -> Result<Value> {
+        if let Some(remote) = request
+            .params
+            .get("_auth")
+            .and_then(|a| a.get("remote_call"))
+            && remote.get("call_id") != Some(&request.id)
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "remote call does not match its RPC request",
+            ));
         }
+        self.handle(&request.method, request.params.clone()).await
     }
 
     pub(crate) fn progress_receiver(&self) -> watch::Receiver<u64> {
@@ -454,10 +484,19 @@ impl Router {
     }
 
     async fn submit(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        self.submit_bound(params, principal, None).await
+    }
+
+    async fn submit_bound(
+        &self,
+        params: &Value,
+        principal: &Principal,
+        remote: Option<&eliot_core::RemoteCallContext>,
+    ) -> Result<Value> {
         let request: CommandSubmitRequest = serde_json::from_value(params.clone())
             .map_err(|_| Error::new("invalid", "command.submit params are malformed"))?;
         if request.verb == "git.fetch" {
-            return self.submit_git_fetch(request, principal).await;
+            return self.submit_git_fetch(request, principal, remote).await;
         }
         if matches!(request.verb.as_str(), "notify" | "emit") {
             Self::validate_user_event_request(&request)?;
@@ -475,23 +514,26 @@ impl Router {
             }
             let principal = principal_name(principal);
             let now = now_ms();
-            let submitted = match preparation.take() {
-                Some(input) => store.submit_with_workspace(&principal, request.clone(), input, now),
-                None => store.submit(&principal, request.clone(), now),
-            };
+            let submitted = store.submit_with_remote_context(
+                &principal,
+                request.clone(),
+                preparation.take(),
+                remote,
+                now,
+            );
             let admission = match submitted {
                 Ok(admission) => admission,
                 Err(error) if error.code == "id_conflict" && request.verb == "launch" => {
                     if let Some(retained) = retained_launch_profile(&store, &request)? {
                         install_retained_profile(&mut request, retained)?;
-                        store.submit(&principal, request, now)?
+                        store.submit_with_remote_context(&principal, request, None, remote, now)?
                     } else {
                         return Err(error);
                     }
                 }
                 Err(error) if error.code == "id_conflict" && request.verb == "attach" => {
                     if install_retained_attach_profile(&store, &mut request)? {
-                        store.submit(&principal, request, now)?
+                        store.submit_with_remote_context(&principal, request, None, remote, now)?
                     } else {
                         return Err(error);
                     }
@@ -526,6 +568,7 @@ impl Router {
         &self,
         request: CommandSubmitRequest,
         principal: &Principal,
+        remote: Option<&eliot_core::RemoteCallContext>,
     ) -> Result<Value> {
         request.validate()?;
         let definition = serde_json::from_value::<GitFetchDefinitionArgs>(request.args.clone())
@@ -558,7 +601,13 @@ impl Router {
         let principal_name = principal_name(principal);
         let admission = {
             let mut store = self.inner.store.lock().await;
-            let result = store.submit(&principal_name, prepared.request, now_ms());
+            let result = store.submit_with_remote_context(
+                &principal_name,
+                prepared.request,
+                None,
+                remote,
+                now_ms(),
+            );
             match result {
                 Ok(admission) => {
                     self.publish_locked(&admission.events);

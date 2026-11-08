@@ -212,6 +212,11 @@ proven controller commands start at depth 0. Rule, timer and manual-timer comman
 their own command identity and depth 1 when no triggering cause exists, or one greater
 than the verified triggering cause. The existing `commands.cause` storage carries typed
 cause JSON for rule parents and children, each bound to that row's own command ID.
+An authenticated HTTP bridge may add the bounded nonsecret `RemoteCallContext`
+to that existing cause during ordinary command admission. Store commits it with
+the command and admission events; retained retries never replace it. It is call
+provenance, not an Agent identity or a credential. Native event payloads cannot
+supply or override it.
 
 Native families are session/turn/message/tool/request/child/goal/usage/provider/edit.
 Exactly one source owns each implemented family per Agent generation. Daemon-owned

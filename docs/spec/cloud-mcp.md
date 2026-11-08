@@ -25,6 +25,11 @@ native `originRequest.access` JWT validation using the supplied team and
 audience tag. Cloudflare Access Managed OAuth remains the external identity
 provider; Eliot adds no OAuth framework.
 
+The HTTP child independently verifies the signed Access application assertion at
+the origin before SDK dispatch, using the same configured team and audience. The
+native cloudflared check protects the tunnel route; it cannot authenticate a direct
+loopback request. Both managed and manual HTTP fail closed without origin auth.
+
 The module owns exactly these two children. It never discovers, adopts, signals,
 or stops a pre-existing `mcp-bridge` or other tunnel. HTTP stdin stays open
 while serving; shutdown closes it to deliver EOF, then waits for graceful exit
@@ -43,9 +48,10 @@ no `[cloud_mcp]` table the member is `null`.
 The snapshot exposes no child PID and does not create a local Agent, fake
 cloud-Agent PID, persistence table, or generic service registry.
 
-Cloudflare Access authenticates the remote caller. The HTTP child reuses the
-existing MCP handler and its owner service principal; it does not derive an
-Agent identity from `clientInfo` or process metadata. Any remote
-identity/connection/call binding belongs to the routed MCP/API integration,
-outside this process module. End-to-end authenticated-call qualification
-remains integration work.
+Cloudflare Access authenticates the remote caller and forwards its signed assertion.
+The HTTP verifier binds the verified subject to the SDK session and carries nonsecret
+connection/call provenance through the existing authenticated Router path, as owned
+by [the API](api.md#mcp-streamablehttp-server). It does not derive identity from
+`clientInfo` or process metadata. The process module owns custody, not an OAuth or
+principal registry. End-to-end qualification of the corrected origin and caller
+binding remains required by L6.7.

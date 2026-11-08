@@ -292,6 +292,10 @@ impl Store {
             let cause = core::EventCause {
                 command_id: child_id.clone(),
                 rule: Some(request.rule.clone()),
+                remote_call: trigger
+                    .cause
+                    .as_ref()
+                    .and_then(|cause| cause.remote_call.clone()),
                 depth,
             };
             tx.execute_batch("SAVEPOINT rule_catch_up_action")
@@ -332,6 +336,7 @@ impl Store {
                     core::EventCause {
                         command_id: linked_command.id.clone(),
                         rule: cause.rule.clone(),
+                        remote_call: cause.remote_call.clone(),
                         depth: cause.depth,
                     },
                 )?;
@@ -372,6 +377,7 @@ impl Store {
         let parent_cause = core::EventCause {
             command_id: parent.id.clone(),
             rule: Some(request.rule.clone()),
+            remote_call: None,
             depth: 1,
         };
         annotate_new_command_cause_tx(&tx, &parent.id, &mut parent_event, parent_cause.clone())?;
