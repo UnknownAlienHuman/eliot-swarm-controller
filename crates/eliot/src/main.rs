@@ -15,14 +15,15 @@ use eliot_core::{
         EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
         EventsSubscribeRequest, EventsSubscribeResponse, GoalClearRequest, GoalDefinition,
         GoalGetRequest, GoalMode, GoalPauseRequest, GoalResumeRequest, GoalRoundRequest,
-        GoalRoundResponse, GoalSetRequest, GoalView, MailAckRequest, MailAckResponse, MailDelivery,
-        MailInboxRequest, MailInboxResponse, MailMode, MailReadRequest, MailSendRequest,
-        MailSendResponse, ObservationPage, ProjectRegistrationView, ProviderClearHoldRequest,
-        ProviderClearHoldResponse, ProviderCorrectiveEvidence, ProviderHoldsRequest,
-        ProviderHoldsResponse, RuleCatchUpRequest, RuleGetRequest, RuleStateView, ShutdownMode,
-        TimerGetRequest, TimerRunRequest, TimerStateView, TurnGetRequest, TurnResolveRequest,
-        TurnResolveResponse, TurnResolveStatus, VarGetRequest, VarGetResponse, VarSetRequest,
-        VarSetResponse, WhoRequest, WhoResponse,
+        GoalRoundResponse, GoalSetRequest, GoalView, MAX_VAR_VALUE_BYTES, MailAckRequest,
+        MailAckResponse, MailDelivery, MailInboxRequest, MailInboxResponse, MailMode,
+        MailReadRequest, MailSendRequest, MailSendResponse, ObservationPage,
+        ProjectRegistrationView, ProviderClearHoldRequest, ProviderClearHoldResponse,
+        ProviderCorrectiveEvidence, ProviderHoldsRequest, ProviderHoldsResponse,
+        RuleCatchUpRequest, RuleGetRequest, RuleStateView, ShutdownMode, TimerGetRequest,
+        TimerRunRequest, TimerStateView, TurnGetRequest, TurnResolveRequest, TurnResolveResponse,
+        TurnResolveStatus, VarGetRequest, VarGetResponse, VarSetRequest, VarSetResponse,
+        WhoRequest, WhoResponse,
     },
 };
 use serde_json::{Value, json};
@@ -696,11 +697,20 @@ enum VarCommand {
 struct VarSetArgs {
     #[arg(value_name = "KEY")]
     key: String,
-    #[arg(value_name = "VALUE", allow_hyphen_values = true)]
-    value: String,
+    /// Value supplied directly on the command line.
+    #[arg(
+        value_name = "VALUE",
+        allow_hyphen_values = true,
+        required_unless_present = "value_file",
+        conflicts_with = "value_file"
+    )]
+    value: Option<String>,
+    /// Read the value from a UTF-8 file instead of the inline VALUE.
+    #[arg(long, value_name = "PATH")]
+    value_file: Option<PathBuf>,
     #[arg(long, value_name = "SCOPE")]
     scope: Option<String>,
-    /// Parse VALUE as JSON instead of storing it as a string.
+    /// Parse the value (inline or from --value-file) as JSON instead of storing it as a string.
     #[arg(long)]
     as_json: bool,
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(i64).range(0..))]
@@ -2223,16 +2233,27 @@ async fn dispatch(
             VarCommand::Set(VarSetArgs {
                 key,
                 value,
+                value_file,
                 scope,
                 as_json,
                 expect_version,
                 note,
             }) => {
+                let raw_value = match (value, value_file) {
+                    (Some(value), None) => value,
+                    (None, Some(path)) => read_var_value_file(&path)?,
+                    _ => {
+                        return Err(Failure::new(
+                            2,
+                            "provide exactly one of VALUE or --value-file",
+                        ));
+                    }
+                };
                 let value = if as_json {
-                    serde_json::from_str(&value)
+                    serde_json::from_str(&raw_value)
                         .map_err(|_| Failure::new(2, "--as-json value must be valid JSON"))?
                 } else {
-                    Value::String(value)
+                    Value::String(raw_value)
                 };
                 let request = VarSetRequest {
                     id: mutation_id(id)?,
@@ -2572,6 +2593,22 @@ fn read_answers_file(path: &Path) -> Result<Value, Failure> {
         )
     })?;
     Ok(answers)
+}
+
+fn read_var_value_file(path: &Path) -> Result<String, Failure> {
+    let file = File::open(path).map_err(|_| Failure::new(2, "value file could not be read"))?;
+    let mut bounded = file.take(MAX_VAR_VALUE_BYTES as u64 + 1);
+    let mut bytes = Vec::new();
+    let byte_count = bounded
+        .read_to_end(&mut bytes)
+        .map_err(|_| Failure::new(2, "value file could not be read"))?;
+    if byte_count > MAX_VAR_VALUE_BYTES {
+        return Err(Failure::new(
+            2,
+            format!("value file exceeds the {MAX_VAR_VALUE_BYTES} byte limit"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| Failure::new(2, "value file must be UTF-8"))
 }
 
 fn validate_text(text: Option<&str>) -> Result<(), Failure> {

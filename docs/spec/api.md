@@ -868,6 +868,12 @@ current version, where an absent row reads as 0, otherwise the write is
 rejected with `version_conflict` and nothing changes. Every write
 increments the version, records `set_by`, and emits `var.changed`.
 
+The CLI supplies exactly one value source: inline `VALUE` or `--value-file
+PATH`, mutually exclusive. The file is read as bounded UTF-8 (at most 16 KiB)
+and its contents become the value; with `--as-json` the contents must parse
+as JSON before admission. The file path is not part of command metadata;
+only the resulting value is stored.
+
 A routed recipient with `wake_on_mail` (profile snapshot, default true) may
 receive one generic coalesced wake per minute with at most one open notice
 command per recipient across mail and claims: `N unread messages; run swarm inbox, then ack processed delivery IDs`.
@@ -986,7 +992,7 @@ swarm configure ... | compact|fork|background ...
 swarm cmd show|children|cancel|resolve ...
 swarm events [--since SEQ] [--allow-gap]
 swarm msg send ... | msg show ... | msg ack ... | inbox [AGENT] [--wait SECS]
-swarm var set ... | var get ... | who [--project P] [--history] | claim set|list|release ...
+swarm var set KEY [VALUE | --value-file PATH] [--as-json] [...] | var get ... | who [--project P] [--history] | claim set|list|release ...
 swarm project list | show ID
 swarm rule show ID [--project PROJECT]
 swarm rule catch-up ID --after SEQ [--through SEQ] [--project PROJECT]
