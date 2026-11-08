@@ -125,6 +125,8 @@ impl Router {
         let view = self.inner.store.lock().await.goal_set(
             &request.agent,
             request.mode.as_str(),
+            &request.id,
+            &super::principal_name(principal),
             &request.definition,
             now_ms(),
         )?;
@@ -166,6 +168,8 @@ impl Router {
         let view = self.inner.store.lock().await.goal_pause(
             &request.agent,
             request.mode.as_str(),
+            &request.id,
+            &super::principal_name(principal),
             request.reason.as_deref(),
             now_ms(),
         )?;
@@ -186,6 +190,8 @@ impl Router {
         let view = self.inner.store.lock().await.goal_clear(
             &request.agent,
             request.mode.as_str(),
+            &request.id,
+            &super::principal_name(principal),
             now_ms(),
         )?;
         request.validate_response(&view)?;
@@ -205,6 +211,8 @@ impl Router {
         let view = self.inner.store.lock().await.goal_resume(
             &request.agent,
             request.mode.as_str(),
+            &request.id,
+            &super::principal_name(principal),
             now_ms(),
         )?;
         request.validate_response(&view)?;
@@ -977,7 +985,7 @@ mod tests {
     async fn set_goal(router: &Router, agent: &str, definition: Value) -> Value {
         router
             .goal_set(
-                &json!({"agent":agent, "mode":"eliot", "definition":definition}),
+                &json!({"id": ulid::Ulid::new().to_string(), "agent":agent, "mode":"eliot", "definition":definition}),
                 &Principal::Owner,
             )
             .await
@@ -1316,7 +1324,7 @@ mod tests {
         assert_eq!(shown, set);
         let paused = router
             .goal_pause(
-                &json!({"agent":agent, "mode":"eliot", "reason":"waiting"}),
+                &json!({"id": ulid::Ulid::new().to_string(), "agent":agent, "mode":"eliot", "reason":"waiting"}),
                 &Principal::Owner,
             )
             .await
@@ -1324,12 +1332,18 @@ mod tests {
         assert_eq!(paused["revision"], 2);
         assert_eq!(paused["status"], "paused");
         let resumed = router
-            .goal_resume(&json!({"agent":agent, "mode":"eliot"}), &Principal::Owner)
+            .goal_resume(
+                &json!({"id": ulid::Ulid::new().to_string(), "agent":agent, "mode":"eliot"}),
+                &Principal::Owner,
+            )
             .await
             .unwrap();
         assert_eq!(resumed["revision"], 3);
         let cleared = router
-            .goal_clear(&json!({"agent":agent, "mode":"eliot"}), &Principal::Owner)
+            .goal_clear(
+                &json!({"id": ulid::Ulid::new().to_string(), "agent":agent, "mode":"eliot"}),
+                &Principal::Owner,
+            )
             .await
             .unwrap();
         assert_eq!(cleared["revision"], 4);
@@ -1342,7 +1356,7 @@ mod tests {
         let agent = ready_agent(&router, "goal-native").await;
         let error = router
             .goal_set(
-                &json!({"agent":agent, "mode":"native", "definition":definition("x")}),
+                &json!({"id": ulid::Ulid::new().to_string(), "agent":agent, "mode":"native", "definition":definition("x")}),
                 &Principal::Owner,
             )
             .await
@@ -1961,7 +1975,7 @@ mod tests {
         set_goal(&router, &paused, definition("keep green")).await;
         router
             .goal_pause(
-                &json!({"agent":paused, "mode":"eliot", "reason":"waiting"}),
+                &json!({"id": ulid::Ulid::new().to_string(), "agent":paused, "mode":"eliot", "reason":"waiting"}),
                 &Principal::Owner,
             )
             .await

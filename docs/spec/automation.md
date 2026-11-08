@@ -829,6 +829,17 @@ driving needs a bound: `set` refuses a Goal without a cadence unless `max_turns`
 or `max_rounds` is set. Cadenced Goals round only on explicit slots and need
 none; explicit manual rounds never need one either.
 
+Goal set, pause, clear and resume each take a required external mutation id
+(see Mutation ids in api.md); the DTO link in Core api/goals.rs is the only
+field catalog. The CLI supplies the global --id to all four. Each applies its
+state change and retains the original GoalView under the same id in one
+IMMEDIATE transaction: an exact retry returns the stored view without
+re-applying the transition, so the stored view survives intervening
+resume/set/clear; a different binding is id_conflict. The stored view is
+allowed MAX_FRAME_BYTES (its definition alone may reach 64 KiB); the
+persisted-event MAX_EVENT_BYTES budget never caps the stored reply, and a
+serialization over the frame bound fails before any write.
+
 Rounds name a key in one of two forms, and the form must match the Goal.
 Idle keys name the exact idle event seq the caller observed; slot keys name
 an anchored cadence slot of a cadenced Goal. Before work, the round reads
