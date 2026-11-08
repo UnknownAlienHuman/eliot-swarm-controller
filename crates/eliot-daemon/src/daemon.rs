@@ -170,7 +170,11 @@ async fn run_owned(
         capacity_recheck.spawn(restart_capacity::recheck(capacity, retained));
     }
     let (automation_stop, automation_shutdown) = watch::channel(false);
-    let mut automation_tasks: JoinSet<(&'static str, Result<()>)> = JoinSet::new();
+    // The rule worker's successful output carries its actual exit reason
+    // through the JoinSet to both supervisor consumers, so an intentional
+    // admission-closed drain is never re-derived from the shutdown flag.
+    let mut automation_tasks: JoinSet<(&'static str, Result<automation::RuleWorkerExit>)> =
+        JoinSet::new();
     let mut automation_task_names: Vec<(tokio::task::Id, &'static str)> = Vec::new();
     let rule_router = router.clone();
     let rule_data_root = data_dir.path().to_path_buf();
@@ -205,6 +209,8 @@ async fn run_owned(
                     goal_shutdown,
                 )
                 .await;
+                // The goal driver keeps its current shutdown-only output.
+                let outcome = outcome.map(|()| automation::RuleWorkerExit::Shutdown);
                 ("goal_driver", outcome)
             })
             .id();
@@ -311,18 +317,27 @@ async fn run_owned(
                         );
                         let _ = task_id;
                     }
-                    Some(Ok((task_id, (name, Ok(()))))) => {
-                        let shutdown = *automation_stop.borrow();
-                        if shutdown {
-                            router.note_automation_task_stopped(name, None);
-                        } else {
-                            router.note_automation_task_stopped(name, Some("worker_exited".to_owned()));
-                            logging::record(
-                                &policy,
-                                "daemon.automation_worker_exited",
-                                &[("task", name)],
-                                None,
-                            );
+                    Some(Ok((task_id, (name, Ok(reason))))) => {
+                        match reason {
+                            automation::RuleWorkerExit::Shutdown
+                            | automation::RuleWorkerExit::AdmissionClosed => {
+                                router.note_automation_task_stopped(name, None);
+                            }
+                            automation::RuleWorkerExit::Exited => {
+                                // Only an unexpected exit reaches this arm;
+                                // an intentional reason stays stopped even when
+                                // automation_stop is still false.
+                                router.note_automation_task_stopped(
+                                    name,
+                                    Some("worker_exited".to_owned()),
+                                );
+                                logging::record(
+                                    &policy,
+                                    "daemon.automation_worker_exited",
+                                    &[("task", name)],
+                                    None,
+                                );
+                            }
                         }
                         let _ = task_id;
                     }
@@ -421,8 +436,24 @@ async fn run_owned(
     automation_stop.send_replace(true);
     while let Some(joined) = automation_tasks.join_next_with_id().await {
         match joined {
-            Ok((task_id, (name, Ok(())))) => {
-                router.note_automation_task_stopped(name, None);
+            Ok((task_id, (name, Ok(reason)))) => {
+                // The shutdown drain honours the same propagated reason:
+                // an unexpected exit must not be forgiven as stopped here.
+                match reason {
+                    automation::RuleWorkerExit::Shutdown
+                    | automation::RuleWorkerExit::AdmissionClosed => {
+                        router.note_automation_task_stopped(name, None);
+                    }
+                    automation::RuleWorkerExit::Exited => {
+                        router.note_automation_task_stopped(name, Some("worker_exited".to_owned()));
+                        logging::record(
+                            &policy,
+                            "daemon.automation_worker_exited",
+                            &[("task", name)],
+                            None,
+                        );
+                    }
+                }
                 let _ = task_id;
             }
             Ok((task_id, (name, Err(error)))) => {

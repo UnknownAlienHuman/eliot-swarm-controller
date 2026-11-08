@@ -245,6 +245,9 @@ task startup boundary; `running` means alive after that boundary and does not pr
 rule/timer/goal delivery; `stopped` means the task exited without error (including
 shutdown); `failed` carries only a bounded code (`worker_panicked`, `worker_cancelled`,
 `worker_task_failed`, `worker_exited`, or the task's error code), never raw messages.
+The rule worker propagates its actual exit reason from its admission-closed
+return sites: an intentional admission/shutdown exit surfaces as `stopped`,
+while any other `Ok(())` surfaces as `failed` (`worker_exited`).
 
 `project.list` and `project.get` are owner-only readbacks of the owner-registered
 canonical checkout, repository common directory, explicit profile/action allowlists and
