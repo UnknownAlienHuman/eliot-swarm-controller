@@ -87,6 +87,8 @@ struct Cli {
     command: Option<CliCommand>,
 }
 
+// Keep payloads in typed Args: clap builds each payload in its own generated
+// function instead of accumulating every argument builder in this enum's frame.
 #[derive(Subcommand)]
 enum CliCommand {
     /// Start the local daemon, or stop it with a drain/force request.
@@ -95,359 +97,478 @@ enum CliCommand {
     Status,
     /// Serve one generic { method, params } MCP tool over stdio (default) or loopback StreamableHTTP.
     #[command(name = "mcp")]
-    Mcp {
-        /// Serve StreamableHTTP on 127.0.0.1 instead of stdio.
-        #[arg(long)]
-        http: bool,
-        /// Loopback port for --http; 0 selects an ephemeral port (actual address is printed in the ready frame).
-        #[arg(long, default_value_t = 0)]
-        port: u16,
-        /// Public https tunnel URL (path /mcp) widening the --http Host/Origin checks; required with --managed-child.
-        #[arg(long, value_name = "URL")]
-        public_url: Option<String>,
-        /// Managed-child lifecycle: also exit cleanly when stdin reaches EOF.
-        #[arg(long, hide = true)]
-        managed_child: bool,
-    },
+    Mcp(McpArgs),
     /// Inspect provider holds or clear one with owner corrective evidence.
-    Provider {
-        #[command(subcommand)]
-        command: ProviderCommand,
-    },
+    Provider(ProviderArgs),
     /// Read owner-registered project authority.
-    Project {
-        #[command(subcommand)]
-        command: ProjectCommand,
-    },
+    Project(ProjectArgs),
     /// Read or explicitly catch up one startup-loaded rule.
-    Rule {
-        #[command(subcommand)]
-        command: RuleCommand,
-    },
+    Rule(RuleArgs),
     /// Read or manually run a startup-loaded timer.
-    Timer {
-        #[command(subcommand)]
-        command: TimerCommand,
-    },
+    Timer(TimerArgs),
     /// Set, read or drive one Agent's Eliot-mode Goal.
-    Goal {
-        #[command(subcommand)]
-        command: GoalCommand,
-    },
+    Goal(GoalArgs),
     /// Discover one page of native sessions through an explicit profile.
-    Discover {
-        #[arg(long, value_name = "PROFILE")]
-        profile: String,
-        #[arg(long, value_name = "HARNESS")]
-        harness: Option<String>,
-        #[arg(long, value_name = "SCOPE")]
-        scope: Option<String>,
-        #[arg(long, value_name = "CURSOR")]
-        cursor: Option<String>,
-        #[arg(long)]
-        archived: bool,
-        #[command(flatten)]
-        page: PageArgs,
-    },
+    Discover(DiscoverArgs),
     /// Attach to an exact native subject without taking control of it.
-    Attach {
-        #[arg(long, value_name = "PROFILE")]
-        profile: String,
-        #[arg(long, value_name = "HARNESS")]
-        harness: String,
-        #[arg(long, value_name = "SCOPE")]
-        scope: String,
-        #[arg(long = "ref", value_name = "REF")]
-        native_ref: String,
-        #[arg(long, value_name = "LABEL")]
-        project: Option<String>,
-    },
+    Attach(AttachArgs),
     /// Start an Agent using the named profile.
-    Launch {
-        #[arg(long, value_name = "PROFILE")]
-        profile: String,
-        #[arg(long, value_name = "PATH")]
-        workspace: PathBuf,
-        #[arg(long, value_name = "BRANCH")]
-        worktree: Option<String>,
-        #[arg(long, value_name = "REF", requires = "worktree")]
-        base: Option<String>,
-        /// Launch as a child of this Agent; the child inherits its project.
-        #[arg(long, value_name = "AGENT")]
-        parent: Option<String>,
-        #[arg(value_name = "PROMPT")]
-        prompt: Option<String>,
-        #[arg(long)]
-        wait: bool,
-        #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
-        timeout_seconds: u64,
-    },
+    Launch(LaunchArgs),
     /// Send text to an existing Agent.
-    Send {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[arg(value_name = "TEXT", allow_hyphen_values = true)]
-        text: String,
-        #[arg(long)]
-        wait: bool,
-        /// Explicitly claim one eligible provider-hold probe for this send.
-        #[arg(long)]
-        probe: bool,
-        #[command(flatten)]
-        generation: GenerationArgs,
-        #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
-        timeout_seconds: u64,
-    },
+    Send(SendArgs),
     /// Resume a retained native session, optionally with new input.
-    Resume {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[arg(value_name = "PROMPT", allow_hyphen_values = true)]
-        prompt: Option<String>,
-        #[arg(long)]
-        wait: bool,
-        #[command(flatten)]
-        generation: GenerationArgs,
-    },
+    Resume(ResumeArgs),
     /// Steer the exact active turn.
-    Steer {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[arg(value_name = "TEXT", allow_hyphen_values = true)]
-        text: String,
-        #[command(flatten)]
-        generation: GenerationArgs,
-        #[arg(long, value_name = "TURN")]
-        turn: Option<String>,
-    },
+    Steer(SteerArgs),
     /// Queue system context for the next input or the exact active turn's safe point.
-    Inject {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[arg(value_name = "TEXT", allow_hyphen_values = true)]
-        text: String,
-        #[arg(long, value_parser = ["next_input", "turn_safe_point", "active_turn"], default_value = "next_input")]
-        point: String,
-        #[command(flatten)]
-        generation: GenerationArgs,
-        #[arg(long, value_name = "TURN")]
-        turn: Option<String>,
-        #[arg(long, value_name = "MS")]
-        expires_at_ms: Option<i64>,
-    },
+    Inject(InjectCliArgs),
     /// Interrupt the exact active turn. `abort` is an alias.
     #[command(alias = "abort")]
-    Interrupt {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[command(flatten)]
-        generation: GenerationArgs,
-        #[arg(long, value_name = "TURN")]
-        turn: Option<String>,
-    },
+    Interrupt(InterruptArgs),
     /// Approve a pending native request.
-    Approve {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[command(flatten)]
-        generation: GenerationArgs,
-        #[arg(long, value_name = "REQUEST")]
-        request: Option<String>,
-        #[arg(long, value_name = "CHOICE_ID")]
-        choice: Option<String>,
-        #[arg(long, value_name = "FEEDBACK")]
-        feedback: Option<String>,
-    },
+    Approve(ApproveArgs),
     /// Deny a pending native request.
-    Deny {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[command(flatten)]
-        generation: GenerationArgs,
-        #[arg(long, value_name = "REQUEST")]
-        request: Option<String>,
-        #[arg(long, value_name = "CHOICE_ID")]
-        choice: Option<String>,
-        #[arg(long, value_name = "FEEDBACK")]
-        feedback: Option<String>,
-    },
+    Deny(DenyArgs),
     /// Answer a pending native question from a bounded JSON file.
-    Answer {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[arg(long, value_name = "PATH")]
-        answers_file: PathBuf,
-        #[command(flatten)]
-        generation: GenerationArgs,
-        #[arg(long, value_name = "REQUEST")]
-        request: Option<String>,
-    },
+    Answer(AnswerArgs),
     /// List Agents.
-    Ls {
-        #[arg(long, value_name = "AGENT")]
-        after: Option<String>,
-        #[command(flatten)]
-        page: PageArgs,
-    },
+    Ls(LsArgs),
     /// Read one page of Agents with their current cached observations.
-    Top {
-        #[arg(long, value_name = "AGENT")]
-        after: Option<String>,
-        #[command(flatten)]
-        page: PageArgs,
-    },
+    Top(TopArgs),
     /// Show one Agent.
-    Show { agent: String },
+    Show(ShowArgs),
     /// Read one page of an Agent's process records.
-    Processes {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[command(flatten)]
-        generation: ReadGenerationArgs,
-        #[arg(long, default_value = "agent", value_name = "SCOPE")]
-        scope: String,
-        #[arg(long, value_name = "CURSOR")]
-        after: Option<String>,
-        #[command(flatten)]
-        page: PageArgs,
-    },
+    Processes(ProcessesArgs),
     /// Read an Agent's ephemeral process statistics.
-    Stats {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[command(flatten)]
-        generation: ReadGenerationArgs,
-    },
+    Stats(StatsArgs),
     /// Read the current Git snapshot for an Agent's workspace.
-    GitStatus {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[command(flatten)]
-        generation: ReadGenerationArgs,
-    },
+    GitStatus(GitStatusArgs),
     /// Read one page of edits attributed to an Agent by native file-change hints.
-    Edits {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[command(flatten)]
-        generation: ReadGenerationArgs,
-        #[arg(long, value_name = "PATH")]
-        after: Option<String>,
-        #[command(flatten)]
-        page: PageArgs,
-    },
+    Edits(EditsArgs),
     /// Follow new committed events; use --after to replay retained history.
-    Watch {
-        agent: Option<String>,
-        /// Exclusive replay cursor. Omitted: start at the current journal tip.
-        #[arg(long, value_name = "SEQ")]
-        after: Option<i64>,
-    },
+    Watch(WatchArgs),
     /// Read an Agent's retained turn results.
-    Result {
-        agent: String,
-        #[command(flatten)]
-        generation: GenerationArgs,
-        #[arg(long, value_name = "TURN")]
-        turn_id: Option<String>,
-        #[command(flatten)]
-        page: PageArgs,
-    },
+    Result(ResultArgs),
     /// Read a bounded, private page of native or rollout history.
-    History {
-        agent: String,
-        #[command(flatten)]
-        generation: ReadGenerationArgs,
-        #[arg(long, default_value = "native", value_name = "SOURCE", value_parser = ["native", "rollout"])]
-        source: String,
-        #[arg(long, value_name = "VIEW", value_parser = ["subject", "turns", "items"])]
-        view: String,
-        #[arg(long, value_name = "TURN")]
-        turn_id: Option<String>,
-        #[arg(long, value_name = "CURSOR")]
-        cursor: Option<String>,
-        #[command(flatten)]
-        page: PageArgs,
-    },
+    History(HistoryArgs),
     /// Detach Eliot's observer from an Agent generation.
-    Detach {
-        agent: String,
-        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(1..))]
-        generation: Option<i64>,
-    },
+    Detach(DetachArgs),
     /// Stop an Agent.
-    Stop {
-        agent: String,
-        #[arg(long)]
-        force: bool,
-        /// Stop the Agent's whole subtree instead of just the Agent.
-        #[arg(long, conflicts_with = "generation")]
-        tree: bool,
-        #[command(flatten)]
-        generation: GenerationArgs,
-    },
+    Stop(StopArgs),
     /// Manage an Agent's retained worktree.
-    Worktree {
-        #[command(subcommand)]
-        command: WorktreeCommand,
-    },
+    Worktree(WorktreeArgs),
     /// Inspect a command.
-    Cmd {
-        #[command(subcommand)]
-        command: CmdCommand,
-    },
+    Cmd(CmdArgs),
     /// Resolve an unknown turn with an exact owner assertion.
-    Turn {
-        #[command(subcommand)]
-        command: TurnCommand,
-    },
+    Turn(TurnArgs),
     /// Read committed events after a sequence number.
-    Events {
-        #[arg(long, value_name = "SEQ")]
-        since: Option<i64>,
-        #[command(flatten)]
-        page: PageArgs,
-    },
+    Events(EventsArgs),
     /// Send, read or acknowledge addressed Agent mail.
-    Msg {
-        #[command(subcommand)]
-        command: MsgCommand,
-    },
+    Msg(MsgArgs),
     /// Read one page of unread mail for a mailbox.
-    Inbox {
-        #[arg(value_name = "AGENT")]
-        agent: Option<String>,
-        #[arg(long)]
-        limit: Option<usize>,
-        #[arg(long, value_name = "DELIVERY")]
-        after: Option<String>,
-        #[arg(long, value_name = "SECS")]
-        wait: Option<u64>,
-    },
+    Inbox(InboxArgs),
     /// Read or compare-and-swap shared variables.
-    Var {
-        #[command(subcommand)]
-        command: VarCommand,
-    },
+    Var(VarArgs),
     /// Show current workers and their file areas.
-    Who {
-        #[arg(long, value_name = "PROJECT")]
-        project: Option<String>,
-        /// Include bounded recent Git history per worker.
-        #[arg(long)]
-        history: bool,
-    },
+    Who(WhoArgs),
     /// Set, list or release advisory work claims.
-    Claim {
-        #[command(subcommand)]
-        command: ClaimCommand,
-    },
+    Claim(ClaimArgs),
     /// Internal plugin entry point used by the daemon.
     #[command(hide = true)]
-    Plugin {
-        #[command(subcommand)]
-        command: PluginCommand,
-    },
+    Plugin(PluginArgs),
+}
+
+#[derive(Args)]
+struct McpArgs {
+    /// Serve StreamableHTTP on 127.0.0.1 instead of stdio.
+    #[arg(long)]
+    http: bool,
+    /// Loopback port for --http; 0 selects an ephemeral port (actual address is printed in the ready frame).
+    #[arg(long, default_value_t = 0)]
+    port: u16,
+    /// Public https tunnel URL (path /mcp) widening the --http Host/Origin checks; required with --managed-child.
+    #[arg(long, value_name = "URL")]
+    public_url: Option<String>,
+    /// Managed-child lifecycle: also exit cleanly when stdin reaches EOF.
+    #[arg(long, hide = true)]
+    managed_child: bool,
+}
+
+#[derive(Args)]
+struct ProviderArgs {
+    #[command(subcommand)]
+    command: ProviderCommand,
+}
+
+#[derive(Args)]
+struct ProjectArgs {
+    #[command(subcommand)]
+    command: ProjectCommand,
+}
+
+#[derive(Args)]
+struct RuleArgs {
+    #[command(subcommand)]
+    command: RuleCommand,
+}
+
+#[derive(Args)]
+struct TimerArgs {
+    #[command(subcommand)]
+    command: TimerCommand,
+}
+
+#[derive(Args)]
+struct GoalArgs {
+    #[command(subcommand)]
+    command: GoalCommand,
+}
+
+#[derive(Args)]
+struct DiscoverArgs {
+    #[arg(long, value_name = "PROFILE")]
+    profile: String,
+    #[arg(long, value_name = "HARNESS")]
+    harness: Option<String>,
+    #[arg(long, value_name = "SCOPE")]
+    scope: Option<String>,
+    #[arg(long, value_name = "CURSOR")]
+    cursor: Option<String>,
+    #[arg(long)]
+    archived: bool,
+    #[command(flatten)]
+    page: PageArgs,
+}
+
+#[derive(Args)]
+struct AttachArgs {
+    #[arg(long, value_name = "PROFILE")]
+    profile: String,
+    #[arg(long, value_name = "HARNESS")]
+    harness: String,
+    #[arg(long, value_name = "SCOPE")]
+    scope: String,
+    #[arg(long = "ref", value_name = "REF")]
+    native_ref: String,
+    #[arg(long, value_name = "LABEL")]
+    project: Option<String>,
+}
+
+#[derive(Args)]
+struct LaunchArgs {
+    #[arg(long, value_name = "PROFILE")]
+    profile: String,
+    #[arg(long, value_name = "PATH")]
+    workspace: PathBuf,
+    #[arg(long, value_name = "BRANCH")]
+    worktree: Option<String>,
+    #[arg(long, value_name = "REF", requires = "worktree")]
+    base: Option<String>,
+    /// Launch as a child of this Agent; the child inherits its project.
+    #[arg(long, value_name = "AGENT")]
+    parent: Option<String>,
+    #[arg(value_name = "PROMPT")]
+    prompt: Option<String>,
+    #[arg(long)]
+    wait: bool,
+    #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
+    timeout_seconds: u64,
+}
+
+#[derive(Args)]
+struct SendArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[arg(value_name = "TEXT", allow_hyphen_values = true)]
+    text: String,
+    #[arg(long)]
+    wait: bool,
+    /// Explicitly claim one eligible provider-hold probe for this send.
+    #[arg(long)]
+    probe: bool,
+    #[command(flatten)]
+    generation: GenerationArgs,
+    #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
+    timeout_seconds: u64,
+}
+
+#[derive(Args)]
+struct ResumeArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[arg(value_name = "PROMPT", allow_hyphen_values = true)]
+    prompt: Option<String>,
+    #[arg(long)]
+    wait: bool,
+    #[command(flatten)]
+    generation: GenerationArgs,
+}
+
+#[derive(Args)]
+struct SteerArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[arg(value_name = "TEXT", allow_hyphen_values = true)]
+    text: String,
+    #[command(flatten)]
+    generation: GenerationArgs,
+    #[arg(long, value_name = "TURN")]
+    turn: Option<String>,
+}
+
+#[derive(Args)]
+struct InjectCliArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[arg(value_name = "TEXT", allow_hyphen_values = true)]
+    text: String,
+    #[arg(long, value_parser = ["next_input", "turn_safe_point", "active_turn"], default_value = "next_input")]
+    point: String,
+    #[command(flatten)]
+    generation: GenerationArgs,
+    #[arg(long, value_name = "TURN")]
+    turn: Option<String>,
+    #[arg(long, value_name = "MS")]
+    expires_at_ms: Option<i64>,
+}
+
+#[derive(Args)]
+struct InterruptArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[command(flatten)]
+    generation: GenerationArgs,
+    #[arg(long, value_name = "TURN")]
+    turn: Option<String>,
+}
+
+#[derive(Args)]
+struct ApproveArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[command(flatten)]
+    generation: GenerationArgs,
+    #[arg(long, value_name = "REQUEST")]
+    request: Option<String>,
+    #[arg(long, value_name = "CHOICE_ID")]
+    choice: Option<String>,
+    #[arg(long, value_name = "FEEDBACK")]
+    feedback: Option<String>,
+}
+
+#[derive(Args)]
+struct DenyArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[command(flatten)]
+    generation: GenerationArgs,
+    #[arg(long, value_name = "REQUEST")]
+    request: Option<String>,
+    #[arg(long, value_name = "CHOICE_ID")]
+    choice: Option<String>,
+    #[arg(long, value_name = "FEEDBACK")]
+    feedback: Option<String>,
+}
+
+#[derive(Args)]
+struct AnswerArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[arg(long, value_name = "PATH")]
+    answers_file: PathBuf,
+    #[command(flatten)]
+    generation: GenerationArgs,
+    #[arg(long, value_name = "REQUEST")]
+    request: Option<String>,
+}
+
+#[derive(Args)]
+struct LsArgs {
+    #[arg(long, value_name = "AGENT")]
+    after: Option<String>,
+    #[command(flatten)]
+    page: PageArgs,
+}
+
+#[derive(Args)]
+struct TopArgs {
+    #[arg(long, value_name = "AGENT")]
+    after: Option<String>,
+    #[command(flatten)]
+    page: PageArgs,
+}
+
+#[derive(Args)]
+struct ShowArgs {
+    agent: String,
+}
+
+#[derive(Args)]
+struct ProcessesArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[command(flatten)]
+    generation: ReadGenerationArgs,
+    #[arg(long, default_value = "agent", value_name = "SCOPE")]
+    scope: String,
+    #[arg(long, value_name = "CURSOR")]
+    after: Option<String>,
+    #[command(flatten)]
+    page: PageArgs,
+}
+
+#[derive(Args)]
+struct StatsArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[command(flatten)]
+    generation: ReadGenerationArgs,
+}
+
+#[derive(Args)]
+struct GitStatusArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[command(flatten)]
+    generation: ReadGenerationArgs,
+}
+
+#[derive(Args)]
+struct EditsArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[command(flatten)]
+    generation: ReadGenerationArgs,
+    #[arg(long, value_name = "PATH")]
+    after: Option<String>,
+    #[command(flatten)]
+    page: PageArgs,
+}
+
+#[derive(Args)]
+struct WatchArgs {
+    agent: Option<String>,
+    /// Exclusive replay cursor. Omitted: start at the current journal tip.
+    #[arg(long, value_name = "SEQ")]
+    after: Option<i64>,
+}
+
+#[derive(Args)]
+struct ResultArgs {
+    agent: String,
+    #[command(flatten)]
+    generation: GenerationArgs,
+    #[arg(long, value_name = "TURN")]
+    turn_id: Option<String>,
+    #[command(flatten)]
+    page: PageArgs,
+}
+
+#[derive(Args)]
+struct HistoryArgs {
+    agent: String,
+    #[command(flatten)]
+    generation: ReadGenerationArgs,
+    #[arg(long, default_value = "native", value_name = "SOURCE", value_parser = ["native", "rollout"])]
+    source: String,
+    #[arg(long, value_name = "VIEW", value_parser = ["subject", "turns", "items"])]
+    view: String,
+    #[arg(long, value_name = "TURN")]
+    turn_id: Option<String>,
+    #[arg(long, value_name = "CURSOR")]
+    cursor: Option<String>,
+    #[command(flatten)]
+    page: PageArgs,
+}
+
+#[derive(Args)]
+struct DetachArgs {
+    agent: String,
+    #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(1..))]
+    generation: Option<i64>,
+}
+
+#[derive(Args)]
+struct StopArgs {
+    agent: String,
+    #[arg(long)]
+    force: bool,
+    /// Stop the Agent's whole subtree instead of just the Agent.
+    #[arg(long, conflicts_with = "generation")]
+    tree: bool,
+    #[command(flatten)]
+    generation: GenerationArgs,
+}
+
+#[derive(Args)]
+struct WorktreeArgs {
+    #[command(subcommand)]
+    command: WorktreeCommand,
+}
+
+#[derive(Args)]
+struct CmdArgs {
+    #[command(subcommand)]
+    command: CmdCommand,
+}
+
+#[derive(Args)]
+struct TurnArgs {
+    #[command(subcommand)]
+    command: TurnCommand,
+}
+
+#[derive(Args)]
+struct EventsArgs {
+    #[arg(long, value_name = "SEQ")]
+    since: Option<i64>,
+    #[command(flatten)]
+    page: PageArgs,
+}
+
+#[derive(Args)]
+struct MsgArgs {
+    #[command(subcommand)]
+    command: MsgCommand,
+}
+
+#[derive(Args)]
+struct InboxArgs {
+    #[arg(value_name = "AGENT")]
+    agent: Option<String>,
+    #[arg(long)]
+    limit: Option<usize>,
+    #[arg(long, value_name = "DELIVERY")]
+    after: Option<String>,
+    #[arg(long, value_name = "SECS")]
+    wait: Option<u64>,
+}
+
+#[derive(Args)]
+struct VarArgs {
+    #[command(subcommand)]
+    command: VarCommand,
+}
+
+#[derive(Args)]
+struct WhoArgs {
+    #[arg(long, value_name = "PROJECT")]
+    project: Option<String>,
+    /// Include bounded recent Git history per worker.
+    #[arg(long)]
+    history: bool,
+}
+
+#[derive(Args)]
+struct ClaimArgs {
+    #[command(subcommand)]
+    command: ClaimCommand,
+}
+
+#[derive(Args)]
+struct PluginArgs {
+    #[command(subcommand)]
+    command: PluginCommand,
 }
 
 #[derive(Args)]
@@ -474,262 +595,334 @@ struct ShutdownArgs {
 
 #[derive(Subcommand)]
 enum CmdCommand {
-    Show {
-        id: String,
-    },
+    Show(CmdShowArgs),
     /// Read one bounded page of a retained command expansion.
-    Children {
-        id: String,
-        #[arg(long, value_name = "ID")]
-        after: Option<String>,
-        #[command(flatten)]
-        page: PageArgs,
-    },
+    Children(CmdChildrenArgs),
     /// Resolve an unknown command to its owner-asserted terminal state.
-    Resolve {
-        command_id: String,
-        #[arg(long = "as", value_name = "STATE")]
-        resolution: String,
-        #[arg(long, value_name = "TEXT")]
-        reason: String,
-    },
+    Resolve(CmdResolveArgs),
+}
+
+#[derive(Args)]
+struct CmdShowArgs {
+    id: String,
+}
+
+#[derive(Args)]
+struct CmdChildrenArgs {
+    id: String,
+    #[arg(long, value_name = "ID")]
+    after: Option<String>,
+    #[command(flatten)]
+    page: PageArgs,
+}
+
+#[derive(Args)]
+struct CmdResolveArgs {
+    command_id: String,
+    #[arg(long = "as", value_name = "STATE")]
+    resolution: String,
+    #[arg(long, value_name = "TEXT")]
+    reason: String,
 }
 
 #[derive(Subcommand)]
 enum TurnCommand {
     /// Resolve an unknown turn to its owner-asserted terminal status.
-    Resolve {
-        agent: String,
-        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
-        generation: i64,
-        #[arg(long, value_name = "TURN")]
-        turn_id: String,
-        #[arg(long, value_name = "STATUS")]
-        status: String,
-        #[arg(long, value_name = "TEXT")]
-        reason: String,
-    },
+    Resolve(TurnResolveArgs),
+}
+
+#[derive(Args)]
+struct TurnResolveArgs {
+    agent: String,
+    #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
+    generation: i64,
+    #[arg(long, value_name = "TURN")]
+    turn_id: String,
+    #[arg(long, value_name = "STATUS")]
+    status: String,
+    #[arg(long, value_name = "TEXT")]
+    reason: String,
 }
 
 #[derive(Subcommand)]
 enum MsgCommand {
     /// Queue one message to the named recipients.
-    Send {
-        #[arg(long, value_name = "AGENT")]
-        to: Vec<String>,
-        #[arg(value_name = "TEXT", allow_hyphen_values = true)]
-        text: String,
-        #[arg(long, value_name = "LABEL")]
-        thread: Option<String>,
-        #[arg(long, value_name = "DELIVERY")]
-        reply_to: Option<String>,
-        #[arg(long, value_parser = ["queue", "send", "steer", "inject"], default_value = "queue")]
-        mode: String,
-    },
+    Send(MsgSendArgs),
     /// Read one exact delivery without marking it.
-    Show {
-        #[arg(value_name = "DELIVERY")]
-        delivery: String,
-        #[arg(long, value_name = "AGENT")]
-        agent: Option<String>,
-    },
+    Show(MsgShowArgs),
     /// Acknowledge exact delivery ids.
-    Ack {
-        #[arg(long, value_name = "DELIVERY")]
-        delivery: Vec<String>,
-        #[arg(long, value_name = "AGENT")]
-        agent: Option<String>,
-    },
+    Ack(MsgAckArgs),
+}
+
+#[derive(Args)]
+struct MsgSendArgs {
+    #[arg(long, value_name = "AGENT")]
+    to: Vec<String>,
+    #[arg(value_name = "TEXT", allow_hyphen_values = true)]
+    text: String,
+    #[arg(long, value_name = "LABEL")]
+    thread: Option<String>,
+    #[arg(long, value_name = "DELIVERY")]
+    reply_to: Option<String>,
+    #[arg(long, value_parser = ["queue", "send", "steer", "inject"], default_value = "queue")]
+    mode: String,
+}
+
+#[derive(Args)]
+struct MsgShowArgs {
+    #[arg(value_name = "DELIVERY")]
+    delivery: String,
+    #[arg(long, value_name = "AGENT")]
+    agent: Option<String>,
+}
+
+#[derive(Args)]
+struct MsgAckArgs {
+    #[arg(long, value_name = "DELIVERY")]
+    delivery: Vec<String>,
+    #[arg(long, value_name = "AGENT")]
+    agent: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum VarCommand {
     /// Write one variable, optionally guarded by its expected version.
-    Set {
-        #[arg(value_name = "KEY")]
-        key: String,
-        #[arg(value_name = "VALUE", allow_hyphen_values = true)]
-        value: String,
-        #[arg(long, value_name = "SCOPE")]
-        scope: Option<String>,
-        /// Parse VALUE as JSON instead of storing it as a string.
-        #[arg(long)]
-        as_json: bool,
-        #[arg(long, value_name = "N", value_parser = clap::value_parser!(i64).range(0..))]
-        expect_version: Option<i64>,
-        #[arg(long, value_name = "TEXT")]
-        note: Option<String>,
-    },
+    Set(VarSetArgs),
     /// Read one variable value with its version and writer.
-    Get {
-        #[arg(value_name = "KEY")]
-        key: String,
-        #[arg(long, value_name = "SCOPE")]
-        scope: Option<String>,
-    },
+    Get(VarGetArgs),
+}
+
+#[derive(Args)]
+struct VarSetArgs {
+    #[arg(value_name = "KEY")]
+    key: String,
+    #[arg(value_name = "VALUE", allow_hyphen_values = true)]
+    value: String,
+    #[arg(long, value_name = "SCOPE")]
+    scope: Option<String>,
+    /// Parse VALUE as JSON instead of storing it as a string.
+    #[arg(long)]
+    as_json: bool,
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(i64).range(0..))]
+    expect_version: Option<i64>,
+    #[arg(long, value_name = "TEXT")]
+    note: Option<String>,
+}
+
+#[derive(Args)]
+struct VarGetArgs {
+    #[arg(value_name = "KEY")]
+    key: String,
+    #[arg(long, value_name = "SCOPE")]
+    scope: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum ClaimCommand {
     /// Claim a project-relative glob for an Agent generation.
-    Set {
-        #[arg(value_name = "GLOB")]
-        glob: String,
-        #[arg(long, value_name = "AGENT")]
-        agent: Option<String>,
-        #[arg(long, value_name = "TEXT")]
-        note: Option<String>,
-        /// Claim lifetime in seconds (1 to 86400, default 3600).
-        #[arg(long, value_name = "SECS")]
-        ttl_secs: Option<u64>,
-    },
+    Set(ClaimSetArgs),
     /// List live claims in scope.
-    List {
-        #[arg(long, value_name = "PROJECT")]
-        project: Option<String>,
-        #[arg(long, value_name = "AGENT")]
-        agent: Option<String>,
-    },
+    List(ClaimListArgs),
     /// Release one live claim.
-    Release {
-        #[arg(value_name = "GLOB")]
-        glob: String,
-        #[arg(long, value_name = "AGENT")]
-        agent: Option<String>,
-    },
+    Release(ClaimReleaseArgs),
+}
+
+#[derive(Args)]
+struct ClaimSetArgs {
+    #[arg(value_name = "GLOB")]
+    glob: String,
+    #[arg(long, value_name = "AGENT")]
+    agent: Option<String>,
+    #[arg(long, value_name = "TEXT")]
+    note: Option<String>,
+    /// Claim lifetime in seconds (1 to 86400, default 3600).
+    #[arg(long, value_name = "SECS")]
+    ttl_secs: Option<u64>,
+}
+
+#[derive(Args)]
+struct ClaimListArgs {
+    #[arg(long, value_name = "PROJECT")]
+    project: Option<String>,
+    #[arg(long, value_name = "AGENT")]
+    agent: Option<String>,
+}
+
+#[derive(Args)]
+struct ClaimReleaseArgs {
+    #[arg(value_name = "GLOB")]
+    glob: String,
+    #[arg(long, value_name = "AGENT")]
+    agent: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum ProviderCommand {
     /// Read one bounded page of durable provider holds.
-    Holds {
-        #[arg(long, value_name = "SCOPE")]
-        after: Option<String>,
-        #[arg(long)]
-        limit: Option<usize>,
-    },
+    Holds(ProviderHoldsArgs),
     /// Clear a provider hold with exact owner corrective evidence.
-    ClearHold {
-        #[arg(value_name = "SCOPE")]
-        scope: String,
-        #[arg(
-            long,
-            value_name = "EVIDENCE",
-            value_parser = ["credentials_updated", "configuration_updated", "owner_verified"]
-        )]
-        corrective_evidence: String,
-        #[arg(long, value_name = "ID")]
-        expected_probe_command: Option<String>,
-    },
+    ClearHold(ProviderClearHoldArgs),
+}
+
+#[derive(Args)]
+struct ProviderHoldsArgs {
+    #[arg(long, value_name = "SCOPE")]
+    after: Option<String>,
+    #[arg(long)]
+    limit: Option<usize>,
+}
+
+#[derive(Args)]
+struct ProviderClearHoldArgs {
+    #[arg(value_name = "SCOPE")]
+    scope: String,
+    #[arg(
+        long,
+        value_name = "EVIDENCE",
+        value_parser = ["credentials_updated", "configuration_updated", "owner_verified"]
+    )]
+    corrective_evidence: String,
+    #[arg(long, value_name = "ID")]
+    expected_probe_command: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum RuleCommand {
     /// Show the loaded rule state and current/retiring cursor progress.
-    Show {
-        id: String,
-        #[arg(long, value_name = "PROJECT")]
-        project: Option<String>,
-    },
+    Show(RuleShowArgs),
     /// Process one finite committed-event range through the ordinary rule path.
-    CatchUp {
-        #[arg(value_name = "ID")]
-        rule: String,
-        #[arg(long, value_name = "SEQ", value_parser = clap::value_parser!(i64).range(0..))]
-        after: i64,
-        #[arg(long, value_name = "SEQ", value_parser = clap::value_parser!(i64).range(0..))]
-        through: Option<i64>,
-        #[arg(long, value_name = "PROJECT")]
-        project: Option<String>,
-    },
+    CatchUp(RuleCatchUpArgs),
+}
+
+#[derive(Args)]
+struct RuleShowArgs {
+    id: String,
+    #[arg(long, value_name = "PROJECT")]
+    project: Option<String>,
+}
+
+#[derive(Args)]
+struct RuleCatchUpArgs {
+    #[arg(value_name = "ID")]
+    rule: String,
+    #[arg(long, value_name = "SEQ", value_parser = clap::value_parser!(i64).range(0..))]
+    after: i64,
+    #[arg(long, value_name = "SEQ", value_parser = clap::value_parser!(i64).range(0..))]
+    through: Option<i64>,
+    #[arg(long, value_name = "PROJECT")]
+    project: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum TimerCommand {
     /// Show the current timer schedule and durable UTC slot state.
-    Show {
-        id: String,
-        #[arg(long, value_name = "PROJECT")]
-        project: Option<String>,
-    },
+    Show(TimerShowArgs),
     /// Run one timer action using a durable mutation ID.
-    Run {
-        #[arg(value_name = "ID")]
-        rule: String,
-        #[arg(long, value_name = "PROJECT")]
-        project: Option<String>,
-    },
+    Run(TimerRunArgs),
+}
+
+#[derive(Args)]
+struct TimerShowArgs {
+    id: String,
+    #[arg(long, value_name = "PROJECT")]
+    project: Option<String>,
+}
+
+#[derive(Args)]
+struct TimerRunArgs {
+    #[arg(value_name = "ID")]
+    rule: String,
+    #[arg(long, value_name = "PROJECT")]
+    project: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum GoalCommand {
     /// Set (or replace) the Agent's Eliot-mode Goal with an explicit check command.
-    Set {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
-        mode: String,
-        #[arg(long, value_name = "TEXT")]
-        text: String,
-        /// Explicit check argv; pass last since it consumes the remaining arguments.
-        #[arg(long, num_args = 1.., allow_hyphen_values = true, value_name = "ARG")]
-        check: Vec<String>,
-        #[arg(long, value_name = "PATH")]
-        check_cwd: Option<String>,
-        #[arg(long, value_name = "MS")]
-        check_timeout_ms: Option<i64>,
-        #[arg(long, value_name = "N")]
-        max_turns: Option<i64>,
-        #[arg(long, value_name = "N")]
-        max_rounds: Option<i64>,
-        #[arg(long, value_name = "N")]
-        max_without_progress: Option<i64>,
-        /// Cadence in milliseconds; a cadenced Goal rounds on anchored
-        /// time slots instead of idle events.
-        #[arg(long, value_name = "MS")]
-        cadence_ms: Option<i64>,
-    },
+    Set(GoalSetArgs),
     /// Show the Goal definition, counters, budgets and limits.
-    Show {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
-        mode: String,
-    },
+    Show(GoalShowArgs),
     /// Pause the Goal; a paused Goal takes no rounds.
-    Pause {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
-        mode: String,
-        #[arg(long, value_name = "REASON")]
-        reason: Option<String>,
-    },
+    Pause(GoalPauseArgs),
     /// Clear the Goal; only `set` revives a cleared Goal.
-    Clear {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
-        mode: String,
-    },
+    Clear(GoalClearArgs),
     /// Resume a paused Goal on its bound generation.
-    Resume {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
-        mode: String,
-    },
+    Resume(GoalResumeArgs),
     /// Run one round keyed by the exact idle event seq or cadence slot.
-    Round {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
-        mode: String,
-        #[arg(long, value_name = "SEQ", value_parser = clap::value_parser!(i64).range(0..))]
-        idle_seq: Option<i64>,
-        #[arg(long, value_name = "N", value_parser = clap::value_parser!(i64).range(1..))]
-        slot: Option<i64>,
-    },
+    Round(GoalRoundArgs),
+}
+
+#[derive(Args)]
+struct GoalSetArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
+    mode: String,
+    #[arg(long, value_name = "TEXT")]
+    text: String,
+    /// Explicit check argv; pass last since it consumes the remaining arguments.
+    #[arg(long, num_args = 1.., allow_hyphen_values = true, value_name = "ARG")]
+    check: Vec<String>,
+    #[arg(long, value_name = "PATH")]
+    check_cwd: Option<String>,
+    #[arg(long, value_name = "MS")]
+    check_timeout_ms: Option<i64>,
+    #[arg(long, value_name = "N")]
+    max_turns: Option<i64>,
+    #[arg(long, value_name = "N")]
+    max_rounds: Option<i64>,
+    #[arg(long, value_name = "N")]
+    max_without_progress: Option<i64>,
+    /// Cadence in milliseconds; a cadenced Goal rounds on anchored
+    /// time slots instead of idle events.
+    #[arg(long, value_name = "MS")]
+    cadence_ms: Option<i64>,
+}
+
+#[derive(Args)]
+struct GoalShowArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
+    mode: String,
+}
+
+#[derive(Args)]
+struct GoalPauseArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
+    mode: String,
+    #[arg(long, value_name = "REASON")]
+    reason: Option<String>,
+}
+
+#[derive(Args)]
+struct GoalClearArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
+    mode: String,
+}
+
+#[derive(Args)]
+struct GoalResumeArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
+    mode: String,
+}
+
+#[derive(Args)]
+struct GoalRoundArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
+    mode: String,
+    #[arg(long, value_name = "SEQ", value_parser = clap::value_parser!(i64).range(0..))]
+    idle_seq: Option<i64>,
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(i64).range(1..))]
+    slot: Option<i64>,
 }
 
 #[derive(Subcommand)]
@@ -737,18 +930,26 @@ enum ProjectCommand {
     /// List owner-registered projects and their authority bounds.
     List,
     /// Show one owner-registered project readback.
-    Show { id: String },
+    Show(ProjectShowArgs),
+}
+
+#[derive(Args)]
+struct ProjectShowArgs {
+    id: String,
 }
 
 #[derive(Subcommand)]
 enum WorktreeCommand {
     /// Remove a terminal Agent's clean worktree while retaining its branch.
-    Remove {
-        #[arg(value_name = "AGENT")]
-        agent: String,
-        #[command(flatten)]
-        generation: ReadGenerationArgs,
-    },
+    Remove(WorktreeRemoveArgs),
+}
+
+#[derive(Args)]
+struct WorktreeRemoveArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    #[command(flatten)]
+    generation: ReadGenerationArgs,
 }
 
 #[derive(Subcommand)]
@@ -858,29 +1059,33 @@ impl Failure {
     }
 }
 
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    run(cli)
+}
+
 #[tokio::main]
-async fn main() -> ExitCode {
-    // The derived CLI parser overflows the 1 MiB Windows main-thread stack
-    // once the `who`/`claim` subcommands are added, so parse on a roomy
-    // thread instead. Measured in a debug build with a direct `Cli::parse`:
-    // the pre-PR parser prints `swarm --version` and exits 0, while with
-    // `who`/`claim` every probe (`--version`, `status`, `who`, `claim list`,
-    // `--help`) dies in `Cli::parse` with STATUS_STACK_OVERFLOW before any
-    // output. Help/version still exit from the parser. A `/STACK` link arg
-    // for the binary is a later follow-up.
-    let cli = std::thread::Builder::new()
-        .name("cli-parse".to_owned())
-        .stack_size(8 * 1024 * 1024)
-        .spawn(Cli::parse)
-        .expect("spawn CLI parser")
-        .join()
-        .expect("CLI parser panicked");
+async fn run(cli: Cli) -> ExitCode {
     let data_dir = match resolve_data_dir(cli.data_dir.as_deref()) {
         Ok(path) => path,
         Err(failure) => return report_failure(failure),
     };
 
-    match dispatch(cli, data_dir).await {
+    let Cli {
+        json: json_output,
+        id,
+        command,
+        ..
+    } = cli;
+    // Build top-level help before entering dispatch's large async frame.
+    let Some(command) = command else {
+        let mut command = Cli::command();
+        let _ = command.print_help();
+        println!();
+        return ExitCode::SUCCESS;
+    };
+
+    match dispatch(command, data_dir, json_output, id).await {
         Ok(exit_code) => ExitCode::from(exit_code),
         Err(failure) => report_failure(failure),
     }
@@ -923,14 +1128,12 @@ fn resolve_data_dir(argument: Option<&Path>) -> Result<PathBuf, Failure> {
     ))
 }
 
-async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
-    let Cli {
-        json: json_output,
-        id,
-        command,
-        ..
-    } = cli;
-
+async fn dispatch(
+    command: CliCommand,
+    data_dir: PathBuf,
+    json_output: bool,
+    id: Option<String>,
+) -> Result<u8, Failure> {
     // The concrete request/response pair stays at each read caller. Binding is
     // checked before any response data is printed.
     macro_rules! read_and_print {
@@ -951,13 +1154,6 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             Ok(0)
         }};
     }
-
-    let Some(command) = command else {
-        let mut command = Cli::command();
-        let _ = command.print_help();
-        println!();
-        return Ok(0);
-    };
 
     match command {
         CliCommand::Daemon(args) => {
@@ -1003,12 +1199,12 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 }
             }
         }
-        CliCommand::Mcp {
+        CliCommand::Mcp(McpArgs {
             http,
             port,
             public_url,
             managed_child,
-        } => {
+        }) => {
             if json_output {
                 return Err(Failure::new(
                     2,
@@ -1042,8 +1238,8 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 DaemonStatusResponse
             )
         }
-        CliCommand::Provider { command } => match command {
-            ProviderCommand::Holds { after, limit } => {
+        CliCommand::Provider(ProviderArgs { command }) => match command {
+            ProviderCommand::Holds(ProviderHoldsArgs { after, limit }) => {
                 let request = ProviderHoldsRequest { after, limit };
                 request
                     .validate()
@@ -1060,11 +1256,11 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 print_value(&value, json_output);
                 Ok(0)
             }
-            ProviderCommand::ClearHold {
+            ProviderCommand::ClearHold(ProviderClearHoldArgs {
                 scope,
                 corrective_evidence,
                 expected_probe_command,
-            } => {
+            }) => {
                 let corrective_evidence: ProviderCorrectiveEvidence =
                     serde_json::from_value(Value::String(corrective_evidence))
                         .map_err(|_| Failure::new(2, "invalid provider corrective evidence"))?;
@@ -1090,7 +1286,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 Ok(0)
             }
         },
-        CliCommand::Project { command } => match command {
+        CliCommand::Project(ProjectArgs { command }) => match command {
             ProjectCommand::List => {
                 let response = eliot_daemon::client_call(&data_dir, "project.list", json!({}))
                     .await
@@ -1109,7 +1305,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 print_value(&response, json_output);
                 Ok(0)
             }
-            ProjectCommand::Show { id } => {
+            ProjectCommand::Show(ProjectShowArgs { id }) => {
                 let response: ProjectRegistrationView =
                     eliot_daemon::client_call_typed(&data_dir, "project.get", &json!({"id":id}))
                         .await
@@ -1123,20 +1319,20 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 Ok(0)
             }
         },
-        CliCommand::Rule { command } => match command {
-            RuleCommand::Show { id, project } => {
+        CliCommand::Rule(RuleArgs { command }) => match command {
+            RuleCommand::Show(RuleShowArgs { id, project }) => {
                 let request = match project {
                     Some(project) => RuleGetRequest::new(id).in_project(project),
                     None => RuleGetRequest::new(id),
                 };
                 read_and_print!("rule.get", request, RuleStateView)
             }
-            RuleCommand::CatchUp {
+            RuleCommand::CatchUp(RuleCatchUpArgs {
                 rule,
                 after,
                 through,
                 project,
-            } => {
+            }) => {
                 let request = RuleCatchUpRequest::new(mutation_id(id)?, rule, after, through);
                 let request = match project {
                     Some(project) => request.in_project(project),
@@ -1158,15 +1354,15 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 Ok(exit_code)
             }
         },
-        CliCommand::Timer { command } => match command {
-            TimerCommand::Show { id, project } => {
+        CliCommand::Timer(TimerArgs { command }) => match command {
+            TimerCommand::Show(TimerShowArgs { id, project }) => {
                 let request = match project {
                     Some(project) => TimerGetRequest::new(id).in_project(project),
                     None => TimerGetRequest::new(id),
                 };
                 read_and_print!("timer.get", request, TimerStateView)
             }
-            TimerCommand::Run { rule, project } => {
+            TimerCommand::Run(TimerRunArgs { rule, project }) => {
                 let request = TimerRunRequest::new(mutation_id(id)?, rule);
                 let request = match project {
                     Some(project) => request.in_project(project),
@@ -1188,8 +1384,8 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 Ok(exit_code)
             }
         },
-        CliCommand::Goal { command } => match command {
-            GoalCommand::Set {
+        CliCommand::Goal(GoalArgs { command }) => match command {
+            GoalCommand::Set(GoalSetArgs {
                 agent,
                 mode,
                 text,
@@ -1200,7 +1396,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 max_rounds,
                 max_without_progress,
                 cadence_ms,
-            } => {
+            }) => {
                 let request = GoalSetRequest {
                     id: mutation_id(id)?,
                     agent,
@@ -1232,18 +1428,18 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 print_value(&value, json_output);
                 Ok(0)
             }
-            GoalCommand::Show { agent, mode } => {
+            GoalCommand::Show(GoalShowArgs { agent, mode }) => {
                 let request = GoalGetRequest {
                     agent,
                     mode: goal_mode(&mode)?,
                 };
                 read_and_print!("goal.get", request, GoalView)
             }
-            GoalCommand::Pause {
+            GoalCommand::Pause(GoalPauseArgs {
                 agent,
                 mode,
                 reason,
-            } => {
+            }) => {
                 let request = GoalPauseRequest {
                     id: mutation_id(id)?,
                     agent,
@@ -1265,7 +1461,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 print_value(&value, json_output);
                 Ok(0)
             }
-            GoalCommand::Clear { agent, mode } => {
+            GoalCommand::Clear(GoalClearArgs { agent, mode }) => {
                 let request = GoalClearRequest {
                     id: mutation_id(id)?,
                     agent,
@@ -1286,7 +1482,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 print_value(&value, json_output);
                 Ok(0)
             }
-            GoalCommand::Resume { agent, mode } => {
+            GoalCommand::Resume(GoalResumeArgs { agent, mode }) => {
                 let request = GoalResumeRequest {
                     id: mutation_id(id)?,
                     agent,
@@ -1307,12 +1503,12 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 print_value(&value, json_output);
                 Ok(0)
             }
-            GoalCommand::Round {
+            GoalCommand::Round(GoalRoundArgs {
                 agent,
                 mode,
                 idle_seq,
                 slot,
-            } => {
+            }) => {
                 if idle_seq.is_none() == slot.is_none() {
                     return Err(Failure::new(
                         2,
@@ -1342,14 +1538,14 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 Ok(0)
             }
         },
-        CliCommand::Discover {
+        CliCommand::Discover(DiscoverArgs {
             profile,
             harness,
             scope,
             cursor,
             archived,
             page: PageArgs { limit },
-        } => {
+        }) => {
             validate_limit(limit)?;
             let params = AgentDiscoverRequest {
                 profile,
@@ -1361,13 +1557,13 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             };
             read_and_print!("agent.discover", params, DiscoverPage)
         }
-        CliCommand::Attach {
+        CliCommand::Attach(AttachArgs {
             profile,
             harness,
             scope,
             native_ref,
             project,
-        } => {
+        }) => {
             let mut args = json!({
                 "mode": "observe",
                 "profile": profile,
@@ -1381,7 +1577,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             let params = submit_request(id, None, "attach", args)?;
             submit_and_print(&data_dir, &params, json_output).await
         }
-        CliCommand::Launch {
+        CliCommand::Launch(LaunchArgs {
             profile,
             workspace,
             worktree,
@@ -1390,7 +1586,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             prompt,
             wait,
             timeout_seconds,
-        } => {
+        }) => {
             if profile.is_empty() {
                 return Err(Failure::new(2, "--profile must not be empty"));
             }
@@ -1443,14 +1639,14 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             print_value(&completed, json_output);
             Ok(exit_code)
         }
-        CliCommand::Send {
+        CliCommand::Send(SendArgs {
             agent,
             text,
             wait,
             probe,
             generation: GenerationArgs { generation },
             timeout_seconds,
-        } => {
+        }) => {
             validate_text(Some(&text))?;
             let deadline = if wait {
                 Some(wait_deadline(timeout_seconds)?)
@@ -1476,12 +1672,12 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             print_value(&turn_value(completed)?, json_output);
             Ok(exit_code)
         }
-        CliCommand::Resume {
+        CliCommand::Resume(ResumeArgs {
             agent,
             prompt,
             wait,
             generation: GenerationArgs { generation },
-        } => {
+        }) => {
             validate_text(prompt.as_deref())?;
             let deadline = if wait {
                 Some(wait_deadline(DEFAULT_WAIT_SECONDS)?)
@@ -1521,26 +1717,26 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             print_value(&completed, json_output);
             Ok(exit_code)
         }
-        CliCommand::Steer {
+        CliCommand::Steer(SteerArgs {
             agent,
             text,
             generation: GenerationArgs { generation },
             turn,
-        } => {
+        }) => {
             validate_text(Some(&text))?;
             let mut params = submit_request(id, Some(agent), "steer", json!({ "text": text }))?;
             params.expected_generation = generation;
             params.expected_turn_id = turn;
             submit_and_print(&data_dir, &params, json_output).await
         }
-        CliCommand::Inject {
+        CliCommand::Inject(InjectCliArgs {
             agent,
             text,
             point,
             generation: GenerationArgs { generation },
             turn,
             expires_at_ms,
-        } => {
+        }) => {
             validate_text(Some(&text))?;
             let point = match point.as_str() {
                 "next_input" => InjectPoint::NextInput,
@@ -1564,23 +1760,23 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             params.expected_turn_id = turn;
             submit_and_print(&data_dir, &params, json_output).await
         }
-        CliCommand::Interrupt {
+        CliCommand::Interrupt(InterruptArgs {
             agent,
             generation: GenerationArgs { generation },
             turn,
-        } => {
+        }) => {
             let mut params = submit_request(id, Some(agent), "interrupt", json!({}))?;
             params.expected_generation = generation;
             params.expected_turn_id = turn;
             submit_and_print(&data_dir, &params, json_output).await
         }
-        CliCommand::Approve {
+        CliCommand::Approve(ApproveArgs {
             agent,
             generation: GenerationArgs { generation },
             request,
             choice,
             feedback,
-        } => {
+        }) => {
             let mut params = submit_request(
                 id,
                 Some(agent),
@@ -1591,13 +1787,13 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             params.request_id = request;
             submit_and_print(&data_dir, &params, json_output).await
         }
-        CliCommand::Deny {
+        CliCommand::Deny(DenyArgs {
             agent,
             generation: GenerationArgs { generation },
             request,
             choice,
             feedback,
-        } => {
+        }) => {
             let mut params = submit_request(
                 id,
                 Some(agent),
@@ -1608,12 +1804,12 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             params.request_id = request;
             submit_and_print(&data_dir, &params, json_output).await
         }
-        CliCommand::Answer {
+        CliCommand::Answer(AnswerArgs {
             agent,
             answers_file,
             generation: GenerationArgs { generation },
             request,
-        } => {
+        }) => {
             let answers = read_answers_file(&answers_file)?;
             let mut params =
                 submit_request(id, Some(agent), "answer", json!({ "answers": answers }))?;
@@ -1621,10 +1817,10 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             params.request_id = request;
             submit_and_print(&data_dir, &params, json_output).await
         }
-        CliCommand::Ls {
+        CliCommand::Ls(LsArgs {
             after,
             page: PageArgs { limit },
-        } => {
+        }) => {
             validate_limit(limit)?;
             let params = AgentListRequest {
                 after,
@@ -1633,10 +1829,10 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             };
             read_and_print!("agent.list", params, AgentListResponse)
         }
-        CliCommand::Top {
+        CliCommand::Top(TopArgs {
             after,
             page: PageArgs { limit },
-        } => {
+        }) => {
             validate_limit(limit)?;
             let params = AgentListRequest {
                 after,
@@ -1645,16 +1841,16 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             };
             read_and_print!("agent.list", params, AgentListResponse)
         }
-        CliCommand::Show { agent } => {
+        CliCommand::Show(ShowArgs { agent }) => {
             read_and_print!("agent.get", AgentGetRequest::new(agent), AgentGetResponse)
         }
-        CliCommand::Processes {
+        CliCommand::Processes(ProcessesArgs {
             agent,
             generation: ReadGenerationArgs { generation },
             scope,
             after,
             page: PageArgs { limit },
-        } => {
+        }) => {
             validate_limit(limit)?;
             let params = AgentProcessesRequest {
                 id: agent,
@@ -1665,32 +1861,32 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             };
             read_and_print!("agent.processes", params, AgentProcessesResponse)
         }
-        CliCommand::Stats {
+        CliCommand::Stats(StatsArgs {
             agent,
             generation: ReadGenerationArgs { generation },
-        } => {
+        }) => {
             let params = AgentStatsRequest {
                 id: agent,
                 generation,
             };
             read_and_print!("agent.stats", params, AgentStatsResponse)
         }
-        CliCommand::GitStatus {
+        CliCommand::GitStatus(GitStatusArgs {
             agent,
             generation: ReadGenerationArgs { generation },
-        } => {
+        }) => {
             let params = AgentGitRequest {
                 id: agent,
                 generation,
             };
             read_and_print!("agent.git", params, AgentGitResponse)
         }
-        CliCommand::Edits {
+        CliCommand::Edits(EditsArgs {
             agent,
             generation: ReadGenerationArgs { generation },
             after,
             page: PageArgs { limit },
-        } => {
+        }) => {
             validate_limit(limit)?;
             let params = AgentEditsRequest {
                 id: agent,
@@ -1700,15 +1896,15 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             };
             read_and_print!("agent.edits", params, AgentEditsResponse)
         }
-        CliCommand::Watch { agent, after } => {
+        CliCommand::Watch(WatchArgs { agent, after }) => {
             watch(&data_dir, agent.as_deref(), after, json_output).await
         }
-        CliCommand::Result {
+        CliCommand::Result(ResultArgs {
             agent,
             generation: GenerationArgs { generation },
             turn_id,
             page: PageArgs { limit },
-        } => {
+        }) => {
             validate_limit(limit)?;
             let params = AgentResultRequest {
                 id: agent,
@@ -1718,7 +1914,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             };
             read_and_print!("agent.result", params, AgentResultResponse)
         }
-        CliCommand::History {
+        CliCommand::History(HistoryArgs {
             agent,
             generation: ReadGenerationArgs { generation },
             source,
@@ -1726,7 +1922,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             turn_id,
             cursor,
             page: PageArgs { limit },
-        } => {
+        }) => {
             validate_limit(limit)?;
             let params = AgentHistoryRequest {
                 id: agent,
@@ -1739,17 +1935,17 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             };
             read_and_print!("agent.history", params, ObservationPage)
         }
-        CliCommand::Detach { agent, generation } => {
+        CliCommand::Detach(DetachArgs { agent, generation }) => {
             let mut params = submit_request(id, Some(agent), "detach", json!({}))?;
             params.expected_generation = generation;
             submit_and_print(&data_dir, &params, json_output).await
         }
-        CliCommand::Stop {
+        CliCommand::Stop(StopArgs {
             agent,
             force,
             tree,
             generation: GenerationArgs { generation },
-        } => {
+        }) => {
             let mut params = submit_request(id, Some(agent), "stop", json!({ "force": force }))?;
             if tree {
                 params.selector = params.target.take().map(|agent| format!("tree:{agent}"));
@@ -1758,11 +1954,11 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             }
             submit_and_print(&data_dir, &params, json_output).await
         }
-        CliCommand::Worktree { command } => match command {
-            WorktreeCommand::Remove {
+        CliCommand::Worktree(WorktreeArgs { command }) => match command {
+            WorktreeCommand::Remove(WorktreeRemoveArgs {
                 agent,
                 generation: ReadGenerationArgs { generation },
-            } => {
+            }) => {
                 let deadline = wait_deadline(DEFAULT_WAIT_SECONDS)?;
                 let mut params = submit_request(id, Some(agent), "worktree.remove", json!({}))?;
                 params.expected_generation = generation;
@@ -1779,8 +1975,8 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 Ok(exit_code)
             }
         },
-        CliCommand::Cmd { command } => match command {
-            CmdCommand::Show { id } => {
+        CliCommand::Cmd(CmdArgs { command }) => match command {
+            CmdCommand::Show(CmdShowArgs { id }) => {
                 let params = CommandGetRequest::new(id);
                 params
                     .validate()
@@ -1796,11 +1992,11 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 print_value(&result, json_output);
                 Ok(0)
             }
-            CmdCommand::Children {
+            CmdCommand::Children(CmdChildrenArgs {
                 id,
                 after,
                 page: PageArgs { limit },
-            } => {
+            }) => {
                 validate_limit(limit)?;
                 let request = CommandChildrenRequest { id, after, limit };
                 request
@@ -1818,11 +2014,11 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 print_value(&value, json_output);
                 Ok(0)
             }
-            CmdCommand::Resolve {
+            CmdCommand::Resolve(CmdResolveArgs {
                 command_id,
                 resolution,
                 reason,
-            } => {
+            }) => {
                 let resolution = CommandResolution::parse(&resolution)
                     .map_err(|_| Failure::new(2, "--as must be applied or failed"))?;
                 let request = CommandResolveRequest {
@@ -1847,14 +2043,14 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 Ok(0)
             }
         },
-        CliCommand::Turn { command } => match command {
-            TurnCommand::Resolve {
+        CliCommand::Turn(TurnArgs { command }) => match command {
+            TurnCommand::Resolve(TurnResolveArgs {
                 agent,
                 generation,
                 turn_id,
                 status,
                 reason,
-            } => {
+            }) => {
                 let status = TurnResolveStatus::parse(&status).map_err(|_| {
                     Failure::new(2, "--status must be completed, failed, or interrupted")
                 })?;
@@ -1882,10 +2078,10 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 Ok(0)
             }
         },
-        CliCommand::Events {
+        CliCommand::Events(EventsArgs {
             since,
             page: PageArgs { limit },
-        } => {
+        }) => {
             validate_limit(limit)?;
             let params = EventsReadRequest {
                 after: since.unwrap_or(0),
@@ -1908,14 +2104,14 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             print_value(&result, json_output);
             Ok(0)
         }
-        CliCommand::Msg { command } => match command {
-            MsgCommand::Send {
+        CliCommand::Msg(MsgArgs { command }) => match command {
+            MsgCommand::Send(MsgSendArgs {
                 to,
                 text,
                 thread,
                 reply_to,
                 mode,
-            } => {
+            }) => {
                 let mode: MailMode = serde_json::from_value(Value::String(mode)).map_err(|_| {
                     Failure::new(2, "mail mode must be queue, send, steer or inject")
                 })?;
@@ -1942,7 +2138,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 print_value(&value, json_output);
                 Ok(0)
             }
-            MsgCommand::Show { delivery, agent } => {
+            MsgCommand::Show(MsgShowArgs { delivery, agent }) => {
                 let request = MailReadRequest {
                     agent,
                     delivery_id: delivery,
@@ -1962,7 +2158,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 print_value(&value, json_output);
                 Ok(0)
             }
-            MsgCommand::Ack { delivery, agent } => {
+            MsgCommand::Ack(MsgAckArgs { delivery, agent }) => {
                 let request = MailAckRequest {
                     id: mutation_id(id)?,
                     agent,
@@ -1984,12 +2180,12 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 Ok(0)
             }
         },
-        CliCommand::Inbox {
+        CliCommand::Inbox(InboxArgs {
             agent,
             limit,
             after,
             wait,
-        } => {
+        }) => {
             let request = MailInboxRequest {
                 agent,
                 limit,
@@ -2023,15 +2219,15 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 sleep(WAIT_POLL_INTERVAL).await;
             }
         }
-        CliCommand::Var { command } => match command {
-            VarCommand::Set {
+        CliCommand::Var(VarArgs { command }) => match command {
+            VarCommand::Set(VarSetArgs {
                 key,
                 value,
                 scope,
                 as_json,
                 expect_version,
                 note,
-            } => {
+            }) => {
                 let value = if as_json {
                     serde_json::from_str(&value)
                         .map_err(|_| Failure::new(2, "--as-json value must be valid JSON"))?
@@ -2061,7 +2257,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 print_value(&value, json_output);
                 Ok(0)
             }
-            VarCommand::Get { key, scope } => {
+            VarCommand::Get(VarGetArgs { key, scope }) => {
                 let request = VarGetRequest { scope, key };
                 request
                     .validate()
@@ -2079,13 +2275,13 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 Ok(0)
             }
         },
-        CliCommand::Who { project, history } => {
+        CliCommand::Who(WhoArgs { project, history }) => {
             run_who_command(&data_dir, json_output, project, history).await
         }
-        CliCommand::Claim { command } => {
+        CliCommand::Claim(ClaimArgs { command }) => {
             run_claim_command(&data_dir, json_output, id, command).await
         }
-        CliCommand::Plugin { command } => match command {
+        CliCommand::Plugin(PluginArgs { command }) => match command {
             PluginCommand::Codex => {
                 eliot_plugin_codex::run_codex()
                     .await
@@ -2158,12 +2354,12 @@ async fn run_claim_command(
     command: ClaimCommand,
 ) -> Result<u8, Failure> {
     match command {
-        ClaimCommand::Set {
+        ClaimCommand::Set(ClaimSetArgs {
             glob,
             agent,
             note,
             ttl_secs,
-        } => {
+        }) => {
             let request = ClaimSetRequest {
                 id: mutation_id(id)?,
                 agent,
@@ -2186,7 +2382,7 @@ async fn run_claim_command(
             print_value(&value, json_output);
             Ok(0)
         }
-        ClaimCommand::List { project, agent } => {
+        ClaimCommand::List(ClaimListArgs { project, agent }) => {
             let request = ClaimListRequest { project, agent };
             request
                 .validate()
@@ -2203,7 +2399,7 @@ async fn run_claim_command(
             print_value(&value, json_output);
             Ok(0)
         }
-        ClaimCommand::Release { glob, agent } => {
+        ClaimCommand::Release(ClaimReleaseArgs { glob, agent }) => {
             let request = ClaimReleaseRequest {
                 id: mutation_id(id)?,
                 agent,
@@ -2643,12 +2839,12 @@ mod tests {
                 panic!("approve/deny command required");
             };
             let (choice, feedback) = match command {
-                CliCommand::Approve {
+                CliCommand::Approve(ApproveArgs {
                     choice, feedback, ..
-                } => (choice, feedback),
-                CliCommand::Deny {
+                }) => (choice, feedback),
+                CliCommand::Deny(DenyArgs {
                     choice, feedback, ..
-                } => (choice, feedback),
+                }) => (choice, feedback),
                 _ => panic!("expected an approve or deny command"),
             };
             assert_eq!(
