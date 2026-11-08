@@ -140,6 +140,8 @@ fn commit_for(
     continuation: Option<GoalContinuation>,
 ) -> GoalRoundCommit {
     GoalRoundCommit {
+        id: Ulid::new().to_string(),
+        principal: "owner".to_owned(),
         agent: agent.to_owned(),
         mode: "eliot".to_owned(),
         expected_generation: 1,
@@ -177,13 +179,28 @@ fn claim(store: &mut Store, agent: &str, revision: i64, key: i64, now: i64) {
         .expect("probe before claim");
     store
         .goal_claim_round(
-            agent,
-            "eliot",
-            GoalRoundKey::Idle(key),
+            "owner",
+            &eliot_core::api::GoalRoundRequest {
+                id: Ulid::new().to_string(),
+                agent: (agent).to_owned(),
+                mode: GoalMode::parse("eliot").unwrap(),
+                idle_seq: match GoalRoundKey::Idle(key) {
+                    GoalRoundKey::Idle(seq) => Some(seq),
+                    _ => None,
+                },
+                slot: match GoalRoundKey::Idle(key) {
+                    GoalRoundKey::Slot(slot) => Some(slot),
+                    _ => None,
+                },
+            },
             revision,
             probe.spent_by_goal_continuation,
             now,
         )
+        .map(|claim| match claim {
+            super::GoalRoundClaim::Claimed { seq, .. } => seq,
+            super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+        })
         .expect("claim round");
 }
 
@@ -1029,11 +1046,21 @@ fn goal_commit_refuses_revision_and_event_drift() {
     );
     store
         .goal_abandon_round(
-            &agent,
-            "eliot",
-            1,
-            view.revision,
-            GoalRoundKey::Idle(key),
+            "owner",
+            &eliot_core::api::GoalRoundRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.to_owned(),
+                mode: GoalMode::parse("eliot").unwrap(),
+                idle_seq: match GoalRoundKey::Idle(key) {
+                    GoalRoundKey::Idle(seq) => Some(seq),
+                    _ => None,
+                },
+                slot: match GoalRoundKey::Idle(key) {
+                    GoalRoundKey::Slot(slot) => Some(slot),
+                    _ => None,
+                },
+            },
+            &eliot_core::Error::new("unknown", "round abandoned"),
             now + 3,
         )
         .unwrap();
@@ -1044,13 +1071,28 @@ fn goal_commit_refuses_revision_and_event_drift() {
     assert_eq!(
         store
             .goal_claim_round(
-                &agent,
-                "eliot",
-                GoalRoundKey::Idle(key),
+                "owner",
+                &eliot_core::api::GoalRoundRequest {
+                    id: Ulid::new().to_string(),
+                    agent: agent.to_owned(),
+                    mode: GoalMode::parse("eliot").unwrap(),
+                    idle_seq: match GoalRoundKey::Idle(key) {
+                        GoalRoundKey::Idle(seq) => Some(seq),
+                        _ => None,
+                    },
+                    slot: match GoalRoundKey::Idle(key) {
+                        GoalRoundKey::Slot(slot) => Some(slot),
+                        _ => None,
+                    }
+                },
                 current.revision,
                 false,
                 now + 4
             )
+            .map(|claim| match claim {
+                super::GoalRoundClaim::Claimed { seq, .. } => seq,
+                super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+            })
             .unwrap_err()
             .code,
         "stale_round"
@@ -1467,13 +1509,28 @@ fn goal_claim_refuses_a_second_round_while_one_is_in_flight() {
         assert_eq!(
             store
                 .goal_claim_round(
-                    &agent,
-                    "eliot",
-                    GoalRoundKey::Idle(other),
+                    "owner",
+                    &eliot_core::api::GoalRoundRequest {
+                        id: Ulid::new().to_string(),
+                        agent: agent.to_owned(),
+                        mode: GoalMode::parse("eliot").unwrap(),
+                        idle_seq: match GoalRoundKey::Idle(other) {
+                            GoalRoundKey::Idle(seq) => Some(seq),
+                            _ => None,
+                        },
+                        slot: match GoalRoundKey::Idle(other) {
+                            GoalRoundKey::Slot(slot) => Some(slot),
+                            _ => None,
+                        }
+                    },
                     view.revision,
                     false,
                     now + 2
                 )
+                .map(|claim| match claim {
+                    super::GoalRoundClaim::Claimed { seq, .. } => seq,
+                    super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+                })
                 .unwrap_err()
                 .code,
             "busy"
@@ -1489,21 +1546,41 @@ fn goal_claim_refuses_a_second_round_while_one_is_in_flight() {
     // Abandoning releases single flight but burns the key.
     store
         .goal_abandon_round(
-            &agent,
-            "eliot",
-            1,
-            view.revision,
-            GoalRoundKey::Idle(key),
+            "owner",
+            &eliot_core::api::GoalRoundRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.to_owned(),
+                mode: GoalMode::parse("eliot").unwrap(),
+                idle_seq: match GoalRoundKey::Idle(key) {
+                    GoalRoundKey::Idle(seq) => Some(seq),
+                    _ => None,
+                },
+                slot: match GoalRoundKey::Idle(key) {
+                    GoalRoundKey::Slot(slot) => Some(slot),
+                    _ => None,
+                },
+            },
+            &eliot_core::Error::new("unknown", "round abandoned"),
             now + 3,
         )
         .unwrap();
     store
         .goal_abandon_round(
-            &agent,
-            "eliot",
-            1,
-            view.revision,
-            GoalRoundKey::Idle(key),
+            "owner",
+            &eliot_core::api::GoalRoundRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.to_owned(),
+                mode: GoalMode::parse("eliot").unwrap(),
+                idle_seq: match GoalRoundKey::Idle(key) {
+                    GoalRoundKey::Idle(seq) => Some(seq),
+                    _ => None,
+                },
+                slot: match GoalRoundKey::Idle(key) {
+                    GoalRoundKey::Slot(slot) => Some(slot),
+                    _ => None,
+                },
+            },
+            &eliot_core::Error::new("unknown", "round abandoned"),
             now + 3,
         )
         .expect("abandon is idempotent");
@@ -1517,13 +1594,28 @@ fn goal_claim_refuses_a_second_round_while_one_is_in_flight() {
     assert_eq!(
         store
             .goal_claim_round(
-                &agent,
-                "eliot",
-                GoalRoundKey::Idle(key),
+                "owner",
+                &eliot_core::api::GoalRoundRequest {
+                    id: Ulid::new().to_string(),
+                    agent: agent.to_owned(),
+                    mode: GoalMode::parse("eliot").unwrap(),
+                    idle_seq: match GoalRoundKey::Idle(key) {
+                        GoalRoundKey::Idle(seq) => Some(seq),
+                        _ => None,
+                    },
+                    slot: match GoalRoundKey::Idle(key) {
+                        GoalRoundKey::Slot(slot) => Some(slot),
+                        _ => None,
+                    }
+                },
                 view.revision,
                 false,
                 now + 4
             )
+            .map(|claim| match claim {
+                super::GoalRoundClaim::Claimed { seq, .. } => seq,
+                super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+            })
             .unwrap_err()
             .code,
         "stale_round"
@@ -1739,11 +1831,21 @@ fn goal_commit_refuses_activity_admitted_during_the_check() {
     assert!(current.last_round_key.is_none());
     store
         .goal_abandon_round(
-            &agent,
-            "eliot",
-            1,
-            view.revision,
-            GoalRoundKey::Idle(key),
+            "owner",
+            &eliot_core::api::GoalRoundRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.to_owned(),
+                mode: GoalMode::parse("eliot").unwrap(),
+                idle_seq: match GoalRoundKey::Idle(key) {
+                    GoalRoundKey::Idle(seq) => Some(seq),
+                    _ => None,
+                },
+                slot: match GoalRoundKey::Idle(key) {
+                    GoalRoundKey::Slot(slot) => Some(slot),
+                    _ => None,
+                },
+            },
+            &eliot_core::Error::new("unknown", "round abandoned"),
             now + 2,
         )
         .unwrap();
@@ -1869,13 +1971,28 @@ fn goal_round_key_must_name_a_generation_event() {
     assert_eq!(
         store
             .goal_claim_round(
-                &agent,
-                "eliot",
-                GoalRoundKey::Idle(0),
+                "owner",
+                &eliot_core::api::GoalRoundRequest {
+                    id: Ulid::new().to_string(),
+                    agent: agent.to_owned(),
+                    mode: GoalMode::parse("eliot").unwrap(),
+                    idle_seq: match GoalRoundKey::Idle(0) {
+                        GoalRoundKey::Idle(seq) => Some(seq),
+                        _ => None,
+                    },
+                    slot: match GoalRoundKey::Idle(0) {
+                        GoalRoundKey::Slot(slot) => Some(slot),
+                        _ => None,
+                    }
+                },
                 view.revision,
                 false,
                 now + 1
             )
+            .map(|claim| match claim {
+                super::GoalRoundClaim::Claimed { seq, .. } => seq,
+                super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+            })
             .unwrap_err()
             .code,
         "stale_round"
@@ -2021,13 +2138,28 @@ fn goal_burned_key_survives_pause_and_resume() {
     assert_eq!(
         store
             .goal_claim_round(
-                &agent,
-                "eliot",
-                GoalRoundKey::Idle(key),
+                "owner",
+                &eliot_core::api::GoalRoundRequest {
+                    id: Ulid::new().to_string(),
+                    agent: agent.to_owned(),
+                    mode: GoalMode::parse("eliot").unwrap(),
+                    idle_seq: match GoalRoundKey::Idle(key) {
+                        GoalRoundKey::Idle(seq) => Some(seq),
+                        _ => None,
+                    },
+                    slot: match GoalRoundKey::Idle(key) {
+                        GoalRoundKey::Slot(slot) => Some(slot),
+                        _ => None,
+                    }
+                },
                 resumed.revision,
                 false,
                 now + 3
             )
+            .map(|claim| match claim {
+                super::GoalRoundClaim::Claimed { seq, .. } => seq,
+                super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+            })
             .unwrap_err()
             .code,
         "stale_round"
@@ -2128,6 +2260,8 @@ fn slot_commit_for(
     continuation: Option<GoalContinuation>,
 ) -> GoalRoundCommit {
     GoalRoundCommit {
+        id: Ulid::new().to_string(),
+        principal: "owner".to_owned(),
         agent: agent.to_owned(),
         mode: "eliot".to_owned(),
         expected_generation: 1,
@@ -2241,13 +2375,28 @@ fn goal_slot_round_trip_continues_then_completes() {
         .expect("first slot probes when due");
     let claim_seq = store
         .goal_claim_round(
-            &agent,
-            "eliot",
-            GoalRoundKey::Slot(1),
+            "owner",
+            &eliot_core::api::GoalRoundRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.to_owned(),
+                mode: GoalMode::parse("eliot").unwrap(),
+                idle_seq: match GoalRoundKey::Slot(1) {
+                    GoalRoundKey::Idle(seq) => Some(seq),
+                    _ => None,
+                },
+                slot: match GoalRoundKey::Slot(1) {
+                    GoalRoundKey::Slot(slot) => Some(slot),
+                    _ => None,
+                },
+            },
             set.revision,
             probe.spent_by_goal_continuation,
             first_due,
         )
+        .map(|claim| match claim {
+            super::GoalRoundClaim::Claimed { seq, .. } => seq,
+            super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+        })
         .expect("claim first slot");
     assert_eq!(claim_seq, store.high_water().unwrap());
     let first = store
@@ -2281,13 +2430,28 @@ fn goal_slot_round_trip_continues_then_completes() {
         .expect("second slot probes when due");
     let claim_seq = store
         .goal_claim_round(
-            &agent,
-            "eliot",
-            GoalRoundKey::Slot(2),
+            "owner",
+            &eliot_core::api::GoalRoundRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.to_owned(),
+                mode: GoalMode::parse("eliot").unwrap(),
+                idle_seq: match GoalRoundKey::Slot(2) {
+                    GoalRoundKey::Idle(seq) => Some(seq),
+                    _ => None,
+                },
+                slot: match GoalRoundKey::Slot(2) {
+                    GoalRoundKey::Slot(slot) => Some(slot),
+                    _ => None,
+                },
+            },
             first.view.revision,
             probe.spent_by_goal_continuation,
             second_due,
         )
+        .map(|claim| match claim {
+            super::GoalRoundClaim::Claimed { seq, .. } => seq,
+            super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+        })
         .expect("claim second slot");
     let second = store
         .goal_commit_round(
@@ -2333,7 +2497,29 @@ fn goal_slot_keys_validate_form_range_and_due() {
         );
         assert_eq!(
             store
-                .goal_claim_round(&agent, "eliot", key, set.revision, false, base)
+                .goal_claim_round(
+                    "owner",
+                    &eliot_core::api::GoalRoundRequest {
+                        id: Ulid::new().to_string(),
+                        agent: agent.to_owned(),
+                        mode: GoalMode::parse("eliot").unwrap(),
+                        idle_seq: match key {
+                            GoalRoundKey::Idle(seq) => Some(seq),
+                            _ => None,
+                        },
+                        slot: match key {
+                            GoalRoundKey::Slot(slot) => Some(slot),
+                            _ => None,
+                        }
+                    },
+                    set.revision,
+                    false,
+                    base
+                )
+                .map(|claim| match claim {
+                    super::GoalRoundClaim::Claimed { seq, .. } => seq,
+                    super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+                })
                 .unwrap_err()
                 .code,
             "invalid"
@@ -2349,13 +2535,28 @@ fn goal_slot_keys_validate_form_range_and_due() {
     assert_eq!(
         store
             .goal_claim_round(
-                &agent,
-                "eliot",
-                GoalRoundKey::Slot(9),
+                "owner",
+                &eliot_core::api::GoalRoundRequest {
+                    id: Ulid::new().to_string(),
+                    agent: agent.to_owned(),
+                    mode: GoalMode::parse("eliot").unwrap(),
+                    idle_seq: match GoalRoundKey::Slot(9) {
+                        GoalRoundKey::Idle(seq) => Some(seq),
+                        _ => None,
+                    },
+                    slot: match GoalRoundKey::Slot(9) {
+                        GoalRoundKey::Slot(slot) => Some(slot),
+                        _ => None,
+                    }
+                },
                 set.revision,
                 false,
                 base
             )
+            .map(|claim| match claim {
+                super::GoalRoundClaim::Claimed { seq, .. } => seq,
+                super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+            })
             .unwrap_err()
             .code,
         "stale_round"
@@ -2372,13 +2573,28 @@ fn goal_slot_keys_validate_form_range_and_due() {
     assert_eq!(
         store
             .goal_claim_round(
-                &agent,
-                "eliot",
-                GoalRoundKey::Idle(key),
+                "owner",
+                &eliot_core::api::GoalRoundRequest {
+                    id: Ulid::new().to_string(),
+                    agent: agent.to_owned(),
+                    mode: GoalMode::parse("eliot").unwrap(),
+                    idle_seq: match GoalRoundKey::Idle(key) {
+                        GoalRoundKey::Idle(seq) => Some(seq),
+                        _ => None,
+                    },
+                    slot: match GoalRoundKey::Idle(key) {
+                        GoalRoundKey::Slot(slot) => Some(slot),
+                        _ => None,
+                    }
+                },
                 set.revision,
                 false,
                 base
             )
+            .map(|claim| match claim {
+                super::GoalRoundClaim::Claimed { seq, .. } => seq,
+                super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+            })
             .unwrap_err()
             .code,
         "bad_state"
@@ -2427,22 +2643,47 @@ fn goal_slot_burn_ignores_revision_but_separates_forms() {
     let key = store.high_water().unwrap();
     let claim_seq = store
         .goal_claim_round(
-            &agent,
-            "eliot",
-            GoalRoundKey::Idle(key),
+            "owner",
+            &eliot_core::api::GoalRoundRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.to_owned(),
+                mode: GoalMode::parse("eliot").unwrap(),
+                idle_seq: match GoalRoundKey::Idle(key) {
+                    GoalRoundKey::Idle(seq) => Some(seq),
+                    _ => None,
+                },
+                slot: match GoalRoundKey::Idle(key) {
+                    GoalRoundKey::Slot(slot) => Some(slot),
+                    _ => None,
+                },
+            },
             set.revision,
             false,
             base,
         )
+        .map(|claim| match claim {
+            super::GoalRoundClaim::Claimed { seq, .. } => seq,
+            super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+        })
         .expect("claim idle key");
     assert_eq!(claim_seq, key);
     store
         .goal_abandon_round(
-            &agent,
-            "eliot",
-            1,
-            set.revision,
-            GoalRoundKey::Idle(key),
+            "owner",
+            &eliot_core::api::GoalRoundRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.to_owned(),
+                mode: GoalMode::parse("eliot").unwrap(),
+                idle_seq: match GoalRoundKey::Idle(key) {
+                    GoalRoundKey::Idle(seq) => Some(seq),
+                    _ => None,
+                },
+                slot: match GoalRoundKey::Idle(key) {
+                    GoalRoundKey::Slot(slot) => Some(slot),
+                    _ => None,
+                },
+            },
+            &eliot_core::Error::new("unknown", "round abandoned"),
             base,
         )
         .expect("abandon idle key");
@@ -2465,21 +2706,46 @@ fn goal_slot_burn_ignores_revision_but_separates_forms() {
         .expect("same number as a slot is not burned");
     store
         .goal_claim_round(
-            &agent,
-            "eliot",
-            GoalRoundKey::Slot(key),
+            "owner",
+            &eliot_core::api::GoalRoundRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.to_owned(),
+                mode: GoalMode::parse("eliot").unwrap(),
+                idle_seq: match GoalRoundKey::Slot(key) {
+                    GoalRoundKey::Idle(seq) => Some(seq),
+                    _ => None,
+                },
+                slot: match GoalRoundKey::Slot(key) {
+                    GoalRoundKey::Slot(slot) => Some(slot),
+                    _ => None,
+                },
+            },
             cadenced.revision,
             probe.spent_by_goal_continuation,
             due,
         )
+        .map(|claim| match claim {
+            super::GoalRoundClaim::Claimed { seq, .. } => seq,
+            super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+        })
         .expect("claim slot");
     store
         .goal_abandon_round(
-            &agent,
-            "eliot",
-            1,
-            cadenced.revision,
-            GoalRoundKey::Slot(key),
+            "owner",
+            &eliot_core::api::GoalRoundRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.to_owned(),
+                mode: GoalMode::parse("eliot").unwrap(),
+                idle_seq: match GoalRoundKey::Slot(key) {
+                    GoalRoundKey::Idle(seq) => Some(seq),
+                    _ => None,
+                },
+                slot: match GoalRoundKey::Slot(key) {
+                    GoalRoundKey::Slot(slot) => Some(slot),
+                    _ => None,
+                },
+            },
+            &eliot_core::Error::new("unknown", "round abandoned"),
             due,
         )
         .expect("abandon slot");
@@ -2508,13 +2774,28 @@ fn goal_slot_burn_ignores_revision_but_separates_forms() {
     assert_eq!(
         store
             .goal_claim_round(
-                &agent,
-                "eliot",
-                GoalRoundKey::Slot(key),
+                "owner",
+                &eliot_core::api::GoalRoundRequest {
+                    id: Ulid::new().to_string(),
+                    agent: agent.to_owned(),
+                    mode: GoalMode::parse("eliot").unwrap(),
+                    idle_seq: match GoalRoundKey::Slot(key) {
+                        GoalRoundKey::Idle(seq) => Some(seq),
+                        _ => None,
+                    },
+                    slot: match GoalRoundKey::Slot(key) {
+                        GoalRoundKey::Slot(slot) => Some(slot),
+                        _ => None,
+                    }
+                },
                 resumed.revision,
                 false,
                 due + 3
             )
+            .map(|claim| match claim {
+                super::GoalRoundClaim::Claimed { seq, .. } => seq,
+                super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+            })
             .unwrap_err()
             .code,
         "stale_round"
@@ -2543,13 +2824,28 @@ fn goal_slot_commit_refuses_events_during_the_check() {
     let due = base + MIN_GOAL_CADENCE_MS;
     let claim_seq = store
         .goal_claim_round(
-            &agent,
-            "eliot",
-            GoalRoundKey::Slot(1),
+            "owner",
+            &eliot_core::api::GoalRoundRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.to_owned(),
+                mode: GoalMode::parse("eliot").unwrap(),
+                idle_seq: match GoalRoundKey::Slot(1) {
+                    GoalRoundKey::Idle(seq) => Some(seq),
+                    _ => None,
+                },
+                slot: match GoalRoundKey::Slot(1) {
+                    GoalRoundKey::Slot(slot) => Some(slot),
+                    _ => None,
+                },
+            },
             set.revision,
             false,
             due,
         )
+        .map(|claim| match claim {
+            super::GoalRoundClaim::Claimed { seq, .. } => seq,
+            super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+        })
         .expect("claim slot");
     // A benign Git binding commits an Agent event without tripping any
     // gate; the slot commit still sees the high-water move.
@@ -3088,13 +3384,28 @@ fn goal_committed_slots_are_monotonic() {
         .expect("slot 9 probes when due");
     let claim_seq = store
         .goal_claim_round(
-            &agent,
-            "eliot",
-            GoalRoundKey::Slot(9),
+            "owner",
+            &eliot_core::api::GoalRoundRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.to_owned(),
+                mode: GoalMode::parse("eliot").unwrap(),
+                idle_seq: match GoalRoundKey::Slot(9) {
+                    GoalRoundKey::Idle(seq) => Some(seq),
+                    _ => None,
+                },
+                slot: match GoalRoundKey::Slot(9) {
+                    GoalRoundKey::Slot(slot) => Some(slot),
+                    _ => None,
+                },
+            },
             set.revision,
             probe.spent_by_goal_continuation,
             ninth_due,
         )
+        .map(|claim| match claim {
+            super::GoalRoundClaim::Claimed { seq, .. } => seq,
+            super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+        })
         .expect("claim slot 9");
     let committed = store
         .goal_commit_round(
@@ -3131,13 +3442,28 @@ fn goal_committed_slots_are_monotonic() {
     assert_eq!(
         store
             .goal_claim_round(
-                &agent,
-                "eliot",
-                GoalRoundKey::Slot(1),
+                "owner",
+                &eliot_core::api::GoalRoundRequest {
+                    id: Ulid::new().to_string(),
+                    agent: agent.to_owned(),
+                    mode: GoalMode::parse("eliot").unwrap(),
+                    idle_seq: match GoalRoundKey::Slot(1) {
+                        GoalRoundKey::Idle(seq) => Some(seq),
+                        _ => None,
+                    },
+                    slot: match GoalRoundKey::Slot(1) {
+                        GoalRoundKey::Slot(slot) => Some(slot),
+                        _ => None,
+                    }
+                },
                 committed.view.revision,
                 false,
-                ninth_due,
+                ninth_due
             )
+            .map(|claim| match claim {
+                super::GoalRoundClaim::Claimed { seq, .. } => seq,
+                super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+            })
             .unwrap_err()
             .code,
         "stale_round"
@@ -3199,13 +3525,28 @@ fn goal_reopen_reads_idle_and_slot_markers_as_unknown() {
             .expect("probe first slot");
         store
             .goal_claim_round(
-                &slot_agent,
-                "eliot",
-                GoalRoundKey::Slot(1),
+                "owner",
+                &eliot_core::api::GoalRoundRequest {
+                    id: Ulid::new().to_string(),
+                    agent: slot_agent.to_owned(),
+                    mode: GoalMode::parse("eliot").unwrap(),
+                    idle_seq: match GoalRoundKey::Slot(1) {
+                        GoalRoundKey::Idle(seq) => Some(seq),
+                        _ => None,
+                    },
+                    slot: match GoalRoundKey::Slot(1) {
+                        GoalRoundKey::Slot(slot) => Some(slot),
+                        _ => None,
+                    },
+                },
                 slot_view.revision,
                 probe.spent_by_goal_continuation,
                 first_due,
             )
+            .map(|claim| match claim {
+                super::GoalRoundClaim::Claimed { seq, .. } => seq,
+                super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+            })
             .expect("claim first slot");
         // Crash: the handle drops with both markers `running`.
         (idle_agent, idle_key, slot_agent)
@@ -3241,13 +3582,28 @@ fn goal_reopen_reads_idle_and_slot_markers_as_unknown() {
         assert_eq!(
             store
                 .goal_claim_round(
-                    agent,
-                    "eliot",
-                    key,
+                    "owner",
+                    &eliot_core::api::GoalRoundRequest {
+                        id: Ulid::new().to_string(),
+                        agent: (agent).to_owned(),
+                        mode: GoalMode::parse("eliot").unwrap(),
+                        idle_seq: match key {
+                            GoalRoundKey::Idle(seq) => Some(seq),
+                            _ => None,
+                        },
+                        slot: match key {
+                            GoalRoundKey::Slot(slot) => Some(slot),
+                            _ => None,
+                        }
+                    },
                     revision,
                     false,
                     base + MIN_GOAL_CADENCE_MS + 1
                 )
+                .map(|claim| match claim {
+                    super::GoalRoundClaim::Claimed { seq, .. } => seq,
+                    super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+                })
                 .unwrap_err()
                 .code,
             "stale_round"
@@ -3276,13 +3632,28 @@ fn goal_reopen_reads_idle_and_slot_markers_as_unknown() {
         .expect("probe the fresh slot");
     store
         .goal_claim_round(
-            &slot_agent,
-            "eliot",
-            GoalRoundKey::Slot(2),
+            "owner",
+            &eliot_core::api::GoalRoundRequest {
+                id: Ulid::new().to_string(),
+                agent: slot_agent.to_owned(),
+                mode: GoalMode::parse("eliot").unwrap(),
+                idle_seq: match GoalRoundKey::Slot(2) {
+                    GoalRoundKey::Idle(seq) => Some(seq),
+                    _ => None,
+                },
+                slot: match GoalRoundKey::Slot(2) {
+                    GoalRoundKey::Slot(slot) => Some(slot),
+                    _ => None,
+                },
+            },
             current_slot.revision,
             probe.spent_by_goal_continuation,
             second_due,
         )
+        .map(|claim| match claim {
+            super::GoalRoundClaim::Claimed { seq, .. } => seq,
+            super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
+        })
         .expect("claim the fresh slot");
     let mut states: Vec<(String, String)> = store
         .connection

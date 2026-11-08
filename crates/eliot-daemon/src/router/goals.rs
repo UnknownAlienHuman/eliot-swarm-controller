@@ -3,7 +3,8 @@
 //! A round probes the Goal and its Agent, runs the frozen check command
 //! through the shared script/process custody outside the Store lock, then
 //! commits one outcome only if generation, revision and round still match.
-//! Unknown check outcomes commit nothing and never authorize replay.
+//! Unknown check outcomes retain no Goal progress or continuation and never
+//! authorize another check; the reservation retains their error.
 use super::{Principal, Router, coordination::decode_coordination_request, require_owner};
 use crate::{
     common::now_ms,
@@ -13,14 +14,13 @@ use eliot_core::{
     AgentState, Error, Event, Result, SecretPolicy,
     api::{
         GoalClearRequest, GoalGetRequest, GoalMode, GoalPauseRequest, GoalResumeRequest,
-        GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalSetRequest, GoalStatus,
-        MAX_GOAL_OBSERVATION_BYTES,
+        GoalRoundRequest, GoalSetRequest, GoalStatus, MAX_GOAL_OBSERVATION_BYTES,
     },
     limits::MAX_FRAME_BYTES,
 };
 use eliot_plugin::sync::LockExt;
 use eliot_store::{
-    GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundCommit, GoalRoundKey,
+    GoalCheckResult, GoalContinuation, GoalRoundClaim, GoalRoundCommit, GoalRoundKey,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -42,6 +42,73 @@ pub(crate) type GoalCheckRunner = fn(
     Arc<SecretPolicy>,
     watch::Receiver<bool>,
 ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>>;
+
+/// Own the check future as well as its reservation. Dropping the RPC requests
+/// cancellation, but keeps the same future alive until its process supervisor
+/// settles custody; only then may the finalizer release single-flight.
+struct ClaimedGoalRound {
+    router: Router,
+    runtime: tokio::runtime::Handle,
+    principal: String,
+    request: GoalRoundRequest,
+    error: Error,
+    armed: bool,
+    cancellation: watch::Sender<bool>,
+    check: Option<Pin<Box<dyn Future<Output = ProcessOutcome> + Send>>>,
+    quiescent: bool,
+}
+
+impl ClaimedGoalRound {
+    fn complete(&mut self, result: Result<Value>) -> Result<Value> {
+        match &result {
+            Ok(_) => self.armed = false,
+            Err(error) => self.error = error.clone(),
+        }
+        result
+    }
+}
+
+impl Drop for ClaimedGoalRound {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let router = self.router.clone();
+        let principal = self.principal.clone();
+        let request = self.request.clone();
+        let mut error = self.error.clone();
+        let mut quiescent = self.quiescent;
+        self.cancellation.send_replace(true);
+        let check = self.check.take();
+        self.runtime.spawn(async move {
+            if let Some(check) = check {
+                // Await this exact invocation, never reconstruct or replay it.
+                // run_owned_process retains and drains its existing supervisor.
+                let outcome = check.await;
+                quiescent = goal_check_quiescent(&outcome);
+                if !quiescent {
+                    let policy = router.secret_policy_snapshot();
+                    error = match goal_check_result(outcome, &policy) {
+                        Err(error) => error,
+                        Ok(_) => Error::new("unknown", "goal check cleanup is unproven"),
+                    };
+                    crate::logging::record(
+                        &policy,
+                        "daemon.goal_check_cleanup_unproven",
+                        &[("agent", &request.agent)],
+                        None,
+                    );
+                }
+            }
+            // A previously retained terminal reply/error is never overwritten.
+            // A persistence failure faults the Store; restart resolves any
+            // remaining reservation under the old holder to unknown.
+            let _ = router
+                .settle_goal_round_error(&principal, &request, &error, quiescent)
+                .await;
+        });
+    }
+}
 
 pub(crate) fn real_goal_check(
     command: TokioCommand,
@@ -241,7 +308,7 @@ impl Router {
         params: &Value,
         principal: &Principal,
         run_check: GoalCheckRunner,
-        cancellation: watch::Receiver<bool>,
+        mut cancellation: watch::Receiver<bool>,
     ) -> Result<Value> {
         let request: GoalRoundRequest = decode_goal_request(
             params,
@@ -253,15 +320,15 @@ impl Router {
         require_eliot_mode(request.mode)?;
         ulid::Ulid::from_string(&request.id)
             .map_err(|_| Error::new("invalid", "mutation id must be a ULID"))?;
+        let principal = super::principal_name(principal);
+        let mut store = self.inner.store.lock().await;
+        if let Some(response) = store.goal_round_replay(&principal, &request, now_ms())? {
+            return serde_json::to_value(response)
+                .map_err(|_| Error::new("internal", "goal.round result could not be encoded"));
+        }
         let key = goal_round_key(&request)?;
-        let probe = {
-            self.inner.store.lock().await.goal_round_probe(
-                &request.agent,
-                request.mode.as_str(),
-                key,
-                now_ms(),
-            )?
-        };
+        let probe =
+            { store.goal_round_probe(&request.agent, request.mode.as_str(), key, now_ms())? };
         goal_round_gates(&probe, key)?;
         let definition = probe.view.definition.clone();
         let stdin = serde_json::to_vec(&json!({
@@ -280,15 +347,37 @@ impl Router {
         // The claim re-validates the probe and commits the durable in-flight
         // marker. Everything after it resolves the marker exactly once: the
         // commit consumes it, every other exit abandons it to `unknown`.
-        let claim_seq = {
-            self.inner.store.lock().await.goal_claim_round(
-                &request.agent,
-                request.mode.as_str(),
-                key,
+        let claim = {
+            store.goal_claim_round(
+                &principal,
+                &request,
                 probe.view.revision,
                 probe.spent_by_goal_continuation,
                 now_ms(),
             )?
+        };
+        drop(store);
+        let (claim_seq, continuation_id) = match claim {
+            GoalRoundClaim::Claimed {
+                seq,
+                continuation_id,
+            } => (seq, continuation_id),
+            GoalRoundClaim::Replay(response) => {
+                return serde_json::to_value(response)
+                    .map_err(|_| Error::new("internal", "goal.round result could not be encoded"));
+            }
+        };
+        let (check_cancellation, check_cancelled) = watch::channel(*cancellation.borrow());
+        let mut claimed = ClaimedGoalRound {
+            router: self.clone(),
+            runtime: tokio::runtime::Handle::current(),
+            principal: principal.clone(),
+            request: request.clone(),
+            error: Error::new("unknown", "goal round task ended without a retained result"),
+            armed: true,
+            cancellation: check_cancellation,
+            check: None,
+            quiescent: true,
         };
         let turns_used = probe
             .turn_count
@@ -306,9 +395,10 @@ impl Router {
             .is_some_and(|max| turns_used >= max)
             && !probe.spent_by_goal_continuation
         {
-            return self
-                .commit_goal_block(&request, &probe, key, claim_seq, "turn_limit")
+            let result = self
+                .commit_goal_block(&principal, &request, &probe, key, claim_seq, "turn_limit")
                 .await;
+            return claimed.complete(result);
         }
         let policy = self.secret_policy_snapshot();
         let mut command = TokioCommand::new(&definition.check[0]);
@@ -321,17 +411,47 @@ impl Router {
             command.current_dir(cwd);
         }
         let timeout = Duration::from_millis(definition.check_timeout_ms.max(0) as u64);
-        let outcome = run_check(command, stdin, timeout, Arc::clone(&policy), cancellation).await;
+        claimed.quiescent = false;
+        claimed.check = Some(run_check(
+            command,
+            stdin,
+            timeout,
+            Arc::clone(&policy),
+            check_cancelled,
+        ));
+        let outcome = {
+            let check = claimed
+                .check
+                .as_mut()
+                .expect("claimed check was just installed");
+            tokio::select! {
+                biased;
+                _ = async { let _ = cancellation.wait_for(|cancelled| *cancelled).await; } => {
+                    claimed.cancellation.send_replace(true);
+                    check.await
+                }
+                outcome = check.as_mut() => outcome,
+            }
+        };
+        // A completed future is never polled again. Carry its independent
+        // custody fact through error retention and cancellation of that await.
+        claimed.quiescent = goal_check_quiescent(&outcome);
+        claimed.check = None;
         let check = match goal_check_result(outcome, &policy) {
             Ok(check) => check,
             Err(error) => {
-                self.abandon_goal_round(&request, &probe).await;
-                return Err(error);
+                claimed.error = error.clone();
+                let retained = self
+                    .settle_goal_round_error(&principal, &request, &error, claimed.quiescent)
+                    .await;
+                return claimed.complete(Err(retained));
             }
         };
         if check.exit_code != Some(0) {
             let text = goal_continuation_text(&definition.text, &definition.check, &check, &policy);
             let commit = GoalRoundCommit {
+                id: request.id.clone(),
+                principal: principal.clone(),
                 agent: request.agent.clone(),
                 mode: request.mode.as_str().to_owned(),
                 expected_generation: probe.view.generation,
@@ -341,13 +461,16 @@ impl Router {
                 check: Some(check),
                 blocked_reason: None,
                 continuation: Some(GoalContinuation {
-                    id: request.id.clone(),
+                    id: continuation_id,
                     text,
                 }),
             };
-            return self.commit_goal_round(&request, commit).await;
+            let result = self.commit_goal_round(&principal, &request, commit).await;
+            return claimed.complete(result);
         }
         let commit = GoalRoundCommit {
+            id: request.id.clone(),
+            principal: principal.clone(),
             agent: request.agent.clone(),
             mode: request.mode.as_str().to_owned(),
             expected_generation: probe.view.generation,
@@ -358,11 +481,13 @@ impl Router {
             blocked_reason: None,
             continuation: None,
         };
-        self.commit_goal_round(&request, commit).await
+        let result = self.commit_goal_round(&principal, &request, commit).await;
+        claimed.complete(result)
     }
 
     async fn commit_goal_block(
         &self,
+        principal: &str,
         request: &GoalRoundRequest,
         probe: &eliot_store::GoalRoundProbe,
         key: GoalRoundKey,
@@ -370,6 +495,8 @@ impl Router {
         reason: &str,
     ) -> Result<Value> {
         let commit = GoalRoundCommit {
+            id: request.id.clone(),
+            principal: principal.to_owned(),
             agent: request.agent.clone(),
             mode: request.mode.as_str().to_owned(),
             expected_generation: probe.view.generation,
@@ -380,41 +507,42 @@ impl Router {
             blocked_reason: Some(reason.to_owned()),
             continuation: None,
         };
-        self.commit_goal_round(request, commit).await
+        self.commit_goal_round(principal, request, commit).await
     }
 
-    /// Burn a claimed round key without committing any outcome. Best
-    /// effort, but a failure is logged: abandon only fails when the Store
-    /// writer is already faulted, which fails loudly on the next use either
-    /// way.
-    async fn abandon_goal_round(
+    /// Retain the error; only proven custody closure may release the marker.
+    /// If persistence cannot prove that commit, return unknown and log it.
+    async fn settle_goal_round_error(
         &self,
+        principal: &str,
         request: &GoalRoundRequest,
-        probe: &eliot_store::GoalRoundProbe,
-    ) {
-        let Ok(key) = goal_round_key(request) else {
-            return;
+        error: &Error,
+        quiescent: bool,
+    ) -> Error {
+        let mut store = self.inner.store.lock().await;
+        let retained = if quiescent {
+            store.goal_abandon_round(principal, request, error, now_ms())
+        } else {
+            store.goal_hold_round_error(principal, request, error, now_ms())
         };
-        if let Err(error) = self.inner.store.lock().await.goal_abandon_round(
-            &request.agent,
-            request.mode.as_str(),
-            probe.view.generation,
-            probe.view.revision,
-            key,
-            now_ms(),
-        ) {
-            let policy = self.secret_policy_snapshot();
-            crate::logging::record(
-                &policy,
-                "daemon.goal_abandon_failed",
-                &[("agent", &request.agent)],
-                Some(&error),
-            );
+        match retained {
+            Ok(retained) => retained,
+            Err(error) => {
+                let policy = self.secret_policy_snapshot();
+                crate::logging::record(
+                    &policy,
+                    "daemon.goal_abandon_failed",
+                    &[("agent", &request.agent)],
+                    Some(&error),
+                );
+                Error::new("unknown", "goal round result could not be retained")
+            }
         }
     }
 
     async fn commit_goal_round(
         &self,
+        principal: &str,
         request: &GoalRoundRequest,
         commit: GoalRoundCommit,
     ) -> Result<Value> {
@@ -423,23 +551,22 @@ impl Router {
             let result = match store.goal_commit_round(&commit, now_ms()) {
                 Ok(result) => result,
                 Err(error) => {
-                    if let Err(abandon) = store.goal_abandon_round(
-                        &commit.agent,
-                        &commit.mode,
-                        commit.expected_generation,
-                        commit.expected_revision,
-                        commit.round_key,
-                        now_ms(),
-                    ) {
-                        let policy = self.secret_policy_snapshot();
-                        crate::logging::record(
-                            &policy,
-                            "daemon.goal_abandon_failed",
-                            &[("agent", &commit.agent)],
-                            Some(&abandon),
-                        );
+                    match store.goal_abandon_round(principal, request, &error, now_ms()) {
+                        Ok(retained) => return Err(retained),
+                        Err(abandon) => {
+                            let policy = self.secret_policy_snapshot();
+                            crate::logging::record(
+                                &policy,
+                                "daemon.goal_abandon_failed",
+                                &[("agent", &commit.agent)],
+                                Some(&abandon),
+                            );
+                            return Err(Error::new(
+                                "unknown",
+                                "goal round result could not be retained",
+                            ));
+                        }
                     }
-                    return Err(error);
                 }
             };
             if let Some(admission) = &result.admission {
@@ -465,24 +592,7 @@ impl Router {
             }
         }
         self.signal_progress();
-        let (outcome, reason, command_id) = match &result.outcome {
-            GoalCommitOutcome::Completed => (GoalRoundOutcome::Completed, None, None),
-            GoalCommitOutcome::Blocked { reason } => {
-                (GoalRoundOutcome::Blocked, Some(reason.clone()), None)
-            }
-            GoalCommitOutcome::Continued { command_id } => {
-                (GoalRoundOutcome::Continued, None, Some(command_id.clone()))
-            }
-        };
-        let response = GoalRoundResponse {
-            outcome,
-            reason,
-            command_id,
-            continuation: result.admission.as_ref().map(|admission| {
-                super::submit_result(&admission.command, admission.linked_command.as_ref())
-            }),
-            view: result.view,
-        };
+        let response = result.response;
         request.validate_response(&response)?;
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "goal.round result could not be encoded"))
@@ -804,6 +914,18 @@ async fn drive_goal_for_event(
             );
         }
     }
+}
+
+/// Completed/Failed captures are returned only after cleanup (or before spawn).
+/// Unknown explicitly carries whether family quiescence was established.
+fn goal_check_quiescent(outcome: &ProcessOutcome) -> bool {
+    !matches!(
+        outcome,
+        ProcessOutcome::Unknown {
+            quiescent: false,
+            ..
+        }
+    )
 }
 
 /// Interpret one owned check completion. Only a definite direct exit with

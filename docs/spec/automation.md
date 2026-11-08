@@ -860,7 +860,23 @@ Before the check runs, the round claims a durable single-flight marker for
 `(agent,generation,mode,revision,round_key,round_key_kind)` in the same
 Immediate transaction that re-validates the probe. A second `goal round` for
 the same Goal while a marker is running is refused without running anything.
-The final conditional commit requires that exact marker.
+The final conditional commit requires that exact marker. Before any external check,
+the claim transaction also reserves the request id in the existing `writes` table,
+bound to the principal, `goal.round` and canonical Agent/mode/key inputs. It checks
+both command/write namespaces and validates the age of an absent id. The reservation
+captures the generation, revision, key, holder and a distinct continuation ULID.
+The existing `<id>/send` admission requires a command parent; a round reservation
+is a write, so its continuation uses the frozen ULID through ordinary SEND admission.
+The [Goal DTOs](../../crates/eliot-core/src/api/goals.rs) bind the response to the
+round id and the optional continuation separately.
+
+Retained round replies and errors are resolved before current Goal gates: an exact
+retry never reruns the check or dispatches a continuation again, even after later
+Goal changes. A live duplicate is `busy`; a different binding is `id_conflict`.
+The final transaction consumes the marker, updates the Goal, admits any continuation
+and replaces the reservation with the full original response rendered from that
+same transaction connection. Stored round records use `MAX_FRAME_BYTES`, including
+their response; they are not subject to the smaller persisted-event budget.
 
 The check is the frozen explicit argv from `goal set`, run through the shared
 owned-process custody outside the Store lock with a bounded timeout, a small
@@ -874,10 +890,34 @@ optional ordinary `send` continuation admitted by the same transaction:
 completion on check exit 0, `round_budget`, `turn_limit` or `no_progress`
 block, or one continuation. Success always completes, even on a spent budget.
 An unknown check outcome (spawn/timeout/custody failure, or a check with no
-exit code such as a signal kill) commits nothing, and neither does a commit
-that finds the Agent left idle during the check: the marker goes `unknown`
+exit code such as a signal kill) commits no Goal progress or continuation, and
+neither does a commit that finds the Agent left idle during the check: the marker goes `unknown`
 and that round key is never rerun — the next round needs a new key. After a
-crash the marker stays `unknown`. Neither a failed check nor a missing
+crash the marker stays `unknown`. Abandonment burns its marker and retains the
+original sanitized error in one transaction. A reservation from a crashed holder
+is durably resolved to `unknown` on readback, without another check. Claim also
+preflights a bounded unknown recovery record. If the full error record exceeds
+the frame bound, abandonment retains and returns that unknown result atomically
+with the marker burn, rather than leaving a live running marker. Cancellation
+uses the existing owned-process cleanup before abandonment. The claimed-round guard
+owns the same check future passed to the existing process supervisor. Caller/RPC
+drop signals per-round cancellation and transfers that future to the finalizer,
+which awaits process/custody settlement before burning the marker; it never starts
+another invocation. Global cancellation is forwarded to the same per-round channel.
+While the check or its cleanup remains in flight, the running marker excludes every
+other round, including another due cadence slot. If cleanup reports unproven
+quiescence, both normal completion and the drop finalizer retain the original
+request error in `writes.result` without burning the running marker. Exact retries
+return that retained error; other rounds stay excluded even across later Goal
+changes. Request outcome and process-family closure are independent. The current
+process API provides no later closure receipt after an unproven outcome, so the
+live holder conservatively keeps exclusion; returning from the supervisor is not
+closure proof. A proven closure may burn the marker without replacing the retained
+error. Drop while awaiting the final Store lock also carries the observed custody
+fact and cannot turn an unproven outcome into a release. If runtime shutdown prevents finalization,
+a new holder resolves the reservation to `unknown`; this is not cleanup proof.
+A persistence failure faults the Store and leaves the reservation unresolved; it
+never authorizes rerun. Neither a failed check nor a missing
 terminal fact authorizes replay: a refused or unknown round admits no send.
 `goal show` reports the exact status, counters (with a live turn count),
 budgets, limits and the unresolved round marker if any; cost stays
