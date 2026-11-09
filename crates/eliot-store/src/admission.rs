@@ -28,6 +28,62 @@ pub(super) fn command_semantic_payload(request: &SubmitCommand, args: Value) -> 
     Ok(payload)
 }
 
+pub(super) fn command_payload_digest(request: &SubmitCommand) -> Result<Vec<u8>> {
+    if !request.args.is_object() {
+        return Err(Error::new("invalid", "command args must be a JSON object"));
+    }
+    if request.verb != "attach" && encode_json(request)?.len() > MAX_FRAME_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "command request exceeds 1 MiB",
+        ));
+    }
+    validate_ulid(&request.id)?;
+
+    let mut semantic_args = if request.verb == "git.fetch" {
+        serde_json::from_value::<core::api::FrozenGitFetch>(request.args.clone())
+            .map_err(|_| Error::new("invalid", "git.fetch args must be a frozen intent"))?
+            .binding_args()?
+    } else {
+        request.args.clone()
+    };
+    if request.verb == "attach" {
+        semantic_args
+            .as_object_mut()
+            .ok_or_else(|| Error::new("invalid", "attach args must be an object"))?
+            .remove("profile_snapshot");
+    }
+    let semantic_payload = command_semantic_payload(request, semantic_args)?;
+    canonical::digest(&semantic_payload)
+}
+
+pub(super) fn replay_command_binding(
+    connection: &Connection,
+    principal: &str,
+    request: &SubmitCommand,
+    payload_digest: &[u8],
+) -> Result<Option<Admission>> {
+    let Some((old_principal, old_method, old_digest)) = command_binding(connection, &request.id)?
+    else {
+        return Ok(None);
+    };
+    if old_principal != principal || old_method != COMMAND_METHOD || old_digest != payload_digest {
+        return Err(Error::new(
+            "id_conflict",
+            "command id is already bound to another principal, method, or payload",
+        ));
+    }
+    let command = load_command(connection, &request.id)?
+        .ok_or_else(|| Error::new("internal", "command binding exists without its command row"))?;
+    let linked_command = load_linked_command(connection, &request.id)?;
+    Ok(Some(Admission {
+        command,
+        linked_command,
+        events: Vec::new(),
+        is_new: false,
+    }))
+}
+
 /// Admit one tree-selector expansion: snapshot members once, admit one
 /// concrete child per member with the ordinary per-target gates, then the
 /// Store-only applied parent. Any failure rejects the whole expansion.
@@ -246,48 +302,9 @@ pub(super) fn submit_tx(
     }
     // Bound durable admission data here. Host checks the completed start
     // frame, including runtime environment and source state, before writing.
-    if request.verb != "attach" && encode_json(&request)?.len() > MAX_FRAME_BYTES {
-        return Err(Error::new(
-            "frame_too_large",
-            "command request exceeds 1 MiB",
-        ));
-    }
-    validate_ulid(&request.id)?;
-    let mut semantic_args = if request.verb == "git.fetch" {
-        serde_json::from_value::<core::api::FrozenGitFetch>(request.args.clone())
-            .map_err(|_| Error::new("invalid", "git.fetch args must be a frozen intent"))?
-            .binding_args()?
-    } else {
-        request.args.clone()
-    };
-    if request.verb == "attach" {
-        semantic_args
-            .as_object_mut()
-            .ok_or_else(|| Error::new("invalid", "attach args must be an object"))?
-            .remove("profile_snapshot");
-    }
-    let semantic_payload = command_semantic_payload(&request, semantic_args)?;
-    let payload_digest = canonical::digest(&semantic_payload)?;
-    if let Some((old_principal, old_method, old_digest)) = command_binding(tx, &request.id)? {
-        if old_principal != principal
-            || old_method != COMMAND_METHOD
-            || old_digest != payload_digest
-        {
-            return Err(Error::new(
-                "id_conflict",
-                "command id is already bound to another principal, method, or payload",
-            ));
-        }
-        let command = load_command(tx, &request.id)?.ok_or_else(|| {
-            Error::new("internal", "command binding exists without its command row")
-        })?;
-        let linked_command = load_linked_command(tx, &request.id)?;
-        return Ok(Admission {
-            command,
-            linked_command,
-            events: Vec::new(),
-            is_new: false,
-        });
+    let payload_digest = command_payload_digest(&request)?;
+    if let Some(admission) = replay_command_binding(tx, principal, &request, &payload_digest)? {
+        return Ok(admission);
     }
     if write_exists(tx, &request.id)? {
         return Err(Error::new(

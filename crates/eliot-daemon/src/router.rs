@@ -46,8 +46,8 @@ use eliot_core::{
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
 use eliot_store::{
-    ProjectRegistrationInput, RuleProcessingState, TimerDefinitionInput, TimerSlotAdmission,
-    TimerSlotCommit,
+    Admission, ProjectRegistrationInput, RuleProcessingState, TimerDefinitionInput,
+    TimerSlotAdmission, TimerSlotCommit,
 };
 use serde_json::{Value, json};
 use std::{
@@ -519,55 +519,95 @@ impl Router {
         principal: &Principal,
         remote: Option<&eliot_core::RemoteCallContext>,
     ) -> Result<Value> {
-        let request: CommandSubmitRequest = serde_json::from_value(params.clone())
+        let mut request: CommandSubmitRequest = serde_json::from_value(params.clone())
             .map_err(|_| Error::new("invalid", "command.submit params are malformed"))?;
         if request.verb == "git.fetch" {
             return self.submit_git_fetch(request, principal, remote).await;
         }
-        if matches!(request.verb.as_str(), "notify" | "emit") {
-            Self::validate_user_event_request(&request)?;
+
+        authorize_command(principal, &mut request)?;
+        self.authorize_submission_scope(&mut request, principal)
+            .await?;
+        let replay_request = request.clone();
+        if let Some(result) = self
+            .replay_command_submission(&mut request, principal, remote)
+            .await?
+        {
+            return Ok(result);
         }
-        let prepared = self.prepare_submission(request, principal).await?;
+        if matches!(request.verb.as_str(), "notify" | "emit")
+            && let Err(error) = Self::validate_user_event_request(&request)
+        {
+            let mut retry = replay_request.clone();
+            if let Some(result) = self
+                .replay_command_submission(&mut retry, principal, remote)
+                .await?
+            {
+                return Ok(result);
+            }
+            return Err(error);
+        }
+
+        let prepared = match self
+            .prepare_submission_after_authorization(request, principal, false, true)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let mut retry = replay_request.clone();
+                if let Some(result) = self
+                    .replay_command_submission(&mut retry, principal, remote)
+                    .await?
+                {
+                    return Ok(result);
+                }
+                return Err(error);
+            }
+        };
         let PreparedSubmission {
-            mut request,
-            workspace: mut preparation,
+            request,
+            workspace: preparation,
         } = prepared;
 
-        let admission = {
+        let submitted = {
             let mut store = self.inner.store.lock().await;
-            if request.verb == "answer" {
-                validate_answer_request(&store, &request)?;
-            }
             let principal = principal_name(principal);
-            let now = now_ms();
-            let submitted = store.submit_with_remote_context(
-                &principal,
-                request.clone(),
-                preparation.take(),
-                remote,
-                now,
-            );
-            let admission = match submitted {
-                Ok(admission) => admission,
-                Err(error) if error.code == "id_conflict" && request.verb == "launch" => {
-                    if let Some(retained) = retained_launch_profile(&store, &request)? {
-                        install_retained_profile(&mut request, retained)?;
-                        store.submit_with_remote_context(&principal, request, None, remote, now)?
-                    } else {
-                        return Err(error);
-                    }
-                }
-                Err(error) if error.code == "id_conflict" && request.verb == "attach" => {
-                    if install_retained_attach_profile(&store, &mut request)? {
-                        store.submit_with_remote_context(&principal, request, None, remote, now)?
-                    } else {
-                        return Err(error);
-                    }
-                }
-                Err(error) => return Err(error),
+            let validation = if request.verb == "answer" {
+                validate_answer_request(&store, &request)
+            } else {
+                Ok(())
             };
-            self.publish_locked(&admission.events);
-            admission
+            let submitted = validation.and_then(|()| {
+                store.submit_with_remote_context(
+                    &principal,
+                    request.clone(),
+                    preparation,
+                    remote,
+                    now_ms(),
+                )
+            });
+            match submitted {
+                Ok(admission) => {
+                    if !admission.events.is_empty() {
+                        self.publish_locked(&admission.events);
+                    }
+                    Ok(admission)
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let admission = match submitted {
+            Ok(admission) => admission,
+            Err(error) => {
+                let mut retry = replay_request;
+                if let Some(result) = self
+                    .replay_command_submission(&mut retry, principal, remote)
+                    .await?
+                {
+                    return Ok(result);
+                }
+                return Err(error);
+            }
         };
         if admission.command.state == CommandState::Unknown {
             self.inner
@@ -585,6 +625,53 @@ impl Router {
             admission.linked_command.as_ref(),
         ))
         .map_err(|_| Error::new("internal", "command admission result could not be encoded"))
+    }
+
+    async fn replay_command_submission(
+        &self,
+        request: &mut SubmitCommand,
+        principal: &Principal,
+        remote: Option<&eliot_core::RemoteCallContext>,
+    ) -> Result<Option<Value>> {
+        let store = self.inner.store.lock().await;
+        store.ensure_committed_reads()?;
+        match request.verb.as_str() {
+            "launch" => {
+                reject_launch_derived_keys(&request.args)?;
+                if let Some(retained) = retained_launch_profile(&store, request)? {
+                    align_retained_workspace_alias(request, retained.workspace.as_ref());
+                    install_retained_profile(request, retained)?;
+                }
+            }
+            "attach" => {
+                normalize_attach(request)?;
+                install_retained_attach_profile(&store, request)?;
+            }
+            "detach" => Self::hydrate_detach_generation_from_store(&store, request)?,
+            "resume" => normalize_resume(request)?,
+            _ => {}
+        }
+
+        let admission =
+            store.replay_command_submission(&principal_name(principal), request, remote)?;
+        admission
+            .map(|admission| self.retained_command_result(admission))
+            .transpose()
+    }
+
+    fn retained_command_result(&self, admission: Admission) -> Result<Value> {
+        if admission.command.state == CommandState::Unknown {
+            self.inner
+                .unknown_commands
+                .lock_recover()
+                .insert(admission.command.id.clone());
+        }
+        self.signal_progress();
+        serde_json::to_value(submit_result(
+            &admission.command,
+            admission.linked_command.as_ref(),
+        ))
+        .map_err(|_| Error::new("internal", "retained command result could not be encoded"))
     }
 
     async fn submit_git_fetch(
@@ -860,7 +947,7 @@ impl Router {
                 .await?;
         request.args = serde_json::to_value(frozen)
             .map_err(|_| Error::new("internal", "frozen git.fetch intent could not be encoded"))?;
-        self.prepare_submission_after_authorization(request, principal, true)
+        self.prepare_submission_after_authorization(request, principal, true, false)
             .await
     }
 
@@ -914,7 +1001,7 @@ impl Router {
         )?;
         request.args = serde_json::to_value(frozen)
             .map_err(|_| Error::new("internal", "frozen Owner Run could not be encoded"))?;
-        self.prepare_submission_after_authorization(request, &Principal::Owner, false)
+        self.prepare_submission_after_authorization(request, &Principal::Owner, false, false)
             .await
     }
 
@@ -1050,7 +1137,7 @@ impl Router {
             registration: registration.clone(),
         };
         let prepared = self
-            .prepare_submission_after_authorization(request, &principal, true)
+            .prepare_submission_after_authorization(request, &principal, true, false)
             .await?;
         validate_rule_launch_preparation(&prepared)?;
         validate_rule_resume_preparation(&prepared, Some(registration))?;
@@ -1264,8 +1351,24 @@ impl Router {
         principal: &Principal,
     ) -> Result<PreparedSubmission> {
         authorize_command(principal, &mut request)?;
-        self.prepare_submission_after_authorization(request, principal, false)
+        self.prepare_submission_after_authorization(request, principal, false, false)
             .await
+    }
+
+    async fn authorize_submission_scope(
+        &self,
+        request: &mut SubmitCommand,
+        principal: &Principal,
+    ) -> Result<()> {
+        if matches!(request.verb.as_str(), "attach" | "detach") {
+            require_owner(principal)?;
+        }
+        if request.verb == "worktree.remove" {
+            require_owner(principal)?;
+        }
+        let store = self.inner.store.lock().await;
+        store.ensure_committed_reads()?;
+        hierarchy::authorize_agent_submit_scope(&store, principal, request)
     }
 
     async fn prepare_submission_after_authorization(
@@ -1273,6 +1376,7 @@ impl Router {
         mut request: SubmitCommand,
         principal: &Principal,
         project_authority_preverified: bool,
+        submission_scope_preverified: bool,
     ) -> Result<PreparedSubmission> {
         if request.probe && request.verb != "send" {
             return Err(Error::new(
@@ -1280,15 +1384,9 @@ impl Router {
                 "only an explicit send may probe a provider hold",
             ));
         }
-        if matches!(request.verb.as_str(), "attach" | "detach") {
-            require_owner(principal)?;
-        }
-        if request.verb == "worktree.remove" {
-            require_owner(principal)?;
-        }
-        {
-            let store = self.inner.store.lock().await;
-            hierarchy::authorize_agent_submit_scope(&store, principal, &mut request)?;
+        if !submission_scope_preverified {
+            self.authorize_submission_scope(&mut request, principal)
+                .await?;
         }
         if !project_authority_preverified {
             self.verify_native_control_target(&request).await?;
@@ -1427,10 +1525,9 @@ impl Router {
     }
 
     async fn hydrate_retained_launch(&self, request: &mut SubmitCommand) -> Result<bool> {
-        if let Some(retained) = {
-            let store = self.inner.store.lock().await;
-            retained_launch_profile(&store, request)?
-        } {
+        let store = self.inner.store.lock().await;
+        store.ensure_committed_reads()?;
+        if let Some(retained) = retained_launch_profile(&store, request)? {
             align_retained_workspace_alias(request, retained.workspace.as_ref());
             install_retained_profile(request, retained)?;
             return Ok(true);
@@ -1440,11 +1537,20 @@ impl Router {
 
     async fn hydrate_retained_attach(&self, request: &mut SubmitCommand) -> Result<bool> {
         let store = self.inner.store.lock().await;
+        store.ensure_committed_reads()?;
         install_retained_attach_profile(&store, request)
     }
 
     async fn hydrate_detach_generation(&self, request: &mut SubmitCommand) -> Result<()> {
         let store = self.inner.store.lock().await;
+        store.ensure_committed_reads()?;
+        Self::hydrate_detach_generation_from_store(&store, request)
+    }
+
+    fn hydrate_detach_generation_from_store(
+        store: &eliot_store::Store,
+        request: &mut SubmitCommand,
+    ) -> Result<()> {
         if let Some(command) = store.get_command(&request.id)? {
             if command.verb != "detach" {
                 return Err(Error::new(
