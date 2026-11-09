@@ -4,7 +4,10 @@
 //! only into the runtime redaction policies.
 use eliot_core::{Error, Result, RouteBinding, SecretPolicy};
 use serde_json::Value;
-use std::ffi::{OsStr, OsString};
+use std::{
+    ffi::{OsStr, OsString},
+    path::Path,
+};
 
 pub(super) const CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
@@ -90,6 +93,42 @@ impl CodexRoute {
         }
         args.extend(["app-server", "--listen", "stdio://"].map(OsString::from));
         Ok(args)
+    }
+
+    pub(super) fn args_with_agent_mcp(
+        &self,
+        server_name: &str,
+        swarm_executable: &Path,
+        data_dir: &Path,
+        cwd: &Path,
+    ) -> Result<Vec<OsString>> {
+        if !swarm_executable.is_absolute() || !data_dir.is_absolute() || !cwd.is_absolute() {
+            return Err(route_error(
+                "Codex Agent MCP command, data directory, and cwd must be absolute",
+            ));
+        }
+        let args = self.args()?;
+        let app_server_index = args
+            .iter()
+            .position(|arg| arg == OsStr::new("app-server"))
+            .ok_or_else(|| route_error("Codex app-server route is unavailable"))?;
+        let server = format!(
+            "{{ enabled = true, command = {}, args = [\"mcp\", \"--require-agent\", \"--data-dir\", {}], env = {{}}, env_vars = [\"ELIOT_AGENT_ID\", \"ELIOT_AGENT_GENERATION\", \"ELIOT_AGENT_TOKEN\"], cwd = {} }}",
+            quote_path(swarm_executable)?,
+            quote_path(data_dir)?,
+            quote_path(cwd)?,
+        );
+        let mut mcp_override = Vec::new();
+        push_override(
+            &mut mcp_override,
+            &format!("mcp_servers.{server_name}"),
+            server,
+        );
+        let mut result = Vec::with_capacity(args.len() + mcp_override.len());
+        result.extend(args[..app_server_index].iter().cloned());
+        result.extend(mcp_override);
+        result.extend(args[app_server_index..].iter().cloned());
+        Ok(result)
     }
 
     /// Capture the configured credential even when its name does not match
@@ -264,6 +303,13 @@ fn quote(value: &str) -> Result<String> {
         ));
     }
     serde_json::to_string(value).map_err(|_| route_error("Codex route could not be encoded"))
+}
+
+fn quote_path(path: &Path) -> Result<String> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| route_error("Codex Agent MCP path is not valid Unicode"))?;
+    quote(value)
 }
 
 fn route_error(message: &'static str) -> Error {
