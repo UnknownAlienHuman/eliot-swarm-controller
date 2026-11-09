@@ -16,7 +16,7 @@ use eliot_core::{
         MailSendRequest, MailSendResponse, VarGetRequest, VarGetResponse, VarSetRequest,
     },
 };
-use eliot_store::{NoticeKind, NoticePending};
+use eliot_store::{MailSendOutcome, NoticeKind, NoticePending};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::{
@@ -75,12 +75,18 @@ impl Router {
         let change = {
             let mut store = self.inner.store.lock().await;
             let change = store.mail_send(&name, &request, limits, now_ms())?;
-            self.publish_locked(&change.events);
+            if change.outcome == MailSendOutcome::Fresh {
+                self.publish_locked(&change.events);
+            }
             change
         };
-        self.signal_progress();
+        if change.outcome == MailSendOutcome::Fresh {
+            self.signal_progress();
+        }
         request.validate_response(&change.value)?;
-        self.wake_recipients(&change.value).await;
+        if change.outcome == MailSendOutcome::Fresh {
+            self.wake_recipients(&change.value).await;
+        }
         serde_json::to_value(change.value)
             .map_err(|_| Error::new("internal", "mail delivery could not be encoded"))
     }
