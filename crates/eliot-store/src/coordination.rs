@@ -43,6 +43,31 @@ pub enum NoticeKind {
     Claim,
 }
 
+struct PreparedVarSet {
+    encoded_scope: String,
+    encoded_value: String,
+    payload_digest: Vec<u8>,
+}
+
+fn retained_var_set_binding(
+    connection: &rusqlite::Connection,
+    principal: &str,
+    id: &str,
+    payload_digest: &[u8],
+) -> Result<Option<String>> {
+    let Some((old_principal, old_method, old_digest, old_result)) = write_binding(connection, id)?
+    else {
+        return Ok(None);
+    };
+    if old_principal != principal || old_method != VAR_SET_METHOD || old_digest != payload_digest {
+        return Err(Error::new(
+            "id_conflict",
+            "variable write id is bound to another principal, method, or payload",
+        ));
+    }
+    Ok(Some(old_result))
+}
+
 /// The pending proof a notice claim carries: mail counts unread rows inside
 /// the claim transaction, claims arrive with their overlap count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,16 +256,22 @@ impl Store {
     }
 
     /// Compare-and-swap one variable. An omitted expectation writes
-    /// unconditionally; every write increments the version and emits
-    /// `var.changed`.
+    /// unconditionally; every new write increments the version and emits
+    /// `var.changed`. A committed exact binding is read back before the
+    /// writer-health gate, so its retained response has no new event.
     pub fn var_set(
         &mut self,
         principal: &str,
         request: &VarSetRequest,
         now: i64,
     ) -> Result<Change<VarSetResponse>> {
+        self.ensure_committed_reads()?;
+        let prepared = self.prepare_var_set(principal, request)?;
+        if let Some(retained) = self.replay_retained_var_set(principal, request, &prepared)? {
+            return Ok(retained);
+        }
         self.ensure_writer_healthy()?;
-        let result = self.var_set_inner(principal, request, now);
+        let result = self.var_set_inner(principal, request, &prepared, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -281,6 +312,61 @@ impl Store {
         };
         request.validate_response(&response)?;
         Ok(response)
+    }
+
+    fn prepare_var_set(&self, principal: &str, request: &VarSetRequest) -> Result<PreparedVarSet> {
+        request.validate()?;
+        let scope = self.resolve_var_scope(principal, request.scope.as_deref(), true)?;
+        let encoded_scope = scope.encoded();
+        let encoded_value = encode_json(&request.value)?;
+        if encoded_value.len() > eliot_core::api::MAX_VAR_VALUE_BYTES {
+            return Err(Error::new(
+                "invalid",
+                "variable value exceeds the 16 KiB bound",
+            ));
+        }
+        let semantic_payload = json!({
+            "scope": encoded_scope,
+            "key": request.key,
+            "value": request.value,
+            "expect_version": request.expect_version,
+            "note": request.note,
+        });
+        Ok(PreparedVarSet {
+            encoded_scope,
+            encoded_value,
+            payload_digest: canonical::digest(&semantic_payload)?,
+        })
+    }
+
+    fn replay_retained_var_set(
+        &self,
+        principal: &str,
+        request: &VarSetRequest,
+        prepared: &PreparedVarSet,
+    ) -> Result<Option<Change<VarSetResponse>>> {
+        if command_binding(&self.connection, &request.id)?.is_some() {
+            return Err(Error::new(
+                "id_conflict",
+                "variable write id is already used by a command",
+            ));
+        }
+        let Some(retained) = retained_var_set_binding(
+            &self.connection,
+            principal,
+            &request.id,
+            &prepared.payload_digest,
+        )?
+        else {
+            return Ok(None);
+        };
+        let value = serde_json::from_value::<VarSetResponse>(decode_json(&retained)?)
+            .map_err(|error| Error::new("internal", error.to_string()))?;
+        request.validate_response(&value)?;
+        Ok(Some(Change {
+            value,
+            events: Vec::new(),
+        }))
     }
 
     /// Atomically claim one generic notice, or suppress it (cooldown from
@@ -861,26 +947,12 @@ impl Store {
         &mut self,
         principal: &str,
         request: &VarSetRequest,
+        prepared: &PreparedVarSet,
         now: i64,
     ) -> Result<Change<VarSetResponse>> {
-        request.validate()?;
-        let scope = self.resolve_var_scope(principal, request.scope.as_deref(), true)?;
-        let encoded_scope = scope.encoded();
-        let encoded_value = encode_json(&request.value)?;
-        if encoded_value.len() > eliot_core::api::MAX_VAR_VALUE_BYTES {
-            return Err(Error::new(
-                "invalid",
-                "variable value exceeds the 16 KiB bound",
-            ));
-        }
-        let semantic_payload = json!({
-            "scope": encoded_scope,
-            "key": request.key,
-            "value": request.value,
-            "expect_version": request.expect_version,
-            "note": request.note,
-        });
-        let payload_digest = canonical::digest(&semantic_payload)?;
+        let payload_digest = &prepared.payload_digest;
+        let encoded_scope = &prepared.encoded_scope;
+        let encoded_value = &prepared.encoded_value;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -891,19 +963,10 @@ impl Store {
                 "variable write id is already used by a command",
             ));
         }
-        if let Some((old_principal, old_method, old_digest, old_result)) =
-            write_binding(&tx, &request.id)?
+        if let Some(retained) =
+            retained_var_set_binding(&tx, principal, &request.id, payload_digest)?
         {
-            if old_principal != principal
-                || old_method != VAR_SET_METHOD
-                || old_digest != payload_digest
-            {
-                return Err(Error::new(
-                    "id_conflict",
-                    "variable write id is bound to another principal, method, or payload",
-                ));
-            }
-            let value = serde_json::from_value::<VarSetResponse>(decode_json(&old_result)?)
+            let value = serde_json::from_value::<VarSetResponse>(decode_json(&retained)?)
                 .map_err(|error| Error::new("internal", error.to_string()))?;
             request.validate_response(&value)?;
             commit_transaction(tx, &self.write_faulted)?;
@@ -974,7 +1037,7 @@ impl Store {
             }),
         )?;
         let value = VarSetResponse {
-            scope: encoded_scope,
+            scope: encoded_scope.clone(),
             key: request.key.clone(),
             version,
             set_by: principal.to_owned(),
@@ -985,7 +1048,7 @@ impl Store {
             &request.id,
             principal,
             VAR_SET_METHOD,
-            &payload_digest,
+            payload_digest,
             &serde_json::to_value(&value)
                 .map_err(|error| Error::new("internal", error.to_string()))?,
             now,
