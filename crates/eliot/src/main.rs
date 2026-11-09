@@ -1101,9 +1101,54 @@ async fn run(cli: Cli) -> ExitCode {
         return ExitCode::SUCCESS;
     };
 
-    match dispatch(command, data_dir, json_output, id).await {
+    let result = match command {
+        CliCommand::Plugin(PluginArgs { command }) => run_plugin_command(command).await,
+        command => dispatch(command, data_dir, json_output, id).await,
+    };
+    match result {
         Ok(exit_code) => ExitCode::from(exit_code),
         Err(failure) => report_failure(failure),
+    }
+}
+
+async fn run_plugin_command(command: PluginCommand) -> Result<u8, Failure> {
+    match command {
+        PluginCommand::Codex => {
+            eliot_plugin_codex::run_codex()
+                .await
+                .map_err(|error| Failure::new(1, error.to_string()))?;
+            Ok(0)
+        }
+        PluginCommand::Muse => {
+            eliot_plugin_muse::run_muse()
+                .await
+                .map_err(|error| Failure::new(1, error.to_string()))?;
+            Ok(0)
+        }
+        PluginCommand::Claude => {
+            eliot_plugin_claude::run_claude()
+                .await
+                .map_err(|error| Failure::new(1, error.to_string()))?;
+            Ok(0)
+        }
+        PluginCommand::Opencode => {
+            eliot_plugin_opencode::run_opencode()
+                .await
+                .map_err(|error| Failure::new(1, error.to_string()))?;
+            Ok(0)
+        }
+        PluginCommand::Antigravity => {
+            eliot_plugin_antigravity::run()
+                .await
+                .map_err(|error| Failure::new(1, error.to_string()))?;
+            Ok(0)
+        }
+        PluginCommand::AntigravityHook => {
+            eliot_plugin_antigravity::run_hook_helper()
+                .await
+                .map_err(|error| Failure::new(1, error.to_string()))?;
+            Ok(0)
+        }
     }
 }
 
@@ -2325,44 +2370,10 @@ async fn dispatch(
         CliCommand::Claim(ClaimArgs { command }) => {
             run_claim_command(&data_dir, json_output, id, command).await
         }
-        CliCommand::Plugin(PluginArgs { command }) => match command {
-            PluginCommand::Codex => {
-                eliot_plugin_codex::run_codex()
-                    .await
-                    .map_err(|error| Failure::new(1, error.to_string()))?;
-                Ok(0)
-            }
-            PluginCommand::Muse => {
-                eliot_plugin_muse::run_muse()
-                    .await
-                    .map_err(|error| Failure::new(1, error.to_string()))?;
-                Ok(0)
-            }
-            PluginCommand::Claude => {
-                eliot_plugin_claude::run_claude()
-                    .await
-                    .map_err(|error| Failure::new(1, error.to_string()))?;
-                Ok(0)
-            }
-            PluginCommand::Opencode => {
-                eliot_plugin_opencode::run_opencode()
-                    .await
-                    .map_err(|error| Failure::new(1, error.to_string()))?;
-                Ok(0)
-            }
-            PluginCommand::Antigravity => {
-                eliot_plugin_antigravity::run()
-                    .await
-                    .map_err(|error| Failure::new(1, error.to_string()))?;
-                Ok(0)
-            }
-            PluginCommand::AntigravityHook => {
-                eliot_plugin_antigravity::run_hook_helper()
-                    .await
-                    .map_err(|error| Failure::new(1, error.to_string()))?;
-                Ok(0)
-            }
-        },
+        CliCommand::Plugin(_) => Err(Failure::new(
+            1,
+            "plugin commands must be dispatched before CLI dispatch",
+        )),
     }
 }
 
