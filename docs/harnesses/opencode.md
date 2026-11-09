@@ -129,6 +129,8 @@ slash: `openrouter/stealth/crouton-alpha` selects provider `openrouter` and mode
 Empty slash segments, backslash separators, whitespace and control characters reject.
 The native `#variant` suffix is not mapped by this slice and rejects; requests retain
 `variant=None` and the existing exact requested/effective model comparison.
+Effective output reports native `ModelRef.variant` as `model_variant` (null when
+backend omits it); it is readback-only and does not change `model_verified` (provider/id).
 
 L7 verifies two-session isolation when shared mode is selected, adopted-service safety,
 204-vs-execution, lost stream/input, snapshot races, pagination, exact controls and no
