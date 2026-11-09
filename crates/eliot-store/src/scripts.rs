@@ -92,7 +92,12 @@ impl Store {
         }
 
         let frozen = decode_frozen_run(&run.command.args)?;
-        let origin = rules::resolve_script_run_origin_tx(&tx, &run.command, &frozen)?;
+        let origin = if actions.is_empty() {
+            rules::validate_script_run_admitted_origin_tx(&tx, &run.command, &frozen)?;
+            None
+        } else {
+            Some(rules::resolve_script_run_origin_tx(&tx, &run.command, &frozen)?)
+        };
         projects::validate_project_command_dispatch_tx(&tx, &run)?;
 
         let mut events = Vec::new();
@@ -107,7 +112,13 @@ impl Store {
             let ordinal = i64::try_from(index)
                 .map_err(|_| Error::new("frame_too_large", "script action ordinal overflowed"))?;
             action.id = derived_script_action_id(run_id, ordinal)?;
-            rules::validate_script_output_rate_tx(&tx, &origin, action.target.as_deref(), now)?;
+            let origin = origin.as_ref().ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "script output action has no saved rule origin",
+                )
+            })?;
+            rules::validate_script_output_rate_tx(&tx, origin, action.target.as_deref(), now)?;
 
             let limits = self.hierarchy_limits;
             let admission =
