@@ -32,8 +32,8 @@ payloads, recordings or logs.
 After acquiring the data-directory lock, daemon startup calls
 `logging::init(&DataDir,&DaemonLock)->Result<DaemonLog>` and owns the returned guard for
 the run. `logs/daemon.log` and its rotation remain private to the data directory and
-size-bounded. `logging::record(&SecretPolicy,code:&str,ids:&[(&str,&str)],error:Option<&Error>)->()`
-writes only bounded codes/IDs and structured sanitized plugin/harness stderr tails,
+bounded. `logging::record(&SecretPolicy,code:&str,ids:&[(&str,&str)],error:Option<&Error>)->()`
+writes only bounded codes/IDs, typed nonnegative numeric counts for daemon.retention_pruned under counts, and structured sanitized plugin/harness stderr tails,
 applying the same policy to code and ID values. It omits `Error.message`, request
 parameters and environment values. A record failure is diagnostic loss only; it cannot
 change command settlement, source acknowledgement or process cleanup.

@@ -78,21 +78,16 @@ pub(crate) async fn run(
                 + report.writes_deleted
                 + report.mail_deleted;
             if rows > 0 {
-                let events = report.events_deleted.to_string();
-                let pruned_through = report.pruned_through.to_string();
-                let commands = report.commands_deleted.to_string();
-                let writes = report.writes_deleted.to_string();
-                let mail = report.mail_deleted.to_string();
-                logging::record(
+                logging::record_counts(
                     &policy,
                     "daemon.retention_pruned",
-                    &[
-                        ("events", events.as_str()),
-                        ("pruned_through", pruned_through.as_str()),
-                        ("commands", commands.as_str()),
-                        ("writes", writes.as_str()),
-                        ("mail", mail.as_str()),
-                    ],
+                    logging::Counts {
+                        events: report.events_deleted.max(0) as u64,
+                        pruned_through: report.pruned_through.max(0) as u64,
+                        commands: report.commands_deleted.max(0) as u64,
+                        writes: report.writes_deleted.max(0) as u64,
+                        mail: report.mail_deleted.max(0) as u64,
+                    },
                     None,
                 );
             }
