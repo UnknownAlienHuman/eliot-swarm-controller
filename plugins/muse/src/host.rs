@@ -138,9 +138,11 @@ pub(crate) async fn run() -> Result<()> {
     let mut plugin = MusePlugin::default();
     let mut completed_shutdown = false;
     let mut native_endpoint_retired = false;
-    let mut pending_request = None;
+    let mut pending_request: Option<(RpcRequest, Option<Instant>)> = None;
     loop {
-        let event = if let Some(request) = pending_request.take() {
+        let mut carried_stop_deadline = None;
+        let event = if let Some((request, stop_deadline)) = pending_request.take() {
+            carried_stop_deadline = stop_deadline;
             HostLoopEvent::Request(Some(request))
         } else if plugin.native_endpoint_retirement_pending {
             if plugin.native_endpoint_exit_observed() {
@@ -184,7 +186,8 @@ pub(crate) async fn run() -> Result<()> {
             HostLoopEvent::Request(Some(request)) => {
                 let is_shutdown = request.method == "shutdown";
                 let is_stop = request.method == "agent.stop";
-                let deadline = Instant::now() + RPC_TIMEOUT;
+                let deadline =
+                    carried_stop_deadline.unwrap_or_else(|| Instant::now() + RPC_TIMEOUT);
                 let result = if request.method == "agent.snapshot" {
                     match eliot_plugin::preemptible_snapshot(
                         &mut requests,
@@ -194,6 +197,10 @@ pub(crate) async fn run() -> Result<()> {
                     {
                         eliot_plugin::SnapshotDispatch::Ready(result) => result,
                         eliot_plugin::SnapshotDispatch::Preempted(next) => {
+                            let stop_deadline = next
+                                .as_ref()
+                                .filter(|next| next.method == "agent.stop")
+                                .map(|_| Instant::now() + RPC_TIMEOUT);
                             let preempted = client
                                 .respond(
                                     request.id.clone(),
@@ -201,14 +208,14 @@ pub(crate) async fn run() -> Result<()> {
                                         "busy",
                                         "status snapshot was preempted by a host request",
                                     )),
-                                    Instant::now() + RPC_TIMEOUT,
+                                    stop_deadline.unwrap_or_else(|| Instant::now() + RPC_TIMEOUT),
                                 )
                                 .await;
                             if preempted.is_err() {
                                 break;
                             }
                             let Some(next) = next else { break };
-                            pending_request = Some(next);
+                            pending_request = Some((next, stop_deadline));
                             continue;
                         }
                     }
@@ -1690,7 +1697,18 @@ async fn terminate_session(
 ) -> Result<()> {
     let settlement_deadline = deadline - STOP_RESPONSE_RESERVE;
     let native_deadline = settlement_deadline - STOP_SETTLEMENT_RESERVE;
-    let begin = timeout_at(native_deadline, session.events.begin_stop()).await;
+    let begin = Instant::now() < native_deadline
+        && matches!(
+            timeout_at(native_deadline, session.events.begin_stop()).await,
+            Ok(Ok(()))
+        );
+    if Instant::now() >= native_deadline {
+        session.phase = SessionPhase::Unknown;
+        return Err(Error::new(
+            "unknown",
+            "Muse stop deadline elapsed before native termination",
+        ));
+    }
     let process_exit = session
         .native
         .transport
@@ -1698,11 +1716,16 @@ async fn terminate_session(
         .await;
     let drained = session.native.await_output_drained(native_deadline).await;
     // The event actor retains commit ownership if this acknowledgement times out.
-    let ended = timeout_at(settlement_deadline, session.events.end_stop()).await;
-    if !matches!(begin, Ok(Ok(())))
+    let ended = Instant::now() < settlement_deadline
+        && matches!(
+            timeout_at(settlement_deadline, session.events.end_stop()).await,
+            Ok(Ok(()))
+        );
+    if !begin
         || process_exit.is_err()
         || drained.is_err()
-        || !matches!(ended, Ok(Ok(())))
+        || !ended
+        || Instant::now() >= settlement_deadline
     {
         session.phase = SessionPhase::Unknown;
         return Err(Error::new(

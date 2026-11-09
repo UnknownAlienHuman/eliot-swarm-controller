@@ -40,6 +40,8 @@ Use supported typed APIs, not an inferred method list from a different host vers
 Owned-host stop drops MSP stdin before its graceful wait. One absolute stop RPC
 deadline bounds waits for control preparation, native exit/output drain, event
 settlement and the reply, with time reserved for ordered event acknowledgement and response.
+When stop preempts a snapshot, its deadline is captured before replying to the
+displaced snapshot and carried into stop dispatch; that reply shares the same budget.
 Stop requires observed process exit, drained output and acknowledged `session.ended`;
 deadline expiry or uncertain drain stays unknown. Stopping does not supply a missing
 terminal turn result or replay retained start/input outcomes.
