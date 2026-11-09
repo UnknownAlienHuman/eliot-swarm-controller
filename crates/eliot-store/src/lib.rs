@@ -126,6 +126,22 @@ fn sql_error(error: rusqlite::Error) -> Error {
     Error::new("internal", error.to_string())
 }
 
+fn validate_remote_command_context(
+    principal: &str,
+    remote: Option<&core::RemoteCallContext>,
+) -> Result<()> {
+    if let Some(remote) = remote {
+        remote.validate()?;
+        if principal != "owner" {
+            return Err(Error::new(
+                "not_allowed",
+                "remote provenance requires the authenticated owner bridge",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn commit_transaction(tx: Transaction<'_>, write_faulted: &Cell<bool>) -> Result<()> {
     match tx.commit() {
         Ok(()) => Ok(()),
@@ -262,6 +278,19 @@ impl Store {
         self.write_faulted.get()
     }
 
+    /// Refuse retained-command reads if a failed transaction left the
+    /// connection outside autocommit. In that state the same connection could
+    /// still observe transaction-local rows.
+    pub fn ensure_committed_reads(&self) -> Result<()> {
+        if !self.connection.is_autocommit() {
+            return Err(Error::new(
+                "unavailable",
+                "Store transaction state is uncertain; retained commands cannot be read",
+            ));
+        }
+        Ok(())
+    }
+
     /// Admit an external launch/send/stop command. Launch allocates its stable
     /// Agent row here; generation 1 is installed only by `dispatch`.
     pub fn submit(
@@ -303,13 +332,7 @@ impl Store {
         let Some(remote) = remote else {
             return self.submit_inner_checked(principal, request, preparation, now);
         };
-        remote.validate()?;
-        if principal != "owner" {
-            return Err(Error::new(
-                "not_allowed",
-                "remote provenance requires the authenticated owner bridge",
-            ));
-        }
+        validate_remote_command_context(principal, Some(remote))?;
         self.ensure_writer_healthy()?;
         let result = (|| {
             let tx = self
@@ -352,6 +375,37 @@ impl Store {
         result
     }
 
+    /// Read a retained command binding without entering the writer path.
+    /// This remains available after a persistence fault because it performs
+    /// no transaction or write. Store write transactions are local to their
+    /// call; this refuses reads if commit/rollback leaves one active.
+    pub fn replay_command_submission(
+        &self,
+        principal: &str,
+        request: &SubmitCommand,
+        remote: Option<&core::RemoteCallContext>,
+    ) -> Result<Option<Admission>> {
+        require_nonempty(principal, "principal")?;
+        validate_remote_command_context(principal, remote)?;
+        self.ensure_committed_reads()?;
+        let payload_digest = admission::command_payload_digest(request)?;
+        if let Some(admission) = admission::replay_command_binding(
+            &self.connection,
+            principal,
+            request,
+            &payload_digest,
+        )? {
+            return Ok(Some(admission));
+        }
+        if write_exists(&self.connection, &request.id)? {
+            return Err(Error::new(
+                "id_conflict",
+                "mutation id is already used by another write",
+            ));
+        }
+        Ok(None)
+    }
+
     fn submit_inner_checked(
         &mut self,
         principal: &str,
@@ -375,6 +429,7 @@ impl Store {
         timeout_ms: i64,
     ) -> Result<Option<Admission>> {
         require_nonempty(principal, "principal")?;
+        self.ensure_committed_reads()?;
         request.validate()?;
         validate_ulid(&request.id)?;
         if request.verb != "git.fetch"
@@ -402,34 +457,20 @@ impl Store {
         let semantic_args = definition.binding_args(timeout_ms)?;
         let semantic_payload = admission::command_semantic_payload(request, semantic_args)?;
         let payload_digest = canonical::digest(&semantic_payload)?;
-        if let Some((old_principal, old_method, old_digest)) =
-            command_binding(&self.connection, &request.id)?
-        {
-            if old_principal != principal
-                || old_method != COMMAND_METHOD
-                || old_digest != payload_digest
-            {
-                return Err(Error::new(
-                    "id_conflict",
-                    "command id is already bound to another principal, method, or payload",
-                ));
-            }
-            let command = load_command(&self.connection, &request.id)?.ok_or_else(|| {
-                Error::new("internal", "command binding exists without its command row")
-            })?;
+        if let Some(admission) = admission::replay_command_binding(
+            &self.connection,
+            principal,
+            request,
+            &payload_digest,
+        )? {
+            let command = &admission.command;
             if command.verb != "git.fetch" || command.target.is_some() {
                 return Err(Error::new(
                     "source_integrity",
                     "retained Git fetch binding has another command shape",
                 ));
             }
-            let linked_command = load_linked_command(&self.connection, &request.id)?;
-            return Ok(Some(Admission {
-                command,
-                linked_command,
-                events: Vec::new(),
-                is_new: false,
-            }));
+            return Ok(Some(admission));
         }
         if write_exists(&self.connection, &request.id)? {
             return Err(Error::new(
