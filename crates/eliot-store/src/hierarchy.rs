@@ -238,7 +238,6 @@ pub(super) struct ParentLink {
     pub(super) workspace: Option<String>,
     pub(super) profile_snapshot: Value,
     pub(super) control: AgentControl,
-    pub(super) state: AgentState,
 }
 
 /// Resolve `args.parent` for a launch: the parent must exist and be
@@ -278,6 +277,12 @@ pub(super) fn resolve_launch_parent(
     // A child needs a controlled parent: observe-only and unknown Agents
     // have no native control authority to parent new work.
     observer::require_controlled(&parent_agent)?;
+    if matches!(caller, Caller::Agent { .. }) && parent_agent.is_terminal() {
+        return Err(Error::new(
+            "stale_generation",
+            "caller generation is no longer current",
+        ));
+    }
     let root_num = parse_agent_id(&parent_agent.root)?;
     Ok(Some(ParentLink {
         num: parent_num,
@@ -289,7 +294,6 @@ pub(super) fn resolve_launch_parent(
         workspace: parent_agent.workspace.clone(),
         profile_snapshot: parent_agent.profile_snapshot.clone(),
         control: parent_agent.control,
-        state: parent_agent.state,
     }))
 }
 
@@ -375,9 +379,6 @@ pub(super) fn admission_allows_carried_parent_binding(
     let Some(parent) = resolve_launch_parent(tx, principal, args)? else {
         return Ok(false);
     };
-    if parent.state.is_terminal() {
-        return Ok(false);
-    }
     let child_control =
         control_from_snapshot(args.get("profile_snapshot").unwrap_or(&Value::Null))?;
     let child_control = AgentControl::parse(&child_control)?;
