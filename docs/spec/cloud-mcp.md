@@ -4,6 +4,13 @@ This specification owns the local HTTP MCP child and its dedicated Cloudflare
 Tunnel lifecycle. [`api.md`](api.md) owns the MCP call contract; the HTTP worker
 reuses that handler and the authenticated local daemon API.
 
+External hosted custom connectors using Cloudflare Access Managed OAuth dynamic
+client registration must have the caller's exact hosted OAuth redirect URI in the
+Access application's `allowed_uris`; loopback-only callbacks are insufficient. For
+example, the Muse custom connector's public callback is
+`https://agent.meta.ai/api/hatch/oauth/callback`; omitting this URI can cause HTTP
+400 `invalid_client_metadata`.
+
 ## Boundary
 
 The daemon starts one managed `swarm mcp --http --port 0 --managed-child`
