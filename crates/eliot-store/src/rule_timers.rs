@@ -896,11 +896,11 @@ fn rule_catch_up(rule: &StoredRuleState) -> Result<core::api::CatchUp> {
     }
 }
 
-pub(super) fn resolve_timer_script_run_origin_tx(
+pub(super) fn validate_timer_script_run_admitted_origin_tx(
     tx: &Transaction<'_>,
     run: &Command,
     frozen: &core::api::FrozenScriptRun,
-) -> Result<ScriptRunOrigin> {
+) -> Result<()> {
     let core::api::FrozenScriptContext::Timer {
         timer: timer_context,
         rule: script_rule,
@@ -1094,7 +1094,25 @@ pub(super) fn resolve_timer_script_run_origin_tx(
         ));
     }
 
-    let stored = load_rule_state(tx, &run.principal, &rule)?
+    Ok(())
+}
+
+pub(super) fn resolve_timer_script_run_origin_tx(
+    tx: &Transaction<'_>,
+    run: &Command,
+    frozen: &core::api::FrozenScriptRun,
+) -> Result<ScriptRunOrigin> {
+    let core::api::FrozenScriptContext::Timer {
+        rule: script_rule, ..
+    } = &frozen.context
+    else {
+        return Err(Error::new(
+            "source_integrity",
+            "timer Run has no frozen timer context",
+        ));
+    };
+    validate_timer_script_run_admitted_origin_tx(tx, run, frozen)?;
+    let stored = load_rule_state(tx, &run.principal, &script_rule.id)?
         .ok_or_else(|| Error::new("source_integrity", "timer rule state was removed"))?;
     let revision = script_rule.revision;
     let definition = if stored.view.revision == revision {
@@ -1111,9 +1129,11 @@ pub(super) fn resolve_timer_script_run_origin_tx(
         ));
     };
     let limit = rule_action_limit_for_definition(definition)?;
+    let cause = command_cause_tx(tx, &run.id)?
+        .ok_or_else(|| Error::new("source_integrity", "timer Run has no stored cause"))?;
     Ok(ScriptRunOrigin {
         principal: run.principal.clone(),
-        rule,
+        rule: script_rule.id.clone(),
         cause,
         limit,
     })

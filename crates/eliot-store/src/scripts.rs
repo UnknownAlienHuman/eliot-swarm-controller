@@ -260,7 +260,7 @@ pub(super) fn validate_rule_run_context_tx(
 
 pub(super) fn validate_run_dispatch_tx(tx: &Transaction<'_>, run: &CommandRecord) -> Result<()> {
     let frozen = decode_frozen_run(&run.command.args)?;
-    rules::resolve_script_run_origin_tx(tx, &run.command, &frozen)?;
+    rules::validate_script_run_admitted_origin_tx(tx, &run.command, &frozen)?;
     Ok(())
 }
 
