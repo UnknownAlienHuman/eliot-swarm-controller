@@ -521,13 +521,46 @@ async fn run_owned(
 /// Make one authenticated local JSON-RPC call. Clients open only an existing
 /// private root; reads never initialize credentials, a database, or a daemon.
 pub async fn client_call(path: &Path, method: &str, params: Value) -> Result<Value> {
-    if method.trim().is_empty() || !params.is_object() {
-        return Err(Error::new(
-            "invalid",
-            "daemon RPC requires a method and object params",
-        ));
-    }
+    validate_client_call(method, &params)?;
     let identity = caller_identity()?;
+    client_call_with_identity(path, method, params, identity).await
+}
+
+/// Require the inherited identity to be a complete Agent identity. This
+/// validates only local role context and never opens the data directory or
+/// reads the Owner token; the Router remains authoritative for generation.
+pub fn require_agent_identity() -> Result<()> {
+    required_agent_identity().map(|_| ())
+}
+
+/// Make one local JSON-RPC call using only a complete inherited Agent identity.
+/// Owner and Run contexts are rejected before any Owner credential lookup.
+pub async fn client_call_with_agent_identity(
+    path: &Path,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    validate_client_call(method, &params)?;
+    let identity = required_agent_identity()?;
+    client_call_with_identity(path, method, params, identity).await
+}
+
+fn required_agent_identity() -> Result<ClientIdentity> {
+    match caller_identity()? {
+        identity @ ClientIdentity::Agent { .. } => Ok(identity),
+        ClientIdentity::Owner | ClientIdentity::Run { .. } => Err(Error::new(
+            "not_allowed",
+            "a complete Agent identity is required; Owner and Run contexts are rejected",
+        )),
+    }
+}
+
+async fn client_call_with_identity(
+    path: &Path,
+    method: &str,
+    params: Value,
+    identity: ClientIdentity,
+) -> Result<Value> {
     let data_dir = DataDir::open_existing(path)?;
     let info = data_dir
         .read_daemon_info()?
@@ -562,6 +595,16 @@ pub async fn client_call(path: &Path, method: &str, params: Value) -> Result<Val
     let credential = auth["credential"].as_str().unwrap_or("");
     let policy = SecretPolicy::new([credential]);
     raw_client_call(&info.endpoint, method, params, auth, &policy).await
+}
+
+fn validate_client_call(method: &str, params: &Value) -> Result<()> {
+    if method.trim().is_empty() || !params.is_object() {
+        return Err(Error::new(
+            "invalid",
+            "daemon RPC requires a method and object params",
+        ));
+    }
+    Ok(())
 }
 
 /// Make one JSON-RPC call using an explicitly supplied owner credential.

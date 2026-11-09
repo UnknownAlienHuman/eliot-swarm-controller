@@ -108,6 +108,7 @@ pub async fn run_http(
             Ok(EliotMcpHandler {
                 data_dir: data_dir.clone(),
                 notify_owner_events: true,
+                require_agent: false,
                 shutdown: factory_shutdown.clone(),
                 notify_spawned: Arc::new(AtomicBool::new(false)),
                 session_lifetime: Arc::new(SessionLifetime::default()),

@@ -51,17 +51,25 @@ owned plugin/workspace custody establish subsequent authority.
 
 `swarm mcp` is one local stdio server and never starts the daemon. It exposes exactly one
 tool, `swarm`, with required `method` (non-empty string) and `params` (object), and
-forwards each call through [`eliot_daemon::client_call`](../../crates/eliot-daemon/src/daemon.rs)
-to the existing authenticated local API. It reuses existing methods and DTOs; it adds no
-management-method catalogue.
+forwards calls through the existing authenticated local client. Ordinary mode uses
+[`eliot_daemon::client_call`](../../crates/eliot-daemon/src/daemon.rs); `--require-agent`
+uses [`eliot_daemon::client_call_with_agent_identity`](../../crates/eliot-daemon/src/daemon.rs).
+Both reuse existing methods and DTOs; MCP adds no management-method catalogue.
 
 Clients configure the stdio server using their native project-scoped configuration, such as
 an Antigravity workspace plugin (`.agents/plugins/eliot-swarm/plugin.json` + `mcp_config.json`).
-Principal resolution stays in `client_call` and follows
+Principal resolution stays in the daemon client identity boundary and follows
 [Transport and principal identity](#transport-and-principal-identity). Partial or conflicting
 inherited Agent/Run/Owner identity fails closed; the server never downgrades to Owner.
 MCP arguments cannot supply or override authentication. Credentials are never included
 in tool arguments, results, diagnostics or logs.
+
+Controlled Agent stdio clients may use `swarm mcp --require-agent`. This stdio-only guard
+requires a complete inherited Agent ID/generation/token before the MCP server initializes
+and before any Owner token lookup. Missing, partial, conflicting, Owner, and Run contexts
+fail with `not_allowed`. Each tool call still uses the existing local client and Router path,
+which validates the Agent credential and current generation. `--require-agent --http` is a
+usage error; ordinary Owner MCP stdio and StreamableHTTP behavior are unchanged.
 
 The caller supplies and retains the mutation ULID in `params` before a write. A retry
 must carry the same id, principal, method and semantic payload; a different binding is
