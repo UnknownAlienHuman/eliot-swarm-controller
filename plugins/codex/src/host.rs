@@ -656,9 +656,42 @@ impl CodexPlugin {
         route.capture_client_secret(&environment, &mut secrets, &mut metadata_secrets, true)?;
         secrets.push(initialized.credential.clone());
         metadata_secrets.push(initialized.credential.clone());
+        let data_dir = environment
+            .iter()
+            .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("ELIOT_HOME"))
+            .map(|(_, value)| PathBuf::from(value))
+            .filter(|path| path.is_absolute() && path.is_dir())
+            .ok_or_else(|| {
+                Error::new(
+                    "profile_error",
+                    "Codex Agent MCP requires an absolute owned Eliot data directory",
+                )
+            })?;
+        let swarm_executable = std::env::current_exe().map_err(|_| {
+            Error::new(
+                "platform_io",
+                "active Swarm executable could not be resolved for the Codex Agent MCP",
+            )
+        })?;
+        let mcp_cwd = std::fs::canonicalize(&workspace).map_err(|_| {
+            Error::new(
+                "profile_error",
+                "Codex Agent workspace could not be resolved for its MCP cwd",
+            )
+        })?;
+        let start_command = ulid::Ulid::from_string(&params.command_id)
+            .map_err(|_| Error::new("invalid", "Codex start command id is not a ULID"))?
+            .to_string()
+            .to_ascii_lowercase();
+        let mcp_server_name = format!("eliot_swarm_{start_command}");
         let launch = NativeLaunch {
             program,
-            args: route.args()?,
+            args: route.args_with_agent_mcp(
+                &mcp_server_name,
+                &swarm_executable,
+                &data_dir,
+                &mcp_cwd,
+            )?,
             cwd: workspace.clone(),
             environment,
         };

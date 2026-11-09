@@ -3,13 +3,14 @@
 //! Official Rust MCP SDK (`rmcp 3.9.0`) over stdio; the handler implements
 //! `ServerHandler` manually (`initialize` via `get_info`, plus `tools/list`
 //! and `tools/call`), so no macro feature is required.
-//! No embedded Router/Store/second daemon; the only daemon path is the
-//! existing `eliot_daemon::client_call`, which resolves caller identity from
-//! the inherited process environment and fails closed on partial/conflicting
-//! Agent/Run/Owner credentials (never an owner fallback).
+//! No embedded Router/Store/second daemon; ordinary MCP uses the existing
+//! `eliot_daemon::client_call`, while `--require-agent` stdio uses its
+//! Agent-only sibling. Both resolve inherited process identity; the restricted
+//! path rejects missing/partial/conflicting or Owner/Run context before any
+//! Owner token lookup.
 //!
 //! Auth boundary: the `_auth`/`_payload` envelope is built server-side by
-//! `eliot_daemon::client_call` from the inherited environment. Tool arguments
+//! the daemon client from the inherited environment. Tool arguments
 //! (`method`, `params`) can never inject or override credentials, and no
 //! credential, token, or raw environment value is echoed to tool output or
 //! logs. The tool is intentionally generic: `{ method, params }` maps 1:1 to
@@ -59,6 +60,7 @@ use tokio_util::sync::CancellationToken;
 const TOOL_NAME: &str = "swarm";
 const TOOL_DESCRIPTION: &str =
     "Generic Eliot management call: { method, params } -> authenticated daemon RPC result";
+const REQUIRE_AGENT_INSTRUCTIONS: &str = "Use this server's swarm tool for Eliot controller and coordination operations instead of shell commands. Supply method and params using the current API DTO shape. Authentication is inherited from this Agent session; never put credentials or tokens in tool arguments.";
 
 const INVALID_ARGS_MESSAGE: &str = "tool arguments must be an object with method and params";
 
@@ -71,11 +73,16 @@ struct ToolArgs {
 
 /// MCP stdio entry point. The `data_dir` already comes from `--data-dir` /
 /// `ELIOT_HOME` resolution in `main.rs`; no daemon is started here.
-pub async fn run_stdio(data_dir: PathBuf) -> Result<(), String> {
+pub async fn run_stdio(data_dir: PathBuf, require_agent: bool) -> Result<(), String> {
+    if require_agent {
+        eliot_daemon::require_agent_identity()
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    }
     #[allow(deprecated)] // SEP-2577: LoggingLevel default is deprecated but functional in rmcp 3.9.
     let handler = EliotMcpHandler {
         data_dir,
         notify_owner_events: false,
+        require_agent,
         shutdown: CancellationToken::new(),
         notify_spawned: Arc::new(AtomicBool::new(false)),
         session_lifetime: Arc::new(origin_auth::SessionLifetime::default()),
@@ -98,6 +105,8 @@ pub async fn run_stdio(data_dir: PathBuf) -> Result<(), String> {
 #[derive(Clone)]
 struct EliotMcpHandler {
     data_dir: PathBuf,
+    /// Stdio-only policy; HTTP sessions always use their separately verified remote identity.
+    require_agent: bool,
     /// True only for HTTP sessions: advertise `logging` and spawn the one
     /// owner-event delivery task on initialize. Stdio stays `false`.
     notify_owner_events: bool,
@@ -138,8 +147,13 @@ impl ServerHandler for EliotMcpHandler {
     }
 
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(server_capabilities(self.notify_owner_events))
-            .with_server_info(Implementation::new("eliot", env!("CARGO_PKG_VERSION")))
+        let config = ServerConfig::new(server_capabilities(self.notify_owner_events))
+            .with_server_info(Implementation::new("eliot", env!("CARGO_PKG_VERSION")));
+        if self.require_agent {
+            config.with_instructions(REQUIRE_AGENT_INSTRUCTIONS)
+        } else {
+            config
+        }
     }
 
     fn on_initialized(
@@ -208,6 +222,7 @@ impl ServerHandler for EliotMcpHandler {
             Some(serde_json::to_value(&context.id).unwrap_or(Value::Null)),
         );
         let http = self.notify_owner_events;
+        let require_agent = self.require_agent;
         async move {
             if http && remote.is_none() {
                 return Err(McpError::invalid_request(
@@ -243,6 +258,14 @@ impl ServerHandler for EliotMcpHandler {
                         &parsed.method,
                         params,
                         remote,
+                    )
+                    .await
+                }
+                None if require_agent => {
+                    eliot_daemon::client_call_with_agent_identity(
+                        Path::new(&data_dir),
+                        &parsed.method,
+                        params,
                     )
                     .await
                 }

@@ -184,6 +184,9 @@ struct McpArgs {
     /// Serve StreamableHTTP on 127.0.0.1 instead of stdio.
     #[arg(long)]
     http: bool,
+    /// Require a complete inherited Agent identity for stdio calls; never use Owner or Run.
+    #[arg(long)]
+    require_agent: bool,
     /// Loopback port for --http; 0 selects an ephemeral port (actual address is printed in the ready frame).
     #[arg(long, default_value_t = 0)]
     port: u16,
@@ -1211,10 +1214,17 @@ async fn dispatch(
         }
         CliCommand::Mcp(McpArgs {
             http,
+            require_agent,
             port,
             public_url,
             managed_child,
         }) => {
+            if require_agent && http {
+                return Err(Failure::new(
+                    2,
+                    "--require-agent is only valid with MCP stdio",
+                ));
+            }
             if json_output {
                 return Err(Failure::new(
                     2,
@@ -1228,7 +1238,7 @@ async fn dispatch(
                         "--port, --public-url and --managed-child require --http",
                     ));
                 }
-                mcp::run_stdio(data_dir)
+                mcp::run_stdio(data_dir, require_agent)
                     .await
                     .map_err(Failure::new_from_message)?;
                 return Ok(0);

@@ -98,6 +98,20 @@ exercise used `permissions = "read-only"`. The mode also accepts `"default"`; om
 preserves the native default. Model and effort stay pinned, and permissions are configured
 independently of the collaboration mode.
 
+### Eliot MCP bridge
+
+Each controlled Agent generation receives a private process-local stdio server named
+eliot_swarm_<start-command-ulid>, using the active Swarm executable, that Agent's owned
+Eliot data directory, and its selected workspace as the server cwd. Its only tool is
+swarm, with the installed schema { method: string, params: object }. Use the advertised
+Eliot method and its existing params DTO for Eliot status, control, or coordination.
+Authentication is inherited by the server and must not appear in tool arguments. Use
+normal Codex tools for workspace work. The per-generation config sets native
+approval_mode to approve for this swarm tool only, so its calls do not request Codex
+MCP approval when the profile policy is never. This leaves the profile approval policy
+and workspace permissions unchanged; Eliot still authorizes every call as the exact
+Agent generation.
+
 Example lifecycle:
 
 ```powershell
