@@ -722,6 +722,7 @@ impl OpenCodePlugin {
         let effective = json!({
             "model": effective_model.clone(),
             "model_verified": model_verified,
+            "model_variant": created.model.as_ref().and_then(|model| model.variant.clone()),
             "cwd": created.location.as_ref().map(|location| location.directory.clone()),
         });
         let context_bound =
@@ -1162,6 +1163,7 @@ impl OpenCodePlugin {
         Ok(json!({
             "model": effective.model.as_ref().map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim())),
             "model_verified": model_verified,
+            "model_variant": effective.model.as_ref().and_then(|model| model.variant.clone()),
             "agent": effective.agent.clone(),
             "agent_verified": agent_verified,
             "cwd": effective.location.as_ref().map(|location| location.directory.clone()),
