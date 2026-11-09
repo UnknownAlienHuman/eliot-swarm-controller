@@ -78,6 +78,8 @@ using that service.
 
 ### Unix degraded
 
+For Linux containers, we recommend a reaping init such as Docker --init.
+
 A process group contains ordinary descendants but a same-user child can `setsid`, and
 the group does not automatically die with the daemon. Until a qualified cgroup/equivalent
 is implemented, capability is `degraded`:
