@@ -49,21 +49,20 @@ struct PreparedVarSet {
     payload_digest: Vec<u8>,
 }
 
-fn retained_var_set_binding(
+fn retained_write_binding(
     connection: &rusqlite::Connection,
     principal: &str,
     id: &str,
+    method: &str,
     payload_digest: &[u8],
+    conflict_message: &'static str,
 ) -> Result<Option<String>> {
     let Some((old_principal, old_method, old_digest, old_result)) = write_binding(connection, id)?
     else {
         return Ok(None);
     };
-    if old_principal != principal || old_method != VAR_SET_METHOD || old_digest != payload_digest {
-        return Err(Error::new(
-            "id_conflict",
-            "variable write id is bound to another principal, method, or payload",
-        ));
+    if old_principal != principal || old_method != method || old_digest != payload_digest {
+        return Err(Error::new("id_conflict", conflict_message));
     }
     Ok(Some(old_result))
 }
@@ -101,6 +100,19 @@ pub struct NoticeState {
     pub open_notice_command: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MailSendOutcome {
+    Fresh,
+    Retained,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MailSendResult {
+    pub value: MailSendResponse,
+    pub events: Vec<eliot_core::Event>,
+    pub outcome: MailSendOutcome,
+}
+
 pub(super) enum Sender {
     Owner,
     Agent {
@@ -108,6 +120,16 @@ pub(super) enum Sender {
         id: String,
         generation: i64,
     },
+}
+
+struct PreparedMailSend {
+    sender: Sender,
+    payload_digest: Vec<u8>,
+}
+
+struct PreparedMailAck {
+    mailbox: i64,
+    payload_digest: Vec<u8>,
 }
 
 pub(super) fn parse_sender(principal: &str, domain: &str) -> Result<Sender> {
@@ -171,6 +193,57 @@ const DELIVERY_COLUMNS: &str = "m.delivery_id, m.sender, m.sender_generation,
     m.admitted_at, m.presented_at, m.presentation_command, m.read_at";
 
 impl Store {
+    fn prepare_mail_send(
+        &self,
+        principal: &str,
+        request: &MailSendRequest,
+    ) -> Result<PreparedMailSend> {
+        request.validate()?;
+        let sender = parse_sender(principal, "mail")?;
+        if let Sender::Agent {
+            num, generation, ..
+        } = &sender
+        {
+            let agent = load_agent_by_num(&self.connection, *num)?.ok_or_else(|| {
+                Error::new("stale_generation", "sender generation is no longer current")
+            })?;
+            if agent.generation != *generation {
+                return Err(Error::new(
+                    "stale_generation",
+                    "sender generation is no longer current",
+                ));
+            }
+        }
+        let semantic_payload = json!({
+            "to": request.to,
+            "mode": request.mode.as_str(),
+            "text": request.text,
+            "thread": request.thread,
+            "reply_to_delivery": request.reply_to_delivery,
+        });
+        Ok(PreparedMailSend {
+            sender,
+            payload_digest: canonical::digest(&semantic_payload)?,
+        })
+    }
+
+    fn prepare_mail_ack(
+        &self,
+        principal: &str,
+        request: &MailAckRequest,
+    ) -> Result<PreparedMailAck> {
+        request.validate()?;
+        let mailbox = self.resolve_mailbox(principal, request.agent.as_deref())?;
+        let semantic_payload = json!({
+            "agent": mailbox_name(mailbox),
+            "deliveries": request.deliveries,
+        });
+        Ok(PreparedMailAck {
+            mailbox,
+            payload_digest: canonical::digest(&semantic_payload)?,
+        })
+    }
+
     /// Queue one message to concrete recipients, snapshotting their
     /// generations in a single bounded transaction. Every recipient mailbox
     /// must fit the owner-configured unread `limits`, checked before any row
@@ -181,9 +254,34 @@ impl Store {
         request: &MailSendRequest,
         limits: MailLimits,
         now: i64,
-    ) -> Result<Change<MailSendResponse>> {
+    ) -> Result<MailSendResult> {
+        self.ensure_committed_reads()?;
+        let prepared = self.prepare_mail_send(principal, request)?;
+        if command_binding(&self.connection, &request.id)?.is_some() {
+            return Err(Error::new(
+                "id_conflict",
+                "mail write id is already used by a command",
+            ));
+        }
+        if let Some(retained) = retained_write_binding(
+            &self.connection,
+            principal,
+            &request.id,
+            MAIL_SEND_METHOD,
+            &prepared.payload_digest,
+            "mail write id is bound to another principal, method, or payload",
+        )? {
+            let value = serde_json::from_value::<MailSendResponse>(decode_json(&retained)?)
+                .map_err(|error| Error::new("internal", error.to_string()))?;
+            request.validate_response(&value)?;
+            return Ok(MailSendResult {
+                value,
+                events: Vec::new(),
+                outcome: MailSendOutcome::Retained,
+            });
+        }
         self.ensure_writer_healthy()?;
-        let result = self.mail_send_inner(principal, request, limits, now);
+        let result = self.mail_send_inner(principal, request, &prepared, limits, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -249,8 +347,32 @@ impl Store {
         request: &MailAckRequest,
         now: i64,
     ) -> Result<Change<MailAckResponse>> {
+        self.ensure_committed_reads()?;
+        let prepared = self.prepare_mail_ack(principal, request)?;
+        if command_binding(&self.connection, &request.id)?.is_some() {
+            return Err(Error::new(
+                "id_conflict",
+                "mail write id is already used by a command",
+            ));
+        }
+        if let Some(retained) = retained_write_binding(
+            &self.connection,
+            principal,
+            &request.id,
+            MAIL_ACK_METHOD,
+            &prepared.payload_digest,
+            "mail write id is bound to another principal, method, or payload",
+        )? {
+            let value = serde_json::from_value::<MailAckResponse>(decode_json(&retained)?)
+                .map_err(|error| Error::new("internal", error.to_string()))?;
+            request.validate_response(&value)?;
+            return Ok(Change {
+                value,
+                events: Vec::new(),
+            });
+        }
         self.ensure_writer_healthy()?;
-        let result = self.mail_ack_inner(principal, request, now);
+        let result = self.mail_ack_inner(principal, request, &prepared, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -351,11 +473,13 @@ impl Store {
                 "variable write id is already used by a command",
             ));
         }
-        let Some(retained) = retained_var_set_binding(
+        let Some(retained) = retained_write_binding(
             &self.connection,
             principal,
             &request.id,
+            VAR_SET_METHOD,
             &prepared.payload_digest,
+            "variable write id is bound to another principal, method, or payload",
         )?
         else {
             return Ok(None);
@@ -622,10 +746,10 @@ impl Store {
         &mut self,
         principal: &str,
         request: &MailSendRequest,
+        prepared: &PreparedMailSend,
         limits: MailLimits,
         now: i64,
-    ) -> Result<Change<MailSendResponse>> {
-        request.validate()?;
+    ) -> Result<MailSendResult> {
         limits.validate()?;
         if request.mode != MailMode::Queue {
             return Err(Error::new(
@@ -633,31 +757,8 @@ impl Store {
                 "only queued mail is connected; presentation modes are not",
             ));
         }
-        let sender = parse_sender(principal, "mail")?;
-        // Sender generation must be current; queue mail carries no
-        // project-scope authority beyond that.
-        if let Sender::Agent {
-            num, generation, ..
-        } = &sender
-        {
-            let agent = load_agent_by_num(&self.connection, *num)?.ok_or_else(|| {
-                Error::new("stale_generation", "sender generation is no longer current")
-            })?;
-            if agent.generation != *generation {
-                return Err(Error::new(
-                    "stale_generation",
-                    "sender generation is no longer current",
-                ));
-            }
-        }
-        let semantic_payload = json!({
-            "to": request.to,
-            "mode": request.mode.as_str(),
-            "text": request.text,
-            "thread": request.thread,
-            "reply_to_delivery": request.reply_to_delivery,
-        });
-        let payload_digest = canonical::digest(&semantic_payload)?;
+        let sender = &prepared.sender;
+        let payload_digest = &prepared.payload_digest;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -668,25 +769,22 @@ impl Store {
                 "mail write id is already used by a command",
             ));
         }
-        if let Some((old_principal, old_method, old_digest, old_result)) =
-            write_binding(&tx, &request.id)?
-        {
-            if old_principal != principal
-                || old_method != MAIL_SEND_METHOD
-                || old_digest != payload_digest
-            {
-                return Err(Error::new(
-                    "id_conflict",
-                    "mail write id is bound to another principal, method, or payload",
-                ));
-            }
+        if let Some(old_result) = retained_write_binding(
+            &tx,
+            principal,
+            &request.id,
+            MAIL_SEND_METHOD,
+            payload_digest,
+            "mail write id is bound to another principal, method, or payload",
+        )? {
             let value = serde_json::from_value::<MailSendResponse>(decode_json(&old_result)?)
                 .map_err(|error| Error::new("internal", error.to_string()))?;
             request.validate_response(&value)?;
             commit_transaction(tx, &self.write_faulted)?;
-            return Ok(Change {
+            return Ok(MailSendResult {
                 value,
                 events: Vec::new(),
+                outcome: MailSendOutcome::Retained,
             });
         }
         validate_id_age(&request.id, now)?;
@@ -703,7 +801,7 @@ impl Store {
             recipients.push(agent);
         }
         if let Some(reply) = request.reply_to_delivery.as_deref() {
-            Self::check_reply_participants_tx(&tx, reply, &sender, &recipients, now)?;
+            Self::check_reply_participants_tx(&tx, reply, sender, &recipients, now)?;
         }
         let addition = i64::try_from(request.text.len()).unwrap_or(i64::MAX);
         for agent in &recipients {
@@ -737,7 +835,7 @@ impl Store {
             }
         }
 
-        let (sender_name, sender_generation) = match &sender {
+        let (sender_name, sender_generation) = match sender {
             Sender::Owner => ("owner".to_owned(), None),
             Sender::Agent { id, generation, .. } => (id.clone(), Some(*generation)),
         };
@@ -786,15 +884,16 @@ impl Store {
             &request.id,
             principal,
             MAIL_SEND_METHOD,
-            &payload_digest,
+            payload_digest,
             &serde_json::to_value(&value)
                 .map_err(|error| Error::new("internal", error.to_string()))?,
             now,
         )?;
         commit_transaction(tx, &self.write_faulted)?;
-        Ok(Change {
+        Ok(MailSendResult {
             value,
             events: Vec::new(),
+            outcome: MailSendOutcome::Fresh,
         })
     }
 
@@ -853,15 +952,11 @@ impl Store {
         &mut self,
         principal: &str,
         request: &MailAckRequest,
+        prepared: &PreparedMailAck,
         now: i64,
     ) -> Result<Change<MailAckResponse>> {
-        request.validate()?;
-        let mailbox = self.resolve_mailbox(principal, request.agent.as_deref())?;
-        let semantic_payload = json!({
-            "agent": mailbox_name(mailbox),
-            "deliveries": request.deliveries,
-        });
-        let payload_digest = canonical::digest(&semantic_payload)?;
+        let mailbox = prepared.mailbox;
+        let payload_digest = &prepared.payload_digest;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -872,18 +967,14 @@ impl Store {
                 "mail write id is already used by a command",
             ));
         }
-        if let Some((old_principal, old_method, old_digest, old_result)) =
-            write_binding(&tx, &request.id)?
-        {
-            if old_principal != principal
-                || old_method != MAIL_ACK_METHOD
-                || old_digest != payload_digest
-            {
-                return Err(Error::new(
-                    "id_conflict",
-                    "mail write id is bound to another principal, method, or payload",
-                ));
-            }
+        if let Some(old_result) = retained_write_binding(
+            &tx,
+            principal,
+            &request.id,
+            MAIL_ACK_METHOD,
+            payload_digest,
+            "mail write id is bound to another principal, method, or payload",
+        )? {
             let value = serde_json::from_value::<MailAckResponse>(decode_json(&old_result)?)
                 .map_err(|error| Error::new("internal", error.to_string()))?;
             request.validate_response(&value)?;
@@ -931,7 +1022,7 @@ impl Store {
             &request.id,
             principal,
             MAIL_ACK_METHOD,
-            &payload_digest,
+            payload_digest,
             &serde_json::to_value(&value)
                 .map_err(|error| Error::new("internal", error.to_string()))?,
             now,
@@ -963,9 +1054,14 @@ impl Store {
                 "variable write id is already used by a command",
             ));
         }
-        if let Some(retained) =
-            retained_var_set_binding(&tx, principal, &request.id, payload_digest)?
-        {
+        if let Some(retained) = retained_write_binding(
+            &tx,
+            principal,
+            &request.id,
+            VAR_SET_METHOD,
+            payload_digest,
+            "variable write id is bound to another principal, method, or payload",
+        )? {
             let value = serde_json::from_value::<VarSetResponse>(decode_json(&retained)?)
                 .map_err(|error| Error::new("internal", error.to_string()))?;
             request.validate_response(&value)?;

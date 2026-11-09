@@ -13,7 +13,9 @@ pub use attribution::WhoWorkerRow;
 pub use capacity::{RecordedProcess, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, history_expired};
 pub use context::ContextDispatch;
-pub use coordination::{NoticeClaim, NoticeKind, NoticePending, NoticeState};
+pub use coordination::{
+    MailSendOutcome, MailSendResult, NoticeClaim, NoticeKind, NoticePending, NoticeState,
+};
 pub use goals::{
     GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundClaim, GoalRoundCommit,
     GoalRoundCommitResult, GoalRoundKey, GoalRoundProbe,
