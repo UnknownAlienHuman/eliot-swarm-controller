@@ -180,10 +180,6 @@ impl ObserverSession {
             rollout_path,
             cli_version,
         } = subject_read;
-        if let Err(error) = validate_live_codec(&cli_version) {
-            finish_reader(&mut reader, Some(drainer)).await?;
-            return Err(reader.client().diagnostic_error(error));
-        }
 
         let metadata = match native_store_identity(&store).map(|identity| {
             json!({
@@ -703,6 +699,10 @@ impl ObserverSession {
     async fn open_live_rollout(&mut self, deadline: Instant) -> Result<()> {
         if self.live_rollout.is_some() {
             return Ok(());
+        }
+        if validate_live_codec(&self.rollout_cli_version).is_err() {
+            self.live_problem = Some("observer rollout live edge is unavailable");
+            return Err(rollout_unavailable());
         }
         if self.live_opening.is_none() {
             if self.rollout_path.is_none() {

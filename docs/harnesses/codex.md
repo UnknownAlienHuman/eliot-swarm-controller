@@ -281,9 +281,12 @@ process loss ends that controlled generation after buffered output is drained.
 Observe-only live reading is separate from private `agent.history` pages. It opens only
 the exact rollout path returned for the attached `native_ref`, verifies its held-file
 identity and `session_meta` header under the selected Codex home's `sessions` or
-`archived_sessions` root, and captures a bounded
-live-edge baseline. Only after private `source.state` proves settled `observer_ready`
-does it commit a gap-backed `observe` to `transcript` handoff (`rollout_tail`). Store
+`archived_sessions` root. Metadata attachment and native `agent.history` pages do not
+depend on the live rollout codec gate; opening the live tail remains pinned to Codex
+0.161.0 and rejects other versions before reading records or establishing a live cursor.
+It captures a bounded live-edge baseline. Only after private `source.state` proves
+settled `observer_ready` does it commit a gap-backed `observe` to `transcript` handoff
+(`rollout_tail`). Store
 rechecks readiness, subject and ownership before accepting each observed batch. History
 pages never publish events or settle commands.
 
