@@ -511,8 +511,13 @@ impl Router {
                     break (command, seq, context_items);
                 }
                 Err(error) => {
-                    self.settle_dispatch_error(id, &error, change.1, launch_binding.is_some())
-                        .await;
+                    self.settle_dispatch_error(
+                        id,
+                        &error,
+                        change.1,
+                        launch_binding.is_some() || command.verb == "run",
+                    )
+                    .await;
                     return None;
                 }
             }

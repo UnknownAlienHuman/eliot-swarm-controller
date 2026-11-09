@@ -1443,11 +1443,26 @@ pub(super) fn resolve_script_run_origin_tx(
     }
 }
 
-fn resolve_event_script_run_origin_tx(
+pub(super) fn validate_script_run_admitted_origin_tx(
     tx: &Transaction<'_>,
     run: &Command,
     frozen: &core::api::FrozenScriptRun,
-) -> Result<ScriptRunOrigin> {
+) -> Result<()> {
+    match &frozen.context {
+        core::api::FrozenScriptContext::Event { .. } => {
+            validate_event_script_run_admitted_origin_tx(tx, run, frozen)
+        }
+        core::api::FrozenScriptContext::Timer { .. } => {
+            rule_timers::validate_timer_script_run_admitted_origin_tx(tx, run, frozen)
+        }
+    }
+}
+
+fn validate_event_script_run_admitted_origin_tx(
+    tx: &Transaction<'_>,
+    run: &Command,
+    frozen: &core::api::FrozenScriptRun,
+) -> Result<()> {
     let core::api::FrozenScriptContext::Event {
         event: frozen_event,
         subject: frozen_subject,
@@ -1603,11 +1618,29 @@ fn resolve_event_script_run_origin_tx(
         ));
     }
 
-    let stored = load_rule_state(tx, &run.principal, &rule)?
+    Ok(())
+}
+
+fn resolve_event_script_run_origin_tx(
+    tx: &Transaction<'_>,
+    run: &Command,
+    frozen: &core::api::FrozenScriptRun,
+) -> Result<ScriptRunOrigin> {
+    let core::api::FrozenScriptContext::Event {
+        rule: frozen_rule, ..
+    } = &frozen.context
+    else {
+        return Err(Error::new(
+            "source_integrity",
+            "event rule Run has no frozen event context",
+        ));
+    };
+    validate_event_script_run_admitted_origin_tx(tx, run, frozen)?;
+    let stored = load_rule_state(tx, &run.principal, &frozen_rule.id)?
         .ok_or_else(|| Error::new("source_integrity", "script rule state was removed"))?;
-    let definition = if stored.view.revision == revision {
+    let definition = if stored.view.revision == frozen_rule.revision {
         stored.canonical_definition.as_str()
-    } else if stored.view.retiring_revision == Some(revision) {
+    } else if stored.view.retiring_revision == Some(frozen_rule.revision) {
         stored
             .retiring_definition
             .as_deref()
@@ -1619,9 +1652,11 @@ fn resolve_event_script_run_origin_tx(
         ));
     };
     let limit = rule_action_limit_for_definition(definition)?;
+    let cause = command_cause_tx(tx, &run.id)?
+        .ok_or_else(|| Error::new("source_integrity", "script Run has no stored cause"))?;
     Ok(ScriptRunOrigin {
         principal: run.principal.clone(),
-        rule,
+        rule: frozen_rule.id.clone(),
         cause,
         limit,
     })
