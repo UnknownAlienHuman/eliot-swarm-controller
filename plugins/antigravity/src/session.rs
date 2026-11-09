@@ -159,11 +159,10 @@ impl Session {
                 "Eliot hook helper path is not an existing absolute executable",
             ));
         }
-        let mut hook_config = HookConfigGuard(Some(install_hook_config(
-            instance_dir,
-            &plan.launch.cwd,
-            &helper,
-        )?));
+        let mut hook_config = HookConfigGuard(Some(
+            install_hook_config(instance_dir, &plan.launch.cwd, &helper)
+                .map_err(|error| error.with_code("native_not_dispatched"))?,
+        ));
         let mut environment = plan.launch.environment.clone();
         environment.extend(hooks.endpoint_env());
         environment.push((hooks::ENV_HOOK_HELPER.into(), helper.into_os_string()));
