@@ -238,6 +238,7 @@ pub(super) struct ParentLink {
     pub(super) workspace: Option<String>,
     pub(super) profile_snapshot: Value,
     pub(super) control: AgentControl,
+    pub(super) state: AgentState,
 }
 
 /// Resolve `args.parent` for a launch: the parent must exist and be
@@ -288,6 +289,7 @@ pub(super) fn resolve_launch_parent(
         workspace: parent_agent.workspace.clone(),
         profile_snapshot: parent_agent.profile_snapshot.clone(),
         control: parent_agent.control,
+        state: parent_agent.state,
     }))
 }
 
@@ -349,7 +351,7 @@ fn control_rank(control: AgentControl) -> u8 {
 
 /// The single exception to the Store admission guard that a launch
 /// `profile_snapshot` must not carry a dispatch-derived
-/// `native_store_binding`: an authenticated Agent launching its own
+/// `native_store_binding`: an authenticated nonterminal Agent launching its own
 /// controlled child, reusing the parent's frozen snapshot verbatim
 /// (profile, harness, workspace, full snapshot, control narrowed or
 /// equal). The binding still flows through the dispatch-owned path, and
@@ -373,6 +375,9 @@ pub(super) fn admission_allows_carried_parent_binding(
     let Some(parent) = resolve_launch_parent(tx, principal, args)? else {
         return Ok(false);
     };
+    if parent.state.is_terminal() {
+        return Ok(false);
+    }
     let child_control =
         control_from_snapshot(args.get("profile_snapshot").unwrap_or(&Value::Null))?;
     let child_control = AgentControl::parse(&child_control)?;
