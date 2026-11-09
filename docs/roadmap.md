@@ -210,8 +210,8 @@ findings and exact acknowledgements under their own Agent principals, advancing 
 value from version 0 to 2. A mail-notice turn consumed one next_input context; a reply notice
 woke the other Agent. No Owner body relay/manual wake. A bounded two-item FIFO ordering and
 one CAS conflict case are now qualified. A native-agent run verified raw `who` output with empty
-edit attribution and the unseen-arrival acknowledgement race; `who` with nonempty live edit
-attribution remains unqualified.
+edit attribution and the unseen-arrival acknowledgement race. Live `who` also showed a singly
+owned Codex Luna Agent with complete, nonempty attribution for dirty `docs/spec/cloud-mcp.md`.
 
 ## L6 — Additional harnesses and only demonstrated missing features
 
