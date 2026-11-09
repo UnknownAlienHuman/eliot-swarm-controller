@@ -96,7 +96,11 @@ impl Store {
             rules::validate_script_run_admitted_origin_tx(&tx, &run.command, &frozen)?;
             None
         } else {
-            Some(rules::resolve_script_run_origin_tx(&tx, &run.command, &frozen)?)
+            Some(rules::resolve_script_run_origin_tx(
+                &tx,
+                &run.command,
+                &frozen,
+            )?)
         };
         projects::validate_project_command_dispatch_tx(&tx, &run)?;
 
