@@ -458,7 +458,7 @@ Worktree creation is opt-in on the same launch command:
 
 ```text
 command.submit {id, verb:"launch",
-  args:{profile, workspace, worktree?:BRANCH, base?:REF, parent?:AGENT, text?}}
+  args:{profile?:NAME, workspace, worktree?:BRANCH, base?:REF, parent?:AGENT, text?}}
 ```
 
 Without `worktree`, `workspace` remains the existing execution directory. With it,
@@ -473,9 +473,14 @@ the existing readiness/linked-input wait semantics above are unchanged.
 With `parent`, the launch creates a child of that Agent: an Agent principal launches
 only its own children (the Router defaults an absent parent to the caller), the child
 inherits the parent's project label and tree root, and the configured fanout limits
-are checked at admission. The parent must be controlled; an Agent's child reuses the
-parent's frozen profile with control narrowed or equal, shares its workspace, and
-mints no worktree (see [coordination](coordination.md#claims-and-hierarchy)).
+are checked at admission. The parent must be controlled. An Agent-principal child
+may omit `profile` or specify the parent's same profile name, with no `worktree`,
+and reuses the parent's frozen profile snapshot
+verbatim, without resolving a mutable named profile, then passes the authority
+check below. An Owner child launch may instead supply `profile`, a different
+workspace, and `worktree`, and remains unrestricted by that check. For an
+Agent-principal child, control is narrowed or equal, the workspace is shared, and
+no worktree is minted (see [coordination](coordination.md#claims-and-hierarchy)).
 
 Removal uses the same command admission and readback path:
 

@@ -260,15 +260,18 @@ struct AttachArgs {
 
 #[derive(Args)]
 struct LaunchArgs {
+    /// Named profile. Required for a parentless launch. An Agent child
+    /// reuses its parent's frozen profile; the Owner may supply one.
     #[arg(long, value_name = "PROFILE")]
-    profile: String,
+    profile: Option<String>,
     #[arg(long, value_name = "PATH")]
     workspace: PathBuf,
     #[arg(long, value_name = "BRANCH")]
     worktree: Option<String>,
     #[arg(long, value_name = "REF", requires = "worktree")]
     base: Option<String>,
-    /// Launch as a child of this Agent; the child inherits its project.
+    /// Launch as a child of this Agent; the child inherits its project
+    /// and, for an Agent principal, its parent's frozen profile.
     #[arg(long, value_name = "AGENT")]
     parent: Option<String>,
     #[arg(value_name = "PROMPT")]
@@ -1607,15 +1610,25 @@ async fn dispatch(
             wait,
             timeout_seconds,
         }) => {
-            if profile.is_empty() {
+            if let Some(name) = &profile
+                && name.is_empty()
+            {
                 return Err(Failure::new(2, "--profile must not be empty"));
+            }
+            if profile.is_none() && parent.is_none() {
+                return Err(Failure::new(
+                    2,
+                    "--profile is required for a parentless launch",
+                ));
             }
             validate_text(prompt.as_deref())?;
             let deadline = wait_deadline(timeout_seconds)?;
             let mut args = json!({
-                "profile": profile,
                 "workspace": workspace.to_string_lossy(),
             });
+            if let Some(profile) = profile {
+                args["profile"] = Value::String(profile);
+            }
             if let Some(worktree) = worktree {
                 args["worktree"] = Value::String(worktree);
             }

@@ -317,6 +317,8 @@ pub(super) fn submit_tx(
             .args
             .get("profile_snapshot")
             .is_some_and(|snapshot| snapshot.get("native_store_binding").is_some())
+        && !(request.verb == "launch"
+            && hierarchy::admission_allows_carried_parent_binding(tx, principal, &request.args)?)
     {
         return Err(Error::new(
             "invalid",
