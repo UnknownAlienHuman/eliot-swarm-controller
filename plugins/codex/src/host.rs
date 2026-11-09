@@ -335,9 +335,9 @@ impl CodexPlugin {
             ));
         }
         let params: DiscoverParams = decode(raw, "Codex discover params are invalid")?;
-        let (launch, secrets, _) =
+        let (launch, secrets, metadata_secrets) =
             self.reader_launch(&params.profile, &params.target_environment)?;
-        crate::discovery::discover(params, launch, secrets).await
+        crate::discovery::discover(params, launch, secrets, metadata_secrets).await
     }
 
     fn reader_launch(
@@ -457,12 +457,13 @@ impl CodexPlugin {
         if let Some(observer) = &self.observer {
             return observer.repeat_attach(&params);
         }
-        let (launch, secrets, _) =
+        let (launch, secrets, metadata_secrets) =
             self.reader_launch(&params.profile, &params.target_environment)?;
         let (observer, result) = ObserverSession::attach(
             params,
             launch,
             secrets,
+            metadata_secrets,
             Instant::now() + crate::discovery::READ_TIMEOUT,
         )
         .await?;

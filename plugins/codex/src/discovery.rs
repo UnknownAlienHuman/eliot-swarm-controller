@@ -123,7 +123,7 @@ pub(crate) async fn profile_store(
     diagnostic_secrets: &[String],
     deadline: Instant,
 ) -> Result<NativeStoreBinding> {
-    probe_store_with_secrets(
+    probe_store(
         launch,
         environment,
         metadata_secrets,
@@ -189,7 +189,8 @@ fn binding_paths(binding: &NativeStoreBinding) -> Result<(&Path, &Path)> {
 pub(crate) async fn discover(
     params: DiscoverParams,
     launch: NativeLaunch,
-    secrets: Vec<String>,
+    diagnostic_secrets: Vec<String>,
+    metadata_secrets: Vec<String>,
 ) -> Result<Value> {
     let deadline = Instant::now() + READ_TIMEOUT;
     if !(1..=MAX_DISCOVER_PAGE_ENTRIES).contains(&params.limit) {
@@ -212,12 +213,20 @@ pub(crate) async fn discover(
         &binding,
         params.native_scope.as_deref(),
     )?;
-    let store = probe_store(&launch, &params.target_environment, &secrets, deadline).await?;
+    let store = probe_store(
+        &launch,
+        &params.target_environment,
+        &metadata_secrets,
+        &diagnostic_secrets,
+        deadline,
+    )
+    .await?;
     validate_store(params.native_scope.as_deref(), cursor.as_ref(), &store)?;
     let (mut query, drainer) = open_pinned_reader(
         &launch,
         &params.target_environment,
-        &secrets,
+        &metadata_secrets,
+        &diagnostic_secrets,
         &store,
         deadline,
     )
@@ -228,7 +237,7 @@ pub(crate) async fn discover(
         cursor.as_ref(),
         &binding,
         &store,
-        &secrets,
+        &metadata_secrets,
         deadline,
     )
     .await;
@@ -237,15 +246,6 @@ pub(crate) async fn discover(
 }
 
 pub(crate) async fn probe_store(
-    launch: &NativeLaunch,
-    environment: &Value,
-    secrets: &[String],
-    deadline: Instant,
-) -> Result<StoreContext> {
-    probe_store_with_secrets(launch, environment, secrets, secrets, deadline).await
-}
-
-async fn probe_store_with_secrets(
     launch: &NativeLaunch,
     environment: &Value,
     metadata_secrets: &[String],
@@ -285,17 +285,18 @@ async fn probe_store_with_secrets(
 pub(crate) async fn open_pinned_reader(
     launch: &NativeLaunch,
     environment: &Value,
-    secrets: &[String],
+    metadata_secrets: &[String],
+    diagnostic_secrets: &[String],
     store: &StoreContext,
     deadline: Instant,
 ) -> Result<(NativeProcess, JoinHandle<()>)> {
     // thread_store is fixed at process startup (pinned message_processor.rs:301-304).
     // A config/read reload must not relabel one store's page with another root.
     let pinned = pinned_launch(launch, store.root())?;
-    let (mut query, drainer) = start_reader(pinned, secrets, deadline).await?;
+    let (mut query, drainer) = start_reader(pinned, diagnostic_secrets, deadline).await?;
     let result = async {
         let client = query.client();
-        let initialized = initialize_reader(&client, secrets, deadline).await?;
+        let initialized = initialize_reader(&client, metadata_secrets, deadline).await?;
         let pinned_store = read_store(
             &client,
             environment,

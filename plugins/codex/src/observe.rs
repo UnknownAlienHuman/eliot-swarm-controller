@@ -113,6 +113,7 @@ pub(crate) struct ObserverSession {
     rollout_path: Option<PathBuf>,
     rollout_cli_version: String,
     secrets: Vec<String>,
+    metadata_secrets: Vec<String>,
     reader: Option<NativeProcess>,
     drainer: Option<JoinHandle<()>>,
     attach_result: Value,
@@ -140,6 +141,7 @@ impl ObserverSession {
         params: ObserverAttachParams,
         launch: NativeLaunch,
         secrets: Vec<String>,
+        metadata_secrets: Vec<String>,
         deadline: Instant,
     ) -> Result<(Self, Value)> {
         validate_attach(&params, &secrets)?;
@@ -149,7 +151,14 @@ impl ObserverSession {
             return Err(too_large());
         }
 
-        let store = probe_store(&launch, &params.target_environment, &secrets, deadline).await?;
+        let store = probe_store(
+            &launch,
+            &params.target_environment,
+            &metadata_secrets,
+            &secrets,
+            deadline,
+        )
+        .await?;
         if store.scope() != params.native_scope {
             return Err(Error::new(
                 "source_integrity",
@@ -160,6 +169,7 @@ impl ObserverSession {
         let (mut reader, drainer) = open_pinned_reader(
             &launch,
             &params.target_environment,
+            &metadata_secrets,
             &secrets,
             &store,
             deadline,
@@ -205,7 +215,7 @@ impl ObserverSession {
                 "metadata": metadata,
                 "coverage": {"kind": "native_metadata", "complete": true, "live": false},
             }),
-            &secrets,
+            &metadata_secrets,
         ) {
             Ok(result) => result,
             Err(error) => {
@@ -221,6 +231,7 @@ impl ObserverSession {
             rollout_path,
             rollout_cli_version: cli_version,
             secrets,
+            metadata_secrets,
             reader: Some(reader),
             drainer: Some(drainer),
             attach_result: attach_result.clone(),
@@ -299,6 +310,11 @@ impl ObserverSession {
         if !matches!(query.source.as_str(), "native" | "rollout") {
             return Err(unsupported());
         }
+        let secrets = if query.source == "native" {
+            &self.metadata_secrets
+        } else {
+            &self.secrets
+        };
         match query.view.as_str() {
             "subject" if query.turn_id.is_some() || query.cursor.is_some() => {
                 return Err(invalid());
@@ -308,7 +324,7 @@ impl ObserverSession {
             _ => {}
         }
         if let Some(turn_id) = &query.turn_id {
-            reject_immutable_secret(turn_id, &self.secrets)?;
+            reject_immutable_secret(turn_id, secrets)?;
         }
 
         let binding = self.page_binding(query)?;
@@ -326,7 +342,7 @@ impl ObserverSession {
         let (entries, next_cursor, coverage) = if query.source == "native" {
             let cursor = decode_cursor(query.cursor.as_deref(), &binding)?;
             if let Some(cursor) = &cursor {
-                reject_immutable_secret(&cursor.native_cursor, &self.secrets)?;
+                reject_immutable_secret(&cursor.native_cursor, secrets)?;
             }
             let (entries, next_cursor) = self
                 .read_native_entries(&client, query, cursor.as_ref(), &binding, deadline)
@@ -378,7 +394,7 @@ impl ObserverSession {
         page.validate()?;
         bounded(
             serde_json::to_value(page).map_err(|_| integrity())?,
-            &self.secrets,
+            secrets,
         )
     }
 
@@ -817,7 +833,7 @@ impl ObserverSession {
                 "state": state,
                 "observation_state": "unknown",
             }),
-            &self.secrets,
+            &self.metadata_secrets,
         )?;
         self.detach_result = Some(result.clone());
         Ok(result)
@@ -945,7 +961,7 @@ impl ObserverSession {
                 if cursor.is_some_and(|cursor| cursor.native_cursor == next) {
                     return Err(integrity());
                 }
-                reject_immutable_secret(&next, &self.secrets)?;
+                reject_immutable_secret(&next, &self.metadata_secrets)?;
                 let encoded = format!(
                     "{CURSOR_PREFIX}{}",
                     serde_json::to_string(&HistoryCursor {
@@ -1009,7 +1025,7 @@ impl ObserverSession {
             {
                 return Err(integrity());
             }
-            reject_immutable_secret(&turn.id, &self.secrets)?;
+            reject_immutable_secret(&turn.id, &self.metadata_secrets)?;
             let value = json!({
                 "turn_id": turn.id,
                 "status": if turn.status == "inProgress" {"in_progress"} else {&turn.status},
@@ -1057,8 +1073,8 @@ impl ObserverSession {
             if entry.turn_id != turn_id || !ids.insert(entry.item.id.clone()) {
                 return Err(integrity());
             }
-            reject_immutable_secret(&entry.turn_id, &self.secrets)?;
-            reject_immutable_secret(&entry.item.id, &self.secrets)?;
+            reject_immutable_secret(&entry.turn_id, &self.metadata_secrets)?;
+            reject_immutable_secret(&entry.item.id, &self.metadata_secrets)?;
             let value = json!({
                 "turn_id": entry.turn_id,
                 "item_id": entry.item.id,
