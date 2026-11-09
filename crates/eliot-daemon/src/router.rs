@@ -1418,7 +1418,7 @@ impl Router {
                 workspace = retained_preparation(&request.args)?;
             } else {
                 let frozen = async {
-                    normalize_launch(&mut request)?;
+                    normalize_launch(&mut request, principal)?;
                     {
                         let store = self.inner.store.lock().await;
                         hierarchy::inherit_launch_project(&store, &mut request)?;
@@ -1640,15 +1640,68 @@ impl Router {
             return Ok(true);
         }
 
-        let profile_name = required_text(&request.args, "profile")?;
-        let mut snapshot = crate::config::resolve_profile(&self.inner.data_root, profile_name)?;
-        crate::config::capture_native_store_inputs(&mut snapshot, |name| std::env::var_os(name))?;
-        let harness = snapshot
-            .get("harness")
-            .and_then(Value::as_str)
-            .filter(|harness| !harness.trim().is_empty())
-            .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
-            .to_owned();
+        // Agent-principal child launches reuse the parent's frozen snapshot
+        // verbatim. Re-resolving a named profile would compare a fresh
+        // snapshot (without the dispatch-derived `native_store_binding`
+        // the parent gained at its own dispatch) against the retained one
+        // and fail the full-snapshot authority check.
+        let agent_child_snapshot = if matches!(principal, Principal::Agent { .. })
+            && request.args.get("parent").is_some()
+        {
+            let parent_id = request
+                .args
+                .get("parent")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::new("invalid", "launch parent must be an Agent id"))?;
+            let store = self.inner.store.lock().await;
+            let parent = store.get_agent(parent_id)?.ok_or_else(|| {
+                Error::new("not_found", format!("Agent {parent_id} was not found"))
+            })?;
+            if !parent.profile_snapshot.is_object() {
+                return Err(Error::new(
+                    "bad_state",
+                    "retained parent profile snapshot is malformed",
+                ));
+            }
+            if let Some(name) = request.args.get("profile").and_then(Value::as_str)
+                && name != parent.profile
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "Agent children inherit their parent's frozen profile; profile must match the parent",
+                ));
+            }
+            Some((
+                parent.profile.clone(),
+                parent.harness.clone(),
+                parent.profile_snapshot.clone(),
+            ))
+        } else {
+            None
+        };
+        let (profile_name, snapshot, harness) = match agent_child_snapshot {
+            Some((name, harness, snapshot)) => (name, snapshot, harness),
+            None => {
+                let profile_name = required_text(&request.args, "profile")?;
+                let mut snapshot =
+                    crate::config::resolve_profile(&self.inner.data_root, profile_name)?;
+                crate::config::capture_native_store_inputs(&mut snapshot, |name| {
+                    std::env::var_os(name)
+                })?;
+                let harness = snapshot
+                    .get("harness")
+                    .and_then(Value::as_str)
+                    .filter(|harness| !harness.trim().is_empty())
+                    .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
+                    .to_owned();
+                (profile_name.to_owned(), snapshot, harness)
+            }
+        };
+        // The retained wire shape keeps the named profile so Store admission
+        // can bind the child row to the parent's profile without guessing.
+        if let Some(args) = request.args.as_object_mut() {
+            args.insert("profile".to_owned(), Value::String(profile_name));
+        }
         install_frozen_profile(request, &harness, snapshot, true)?;
         {
             let store = self.inner.store.lock().await;
@@ -4010,7 +4063,7 @@ fn validate_project_rule_resume_command(
     Ok(())
 }
 
-fn normalize_launch(request: &mut SubmitCommand) -> Result<()> {
+fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Result<()> {
     if request.verb != "launch" {
         return Ok(());
     }
@@ -4054,10 +4107,16 @@ fn normalize_launch(request: &mut SubmitCommand) -> Result<()> {
         .args
         .as_object_mut()
         .ok_or_else(|| Error::new("invalid", "launch args must be an object"))?;
-    if !args
-        .get("profile")
-        .and_then(Value::as_str)
-        .is_some_and(|profile| !profile.trim().is_empty())
+    // An Agent launch without `parent` was already defaulted to the caller
+    // by authorize_command, so an Agent child carries `parent` here and
+    // keeps the profile optional. Only non-Agent callers (Owner
+    // parentless, Run/ProjectRule) require a named profile at this stage;
+    // the freeze step re-checks the principal boundary.
+    if !matches!(principal, Principal::Agent { .. })
+        && !args
+            .get("profile")
+            .and_then(Value::as_str)
+            .is_some_and(|profile| !profile.trim().is_empty())
     {
         return Err(Error::new("invalid", "launch requires a profile name"));
     }
