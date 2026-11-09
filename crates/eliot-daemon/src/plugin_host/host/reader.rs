@@ -1,7 +1,8 @@
 //! Owned reader transport shared by no-Agent discovery and bound observation.
 use super::{
     AgentKey, EventSource, PluginClient, PluginConnection, PluginHost, RPC_GRACE, STOP_GRACE,
-    deadline, remove_empty_instance_dir, serve_plugin_requests, source_secret_snapshot,
+    deadline, metadata_secret_snapshot, remove_empty_instance_dir, serve_plugin_requests,
+    source_secret_snapshot,
 };
 use crate::{
     monitor::Monitoring,
@@ -27,6 +28,7 @@ pub(super) struct ReaderTransport {
     pub child: OwnedChild,
     pub client: PluginClient,
     pub secrets: Arc<[String]>,
+    pub metadata_secrets: Arc<[String]>,
     pub credential: String,
     instance_dir: PathBuf,
     store_root: PathBuf,
@@ -85,11 +87,9 @@ impl PluginHost {
                 };
             }
         };
-        let secrets = source_secret_snapshot(
-            profile,
-            environment,
-            vec![self.state.owner_token.clone(), credential.clone()],
-        );
+        let known = vec![self.state.owner_token.clone(), credential.clone()];
+        let secrets = source_secret_snapshot(profile, environment, known.clone());
+        let metadata_secrets = metadata_secret_snapshot(profile, environment, known);
         let mut child = match self.spawn_plugin_process(harness, &instance_dir) {
             Ok(child) => child,
             Err(error) => {
@@ -182,6 +182,7 @@ impl PluginHost {
                 child,
                 client,
                 secrets,
+                metadata_secrets,
                 credential,
                 instance_dir,
                 store_root: self.state.data_root.join("plugins"),

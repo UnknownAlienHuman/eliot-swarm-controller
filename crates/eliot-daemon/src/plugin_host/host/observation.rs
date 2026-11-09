@@ -397,7 +397,7 @@ impl PluginHost {
                     "plugin did not return bound observer readiness",
                 ));
             }
-            safe_value(value, &reader.secrets)
+            safe_value(value, &reader.metadata_secrets)
         };
         let result = tokio::select! {
             biased;
@@ -449,7 +449,7 @@ impl PluginHost {
                                     {
                                         return Err(Error::new("unknown", "plugin did not confirm observer detach"));
                                     }
-                                    safe_value(value, &reader.secrets)
+                                    safe_value(value, &reader.metadata_secrets)
                                 }),
                                 Err(error) => Err(error),
                             };
@@ -755,7 +755,12 @@ async fn read_snapshot_until(
     }
     // A takeover/detach committed while the read was pending fences its result.
     check_binding(&host.state.store, agent, Some(&query.source)).await?;
-    safe_value(value, &reader.secrets)
+    let secrets = if query.source == "native" {
+        &reader.metadata_secrets
+    } else {
+        &reader.secrets
+    };
+    safe_value(value, secrets)
 }
 
 fn validate_subject(value: &Value, agent: &Agent) -> Result<()> {
