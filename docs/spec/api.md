@@ -55,6 +55,8 @@ forwards calls through the existing authenticated local client. Ordinary mode us
 [`eliot_daemon::client_call`](../../crates/eliot-daemon/src/daemon.rs); `--require-agent`
 uses [`eliot_daemon::client_call_with_agent_identity`](../../crates/eliot-daemon/src/daemon.rs).
 Both reuse existing methods and DTOs; MCP adds no management-method catalogue.
+Only `--require-agent` stdio includes standard `initialize.instructions`, directing the
+client to the `swarm` tool, current `method`/`params` DTOs, and inherited Agent authentication.
 
 Clients configure the stdio server using their native project-scoped configuration, such as
 an Antigravity workspace plugin (`.agents/plugins/eliot-swarm/plugin.json` + `mcp_config.json`).

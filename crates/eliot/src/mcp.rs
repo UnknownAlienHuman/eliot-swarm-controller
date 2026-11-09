@@ -60,6 +60,7 @@ use tokio_util::sync::CancellationToken;
 const TOOL_NAME: &str = "swarm";
 const TOOL_DESCRIPTION: &str =
     "Generic Eliot management call: { method, params } -> authenticated daemon RPC result";
+const REQUIRE_AGENT_INSTRUCTIONS: &str = "Use this server's swarm tool for Eliot controller and coordination operations instead of shell commands. Supply method and params using the current API DTO shape. Authentication is inherited from this Agent session; never put credentials or tokens in tool arguments.";
 
 const INVALID_ARGS_MESSAGE: &str = "tool arguments must be an object with method and params";
 
@@ -146,8 +147,13 @@ impl ServerHandler for EliotMcpHandler {
     }
 
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(server_capabilities(self.notify_owner_events))
-            .with_server_info(Implementation::new("eliot", env!("CARGO_PKG_VERSION")))
+        let config = ServerConfig::new(server_capabilities(self.notify_owner_events))
+            .with_server_info(Implementation::new("eliot", env!("CARGO_PKG_VERSION")));
+        if self.require_agent {
+            config.with_instructions(REQUIRE_AGENT_INSTRUCTIONS)
+        } else {
+            config
+        }
     }
 
     fn on_initialized(
