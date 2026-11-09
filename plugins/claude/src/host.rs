@@ -1970,26 +1970,34 @@ async fn realign_resumed_settings(
         .await
         .map_err(|error| setter_error(error, "set_model"))?;
     let mut effective_mode = current_mode;
-    if let Some(requested) = requested_mode
-        && effective_mode.as_deref() != Some(requested)
-    {
-        let echo = client
-            .control(
-                "set_permission_mode",
-                json!({"mode": requested}),
-                Instant::now() + RPC_TIMEOUT,
-            )
-            .await
-            .map_err(|error| setter_error(error, "set_permission_mode"))?;
-        if echo.get("mode").and_then(Value::as_str) != Some(requested) {
-            return Err(Error::new(
-                "unknown",
-                "Claude set_permission_mode echoed its own mode instead of the requested one",
-            ));
+    if let Some(profile_mode) = requested_mode {
+        let requested = native_resume_permission_mode(profile_mode);
+        if effective_mode.as_deref() != Some(requested) {
+            let echo = client
+                .control(
+                    "set_permission_mode",
+                    json!({"mode": requested}),
+                    Instant::now() + RPC_TIMEOUT,
+                )
+                .await
+                .map_err(|error| setter_error(error, "set_permission_mode"))?;
+            if echo.get("mode").and_then(Value::as_str) != Some(requested) {
+                return Err(Error::new(
+                    "unknown",
+                    "Claude set_permission_mode echoed a different native mode",
+                ));
+            }
+            effective_mode = Some(requested.to_owned());
         }
-        effective_mode = Some(requested.to_owned());
     }
     Ok(effective_mode)
+}
+
+fn native_resume_permission_mode(profile_mode: &str) -> &str {
+    match profile_mode {
+        "manual" => "default",
+        mode => mode,
+    }
 }
 
 fn setter_error(error: Error, subtype: &str) -> Error {

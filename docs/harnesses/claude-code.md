@@ -22,9 +22,13 @@ Verified live on Claude Code 2.1.278: with
 `{"behavior":"deny","message":…}` refuses it, each on the same `request_id`.
 Live on a resumed session: the unconditional `set_model` realign call and
 the resumed CLI's re-announcement of the same retained session id.
-Unverified live: the `set_permission_mode` call, which runs only when the
-frozen profile sets a permission mode that differs from the resumed
-session's current mode; no drift has occurred in a live run yet.
+With Claude Code 2.1.278 and `claude-agent-sdk` 0.2.180, initialize reported
+`current_permission_mode=default`, `set_model("haiku")` succeeded, and the
+native `set_permission_mode("manual")` response was `default`. Resume maps
+the frozen `manual` intent to native `default` for comparison, setter input
+and echo validation only. The requested profile stays `manual`; effective
+mode remains the native readback. Other modes stay literal. Lost setter
+replies and unexpected echoes remain `unknown`.
 
 ## Native identity and generation
 
