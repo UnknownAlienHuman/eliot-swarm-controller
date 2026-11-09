@@ -660,18 +660,21 @@ impl Router {
     }
 
     fn retained_command_result(&self, admission: Admission) -> Result<Value> {
-        if admission.command.state == CommandState::Unknown {
+        let Admission {
+            mut command,
+            linked_command,
+            ..
+        } = admission;
+        if command.state == CommandState::Unknown {
             self.inner
                 .unknown_commands
                 .lock_recover()
-                .insert(admission.command.id.clone());
+                .insert(command.id.clone());
         }
         self.signal_progress();
-        serde_json::to_value(submit_result(
-            &admission.command,
-            admission.linked_command.as_ref(),
-        ))
-        .map_err(|_| Error::new("internal", "retained command result could not be encoded"))
+        self.adjust_command_for_read(&mut command);
+        serde_json::to_value(submit_result(&command, linked_command.as_ref()))
+            .map_err(|_| Error::new("internal", "retained command result could not be encoded"))
     }
 
     async fn submit_git_fetch(
