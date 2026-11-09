@@ -32,12 +32,13 @@ Message {
 }
 ```
 
-Direct delivery uses the write id; selector expansion captures concrete recipients and
-creates `<write-id>/<recipient-agent>` rows in one bounded transaction. The selector is
-not reevaluated later. One admission names 1–100 concrete recipients. Same id with
-different identity/mode/body rejects; unknown recipient never creates an Agent. Text
-is at most 32 KiB, known secrets rejected. Only `queue` mode is connected; `send`,
-`steer` and `inject` presentation return `unsupported`.
+All implemented recipient deliveries use `<write-id>/<recipient-agent>` identifiers and
+create atomic concrete recipient rows from the frozen recipient list in one bounded
+transaction. The frozen list is not reevaluated later. One admission names 1–100
+concrete recipients. Same id with different identity/mode/body rejects; unknown
+recipient never creates an Agent. Text is at most 32 KiB, known secrets rejected.
+Only `queue` mode is connected; `send`, `steer` and `inject` presentation
+return `unsupported`.
 
 `recipient_generation` records the addressee's incarnation at admission and binds any
 native presentation command. It does **not** make queued correspondence disappear when
