@@ -113,7 +113,7 @@ impl CodexRoute {
             .position(|arg| arg == OsStr::new("app-server"))
             .ok_or_else(|| route_error("Codex app-server route is unavailable"))?;
         let server = format!(
-            "{{ enabled = true, command = {}, args = [\"mcp\", \"--require-agent\", \"--data-dir\", {}], env = {{}}, env_vars = [\"ELIOT_AGENT_ID\", \"ELIOT_AGENT_GENERATION\", \"ELIOT_AGENT_TOKEN\"], cwd = {} }}",
+            "{{ enabled = true, command = {}, args = [\"mcp\", \"--require-agent\", \"--data-dir\", {}], env = {{}}, env_vars = [\"ELIOT_AGENT_ID\", \"ELIOT_AGENT_GENERATION\", \"ELIOT_AGENT_TOKEN\"], cwd = {}, tools = {{ swarm = {{ approval_mode = \"approve\" }} }} }}",
             quote_path(swarm_executable)?,
             quote_path(data_dir)?,
             quote_path(cwd)?,
