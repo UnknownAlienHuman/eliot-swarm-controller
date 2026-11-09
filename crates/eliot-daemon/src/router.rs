@@ -1667,8 +1667,8 @@ impl Router {
                 && name != parent.profile
             {
                 return Err(Error::new(
-                    "invalid",
-                    "Agent children inherit their parent's frozen profile; profile must match the parent",
+                    "not_allowed",
+                    "Agent children reuse their parent's frozen profile",
                 ));
             }
             Some((
@@ -4112,12 +4112,18 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
     // keeps the profile optional. Only non-Agent callers (Owner
     // parentless, Run/ProjectRule) require a named profile at this stage;
     // the freeze step re-checks the principal boundary.
-    if !matches!(principal, Principal::Agent { .. })
-        && !args
-            .get("profile")
-            .and_then(Value::as_str)
-            .is_some_and(|profile| !profile.trim().is_empty())
-    {
+    // A present profile must be a nonempty string for every caller.
+    // Absence is optional only for an Agent principal, whose child
+    // reuses the parent's frozen snapshot; every other caller requires it.
+    if let Some(profile) = args.get("profile") {
+        let Some(name) = profile.as_str().filter(|name| !name.trim().is_empty()) else {
+            return Err(Error::new(
+                "invalid",
+                "launch profile must be a non-empty string",
+            ));
+        };
+        let _ = name;
+    } else if !matches!(principal, Principal::Agent { .. }) {
         return Err(Error::new("invalid", "launch requires a profile name"));
     }
     args.insert("workspace".to_owned(), Value::String(workspace.clone()));
@@ -4264,6 +4270,7 @@ struct RetainedLaunchProfile {
     snapshot: Value,
     command_has_harness: bool,
     command_has_snapshot: bool,
+    profile: String,
     workspace: Option<Value>,
     project: Option<Value>,
     preparation: Option<Value>,
@@ -4325,6 +4332,11 @@ fn retained_launch_profile(
 
     let command_has_harness = command.args.get("harness").is_some();
     let command_has_snapshot = command.args.get("profile_snapshot").is_some();
+    let stored_profile = command
+        .args
+        .get("profile")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     let workspace = command.args.get("workspace").cloned();
     let project = command.args.get("project").cloned();
     let preparation = command.args.get("workspace_preparation").cloned();
@@ -4339,11 +4351,21 @@ fn retained_launch_profile(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     if let (Some(harness), Some(snapshot)) = (stored_harness, stored_snapshot) {
+        // Profile was required on every admitted launch, so a missing or
+        // non-string field on a retained command is malformed, never a
+        // legacy shape to repair from the Agent row.
+        let profile = stored_profile.ok_or_else(|| {
+            Error::new(
+                "bad_state",
+                "retained launch profile field is missing or malformed",
+            )
+        })?;
         return Ok(Some(RetainedLaunchProfile {
             harness,
             snapshot,
             command_has_harness,
             command_has_snapshot,
+            profile,
             workspace,
             project,
             preparation,
@@ -4356,11 +4378,18 @@ fn retained_launch_profile(
     if let Some(target) = command.target.as_deref()
         && let Some(agent) = store.get_agent(target)?
     {
+        let profile = stored_profile.ok_or_else(|| {
+            Error::new(
+                "bad_state",
+                "retained launch profile field is missing or malformed",
+            )
+        })?;
         return Ok(Some(RetainedLaunchProfile {
             harness: agent.harness,
             snapshot: agent.profile_snapshot,
             command_has_harness,
             command_has_snapshot,
+            profile,
             workspace,
             project,
             preparation,
@@ -4428,6 +4457,7 @@ fn install_retained_profile(
         snapshot,
         command_has_harness,
         command_has_snapshot,
+        profile,
         workspace,
         project,
         preparation,
@@ -4455,6 +4485,11 @@ fn install_retained_profile(
     } else {
         args.remove("profile_snapshot");
     }
+    // Restore the admitted profile only when the retry omits it, so a
+    // no-profile retry hashes to the persisted digest and an explicitly
+    // changed profile stays untouched for the canonical id_conflict check.
+    args.entry("profile".to_owned())
+        .or_insert(Value::String(profile));
     if let Some(preparation) = preparation {
         args.insert("workspace_preparation".to_owned(), preparation);
     } else {

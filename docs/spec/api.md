@@ -474,7 +474,8 @@ With `parent`, the launch creates a child of that Agent: an Agent principal laun
 only its own children (the Router defaults an absent parent to the caller), the child
 inherits the parent's project label and tree root, and the configured fanout limits
 are checked at admission. The parent must be controlled. An Agent-principal child
-omits `profile` and `worktree` and reuses the parent's frozen profile snapshot
+may omit `profile` or specify the parent's same profile name, with no `worktree`,
+and reuses the parent's frozen profile snapshot
 verbatim, without resolving a mutable named profile, then passes the authority
 check below. An Owner child launch may instead supply `profile`, a different
 workspace, and `worktree`, and remains unrestricted by that check. For an

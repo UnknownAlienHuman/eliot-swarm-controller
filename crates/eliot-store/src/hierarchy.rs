@@ -233,6 +233,11 @@ pub(super) struct ParentLink {
     pub(super) project: String,
     pub(super) root_num: i64,
     pub(super) depth: i64,
+    pub(super) profile: String,
+    pub(super) harness: String,
+    pub(super) workspace: Option<String>,
+    pub(super) profile_snapshot: Value,
+    pub(super) control: AgentControl,
 }
 
 /// Resolve `args.parent` for a launch: the parent must exist and be
@@ -278,6 +283,11 @@ pub(super) fn resolve_launch_parent(
         project: parent_agent.project.clone(),
         root_num,
         depth: parent_agent.depth,
+        profile: parent_agent.profile.clone(),
+        harness: parent_agent.harness.clone(),
+        workspace: parent_agent.workspace.clone(),
+        profile_snapshot: parent_agent.profile_snapshot.clone(),
+        control: parent_agent.control,
     }))
 }
 
@@ -327,6 +337,61 @@ pub(super) fn control_from_snapshot(snapshot: &Value) -> Result<String> {
             "profile_snapshot.control must be self, tree, or project",
         )),
     }
+}
+
+fn control_rank(control: AgentControl) -> u8 {
+    match control {
+        AgentControl::Slf => 0,
+        AgentControl::Tree => 1,
+        AgentControl::Project => 2,
+    }
+}
+
+/// The single exception to the Store admission guard that a launch
+/// `profile_snapshot` must not carry a dispatch-derived
+/// `native_store_binding`: an authenticated Agent launching its own
+/// controlled child, reusing the parent's frozen snapshot verbatim
+/// (profile, harness, workspace, full snapshot, control narrowed or
+/// equal). The binding still flows through the dispatch-owned path, and
+/// any drift surfaces as `source_integrity` there. Owner, Run, and every
+/// other caller keep the existing rejection.
+pub(super) fn admission_allows_carried_parent_binding(
+    tx: &Transaction<'_>,
+    principal: &str,
+    args: &Value,
+) -> Result<bool> {
+    let caller = parse_caller(tx, principal)?;
+    let Caller::Agent { id: caller_id, .. } = &caller else {
+        return Ok(false);
+    };
+    let Some(parent_id) = args.get("parent").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    if caller_id != parent_id {
+        return Ok(false);
+    }
+    let Some(parent) = resolve_launch_parent(tx, principal, args)? else {
+        return Ok(false);
+    };
+    let child_control =
+        control_from_snapshot(args.get("profile_snapshot").unwrap_or(&Value::Null))?;
+    let child_control = AgentControl::parse(&child_control)?;
+    if control_rank(child_control) > control_rank(parent.control) {
+        return Ok(false);
+    }
+    Ok(args
+        .get("profile")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name == parent.profile)
+        && args
+            .get("harness")
+            .and_then(Value::as_str)
+            .is_some_and(|harness| harness == parent.harness)
+        && args
+            .get("workspace")
+            .and_then(Value::as_str)
+            .is_some_and(|workspace| parent.workspace.as_deref() == Some(workspace))
+        && args.get("profile_snapshot") == Some(&parent.profile_snapshot))
 }
 
 /// Snapshot one tree selector to its member rows, in member order. Unknown
