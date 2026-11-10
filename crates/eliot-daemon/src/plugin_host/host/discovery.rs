@@ -387,12 +387,13 @@ impl PluginHost {
             _ = stop.changed() => Err(Error::new("cancelled", "discovery was cancelled")),
         };
         let secrets = reader.secrets.clone();
+        let metadata_secrets = reader.metadata_secrets.clone();
         let close_until = metadata_reader_close_deadline(&stop);
         let closure = reader.close_until(self, None, close_until).await;
         let result = require_reader_cleanup(result, closure.closed, "discovery");
         let result = match result {
             Ok(mut value) => {
-                if crate::redaction::redact_value(&mut value, &secrets) {
+                if crate::redaction::redact_value(&mut value, &metadata_secrets) {
                     Err(Error::new(
                         "source_integrity",
                         "discovery metadata contains reserved credentials",
