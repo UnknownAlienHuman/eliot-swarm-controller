@@ -637,7 +637,15 @@ impl PluginHost {
             id: agent.id.clone(),
             generation: agent.generation,
         };
-        let (sender, stderr, credentials) = self.sender(&key, "stop")?;
+        let (sender, stderr, credentials) = self.sender(&key, "stop").map_err(|error| {
+            if error.code == "not_found" {
+                // This exact-generation lookup happens before enqueue, so no
+                // native stop was dispatched for the missing runtime.
+                error.with_code("native_not_dispatched")
+            } else {
+                error
+            }
+        })?;
         let (reply, response) = oneshot::channel();
         let deadlines = StopDeadlines::new(Instant::now());
         enqueue_stop(
