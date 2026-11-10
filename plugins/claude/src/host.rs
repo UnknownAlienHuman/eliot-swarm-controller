@@ -1,7 +1,7 @@
 use crate::{
     events::{self, EventConfig, EventHandle, EventStatus, SteerOutcome, TurnOutcome},
     native::{
-        ClaudeClient, ClaudeProcess,
+        ClaudeClient, ClaudeMcpConfigFile, ClaudeProcess,
         types::{InitializeReadback, OutboundUserInput, OutboundUserMessage},
     },
 };
@@ -73,6 +73,8 @@ struct AgentSession {
     session_id: Option<String>,
     native_scope: String,
     native: ClaudeProcess,
+    // Keep the private per-session MCP config alive with the owned CLI.
+    mcp_config: Option<ClaudeMcpConfigFile>,
     native_client: ClaudeClient,
     events: EventHandle,
     command_inputs: HashMap<String, String>,
@@ -87,10 +89,14 @@ struct AgentSession {
     stop_command_id: Option<String>,
 }
 
-/// Validated start inputs: the frozen profile plus the minted session id.
-/// Built before any spawn; every later start phase reads from it.
+/// Validated start inputs: the frozen profile, Agent-scoped MCP context, and
+/// minted session id. Built before any spawn; every later start phase reads
+/// from it.
 struct StartPlan {
     workspace: PathBuf,
+    instance_dir: PathBuf,
+    data_root: PathBuf,
+    swarm_binary: PathBuf,
     program: OsString,
     environment: Vec<(OsString, OsString)>,
     secrets: Vec<String>,
@@ -603,6 +609,30 @@ impl ClaudePlugin {
             mut secrets,
             config_dir,
         } = target_environment(params.target_environment.as_ref(), profile.get("pass_env"))?;
+        let data_root = ClaudeMcpConfigFile::require_agent_data_root(
+            &environment,
+            &params.agent_id,
+            params.generation,
+        )?;
+        let instance_dir = PathBuf::from(&initialized.instance_dir);
+        if !instance_dir.is_absolute() || !instance_dir.is_dir() {
+            return Err(Error::new(
+                "not_allowed",
+                "Claude MCP registration requires its private Agent instance directory",
+            ));
+        }
+        let swarm_binary = std::env::current_exe().map_err(|_| {
+            Error::new(
+                "platform_io",
+                "could not locate the current Eliot executable for Claude MCP",
+            )
+        })?;
+        if !swarm_binary.is_file() {
+            return Err(Error::new(
+                "platform_io",
+                "the current Eliot executable for Claude MCP is unavailable",
+            ));
+        }
         secrets.push(initialized.credential.clone());
         if let Some(subject) = resume_subject.as_ref()
             && subject.native_scope != claude_scope(config_dir.as_deref())
@@ -623,6 +653,9 @@ impl ClaudePlugin {
         let resume_ref = resume_subject.map(|subject| subject.native_ref);
         Ok(StartPlan {
             workspace,
+            instance_dir,
+            data_root,
+            swarm_binary,
             program,
             environment,
             secrets,
@@ -1704,6 +1737,7 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
         ));
     }
     session.phase = SessionPhase::Stopped;
+    drop(session.mcp_config.take());
     Ok(())
 }
 
@@ -1872,6 +1906,8 @@ async fn launch_session(
     params: &AgentStartParams,
     peer: &PeerClient,
 ) -> Result<AgentSession> {
+    let mcp_config =
+        ClaudeMcpConfigFile::create(&plan.instance_dir, &plan.swarm_binary, &plan.data_root)?;
     // Approvals always travel over stdio so every `can_use_tool` ask
     // reaches Eliot. Resume continues the exact retained session id; the
     // old prompt is never resent.
@@ -1901,6 +1937,10 @@ async fn launch_session(
         argv.push(OsString::from("--permission-mode"));
         argv.push(OsString::from(mode));
     }
+    // Use an additive per-run config. Never pass --strict-mcp-config: other
+    // native MCP sources remain governed by Claude Code's normal precedence.
+    argv.push(OsString::from("--mcp-config"));
+    argv.push(mcp_config.path().as_os_str().to_owned());
     // The CLI keeps its own login (not the desktop app's): check it, and run
     // its browser login when it is logged out, before any native resource.
     crate::native::ensure_logged_in(&plan.program, &plan.workspace, &plan.environment).await?;
@@ -1935,6 +1975,7 @@ async fn launch_session(
         session_id: None,
         native_scope: claude_scope(plan.config_dir.as_deref()),
         native,
+        mcp_config: Some(mcp_config),
         native_client,
         events,
         command_inputs: HashMap::new(),
