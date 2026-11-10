@@ -54,6 +54,16 @@ Arm the message reader before input. SessionStart hook lines carry the minted
 session id before any input, so the adapter declares no `start_requires_input`.
 A resumed CLI re-announces the same retained session id before readiness.
 
+Each owned Claude CLI launch also receives a private per-session `--mcp-config`
+file in the Eliot-created Agent instance directory. It registers the standard
+`swarm` tool through an `eliot-swarm` stdio server using the current Eliot executable and explicit
+`--data-dir <ELIOT_HOME> mcp --require-agent` arguments. The config contains no
+identity values; the server inherits the Agent id, generation, and token from
+the native process environment, and `--require-agent` fails closed. Eliot does
+not pass `--strict-mcp-config` or write Claude's user configuration, so other
+native MCP sources keep Claude Code's normal behavior. The file remains with
+the owned CLI and is removed after confirmed stop and drain.
+
 Resolve Windows executables explicitly; never insert an unrequested shell wrapper.
 Avoid modes that disable required hooks/instructions.
 
