@@ -1125,10 +1125,12 @@ async fn read_subject(
     let cli_version = raw
         .pointer("/thread/cliVersion")
         .and_then(Value::as_str)
-        .filter(|version| !version.trim().is_empty())
         .ok_or_else(integrity)?
         .to_owned();
-    validate_id(&cli_version)?;
+    // Codex 0.161 requires a string but has no minLength; historical threads may be empty.
+    if !cli_version.is_empty() {
+        validate_id(&cli_version)?;
+    }
     let response: NativeObservedThreadReadResponse =
         serde_json::from_value(raw).map_err(|_| integrity())?;
     if response.thread.metadata.id != native_ref {
