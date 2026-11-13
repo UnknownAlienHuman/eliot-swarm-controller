@@ -217,10 +217,8 @@ impl ServerHandler for EliotMcpHandler {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResponse, McpError>> + MaybeSendFuture + '_ {
         let data_dir = self.data_dir.clone();
-        let remote = verified_remote(
-            &context.extensions,
-            Some(serde_json::to_value(&context.id).unwrap_or(Value::Null)),
-        );
+        let request_id = serde_json::to_value(&context.id).unwrap_or(Value::Null);
+        let remote = verified_remote(&context.extensions, Some(request_id.clone()));
         let http = self.notify_owner_events;
         let require_agent = self.require_agent;
         async move {
@@ -282,7 +280,11 @@ impl ServerHandler for EliotMcpHandler {
                     };
                     Ok(CallToolResult::structured(output).into())
                 }
-                Err(error) => Ok(CallToolResult::structured_error(mcp_error_value(&error)).into()),
+                Err(error) => Ok(CallToolResult::structured_error(mcp_error_value(
+                    &error,
+                    &request_id,
+                ))
+                .into()),
             }
         }
     }
@@ -293,16 +295,52 @@ impl ServerHandler for EliotMcpHandler {
 /// Uses the Core error serializer so tool failures keep `code`, `message`
 /// and the optional bounded, redacted `diagnostics` (source labels plus
 /// truncation/EOF/read-error flags) that local RPC already carries. The
-/// serializer bounds the payload, keeping the MCP response frame within
-/// limit. Serialization cannot fail for a typed error; the fallback keeps
-/// the primary code/message rather than replacing the failure.
-fn mcp_error_value(error: &eliot_core::Error) -> Value {
-    serde_json::to_value(error).unwrap_or_else(|_| {
-        json!({
-            "code": error.code,
-            "message": error.message,
-        })
-    })
+/// `structured_error` duplicates the value in both `content.text` and
+/// `structuredContent`, and the JSON-RPC envelope echoes the request id,
+/// so optional diagnostics are further budgeted against the complete
+/// encoded response (id plus duplicated text plus envelope): tails are
+/// shortened with `truncated` set, or dropped entirely, until the line
+/// (plus newline) fits [`eliot_daemon::MAX_RPC_FRAME_BYTES`]. The primary
+/// code/message is always delivered, even if the id alone leaves no room.
+fn mcp_error_value(error: &eliot_core::Error, request_id: &Value) -> Value {
+    let mut budget = eliot_core::MAX_STDERR_DIAGNOSTIC_BYTES;
+    loop {
+        let mut diagnostics = error.diagnostics.clone();
+        eliot_core::bound_stderr_diagnostics(&mut diagnostics, budget);
+        let mut candidate = error.clone();
+        candidate.diagnostics = diagnostics;
+        let value = serde_json::to_value(&candidate).unwrap_or_else(|_| {
+            json!({
+                "code": error.code,
+                "message": error.message,
+            })
+        });
+        if mcp_error_response_fits(&value, request_id) {
+            return value;
+        }
+        if value.get("diagnostics").is_none() || budget == 0 {
+            return value;
+        }
+        budget /= 2;
+    }
+}
+
+/// Check the complete encoded stdio response line (JSON-RPC envelope with
+/// the echoed request id plus the duplicated error text) against the frame
+/// bound, including the trailing newline.
+fn mcp_error_response_fits(error_value: &Value, request_id: &Value) -> bool {
+    let Ok(result_value) =
+        serde_json::to_value(CallToolResult::structured_error(error_value.clone()))
+    else {
+        return false;
+    };
+    let envelope = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": result_value,
+    });
+    serde_json::to_vec(&envelope)
+        .is_ok_and(|bytes| bytes.len().saturating_add(1) <= eliot_daemon::MAX_RPC_FRAME_BYTES)
 }
 
 fn tool_definition() -> Tool {
@@ -672,7 +710,7 @@ mod tests {
     #[test]
     fn mcp_error_keeps_code_and_message_without_diagnostics() {
         let error = eliot_core::Error::new("not_found", "missing command");
-        let value = mcp_error_value(&error);
+        let value = mcp_error_value(&error, &Value::Null);
         assert_eq!(value.get("code").and_then(Value::as_str), Some("not_found"));
         assert_eq!(
             value.get("message").and_then(Value::as_str),
@@ -694,7 +732,7 @@ mod tests {
                 read_error: false,
             },
         );
-        let value = mcp_error_value(&error);
+        let value = mcp_error_value(&error, &Value::Null);
         assert_eq!(value.get("code").and_then(Value::as_str), Some("failed"));
         let diagnostics = value
             .get("diagnostics")
@@ -726,7 +764,7 @@ mod tests {
                 read_error: false,
             },
         );
-        let value = mcp_error_value(&error);
+        let value = mcp_error_value(&error, &Value::Null);
         assert_eq!(value.get("code").and_then(Value::as_str), Some("failed"));
         assert_eq!(
             value.get("message").and_then(Value::as_str),
@@ -734,6 +772,47 @@ mod tests {
         );
         let encoded = serde_json::to_vec(&value).expect("error value encodes");
         assert!(encoded.len() <= 64 * 1024);
+        let result = CallToolResult::structured_error(value);
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[test]
+    fn mcp_error_oversized_id_keeps_primary_and_fits_frame() {
+        let frame = eliot_daemon::MAX_RPC_FRAME_BYTES;
+        let request_id = Value::String("i".repeat(frame - 8 * 1024));
+        let error = eliot_core::Error::new("failed", "native exit").with_stderr(
+            StderrSource::Plugin,
+            StderrSnapshot {
+                text: "x".repeat(8 * 1024),
+                truncated: false,
+                eof: true,
+                read_error: false,
+            },
+        );
+        let naive = serde_json::to_value(&error).expect("naive error value encodes");
+        assert!(naive.get("diagnostics").is_some());
+        assert!(!mcp_error_response_fits(&naive, &request_id));
+        let value = mcp_error_value(&error, &request_id);
+        assert_eq!(value.get("code").and_then(Value::as_str), Some("failed"));
+        assert_eq!(
+            value.get("message").and_then(Value::as_str),
+            Some("native exit")
+        );
+        assert!(mcp_error_response_fits(&value, &request_id));
+        let tail_len: usize = value
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .map(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .filter_map(|diagnostic| {
+                        diagnostic.pointer("/snapshot/text").and_then(Value::as_str)
+                    })
+                    .map(str::len)
+                    .sum()
+            })
+            .unwrap_or(0);
+        assert!(tail_len < 8 * 1024);
         let result = CallToolResult::structured_error(value);
         assert_eq!(result.is_error, Some(true));
     }
