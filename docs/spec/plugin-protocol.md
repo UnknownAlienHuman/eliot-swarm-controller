@@ -341,9 +341,12 @@ of the predecessor's `last_store_seq`. For a gap-backed handoff, `0 < gap_seq < 
 
 `source` is the expected predecessor. `families` is a unique nonempty set; order is not
 significant, and Store sorts it before hashing the canonical operation and forming the
-ACK. Store rechecks the selected harness subset: Codex supports `session`,
+ACK. Store rechecks the selected harness subset: Codex and Muse support `session`,
 `turn`, `message`, `tool` and `request`; each other native adapter advertises
-only the families its implemented handlers support. Handoff transfer for
+only the families its implemented handlers support. Muse `tool` facts are the
+normalized `toolCall`/turn-bound `userShell` item revisions; the 1.4 item
+carries no inline workspace paths, so Muse `tool.completed` events attach no
+`changed_paths`. Handoff transfer for
 `child`, `goal` and `usage` stays `unsupported`. Native-child observation is
 implemented separately through the shared
 [`ChildParams`](../../crates/eliot-plugin/src/protocol.rs) /
