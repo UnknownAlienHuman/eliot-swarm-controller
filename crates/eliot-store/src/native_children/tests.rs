@@ -4,6 +4,205 @@ use eliot_core::api::HierarchyLimits;
 const NOW: i64 = 1_800_000_000_000;
 const SCOPE: &str = "codex:test-native-store";
 
+#[test]
+fn activity_projection_preserves_control_state_and_prefers_open_turns() {
+    let mut store = store();
+    let root = producer(&mut store, "root");
+    let child = register(&mut store, &root, request(&root, "root", "child"));
+    assert_eq!(
+        child.agent.activity.as_ref().unwrap().state,
+        NativeChildActivityState::Unknown
+    );
+    store
+        .put_native_child_batch(
+            &root,
+            1,
+            batch(
+                &child.agent.id,
+                "activity-start",
+                vec![event(
+                    "turn.started",
+                    "activity-start",
+                    json!({"turn_id":"one"}),
+                )],
+            ),
+            NOW + 2,
+        )
+        .unwrap();
+    let running = store.get_agent(&child.agent.id).unwrap().unwrap();
+    assert_eq!(running.state, AgentState::Unknown);
+    assert!(!running.own_identity);
+    assert_eq!(
+        running.activity.as_ref().unwrap().state,
+        NativeChildActivityState::Running
+    );
+    assert_eq!(
+        running.activity.as_ref().unwrap().last_progress_at,
+        Some(NOW + 2)
+    );
+    let summary = store
+        .native_children_attention(&root, 1, NOW + 1002, 1000)
+        .unwrap();
+    assert_eq!(
+        (summary.unfinished, summary.stalled, summary.lost),
+        (1, 1, 0)
+    );
+    assert!(
+        store
+            .list_attention_agents(None, 100)
+            .unwrap()
+            .iter()
+            .any(|agent| agent.id == root)
+    );
+    assert_eq!(
+        store
+            .native_children_attention(&root, 2, NOW + 1002, 1000)
+            .unwrap()
+            .unfinished,
+        0
+    );
+
+    store
+        .put_native_child_batch(
+            &root,
+            1,
+            batch(
+                &child.agent.id,
+                "activity-terminal",
+                vec![event(
+                    "turn.completed",
+                    "activity-interrupted",
+                    json!({"turn_id":"one", "status":"interrupted"}),
+                )],
+            ),
+            NOW + 3,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .get_agent(&child.agent.id)
+            .unwrap()
+            .unwrap()
+            .activity
+            .unwrap()
+            .state,
+        NativeChildActivityState::Interrupted
+    );
+    assert_eq!(
+        store
+            .native_children_attention(&root, 1, NOW + 1002, 1000)
+            .unwrap()
+            .unfinished,
+        0
+    );
+    store
+        .put_native_child_batch(
+            &root,
+            1,
+            batch(
+                &child.agent.id,
+                "activity-second",
+                vec![event(
+                    "turn.started",
+                    "activity-second",
+                    json!({"turn_id":"two"}),
+                )],
+            ),
+            NOW + 4,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .get_agent(&child.agent.id)
+            .unwrap()
+            .unwrap()
+            .activity
+            .unwrap()
+            .state,
+        NativeChildActivityState::Running
+    );
+    store
+        .mark_native_children_unavailable(&root, 1, "reader_lost", true, NOW + 5)
+        .unwrap();
+    let lost = store.get_agent(&child.agent.id).unwrap().unwrap();
+    assert_eq!(lost.state, AgentState::Unknown);
+    assert_eq!(lost.activity.as_ref().unwrap().open_turns, 1);
+    assert_eq!(lost.activity.unwrap().state, NativeChildActivityState::Lost);
+    assert_eq!(
+        store
+            .native_children_attention(&root, 1, NOW + 1002, 1000)
+            .unwrap()
+            .lost,
+        1
+    );
+}
+
+#[test]
+fn activity_uses_exact_parent_sources_and_aggregates_nested_children() {
+    let mut store = store();
+    let root = producer(&mut store, "root");
+    let child = register(&mut store, &root, request(&root, "root", "child"));
+    let nested = register(
+        &mut store,
+        &root,
+        request(&child.agent.id, "child", "nested"),
+    );
+    for (agent, turn) in [
+        (&child.agent.id, "child-turn"),
+        (&nested.agent.id, "nested-turn"),
+    ] {
+        start_child_turn(&mut store, &root, agent, turn);
+    }
+    // A split message owner can lose coverage independently of the turn owner.
+    store
+        .connection
+        .execute(
+            "INSERT INTO source_state(agent, generation, source, state, health, updated_at)
+         VALUES (?1, 1, 'message-tail', 'closed', 'stale', ?2)",
+            params![parse_agent_id(&root).unwrap(), NOW + 3],
+        )
+        .unwrap();
+    store.connection.execute(
+        "UPDATE source_owners SET source = 'message-tail' WHERE agent = ?1 AND generation = 1 AND family = 'message'",
+        [parse_agent_id(&root).unwrap()],
+    ).unwrap();
+    assert_eq!(
+        store
+            .get_agent(&child.agent.id)
+            .unwrap()
+            .unwrap()
+            .activity
+            .unwrap()
+            .state,
+        NativeChildActivityState::Lost
+    );
+    store.connection.execute(
+        "UPDATE source_owners SET source = 'stream' WHERE agent = ?1 AND generation = 1 AND family = 'message'",
+        [parse_agent_id(&root).unwrap()],
+    ).unwrap();
+    store
+        .record_native_child_source_gap(&root, 1, gap(&child.agent.id), NOW + 3)
+        .unwrap();
+    let activity = store
+        .get_agent(&nested.agent.id)
+        .unwrap()
+        .unwrap()
+        .activity
+        .unwrap();
+    assert_eq!(activity.state, NativeChildActivityState::Lost);
+    let summary = store
+        .native_children_attention(&root, 1, NOW + 4, 1000)
+        .unwrap();
+    assert_eq!((summary.unfinished, summary.lost), (2, 2));
+    assert_eq!(
+        store
+            .native_children_attention(&child.agent.id, 1, NOW + 4, 1000)
+            .unwrap()
+            .unfinished,
+        0
+    );
+}
+
 fn store() -> Store {
     Store::open(Path::new(":memory:")).unwrap()
 }
@@ -22,6 +221,14 @@ fn producer(store: &mut Store, native_ref: &str) -> String {
         .target
         .unwrap();
     store.dispatch(&command, NOW).unwrap();
+    // Match the current host handshake before publishing native facts.
+    let plan = ["session", "turn", "message", "tool", "request"]
+        .into_iter()
+        .map(|family| (family.to_owned(), INITIAL_SOURCE.to_owned()))
+        .collect();
+    store
+        .install_plugin_sources(&id, 1, &command, &plan, NOW)
+        .unwrap();
     store.put_batch(SourceBatch {
         batch_id: format!("{native_ref}:ready"), agent_id: id.clone(), generation: 1,
         source: INITIAL_SOURCE.to_owned(), cursor: None,
@@ -271,10 +478,14 @@ fn registration_rejects_changed_binding_foreign_parent_and_stale_generation() {
     );
     assert_eq!(store.high_water().unwrap(), high_water);
     assert_eq!(count(&store, "native_child_registrations"), 1);
+    let current = store.get_agent(&child.agent.id).unwrap().unwrap();
     assert_eq!(
-        store.get_agent(&child.agent.id).unwrap().unwrap(),
-        child.agent
+        current.activity.as_ref().unwrap().state,
+        NativeChildActivityState::Idle
     );
+    let mut expected = child.agent;
+    expected.activity = current.activity.clone();
+    assert_eq!(current, expected);
 }
 
 #[test]
@@ -781,10 +992,14 @@ fn producer_loss_marks_nested_children_unknown_then_closes_without_another_gap()
         store.get_turn(&first.agent.id, 1, "done").unwrap().unwrap(),
         completed
     );
+    let current = store.get_agent(&first.agent.id).unwrap().unwrap();
     assert_eq!(
-        store.get_agent(&first.agent.id).unwrap().unwrap(),
-        first_metadata
+        current.activity.as_ref().unwrap().state,
+        NativeChildActivityState::Lost
     );
+    let mut expected = first_metadata;
+    expected.activity = current.activity.clone();
+    assert_eq!(current, expected);
     assert_eq!(
         store
             .read_source_state(&unrelated.agent.id, 1, "stream")

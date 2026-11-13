@@ -113,6 +113,7 @@ mod goals;
 mod hierarchy;
 mod lifecycle;
 mod native_children;
+pub use native_children::NativeChildrenAttention;
 mod native_events;
 mod observer;
 mod observer_live;
@@ -795,7 +796,12 @@ impl Store {
                         pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
                         parent, root, depth, control
                  FROM agents
-                 WHERE id > ?1 AND observe_only = 0 AND state IN ('busy', 'waiting')
+                 WHERE id > ?1 AND observe_only = 0 AND (state IN ('busy', 'waiting')
+                   OR EXISTS(SELECT 1 FROM native_child_registrations r
+                     JOIN agents c ON c.id = r.child
+                     JOIN turns t ON t.agent = c.id AND t.generation = c.generation
+                     WHERE r.producer = agents.id AND r.producer_generation = agents.generation
+                       AND t.state IN ('running', 'unknown')))
                  ORDER BY id LIMIT ?2",
             )
             .map_err(sql_error)?;
@@ -2829,6 +2835,15 @@ fn agent_from_record(connection: &Connection, record: AgentRecord) -> Result<Age
             .map(|value| decode_json(&value))
             .transpose()?,
         state: parse_enum(&record.state, "Agent state")?,
+        activity: if record.origin == "native" && record.observe_only {
+            Some(native_children::activity(
+                connection,
+                record.id,
+                record.generation,
+            )?)
+        } else {
+            None
+        },
         active_turn: record.active_turn,
         pending,
         created_at: record.created_at,

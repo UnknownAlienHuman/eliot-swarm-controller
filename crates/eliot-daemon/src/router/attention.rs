@@ -36,6 +36,7 @@ const MAX_PROCESS_FACTS: usize = 16;
 enum IncidentKind {
     SourceUnhealthy,
     NoProgress,
+    ChildrenUnattended,
 }
 
 impl IncidentKind {
@@ -43,6 +44,7 @@ impl IncidentKind {
         match self {
             Self::SourceUnhealthy => "source_unhealthy",
             Self::NoProgress => "no_progress",
+            Self::ChildrenUnattended => "children_unattended",
         }
     }
 }
@@ -120,6 +122,8 @@ struct CapturedAgent {
     tool_coverage: eliot_store::ActiveToolCoverage,
     pending_kinds: Vec<String>,
     pending_kinds_truncated: bool,
+    children: eliot_store::NativeChildrenAttention,
+    manager_progress_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -140,6 +144,7 @@ struct AttentionReport {
     progress_age_ms: Option<i64>,
     source_health: Option<bool>,
     activity: String,
+    children: eliot_store::NativeChildrenAttention,
     pending_kinds: Vec<String>,
     pending_kinds_truncated: bool,
     tool_coverage: String,
@@ -312,7 +317,7 @@ pub(crate) async fn run_attention(
 }
 
 fn attention_transition_event(kind: &str) -> bool {
-    kind == "source.health"
+    matches!(kind, "source.health" | "source.gap" | "source.closed")
         || matches!(
             kind,
             "turn.started"
@@ -927,20 +932,30 @@ async fn inspect_agent(
     suspicion_window: Duration,
     trigger: Trigger,
 ) -> Result<()> {
-    if let Trigger::AgentLost { event_seq } = trigger {
-        return inspect_lost_agent(router, state, agent_id, generation, event_seq).await;
-    }
-
     let trigger_event_seq = match trigger {
         Trigger::SourceEvent { event_seq } => Some(event_seq),
         Trigger::Sweep | Trigger::AgentLost { .. } => None,
     };
 
-    let Some(captured) = capture_agent(router, agent_id, generation).await? else {
+    let Some(captured) = capture_agent(router, agent_id, generation, suspicion_window).await?
+    else {
         return Ok(());
     };
     if captured.agent.observe_only {
         return Ok(());
+    }
+    if let Trigger::AgentLost { event_seq } = trigger
+        && child_attention_activity(&captured, suspicion_window).is_none()
+    {
+        return inspect_lost_agent(
+            router,
+            state,
+            agent_id,
+            generation,
+            event_seq,
+            suspicion_window,
+        )
+        .await;
     }
     let desired = desired_incident(&captured, suspicion_window);
     report_cleared_incidents(router, &state, &captured, suspicion_window).await?;
@@ -955,8 +970,13 @@ async fn inspect_agent(
         return Ok(());
     };
     let process_observation = process_observation(router, &captured.agent).await;
-    let native_status = probe_native_status(router, &captured).await;
-    let Some(after_probe) = revalidate_probe(router, &captured, key.kind).await? else {
+    let native_status = if key.kind == IncidentKind::ChildrenUnattended {
+        NativeStatus::not_requested()
+    } else {
+        probe_native_status(router, &captured).await
+    };
+    let Some(after_probe) = revalidate_probe(router, &captured, key.kind, suspicion_window).await?
+    else {
         return Ok(());
     };
     let Some((still_key, still_activity)) = desired_incident(&after_probe, suspicion_window) else {
@@ -973,7 +993,11 @@ async fn inspect_agent(
             incident_id: incident_id(&after_probe, key.kind, still_activity.as_str()),
             activity: still_activity,
             observed_at: now_ms(),
-            suspicion_window: (key.kind == IncidentKind::NoProgress).then_some(suspicion_window),
+            suspicion_window: matches!(
+                key.kind,
+                IncidentKind::NoProgress | IncidentKind::ChildrenUnattended
+            )
+            .then_some(suspicion_window),
             trigger_event_seq,
             native_status,
             process_observation,
@@ -1003,8 +1027,10 @@ async fn inspect_lost_agent(
     agent_id: &str,
     generation: i64,
     event_seq: i64,
+    suspicion_window: Duration,
 ) -> Result<()> {
-    let Some(captured) = capture_agent(router, agent_id, generation).await? else {
+    let Some(captured) = capture_agent(router, agent_id, generation, suspicion_window).await?
+    else {
         return Ok(());
     };
     if captured.agent.observe_only || captured.agent.state == AgentState::Stopped {
@@ -1024,8 +1050,13 @@ async fn inspect_lost_agent(
     };
     let process_observation = process_observation(router, &captured.agent).await;
     let native_status = probe_native_status(router, &captured).await;
-    let Some(after_probe) =
-        revalidate_probe(router, &captured, IncidentKind::SourceUnhealthy).await?
+    let Some(after_probe) = revalidate_probe(
+        router,
+        &captured,
+        IncidentKind::SourceUnhealthy,
+        suspicion_window,
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -1082,6 +1113,25 @@ async fn report_cleared_incidents(
     suspicion_window: Duration,
 ) -> Result<()> {
     retire_stopped_source_incidents(router, state, captured).await;
+    // Mail wakes an idle manager and starts/completes a new parent turn. That
+    // must not rearm this incident. Only a fully finished child cohort clears it.
+    if captured.children.unfinished == 0 {
+        let key = IncidentKey {
+            agent: captured.agent.id.clone(),
+            generation: captured.agent.generation,
+            kind: IncidentKind::ChildrenUnattended,
+            turn_id: None,
+        };
+        let incident = state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .active
+            .get(&key)
+            .cloned();
+        if let Some(incident) = incident {
+            retire_obsolete_incident(router, state, key, incident, true).await;
+        }
+    }
     let mut candidates = recovery_candidates(state, captured);
     if candidates.is_empty() {
         return Ok(());
@@ -1177,6 +1227,7 @@ fn incident_condition_cleared(
     captured: &CapturedAgent,
 ) -> bool {
     match key.kind {
+        IncidentKind::ChildrenUnattended => false,
         IncidentKind::SourceUnhealthy => {
             captured.source_healthy == Some(true)
                 && !source_is_unhealthy(captured.agent.state, &captured.source_states)
@@ -1266,9 +1317,15 @@ async fn revalidate_probe(
     router: &Router,
     captured: &CapturedAgent,
     kind: IncidentKind,
+    suspicion_window: Duration,
 ) -> Result<Option<CapturedAgent>> {
-    let Some(current) =
-        capture_agent(router, &captured.agent.id, captured.agent.generation).await?
+    let Some(current) = capture_agent(
+        router,
+        &captured.agent.id,
+        captured.agent.generation,
+        suspicion_window,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -1328,6 +1385,7 @@ async fn capture_agent(
     router: &Router,
     agent_id: &str,
     generation: i64,
+    suspicion_window: Duration,
 ) -> Result<Option<CapturedAgent>> {
     let (
         agent,
@@ -1338,6 +1396,8 @@ async fn capture_agent(
         turn,
         turn_command_id,
         tool_coverage,
+        children,
+        manager_progress_at,
     ) = {
         let store = router.inner.store.lock().await;
         let Some(agent) = store.get_agent(agent_id)? else {
@@ -1353,12 +1413,27 @@ async fn capture_agent(
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| Error::new("internal", "Agent source state projection is invalid"))?;
         let last_model_progress_at = store.last_model_progress(agent_id, generation)?;
+        let children = if agent.observe_only {
+            eliot_store::NativeChildrenAttention::default()
+        } else {
+            store.native_children_attention(
+                agent_id,
+                generation,
+                now_ms(),
+                i64::try_from(suspicion_window.as_millis()).unwrap_or(i64::MAX),
+            )?
+        };
         let turn = agent
             .active_turn
             .as_deref()
             .map(|turn_id| store.get_turn(agent_id, generation, turn_id))
             .transpose()?
             .flatten();
+        let manager_progress_at = store
+            .native_model_progress(agent_id, generation)?
+            .into_iter()
+            .chain(turn.as_ref().and_then(|turn| turn.started_at))
+            .max();
         let turn_command_id = match agent.active_turn.as_deref() {
             Some(turn_id) => store.turn_command_id(agent_id, generation, turn_id)?,
             None => None,
@@ -1395,6 +1470,8 @@ async fn capture_agent(
             turn,
             turn_command_id,
             tool_coverage,
+            children,
+            manager_progress_at,
         )
     };
     let turn_started_at = turn.and_then(|turn| turn.started_at);
@@ -1429,6 +1506,8 @@ async fn capture_agent(
         tool_coverage,
         pending_kinds,
         pending_kinds_truncated,
+        children,
+        manager_progress_at,
     }))
 }
 
@@ -1436,6 +1515,17 @@ fn desired_incident(
     captured: &CapturedAgent,
     suspicion_window: Duration,
 ) -> Option<(IncidentKey, String)> {
+    if let Some(activity) = child_attention_activity(captured, suspicion_window) {
+        return Some((
+            IncidentKey {
+                agent: captured.agent.id.clone(),
+                generation: captured.agent.generation,
+                kind: IncidentKind::ChildrenUnattended,
+                turn_id: None,
+            },
+            activity.to_owned(),
+        ));
+    }
     if captured.agent.state != AgentState::Stopped
         && source_is_unhealthy(captured.agent.state, &captured.source_states)
     {
@@ -1470,6 +1560,29 @@ fn desired_incident(
         },
         activity_classification(captured, suspicion_window),
     ))
+}
+
+fn child_attention_activity(
+    captured: &CapturedAgent,
+    suspicion_window: Duration,
+) -> Option<&'static str> {
+    if captured.children.unfinished == 0 {
+        return None;
+    }
+    let threshold = i64::try_from(suspicion_window.as_millis()).unwrap_or(i64::MAX);
+    let manager_silent = captured
+        .manager_progress_at
+        .and_then(|at| now_ms().checked_sub(at))
+        .is_some_and(|age| age >= threshold);
+    if matches!(captured.agent.state, AgentState::Idle | AgentState::Stopped) || manager_silent {
+        Some("manager_inactive_with_unfinished_children")
+    } else if captured.agent.state == AgentState::Busy
+        && (captured.children.lost > 0 || captured.children.stalled > 0)
+    {
+        Some("child_progress_needs_manager")
+    } else {
+        None
+    }
 }
 
 fn activity_classification(captured: &CapturedAgent, suspicion_window: Duration) -> String {
@@ -1682,6 +1795,22 @@ fn build_report(
         eliot_store::ActiveToolCoverage::Clear => ("clear".to_owned(), Some(0)),
         eliot_store::ActiveToolCoverage::Active { count } => ("active".to_owned(), Some(count)),
     };
+    let (last_model_progress_at, progress_basis_at, progress_age_ms) =
+        if kind == IncidentKind::ChildrenUnattended {
+            let at = captured.manager_progress_at;
+            (
+                at,
+                at,
+                at.and_then(|at| observed_at.checked_sub(at))
+                    .filter(|age| *age >= 0),
+            )
+        } else {
+            (
+                captured.last_model_progress_at,
+                captured.progress_basis_at,
+                captured.progress_age_ms,
+            )
+        };
     AttentionReport {
         schema: 1,
         incident_id,
@@ -1695,11 +1824,12 @@ fn build_report(
         observed_at,
         suspicion_window_ms: suspicion_window
             .and_then(|window| i64::try_from(window.as_millis()).ok()),
-        last_model_progress_at: captured.last_model_progress_at,
-        progress_basis_at: captured.progress_basis_at,
-        progress_age_ms: captured.progress_age_ms,
+        last_model_progress_at,
+        progress_basis_at,
+        progress_age_ms,
         source_health: captured.source_healthy,
         activity,
+        children: captured.children.clone(),
         pending_kinds: captured.pending_kinds.clone(),
         pending_kinds_truncated: captured.pending_kinds_truncated,
         tool_coverage,
@@ -2004,7 +2134,7 @@ async fn send_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
     if let Some(parent) = report
         .parent_agent
         .as_ref()
-        .filter(|parent| *parent != &report.agent_id)
+        .filter(|parent| *parent != &report.agent_id && report.reason != "children_unattended")
     {
         let supervisor = MailSendRequest {
             id: delivery.supervisor_mail_id.clone(),
@@ -2043,6 +2173,11 @@ async fn send_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
             .await
         {
             delivery_errors.push(format!("owner_notify:{}", error.code));
+        }
+        if report.reason == "children_unattended"
+            && let Err(error) = wait_for_applied(router, &delivery.owner_notify_id).await
+        {
+            delivery_errors.push(format!("owner_notify_settlement:{}", error.code));
         }
     }
     if delivery_errors.is_empty() {
@@ -2086,9 +2221,12 @@ fn diagnosis_summary(report: &AttentionReport) -> String {
         .map(|exited| exited.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
     format!(
-        "Diagnosis: reason={}, activity={}, source_health={}, progress_age_ms={}, native_probe_requested={}, native_state={}, native_error={}, native_basis={}, native_freshness={}, native_binding_matches={}, process_coverage={}, process_sample_age_ms={}, process_complete={}, process_exited={}",
+        "Diagnosis: reason={}, activity={}, children_unfinished={}, children_lost={}, children_stalled={}, source_health={}, progress_age_ms={}, native_probe_requested={}, native_state={}, native_error={}, native_basis={}, native_freshness={}, native_binding_matches={}, process_coverage={}, process_sample_age_ms={}, process_complete={}, process_exited={}",
         report.reason,
         report.activity,
+        report.children.unfinished,
+        report.children.lost,
+        report.children.stalled,
         source_health,
         progress_age,
         report.native_status.probe_requested,
@@ -2115,5 +2253,100 @@ fn state_name(state: AgentState) -> &'static str {
         AgentState::Failed => "failed",
         AgentState::Lost => "lost",
         AgentState::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod child_attention_tests {
+    use super::*;
+
+    fn manager() -> CapturedAgent {
+        let now = now_ms();
+        let mut agent = Agent::new("a1", "project", "codex", "profile", now);
+        agent.generation = 1;
+        agent.state = AgentState::Busy;
+        agent.active_turn = Some("parent-turn".to_owned());
+        CapturedAgent {
+            agent,
+            source_states: Vec::new(),
+            source_healthy: Some(true),
+            unhealthy_source_seq: None,
+            last_model_progress_at: Some(now),
+            progress_basis_at: Some(now),
+            progress_age_ms: Some(0),
+            turn_command_id: None,
+            tool_coverage: eliot_store::ActiveToolCoverage::Clear,
+            pending_kinds: Vec::new(),
+            pending_kinds_truncated: false,
+            children: eliot_store::NativeChildrenAttention {
+                unfinished: 1,
+                ..Default::default()
+            },
+            manager_progress_at: Some(now),
+        }
+    }
+
+    #[test]
+    fn decision_requires_unfinished_children_and_manager_or_child_suspicion() {
+        let window = Duration::from_secs(900);
+        let mut captured = manager();
+        assert!(child_attention_activity(&captured, window).is_none());
+        for state in [AgentState::Idle, AgentState::Stopped] {
+            captured.agent.state = state;
+            assert_eq!(
+                child_attention_activity(&captured, window),
+                Some("manager_inactive_with_unfinished_children")
+            );
+        }
+        captured.agent.state = AgentState::Busy;
+        captured.children.stalled = 1;
+        assert_eq!(
+            child_attention_activity(&captured, window),
+            Some("child_progress_needs_manager")
+        );
+        captured.children.stalled = 0;
+        captured.children.lost = 1;
+        assert_eq!(
+            child_attention_activity(&captured, window),
+            Some("child_progress_needs_manager")
+        );
+        captured.agent.state = AgentState::Waiting;
+        assert!(child_attention_activity(&captured, window).is_none());
+        captured.agent.state = AgentState::Busy;
+        captured.children.lost = 0;
+        captured.manager_progress_at = Some(now_ms() - 900_001);
+        assert_eq!(
+            child_attention_activity(&captured, window),
+            Some("manager_inactive_with_unfinished_children")
+        );
+        captured.children.unfinished = 0;
+        captured.agent.state = AgentState::Idle;
+        assert!(child_attention_activity(&captured, window).is_none());
+    }
+
+    #[test]
+    fn mail_wake_and_parent_turn_changes_do_not_rearm_child_cohort() {
+        let window = Duration::from_secs(900);
+        let mut captured = manager();
+        captured.agent.state = AgentState::Idle;
+        let (key, _) = desired_incident(&captured, window).unwrap();
+        let state = Arc::new(Mutex::new(AttentionState::default()));
+        let incident = ActiveIncident {
+            incident_id: "frozen-child-incident".to_owned(),
+            baseline_progress_at: captured.progress_basis_at,
+            baseline_model_progress_at: captured.last_model_progress_at,
+            incident_delivery: None,
+            recovery_delivery: None,
+        };
+        reserve_incident(&state, &key)
+            .unwrap()
+            .commit(key.clone(), incident.clone());
+        captured.agent.active_turn = Some("mail-wake-turn".to_owned());
+        captured.manager_progress_at = Some(now_ms());
+        captured.children.unfinished = 100;
+        let (same_key, _) = desired_incident(&captured, window).unwrap();
+        assert_eq!(same_key, key);
+        assert!(reserve_incident(&state, &same_key).is_none());
+        assert!(!incident_condition_cleared(&same_key, &incident, &captured));
     }
 }

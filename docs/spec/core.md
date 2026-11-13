@@ -117,6 +117,20 @@ unknown, and a detached row retains that status. Reader-local `notLoaded` is not
 idle or stopped evidence. Observation failure and restart retain unknown/stale coverage;
 they do not take the controlled-generation `agent.lost` transition.
 
+Native observe-only children also expose the read-only `Agent.activity` projection
+(`NativeChildActivity`): `running` when a committed child turn is open; `lost` when
+that turn remains open but its child, immediate parent or exact producer source is
+closed, gapped, unhealthy or superseded; `idle` after the latest terminal turn, or
+`interrupted` for an interrupted/cancelled terminal turn; `unknown` without sufficient
+turn facts. Partial message facts without a terminal receipt also leave an observed
+turn open; source loss/restart and event retention do not silently clear that work.
+Open turns take precedence over terminal history. Progress comes only
+from committed native turn/message/tool/request facts, never CPU, Git or mail.
+The projection is derived from existing turns, events and source/registration rows,
+with no new activity table. Retention can leave the progress timestamp unknown.
+`ls`, `show`, `top` and MCP reads expose this field next to unchanged lifecycle
+`state=unknown`; activity grants neither a principal nor child control verbs.
+
 Observe attachment records `origin=external`, `observe_only=true`, `own_identity=false`
 and no token. The generation/source fence commits before reader I/O. Owner-issued native
 control commands reject as well. Detach closes only owned reader resources and source

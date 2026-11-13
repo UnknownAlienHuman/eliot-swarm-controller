@@ -10,6 +10,24 @@ pub const CODEX_NATIVE_CHILD_FAMILIES: [&str; 3] = ["session", "turn", "message"
 pub const MUSE_NATIVE_CHILD_FAMILIES: [&str; 1] = ["turn"];
 pub const NATIVE_CHILD_FAMILIES: [&str; 3] = CODEX_NATIVE_CHILD_FAMILIES;
 
+/// Committed observation only; this never grants native child control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeChildActivityState {
+    Running,
+    Idle,
+    Interrupted,
+    Lost,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeChildActivity {
+    pub state: NativeChildActivityState,
+    pub open_turns: usize,
+    pub last_progress_at: Option<i64>,
+}
+
 /// Observation stream families currently implemented for each supported native-child harness.
 pub fn native_child_families_for_harness(harness: &str) -> Option<&'static [&'static str]> {
     match harness {

@@ -7,9 +7,165 @@ use eliot_core::{
     CODEX_NATIVE_CHILD_FAMILIES, ChildRegistration, ChildRegistrationAck,
     MUSE_NATIVE_CHILD_FAMILIES, native_child_families_for_harness,
 };
+use eliot_core::{NativeChildActivity, NativeChildActivityState};
 use std::collections::BTreeMap;
 
+/// A bounded sample plus complete counts; no transcript text or native identity.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct NativeChildrenAttention {
+    pub unfinished: usize,
+    pub lost: usize,
+    pub stalled: usize,
+    pub children: Vec<(String, NativeChildActivity)>,
+    pub children_truncated: bool,
+}
+
+pub(super) fn activity(
+    connection: &Connection,
+    child: i64,
+    generation: i64,
+) -> Result<NativeChildActivity> {
+    let open_turns: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM turns WHERE agent = ?1 AND generation = ?2
+             AND state IN ('running', 'unknown')",
+            params![child, generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    let open_turns = usize::try_from(open_turns)
+        .map_err(|_| Error::new("internal", "native child open-turn count overflowed"))?;
+    let last_progress_at = native_progress(connection, child, generation)?;
+    let state = if open_turns > 0 {
+        let binding: Option<(i64, i64, i64, i64)> = connection
+            .query_row(
+                "SELECT producer, producer_generation, parent, parent_generation
+             FROM native_child_registrations WHERE child = ?1",
+                [child],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let healthy = source_healthy(connection, child, generation)?
+            && match binding {
+                Some((producer, producer_generation, parent, parent_generation)) => {
+                    source_healthy(connection, producer, producer_generation)?
+                        && source_healthy(connection, parent, parent_generation)?
+                }
+                None => false,
+            };
+        if healthy {
+            NativeChildActivityState::Running
+        } else {
+            NativeChildActivityState::Lost
+        }
+    } else {
+        let terminal: Option<Option<String>> = connection.query_row(
+            "SELECT status FROM turns WHERE agent = ?1 AND generation = ?2 AND state = 'completed'
+             ORDER BY COALESCE(completed_at, started_at, 0) DESC, rowid DESC LIMIT 1",
+            params![child, generation], |row| row.get(0),
+        ).optional().map_err(sql_error)?;
+        match terminal {
+            Some(Some(status)) if matches!(status.as_str(), "interrupted" | "cancelled") => {
+                NativeChildActivityState::Interrupted
+            }
+            Some(_) => NativeChildActivityState::Idle,
+            None => NativeChildActivityState::Unknown,
+        }
+    };
+    Ok(NativeChildActivity {
+        state,
+        open_turns,
+        last_progress_at,
+    })
+}
+
+fn source_healthy(connection: &Connection, agent: i64, generation: i64) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM source_owners o JOIN agents a
+             ON a.id = o.agent AND a.generation = o.generation
+             WHERE o.agent = ?1 AND o.generation = ?2 AND o.family = 'turn')
+             AND NOT EXISTS(SELECT 1 FROM source_owners o LEFT JOIN source_state s
+             ON s.agent = o.agent AND s.generation = o.generation AND s.source = o.source
+             WHERE o.agent = ?1 AND o.generation = ?2
+             AND o.family IN ('session', 'turn', 'message', 'tool', 'request')
+             AND (s.state IS NULL OR s.state != 'open' OR s.health != 'ok' OR s.gap_id IS NOT NULL))",
+            params![agent, generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
+}
+
+fn native_progress(connection: &Connection, agent: i64, generation: i64) -> Result<Option<i64>> {
+    connection.query_row(
+        "SELECT MAX(ts) FROM events WHERE agent = ?1 AND generation = ?2
+           AND native_id IS NOT NULL AND source NOT IN ('daemon', 'os', 'git', 'workspace_process')
+           AND kind IN ('turn.started', 'turn.completed', 'message.completed',
+                        'tool.started', 'tool.completed', 'request.opened', 'request.resolved', 'request.closed')",
+        params![agent, generation], |row| row.get(0),
+    ).map_err(sql_error)
+}
+
 impl Store {
+    /// Native descendants share the exact controlled producer connection. Its
+    /// registration is the nearest controlled ancestor, including nested children.
+    pub fn native_children_attention(
+        &self,
+        manager: &str,
+        generation: i64,
+        now: i64,
+        suspicion_ms: i64,
+    ) -> Result<NativeChildrenAttention> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT c.id, c.generation FROM native_child_registrations r
+             JOIN agents c ON c.id = r.child
+             WHERE r.producer = ?1 AND r.producer_generation = ?2
+             AND c.origin = 'native' AND c.observe_only = 1
+             AND EXISTS(SELECT 1 FROM turns t WHERE t.agent = c.id AND t.generation = c.generation
+                        AND t.state IN ('running', 'unknown')) ORDER BY c.id",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![parse_agent_id(manager)?, generation], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(sql_error)?;
+        let mut summary = NativeChildrenAttention::default();
+        for row in rows {
+            let (child, child_generation) = row.map_err(sql_error)?;
+            let activity = activity(&self.connection, child, child_generation)?;
+            // A no-facts Unknown child never opens a manager incident.
+            if !matches!(
+                activity.state,
+                NativeChildActivityState::Running | NativeChildActivityState::Lost
+            ) {
+                continue;
+            }
+            summary.unfinished += 1;
+            summary.lost += usize::from(activity.state == NativeChildActivityState::Lost);
+            summary.stalled += usize::from(
+                activity.state == NativeChildActivityState::Running
+                    && activity
+                        .last_progress_at
+                        .and_then(|at| now.checked_sub(at))
+                        .is_some_and(|age| age >= suspicion_ms),
+            );
+            if summary.children.len() < 16 {
+                summary.children.push((format_agent_id(child), activity));
+            } else {
+                summary.children_truncated = true;
+            }
+        }
+        Ok(summary)
+    }
+
+    pub fn native_model_progress(&self, agent: &str, generation: i64) -> Result<Option<i64>> {
+        native_progress(&self.connection, parse_agent_id(agent)?, generation)
+    }
+
     /// The host supplies the producer from its private connection, not the wire.
     pub fn register_native_child(
         &mut self,
