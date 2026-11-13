@@ -273,6 +273,13 @@ observation only and never grants permission to signal a stale numeric PGID.
 retrospective assertion about historical commands. Unknown prior Unix custody after
 daemon replacement cannot be promoted to an exact stopped result.
 
+Runtime operation slots retain current preparation/cancellation/removal evidence and
+unconfirmed process quiescence. Obsolete or settled slots retire only after all
+operation, cancellation and run references release them, under the same lookup and
+startup/cleanup serialization used for registration. Durable removed rows remain;
+they do not require an idle runtime slot. Recovery and FORCE cleanup consume bounded
+pages of pending preparations, selecting actionable phases before allocating slots.
+
 `worktree.remove` uses normal command admission. No other live Agent may use that
 checkout; the `removing` marker blocks concurrent launch into it. Cleanup may remove
 only untracked/ignored entries under frozen scratch paths, never tracked changes or
@@ -351,6 +358,13 @@ unavailable; cached values may remain visible as diagnostics. An available sampl
 still have `complete=false`. Executable Git filters are disabled, and applicable filter
 attributes make raw status partial; bounded attribution-path coverage can also make a
 snapshot partial. An empty partial dirty set does not prove the workspace clean.
+
+The in-memory Git cache has no inactive diagnostic allowance: a workspace entry retires
+after its last current or settling binding releases it. Final hint attribution and
+source closure precede binding retirement. Registration and eviction share a registry
+gate; watcher/backend disposal happens outside map and Store locks. A retired cache
+reads as unavailable with inactive filesystem invalidation; its durable baseline and
+edit attribution remain available from Store.
 
 `history_complete` / `history_gap` describe commit coverage separately. Recovery uses
 the persisted workspace HEAD baseline, with at most 64 commits per probe and bounded
