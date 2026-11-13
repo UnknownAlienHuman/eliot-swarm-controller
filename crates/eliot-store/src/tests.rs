@@ -10453,6 +10453,69 @@ fn claude_resume_passes_admission_and_dispatch_gates_with_exact_linked_input() {
 }
 
 #[test]
+fn enforce_page_bytes_keeps_longest_fitting_prefix() {
+    // Reference quadratic sizing: reserialize each shrinking prefix.
+    fn reference_keep(items: &[String]) -> usize {
+        let mut keep = items.len();
+        while serde_json::to_vec(&items[..keep])
+            .expect("encode prefix")
+            .len()
+            > super::MAX_PAGE_BYTES
+        {
+            keep -= 1;
+            if keep == 0 {
+                break;
+            }
+        }
+        keep
+    }
+
+    // Mixed entry sizes, including bytes that must be escaped in JSON
+    // (quotes, backslashes, control characters) so the byte count covers
+    // escaped output rather than in-memory length.
+    let small = "a\"b\\c\n\u{1f600}".to_owned();
+    let medium = "m".repeat(1_000);
+    let large = "L\"\\".repeat(200_000);
+    let tail = "t".repeat(500);
+    let candidates = vec![small.clone(), medium.clone(), large.clone(), tail.clone()];
+    let expected = reference_keep(&candidates);
+
+    let mut sized = candidates.clone();
+    super::enforce_page_bytes(&mut sized).expect("mixed page fits a prefix");
+    assert_eq!(
+        sized.len(),
+        expected,
+        "linear sizing must keep the same prefix as reserializing each prefix"
+    );
+    assert_eq!(&sized, &candidates[..expected]);
+    let encoded = serde_json::to_vec(&sized).expect("encode kept prefix");
+    assert!(encoded.len() <= super::MAX_PAGE_BYTES);
+    if expected < candidates.len() {
+        let mut extended = sized.clone();
+        extended.push(candidates[expected].clone());
+        assert!(
+            serde_json::to_vec(&extended)
+                .expect("encode overflow")
+                .len()
+                > super::MAX_PAGE_BYTES,
+            "kept prefix must be the longest fitting one"
+        );
+    }
+}
+
+#[test]
+fn enforce_page_bytes_rejects_oversized_first_entry() {
+    let oversized = "x".repeat(super::MAX_PAGE_BYTES);
+    let mut items = vec![oversized];
+    let error = super::enforce_page_bytes(&mut items).expect_err("first entry cannot fit");
+    assert_eq!(error.code, "frame_too_large");
+    assert!(items.is_empty());
+
+    let mut empty: Vec<String> = Vec::new();
+    super::enforce_page_bytes(&mut empty).expect("empty page stays empty");
+}
+
+#[test]
 fn claude_project_resume_passes_the_projects_gate_with_linked_input() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
