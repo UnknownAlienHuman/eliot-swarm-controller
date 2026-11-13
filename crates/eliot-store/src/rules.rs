@@ -2081,23 +2081,24 @@ pub(super) fn gate_rule_action_dispatch_tx(
             let current = load_command_record(tx, command_id)?
                 .ok_or_else(|| Error::new("source_integrity", "rule-action child disappeared"))?;
             if current.state == CommandState::Accepted {
-                let target = current.target.ok_or_else(|| {
-                    Error::new("source_integrity", "rule-action child has no target")
-                })?;
+                let target = current.target;
                 let generation = current
                     .command
                     .generation
-                    .or(current.command.expected_generation)
-                    .ok_or_else(|| {
-                        Error::new("source_integrity", "rule-action child has no generation")
-                    })?;
+                    .or(current.command.expected_generation);
+                if target.is_some() != generation.is_some() {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "rule-action child has inconsistent target binding",
+                    ));
+                }
                 update_command_state(tx, command_id, CommandState::Queued, None, None, now)?;
                 events.push(insert_daemon_command_event(
                     tx,
                     now,
                     "command.queued",
-                    Some(target),
-                    Some(generation),
+                    target,
+                    generation,
                     command_id,
                     json!({
                         "command_id": command_id,
@@ -2137,23 +2138,24 @@ pub(super) fn gate_rule_action_dispatch_tx(
             let current = load_command_record(tx, command_id)?
                 .ok_or_else(|| Error::new("source_integrity", "rule-action child disappeared"))?;
             if current.state == CommandState::Accepted {
-                let current_target = current.target.ok_or_else(|| {
-                    Error::new("source_integrity", "rule-action child has no target")
-                })?;
+                let current_target = current.target;
                 let current_generation = current
                     .command
                     .generation
-                    .or(current.command.expected_generation)
-                    .ok_or_else(|| {
-                        Error::new("source_integrity", "rule-action child has no generation")
-                    })?;
+                    .or(current.command.expected_generation);
+                if current_target.is_some() != current_generation.is_some() {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "rule-action child has inconsistent target binding",
+                    ));
+                }
                 update_command_state(tx, command_id, CommandState::Queued, None, None, now)?;
                 events.push(insert_daemon_command_event(
                     tx,
                     now,
                     "command.queued",
-                    Some(current_target),
-                    Some(current_generation),
+                    current_target,
+                    current_generation,
                     command_id,
                     json!({
                         "command_id": command_id,
@@ -2169,43 +2171,73 @@ pub(super) fn gate_rule_action_dispatch_tx(
         if !matches!(sibling_state, CommandState::Accepted | CommandState::Queued) {
             continue;
         }
-        let target = row.4.ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "undispatched rule-action child has no target",
-            )
-        })?;
-        let generation = row.5.or(row.6).ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "undispatched rule-action child has no generation",
-            )
-        })?;
         let sibling = load_command_record(tx, &row.0)?
             .ok_or_else(|| Error::new("source_integrity", "rule-action sibling disappeared"))?;
-        cancel_pending_command_tx(
-            tx,
-            target,
-            generation,
-            &row.0,
-            "rule_action_predecessor_terminal",
-            now,
-            events,
-        )?;
-        if sibling.command.verb == "launch" {
-            super::capacity::release_unstarted_tx(tx, target, 1, &row.0)?;
-            super::fail_unstarted_launch_tx(tx, target, &row.0, now, events)?;
-        } else if sibling.command.verb == "resume" {
-            super::lifecycle::cancel_unstarted_resume_input_tx(
+        if sibling.target.is_some() {
+            let target = row.4.ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "undispatched rule-action child has no target",
+                )
+            })?;
+            let generation = row.5.or(row.6).ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "undispatched rule-action child has no generation",
+                )
+            })?;
+            cancel_pending_command_tx(
                 tx,
                 target,
+                generation,
                 &row.0,
                 "rule_action_predecessor_terminal",
                 now,
                 events,
-                false,
             )?;
+            if sibling.command.verb == "launch" {
+                super::capacity::release_unstarted_tx(tx, target, 1, &row.0)?;
+                super::fail_unstarted_launch_tx(tx, target, &row.0, now, events)?;
+            } else if sibling.command.verb == "resume" {
+                super::lifecycle::cancel_unstarted_resume_input_tx(
+                    tx,
+                    target,
+                    &row.0,
+                    "rule_action_predecessor_terminal",
+                    now,
+                    events,
+                    false,
+                )?;
+            }
+            continue;
         }
+        if row.4.is_some() || row.5.is_some() || row.6.is_some() {
+            return Err(Error::new(
+                "source_integrity",
+                "targetless rule-action child has an Agent binding",
+            ));
+        }
+        let outcome = json!({"reason": "rule_action_predecessor_terminal"});
+        update_command_state(
+            tx,
+            &row.0,
+            CommandState::Cancelled,
+            Some(&outcome),
+            None,
+            now,
+        )?;
+        events.push(insert_daemon_command_event(
+            tx,
+            now,
+            "command.cancelled",
+            None,
+            None,
+            &row.0,
+            json!({
+                "command_id": row.0,
+                "reason": "rule_action_predecessor_terminal",
+            }),
+        )?);
     }
     Ok(RuleActionDispatchGate::Cancelled)
 }
@@ -5537,6 +5569,104 @@ mod tests {
                 .unwrap();
             assert_eq!(child_two_dispatches, 0);
         }
+    }
+
+    #[test]
+    fn catch_up_targetless_predecessor_rejection_cancels_follower() {
+        let mut store = store();
+        let request_id = Ulid::new();
+        let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 10;
+        let first_event = insert_test_event(&mut store, "var.changed", now - 2);
+        let second_event = insert_test_event(&mut store, "var.changed", now - 1);
+        let rule = definition("targetless-sibling-cancel", true);
+        let state = store.ensure_rule_state("owner", &rule, now).unwrap();
+        let captured_through = state.current_cursor;
+        assert!(second_event <= captured_through);
+
+        let mut first_request = SubmitCommand::new("", "var.set");
+        first_request.args = json!({"scope": "global", "key": "sibling-key", "value": 1});
+        let mut second_request = SubmitCommand::new("", "var.set");
+        second_request.args = json!({"scope": "global", "key": "sibling-key", "value": 2});
+        let request = core::api::RuleCatchUpRequest::new(
+            request_id.to_string(),
+            "targetless-sibling-cancel",
+            first_event - 1,
+            Some(captured_through),
+        );
+        let actions = [
+            RuleCatchUpAction::command(first_event, first_request),
+            RuleCatchUpAction::command(second_event, second_request),
+        ];
+        let admission = store
+            .admit_rule_catch_up("owner", &request, &state, captured_through, &actions, now)
+            .unwrap();
+        assert_eq!(admission.children.len(), 2);
+        let first_child_id = admission.children[0].command.id.clone();
+        let second_child_id = admission.children[1].command.id.clone();
+        assert_eq!(admission.children[0].command.verb, "var.set");
+        assert_eq!(admission.children[1].command.verb, "var.set");
+        assert!(admission.children[1].command.target.is_none());
+
+        let held = store.dispatch(&second_child_id, now + 1).unwrap();
+        assert_eq!(held.value.state, CommandState::Queued);
+        let queued_event = held
+            .events
+            .iter()
+            .find(|event| event.kind == "command.queued")
+            .expect("pending predecessor queues the targetless follower");
+        assert_eq!(
+            queued_event.data["reason"],
+            "rule_action_predecessor_pending"
+        );
+
+        store
+            .settle(
+                &first_child_id,
+                CommandState::Rejected,
+                Some(json!({"reason": "version_conflict"})),
+                now + 2,
+            )
+            .unwrap();
+
+        let recoverable = store.recover_rule_children(None, 100).unwrap();
+        assert!(
+            recoverable
+                .iter()
+                .any(|command| command.command.id == second_child_id),
+            "Store recovery must surface the targetless follower for cancellation"
+        );
+        let cancelled = store.dispatch(&second_child_id, now + 3).unwrap();
+        assert_eq!(cancelled.value.state, CommandState::Cancelled);
+        let cancelled_event = cancelled
+            .events
+            .iter()
+            .find(|event| event.kind == "command.cancelled")
+            .expect("Store gate cancels the targetless follower");
+        assert_eq!(
+            cancelled_event.data["reason"],
+            "rule_action_predecessor_terminal"
+        );
+        assert_eq!(
+            store.get_command(&second_child_id).unwrap().unwrap().state,
+            CommandState::Cancelled,
+        );
+        let recoverable_after_cancel = store.recover_rule_children(None, 100).unwrap();
+        assert!(
+            !recoverable_after_cancel
+                .iter()
+                .any(|command| command.command.id == second_child_id)
+        );
+        let follower_dispatches: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE kind = 'command.dispatched'
+                   AND json_extract(data, '$.command_id') = ?1",
+                [&second_child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(follower_dispatches, 0);
     }
 
     #[test]

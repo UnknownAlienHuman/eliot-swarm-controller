@@ -839,9 +839,9 @@ impl Store {
             // A reply names exact history, but no single mailbox is
             // authorized here yet: only the write-id age classifies it, and
             // the age rule alone leaks nothing beyond the caller's own input.
-            let gap = reply
-                .split_once('/')
-                .is_some_and(|(head, _)| history_expired(head, now));
+            let gap = reply.split_once('/').is_some_and(|(head, _)| {
+                history_expired(head.strip_prefix("rule:").unwrap_or(head), now)
+            });
             return Err(if gap {
                 Error::new("history_gap", "replied-to delivery is no longer retained")
             } else {
@@ -2342,6 +2342,33 @@ mod tests {
         store
             .mail_read(&agent_principal(&a), &kept, now)
             .expect("young acked mail still reads");
+    }
+
+    #[test]
+    fn pruned_rule_delivery_reply_reads_history_gap() {
+        let mut store = store();
+        let now = now_ms();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents(generation, project, harness, profile, state, created_at, updated_at)
+                 VALUES (1, 'project-test', 'fake', 'fake', 'idle', 1, 1)",
+                [],
+            )
+            .unwrap();
+        let num = store.connection.last_insert_rowid();
+        let a = format!("a{num}");
+        let old = now - 31 * DAY_MS;
+        let pruned_rule_delivery = format!("rule:{}/{}", ulid_at(old, 1), a);
+        let mut reply = send_request(vec![a.clone()], "reply");
+        reply.reply_to_delivery = Some(pruned_rule_delivery);
+        assert_eq!(
+            store
+                .mail_send("owner", &reply, MailLimits::default(), now)
+                .unwrap_err()
+                .code,
+            "history_gap"
+        );
     }
 
     #[test]
