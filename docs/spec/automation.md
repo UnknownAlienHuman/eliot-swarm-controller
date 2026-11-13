@@ -949,6 +949,26 @@ single-flight marker and the burn and stay silent. Shutdown cancels every
 in-flight automatic check through its custody cancellation and waits only for
 the rounds to resolve their markers (`unknown`, never rerun).
 
+Setting or resuming an enabled idle-keyed Goal also reconciles the
+retained exact-generation idle subject: the set/resume wakes the driver,
+which sweeps every active non-cadenced Goal bound to its Agent's current
+generation and reserves a round on the latest event only when that row
+still names an idle event of that generation. The sweep uses the same
+reservation as a bus event — same scope, enablement, single-flight and
+cap — without re-offering mail, and waits for a real event when the
+subject is missing (pruned, superseded or never retained), leaving the
+Goal's marker and counters untouched on the readback. A busy Agent or a
+drifted generation skips silently; a set/resume never resumes a lost
+Agent, and only the round path itself may pause a drifted Goal. Startup
+performs no sweep: the restart marks every owned session lost, so no
+retained subject is eligible.
+A consumed idle subject rearms only through a new Goal revision: a
+definition change clears the committed key, so the next sweep may round
+the still-current subject again. Unknown-burned keys never rerun within
+the generation, and the same revision never rerounds a consumed key —
+repeated set/retry, reads and daemon restart cannot create another
+round.
+
 No-progress compares check output digests and the read-only workspace
 fingerprint together. The fingerprint digests the committed Git observation —
 the latest `git.changed` HEAD plus dirty set and the attributed edit paths —

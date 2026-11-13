@@ -3680,3 +3680,63 @@ fn goal_reopen_reads_idle_and_slot_markers_as_unknown() {
     );
     remove_goal_crash_store_files(&path);
 }
+
+#[test]
+fn goal_reconcile_candidates_cover_only_active_idle_keyed_goals() {
+    let mut store = store();
+    let now = now_ms();
+    let agent = ready_agent(&mut store, "goal-reconcile", now);
+    let key = store.high_water().unwrap();
+    store
+        .goal_set(
+            &agent,
+            "eliot",
+            &Ulid::new().to_string(),
+            "owner",
+            &definition("green"),
+            now,
+        )
+        .unwrap();
+    let candidates = store.goal_reconcile_candidates().unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].agent, agent);
+    assert_eq!(candidates[0].generation, 1);
+    assert_eq!(candidates[0].revision, 1);
+    assert_eq!(candidates[0].agent_state, AgentState::Idle);
+    assert_eq!(candidates[0].idle_seq, Some(key));
+    // A paused Goal takes no rounds until resumed.
+    store
+        .goal_pause(
+            &agent,
+            "eliot",
+            &Ulid::new().to_string(),
+            "owner",
+            None,
+            now,
+        )
+        .unwrap();
+    assert!(store.goal_reconcile_candidates().unwrap().is_empty());
+    store
+        .goal_resume(&agent, "eliot", &Ulid::new().to_string(), "owner", now)
+        .unwrap();
+    assert_eq!(store.goal_reconcile_candidates().unwrap().len(), 1);
+    // A cadenced Goal rounds on slots, never on retained idle events.
+    let slot_agent = ready_agent(&mut store, "goal-reconcile-slot", now);
+    store
+        .goal_set(
+            &slot_agent,
+            "eliot",
+            &Ulid::new().to_string(),
+            "owner",
+            &cadenced_definition("green"),
+            now,
+        )
+        .unwrap();
+    let agents: Vec<String> = store
+        .goal_reconcile_candidates()
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.agent)
+        .collect();
+    assert_eq!(agents, vec![agent]);
+}
