@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path};
 
 /// Owner-configured interpreter executable and fixed argv prefix.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScriptInterpreter {
     pub program: String,

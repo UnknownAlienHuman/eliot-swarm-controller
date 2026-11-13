@@ -6,16 +6,18 @@ use crate::{Agent, Command, Error, Result, Turn};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleGetRequest {
     #[serde(deserialize_with = "required_id")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_project"
     )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub project: Option<String>,
 }
 
@@ -41,7 +43,7 @@ impl RuleGetRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleStateView {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,10 +102,11 @@ impl RuleStateView {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandGetRequest {
     #[serde(deserialize_with = "required_id")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
 }
 
@@ -117,14 +120,17 @@ impl CommandGetRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TurnGetRequest {
     #[serde(deserialize_with = "required_id")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub agent: String,
     #[serde(deserialize_with = "generation")]
+    #[schemars(range(min = 0))]
     pub generation: i64,
     #[serde(deserialize_with = "required_id")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub turn_id: String,
 }
 
@@ -144,27 +150,34 @@ impl TurnGetRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentResultRequest {
     #[serde(deserialize_with = "required_id")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present_generation"
     )]
+    #[schemars(range(min = 0), with = "i64")]
     pub generation: Option<i64>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present_id"
     )]
+    #[schemars(
+        description = "Nonblank string; preserved without trimming or normalization.",
+        with = "String"
+    )]
     pub turn_id: Option<String>,
     #[serde(
         default = "super::default_limit",
         deserialize_with = "super::event_limit"
     )]
+    #[schemars(range(min = 1, max = 1000))]
     pub limit: usize,
 }
 
@@ -193,21 +206,27 @@ impl AgentResultRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandChildrenRequest {
     #[serde(deserialize_with = "required_id")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present_id"
     )]
+    #[schemars(
+        description = "Nonblank string; preserved without trimming or normalization.",
+        with = "String"
+    )]
     pub after: Option<String>,
     #[serde(
         default = "super::default_limit",
         deserialize_with = "super::event_limit"
     )]
+    #[schemars(range(min = 1, max = 1000))]
     pub limit: usize,
 }
 
@@ -232,7 +251,7 @@ impl CommandChildrenRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandChildrenResponse {
     #[serde(deserialize_with = "object_commands")]
@@ -241,7 +260,7 @@ pub struct CommandChildrenResponse {
     pub next: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentResultResponse {
     pub agent: String,
     pub generation: i64,

@@ -34,26 +34,31 @@ impl RuleLimit {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleCatchUpRequest {
     #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
     #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub rule: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_project"
     )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub project: Option<String>,
     #[serde(deserialize_with = "nonnegative_sequence")]
+    #[schemars(range(min = 0))]
     pub after_seq: i64,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_sequence"
     )]
+    #[schemars(range(min = 0))]
     pub through_seq: Option<i64>,
 }
 
