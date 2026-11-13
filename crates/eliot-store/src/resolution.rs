@@ -23,10 +23,10 @@ use super::{
     turn_state_name, update_command_state, validate_id_age, write_binding,
 };
 use eliot_core::{
-    CommandState, TurnState,
+    CommandState, TurnOutcome, TurnState,
     api::{
         CommandResolution, CommandResolveRequest, CommandResolveResponse, TurnResolveRequest,
-        TurnResolveResponse,
+        TurnResolveResponse, TurnResolveStatus,
     },
     parse_agent_id,
 };
@@ -444,13 +444,19 @@ fn resolve_turn_tx(
     request: &TurnResolveRequest,
     now: i64,
 ) -> Result<eliot_core::Event> {
+    let outcome = match request.status {
+        TurnResolveStatus::Completed => TurnOutcome::Success,
+        TurnResolveStatus::Failed => TurnOutcome::Failure,
+        TurnResolveStatus::Interrupted => TurnOutcome::Interrupted,
+    };
     let changed = tx
         .execute(
-            "UPDATE turns SET state = ?1, status = ?2, completed_at = ?3
-             WHERE agent = ?4 AND generation = ?5 AND turn_id = ?6 AND state = 'unknown'",
+            "UPDATE turns SET state = ?1, status = ?2, outcome = ?3, completed_at = ?4
+             WHERE agent = ?5 AND generation = ?6 AND turn_id = ?7 AND state = 'unknown'",
             params![
                 turn_state_name(TurnState::Completed),
                 request.status.as_str(),
+                outcome.as_str(),
                 now,
                 agent_num,
                 request.generation,

@@ -1773,10 +1773,13 @@ impl EventProcessor {
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
         self.miss_ended_steers(&turn_id);
-        let status = match envelope.event_type.as_str() {
-            "session.execution.succeeded" => "completed",
-            "session.execution.failed" => "failed",
-            _ => "interrupted",
+        // Canonical outcome decided here at the plugin boundary from the
+        // OpenCode execution vocabulary; the raw SSE event type is preserved
+        // as `native_status` next to it.
+        let (status, outcome) = match envelope.event_type.as_str() {
+            "session.execution.succeeded" => ("completed", "success"),
+            "session.execution.failed" => ("failed", "failure"),
+            _ => ("interrupted", "interrupted"),
         };
         // The exactly associated stream terminal proves status independently
         // of optional HTTP text/usage enrichment. A dead server cannot revoke
@@ -1823,7 +1826,7 @@ impl EventProcessor {
             self.commit_event("message.completed", native_id, data)
                 .await?;
         }
-        let data = terminal_turn_data(
+        let mut data = terminal_turn_data(
             &command_id,
             &turn_id,
             status,
@@ -1831,6 +1834,8 @@ impl EventProcessor {
             readback.as_ref(),
             &secrets,
         );
+        data["outcome"] = json!(outcome);
+        data["native_status"] = json!(envelope.event_type.as_str());
         let native_id = event_id(
             &terminal.session_id,
             &turn_id,

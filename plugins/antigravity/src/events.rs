@@ -804,10 +804,23 @@ impl State {
             .ok_or_else(|| Error::new("unknown", "Antigravity turn is absent"))?;
         let (command, turn) = (pending.command.clone(), pending.turn.clone());
         let failed = status == "failed";
+        // Canonical outcome decided here at the plugin boundary from the
+        // Antigravity terminal vocabulary (`completed` | `failed` |
+        // `cancelled`). The grouped normal stop reasons (`end_turn`,
+        // `max_tokens`, `max_turn_requests`) all complete normally: ordinary
+        // native termination is success with its native reason, not Goal
+        // fulfilment. The raw `stopReason` is already preserved as
+        // `native_status` next to it.
+        let outcome = match status {
+            "completed" => "success",
+            "failed" => "failure",
+            "cancelled" => "interrupted",
+            _ => "unknown",
+        };
         let text = self.policy.redact_text(&self.text_accum);
         let truncated = self.text_truncated;
         let mut data = json!({"command_id": command, "turn_id": turn,
-            "status": status, "native_status": result.stop_reason});
+            "status": status, "outcome": outcome, "native_status": result.stop_reason});
         self.policy.redact_values(&mut data);
         if !text.is_empty() && !truncated {
             self.commit(

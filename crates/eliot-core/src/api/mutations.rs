@@ -63,7 +63,7 @@ impl CommandSubmitRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CommandSubmitResponse {
     pub command_id: String,
     #[serde(deserialize_with = "nullable")]
@@ -77,7 +77,7 @@ pub struct CommandSubmitResponse {
     pub linked_command: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShutdownMode {
     Drain,
@@ -104,10 +104,11 @@ impl ShutdownMode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonShutdownRequest {
     #[serde(deserialize_with = "shutdown_id")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
     pub mode: ShutdownMode,
 }
@@ -125,7 +126,7 @@ impl DaemonShutdownRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonShutdownResponse {
     pub state: CommandState,
     pub mode: ShutdownMode,

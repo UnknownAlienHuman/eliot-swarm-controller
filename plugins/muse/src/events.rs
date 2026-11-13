@@ -2365,6 +2365,8 @@ impl EventProcessor {
             "command_id": command_id.clone(),
             "turn_id": notification.turn_id,
             "status": status_text,
+            "outcome": turn_outcome(&notification.terminal),
+            "native_status": native_terminal(&notification.terminal),
         });
         // The semantic hold signal gets first claim on the bounded terminal data.
         if let Some(restriction) = provider_restriction {
@@ -2907,9 +2909,14 @@ impl EventProcessor {
                     self.start_workflow_child_turn(&key).await;
                     return Ok(());
                 }
-                PlannedAction::Complete { status } => {
-                    self.complete_workflow_child_turn(&key, status, notification.item.revision)
-                        .await;
+                PlannedAction::Complete { status, native } => {
+                    self.complete_workflow_child_turn(
+                        &key,
+                        status,
+                        native,
+                        notification.item.revision,
+                    )
+                    .await;
                     return Ok(());
                 }
             }
@@ -3076,10 +3083,13 @@ impl EventProcessor {
 
     /// Commit the ONE `turn.completed`, starting first when the live states
     /// were never observed: an explicit terminal proves the turn ran.
+    /// `status` is the normalized turn status; `native` is the raw wire
+    /// terminal preserved as `native_status`.
     async fn complete_workflow_child_turn(
         &mut self,
         key: &WorkflowChildKey,
         status: &'static str,
+        native: &'static str,
         revision: i64,
     ) {
         if self
@@ -3116,7 +3126,7 @@ impl EventProcessor {
                 return;
             }
         };
-        let data = complete_event_data(key, status);
+        let data = complete_event_data(key, status, native);
         let host = self.host.clone();
         let credential = self.credential.clone();
         let sink = &mut self.sink;
@@ -3641,6 +3651,29 @@ pub(crate) fn turn_status(terminal: &NativeTurnTerminal) -> Option<&'static str>
         NativeTurnTerminal::Completed => Some("completed"),
         NativeTurnTerminal::Failed => Some("failed"),
         NativeTurnTerminal::Cancelled => Some("interrupted"),
+        NativeTurnTerminal::Unknown => None,
+    }
+}
+
+/// Canonical outcome for the MSP terminal vocabulary (`completed` | `failed`
+/// | `cancelled`): decided here at the plugin boundary, with the raw wire
+/// terminal preserved as `native_status`. `cancelled` is an interrupt.
+pub(crate) fn turn_outcome(terminal: &NativeTurnTerminal) -> Option<&'static str> {
+    match terminal {
+        NativeTurnTerminal::Completed => Some("success"),
+        NativeTurnTerminal::Failed => Some("failure"),
+        NativeTurnTerminal::Cancelled => Some("interrupted"),
+        NativeTurnTerminal::Unknown => None,
+    }
+}
+
+/// Raw wire terminal verbatim, preserved as `native_status` next to the
+/// canonical outcome.
+pub(crate) fn native_terminal(terminal: &NativeTurnTerminal) -> Option<&'static str> {
+    match terminal {
+        NativeTurnTerminal::Completed => Some("completed"),
+        NativeTurnTerminal::Failed => Some("failed"),
+        NativeTurnTerminal::Cancelled => Some("cancelled"),
         NativeTurnTerminal::Unknown => None,
     }
 }

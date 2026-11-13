@@ -12,10 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const PROCESS_CURSOR_MAX_BYTES: usize = 2_048;
 const EDIT_CURSOR_MAX_BYTES: usize = 64 * 1_024;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentGetRequest {
     #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
 }
 
@@ -47,7 +48,7 @@ impl AgentGetRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentListRequest {
     #[serde(
@@ -55,11 +56,13 @@ pub struct AgentListRequest {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_text"
     )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub after: Option<String>,
     #[serde(
         default = "super::default_limit",
         deserialize_with = "super::event_limit"
     )]
+    #[schemars(range(min = 1, max = 1000))]
     pub limit: usize,
     #[serde(default)]
     pub observations: bool,
@@ -104,33 +107,38 @@ impl AgentListRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentProcessesRequest {
     #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_generation"
     )]
+    #[schemars(range(min = 0))]
     pub generation: Option<i64>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_scope"
     )]
+    #[schemars(description = "Process scope: agent or workspace.")]
     pub scope: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_text"
     )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub after: Option<String>,
     #[serde(
         default = "super::default_limit",
         deserialize_with = "super::event_limit"
     )]
+    #[schemars(range(min = 1, max = 1000))]
     pub limit: usize,
 }
 
@@ -215,16 +223,18 @@ impl AgentProcessesRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentStatsRequest {
     #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_generation"
     )]
+    #[schemars(range(min = 0))]
     pub generation: Option<i64>,
 }
 
@@ -249,16 +259,18 @@ impl AgentStatsRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentGitRequest {
     #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_generation"
     )]
+    #[schemars(range(min = 0))]
     pub generation: Option<i64>,
 }
 
@@ -283,27 +295,31 @@ impl AgentGitRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentEditsRequest {
     #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_generation"
     )]
+    #[schemars(range(min = 0))]
     pub generation: Option<i64>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_edit_cursor"
     )]
+    #[schemars(description = "Nonblank retained edit cursor, at most 65536 bytes, no NUL.")]
     pub after: Option<String>,
     #[serde(
         default = "super::default_limit",
         deserialize_with = "super::event_limit"
     )]
+    #[schemars(range(min = 1, max = 1000))]
     pub limit: usize,
 }
 
@@ -351,7 +367,7 @@ impl AgentEditsRequest {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonStatusRequest {}
 
@@ -395,7 +411,7 @@ impl DaemonStatusRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentGetResponse {
     #[serde(flatten, deserialize_with = "object_agent")]
     pub agent: Agent,
@@ -405,7 +421,7 @@ pub struct AgentGetResponse {
     pub source_states: Vec<SourceState>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentListRow {
     #[serde(flatten, deserialize_with = "object_agent")]
     pub agent: Agent,
@@ -417,7 +433,7 @@ pub struct AgentListRow {
     pub observation: Option<ObservationView>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentListResponse {
     #[serde(deserialize_with = "objects")]
     pub agents: Vec<AgentListRow>,
@@ -425,7 +441,7 @@ pub struct AgentListResponse {
     pub next: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentProcessesResponse {
     pub agent: String,
     pub generation: i64,
@@ -437,7 +453,7 @@ pub struct AgentProcessesResponse {
     pub scope: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentStatsResponse {
     pub agent: String,
     pub generation: i64,
@@ -445,7 +461,7 @@ pub struct AgentStatsResponse {
     pub observation: ObservationView,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentGitResponse {
     pub agent: String,
     pub generation: i64,
@@ -453,7 +469,7 @@ pub struct AgentGitResponse {
     pub git: GitView,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEditsResponse {
     pub agent: String,
     pub generation: i64,
@@ -464,7 +480,7 @@ pub struct AgentEditsResponse {
 }
 
 /// The exact public Store source projection, separate from private plugin ACKs.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceState {
     pub agent_id: String,
     pub generation: i64,
@@ -494,14 +510,14 @@ pub struct SourceState {
     pub gap_seq: Option<i64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceOwner {
     pub family: String,
     pub source: String,
     pub mechanism: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceCustodyView {
     pub scope: String,
     pub capability: String,
@@ -509,13 +525,13 @@ pub struct WorkspaceCustodyView {
     pub orphan_possible: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GitCredentialHelper {
     Manager,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectGitView {
     #[serde(default)]
@@ -546,7 +562,7 @@ impl ProjectGitView {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectRegistrationView {
     pub id: String,
@@ -598,7 +614,7 @@ impl ProjectRegistrationView {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnsettledCommandSummary {
     pub id: String,
     #[serde(deserialize_with = "nullable")]
@@ -609,7 +625,7 @@ pub struct UnsettledCommandSummary {
     pub state: CommandState,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StatusBlocker {
     WorkspaceProcesses,
@@ -634,7 +650,7 @@ pub enum StatusBlocker {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloudMcpHealth {
     StartingHttp,
@@ -645,7 +661,7 @@ pub enum CloudMcpHealth {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloudMcpCustody {
     WindowsJobExact,
@@ -655,7 +671,7 @@ pub enum CloudMcpCustody {
 
 /// Current managed cloud MCP child-pair state. `running` proves the two child
 /// leaders are alive; it does not prove public tunnel connectivity or auth.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CloudMcpStatus {
     pub public_url: String,
@@ -675,7 +691,7 @@ impl CloudMcpStatus {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonStatusResponse {
     pub state: String,
@@ -704,7 +720,7 @@ pub struct DaemonStatusResponse {
     pub blockers: Vec<StatusBlocker>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerTaskHealth {
     Starting,
@@ -718,7 +734,7 @@ pub enum WorkerTaskHealth {
 /// not prove a rule/timer/goal delivery. `starting` means spawned but not
 /// yet initialized. `failed` carries only a bounded code, never a raw error
 /// message.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerTaskStatus {
     pub name: String,

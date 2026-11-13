@@ -881,6 +881,8 @@ fn mark_lost_turn_unknown_tx(
                     turn_id,
                     state: TurnState::Unknown,
                     status: None,
+                    outcome: None,
+                    native_status: None,
                     final_text: None,
                     started_at: None,
                     completed_at: Some(now),

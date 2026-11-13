@@ -72,68 +72,91 @@ struct TriggerDefinition {
     compiled_matches: BTreeMap<String, CompiledMatch>,
 }
 
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchActionDefinition {
+    profile: String,
+    workspace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<Value>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnswerActionDefinition {
+    target: Value,
+    expected_generation: Value,
+    expected_turn_id: Value,
+    request_id: Value,
+    answers: BTreeMap<String, Value>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopActionDefinition {
+    target: Value,
+    expected_generation: Value,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendActionDefinition {
+    target: Value,
+    expected_generation: Value,
+    text: Value,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InterruptActionDefinition {
+    target: Value,
+    expected_generation: Value,
+    expected_turn_id: Value,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SteerActionDefinition {
+    target: Value,
+    expected_generation: Value,
+    expected_turn_id: Value,
+    text: Value,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChoiceActionDefinition {
+    target: Value,
+    expected_generation: Value,
+    expected_turn_id: Value,
+    request_id: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    choice: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    feedback: Option<Value>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResumeActionDefinition {
+    target: Value,
+    expected_generation: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<Value>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum AgentActionDefinition {
-    Stop {
-        target: Value,
-        expected_generation: Value,
-    },
-    Send {
-        target: Value,
-        expected_generation: Value,
-        text: Value,
-    },
-    Interrupt {
-        target: Value,
-        expected_generation: Value,
-        expected_turn_id: Value,
-    },
-    Steer {
-        target: Value,
-        expected_generation: Value,
-        expected_turn_id: Value,
-        text: Value,
-    },
-    Approve {
-        target: Value,
-        expected_generation: Value,
-        expected_turn_id: Value,
-        request_id: Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        choice: Option<Value>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        feedback: Option<Value>,
-    },
-    Deny {
-        target: Value,
-        expected_generation: Value,
-        expected_turn_id: Value,
-        request_id: Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        choice: Option<Value>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        feedback: Option<Value>,
-    },
-    Answer {
-        target: Value,
-        expected_generation: Value,
-        expected_turn_id: Value,
-        request_id: Value,
-        answers: BTreeMap<String, Value>,
-    },
-    Resume {
-        target: Value,
-        expected_generation: Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        text: Option<Value>,
-    },
-    Launch {
-        profile: String,
-        workspace: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        text: Option<Value>,
-    },
+    Stop(StopActionDefinition),
+    Send(SendActionDefinition),
+    Interrupt(InterruptActionDefinition),
+    Steer(SteerActionDefinition),
+    Approve(ChoiceActionDefinition),
+    Deny(ChoiceActionDefinition),
+    Answer(AnswerActionDefinition),
+    Resume(ResumeActionDefinition),
+    Launch(LaunchActionDefinition),
 }
 
 #[derive(Clone, Debug)]
@@ -150,46 +173,87 @@ impl<'de> Deserialize<'de> for ActionDefinition {
     where
         D: serde::Deserializer<'de>,
     {
-        let value = Value::deserialize(deserializer)?;
+        Self::decode_at(Value::deserialize(deserializer)?, "action").map_err(D::Error::custom)
+    }
+}
+
+impl ActionDefinition {
+    fn decode_at(value: Value, root: &str) -> Result<Self, Error> {
         let object = value
             .as_object()
-            .ok_or_else(|| D::Error::custom("rule action must be an object"))?;
+            .ok_or_else(|| Error::invalid_field(root, "rule action object"))?;
         let action = object
             .get("action")
             .and_then(Value::as_str)
-            .ok_or_else(|| D::Error::custom("rule action kind is missing"))?
+            .ok_or_else(|| Error::invalid_field(format!("{root}.action"), "action name string"))?
             .to_owned();
         if action == "run" {
             let mut fields = object.clone();
             fields.remove("action");
             let definition =
-                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+                eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
             return Ok(Self::Run { definition });
         }
         if action == "git.fetch" {
             let mut fields = object.clone();
             fields.remove("action");
             let definition =
-                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+                eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
             return Ok(Self::GitFetch { definition });
         }
         if action == "notify" {
             let mut fields = object.clone();
             fields.remove("action");
             let definition =
-                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+                eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
             return Ok(Self::Notify { definition });
         }
         if action == "emit" {
             let mut fields = object.clone();
             fields.remove("action");
             let definition =
-                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+                eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
             return Ok(Self::Emit { definition });
         }
-        serde_json::from_value::<AgentActionDefinition>(value)
-            .map(Self::Agent)
-            .map_err(D::Error::custom)
+        let mut fields = object.clone();
+        fields.remove("action");
+        let fields = Value::Object(fields);
+        let action = match action.as_str() {
+            "stop" => AgentActionDefinition::Stop(eliot_core::api::discovery::decode_params_at(
+                fields, root,
+            )?),
+            "send" => AgentActionDefinition::Send(eliot_core::api::discovery::decode_params_at(
+                fields, root,
+            )?),
+            "interrupt" => AgentActionDefinition::Interrupt(
+                eliot_core::api::discovery::decode_params_at(fields, root)?,
+            ),
+            "steer" => AgentActionDefinition::Steer(eliot_core::api::discovery::decode_params_at(
+                fields, root,
+            )?),
+            "approve" => AgentActionDefinition::Approve(
+                eliot_core::api::discovery::decode_params_at(fields, root)?,
+            ),
+            "deny" => AgentActionDefinition::Deny(eliot_core::api::discovery::decode_params_at(
+                fields, root,
+            )?),
+            "answer" => AgentActionDefinition::Answer(
+                eliot_core::api::discovery::decode_params_at(fields, root)?,
+            ),
+            "resume" => AgentActionDefinition::Resume(
+                eliot_core::api::discovery::decode_params_at(fields, root)?,
+            ),
+            "launch" => AgentActionDefinition::Launch(
+                eliot_core::api::discovery::decode_params_at(fields, root)?,
+            ),
+            _ => {
+                return Err(Error::invalid_field(
+                    format!("{root}.action"),
+                    "supported Agent action name",
+                ));
+            }
+        };
+        Ok(Self::Agent(action))
     }
 }
 
@@ -295,132 +359,140 @@ impl CompiledMatch {
 impl AgentActionDefinition {
     fn target(&self) -> Option<&Value> {
         match self {
-            Self::Stop { target, .. }
-            | Self::Send { target, .. }
-            | Self::Interrupt { target, .. }
-            | Self::Steer { target, .. }
-            | Self::Approve { target, .. }
-            | Self::Deny { target, .. }
-            | Self::Answer { target, .. }
-            | Self::Resume { target, .. } => Some(target),
-            Self::Launch { .. } => None,
+            Self::Stop(StopActionDefinition { target, .. })
+            | Self::Send(SendActionDefinition { target, .. })
+            | Self::Interrupt(InterruptActionDefinition { target, .. })
+            | Self::Steer(SteerActionDefinition { target, .. })
+            | Self::Approve(ChoiceActionDefinition { target, .. })
+            | Self::Deny(ChoiceActionDefinition { target, .. })
+            | Self::Answer(AnswerActionDefinition { target, .. })
+            | Self::Resume(ResumeActionDefinition { target, .. }) => Some(target),
+            Self::Launch(_) => None,
         }
     }
 
     fn expected_generation(&self) -> Option<&Value> {
         match self {
-            Self::Stop {
+            Self::Stop(StopActionDefinition {
                 expected_generation,
                 ..
-            }
-            | Self::Send {
+            })
+            | Self::Send(SendActionDefinition {
                 expected_generation,
                 ..
-            }
-            | Self::Interrupt {
+            })
+            | Self::Interrupt(InterruptActionDefinition {
                 expected_generation,
                 ..
-            }
-            | Self::Steer {
+            })
+            | Self::Steer(SteerActionDefinition {
                 expected_generation,
                 ..
-            }
-            | Self::Approve {
+            })
+            | Self::Approve(ChoiceActionDefinition {
                 expected_generation,
                 ..
-            }
-            | Self::Deny {
+            })
+            | Self::Deny(ChoiceActionDefinition {
                 expected_generation,
                 ..
-            }
-            | Self::Answer {
+            })
+            | Self::Answer(AnswerActionDefinition {
                 expected_generation,
                 ..
-            }
-            | Self::Resume {
+            })
+            | Self::Resume(ResumeActionDefinition {
                 expected_generation,
                 ..
-            } => Some(expected_generation),
-            Self::Launch { .. } => None,
+            }) => Some(expected_generation),
+            Self::Launch(_) => None,
         }
     }
 
     fn text(&self) -> Option<(&Value, usize, &'static str)> {
         match self {
-            Self::Send { text, .. } => Some((text, MAX_EVENT_BYTES, "64 KiB persisted-text bound")),
-            Self::Steer { text, .. } => Some((text, MAX_TEXT_BYTES, "512 KiB text bound")),
-            Self::Launch {
-                text: Some(text), ..
+            Self::Send(SendActionDefinition { text, .. }) => {
+                Some((text, MAX_EVENT_BYTES, "64 KiB persisted-text bound"))
             }
-            | Self::Resume {
+            Self::Steer(SteerActionDefinition { text, .. }) => {
+                Some((text, MAX_TEXT_BYTES, "512 KiB text bound"))
+            }
+            Self::Launch(LaunchActionDefinition {
                 text: Some(text), ..
-            } => Some((text, MAX_EVENT_BYTES, "64 KiB persisted-text bound")),
+            })
+            | Self::Resume(ResumeActionDefinition {
+                text: Some(text), ..
+            }) => Some((text, MAX_EVENT_BYTES, "64 KiB persisted-text bound")),
             _ => None,
         }
     }
 
     fn turn_binding(&self) -> Option<(&Value, &'static str)> {
         match self {
-            Self::Interrupt {
+            Self::Interrupt(InterruptActionDefinition {
                 expected_turn_id, ..
-            } => Some((expected_turn_id, "interrupt")),
-            Self::Steer {
+            }) => Some((expected_turn_id, "interrupt")),
+            Self::Steer(SteerActionDefinition {
                 expected_turn_id, ..
-            } => Some((expected_turn_id, "steer")),
-            Self::Approve {
+            }) => Some((expected_turn_id, "steer")),
+            Self::Approve(ChoiceActionDefinition {
                 expected_turn_id, ..
-            } => Some((expected_turn_id, "approve")),
-            Self::Deny {
+            }) => Some((expected_turn_id, "approve")),
+            Self::Deny(ChoiceActionDefinition {
                 expected_turn_id, ..
-            } => Some((expected_turn_id, "deny")),
-            Self::Answer {
+            }) => Some((expected_turn_id, "deny")),
+            Self::Answer(AnswerActionDefinition {
                 expected_turn_id, ..
-            } => Some((expected_turn_id, "answer")),
+            }) => Some((expected_turn_id, "answer")),
             _ => None,
         }
     }
 
     fn request_binding(&self) -> Option<(&Value, &'static str)> {
         match self {
-            Self::Approve { request_id, .. } => Some((request_id, "approve")),
-            Self::Deny { request_id, .. } => Some((request_id, "deny")),
-            Self::Answer { request_id, .. } => Some((request_id, "answer")),
+            Self::Approve(ChoiceActionDefinition { request_id, .. }) => {
+                Some((request_id, "approve"))
+            }
+            Self::Deny(ChoiceActionDefinition { request_id, .. }) => Some((request_id, "deny")),
+            Self::Answer(AnswerActionDefinition { request_id, .. }) => Some((request_id, "answer")),
             _ => None,
         }
     }
 
     fn approval_choice(&self) -> Option<&Value> {
         match self {
-            Self::Approve { choice, .. } | Self::Deny { choice, .. } => choice.as_ref(),
+            Self::Approve(ChoiceActionDefinition { choice, .. })
+            | Self::Deny(ChoiceActionDefinition { choice, .. }) => choice.as_ref(),
             _ => None,
         }
     }
 
     fn approval_feedback(&self) -> Option<&Value> {
         match self {
-            Self::Approve { feedback, .. } | Self::Deny { feedback, .. } => feedback.as_ref(),
+            Self::Approve(ChoiceActionDefinition { feedback, .. })
+            | Self::Deny(ChoiceActionDefinition { feedback, .. }) => feedback.as_ref(),
             _ => None,
         }
     }
 
     fn answers(&self) -> Option<&BTreeMap<String, Value>> {
         match self {
-            Self::Answer { answers, .. } => Some(answers),
+            Self::Answer(AnswerActionDefinition { answers, .. }) => Some(answers),
             _ => None,
         }
     }
 
     fn verb(&self) -> &'static str {
         match self {
-            Self::Stop { .. } => "stop",
-            Self::Send { .. } => "send",
-            Self::Interrupt { .. } => "interrupt",
-            Self::Steer { .. } => "steer",
-            Self::Approve { .. } => "approve",
-            Self::Deny { .. } => "deny",
-            Self::Answer { .. } => "answer",
-            Self::Resume { .. } => "resume",
-            Self::Launch { .. } => "launch",
+            Self::Stop(_) => "stop",
+            Self::Send(_) => "send",
+            Self::Interrupt(_) => "interrupt",
+            Self::Steer(_) => "steer",
+            Self::Approve(_) => "approve",
+            Self::Deny(_) => "deny",
+            Self::Answer(_) => "answer",
+            Self::Resume(_) => "resume",
+            Self::Launch(_) => "launch",
         }
     }
 }
@@ -501,11 +573,9 @@ pub fn load(reader: impl Read) -> Result<Vec<RuleDefinition>, Error> {
 
     let mut rules = Vec::with_capacity(file.rule.len());
     let mut ids = HashSet::with_capacity(file.rule.len());
-    for raw in file.rule {
+    for (index, raw) in file.rule.into_iter().enumerate() {
         reject_unimplemented_options(&raw)?;
-        let mut rule: RuleDefinition = raw
-            .try_into()
-            .map_err(|_| Error::new("invalid", "rule definition is malformed"))?;
+        let mut rule = decode_rule_definition(raw, &format!("rule[{index}]"))?;
         validate_rule(&mut rule)?;
         if !ids.insert(rule.id.clone()) {
             return Err(Error::new("invalid", "rule file contains duplicate ids"));
@@ -513,6 +583,30 @@ pub fn load(reader: impl Read) -> Result<Vec<RuleDefinition>, Error> {
         rules.push(rule);
     }
     Ok(rules)
+}
+
+fn decode_rule_definition(mut raw: toml::Value, root: &str) -> Result<RuleDefinition, Error> {
+    let path = format!("{root}.do");
+    let actions = raw
+        .get_mut("do")
+        .ok_or_else(|| Error::invalid_field(&path, "array of action objects"))?;
+    // Decode the existing rule DTO envelope without routing its actions through
+    // serde's string-only Error::custom boundary. Restore the actual actions
+    // before validation; their conversion uses the same Value boundary as
+    // ActionDefinition::deserialize and retains Core Error details directly.
+    let actions = std::mem::replace(actions, toml::Value::Array(Vec::new()));
+    let mut rule: RuleDefinition = raw
+        .try_into()
+        .map_err(|_| Error::new("invalid", "rule definition is malformed"))?;
+    let actions: Vec<Value> = actions
+        .try_into()
+        .map_err(|_| Error::invalid_field(&path, "array of action objects"))?;
+    rule.actions = actions
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| ActionDefinition::decode_at(value, &format!("{path}[{index}]")))
+        .collect::<Result<_, _>>()?;
+    Ok(rule)
 }
 
 impl RuleDefinition {
@@ -630,9 +724,9 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         subject,
         data: &event.data,
     };
-    if let AgentActionDefinition::Launch {
+    if let AgentActionDefinition::Launch(LaunchActionDefinition {
         profile, workspace, ..
-    } = action
+    }) = action
     {
         let text = action
             .text()
@@ -1079,11 +1173,11 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
         ActionDefinition::Emit { definition } => return definition.validate(),
         ActionDefinition::Agent(action) => action,
     };
-    if let AgentActionDefinition::Launch {
+    if let AgentActionDefinition::Launch(LaunchActionDefinition {
         profile,
         workspace,
         text,
-    } = action
+    }) = action
     {
         return validate_launch_action(profile, workspace, text.as_ref(), true);
     }
@@ -1216,15 +1310,15 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
         ActionDefinition::Agent(action) => action,
     };
     let (target_value, generation_value, args) = match action {
-        AgentActionDefinition::Stop {
+        AgentActionDefinition::Stop(StopActionDefinition {
             target,
             expected_generation,
-        } => (target, expected_generation, json!({})),
-        AgentActionDefinition::Send {
+        }) => (target, expected_generation, json!({})),
+        AgentActionDefinition::Send(SendActionDefinition {
             target,
             expected_generation,
             text,
-        } => {
+        }) => {
             let (_, max_bytes, limit_label) = action.text().expect("Send action has text");
             validate_text_template(text, false, max_bytes, action.verb(), limit_label)?;
             (
@@ -1233,17 +1327,17 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
                 json!({"text": text.as_str().expect("validated send text")}),
             )
         }
-        AgentActionDefinition::Interrupt { .. } => {
+        AgentActionDefinition::Interrupt(_) => {
             return Err(Error::new(
                 "unsupported",
                 "interrupt actions require an event trigger",
             ));
         }
-        AgentActionDefinition::Resume {
+        AgentActionDefinition::Resume(ResumeActionDefinition {
             target,
             expected_generation,
             ..
-        } => {
+        }) => {
             let args = match action.text() {
                 Some((text, max_bytes, limit_label)) => {
                     validate_text_template(text, false, max_bytes, action.verb(), limit_label)?;
@@ -1260,25 +1354,25 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
             };
             (target, expected_generation, args)
         }
-        AgentActionDefinition::Steer { .. } => {
+        AgentActionDefinition::Steer(_) => {
             return Err(Error::new(
                 "unsupported",
                 "steer actions require an event trigger",
             ));
         }
-        AgentActionDefinition::Approve { .. }
-        | AgentActionDefinition::Deny { .. }
-        | AgentActionDefinition::Answer { .. } => {
+        AgentActionDefinition::Approve(_)
+        | AgentActionDefinition::Deny(_)
+        | AgentActionDefinition::Answer(_) => {
             return Err(Error::new(
                 "unsupported",
                 "request reply actions require an event trigger",
             ));
         }
-        AgentActionDefinition::Launch {
+        AgentActionDefinition::Launch(LaunchActionDefinition {
             profile,
             workspace,
             text,
-        } => {
+        }) => {
             validate_launch_action(profile, workspace, text.as_ref(), false)?;
             let text = text
                 .as_ref()
@@ -1298,7 +1392,7 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
     ensure_agent_id_capacity(target.len())?;
     parse_agent_id(target)
         .map_err(|_| Error::new("invalid", "timer action target is not a canonical Agent id"))?;
-    let is_resume = matches!(action, AgentActionDefinition::Resume { .. });
+    let is_resume = matches!(action, AgentActionDefinition::Resume(_));
     let expected_generation = generation_value
         .as_i64()
         .filter(|generation| {
@@ -1703,6 +1797,122 @@ on = { event = 'turn.completed', match = { 'subject.harness' = 'fake' } }
 do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${event.generation}' }]
 "#;
 
+    #[test]
+    fn audit_390_nested_rule_action_diagnostics() {
+        let prefix = "[[rule]]\nid = 'first'\non = { event = 'turn.completed' }\ndo = [{ action = 'notify', message = 'ok' }]\n";
+        for (action, field) in [
+            ("{ action = 'notify', message = 17 }", "message"),
+            (
+                "{ action = 'notify', message = 'private-payload', title = 17 }",
+                "title",
+            ),
+            (
+                "{ action = 'emit', topic = 17, data = 'private-payload' }",
+                "topic",
+            ),
+            ("{ action = 'run', cmd = [17, 'script.ps1'] }", "cmd[0]"),
+            (
+                "{ action = 'git.fetch', repository = 17, remote = 'origin', source_ref = 'refs/heads/main', tracking_ref = 'refs/remotes/origin/main' }",
+                "repository",
+            ),
+        ] {
+            let source = format!(
+                "{prefix}\n[[rule]]\nid = 'second'\non = {{ event = 'turn.completed' }}\ndo = [{action}]\n"
+            );
+            let error = load(Cursor::new(source)).unwrap_err();
+            assert_eq!(error.code, "invalid");
+            let details = error.details.as_ref().unwrap();
+            assert_eq!(details.field, format!("rule[1].do[0].{field}"));
+            assert!(details.expected.contains("string"));
+            assert!(
+                !serde_json::to_string(&error)
+                    .unwrap()
+                    .contains("private-payload")
+            );
+        }
+        // The authored action and saved canonical representation still share
+        // the same conversion and normalization after the diagnostic change.
+        let rules = load(Cursor::new(prefix)).unwrap();
+        let saved = serde_json::to_string(&rules[0]).unwrap();
+        let restored = RuleDefinition::deserialize_saved(&saved).unwrap();
+        assert_eq!(
+            restored.semantic_digest().unwrap(),
+            rules[0].semantic_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn audit_390_agent_action_diagnostics_and_wire_shapes() {
+        for (action, field, expected) in [
+            (
+                "{ action = 'send', target = 'a1', expected_generation = 1 }",
+                "text",
+                "{}",
+            ),
+            (
+                "{ action = 'send', target = 'a1', expected_generation = 1, text = 'ok', private-credential = true }",
+                "<unknown-field>",
+                "object",
+            ),
+            (
+                "{ action = 'launch', profile = 17, workspace = 'ws' }",
+                "profile",
+                "string",
+            ),
+            (
+                "{ action = 'launch', profile = 'codex', workspace = 17 }",
+                "workspace",
+                "string",
+            ),
+            (
+                "{ action = 'launch', profile = 'codex' }",
+                "workspace",
+                "string",
+            ),
+            (
+                "{ action = 'launch', profile = 'codex', workspace = 'ws', private-credential = true }",
+                "<unknown-field>",
+                "object",
+            ),
+            (
+                "{ action = 'answer', target = 'a1', expected_generation = 1, expected_turn_id = 'turn', request_id = 'request', answers = 17 }",
+                "answers",
+                "object",
+            ),
+        ] {
+            let source = format!(
+                "[[rule]]\nid = 'agent-action'\non = {{ event = 'request.opened' }}\ndo = [{action}]\n"
+            );
+            let error = load(Cursor::new(source)).unwrap_err();
+            assert_eq!(error.code, "invalid");
+            let details = error.details.as_ref().unwrap();
+            assert_eq!(details.field, format!("rule[0].do[0].{field}"));
+            assert!(details.expected.contains(expected));
+            assert!(
+                !serde_json::to_string(&error)
+                    .unwrap()
+                    .contains("private-credential")
+            );
+        }
+        for value in [
+            json!({"action":"stop","target":"a1","expected_generation":1}),
+            json!({"action":"send","target":"a1","expected_generation":1,"text":"hello"}),
+            json!({"action":"interrupt","target":"a1","expected_generation":1,"expected_turn_id":"turn"}),
+            json!({"action":"steer","target":"a1","expected_generation":1,"expected_turn_id":"turn","text":"hello"}),
+            json!({"action":"approve","target":"a1","expected_generation":1,"expected_turn_id":"turn","request_id":"request"}),
+            json!({"action":"deny","target":"a1","expected_generation":1,"expected_turn_id":"turn","request_id":"request","choice":"reject","feedback":"reason"}),
+            json!({"action":"resume","target":"a1","expected_generation":1,"text":"hello"}),
+            json!({"action":"launch","profile":"codex","workspace":"ws"}),
+            json!({"action":"launch","profile":"codex","workspace":"ws","text":"hello"}),
+            json!({"action":"answer","target":"a1","expected_generation":1,"expected_turn_id":"turn","request_id":"request","answers":{"question":"yes"}}),
+        ] {
+            let action = ActionDefinition::decode_at(value.clone(), "action").unwrap();
+            assert_eq!(serde_json::to_value(&action).unwrap(), value);
+            let restored: ActionDefinition = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(restored).unwrap(), value);
+        }
+    }
+
     const SEND_RULE: &str = r#"
 [[rule]]
 id = 'send-on-result'
@@ -1846,7 +2056,7 @@ do = [{ action = 'resume', target = '${event.agent}', expected_generation = '${e
         );
 
         let unsupported = [
-            RULE.replace("action = 'stop'", "action = 'notify'"),
+            RULE.replace("action = 'stop'", "action = 'future.action'"),
             RULE.replace("'subject.harness' = 'fake'", "'subject.labels.role' = 'writer'"),
             RULE.replace("'subject.harness' = 'fake'", "'event.parent' = 'command-id'"),
             RULE.replace(

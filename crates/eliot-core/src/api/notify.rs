@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// A bounded local notification: a human message persisted as `x.user.notify`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotifyDefinitionArgs {
     pub message: String,
@@ -37,7 +37,7 @@ impl NotifyDefinitionArgs {
 }
 
 /// A named local user event: opaque bounded data persisted as `x.user.<topic>`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmitDefinitionArgs {
     pub topic: String,
