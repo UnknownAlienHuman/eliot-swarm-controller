@@ -266,30 +266,35 @@ impl Router {
         {
             example["agent"] = json!("a1");
         }
-        let scopes = if method.name.starts_with("var.") {
-            identity
-                .allowed_scopes
-                .iter()
-                .filter(|s| !s.starts_with("mailbox:"))
-                .filter(|s| {
-                    !(method.name == "var.set"
-                        && matches!(principal, Principal::Agent { .. })
-                        && *s == "global")
-                })
-                .cloned()
-                .collect()
-        } else {
-            identity.allowed_scopes
-        };
+        let scopes = method_scopes(method.name, principal, &identity);
         encode(MethodHelpResponse {
             method:method.name.to_owned(), summary:method.summary.to_owned(),
             cli_aliases:aliases.iter().map(|s| (*s).to_owned()).collect(),
             request_schema:(method.input)(), response_schema:(method.output)(),
             example:json!({"method":method.name,"params":example}),
             mutation_id:if method.mutation { "Supply a fresh caller-retained ULID in id before the first write. Retry only with that same id, principal, method and identical semantic payload. Never mint another id after an uncertain outcome; read back the retained result. The example id is illustrative; replace it for a new write." } else { "Read-only; no mutation id is required." }.to_owned(),
-            scopes, limits:format!("{} {} Responses retain their DTO pagination and daemon 4 MiB frame bounds; one help result is at most 256 KiB. Examples for existing resources require their actual retained ids/profile/source/view.", identity.limits, method_limits(method.name)), unsupported,
+            scopes, limits:format!("{} Responses retain their DTO pagination and daemon 4 MiB frame bounds; one help result is at most 256 KiB. Examples for existing resources require their actual retained ids/profile/source/view.", method_limits(method.name)), unsupported,
         })
     }
+}
+
+fn method_scopes(name: &str, principal: &Principal, identity: &IdentityResponse) -> Vec<String> {
+    identity
+        .allowed_scopes
+        .iter()
+        .filter(|scope| match name {
+            "var.get" => scope.as_str() == "global" || scope.starts_with("project:"),
+            "var.set" => {
+                scope.starts_with("project:")
+                    || (scope.as_str() == "global" && matches!(principal, Principal::Owner))
+            }
+            "mail.inbox" | "mail.read" | "mail.ack" => scope.starts_with("mailbox:"),
+            // Native/process/provider selectors are described by their DTO fields;
+            // they do not select one of the caller's coordination authority scopes.
+            _ => false,
+        })
+        .cloned()
+        .collect()
 }
 
 fn method_limits(name: &str) -> &'static str {
@@ -343,6 +348,71 @@ fn encode(value: impl serde::Serialize) -> Result<Value> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn audit_390_help_scopes_are_method_specific() {
+        let router = super::super::tests::router();
+        // A retained row is enough to exercise metadata; no plugin or native
+        // process is started, and these calls do not qualify authentication.
+        let mut launch = CommandSubmitRequest::new(ulid::Ulid::new().to_string(), "launch");
+        launch.expected_generation = Some(0);
+        launch.args = json!({"project":"audit-project","workspace":"audit-workspace","harness":"codex","profile":"fixture","profile_snapshot":{}});
+        let agent_id = router
+            .inner
+            .store
+            .lock()
+            .await
+            .submit("owner", launch, crate::common::now_ms())
+            .unwrap()
+            .command
+            .target
+            .unwrap();
+        let agent_mailbox = format!("mailbox:{agent_id}");
+        let callers = [
+            (Principal::Owner, "project:<name>", "mailbox:<agent>"),
+            (
+                Principal::Agent {
+                    id: agent_id,
+                    generation: 0,
+                },
+                "project:audit-project",
+                agent_mailbox.as_str(),
+            ),
+        ];
+        for (principal, project, mailbox) in callers {
+            let identity = router
+                .caller_identity(&json!({}), &principal)
+                .await
+                .unwrap();
+            assert_eq!(
+                identity["allowed_scopes"],
+                json!(["global", project, mailbox])
+            );
+            for method in METHODS.iter().filter(|m| visible(m, &principal)) {
+                let help = router
+                    .method_help(&json!({"method":method.name}), &principal)
+                    .await
+                    .unwrap();
+                let expected = match method.name {
+                    "var.get" => vec!["global", project],
+                    "var.set" if matches!(principal, Principal::Owner) => vec!["global", project],
+                    "var.set" => vec![project],
+                    "mail.inbox" | "mail.read" | "mail.ack" => vec![mailbox],
+                    _ => Vec::new(),
+                };
+                assert_eq!(help["scopes"], json!(expected), "{}", method.name);
+                assert!(
+                    !help["limits"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Variables default")
+                );
+                if matches!(method.name, "mail.inbox" | "mail.read" | "mail.ack") {
+                    assert!(help["request_schema"]["properties"].get("scope").is_none());
+                }
+            }
+        }
+    }
 
     #[test]
     fn descriptors_cover_router_methods_and_examples_decode() {

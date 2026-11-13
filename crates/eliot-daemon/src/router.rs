@@ -680,8 +680,10 @@ impl Router {
         remote: Option<&eliot_core::RemoteCallContext>,
     ) -> Result<Value> {
         request.validate()?;
-        let definition = serde_json::from_value::<GitFetchDefinitionArgs>(request.args.clone())
-            .map_err(|_| Error::new("invalid", "git.fetch definition is malformed"))?;
+        let definition = eliot_core::api::discovery::decode_params_at::<GitFetchDefinitionArgs>(
+            request.args.clone(),
+            "params.args",
+        )?;
         definition.validate()?;
         let timeout_ms = crate::automation::git_fetch_timeout_ms(definition.timeout.as_deref())?;
 
@@ -881,8 +883,10 @@ impl Router {
                 "git.fetch request contains a known credential",
             ));
         }
-        let definition = serde_json::from_value::<GitFetchDefinitionArgs>(request.args.clone())
-            .map_err(|_| Error::new("invalid", "git.fetch definition is malformed"))?;
+        let definition = eliot_core::api::discovery::decode_params_at::<GitFetchDefinitionArgs>(
+            request.args.clone(),
+            "params.args",
+        )?;
         definition.validate()?;
         let timeout_ms = crate::automation::git_fetch_timeout_ms(definition.timeout.as_deref())?;
         let _binding_args = definition.binding_args(timeout_ms)?;
@@ -987,8 +991,8 @@ impl Router {
                 "Owner event Run must be targetless and unbound",
             ));
         }
-        let definition: RunDefinitionArgs = serde_json::from_value(request.args.clone())
-            .map_err(|_| Error::new("invalid", "Owner Run args are malformed"))?;
+        let definition: RunDefinitionArgs =
+            eliot_core::api::discovery::decode_params_at(request.args.clone(), "params.args")?;
         let automation = crate::config::load_automation_config(&self.inner.data_root)?;
         let policy = self.secret_policy_snapshot();
         let frozen = crate::scripts::freeze::freeze_global_run(
@@ -1028,8 +1032,10 @@ impl Router {
         context.validate()?;
         match project {
             Some(registration) => {
-                let definition: RunDefinitionArgs = serde_json::from_value(request.args.clone())
-                    .map_err(|_| Error::new("invalid", "project Run args are malformed"))?;
+                let definition: RunDefinitionArgs = eliot_core::api::discovery::decode_params_at(
+                    request.args.clone(),
+                    "params.args",
+                )?;
                 let policy = self.secret_policy_snapshot();
                 let frozen = crate::scripts::freeze_project_run(
                     definition,
@@ -4156,8 +4162,10 @@ fn normalize_resume(request: &mut SubmitCommand) -> Result<()> {
 fn user_event_kind_data(verb: &str, args: &Value) -> Result<(String, Value)> {
     match verb {
         "notify" => {
-            let definition = serde_json::from_value::<NotifyDefinitionArgs>(args.clone())
-                .map_err(|_| Error::new("invalid", "notify definition is malformed"))?;
+            let definition = eliot_core::api::discovery::decode_params_at::<NotifyDefinitionArgs>(
+                args.clone(),
+                "params.args",
+            )?;
             definition.validate()?;
             let mut data = json!({"message": definition.message});
             if let Some(title) = definition.title {
@@ -4166,8 +4174,10 @@ fn user_event_kind_data(verb: &str, args: &Value) -> Result<(String, Value)> {
             Ok(("x.user.notify".to_owned(), data))
         }
         "emit" => {
-            let definition = serde_json::from_value::<EmitDefinitionArgs>(args.clone())
-                .map_err(|_| Error::new("invalid", "emit definition is malformed"))?;
+            let definition = eliot_core::api::discovery::decode_params_at::<EmitDefinitionArgs>(
+                args.clone(),
+                "params.args",
+            )?;
             definition.validate()?;
             Ok((
                 format!("x.user.{}", definition.topic),
@@ -4809,6 +4819,49 @@ mod tests {
             Arc::new(AsyncMutex::new(store)),
             Bus::new(16),
         )
+    }
+
+    #[tokio::test]
+    async fn audit_390_nested_command_action_diagnostics() {
+        let router = router();
+        let private_text = "rejected-payload-must-stay-private";
+        for (verb, args, field) in [
+            (
+                "notify",
+                json!({"message":private_text,"title":17}),
+                "title",
+            ),
+            ("emit", json!({"topic":17,"data":private_text}), "topic"),
+        ] {
+            let id = ulid::Ulid::new().to_string();
+            let error = router
+                .handle(
+                    "command.submit",
+                    json!({
+                        "_auth":{"kind":"owner","credential":"owner-credential"},
+                        "_payload":{"id":id,"verb":verb,"args":args},
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "invalid");
+            let details = error.details.as_ref().unwrap();
+            assert_eq!(details.field, format!("params.args.{field}"));
+            assert!(details.expected.contains("string"));
+            let encoded = serde_json::to_string(&error).unwrap();
+            assert!(!encoded.contains(private_text));
+            assert!(!encoded.contains("owner-credential"));
+            assert!(
+                router
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .get_command(&id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]

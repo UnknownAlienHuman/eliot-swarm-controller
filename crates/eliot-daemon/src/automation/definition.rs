@@ -150,46 +150,51 @@ impl<'de> Deserialize<'de> for ActionDefinition {
     where
         D: serde::Deserializer<'de>,
     {
-        let value = Value::deserialize(deserializer)?;
+        Self::decode_at(Value::deserialize(deserializer)?, "action").map_err(D::Error::custom)
+    }
+}
+
+impl ActionDefinition {
+    fn decode_at(value: Value, root: &str) -> Result<Self, Error> {
         let object = value
             .as_object()
-            .ok_or_else(|| D::Error::custom("rule action must be an object"))?;
+            .ok_or_else(|| Error::invalid_field(root, "rule action object"))?;
         let action = object
             .get("action")
             .and_then(Value::as_str)
-            .ok_or_else(|| D::Error::custom("rule action kind is missing"))?
+            .ok_or_else(|| Error::invalid_field(format!("{root}.action"), "action name string"))?
             .to_owned();
         if action == "run" {
             let mut fields = object.clone();
             fields.remove("action");
             let definition =
-                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+                eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
             return Ok(Self::Run { definition });
         }
         if action == "git.fetch" {
             let mut fields = object.clone();
             fields.remove("action");
             let definition =
-                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+                eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
             return Ok(Self::GitFetch { definition });
         }
         if action == "notify" {
             let mut fields = object.clone();
             fields.remove("action");
             let definition =
-                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+                eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
             return Ok(Self::Notify { definition });
         }
         if action == "emit" {
             let mut fields = object.clone();
             fields.remove("action");
             let definition =
-                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+                eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
             return Ok(Self::Emit { definition });
         }
         serde_json::from_value::<AgentActionDefinition>(value)
             .map(Self::Agent)
-            .map_err(D::Error::custom)
+            .map_err(|_| Error::invalid_field(root, "supported Agent action object"))
     }
 }
 
@@ -501,11 +506,9 @@ pub fn load(reader: impl Read) -> Result<Vec<RuleDefinition>, Error> {
 
     let mut rules = Vec::with_capacity(file.rule.len());
     let mut ids = HashSet::with_capacity(file.rule.len());
-    for raw in file.rule {
+    for (index, raw) in file.rule.into_iter().enumerate() {
         reject_unimplemented_options(&raw)?;
-        let mut rule: RuleDefinition = raw
-            .try_into()
-            .map_err(|_| Error::new("invalid", "rule definition is malformed"))?;
+        let mut rule = decode_rule_definition(raw, &format!("rule[{index}]"))?;
         validate_rule(&mut rule)?;
         if !ids.insert(rule.id.clone()) {
             return Err(Error::new("invalid", "rule file contains duplicate ids"));
@@ -513,6 +516,30 @@ pub fn load(reader: impl Read) -> Result<Vec<RuleDefinition>, Error> {
         rules.push(rule);
     }
     Ok(rules)
+}
+
+fn decode_rule_definition(mut raw: toml::Value, root: &str) -> Result<RuleDefinition, Error> {
+    let path = format!("{root}.do");
+    let actions = raw
+        .get_mut("do")
+        .ok_or_else(|| Error::invalid_field(&path, "array of action objects"))?;
+    // Decode the existing rule DTO envelope without routing its actions through
+    // serde's string-only Error::custom boundary. Restore the actual actions
+    // before validation; their conversion uses the same Value boundary as
+    // ActionDefinition::deserialize and retains Core Error details directly.
+    let actions = std::mem::replace(actions, toml::Value::Array(Vec::new()));
+    let mut rule: RuleDefinition = raw
+        .try_into()
+        .map_err(|_| Error::new("invalid", "rule definition is malformed"))?;
+    let actions: Vec<Value> = actions
+        .try_into()
+        .map_err(|_| Error::invalid_field(&path, "array of action objects"))?;
+    rule.actions = actions
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| ActionDefinition::decode_at(value, &format!("{path}[{index}]")))
+        .collect::<Result<_, _>>()?;
+    Ok(rule)
 }
 
 impl RuleDefinition {
@@ -1702,6 +1729,50 @@ id = 'stop-on-result'
 on = { event = 'turn.completed', match = { 'subject.harness' = 'fake' } }
 do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${event.generation}' }]
 "#;
+
+    #[test]
+    fn audit_390_nested_rule_action_diagnostics() {
+        let prefix = "[[rule]]\nid = 'first'\non = { event = 'turn.completed' }\ndo = [{ action = 'notify', message = 'ok' }]\n";
+        for (action, field) in [
+            ("{ action = 'notify', message = 17 }", "message"),
+            (
+                "{ action = 'notify', message = 'private-payload', title = 17 }",
+                "title",
+            ),
+            (
+                "{ action = 'emit', topic = 17, data = 'private-payload' }",
+                "topic",
+            ),
+            ("{ action = 'run', cmd = [17, 'script.ps1'] }", "cmd[0]"),
+            (
+                "{ action = 'git.fetch', repository = 17, remote = 'origin', source_ref = 'refs/heads/main', tracking_ref = 'refs/remotes/origin/main' }",
+                "repository",
+            ),
+        ] {
+            let source = format!(
+                "{prefix}\n[[rule]]\nid = 'second'\non = {{ event = 'turn.completed' }}\ndo = [{action}]\n"
+            );
+            let error = load(Cursor::new(source)).unwrap_err();
+            assert_eq!(error.code, "invalid");
+            let details = error.details.as_ref().unwrap();
+            assert_eq!(details.field, format!("rule[1].do[0].{field}"));
+            assert!(details.expected.contains("string"));
+            assert!(
+                !serde_json::to_string(&error)
+                    .unwrap()
+                    .contains("private-payload")
+            );
+        }
+        // The authored action and saved canonical representation still share
+        // the same conversion and normalization after the diagnostic change.
+        let rules = load(Cursor::new(prefix)).unwrap();
+        let saved = serde_json::to_string(&rules[0]).unwrap();
+        let restored = RuleDefinition::deserialize_saved(&saved).unwrap();
+        assert_eq!(
+            restored.semantic_digest().unwrap(),
+            rules[0].semantic_digest().unwrap()
+        );
+    }
 
     const SEND_RULE: &str = r#"
 [[rule]]

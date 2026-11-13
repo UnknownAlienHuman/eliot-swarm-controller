@@ -261,6 +261,9 @@ a fresh caller-retained mutation ULID rather than reusing the illustrative examp
 `api.identity` returns the authenticated principal kind, Agent id/generation when present,
 and its allowed scope patterns. An Agent's variable scope defaults to its actual project;
 mailbox access is self-only. Owners explicitly select variable scopes and mailboxes.
+Help's `scopes` describes only the requested method's domain, rather than inheriting
+the caller-wide list from `api.identity`. A mailbox scope denotes the `agent` mailbox
+selector, not a `scope` request field; methods without a scope domain return an empty list.
 Unsupported mail presentation modes, tree variable scopes and native Goal/cost controls
 are described as unsupported, not advertised as available native capabilities. Use
 `agent.get` for target-generation capabilities before `command.submit`.
@@ -268,6 +271,8 @@ are described as unsupported, not advertised as available native capabilities. U
 Malformed fields return Core `Error` code `invalid`, with a bounded `details.field` path
 and `details.expected` shape, repeated in the safe message for transports that only expose
 code/message. DTO-owned validation retains its existing error code (including `unsupported`).
+Nested action DTO failures retain `params.args.<field>` for command submission and
+`rule[<index>].do[<index>].<field>` when loading authored rule files.
 Rejected values, unknown user-supplied keys/variants and whole payloads are never echoed.
 An unknown key is reported as `<unknown-field>` with the DTO's allowed field names,
 so even a credential accidentally used as a key stays redacted.

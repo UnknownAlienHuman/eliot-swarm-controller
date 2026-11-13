@@ -184,10 +184,16 @@ pub fn response_schema<T: JsonSchema>() -> Value {
 /// can contain credentials. Only schema-owned field names and numeric indices
 /// enter the error, and the expectation comes from the DTO's schema.
 pub fn decode_params<T: DeserializeOwned + JsonSchema>(params: Value) -> Result<T> {
+    decode_params_at(params, "params")
+}
+
+/// Decode a nested DTO at its caller-owned wire path. The root must be a
+/// static field path (plus bounded array indices), never rejected input.
+pub fn decode_params_at<T: DeserializeOwned + JsonSchema>(params: Value, root: &str) -> Result<T> {
     serde_path_to_error::deserialize(params).map_err(|error| {
         let schema = request_schema::<T>();
         let mut node = &schema;
-        let mut path = "params".to_owned();
+        let mut path = root.to_owned();
         let mut unknown_field = false;
         for segment in error.path() {
             node = resolve(&schema, node);
