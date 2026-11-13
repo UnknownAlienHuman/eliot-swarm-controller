@@ -40,9 +40,7 @@ fn activity_projection_preserves_control_state_and_prefers_open_turns() {
         running.activity.as_ref().unwrap().last_progress_at,
         Some(NOW + 2)
     );
-    let summary = store
-        .native_children_attention(&root, 1, NOW + 1002, 1000)
-        .unwrap();
+    let summary = attention_summary(&store, &root, 1, NOW + 1002, 1000);
     assert_eq!(
         (summary.unfinished, summary.stalled, summary.lost),
         (1, 1, 0)
@@ -55,10 +53,7 @@ fn activity_projection_preserves_control_state_and_prefers_open_turns() {
             .any(|agent| agent.id == root)
     );
     assert_eq!(
-        store
-            .native_children_attention(&root, 2, NOW + 1002, 1000)
-            .unwrap()
-            .unfinished,
+        attention_summary(&store, &root, 2, NOW + 1002, 1000).unfinished,
         0
     );
 
@@ -89,10 +84,7 @@ fn activity_projection_preserves_control_state_and_prefers_open_turns() {
         NativeChildActivityState::Interrupted
     );
     assert_eq!(
-        store
-            .native_children_attention(&root, 1, NOW + 1002, 1000)
-            .unwrap()
-            .unfinished,
+        attention_summary(&store, &root, 1, NOW + 1002, 1000).unfinished,
         0
     );
     store
@@ -129,10 +121,7 @@ fn activity_projection_preserves_control_state_and_prefers_open_turns() {
     assert_eq!(lost.activity.as_ref().unwrap().open_turns, 1);
     assert_eq!(lost.activity.unwrap().state, NativeChildActivityState::Lost);
     assert_eq!(
-        store
-            .native_children_attention(&root, 1, NOW + 1002, 1000)
-            .unwrap()
-            .lost,
+        attention_summary(&store, &root, 1, NOW + 1002, 1000).lost,
         1
     );
 }
@@ -190,21 +179,182 @@ fn activity_uses_exact_parent_sources_and_aggregates_nested_children() {
         .activity
         .unwrap();
     assert_eq!(activity.state, NativeChildActivityState::Lost);
-    let summary = store
-        .native_children_attention(&root, 1, NOW + 4, 1000)
-        .unwrap();
+    let summary = attention_summary(&store, &root, 1, NOW + 4, 1000);
     assert_eq!((summary.unfinished, summary.lost), (2, 2));
     assert_eq!(
-        store
-            .native_children_attention(&child.agent.id, 1, NOW + 4, 1000)
-            .unwrap()
-            .unfinished,
+        attention_summary(&store, &child.agent.id, 1, NOW + 4, 1000).unfinished,
         0
     );
 }
 
 fn store() -> Store {
     Store::open(Path::new(":memory:")).unwrap()
+}
+
+fn attention_summary(
+    store: &Store,
+    manager: &str,
+    generation: i64,
+    now: i64,
+    suspicion_ms: i64,
+) -> NativeChildrenAttention {
+    let mut summary = NativeChildrenAttention::default();
+    let Some(through) = store
+        .native_children_attention_end(manager, generation)
+        .unwrap()
+    else {
+        return summary;
+    };
+    let mut after = None;
+    loop {
+        let page = store
+            .native_children_attention_page(
+                manager,
+                generation,
+                after.as_deref(),
+                &through,
+                now,
+                suspicion_ms,
+            )
+            .unwrap();
+        summary.append(page.summary);
+        match page.next {
+            Some(next) => after = Some(next),
+            None => return summary,
+        }
+    }
+}
+
+#[test]
+fn activity_pages_advance_over_finished_rows_and_freeze_the_registration_range() {
+    let mut store = store();
+    let root = producer(&mut store, "root");
+    for index in 0..NATIVE_CHILD_ATTENTION_PAGE_SIZE {
+        let child = register(
+            &mut store,
+            &root,
+            request(&root, "root", &format!("done-{index}")),
+        );
+        store
+            .put_native_child_batch(
+                &root,
+                1,
+                batch(
+                    &child.agent.id,
+                    &format!("done-{index}"),
+                    vec![event(
+                        "turn.completed",
+                        &format!("done-{index}"),
+                        json!({"turn_id":"done", "status":"completed"}),
+                    )],
+                ),
+                NOW + 2,
+            )
+            .unwrap();
+    }
+    let active = register(&mut store, &root, request(&root, "root", "active"));
+    start_child_turn(&mut store, &root, &active.agent.id, "active");
+    let through = store
+        .native_children_attention_end(&root, 1)
+        .unwrap()
+        .unwrap();
+    let first = store
+        .native_children_attention_page(&root, 1, None, &through, NOW + 1002, 1000)
+        .unwrap();
+    assert_eq!(first.summary.unfinished, 0);
+    assert!(first.next.is_some());
+    let late = register(&mut store, &root, request(&root, "root", "late"));
+    start_child_turn(&mut store, &root, &late.agent.id, "late");
+    let last = store
+        .native_children_attention_page(&root, 1, first.next.as_deref(), &through, NOW + 1002, 1000)
+        .unwrap();
+    assert!(last.next.is_none());
+    assert_eq!(last.summary.children[0].0, active.agent.id);
+    assert_eq!(last.summary.unfinished, 1);
+    assert_eq!(
+        attention_summary(&store, &root, 1, NOW + 1002, 1000).unfinished,
+        2
+    );
+}
+
+#[test]
+fn activity_query_plans_seek_indexes_instead_of_retained_history() {
+    let store = store();
+    // These are the production query strings, planned by bundled rusqlite.
+    for (sql, args, expected) in [
+        (OPEN_TURNS_SQL, vec![1i64, 1], "turns_native_activity"),
+        (
+            NATIVE_PROGRESS_SQL,
+            vec![1, 1],
+            "events_native_progress_time",
+        ),
+        (TERMINAL_ACTIVITY_SQL, vec![1, 1], "turns_native_activity"),
+        (GIT_PROGRESS_SQL, vec![1, 1], "events_git_progress_time"),
+        (
+            CHILDREN_ATTENTION_PAGE_SQL,
+            vec![1, 1, 0, 1000, NATIVE_CHILD_ATTENTION_PAGE_SIZE as i64],
+            "native_children_producer",
+        ),
+    ] {
+        let mut statement = store
+            .connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let details = statement
+            .query_map(rusqlite::params_from_iter(args), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(details.contains(expected), "{details}");
+        assert!(
+            !details.contains("SCAN ") && !details.contains("USE TEMP B-TREE"),
+            "{details}"
+        );
+        println!("{expected}: {details}");
+    }
+}
+
+#[test]
+fn activity_progress_keeps_timestamp_order_and_native_git_boundaries() {
+    let mut store = store();
+    let root = producer(&mut store, "root");
+    let agent = parse_agent_id(&root).unwrap();
+    for (offset, generation, source, kind, native_id) in [
+        (3, 1, "stream", "message.completed", Some("newer-time")),
+        (2, 1, "stream", "turn.started", Some("later-sequence")),
+        (4, 1, "git", "file.changed", None),
+        (10, 1, "os", "tool.completed", Some("cpu-noise")),
+        (11, 1, "stream", "message.completed", None),
+        (
+            12,
+            2,
+            "stream",
+            "message.completed",
+            Some("other-generation"),
+        ),
+    ] {
+        store
+            .connection
+            .execute(
+                "INSERT INTO events(ts, kind, agent, generation, source, native_id, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}')",
+                params![NOW + offset, kind, agent, generation, source, native_id],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store.native_model_progress(&root, 1).unwrap(),
+        Some(NOW + 3)
+    );
+    assert_eq!(store.last_model_progress(&root, 1).unwrap(), Some(NOW + 4));
+    assert_eq!(
+        store.native_model_progress(&root, 2).unwrap(),
+        Some(NOW + 12)
+    );
+    assert_eq!(store.last_model_progress("a999", 1).unwrap(), None);
 }
 
 fn producer(store: &mut Store, native_ref: &str) -> String {

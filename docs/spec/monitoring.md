@@ -508,7 +508,15 @@ existing queued mail path (which wakes an eligible idle recipient), plus the Own
 notice even when the manager itself has a parent. A stopped manager receives queued
 mail but is not automatically resumed. No child is addressed, controlled or stopped;
 no native snapshot or model call is needed for this decision. CPU and Git are not
-progress. Sweeps include idle/stopped managers with open native children.
+progress. Sweeps include idle/stopped managers with current native registrations;
+the candidate lookup checks registration existence without traversing child turns.
+Descendant capture visits at most `NATIVE_CHILD_ATTENTION_PAGE_SIZE` registrations
+per Store lock, including finished/no-facts rows; the registration cursor advances
+over every visited row. Store is released between pages and the manager generation
+and parent turn are rechecked after each page and before publishing. Each capture
+freezes its last registration ID so concurrent child creation cannot extend the pass
+indefinitely. Open-turn, latest terminal and native-progress reads use matching
+indexes rather than scanning retained turn/event history.
 
 One frozen report covers an unfinished child cohort per manager generation. Parent
 turn changes, mail wakes, manager progress and child fanout do not rearm it. It retires

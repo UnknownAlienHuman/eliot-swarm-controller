@@ -1387,6 +1387,21 @@ async fn capture_agent(
     generation: i64,
     suspicion_window: Duration,
 ) -> Result<Option<CapturedAgent>> {
+    let binding = {
+        let store = router.inner.store.lock().await;
+        let Some(agent) = store.get_agent(agent_id)? else {
+            return Ok(None);
+        };
+        if agent.generation != generation {
+            return Ok(None);
+        }
+        agent
+    };
+    let Some(children) =
+        capture_child_activity(&router.inner.store, &binding, suspicion_window).await?
+    else {
+        return Ok(None);
+    };
     let (
         agent,
         source_states,
@@ -1396,14 +1411,13 @@ async fn capture_agent(
         turn,
         turn_command_id,
         tool_coverage,
-        children,
         manager_progress_at,
     ) = {
         let store = router.inner.store.lock().await;
         let Some(agent) = store.get_agent(agent_id)? else {
             return Ok(None);
         };
-        if agent.generation != generation {
+        if agent.generation != generation || agent.active_turn != binding.active_turn {
             return Ok(None);
         }
         let source_states = store
@@ -1413,16 +1427,6 @@ async fn capture_agent(
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| Error::new("internal", "Agent source state projection is invalid"))?;
         let last_model_progress_at = store.last_model_progress(agent_id, generation)?;
-        let children = if agent.observe_only {
-            eliot_store::NativeChildrenAttention::default()
-        } else {
-            store.native_children_attention(
-                agent_id,
-                generation,
-                now_ms(),
-                i64::try_from(suspicion_window.as_millis()).unwrap_or(i64::MAX),
-            )?
-        };
         let turn = agent
             .active_turn
             .as_deref()
@@ -1470,7 +1474,6 @@ async fn capture_agent(
             turn,
             turn_command_id,
             tool_coverage,
-            children,
             manager_progress_at,
         )
     };
@@ -1509,6 +1512,66 @@ async fn capture_agent(
         children,
         manager_progress_at,
     }))
+}
+
+async fn capture_child_activity(
+    store: &super::StoreHandle,
+    manager: &Agent,
+    suspicion_window: Duration,
+) -> Result<Option<eliot_store::NativeChildrenAttention>> {
+    let mut children = eliot_store::NativeChildrenAttention::default();
+    if manager.observe_only {
+        return Ok(Some(children));
+    }
+    let through = {
+        let store = store.lock().await;
+        let Some(current) = store.get_agent(&manager.id)? else {
+            return Ok(None);
+        };
+        if current.generation != manager.generation || current.active_turn != manager.active_turn {
+            return Ok(None);
+        }
+        store.native_children_attention_end(&manager.id, manager.generation)?
+    };
+    let Some(through) = through else {
+        return Ok(Some(children));
+    };
+    let observed_at = now_ms();
+    let suspicion_ms = i64::try_from(suspicion_window.as_millis()).unwrap_or(i64::MAX);
+    let mut after = None;
+    loop {
+        let page = {
+            let store = store.lock().await;
+            let page = store.native_children_attention_page(
+                &manager.id,
+                manager.generation,
+                after.as_deref(),
+                &through,
+                observed_at,
+                suspicion_ms,
+            )?;
+            // Check after every page, including the last one. Never combine
+            // descendants across a superseded manager generation or parent turn.
+            let Some(current) = store.get_agent(&manager.id)? else {
+                return Ok(None);
+            };
+            if current.generation != manager.generation
+                || current.active_turn != manager.active_turn
+            {
+                return Ok(None);
+            }
+            page
+        };
+        children.append(page.summary);
+        let Some(next) = page.next else {
+            break;
+        };
+        after = Some(next);
+        // Give admission and native ingestion an opportunity between bounded
+        // pages, even when the next mutex acquisition could otherwise be ready.
+        tokio::task::yield_now().await;
+    }
+    Ok(Some(children))
 }
 
 fn desired_incident(
@@ -2259,6 +2322,94 @@ fn state_name(state: AgentState) -> &'static str {
 #[cfg(test)]
 mod child_attention_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pages_release_store_and_reject_a_replaced_manager_generation() {
+        use eliot_core::{ChildRegistration, NativeEvent, SourceBatch, SubmitCommand};
+        let now = now_ms();
+        let mut store = eliot_store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        let mut launch = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        launch.expected_generation = Some(0);
+        launch.args = json!({"harness":"codex", "profile":"page-test", "profile_snapshot":{},
+            "project":"page-test", "workspace":"page-test"});
+        let command = launch.id.clone();
+        let manager_id = store
+            .submit("owner", launch, now)
+            .unwrap()
+            .command
+            .target
+            .unwrap();
+        store.dispatch(&command, now).unwrap();
+        let plan = ["session", "turn", "message"]
+            .into_iter()
+            .map(|family| (family.to_owned(), "stream".to_owned()))
+            .collect();
+        store
+            .install_plugin_sources(&manager_id, 1, &command, &plan, now)
+            .unwrap();
+        store.put_batch(SourceBatch {
+            batch_id: "ready".to_owned(), agent_id: manager_id.clone(), generation: 1,
+            source: "stream".to_owned(), cursor: None,
+            events: vec![NativeEvent { kind: "session.ready".to_owned(), native_id: "ready".to_owned(),
+                ts: Some(now), data: json!({"command_id":command,"native_scope":"page-test","native_ref":"manager"}) }],
+        }, now).unwrap();
+        store
+            .settle(&command, CommandState::Applied, None, now)
+            .unwrap();
+        for index in 0..=eliot_store::NATIVE_CHILD_ATTENTION_PAGE_SIZE {
+            store
+                .register_native_child(
+                    &manager_id,
+                    1,
+                    ChildRegistration {
+                        registration_id: format!("child-{index}"),
+                        parent_id: manager_id.clone(),
+                        parent_generation: 1,
+                        parent_native_ref: "manager".to_owned(),
+                        native_scope: "page-test".to_owned(),
+                        native_ref: format!("child-{index}"),
+                    },
+                    now,
+                )
+                .unwrap();
+        }
+        let manager = store.get_agent(&manager_id).unwrap().unwrap();
+        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let capture = capture_child_activity(&store, &manager, Duration::from_secs(900));
+        tokio::pin!(capture);
+        // The first pending point is the explicit handoff after one complete page.
+        assert!(futures_util::poll!(&mut capture).is_pending());
+        {
+            let mut writer = store
+                .try_lock()
+                .expect("capture retained Store across a page handoff");
+            writer.mark_lost(&manager_id, 1, now + 1).unwrap();
+            // Store-only fixture: no process or native reader was launched.
+            writer
+                .close_native_sources(&manager_id, 1, now + 1)
+                .unwrap();
+            writer
+                .release_restart_closed_generation(
+                    &manager_id,
+                    1,
+                    "store_only_fixture",
+                    false,
+                    now + 1,
+                )
+                .unwrap();
+            let mut resume = SubmitCommand::new(ulid::Ulid::new().to_string(), "resume");
+            resume.target = Some(manager_id.clone());
+            resume.expected_generation = Some(1);
+            let resume_id = resume.id.clone();
+            writer.submit("owner", resume, now + 2).unwrap();
+            writer.dispatch(&resume_id, now + 2).unwrap();
+            assert_eq!(
+                writer.get_agent(&manager_id).unwrap().unwrap().generation,
+                2
+            );
+        }
+        assert!(capture.await.unwrap().is_none());
+    }
 
     fn manager() -> CapturedAgent {
         let now = now_ms();

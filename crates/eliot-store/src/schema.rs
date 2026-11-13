@@ -696,6 +696,13 @@ impl Store {
                 .map_err(sql_error)?;
             tx.execute_batch(
                 "CREATE INDEX native_children_producer ON native_child_registrations(producer, producer_generation, child);
+                 CREATE INDEX turns_native_activity ON turns(agent, generation, state, COALESCE(completed_at, started_at, 0));
+                 CREATE INDEX events_native_progress_time ON events(agent, generation, ts DESC)
+                     WHERE native_id IS NOT NULL AND source NOT IN ('daemon', 'os', 'git', 'workspace_process')
+                     AND kind IN ('turn.started', 'turn.completed', 'message.completed',
+                                  'tool.started', 'tool.completed', 'request.opened', 'request.resolved', 'request.closed');
+                 CREATE INDEX events_git_progress_time ON events(agent, generation, ts DESC)
+                     WHERE source = 'git' AND kind = 'file.changed';
                  INSERT INTO schema_migrations(version) VALUES (29);",
             ).map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
