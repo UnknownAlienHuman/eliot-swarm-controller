@@ -45,6 +45,11 @@ pub trait NativeStdioConfig: Clone + Send + Sync + 'static {
     /// unless the host's wire protocol documents larger frames (bounded by
     /// [`crate::native_transport::MAX_SUPPORTED_NATIVE_FRAME_BYTES`]).
     const MAX_FRAME_BYTES: usize;
+    /// Inbound method names this host can legitimately send (notifications
+    /// and server requests Eliot consumes). Oversized-frame diagnosis
+    /// records a method only on exact match here; everything else is
+    /// omitted, so arbitrary host tokens never enter persisted gaps.
+    const OVERSIZED_KNOWN_METHODS: &'static [&'static str];
     /// Map a native JSON-RPC response error to a call outcome.
     fn map_response_error(error: NativeJsonRpcErrorBody) -> Result<Value>;
 
@@ -177,6 +182,7 @@ impl<C: NativeStdioConfig> StdioProcess<C> {
             C::ID_PREFIX,
             PumpMode::LossyOverflow,
             C::MAX_FRAME_BYTES,
+            C::OVERSIZED_KNOWN_METHODS,
             classify_jsonrpc_frame::<C>,
         )
         .await?;

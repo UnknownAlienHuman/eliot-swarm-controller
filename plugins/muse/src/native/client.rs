@@ -44,12 +44,35 @@ impl NativeStdioConfig for MuseStdioConfig {
     const SERVER: &'static str = "Muse session host";
     const SHORT: &'static str = "Muse";
     const ID_PREFIX: &'static str = "muse";
-    // MSP documents multi-megabyte single responses: `item/readOutput`
-    // serves up to 6 MiB stored bytes per page (~8 MiB base64 on the wire),
-    // and `view/page` serves up to 1000 events per response. 8 MiB covers
-    // the largest documented response plus envelope overhead; live item
-    // notifications beyond it stay an explicit oversized gap.
+    // The 8 MiB cap covers `view/page` readback (Eliot requests
+    // `limit: 1000`) plus envelope overhead; the installed schema's text
+    // budget is otherwise unpublished, so a live item notification beyond
+    // it stays an explicit oversized gap. Eliot makes no `item/readOutput`
+    // calls, so that surface (6 MiB stored bytes per page, exactly 8 MiB
+    // of base64 before envelope overhead) does not size this cap.
     const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+    /// Inbound methods the Muse host can legitimately send: the
+    /// notifications the event task consumes plus the two server-request
+    /// families Eliot answers (`events.rs`, `native/requests.rs`).
+    /// Oversized-frame diagnosis records only these exact names.
+    const OVERSIZED_KNOWN_METHODS: &'static [&'static str] = &[
+        "turn/started",
+        "turn/completed",
+        "item/started",
+        "item/updated",
+        "item/completed",
+        "approval/resolved",
+        "approval/updated",
+        "userInput/settled",
+        "session/started",
+        "session/closed",
+        "session/viewHealthChanged",
+        "session/reasoningEffortChanged",
+        "view/gap",
+        "approval/request",
+        "userInput/request",
+    ];
 
     fn map_response_error(error: SharedErrorBody) -> Result<Value> {
         // Schema errors table: only pre-admission/validation errors prove the

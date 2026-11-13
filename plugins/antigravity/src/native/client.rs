@@ -127,6 +127,20 @@ pub(crate) struct AgyProcess {
     stream: watch::Receiver<StreamState>,
 }
 
+/// Inbound ACP methods the server can legitimately send: the
+/// `session/update` notification Eliot consumes (agent-to-client requests
+/// are rejected without answering, so their methods are never recorded).
+/// Oversized-frame diagnosis records only these exact names.
+const OVERSIZED_KNOWN_METHODS: &[&str] = &[
+    "initialize",
+    "session/new",
+    "session/load",
+    "session/prompt",
+    "session/update",
+    "session/cancel",
+    "session/close",
+];
+
 #[derive(Serialize)]
 struct OutboundRequest<'a> {
     jsonrpc: &'static str,
@@ -169,6 +183,7 @@ impl AgyProcess {
             ID_PREFIX,
             PumpMode::LossyOverflow,
             DEFAULT_MAX_NATIVE_FRAME_BYTES,
+            OVERSIZED_KNOWN_METHODS,
             move |value| classify_agy_frame(value, &fenced_classify),
         )
         .await?;

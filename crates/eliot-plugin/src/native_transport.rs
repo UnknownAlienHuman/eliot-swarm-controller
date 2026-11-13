@@ -490,29 +490,74 @@ impl OversizedFrameKind {
 
 /// Bounded, secret-free description of one over-limit native frame.
 /// Fixed shape only: byte counts, the envelope kind the bounded prefix
-/// proved, and a token-filtered method name when one parsed. The method
-/// filter admits only protocol-token characters, so free-text bodies can
-/// never be recorded here even when the frame is malformed.
+/// proved, and an allowlisted method name when one parsed. The method is
+/// recorded only when it exactly matches the caller's per-adapter known
+/// protocol set (plus a token-charset guard), so arbitrary host tokens,
+/// identifiers and free-text bodies can never be recorded here even when
+/// the frame is malformed. `lower_bound` marks lengths observed while the
+/// line was still open (fault published at the threshold): the true line
+/// is at least this long.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OversizedFrame {
     limit_bytes: u32,
     length_bytes: u64,
     kind: OversizedFrameKind,
+    lower_bound: bool,
     method_len: u8,
     method_bytes: [u8; OVERSIZED_METHOD_CAP],
 }
 
 impl OversizedFrame {
-    /// Diagnose from a bounded line prefix (the reader always captures one).
-    pub fn parse(limit_bytes: usize, length_bytes: u64, prefix: &[u8]) -> Self {
+    /// Diagnose from a bounded line prefix with an exact length (the line
+    /// ended at a newline or EOF, so its total is known).
+    pub fn parse(
+        limit_bytes: usize,
+        length_bytes: u64,
+        prefix: &[u8],
+        known_methods: &[&str],
+    ) -> Self {
         let (kind, method) = parse_oversized_prefix(prefix);
-        Self::new(limit_bytes, length_bytes, kind, method.as_deref())
+        Self::new(
+            limit_bytes,
+            length_bytes,
+            kind,
+            method.as_deref(),
+            known_methods,
+            false,
+        )
+    }
+
+    /// Diagnose from a bounded prefix while the line is still open: the
+    /// threshold was crossed without a newline, so the length is a lower
+    /// bound (`len>=n` in [`Self::describe`]).
+    pub fn parse_lower_bound(
+        limit_bytes: usize,
+        length_bytes: u64,
+        prefix: &[u8],
+        known_methods: &[&str],
+    ) -> Self {
+        let (kind, method) = parse_oversized_prefix(prefix);
+        Self::new(
+            limit_bytes,
+            length_bytes,
+            kind,
+            method.as_deref(),
+            known_methods,
+            true,
+        )
     }
 
     /// Fallback when the line itself is in hand but no prefix was captured.
     /// Defensive only: the bounded reader always captures a prefix.
     pub fn unparsed(limit_bytes: usize, length_bytes: u64) -> Self {
-        Self::new(limit_bytes, length_bytes, OversizedFrameKind::Unknown, None)
+        Self::new(
+            limit_bytes,
+            length_bytes,
+            OversizedFrameKind::Unknown,
+            None,
+            &[],
+            false,
+        )
     }
 
     fn new(
@@ -520,6 +565,8 @@ impl OversizedFrame {
         length_bytes: u64,
         kind: OversizedFrameKind,
         method: Option<&str>,
+        known_methods: &[&str],
+        lower_bound: bool,
     ) -> Self {
         let mut method_bytes = [0u8; OVERSIZED_METHOD_CAP];
         let mut method_len = 0u8;
@@ -527,6 +574,7 @@ impl OversizedFrame {
             && !name.is_empty()
             && name.len() <= OVERSIZED_METHOD_CAP
             && name.bytes().all(is_oversized_method_char)
+            && known_methods.contains(&name)
         {
             method_bytes[..name.len()].copy_from_slice(name.as_bytes());
             method_len = name.len() as u8;
@@ -535,6 +583,7 @@ impl OversizedFrame {
             limit_bytes: u32::try_from(limit_bytes).unwrap_or(u32::MAX),
             length_bytes,
             kind,
+            lower_bound,
             method_len,
             method_bytes,
         }
@@ -552,8 +601,16 @@ impl OversizedFrame {
         self.kind
     }
 
-    /// The parsed JSON-RPC method, if one parsed and passed the token
-    /// filter. `None` means absent or not parseable, never a redaction.
+    /// True when the length was observed while the line was still open
+    /// (fault published at the threshold): the true line is at least this
+    /// long.
+    pub fn is_lower_bound(self) -> bool {
+        self.lower_bound
+    }
+
+    /// The parsed JSON-RPC method, if one parsed and matched the adapter's
+    /// known protocol set. `None` means absent, unknown, or not allowlisted,
+    /// never a redaction.
     pub fn method(&self) -> Option<&str> {
         if self.method_len == 0 {
             return None;
@@ -565,9 +622,12 @@ impl OversizedFrame {
     /// Bounded one-line diagnosis, e.g.
     /// `frame_oversized len=1834521 limit=8388608 kind=response` or
     /// `frame_oversized len=2100000 limit=8388608 kind=notification method=item/completed`.
+    /// Lower-bound lengths (fault published at the threshold, before the
+    /// newline) render as `len>=n`.
     pub fn describe(self) -> String {
         let mut text = format!(
-            "frame_oversized len={} limit={} kind={}",
+            "frame_oversized len{}={} limit={} kind={}",
+            if self.lower_bound { ">" } else { "" },
             self.length_bytes,
             self.limit_bytes,
             self.kind.as_str(),
@@ -1432,7 +1492,10 @@ pub fn encode_frame(server: &'static str, message: &impl Serialize) -> Result<St
 /// selects [`PumpMode::LosslessBackpressure`]. The caller also selects the
 /// inbound frame cap: [`DEFAULT_MAX_NATIVE_FRAME_BYTES`] unless the
 /// adapter's native protocol documents larger frames (bounded by
-/// [`MAX_SUPPORTED_NATIVE_FRAME_BYTES`]).
+/// [`MAX_SUPPORTED_NATIVE_FRAME_BYTES`]). The caller also passes its
+/// static known-method allowlist for oversized-frame diagnosis: only these
+/// exact method names are ever recorded, everything else is omitted.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_pumped<Frame, Classify>(
     launch: NativeLaunch,
     policy: SecretPolicy,
@@ -1440,6 +1503,7 @@ pub async fn spawn_pumped<Frame, Classify>(
     id_prefix: &'static str,
     mode: PumpMode,
     max_frame_bytes: usize,
+    known_methods: &'static [&'static str],
     classify: Classify,
 ) -> Result<(
     NativeChild,
@@ -1474,6 +1538,7 @@ where
         process_exit,
         mode,
         max_frame_bytes,
+        known_methods,
         classify,
     ));
     transport.set_output_reader(output_reader);
@@ -1569,9 +1634,15 @@ async fn send_held_frame<Frame>(
 
 /// What one raw stdout line decode produced. Oversized lines carry their
 /// measured length and a bounded head prefix; nothing else is retained.
+/// `lower_bound` is true when the threshold was crossed while the line was
+/// still open (no newline yet): the true line is at least this long.
 #[derive(Debug)]
 enum BoundedLineError {
-    Oversized { length_bytes: u64, prefix: Vec<u8> },
+    Oversized {
+        length_bytes: u64,
+        prefix: Vec<u8>,
+        lower_bound: bool,
+    },
     Io(std::io::Error),
 }
 
@@ -1583,37 +1654,30 @@ impl From<std::io::Error> for BoundedLineError {
 
 /// Length-checked NDJSON line codec with bounded oversized diagnosis.
 /// Lines within the limit decode exactly like [`LinesCodec`] (trailing
-/// `\r` stripped, UTF-8 enforced). A line over the limit is discarded
-/// through its newline while counting its total bytes and keeping only the
-/// first [`OVERSIZED_PREFIX_CAP`] bytes; the pump reports it once as
-/// [`NativeStreamFault::FrameOversized`]. Partial lines split across reads
-/// accumulate a counter plus the bounded prefix only, never the body, so a
-/// multi-gigabyte line still holds kilobytes of memory.
+/// `\r` stripped, UTF-8 enforced, and a final lone `\r` at EOF ignored).
+/// A line over the limit fails as soon as the threshold is crossed, even
+/// without a newline, keeping only the first [`OVERSIZED_PREFIX_CAP`]
+/// bytes; the pump reports it once as [`NativeStreamFault::FrameOversized`]
+/// with the observed length marked as a lower bound, so a host that keeps
+/// stdout open can never delay diagnosis or pending-call failure. Buffers
+/// never hold more than the limit plus one read, so a multi-gigabyte line
+/// still holds kilobytes of memory.
 #[derive(Debug)]
 struct BoundedLineCodec {
     max_frame_bytes: usize,
-    discarding: Option<OversizedAccum>,
-}
-
-#[derive(Debug)]
-struct OversizedAccum {
-    total: u64,
-    prefix: Vec<u8>,
 }
 
 impl BoundedLineCodec {
     fn new(max_frame_bytes: usize) -> Self {
-        Self {
-            max_frame_bytes,
-            discarding: None,
-        }
+        Self { max_frame_bytes }
     }
 
-    fn oversized(&mut self, total: u64, prefix: Vec<u8>) -> BoundedLineError {
+    fn oversized(&self, total: u64, prefix: Vec<u8>, lower_bound: bool) -> BoundedLineError {
         debug_assert!(prefix.len() <= OVERSIZED_PREFIX_CAP);
         BoundedLineError::Oversized {
             length_bytes: total,
             prefix,
+            lower_bound,
         }
     }
 
@@ -1644,42 +1708,24 @@ impl Decoder for BoundedLineCodec {
     ) -> std::result::Result<Option<String>, BoundedLineError> {
         if let Some(newline) = src.iter().position(|byte| *byte == b'\n') {
             let end = newline.saturating_add(1);
-            if let Some(mut accum) = self.discarding.take() {
-                let total = accum.total.saturating_add(end as u64);
-                let take = OVERSIZED_PREFIX_CAP
-                    .saturating_sub(accum.prefix.len())
-                    .min(newline);
-                accum.prefix.extend_from_slice(&src[..take]);
-                let _ = src.split_to(end);
-                return Err(self.oversized(total, accum.prefix));
-            }
             if newline.saturating_add(1) > self.max_frame_bytes {
                 let take = newline.min(OVERSIZED_PREFIX_CAP);
                 let prefix = src[..take].to_vec();
                 let _ = src.split_to(end);
-                return Err(self.oversized(end as u64, prefix));
+                return Err(self.oversized(end as u64, prefix, false));
             }
             let line = src.split_to(end);
             return self.decode_content(&line[..newline]);
         }
-        if let Some(accum) = self.discarding.as_mut() {
-            accum.total = accum.total.saturating_add(src.len() as u64);
-            let take = OVERSIZED_PREFIX_CAP
-                .saturating_sub(accum.prefix.len())
-                .min(src.len());
-            accum.prefix.extend_from_slice(&src[..take]);
-            src.clear();
-            return Ok(None);
-        }
         if src.len() > self.max_frame_bytes {
-            // No newline yet and already over the limit: oversized whatever
-            // follows. Discard what is buffered, count the rest as it arrives.
-            let chunk = src.split_to(src.len());
-            let take = chunk.len().min(OVERSIZED_PREFIX_CAP);
-            self.discarding = Some(OversizedAccum {
-                total: chunk.len() as u64,
-                prefix: chunk[..take].to_vec(),
-            });
+            // No newline yet and already over the limit: publish the fault
+            // now instead of waiting for a newline or EOF that may never
+            // come. The true line is at least this long.
+            let take = src.len().min(OVERSIZED_PREFIX_CAP);
+            let prefix = src[..take].to_vec();
+            let total = src.len() as u64;
+            src.clear();
+            return Err(self.oversized(total, prefix, true));
         }
         Ok(None)
     }
@@ -1689,26 +1735,20 @@ impl Decoder for BoundedLineCodec {
         src: &mut BytesMut,
     ) -> std::result::Result<Option<String>, BoundedLineError> {
         if src.is_empty() {
-            if let Some(accum) = self.discarding.take() {
-                return Err(self.oversized(accum.total, accum.prefix));
-            }
             return Ok(None);
         }
-        if let Some(mut accum) = self.discarding.take() {
-            accum.total = accum.total.saturating_add(src.len() as u64);
-            let take = OVERSIZED_PREFIX_CAP
-                .saturating_sub(accum.prefix.len())
-                .min(src.len());
-            accum.prefix.extend_from_slice(&src[..take]);
+        if src.len() == 1 && src[0] == b'\r' {
+            // Match `LinesCodec` 0.7.20: a final lone `\r` at EOF is an
+            // encoding suffix, not an empty frame.
             src.clear();
-            return Err(self.oversized(accum.total, accum.prefix));
+            return Ok(None);
         }
         if src.len().saturating_add(1) > self.max_frame_bytes {
             let take = src.len().min(OVERSIZED_PREFIX_CAP);
             let prefix = src[..take].to_vec();
             let total = src.len() as u64;
             src.clear();
-            return Err(self.oversized(total, prefix));
+            return Err(self.oversized(total, prefix, false));
         }
         let line = src.split_to(src.len());
         self.decode_content(&line)
@@ -1729,6 +1769,7 @@ async fn pump_framed_lines<Frame, Classify>(
     mut process_exit: watch::Receiver<Option<ProcessExit>>,
     mode: PumpMode,
     max_frame_bytes: usize,
+    known_methods: &'static [&'static str],
     mut classify: Classify,
 ) -> Result<()>
 where
@@ -1828,8 +1869,18 @@ where
             Err(BoundedLineError::Oversized {
                 length_bytes,
                 prefix,
+                lower_bound,
             }) => {
-                let detail = OversizedFrame::parse(max_frame_bytes, length_bytes, &prefix);
+                let detail = if lower_bound {
+                    OversizedFrame::parse_lower_bound(
+                        max_frame_bytes,
+                        length_bytes,
+                        &prefix,
+                        known_methods,
+                    )
+                } else {
+                    OversizedFrame::parse(max_frame_bytes, length_bytes, &prefix, known_methods)
+                };
                 return Err(mark_stream_malformed(
                     stream,
                     pending,
@@ -2020,17 +2071,23 @@ mod tests {
         assert!(status.is_none());
     }
 
+    /// Adapter-shaped allowlist for these unit tests: mirrors the
+    /// Muse/Codex inbound sets relevant to the fixtures below.
+    const TEST_KNOWN_METHODS: &[&str] = &["item/completed", "approval/request"];
+
     #[test]
     fn oversized_prefix_parses_notification_method() {
         let prefix =
             b"{\"jsonrpc\":\"2.0\",\"method\":\"item/completed\",\"params\":{\"sessionId\":\"s\"}}";
-        let detail = OversizedFrame::parse(1024 * 1024, 2_000_000, prefix);
+        let detail = OversizedFrame::parse(1024 * 1024, 2_000_000, prefix, TEST_KNOWN_METHODS);
         assert_eq!(detail.length_bytes(), 2_000_000);
         assert_eq!(detail.limit_bytes(), 1024 * 1024);
         assert_eq!(detail.kind(), OversizedFrameKind::Notification);
+        assert!(!detail.is_lower_bound());
         assert_eq!(detail.method(), Some("item/completed"));
         let text = detail.describe();
         assert!(text.contains("len=2000000"), "{text}");
+        assert!(!text.contains("len>="), "{text}");
         assert!(text.contains("limit=1048576"), "{text}");
         assert!(text.contains("kind=notification"), "{text}");
         assert!(text.contains("method=item/completed"), "{text}");
@@ -2043,7 +2100,7 @@ mod tests {
     #[test]
     fn oversized_prefix_parses_response_without_method() {
         let prefix = br#"{"jsonrpc":"2.0","id":"muse-42","result":{"session":{"sessionId":"s"}}"#;
-        let detail = OversizedFrame::parse(8 * 1024 * 1024, 9_000_000, prefix);
+        let detail = OversizedFrame::parse(8 * 1024 * 1024, 9_000_000, prefix, TEST_KNOWN_METHODS);
         assert_eq!(detail.kind(), OversizedFrameKind::Response);
         assert_eq!(detail.method(), None);
         let text = detail.describe();
@@ -2054,7 +2111,7 @@ mod tests {
     #[test]
     fn oversized_prefix_parses_request_with_id() {
         let prefix = br#"{"jsonrpc":"2.0","id":7,"method":"approval/request","params":{}}"#;
-        let detail = OversizedFrame::parse(1024 * 1024, 2_000_000, prefix);
+        let detail = OversizedFrame::parse(1024 * 1024, 2_000_000, prefix, TEST_KNOWN_METHODS);
         assert_eq!(detail.kind(), OversizedFrameKind::Request);
         assert_eq!(detail.method(), Some("approval/request"));
     }
@@ -2066,61 +2123,168 @@ mod tests {
         let secret = "sekrit body payload 12345";
         let prefix =
             format!(r#"{{"jsonrpc":"2.0","method":"{secret}","params":{{"text":"{secret}"}}}}"#);
-        let detail = OversizedFrame::parse(1024 * 1024, 5_000_000, prefix.as_bytes());
+        let detail = OversizedFrame::parse(
+            1024 * 1024,
+            5_000_000,
+            prefix.as_bytes(),
+            TEST_KNOWN_METHODS,
+        );
         assert_eq!(detail.method(), None);
         let text = detail.describe();
         assert!(!text.contains(secret), "{text}");
         assert!(text.len() < 256, "{text}");
 
-        // A token-shaped method records only the token itself, never the
+        // A token-shaped but unallowlisted method is omitted: only the
+        // envelope kind and lengths are recorded, never the token, the
         // surrounding body or the id value.
         let prefix = format!(
             r#"{{"jsonrpc":"2.0","id":"muse-9","method":"sekrit-token","params":{{"text":"{secret}"}}}}"#
         );
-        let detail = OversizedFrame::parse(1024 * 1024, 5_000_000, prefix.as_bytes());
+        let detail = OversizedFrame::parse(
+            1024 * 1024,
+            5_000_000,
+            prefix.as_bytes(),
+            TEST_KNOWN_METHODS,
+        );
         assert_eq!(detail.kind(), OversizedFrameKind::Request);
-        assert_eq!(detail.method(), Some("sekrit-token"));
+        assert_eq!(detail.method(), None);
         let text = detail.describe();
+        assert!(!text.contains("sekrit-token"), "{text}");
+        assert!(!text.contains(secret), "{text}");
+        assert!(!text.contains("muse-9"), "{text}");
+        assert!(!text.contains("method="), "{text}");
+        assert!(text.len() < 256, "{text}");
+
+        // An allowlisted method records only the method name itself.
+        let prefix = format!(
+            r#"{{"jsonrpc":"2.0","id":"muse-9","method":"approval/request","params":{{"text":"{secret}"}}}}"#
+        );
+        let detail = OversizedFrame::parse(
+            1024 * 1024,
+            5_000_000,
+            prefix.as_bytes(),
+            TEST_KNOWN_METHODS,
+        );
+        assert_eq!(detail.kind(), OversizedFrameKind::Request);
+        assert_eq!(detail.method(), Some("approval/request"));
+        let text = detail.describe();
+        assert!(text.contains("method=approval/request"), "{text}");
         assert!(!text.contains(secret), "{text}");
         assert!(!text.contains("muse-9"), "{text}");
         assert!(text.len() < 256, "{text}");
     }
 
     #[test]
+    fn oversized_method_outside_allowlist_is_omitted() {
+        // A well-formed token that is not a known protocol method carries
+        // no diagnosis value and could be an identifier: omit it while
+        // keeping the kind and length.
+        let prefix = b"{\"jsonrpc\":\"2.0\",\"method\":\"session/evil\",\"params\":{\"x\":1}}";
+        let detail = OversizedFrame::parse(1024 * 1024, 2_000_000, prefix, TEST_KNOWN_METHODS);
+        assert_eq!(detail.kind(), OversizedFrameKind::Notification);
+        assert_eq!(detail.method(), None);
+        let text = detail.describe();
+        assert!(text.contains("kind=notification"), "{text}");
+        assert!(!text.contains("session/evil"), "{text}");
+        assert!(!text.contains("method="), "{text}");
+    }
+
+    #[test]
+    fn oversized_lower_bound_marks_length_as_minimum() {
+        let prefix = b"{\"jsonrpc\":\"2.0\",\"method\":\"item/completed\",\"params\":{\"text\":\"";
+        let detail = OversizedFrame::parse_lower_bound(32, 33, prefix, TEST_KNOWN_METHODS);
+        assert!(detail.is_lower_bound());
+        assert_eq!(detail.method(), Some("item/completed"));
+        let text = detail.describe();
+        assert!(text.contains("len>=33"), "{text}");
+        assert!(!text.contains("len=33 limit"), "{text}");
+
+        let exact = OversizedFrame::parse(1024 * 1024, 2_000_000, prefix, TEST_KNOWN_METHODS);
+        assert!(!exact.is_lower_bound());
+        assert!(exact.describe().contains("len=2000000"), "{exact:?}");
+    }
+
+    #[test]
     fn oversized_prefix_ignores_nested_method_keys() {
         let prefix = br#"{"jsonrpc":"2.0","id":"muse-1","result":{"method":"not-a-real-method","items":[]}}"#;
-        let detail = OversizedFrame::parse(1024 * 1024, 2_000_000, prefix);
+        let detail = OversizedFrame::parse(1024 * 1024, 2_000_000, prefix, TEST_KNOWN_METHODS);
         assert_eq!(detail.kind(), OversizedFrameKind::Response);
         assert_eq!(detail.method(), None);
     }
 
     #[test]
-    fn bounded_codec_reports_split_oversized_line_once() {
+    fn bounded_codec_reports_oversized_at_threshold_without_newline() {
         use tokio_util::codec::Decoder;
-        let mut codec = BoundedLineCodec::new(32);
+        // The fault publishes as soon as the buffered bytes cross the cap,
+        // even while the host keeps stdout open with no newline: the length
+        // is a lower bound and only the bounded prefix is kept.
+        let mut codec = BoundedLineCodec::new(64);
         let mut src = BytesMut::from(&b"{\"jsonrpc\":\"2.0\",\"method\":\""[..]);
         assert!(codec.decode(&mut src).expect("need more").is_none());
         src.extend_from_slice(b"item/completed\",\"params\":{\"text\":\"");
         assert!(codec.decode(&mut src).expect("need more").is_none());
         src.extend_from_slice(&[b'x'; 64]);
-        assert!(codec.decode(&mut src).expect("need more").is_none());
-        src.extend_from_slice(b"\"}}\"\n");
-        let error = codec.decode(&mut src).expect_err("oversized");
+        let error = codec.decode(&mut src).expect_err("oversized at threshold");
         let BoundedLineError::Oversized {
             length_bytes,
             prefix,
+            lower_bound,
         } = error
         else {
             panic!("expected oversized, got Io");
         };
-        assert!(length_bytes > 32, "{length_bytes}");
+        assert!(lower_bound);
+        assert!(length_bytes > 64, "{length_bytes}");
         assert!(prefix.len() <= OVERSIZED_PREFIX_CAP);
         assert!(prefix.starts_with(b"{\"jsonrpc\""));
-        // The line was consumed through its newline: a following well-formed
-        // line still decodes.
+        // The over-limit bytes were consumed with the fault: a following
+        // well-formed line still decodes.
         src.extend_from_slice(b"{}\n");
         let line = codec
             .decode(&mut src)
+            .expect("valid line")
+            .expect("one line");
+        assert_eq!(line, "{}");
+    }
+
+    #[test]
+    fn bounded_codec_reports_newline_oversized_with_exact_length() {
+        use tokio_util::codec::Decoder;
+        // A short line that ends at a newline over the cap carries its
+        // exact total, not a lower bound.
+        let mut codec = BoundedLineCodec::new(8);
+        let mut src = BytesMut::from(&b"{\"a\":12}\n"[..]);
+        let error = codec.decode(&mut src).expect_err("oversized");
+        let BoundedLineError::Oversized {
+            length_bytes,
+            lower_bound,
+            ..
+        } = error
+        else {
+            panic!("expected oversized, got Io");
+        };
+        assert!(!lower_bound);
+        assert_eq!(length_bytes, 9);
+    }
+
+    #[test]
+    fn bounded_codec_ignores_lone_cr_at_eof_like_lines_codec() {
+        use tokio_util::codec::Decoder;
+        // Parity with `LinesCodec` 0.7.20: a final lone `\r` at EOF is an
+        // encoding suffix, not an empty frame.
+        let mut codec = BoundedLineCodec::new(1024 * 1024);
+        let mut src = BytesMut::from(&b"\r"[..]);
+        assert!(
+            codec
+                .decode_eof(&mut src)
+                .expect("lone CR is ignored")
+                .is_none()
+        );
+        assert!(src.is_empty());
+        // A real payload ending in `\r` at EOF still strips to its content.
+        let mut src = BytesMut::from(&b"{}\r"[..]);
+        let line = codec
+            .decode_eof(&mut src)
             .expect("valid line")
             .expect("one line");
         assert_eq!(line, "{}");

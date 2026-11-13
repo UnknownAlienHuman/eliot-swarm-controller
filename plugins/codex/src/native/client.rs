@@ -28,6 +28,23 @@ impl NativeStdioConfig for CodexStdioConfig {
     // No evidence of larger Codex frames: keep the 1 MiB default.
     const MAX_FRAME_BYTES: usize = eliot_plugin::native_transport::DEFAULT_MAX_NATIVE_FRAME_BYTES;
 
+    /// Inbound methods the Codex host can legitimately send: the
+    /// notifications the event task consumes plus the three server-request
+    /// families Eliot answers (`events.rs`, `native/requests.rs`).
+    /// Oversized-frame diagnosis records only these exact names.
+    const OVERSIZED_KNOWN_METHODS: &'static [&'static str] = &[
+        "turn/started",
+        "turn/completed",
+        "item/started",
+        "item/completed",
+        "serverRequest/resolved",
+        "thread/started",
+        "error",
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+        "item/tool/requestUserInput",
+    ];
+
     fn map_response_error(error: NativeJsonRpcErrorBody) -> Result<Value> {
         Err(Error::new("native_rejected", error.message))
     }

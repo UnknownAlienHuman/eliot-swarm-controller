@@ -19,19 +19,22 @@ state; the installed stable and experimental schemas define this history-exclusi
 
 Native frame budget: the inbound NDJSON frame cap for the Muse host is 8 MiB
 (`MuseStdioConfig::MAX_FRAME_BYTES`; every other adapter keeps the shared 1 MiB
-default). The installed `muse-bin-1.4.0-R4161.1` schema (`muse schema
-generate-json-schema`) documents multi-megabyte single responses: `item/readOutput`
-serves up to 6 MiB stored bytes per page (~8 MiB base64 on the wire), and
-`view/page` serves up to 1000 events per response (Eliot requests `limit: 1000`).
+default). The cap covers `view/page` readback (Eliot requests `limit: 1000`)
+plus envelope overhead. What it does not cover: Eliot makes no `item/readOutput`
+calls today, so that surface (6 MiB of stored bytes per page, exactly 8 MiB of
+base64 before envelope overhead) does not size this cap; and the installed
+`muse-bin-1.4.0-R4161.1` schema (`muse schema generate-json-schema`) publishes no
+per-surface text budget, so the true `view/page` maximum is unverified.
 `session/resume` with `excludeItems=true` serves `history.mode: "none"` (no items),
 so the resume response itself stays small when the host honors the option, which
 Eliot verifies before proceeding. A frame over the cap ends the session with an
-explicit `source.gap` carrying a bounded, secret-free diagnosis (byte length, limit,
-envelope kind, token-filtered method); responses to Eliot's own calls are never
-skipped. Remaining uncertainty: the schema does not publish the server's per-surface
-text budget, so a single live item notification in a tool-heavy turn could in theory
-still exceed 8 MiB; if that is ever observed, the gap diagnosis will name its kind
-and method.
+explicit `source.gap` carrying a bounded, secret-free diagnosis (byte length with
+a `>=` lower-bound marker when the fault published at the threshold, limit,
+envelope kind, allowlisted method); responses to Eliot's own calls are never
+skipped. Remaining uncertainty: a single live item notification in a tool-heavy
+turn could in theory still exceed 8 MiB; if that is ever observed, the gap
+diagnosis will name its kind and, when the method is a known protocol method,
+its method.
 After an uncertain start/resume reply, Muse reports `native_endpoint_exited` only when
 its owned process exit, closed reader and completed reader task are all observed. The
 daemon keeps the command `unknown` and settles Agent loss only after owner cleanup.
