@@ -23,7 +23,10 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -84,6 +87,8 @@ struct State {
     progress: watch::Sender<u64>,
     monitoring: Monitoring,
     slots: Mutex<HashMap<Key, Arc<Slot>>>,
+    startup_gate: AsyncMutex<()>,
+    startup_closed: AtomicBool,
     #[cfg(test)]
     deferred_git_effect: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
@@ -127,6 +132,8 @@ impl WorkspaceManager {
                 progress,
                 monitoring,
                 slots: Mutex::new(HashMap::new()),
+                startup_gate: AsyncMutex::new(()),
+                startup_closed: AtomicBool::new(false),
                 #[cfg(test)]
                 deferred_git_effect: Mutex::new(None),
             }),
@@ -180,7 +187,7 @@ impl WorkspaceManager {
         let Some((_, preparation)) = self.start(command_id).await? else {
             return Ok(());
         };
-        let slot = self.slot(&preparation);
+        let slot = self.register_slot(&preparation).await?;
         let _operation = slot.operation.lock().await;
         let git = WorkspaceGit::new()?;
         loop {
@@ -445,7 +452,7 @@ impl WorkspaceManager {
             .await
             .get_workspace(agent)?
             .ok_or_else(|| problem("not_found", "managed workspace was not found"))?;
-        let slot = self.slot(&preparation);
+        let slot = self.register_slot(&preparation).await?;
         let _operation = slot.operation.lock().await;
         let outcome = match WorkspaceGit::new() {
             Ok(git) => {
@@ -533,6 +540,10 @@ impl WorkspaceManager {
             let mut deleted = false;
             for file in files {
                 let _gate = slot.gate.clone().lock_owned().await;
+                let _startup = self.inner.startup_gate.lock().await;
+                if self.inner.startup_closed.load(Ordering::SeqCst) {
+                    return removal_unknown("workspace_shutdown");
+                }
                 if self.require_removing(preparation, command).await.is_err() {
                     return removal_unknown("workspace_removal_marker_changed");
                 }
@@ -860,14 +871,25 @@ impl WorkspaceManager {
             .any(|slot| slot.active.lock_recover().is_some() || slot.operation.try_lock().is_err())
     }
 
+    pub(crate) fn close_startup_admission(&self) {
+        self.inner.startup_closed.store(true, Ordering::SeqCst);
+    }
+
     pub(crate) async fn stop_all(&self, force: bool) {
         if !force {
             // Drain rejects new starts in Router and waits for this manager's blockers.
             return;
         }
-        let Ok(preparations) = self.preparations().await else {
-            return;
+        self.close_startup_admission();
+        let slots: Vec<_> = {
+            // A spawn already inside this gate must register its cancellation
+            // owner before the snapshot. Later registrations/effects refuse.
+            let _startup = self.inner.startup_gate.lock().await;
+            self.inner.slots.lock_recover().values().cloned().collect()
         };
+        // In-memory custody cancellation must still run if Store cannot read or
+        // persist cancellation. Durable unsettled effects remain unknown.
+        let preparations = self.preparations().await.unwrap_or_default();
         for preparation in preparations {
             if preparation.phase == WorkspacePhase::Removing {
                 let slot = self.slot(&preparation);
@@ -933,9 +955,18 @@ impl WorkspaceManager {
             let _ = self.cancel(&id).await;
         }
         // Removal cancellation also waits for the owner, without replaying a signal.
-        let slots: Vec<_> = self.inner.slots.lock_recover().values().cloned().collect();
         for slot in slots {
-            let active = slot.active.lock_recover().clone();
+            // Healthy Store cancellation above commits its marker first. FORCE
+            // still owns cleanup if those reads/writes failed; the closed gate
+            // prevents any later child from escaping this cancellation owner.
+            let active = {
+                let _gate = slot.gate.clone().lock_owned().await;
+                let active = slot.active.lock_recover().clone();
+                if let Some(active) = &active {
+                    active.cancel.send_replace(true);
+                }
+                active
+            };
             if let Some(mut active) = active {
                 let deadline = Instant::now() + CANCEL_TIME;
                 while active.done.borrow().is_none() {
@@ -1030,6 +1061,14 @@ impl WorkspaceManager {
             })
             .or_default()
             .clone()
+    }
+
+    async fn register_slot(&self, preparation: &WorkspacePreparation) -> Result<Arc<Slot>> {
+        let _startup = self.inner.startup_gate.lock().await;
+        if self.inner.startup_closed.load(Ordering::SeqCst) {
+            return Err(problem("unavailable", "workspace startup is closed"));
+        }
+        Ok(self.slot(preparation))
     }
 
     fn publish(&self, events: &[eliot_core::Event]) {
@@ -1175,6 +1214,19 @@ impl WorkspaceManager {
         gate: OwnedMutexGuard<()>,
         context: WorkspaceProcessContext,
     ) -> RunResult {
+        // Pair the close flag with cleanup's gate, rather than checking once
+        // before an await. Hold through observation preparation and active
+        // registration so cleanup cannot miss an owned child.
+        let startup = self.inner.startup_gate.lock().await;
+        if self.inner.startup_closed.load(Ordering::SeqCst) {
+            let result = RunResult {
+                state: RunState::Interrupted,
+                quiescent: true,
+                code: "workspace_process_not_started",
+            };
+            *slot.last.lock_recover() = Some(result);
+            return result;
+        }
         // Commit observation ownership before spawning, without advancing the
         // Agent's native generation or granting any control authority.
         if self
@@ -1228,6 +1280,7 @@ impl WorkspaceManager {
             cancel,
             done: done_rx,
         });
+        drop(startup);
         drop(gate);
         let observation = match observer.as_ref() {
             Some(observer) => self
