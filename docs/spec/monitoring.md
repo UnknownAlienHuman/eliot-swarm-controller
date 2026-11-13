@@ -371,7 +371,7 @@ CREATE TABLE agent_edits (
 ```
 
 Only an authoritative, generation-matched native completed `fileChange` tool event can
-supply edit hints. Codex retains bounded path metadata, not patch contents; the daemon
+supply edit hints. Codex and Muse retain bounded path metadata, not patch contents; the daemon
 validates each hint against the admitted workspace's filesystem containment. Store
 verifies the exact native cause before publishing `file.changed` and upserting attribution.
 A current dirty-path intersection is not required: native writes reverted before polling

@@ -147,12 +147,20 @@ turn) stays unmapped, as do `agentMessage` (already `message.completed`),
 These committed facts advance liveness model progress like Codex tool events;
 CPU alone still never counts.
 
-The 1.4 item carries no inline workspace paths: edit-family `toolCall`
-revisions reference their diff through a stored `patchRef`/`patchSummary`
-whose body is fetched out of band (`item/readOutput`), never in the stream.
-The adapter therefore attaches no `changed_paths` to Muse `tool.completed`
-events, so native file-change hint attribution (`swarm edits`) still depends
-on the Git observer for Muse turns.
+A completed edit-family `toolCall` (`apply_patch`, `delete_file`,
+`edit_file`, `write_file` per the installed host's `DIRECT_MUTATORS` set)
+normalizes as the shared completed-file-change payload: `tool` `fileChange`
+with the verbatim native `status`, plus bounded `changed_paths` and
+`changed_paths_truncated` exactly as the Codex adapter emits for its
+`fileChange` items, bound to the exact session/turn while the turn runs. The
+paths come only from the item's inline `args` target (`path`); `args`
+itself, file contents, diffs and results are never persisted. Git
+observation alone cannot establish authorship: only this native hint
+attributes Muse edits. Limit: multi-file patch bodies stay behind the stored
+`patchRef`/`patchSummary` (fetched out of band via `item/readOutput`, which
+this adapter never calls), so a completed edit with no inline target commits
+empty `changed_paths` with `changed_paths_truncated` set, recording the
+coverage gap instead of presenting Git state as authorship.
 
 ## Host permissions
 
