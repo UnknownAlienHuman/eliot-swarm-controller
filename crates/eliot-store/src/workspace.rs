@@ -820,16 +820,27 @@ impl Store {
         Ok(false)
     }
 
-    pub fn list_workspace_preparations(
+    /// Runtime recovery/cleanup candidates only; settled workspace history stays
+    /// durable without allocating an operation slot in the daemon.
+    pub fn list_pending_workspace_preparations(
         &self,
         after_agent: Option<&str>,
         limit: usize,
     ) -> Result<Vec<WorkspacePreparation>> {
         validate_limit(limit)?;
         let after = after_agent.map(parse_agent_id).transpose()?.unwrap_or(0);
-        let mut statement = self.connection.prepare(&format!(
-            "SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE agent > ?1 ORDER BY agent LIMIT ?2"
-        )).map_err(sql_error)?;
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE agent > ?1
+             AND phase <> 'removed' AND (
+                 phase IN ('unknown', 'removing') OR EXISTS (
+                     SELECT 1 FROM commands c WHERE c.id = workspaces.start_command_id
+                     AND c.state IN ('accepted', 'queued', 'unknown')
+                 )
+             ) ORDER BY agent LIMIT ?2"
+            ))
+            .map_err(sql_error)?;
         let rows = statement
             .query_map(params![after, limit as i64], workspace_from_row)
             .map_err(sql_error)?;
