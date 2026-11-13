@@ -16,6 +16,22 @@ generation; callbacks carry that generation. Native children need exact provenan
 remain parent-attributed unless an isolated child environment can actually be installed.
 Resume requests `excludeItems=true` so it receives only session metadata and live resume
 state; the installed stable and experimental schemas define this history-exclusion option.
+
+Native frame budget: the inbound NDJSON frame cap for the Muse host is 8 MiB
+(`MuseStdioConfig::MAX_FRAME_BYTES`; every other adapter keeps the shared 1 MiB
+default). The installed `muse-bin-1.4.0-R4161.1` schema (`muse schema
+generate-json-schema`) documents multi-megabyte single responses: `item/readOutput`
+serves up to 6 MiB stored bytes per page (~8 MiB base64 on the wire), and
+`view/page` serves up to 1000 events per response (Eliot requests `limit: 1000`).
+`session/resume` with `excludeItems=true` serves `history.mode: "none"` (no items),
+so the resume response itself stays small when the host honors the option, which
+Eliot verifies before proceeding. A frame over the cap ends the session with an
+explicit `source.gap` carrying a bounded, secret-free diagnosis (byte length, limit,
+envelope kind, token-filtered method); responses to Eliot's own calls are never
+skipped. Remaining uncertainty: the schema does not publish the server's per-surface
+text budget, so a single live item notification in a tool-heavy turn could in theory
+still exceed 8 MiB; if that is ever observed, the gap diagnosis will name its kind
+and method.
 After an uncertain start/resume reply, Muse reports `native_endpoint_exited` only when
 its owned process exit, closed reader and completed reader task are all observed. The
 daemon keeps the command `unknown` and settles Agent loss only after owner cleanup.

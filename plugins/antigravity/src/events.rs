@@ -1085,7 +1085,7 @@ pub(crate) fn spawn(
                             state
                                 .lose(&format!(
                                     "Antigravity stream contained an invalid frame ({})",
-                                    fault.label()
+                                    fault.describe()
                                 ))
                                 .await;
                         }
@@ -1117,7 +1117,7 @@ pub(crate) fn spawn(
                             state
                                 .lose(&format!(
                                     "Antigravity stream contained an invalid frame ({})",
-                                    fault.label()
+                                    fault.describe()
                                 ))
                                 .await;
                         }

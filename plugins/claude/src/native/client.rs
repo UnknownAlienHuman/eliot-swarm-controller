@@ -20,8 +20,8 @@ use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
 use eliot_plugin::{
     StderrView,
     native_transport::{
-        NativeChild, NativeLabels, NativeLaunch, NativeWriter, PendingCalls, PumpAction, PumpMode,
-        StreamState, encode_frame, spawn_pumped,
+        DEFAULT_MAX_NATIVE_FRAME_BYTES, NativeChild, NativeLabels, NativeLaunch, NativeWriter,
+        PendingCalls, PumpAction, PumpMode, StreamState, encode_frame, spawn_pumped,
     },
 };
 
@@ -66,6 +66,7 @@ impl ClaudeProcess {
             LABELS,
             ID_PREFIX,
             PumpMode::LossyOverflow,
+            DEFAULT_MAX_NATIVE_FRAME_BYTES,
             classify_claude_frame,
         )
         .await?;

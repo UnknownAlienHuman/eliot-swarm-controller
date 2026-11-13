@@ -25,8 +25,8 @@ use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
 use eliot_plugin::{
     StderrView,
     native_transport::{
-        NativeChild, NativeLabels, NativeLaunch, NativeWriter, PendingCalls, PendingGuard,
-        PumpAction, PumpMode, encode_frame, spawn_pumped,
+        DEFAULT_MAX_NATIVE_FRAME_BYTES, NativeChild, NativeLabels, NativeLaunch, NativeWriter,
+        PendingCalls, PendingGuard, PumpAction, PumpMode, encode_frame, spawn_pumped,
     },
 };
 use serde::Serialize;
@@ -168,6 +168,7 @@ impl AgyProcess {
             LABELS,
             ID_PREFIX,
             PumpMode::LossyOverflow,
+            DEFAULT_MAX_NATIVE_FRAME_BYTES,
             move |value| classify_agy_frame(value, &fenced_classify),
         )
         .await?;

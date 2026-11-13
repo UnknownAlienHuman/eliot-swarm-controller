@@ -25,6 +25,8 @@ impl NativeStdioConfig for CodexStdioConfig {
     const SERVER: &'static str = "Codex app-server";
     const SHORT: &'static str = "Codex";
     const ID_PREFIX: &'static str = "codex";
+    // No evidence of larger Codex frames: keep the 1 MiB default.
+    const MAX_FRAME_BYTES: usize = eliot_plugin::native_transport::DEFAULT_MAX_NATIVE_FRAME_BYTES;
 
     fn map_response_error(error: NativeJsonRpcErrorBody) -> Result<Value> {
         Err(Error::new("native_rejected", error.message))

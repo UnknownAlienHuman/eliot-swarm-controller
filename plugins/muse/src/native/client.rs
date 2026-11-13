@@ -44,6 +44,12 @@ impl NativeStdioConfig for MuseStdioConfig {
     const SERVER: &'static str = "Muse session host";
     const SHORT: &'static str = "Muse";
     const ID_PREFIX: &'static str = "muse";
+    // MSP documents multi-megabyte single responses: `item/readOutput`
+    // serves up to 6 MiB stored bytes per page (~8 MiB base64 on the wire),
+    // and `view/page` serves up to 1000 events per response. 8 MiB covers
+    // the largest documented response plus envelope overhead; live item
+    // notifications beyond it stay an explicit oversized gap.
+    const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
     fn map_response_error(error: SharedErrorBody) -> Result<Value> {
         // Schema errors table: only pre-admission/validation errors prove the
