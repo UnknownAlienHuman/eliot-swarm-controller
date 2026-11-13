@@ -1102,6 +1102,15 @@ fn validate_project_rule_action_tx(
         super::projects::capture_project_command_binding_tx(tx, &command)?;
         return Ok(None);
     }
+    if matches!(request.verb.as_str(), "mail.send" | "var.set") {
+        if rule_project_id(principal)?.is_none() {
+            return Ok(None);
+        }
+        let payload_digest = [0_u8; 32];
+        let command = CommandInsert::targetless_admitted(principal, request, &payload_digest, 0);
+        super::projects::capture_project_command_binding_tx(tx, &command)?;
+        return Ok(None);
+    }
     if request.verb == "git.fetch" {
         let Some(project_id) = rule_project_id(principal)? else {
             return Ok(None);
@@ -1744,6 +1753,9 @@ fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
     if matches!(request.verb.as_str(), "notify" | "emit") {
         return valid_targetless_user_event_request(request);
     }
+    if matches!(request.verb.as_str(), "mail.send" | "var.set") {
+        return valid_targetless_coordination_request(request);
+    }
     let reply = matches!(request.verb.as_str(), "approve" | "deny" | "answer");
     if request.verb != "steer" && !reply {
         return valid_rule_action_request(request, true);
@@ -1791,6 +1803,17 @@ fn valid_targetless_rule_run_request(request: &SubmitCommand) -> bool {
 fn valid_targetless_user_event_request(request: &SubmitCommand) -> bool {
     request.validate().is_ok()
         && matches!(request.verb.as_str(), "notify" | "emit")
+        && request.target.is_none()
+        && request.expected_generation.is_none()
+        && request.expected_turn_id.is_none()
+        && request.request_id.is_none()
+        && !request.probe
+        && request.args.is_object()
+}
+
+fn valid_targetless_coordination_request(request: &SubmitCommand) -> bool {
+    request.validate().is_ok()
+        && matches!(request.verb.as_str(), "mail.send" | "var.set")
         && request.target.is_none()
         && request.expected_generation.is_none()
         && request.expected_turn_id.is_none()
@@ -2538,7 +2561,7 @@ fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand)
     }
     if matches!(
         request.verb.as_str(),
-        "launch" | "git.fetch" | "notify" | "emit"
+        "launch" | "git.fetch" | "notify" | "emit" | "mail.send" | "var.set"
     ) {
         return None;
     }

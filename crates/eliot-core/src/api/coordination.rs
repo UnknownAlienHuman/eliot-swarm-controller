@@ -145,6 +145,52 @@ impl MailSendRequest {
     }
 }
 
+/// Literal rule definition for one scoped `mail.send` rule action.
+///
+/// Rule execution always queues (`MailMode::Queue`); the definition carries
+/// no mode field. Field-for-field it mirrors `MailSendRequest` without the
+/// public write id: the Store derives the child command id deterministically
+/// and never reuses the public write-id namespace.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailDefinitionArgs {
+    pub to: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_delivery: Option<String>,
+    pub text: String,
+}
+
+impl MailDefinitionArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.to.is_empty() || self.to.len() > MAX_MAIL_RECIPIENTS {
+            return Err(Error::new(
+                "invalid",
+                "mail recipients require 1 to 100 Agent ids",
+            ));
+        }
+        let mut seen = HashSet::new();
+        for recipient in &self.to {
+            parse_agent_id(recipient)?;
+            if !seen.insert(recipient) {
+                return Err(Error::new(
+                    "invalid",
+                    "mail recipients must not repeat an Agent",
+                ));
+            }
+        }
+        validate_mail_text(&self.text)?;
+        if let Some(thread) = self.thread.as_deref() {
+            validate_mail_thread(thread)?;
+        }
+        if let Some(reply) = self.reply_to_delivery.as_deref() {
+            validate_delivery_id(reply)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailDeliverySummary {
@@ -497,6 +543,45 @@ impl VarSetRequest {
             return Err(unproven());
         }
         parse_var_scope(&response.scope).map_err(|_| unproven())?;
+        Ok(())
+    }
+}
+
+/// Literal rule definition for one versioned `var.set` rule action.
+///
+/// Mirrors `VarSetRequest` without the public write id. Scope defaults are
+/// resolved under the saved originating principal at admission and again at
+/// execution: an omitted scope means the principal's own project, `global`
+/// stays Owner-only, and any other project scope is rejected.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VarDefinitionArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    pub key: String,
+    pub value: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl VarDefinitionArgs {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(scope) = self.scope.as_deref() {
+            parse_var_scope(scope)?;
+        }
+        validate_var_key(&self.key)?;
+        validate_var_value(&self.value)?;
+        if self.expect_version.is_some_and(|version| version < 0) {
+            return Err(Error::new(
+                "invalid",
+                "expected variable version must be zero or positive",
+            ));
+        }
+        if let Some(note) = self.note.as_deref() {
+            validate_var_note(note)?;
+        }
         Ok(())
     }
 }

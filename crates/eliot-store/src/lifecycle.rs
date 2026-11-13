@@ -249,6 +249,255 @@ impl Store {
         self.fault_on_persistence_error(&result);
         result
     }
+
+    /// Commit one rule `mail.send` child together with its Applied settlement
+    /// in a single transaction: validate the Dispatched child and its frozen
+    /// definition, perform the queued-mail effect, record Applied with the
+    /// delivery readback and the normal `command.applied` fact. Returns the
+    /// settled command with the committed batch for in-order publication while
+    /// still serialized with the writer. An already Applied child returns its
+    /// recorded result without a new delivery; any other non-Dispatched state
+    /// (including legacy Unknown rows) is rejected and left untouched. Never
+    /// touches the public write-id namespace: deliveries are prefixed with
+    /// the child command id and deduplicated by the child's own Applied state.
+    pub fn commit_mail_send_applied(
+        &mut self,
+        command_id: &str,
+        limits: core::api::MailLimits,
+        now: i64,
+    ) -> Result<Change<Command>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let record = load_command_record(&tx, command_id)?
+                .ok_or_else(|| Error::new("not_found", "mail command was not found"))?;
+            if record.command.verb != "mail.send" {
+                return Err(Error::new("invalid", "not a rule mail command"));
+            }
+            if record.target.is_some() || record.command.generation.is_some() {
+                return Err(Error::new("invalid", "mail command must be targetless"));
+            }
+            let definition = serde_json::from_value::<core::api::MailDefinitionArgs>(
+                record.command.args.clone(),
+            )
+            .map_err(|_| Error::new("invalid", "mail definition is malformed"))?;
+            definition.validate()?;
+            // Freeze recipient/project scope under the saved originating
+            // principal inside this transaction.
+            Self::validate_rule_mail_definition_tx(&tx, &record.command.principal, &definition)?;
+            if record.state == CommandState::Applied {
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(Change {
+                    value: record.command,
+                    events: Vec::new(),
+                });
+            }
+            if record.state != CommandState::Dispatched {
+                return Err(Error::new("bad_state", "mail command is not dispatched"));
+            }
+            let sender = super::coordination::Sender::Owner;
+            let response =
+                Self::mail_effect_tx(&tx, &sender, &definition, limits, command_id, now)?;
+            if response.deliveries.len() != definition.to.len() {
+                return Err(Error::new("internal", "mail effect did not fan out"));
+            }
+            let outcome = json!({"deliveries": response.deliveries});
+            validate_settle_outcome(CommandState::Applied, &Some(outcome.clone()))?;
+            check_settle_verb_guards(
+                &tx,
+                &record,
+                CommandState::Applied,
+                &Some(outcome.clone()),
+                command_id,
+            )?;
+            if !core::command_transition_allowed(record.state, CommandState::Applied) {
+                return Err(Error::new(
+                    "bad_state",
+                    "command state transition is not allowed for ordinary settlement",
+                ));
+            }
+            let target = record.target;
+            let generation = record.command.generation;
+            update_command_state(
+                &tx,
+                command_id,
+                CommandState::Applied,
+                Some(&outcome),
+                None,
+                now,
+            )?;
+            let mut events = Vec::new();
+            events.push(insert_daemon_command_event(
+                &tx,
+                now,
+                "command.applied",
+                target,
+                generation,
+                command_id,
+                json!({"command_id": command_id, "state": "applied", "outcome": outcome}),
+            )?);
+            release_settle_capacity(
+                &tx,
+                &record,
+                CommandState::Applied,
+                command_id,
+                false,
+                now,
+                &mut events,
+            )?;
+            apply_settle_agent_transition(
+                &tx,
+                &record,
+                CommandState::Applied,
+                command_id,
+                false,
+                now,
+                &mut events,
+            )?;
+            let record = load_command_record(&tx, command_id)?
+                .ok_or_else(|| Error::new("internal", "settled command disappeared"))?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(Change {
+                value: record.command,
+                events,
+            })
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    /// Commit one rule `var.set` child together with its Applied settlement
+    /// in a single transaction: validate the Dispatched child and its frozen
+    /// definition, perform the versioned variable effect with
+    /// compare-and-swap semantics, record Applied with the write readback and
+    /// the normal `command.applied` fact. Returns the settled command with
+    /// the committed batch (`var.changed` first) for in-order publication
+    /// while still serialized with the writer. An already Applied child
+    /// returns its recorded result without a new write; any other
+    /// non-Dispatched state is rejected and left untouched.
+    pub fn commit_var_set_applied(
+        &mut self,
+        command_id: &str,
+        now: i64,
+    ) -> Result<Change<Command>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let record = load_command_record(&tx, command_id)?
+                .ok_or_else(|| Error::new("not_found", "variable command was not found"))?;
+            if record.command.verb != "var.set" {
+                return Err(Error::new("invalid", "not a rule variable command"));
+            }
+            if record.target.is_some() || record.command.generation.is_some() {
+                return Err(Error::new("invalid", "variable command must be targetless"));
+            }
+            let definition =
+                serde_json::from_value::<core::api::VarDefinitionArgs>(record.command.args.clone())
+                    .map_err(|_| Error::new("invalid", "variable definition is malformed"))?;
+            definition.validate()?;
+            let encoded_scope = Self::resolve_rule_var_scope(
+                &record.command.principal,
+                definition.scope.as_deref(),
+            )?;
+            if record.state == CommandState::Applied {
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(Change {
+                    value: record.command,
+                    events: Vec::new(),
+                });
+            }
+            if record.state != CommandState::Dispatched {
+                return Err(Error::new(
+                    "bad_state",
+                    "variable command is not dispatched",
+                ));
+            }
+            let encoded_value = encode_json(&definition.value)?;
+            if encoded_value.len() > core::api::MAX_VAR_VALUE_BYTES {
+                return Err(Error::new(
+                    "invalid",
+                    "variable value exceeds the 16 KiB bound",
+                ));
+            }
+            let (response, event) = Self::var_effect_tx(
+                &tx,
+                &record.command.principal,
+                &encoded_scope,
+                &definition,
+                &encoded_value,
+                now,
+            )?;
+            let outcome = serde_json::to_value(&response)
+                .map_err(|_| Error::new("internal", "variable outcome cannot be encoded"))?;
+            validate_settle_outcome(CommandState::Applied, &Some(outcome.clone()))?;
+            check_settle_verb_guards(
+                &tx,
+                &record,
+                CommandState::Applied,
+                &Some(outcome.clone()),
+                command_id,
+            )?;
+            if !core::command_transition_allowed(record.state, CommandState::Applied) {
+                return Err(Error::new(
+                    "bad_state",
+                    "command state transition is not allowed for ordinary settlement",
+                ));
+            }
+            let target = record.target;
+            let generation = record.command.generation;
+            let mut events = vec![event];
+            update_command_state(
+                &tx,
+                command_id,
+                CommandState::Applied,
+                Some(&outcome),
+                None,
+                now,
+            )?;
+            events.push(insert_daemon_command_event(
+                &tx,
+                now,
+                "command.applied",
+                target,
+                generation,
+                command_id,
+                json!({"command_id": command_id, "state": "applied", "outcome": outcome}),
+            )?);
+            release_settle_capacity(
+                &tx,
+                &record,
+                CommandState::Applied,
+                command_id,
+                false,
+                now,
+                &mut events,
+            )?;
+            apply_settle_agent_transition(
+                &tx,
+                &record,
+                CommandState::Applied,
+                command_id,
+                false,
+                now,
+                &mut events,
+            )?;
+            let record = load_command_record(&tx, command_id)?
+                .ok_or_else(|| Error::new("internal", "settled command disappeared"))?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(Change {
+                value: record.command,
+                events,
+            })
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
 }
 
 fn validate_settle_outcome(state: CommandState, outcome: &Option<Value>) -> Result<()> {

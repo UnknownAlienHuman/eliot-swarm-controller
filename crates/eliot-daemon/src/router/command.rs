@@ -460,6 +460,14 @@ impl Router {
                             "force shutdown prevents local event dispatch",
                         ))
                     }
+                    None if matches!(command.verb.as_str(), "mail.send" | "var.set")
+                        && self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE =>
+                    {
+                        Err(Error::new(
+                            "bad_state",
+                            "force shutdown prevents coordination dispatch",
+                        ))
+                    }
                     None if command.verb == "send" => {
                         store.dispatch_with_context(id, now_ms()).map(|change| {
                             (
@@ -600,6 +608,14 @@ impl Router {
         }
         if matches!(dispatched.verb.as_str(), "notify" | "emit") {
             self.execute_user_event_command(&id, dispatched).await;
+            return;
+        }
+        if dispatched.verb == "mail.send" {
+            self.execute_mail_send_command(&id, dispatched).await;
+            return;
+        }
+        if dispatched.verb == "var.set" {
+            self.execute_var_set_command(&id, dispatched).await;
             return;
         }
         let target = match dispatched.target.as_deref() {
@@ -763,6 +779,144 @@ impl Router {
             .await;
         }
         self.signal_progress();
+    }
+
+    /// Execute a dispatched rule `mail.send`: commit the frozen queued-mail
+    /// effect together with its Applied settlement in a single Store
+    /// transaction, publishing the committed batch in order while still
+    /// serialized with the writer, then fan out mailbox wakes only after
+    /// commit through the existing coordination wake path.
+    async fn execute_mail_send_command(&self, id: &str, dispatched: Command) {
+        if let Err(error) = self.validate_coordination_command(&dispatched) {
+            self.settle(
+                id,
+                CommandState::Rejected,
+                Some(json!({"code": error.code})),
+            )
+            .await;
+            self.signal_progress();
+            return;
+        }
+        let limits = self.inner.mail.limits();
+        let committed = {
+            let mut store = self.inner.store.lock().await;
+            let result = store.commit_mail_send_applied(id, limits, now_ms());
+            if let Ok(change) = &result
+                && !change.events.is_empty()
+            {
+                self.publish_locked(&change.events);
+            }
+            result
+        };
+        match committed {
+            Ok(change) if !change.events.is_empty() => {
+                self.wake_mail_recipients(&change.value).await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                self.settle(
+                    id,
+                    CommandState::Unknown,
+                    Some(json!({"code": error.code, "cause": "mail_commit_failed"})),
+                )
+                .await;
+            }
+        }
+        self.signal_progress();
+    }
+
+    /// Execute a dispatched rule `var.set`: commit the frozen versioned
+    /// variable effect together with its Applied settlement in a single Store
+    /// transaction, publishing the committed batch (`var.changed` first) in
+    /// order while still serialized with the writer.
+    async fn execute_var_set_command(&self, id: &str, dispatched: Command) {
+        if let Err(error) = self.validate_coordination_command(&dispatched) {
+            self.settle(
+                id,
+                CommandState::Rejected,
+                Some(json!({"code": error.code})),
+            )
+            .await;
+            self.signal_progress();
+            return;
+        }
+        let committed = {
+            let mut store = self.inner.store.lock().await;
+            let result = store.commit_var_set_applied(id, now_ms());
+            if let Ok(change) = &result
+                && !change.events.is_empty()
+            {
+                self.publish_locked(&change.events);
+            }
+            result
+        };
+        if let Err(error) = committed {
+            self.settle(
+                id,
+                CommandState::Unknown,
+                Some(json!({"code": error.code, "cause": "var_commit_failed"})),
+            )
+            .await;
+        }
+        self.signal_progress();
+    }
+
+    fn validate_coordination_command(&self, dispatched: &Command) -> Result<()> {
+        if dispatched.target.is_some() || dispatched.generation.is_some() {
+            return Err(Error::new(
+                "invalid",
+                "coordination command must be targetless",
+            ));
+        }
+        match dispatched.verb.as_str() {
+            "mail.send" => serde_json::from_value::<eliot_core::api::MailDefinitionArgs>(
+                dispatched.args.clone(),
+            )
+            .map_err(|_| Error::new("invalid", "mail.send definition is malformed"))?
+            .validate(),
+            "var.set" => serde_json::from_value::<eliot_core::api::VarDefinitionArgs>(
+                dispatched.args.clone(),
+            )
+            .map_err(|_| Error::new("invalid", "var.set definition is malformed"))?
+            .validate(),
+            _ => Err(Error::new("invalid", "not a coordination command")),
+        }
+    }
+
+    async fn wake_mail_recipients(&self, settled: &Command) {
+        let recipients: Vec<String> = settled
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.get("deliveries"))
+            .and_then(|deliveries| deliveries.as_array())
+            .map(|deliveries| {
+                deliveries
+                    .iter()
+                    .filter_map(|delivery| {
+                        delivery
+                            .get("recipient")
+                            .and_then(|recipient| recipient.as_str())
+                            .map(str::to_owned)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if recipients.is_empty() {
+            if let Ok(definition) =
+                serde_json::from_value::<eliot_core::api::MailDefinitionArgs>(settled.args.clone())
+                && definition.validate().is_ok()
+            {
+                for recipient in &definition.to {
+                    self.offer_notice(recipient, eliot_store::NoticePending::Mail)
+                        .await;
+                }
+            }
+            return;
+        }
+        for recipient in &recipients {
+            self.offer_notice(recipient, eliot_store::NoticePending::Mail)
+                .await;
+        }
     }
 
     /// Attach an observer through the owned plugin and settle the validated

@@ -20,10 +20,10 @@ use super::{
 use eliot_core::{
     Agent, AgentState, CommandState,
     api::{
-        MAIL_NOTICE_COOLDOWN_MS, MailAckRequest, MailAckResponse, MailDelivery,
+        MAIL_NOTICE_COOLDOWN_MS, MailAckRequest, MailAckResponse, MailDefinitionArgs, MailDelivery,
         MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailLimits, MailMode,
-        MailReadRequest, MailSendRequest, MailSendResponse, VarGetRequest, VarGetResponse,
-        VarScope, VarSetRequest, VarSetResponse, parse_var_scope,
+        MailReadRequest, MailSendRequest, MailSendResponse, VarDefinitionArgs, VarGetRequest,
+        VarGetResponse, VarScope, VarSetRequest, VarSetResponse, parse_var_scope,
     },
     parse_agent_id,
 };
@@ -759,6 +759,10 @@ impl Store {
         }
         let sender = &prepared.sender;
         let payload_digest = &prepared.payload_digest;
+        // Public-write guards (command-namespace conflict, retained binding,
+        // write-id age) stay here. The row effect below is shared with the
+        // rule-child commit path, which never touches the public write-id
+        // namespace.
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -789,95 +793,13 @@ impl Store {
         }
         validate_id_age(&request.id, now)?;
 
-        // Snapshot every recipient once, in this transaction: unknown ids
-        // never create Agents, and bounds are checked for all before any
-        // row is written, so there is no partial fanout.
-        let mut recipients = Vec::with_capacity(request.to.len());
-        for recipient in &request.to {
-            let num = parse_agent_id(recipient)?;
-            let agent = load_agent_by_num(&tx, num)?.ok_or_else(|| {
-                Error::new("not_found", format!("Agent {recipient} was not found"))
-            })?;
-            recipients.push(agent);
-        }
-        if let Some(reply) = request.reply_to_delivery.as_deref() {
-            Self::check_reply_participants_tx(&tx, reply, sender, &recipients, now)?;
-        }
-        let addition = i64::try_from(request.text.len()).unwrap_or(i64::MAX);
-        for agent in &recipients {
-            let num = parse_agent_id(&agent.id)?;
-            let unread: i64 = tx
-                .query_row(
-                    "SELECT COUNT(*) FROM messages WHERE recipient = ?1 AND read_at IS NULL",
-                    params![num],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error)?;
-            if unread >= limits.max_unread_messages_per_agent {
-                return Err(Error::new(
-                    "mailbox_full",
-                    format!("mailbox {} has no unread room", agent.id),
-                ));
-            }
-            let bytes: i64 = tx
-                .query_row(
-                    "SELECT COALESCE(SUM(LENGTH(CAST(text AS BLOB))), 0) FROM messages
-                     WHERE recipient = ?1 AND read_at IS NULL",
-                    params![num],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error)?;
-            if bytes.saturating_add(addition) > limits.max_unread_bytes_per_agent {
-                return Err(Error::new(
-                    "mailbox_full",
-                    format!("mailbox {} has no unread room", agent.id),
-                ));
-            }
-        }
-
-        let (sender_name, sender_generation) = match sender {
-            Sender::Owner => ("owner".to_owned(), None),
-            Sender::Agent { id, generation, .. } => (id.clone(), Some(*generation)),
+        let definition = MailDefinitionArgs {
+            to: request.to.clone(),
+            text: request.text.clone(),
+            thread: request.thread.clone(),
+            reply_to_delivery: request.reply_to_delivery.clone(),
         };
-        let mut deliveries = Vec::with_capacity(recipients.len());
-        for agent in &recipients {
-            let num = parse_agent_id(&agent.id)?;
-            let delivery_id = format!("{}/{}", request.id, agent.id);
-            let content_digest = canonical::digest(&json!({
-                "sender": sender_name,
-                "sender_generation": sender_generation,
-                "recipient": agent.id,
-                "mode": request.mode.as_str(),
-                "text": request.text,
-                "thread": request.thread,
-                "reply_to_delivery": request.reply_to_delivery,
-            }))?;
-            db!(tx.execute(
-                "INSERT INTO messages(delivery_id, sender, sender_generation, recipient,
-                                      recipient_generation, thread, reply_to_delivery, mode, text,
-                                      content_digest, admitted_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    delivery_id,
-                    sender_name,
-                    sender_generation,
-                    num,
-                    agent.generation,
-                    request.thread,
-                    request.reply_to_delivery,
-                    request.mode.as_str(),
-                    request.text,
-                    content_digest,
-                    now
-                ],
-            ));
-            deliveries.push(MailDeliverySummary {
-                delivery_id,
-                recipient: agent.id.clone(),
-                recipient_generation: agent.generation,
-            });
-        }
-        let value = MailSendResponse { deliveries };
+        let value = Self::mail_effect_tx(&tx, sender, &definition, limits, &request.id, now)?;
         request.validate_response(&value)?;
         retain_write_tx(
             &tx,
@@ -1073,10 +995,164 @@ impl Store {
         }
         validate_id_age(&request.id, now)?;
 
+        let definition = VarDefinitionArgs {
+            scope: request.scope.clone(),
+            key: request.key.clone(),
+            value: request.value.clone(),
+            expect_version: request.expect_version,
+            note: request.note.clone(),
+        };
+        let (value, event) = Self::var_effect_tx(
+            &tx,
+            principal,
+            encoded_scope,
+            &definition,
+            encoded_value,
+            now,
+        )?;
+        request.validate_response(&value)?;
+        retain_write_tx(
+            &tx,
+            &request.id,
+            principal,
+            VAR_SET_METHOD,
+            payload_digest,
+            &serde_json::to_value(&value)
+                .map_err(|error| Error::new("internal", error.to_string()))?,
+            now,
+        )?;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(Change {
+            value,
+            events: vec![event],
+        })
+    }
+
+    /// Shared queued-mail row effect on the caller's transaction. No
+    /// command/write-id checks, no retained binding, no id-age gate: the
+    /// public path enforces those before calling, and the rule-child commit
+    /// path never enters the public write-id namespace. Recipient rows are
+    /// snapshotted once with all mailbox bounds checked before any write, so
+    /// an overfull mailbox rejects without a partial fanout.
+    pub(super) fn mail_effect_tx(
+        tx: &Transaction<'_>,
+        sender: &Sender,
+        definition: &MailDefinitionArgs,
+        limits: MailLimits,
+        delivery_prefix: &str,
+        now: i64,
+    ) -> Result<MailSendResponse> {
+        limits.validate()?;
+        let to = &definition.to;
+        let text = &definition.text;
+        let thread = definition.thread.as_deref();
+        let reply_to_delivery = definition.reply_to_delivery.as_deref();
+        let mut recipients = Vec::with_capacity(to.len());
+        for recipient in to {
+            let num = parse_agent_id(recipient)?;
+            let agent = load_agent_by_num(tx, num)?.ok_or_else(|| {
+                Error::new("not_found", format!("Agent {recipient} was not found"))
+            })?;
+            recipients.push(agent);
+        }
+        if let Some(reply) = reply_to_delivery {
+            Self::check_reply_participants_tx(tx, reply, sender, &recipients, now)?;
+        }
+        let addition = i64::try_from(text.len()).unwrap_or(i64::MAX);
+        for agent in &recipients {
+            let num = parse_agent_id(&agent.id)?;
+            let unread: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE recipient = ?1 AND read_at IS NULL",
+                    params![num],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if unread >= limits.max_unread_messages_per_agent {
+                return Err(Error::new(
+                    "mailbox_full",
+                    format!("mailbox {} has no unread room", agent.id),
+                ));
+            }
+            let bytes: i64 = tx
+                .query_row(
+                    "SELECT COALESCE(SUM(LENGTH(CAST(text AS BLOB))), 0) FROM messages
+                     WHERE recipient = ?1 AND read_at IS NULL",
+                    params![num],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if bytes.saturating_add(addition) > limits.max_unread_bytes_per_agent {
+                return Err(Error::new(
+                    "mailbox_full",
+                    format!("mailbox {} has no unread room", agent.id),
+                ));
+            }
+        }
+        let (sender_name, sender_generation) = match sender {
+            Sender::Owner => ("owner".to_owned(), None),
+            Sender::Agent { id, generation, .. } => (id.clone(), Some(*generation)),
+        };
+        let mut deliveries = Vec::with_capacity(recipients.len());
+        for agent in &recipients {
+            let num = parse_agent_id(&agent.id)?;
+            let delivery_id = format!("{delivery_prefix}/{}", agent.id);
+            let content_digest = canonical::digest(&json!({
+                "sender": sender_name,
+                "sender_generation": sender_generation,
+                "recipient": agent.id,
+                "mode": MailMode::Queue.as_str(),
+                "text": text,
+                "thread": thread,
+                "reply_to_delivery": reply_to_delivery,
+            }))?;
+            db!(tx.execute(
+                "INSERT INTO messages(delivery_id, sender, sender_generation, recipient,
+                                      recipient_generation, thread, reply_to_delivery, mode, text,
+                                      content_digest, admitted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    delivery_id,
+                    sender_name,
+                    sender_generation,
+                    num,
+                    agent.generation,
+                    thread,
+                    reply_to_delivery,
+                    MailMode::Queue.as_str(),
+                    text,
+                    content_digest,
+                    now
+                ],
+            ));
+            deliveries.push(MailDeliverySummary {
+                delivery_id,
+                recipient: agent.id.clone(),
+                recipient_generation: agent.generation,
+            });
+        }
+        Ok(MailSendResponse { deliveries })
+    }
+
+    /// Shared versioned-variable row effect on the caller's transaction.
+    /// Compare-and-swap on an incrementing version; an absent row reads as
+    /// version 0. No command/write-id checks: the public path enforces those
+    /// before calling.
+    pub(super) fn var_effect_tx(
+        tx: &Transaction<'_>,
+        principal: &str,
+        encoded_scope: &str,
+        definition: &VarDefinitionArgs,
+        encoded_value: &str,
+        now: i64,
+    ) -> Result<(VarSetResponse, super::Event)> {
+        let key = &definition.key;
+        let expect_version = definition.expect_version;
+        let note = definition.note.as_deref();
         let current: Option<(String, i64)> = tx
             .query_row(
                 "SELECT value, version FROM vars WHERE scope = ?1 AND key = ?2",
-                params![encoded_scope, request.key],
+                params![encoded_scope, key],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
@@ -1085,10 +1161,7 @@ impl Store {
             Some((value, version)) => (Some(value), version),
             None => (None, 0),
         };
-        if request
-            .expect_version
-            .is_some_and(|expected| expected != current)
-        {
+        if expect_version.is_some_and(|expected| expected != current) {
             let mut message = format!(
                 "variable version does not match the expectation (current version: {current}"
             );
@@ -1110,16 +1183,16 @@ impl Store {
                  set_by = excluded.set_by, note = excluded.note, set_at = excluded.set_at",
             params![
                 encoded_scope,
-                request.key,
+                key,
                 encoded_value,
                 version,
                 principal,
-                request.note,
+                note,
                 now
             ],
         ));
         let event = insert_daemon_event(
-            &tx,
+            tx,
             now,
             "var.changed",
             "coordination",
@@ -1127,33 +1200,128 @@ impl Store {
             None,
             json!({
                 "scope": encoded_scope,
-                "key": request.key,
+                "key": key,
                 "version": version,
                 "set_by": principal,
             }),
         )?;
-        let value = VarSetResponse {
-            scope: encoded_scope.clone(),
-            key: request.key.clone(),
+        let response = VarSetResponse {
+            scope: encoded_scope.to_owned(),
+            key: key.to_owned(),
             version,
             set_by: principal.to_owned(),
         };
-        request.validate_response(&value)?;
-        retain_write_tx(
-            &tx,
-            &request.id,
-            principal,
-            VAR_SET_METHOD,
-            payload_digest,
-            &serde_json::to_value(&value)
-                .map_err(|error| Error::new("internal", error.to_string()))?,
-            now,
-        )?;
-        commit_transaction(tx, &self.write_faulted)?;
-        Ok(Change {
-            value,
-            events: vec![event],
-        })
+        Ok((response, event))
+    }
+
+    /// Resolve the variable scope for a rule child under its saved
+    /// originating principal. Owner names its scope explicitly; a project
+    /// principal defaults to its own project and can write only there.
+    pub(super) fn resolve_rule_var_scope(principal: &str, scope: Option<&str>) -> Result<String> {
+        if principal == "owner" {
+            let Some(scope) = scope else {
+                return Err(Error::new(
+                    "invalid",
+                    "owner variable access must name the scope explicitly",
+                ));
+            };
+            return Ok(parse_var_scope(scope)?.encoded());
+        }
+        let Some(project) = principal.strip_prefix("project:") else {
+            return Err(Error::new(
+                "not_allowed",
+                "coordination needs the owner or a project rule principal",
+            ));
+        };
+        if project.is_empty() || project.contains(':') {
+            return Err(Error::new(
+                "not_allowed",
+                "project rule principal is not authorized",
+            ));
+        }
+        let expected = format!("project:{project}");
+        match scope {
+            None => Ok(expected),
+            Some(scope) => {
+                let resolved = parse_var_scope(scope)?;
+                if resolved.encoded() != expected {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "project rules write only their own project variables",
+                    ));
+                }
+                Ok(expected)
+            }
+        }
+    }
+
+    /// Load and authorize mail recipients for a rule child under its saved
+    /// originating principal. Owner reaches any existing Agent; a project
+    /// principal reaches only Agents in its own project. Generations are
+    /// snapshotted later inside the effect transaction.
+    pub(super) fn load_rule_mail_recipients_tx(
+        tx: &Transaction<'_>,
+        principal: &str,
+        to: &[String],
+    ) -> Result<Vec<Agent>> {
+        let project = if principal == "owner" {
+            None
+        } else if let Some(project) = principal.strip_prefix("project:") {
+            if project.is_empty() || project.contains(':') {
+                return Err(Error::new(
+                    "not_allowed",
+                    "project rule principal is not authorized",
+                ));
+            }
+            Some(project)
+        } else {
+            return Err(Error::new(
+                "not_allowed",
+                "coordination needs the owner or a project rule principal",
+            ));
+        };
+        let mut recipients = Vec::with_capacity(to.len());
+        for recipient in to {
+            let num = parse_agent_id(recipient)?;
+            let agent = load_agent_by_num(tx, num)?.ok_or_else(|| {
+                Error::new("not_found", format!("Agent {recipient} was not found"))
+            })?;
+            if let Some(project) = project
+                && agent.project != project
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "project rules send mail only within their own project",
+                ));
+            }
+            recipients.push(agent);
+        }
+        Ok(recipients)
+    }
+
+    /// Validate one rule `mail.send` definition literally (no templates) and
+    /// freeze its recipient scope under the saved originating principal. Runs
+    /// inside the admission transaction so the check and the parent/child
+    /// insert commit atomically.
+    pub(super) fn validate_rule_mail_definition_tx(
+        tx: &Transaction<'_>,
+        principal: &str,
+        definition: &MailDefinitionArgs,
+    ) -> Result<()> {
+        definition.validate()?;
+        Self::load_rule_mail_recipients_tx(tx, principal, &definition.to)?;
+        Ok(())
+    }
+
+    /// Validate one rule `var.set` definition literally and freeze its scope
+    /// under the saved originating principal. Runs inside the admission
+    /// transaction.
+    pub(super) fn validate_rule_var_definition_tx(
+        principal: &str,
+        definition: &VarDefinitionArgs,
+    ) -> Result<String> {
+        definition.validate()?;
+        Self::resolve_rule_var_scope(principal, definition.scope.as_deref())
     }
 
     fn notice_claim_inner(
@@ -2741,6 +2909,63 @@ mod tests {
                 .unwrap_err()
                 .code,
             "not_found"
+        );
+    }
+
+    #[test]
+    fn rule_coordination_scope_freezes_under_saved_principal() {
+        // Owner var scope must be explicit; a project principal defaults to
+        // its own project and cannot reach global or foreign scopes.
+        assert_eq!(
+            Store::resolve_rule_var_scope("owner", None)
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
+        assert_eq!(
+            Store::resolve_rule_var_scope("project:app", None).unwrap(),
+            "project:app"
+        );
+        assert_eq!(
+            Store::resolve_rule_var_scope("project:app", Some("global"))
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        assert_eq!(
+            Store::resolve_rule_var_scope("project:app", Some("project:other"))
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+
+        // Rule DTOs mirror the public write validation without the write id.
+        let mail = MailDefinitionArgs {
+            to: vec!["a7".to_owned()],
+            text: "done".to_owned(),
+            thread: None,
+            reply_to_delivery: None,
+        };
+        mail.validate().expect("mail definition validates");
+        let bad_mail = MailDefinitionArgs {
+            to: vec![],
+            text: "done".to_owned(),
+            thread: None,
+            reply_to_delivery: None,
+        };
+        assert_eq!(bad_mail.validate().unwrap_err().code, "invalid");
+
+        let var = VarDefinitionArgs {
+            scope: Some("project:app".to_owned()),
+            key: "k".to_owned(),
+            value: json!("v"),
+            expect_version: None,
+            note: None,
+        };
+        var.validate().expect("var definition validates");
+        assert_eq!(
+            Store::resolve_rule_var_scope("project:app", var.scope.as_deref()).unwrap(),
+            "project:app"
         );
     }
 

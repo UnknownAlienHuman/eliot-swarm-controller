@@ -37,11 +37,11 @@ pub use coordination::{
     MAX_CLAIMS_PER_AGENT, MAX_MAIL_ACK_IDS, MAX_MAIL_INBOX_ROWS, MAX_MAIL_RECIPIENTS,
     MAX_MAIL_TEXT_BYTES, MAX_MAIL_THREAD_BYTES, MAX_VAR_KEY_BYTES, MAX_VAR_NOTE_BYTES,
     MAX_VAR_SCOPE_BYTES, MAX_VAR_VALUE_BYTES, MAX_WHO_PATHS, MAX_WHO_WORKERS, MailAckRequest,
-    MailAckResponse, MailDelivery, MailDeliverySummary, MailInboxRequest, MailInboxResponse,
-    MailLimits, MailMode, MailReadRequest, MailSendRequest, MailSendResponse, VarGetRequest,
-    VarGetResponse, VarScope, VarSetRequest, VarSetResponse, WhoRequest, WhoResponse,
-    WhoSharedWorkspace, WhoWorker, claim_glob_matches, claim_globs_overlap,
-    claim_globs_overlap_normalized, normalize_claim_glob, parse_var_scope,
+    MailAckResponse, MailDefinitionArgs, MailDelivery, MailDeliverySummary, MailInboxRequest,
+    MailInboxResponse, MailLimits, MailMode, MailReadRequest, MailSendRequest, MailSendResponse,
+    VarDefinitionArgs, VarGetRequest, VarGetResponse, VarScope, VarSetRequest, VarSetResponse,
+    WhoRequest, WhoResponse, WhoSharedWorkspace, WhoWorker, claim_glob_matches,
+    claim_globs_overlap, claim_globs_overlap_normalized, normalize_claim_glob, parse_var_scope,
 };
 pub use git::{
     DEFAULT_GIT_FETCH_TIMEOUT_MS, FrozenGitFetch, GitFetchDefinitionArgs, GitFetchOutcome,
