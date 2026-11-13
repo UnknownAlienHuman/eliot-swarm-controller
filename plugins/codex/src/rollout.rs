@@ -631,11 +631,30 @@ fn normalize_live_event(
             Some(_) => return Err(integrity()),
         }
     }
-    data["status"] = json!(if aborted || has_error {
-        "failed"
+    // An exact-bound abort with reason `interrupted` is an interruption, not
+    // a failure: the turn never ran to a native terminal because it was
+    // interrupted. Every other abort reason and any native error fails.
+    let interrupted_abort = aborted
+        && payload
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason == "interrupted");
+    let (status, outcome) = if interrupted_abort {
+        ("interrupted", "interrupted")
+    } else if aborted || has_error {
+        ("failed", "failure")
     } else {
-        "completed"
-    });
+        ("completed", "success")
+    };
+    data["status"] = json!(status);
+    data["outcome"] = json!(outcome);
+    // Keep the raw native reason next to the outcome: the abort reason when
+    // the turn never ran to a native terminal, otherwise the rollout line type.
+    if aborted && let Some(reason) = payload.get("reason").and_then(Value::as_str) {
+        data["native_status"] = json!(reason);
+    } else {
+        data["native_status"] = json!(event_type);
+    }
     state.current_turn_id = None;
     state.calls.retain(|_, call| call.turn_id != turn);
     // The terminal's own final_text is retained without emitting a duplicate
@@ -1857,12 +1876,34 @@ mod live_tests {
             .read_page(&terminal.cursor, 1, deadline())
             .await
             .unwrap();
-        assert_eq!(abort.records[0].events[0].data["status"], "failed");
+        // An exact-bound abort with reason `interrupted` is an interruption,
+        // keeping the raw reason in `native_status`.
+        assert_eq!(abort.records[0].events[0].data["status"], "interrupted");
+        assert_eq!(abort.records[0].events[0].data["outcome"], "interrupted");
+        assert_eq!(
+            abort.records[0].events[0].data["native_status"],
+            "interrupted"
+        );
         assert_eq!(
             abort.records[0].events[0].data["abort_reason"],
             "interrupted"
         );
         assert!(abort.records[0].events[0].data.get("started_at").is_none());
+        fixture.append(line(
+            "event_msg",
+            json!({"type":"turn_aborted","turn_id":"turn-2","reason":"replaced"}),
+        ));
+        let replaced = reader
+            .read_page(&abort.cursor, 1, deadline())
+            .await
+            .unwrap();
+        // Any other abort reason still fails.
+        assert_eq!(replaced.records[0].events[0].data["status"], "failed");
+        assert_eq!(replaced.records[0].events[0].data["outcome"], "failure");
+        assert_eq!(
+            replaced.records[0].events[0].data["native_status"],
+            "replaced"
+        );
         reader.close().await.unwrap();
     }
 

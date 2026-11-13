@@ -1755,6 +1755,8 @@ impl EventProcessor {
             "command_id": command_id.clone(),
             "turn_id": notification.turn.id,
             "status": status_text,
+            "outcome": turn_outcome(&notification.turn.status),
+            "native_status": turn_status(&notification.turn.status),
         });
         // The semantic hold signal gets first claim on the bounded terminal data.
         if let Some(restriction) = provider_restriction {
@@ -2999,6 +3001,19 @@ fn turn_status(status: &NativeTurnStatus) -> String {
         NativeTurnStatus::Interrupted => "interrupted".to_owned(),
         NativeTurnStatus::Failed => "failed".to_owned(),
         NativeTurnStatus::InProgress => "inProgress".to_owned(),
+    }
+}
+
+/// Canonical outcome for the Codex terminal vocabulary
+/// (`completed` | `failed` | `interrupted`): decided here at the plugin
+/// boundary, with the raw wire status preserved as `native_status`.
+fn turn_outcome(status: &NativeTurnStatus) -> &'static str {
+    match status {
+        NativeTurnStatus::Completed => "success",
+        NativeTurnStatus::Failed => "failure",
+        NativeTurnStatus::Interrupted => "interrupted",
+        // Unreachable: a nonterminal `inProgress` status gaps before settling.
+        NativeTurnStatus::InProgress => "unknown",
     }
 }
 

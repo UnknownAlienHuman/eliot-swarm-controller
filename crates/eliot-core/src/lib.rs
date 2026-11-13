@@ -583,6 +583,85 @@ pub enum TurnState {
     Unknown,
 }
 
+/// Canonical task outcome of one terminal turn, kept separate from its
+/// lifecycle (`TurnState`). Decided at the plugin boundary from the adapter's
+/// native terminal vocabulary; rows written before outcomes existed classify
+/// explicitly from their legacy status and never default to success.
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOutcome {
+    Success,
+    Failure,
+    Interrupted,
+    Unknown,
+}
+
+impl TurnOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Interrupted => "interrupted",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "success" => Some(Self::Success),
+            "failure" => Some(Self::Failure),
+            "interrupted" => Some(Self::Interrupted),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    /// Explicit classification for rows/events written before canonical
+    /// outcomes existed: `completed` -> success, `failed`/`error` -> failure,
+    /// `interrupted`/`cancelled` -> interrupted, anything else -> unknown.
+    /// Never defaults an unrecognized value to success.
+    pub fn classify_legacy_status(status: Option<&str>) -> Self {
+        match status {
+            Some("completed") => Self::Success,
+            Some("failed") | Some("error") => Self::Failure,
+            Some("interrupted") | Some("cancelled") => Self::Interrupted,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Harness-aware classification for rows written before canonical
+    /// outcomes existed, using the stored harness and that adapter's
+    /// recognized native reasons. Claude rows carry the raw terminal reason
+    /// (`success` -> success; `cancelled`/`interrupted` -> interrupted;
+    /// `error`/`failed`/`failure` and the `api_error*` family -> failure).
+    /// Every other harness carries the normalized lifecycle status and uses
+    /// [`Self::classify_legacy_status`]. Anything else is unknown, never
+    /// success.
+    pub fn classify_legacy_status_for_harness(harness: &str, status: Option<&str>) -> Self {
+        if harness != "claude" {
+            return Self::classify_legacy_status(status);
+        }
+        match status.map(str::trim) {
+            Some("success") => Self::Success,
+            Some("cancelled") | Some("interrupted") => Self::Interrupted,
+            Some("error") | Some("failed") | Some("failure") => Self::Failure,
+            Some(reason) => {
+                let lower = reason.to_lowercase();
+                if lower.starts_with("api_error")
+                    || lower.starts_with("error")
+                    || lower.starts_with("failed")
+                    || lower.starts_with("failure")
+                {
+                    Self::Failure
+                } else {
+                    Self::Unknown
+                }
+            }
+            None => Self::Unknown,
+        }
+    }
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Turn {
     pub agent: String,
@@ -595,6 +674,17 @@ pub struct Turn {
     pub completed_at: Option<i64>,
     #[serde(default)]
     pub usage: Option<TurnUsage>,
+    /// Canonical outcome decided at the plugin boundary. `None` only for
+    /// running turns; terminal turns written before outcomes existed read
+    /// back through [`TurnOutcome::classify_legacy_status_for_harness`].
+    /// Trailing field so existing positional wire order stays stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<TurnOutcome>,
+    /// Raw native terminal reason preserved next to the canonical outcome
+    /// (vendor stop reason / wire terminal verbatim). Trailing field so
+    /// existing positional wire order stays stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_status: Option<String>,
 }
 
 /// Native token usage attributed to one terminal turn. Every member is
@@ -782,6 +872,10 @@ pub enum Effect {
         turn_id: String,
         state: TurnState,
         status: Option<String>,
+        #[serde(default)]
+        outcome: Option<TurnOutcome>,
+        #[serde(default)]
+        native_status: Option<String>,
         final_text: Option<String>,
         #[serde(default)]
         usage: Option<TurnUsage>,
@@ -1100,6 +1194,8 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             let command_id = required_text(event, "command_id")?;
             let turn_id = required_text(event, "turn_id")?;
             let status = required_text(event, "status")?;
+            let outcome = optional_outcome(event)?;
+            let native_status = optional_native_status(event)?;
             let final_text = optional_text(event, "final_text")?;
             let usage = optional_usage(event)?;
             next.state = AgentState::Idle;
@@ -1110,6 +1206,8 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 turn_id,
                 state: TurnState::Completed,
                 status: Some(status),
+                outcome,
+                native_status,
                 final_text,
                 usage,
                 completed_at: now,
@@ -1134,6 +1232,8 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                     turn_id: turn_id.clone(),
                     state: TurnState::Unknown,
                     status: None,
+                    outcome: None,
+                    native_status: None,
                     final_text: None,
                     usage: None,
                     completed_at: now,
@@ -1207,6 +1307,39 @@ fn optional_observed_model(event: &NativeEvent) -> Result<Option<String>> {
         Some(_) => Err(Error::new(
             "invalid",
             format!("{} field model must be a string", event.kind),
+        )),
+    }
+}
+
+fn optional_outcome(event: &NativeEvent) -> Result<Option<TurnOutcome>> {
+    match event.data.get("outcome") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => TurnOutcome::parse(value).map(Some).ok_or_else(|| {
+            Error::new(
+                "invalid",
+                format!(
+                    "{} field outcome must be a canonical turn outcome",
+                    event.kind
+                ),
+            )
+        }),
+        Some(_) => Err(Error::new(
+            "invalid",
+            format!("{} field outcome must be a string", event.kind),
+        )),
+    }
+}
+
+fn optional_native_status(event: &NativeEvent) -> Result<Option<String>> {
+    match event.data.get("native_status") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(_) => Err(Error::new(
+            "invalid",
+            format!(
+                "{} field native_status must be a non-empty string",
+                event.kind
+            ),
         )),
     }
 }
@@ -1289,6 +1422,128 @@ fn optional_details(event: &NativeEvent) -> Result<Value> {
 
 fn bad_state(event: &NativeEvent, message: &str) -> Error {
     Error::new("bad_state", format!("{}: {message}", event.kind))
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    #[test]
+    fn outcome_wire_round_trips_through_its_canonical_names() {
+        for outcome in [
+            TurnOutcome::Success,
+            TurnOutcome::Failure,
+            TurnOutcome::Interrupted,
+            TurnOutcome::Unknown,
+        ] {
+            assert_eq!(TurnOutcome::parse(outcome.as_str()), Some(outcome));
+        }
+        assert_eq!(TurnOutcome::parse("completed"), None);
+    }
+
+    #[test]
+    fn legacy_classification_never_defaults_to_success() {
+        assert_eq!(
+            TurnOutcome::classify_legacy_status(Some("completed")),
+            TurnOutcome::Success
+        );
+        for status in [Some("failed"), Some("error")] {
+            assert_eq!(
+                TurnOutcome::classify_legacy_status(status),
+                TurnOutcome::Failure,
+                "status={status:?}"
+            );
+        }
+        for status in [Some("interrupted"), Some("cancelled")] {
+            assert_eq!(
+                TurnOutcome::classify_legacy_status(status),
+                TurnOutcome::Interrupted,
+                "status={status:?}"
+            );
+        }
+        for status in [
+            None,
+            Some("success"),
+            Some("inProgress"),
+            Some(""),
+            Some("max_tokens"),
+        ] {
+            assert_eq!(
+                TurnOutcome::classify_legacy_status(status),
+                TurnOutcome::Unknown,
+                "status={status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_classification_uses_the_stored_harness_for_claude() {
+        // Claude legacy rows carry the raw terminal reason, not the
+        // normalized lifecycle status: `success` and the `api_error*`
+        // family must not read back as unknown.
+        // Non-Claude harnesses keep the normalized lifecycle mapping.
+        for harness in ["codex", "muse", "opencode", "antigravity", "", "fake"] {
+            for status in [
+                Some("completed"),
+                Some("failed"),
+                Some("success"),
+                Some("api_error"),
+                None,
+            ] {
+                assert_eq!(
+                    TurnOutcome::classify_legacy_status_for_harness(harness, status),
+                    TurnOutcome::classify_legacy_status(status),
+                    "harness={harness} status={status:?}"
+                );
+            }
+        }
+        assert_eq!(
+            TurnOutcome::classify_legacy_status_for_harness("claude", Some("success")),
+            TurnOutcome::Success,
+        );
+        for status in [
+            Some("cancelled"),
+            Some("interrupted"),
+            Some(" interrupted "),
+        ] {
+            assert_eq!(
+                TurnOutcome::classify_legacy_status_for_harness("claude", status),
+                TurnOutcome::Interrupted,
+                "status={status:?}"
+            );
+        }
+        for status in [
+            Some("api_error"),
+            Some("api_error_rate_limited"),
+            Some("API_ERROR_TIMEOUT"),
+            Some("error"),
+            Some("ErrorBudget"),
+            Some("failed"),
+            Some("failed_to_start"),
+            Some("failure"),
+        ] {
+            assert_eq!(
+                TurnOutcome::classify_legacy_status_for_harness("claude", status),
+                TurnOutcome::Failure,
+                "status={status:?}"
+            );
+        }
+        for status in [
+            None,
+            Some("completed"),
+            Some("end_turn"),
+            Some("inProgress"),
+            Some(""),
+            Some("max_tokens"),
+            Some("bogus"),
+        ] {
+            assert_eq!(
+                TurnOutcome::classify_legacy_status_for_harness("claude", status),
+                TurnOutcome::Unknown,
+                "status={status:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

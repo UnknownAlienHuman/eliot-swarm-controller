@@ -570,6 +570,8 @@ mod tests {
             turn_id: "turn-1".to_owned(),
             state: TurnState::Unknown,
             status: None,
+            outcome: None,
+            native_status: None,
             final_text: None,
             started_at: None,
             completed_at: None,

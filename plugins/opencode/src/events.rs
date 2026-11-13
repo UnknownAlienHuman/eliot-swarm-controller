@@ -1767,10 +1767,13 @@ impl EventProcessor {
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
         self.miss_ended_steers(&turn_id);
-        let status = match envelope.event_type.as_str() {
-            "session.execution.succeeded" => "completed",
-            "session.execution.failed" => "failed",
-            _ => "interrupted",
+        // Canonical outcome decided here at the plugin boundary from the
+        // OpenCode execution vocabulary; the raw SSE event type is preserved
+        // as `native_status` next to it.
+        let (status, outcome) = match envelope.event_type.as_str() {
+            "session.execution.succeeded" => ("completed", "success"),
+            "session.execution.failed" => ("failed", "failure"),
+            _ => ("interrupted", "interrupted"),
         };
         let readback = self
             .read_terminal_messages(&terminal.session_id)
@@ -1820,6 +1823,8 @@ impl EventProcessor {
             "command_id": command_id.clone(),
             "turn_id": turn_id,
             "status": status,
+            "outcome": outcome,
+            "native_status": envelope.event_type.as_str(),
         });
         if let Some(text) = readback.final_text.as_deref() {
             attach_final_text(
