@@ -341,9 +341,12 @@ of the predecessor's `last_store_seq`. For a gap-backed handoff, `0 < gap_seq < 
 
 `source` is the expected predecessor. `families` is a unique nonempty set; order is not
 significant, and Store sorts it before hashing the canonical operation and forming the
-ACK. Store rechecks the selected harness subset: Codex supports `session`,
+ACK. Store rechecks the selected harness subset: Codex and Muse support `session`,
 `turn`, `message`, `tool` and `request`; each other native adapter advertises
-only the families its implemented handlers support. Handoff transfer for
+only the families its implemented handlers support. Muse `tool` facts are the
+normalized `toolCall`/turn-bound `userShell` item revisions; the 1.4 item
+carries no inline workspace paths, so Muse `tool.completed` events attach no
+`changed_paths`. Handoff transfer for
 `child`, `goal` and `usage` stays `unsupported`. Native-child observation is
 implemented separately through the shared
 [`ChildParams`](../../crates/eliot-plugin/src/protocol.rs) /
@@ -554,8 +557,9 @@ only after a verified v1 binding. An owned longpoll claims through the same auth
 confirmed `applied`/`empty` may emit a receipt.
 
 The Antigravity `PreInvocation` hook (`before_model`) is the third consumer. The adapter
-installs a private generation-scoped hook group in `.agents/hooks.json` invoking an authenticated
-helper command. When the vendor runner executes the hook, the helper connects to the session-owned
+stages a private generation-scoped hook group in a dedicated hook-only directory's
+`.agents/hooks.json` (the only `--add-dir` native root; the private instance directory
+is never exposed) invoking an authenticated helper command. When the vendor runner executes the hook, the helper connects to the session-owned
 loopback listener and proves its kernel birth identity. The plugin claims FIFO `turn_safe_point`
 context through the existing authenticated `hook.event` channel, combines it with any pending
 exact-turn steer retained inside the plugin, and packages both into one `HookOutput` with native

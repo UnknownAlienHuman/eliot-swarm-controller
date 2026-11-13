@@ -11,7 +11,7 @@ pub const MUSE_NATIVE_CHILD_FAMILIES: [&str; 1] = ["turn"];
 pub const NATIVE_CHILD_FAMILIES: [&str; 3] = CODEX_NATIVE_CHILD_FAMILIES;
 
 /// Committed observation only; this never grants native child control.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NativeChildActivityState {
     Running,
@@ -21,7 +21,7 @@ pub enum NativeChildActivityState {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeChildActivity {
     pub state: NativeChildActivityState,
     pub has_open_turn: bool,

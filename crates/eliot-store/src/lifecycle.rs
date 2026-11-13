@@ -103,6 +103,152 @@ impl Store {
             events,
         })
     }
+
+    /// Commit one local `notify`/`emit` user event together with its Applied
+    /// settlement in a single transaction: validate the Dispatched command
+    /// and its verb/kind, insert the bounded `x.user.*` event, record
+    /// Applied with the exact kind/sequence and the normal `command.applied`
+    /// fact. Returns the settled command with the committed batch (the user
+    /// event first) for in-order publication while still serialized with the
+    /// writer. An already Applied command with the same kind returns its
+    /// recorded result without a new event; any other non-Dispatched state
+    /// (including legacy Unknown rows) is rejected and left untouched.
+    pub fn commit_user_event_applied(
+        &mut self,
+        command_id: &str,
+        kind: &str,
+        data: Value,
+        now: i64,
+    ) -> Result<Change<Command>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let record = load_command_record(&tx, command_id)?
+                .ok_or_else(|| Error::new("not_found", "user-event command was not found"))?;
+            if !matches!(record.command.verb.as_str(), "notify" | "emit") {
+                return Err(Error::new("invalid", "not a local user-event command"));
+            }
+            if record.target.is_some() || record.command.generation.is_some() {
+                return Err(Error::new(
+                    "invalid",
+                    "user-event command must be targetless",
+                ));
+            }
+            let expected_kind = match record.command.verb.as_str() {
+                "notify" => {
+                    serde_json::from_value::<core::api::NotifyDefinitionArgs>(
+                        record.command.args.clone(),
+                    )
+                    .map_err(|_| Error::new("invalid", "notify definition is malformed"))?;
+                    "x.user.notify".to_owned()
+                }
+                _ => {
+                    let definition = serde_json::from_value::<core::api::EmitDefinitionArgs>(
+                        record.command.args.clone(),
+                    )
+                    .map_err(|_| Error::new("invalid", "emit definition is malformed"))?;
+                    format!("x.user.{}", definition.topic)
+                }
+            };
+            if kind != expected_kind {
+                return Err(Error::new(
+                    "invalid",
+                    "user-event kind does not match its command",
+                ));
+            }
+            if record.state == CommandState::Applied
+                && record
+                    .command
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some(kind)
+            {
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(Change {
+                    value: record.command,
+                    events: Vec::new(),
+                });
+            }
+            if record.state != CommandState::Dispatched {
+                return Err(Error::new(
+                    "bad_state",
+                    "user-event command is not dispatched",
+                ));
+            }
+            let mut events = Vec::new();
+            events.push(insert_daemon_event_for_command(
+                &tx,
+                command_id,
+                DaemonEventInput::new(now, kind, "user", None, None, data),
+            )?);
+            let outcome = json!({"kind": kind, "seq": events[0].seq});
+            validate_settle_outcome(CommandState::Applied, &Some(outcome.clone()))?;
+            check_settle_verb_guards(
+                &tx,
+                &record,
+                CommandState::Applied,
+                &Some(outcome.clone()),
+                command_id,
+            )?;
+            if !core::command_transition_allowed(record.state, CommandState::Applied) {
+                return Err(Error::new(
+                    "bad_state",
+                    "command state transition is not allowed for ordinary settlement",
+                ));
+            }
+            let target = record.target;
+            let generation = record.command.generation;
+            update_command_state(
+                &tx,
+                command_id,
+                CommandState::Applied,
+                Some(&outcome),
+                None,
+                now,
+            )?;
+            events.push(insert_daemon_command_event(
+                &tx,
+                now,
+                "command.applied",
+                target,
+                generation,
+                command_id,
+                json!({"command_id": command_id, "state": "applied", "outcome": outcome}),
+            )?);
+            release_settle_capacity(
+                &tx,
+                &record,
+                CommandState::Applied,
+                command_id,
+                false,
+                now,
+                &mut events,
+            )?;
+            apply_settle_agent_transition(
+                &tx,
+                &record,
+                CommandState::Applied,
+                command_id,
+                false,
+                now,
+                &mut events,
+            )?;
+            let record = load_command_record(&tx, command_id)?
+                .ok_or_else(|| Error::new("internal", "settled command disappeared"))?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(Change {
+                value: record.command,
+                events,
+            })
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
 }
 
 fn validate_settle_outcome(state: CommandState, outcome: &Option<Value>) -> Result<()> {
@@ -735,6 +881,8 @@ fn mark_lost_turn_unknown_tx(
                     turn_id,
                     state: TurnState::Unknown,
                     status: None,
+                    outcome: None,
+                    native_status: None,
                     final_text: None,
                     started_at: None,
                     completed_at: Some(now),

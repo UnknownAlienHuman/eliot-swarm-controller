@@ -1,5 +1,9 @@
 use crate::{
     events::{self, EventConfig, EventHandle, TurnFacts},
+    mcp::{
+        McpReadback, compute_disables, merge_status_page, parse_status_page, policy_from_profile,
+        require_minimal_own_server,
+    },
     native::{
         NativeClient, NativeLaunch, NativeProcess,
         types::{
@@ -17,7 +21,8 @@ use crate::{
     route::CodexRoute,
 };
 use eliot_core::{
-    ContextOutcome, Error, InjectArgs, InjectPoint, NativeStoreBinding, Result, SecretPolicy,
+    ContextOutcome, Error, InjectArgs, InjectPoint, McpPolicy, NativeStoreBinding, Result,
+    SecretPolicy,
 };
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, DiscoverParams,
@@ -136,6 +141,9 @@ struct NativeStartContext<'a> {
     route: &'a CodexRoute,
     store: &'a NativeStoreBinding,
     metadata_secrets: &'a [String],
+    mcp_policy: McpPolicy,
+    mcp_allow: &'a [String],
+    own_mcp_server: &'a str,
 }
 
 pub(crate) async fn run() -> Result<()> {
@@ -621,6 +629,7 @@ impl CodexPlugin {
                 "Codex approval_policy must be never or on-request",
             ));
         }
+        let (mcp_policy, mcp_allow) = policy_from_profile(profile)?;
         let workspace = params
             .workspace
             .as_deref()
@@ -685,6 +694,36 @@ impl CodexPlugin {
             .to_string()
             .to_ascii_lowercase();
         let mcp_server_name = format!("eliot_swarm_{start_command}");
+        // Minimal policy: enumerate the worker-visible native servers with a
+        // short-lived metadata reader, then suppress every non-allowed one
+        // with its own `enabled=false` override. Inherit keeps the current
+        // additive behavior with no extra process.
+        let mcp_disables = if mcp_policy == McpPolicy::Minimal {
+            let probe = NativeLaunch {
+                program: program.clone(),
+                args: route.args()?,
+                cwd: workspace.clone(),
+                environment: environment.clone(),
+            };
+            let enumerated = crate::discovery::read_effective_mcp_server_names(
+                &probe,
+                &frozen_store,
+                &metadata_secrets,
+                &secrets,
+                Instant::now() + RPC_TIMEOUT,
+            )
+            .await
+            .map_err(|error| {
+                pre_dispatch_read_error(
+                    error,
+                    "profile_error",
+                    "Codex minimal MCP server enumeration failed before worker spawn",
+                )
+            })?;
+            compute_disables(&enumerated, &mcp_allow, &mcp_server_name)?
+        } else {
+            Vec::new()
+        };
         let launch = NativeLaunch {
             program,
             args: route.args_with_agent_mcp(
@@ -692,6 +731,7 @@ impl CodexPlugin {
                 &swarm_executable,
                 &data_dir,
                 &mcp_cwd,
+                &mcp_disables,
             )?,
             cwd: workspace.clone(),
             environment,
@@ -776,7 +816,7 @@ impl CodexPlugin {
             return Err(error);
         }
 
-        let (selected_effort, native_scope) = match Self::initialize_native(
+        let (selected_effort, native_scope, mcp_readback) = match Self::initialize_native(
             &session.native_client,
             &workspace,
             &requested_model,
@@ -786,11 +826,14 @@ impl CodexPlugin {
                 route: &route,
                 store: &frozen_store,
                 metadata_secrets: &metadata_secrets,
+                mcp_policy,
+                mcp_allow: &mcp_allow,
+                own_mcp_server: &mcp_server_name,
             },
         )
         .await
         {
-            Ok((effort, scope)) => (effort, scope),
+            Ok((effort, scope, mcp_readback)) => (effort, scope, mcp_readback),
             Err(error) => {
                 let error = discard_failed_start(&mut session, error).await;
                 return Err(self.settle_pre_dispatch_outcome(
@@ -1000,6 +1043,12 @@ impl CodexPlugin {
                 .reasoning_effort
                 .as_deref()
                 .is_some_and(|effort| Some(effort) == selected_effort.as_deref());
+        // Names only from the native inventory; `None` stays null so an
+        // unobserved surface is never reported as an observed one.
+        let mcp_servers = mcp_readback
+            .servers
+            .map(|servers| Value::Array(servers.into_iter().map(Value::String).collect()))
+            .unwrap_or(Value::Null);
         let effective = json!({
             "model": readback.model.clone(),
             "model_provider": readback.model_provider.clone(),
@@ -1008,6 +1057,9 @@ impl CodexPlugin {
             "approval_policy": readback.approval_policy.clone(),
             "effort": readback.reasoning_effort.clone(),
             "effort_verified": effort_verified,
+            "mcp_policy": mcp_policy.as_str(),
+            "mcp_servers": mcp_servers,
+            "mcp_servers_verified": mcp_readback.verified,
         });
         let effective = with_context_points(
             effective,
@@ -1072,6 +1124,8 @@ impl CodexPlugin {
                 "cwd": workspace.to_string_lossy(),
                 "permissions": permissions,
                 "approval_policy": approval_policy,
+                "mcp_policy": mcp_policy.as_str(),
+                "mcp_allow": mcp_allow,
             },
             "effective": effective,
         });
@@ -1129,7 +1183,7 @@ impl CodexPlugin {
         requested_effort: Option<&str>,
         experimental_api: bool,
         context: NativeStartContext<'_>,
-    ) -> Result<(Option<String>, String)> {
+    ) -> Result<(Option<String>, String, McpReadback)> {
         let init_params = NativeInitializeParams {
             client_info: NativeClientInfo {
                 name: "eliot".to_owned(),
@@ -1264,10 +1318,43 @@ impl CodexPlugin {
             .route
             .verify_config(effective_config, context.metadata_secrets)?;
 
+        // Requested vs observed MCP surface: read the installed
+        // `mcpServerStatus/list` inventory (verified in the 0.167.1
+        // app-server schema) and keep names only. Minimal fails closed
+        // when the visible surface cannot be verified, shows an enabled
+        // non-allowed server, or omits the Agent-scoped server; inherit
+        // performs no inventory readback on the readiness path and reports
+        // the set as unknown instead of echoing the requested set.
+        let enforce_minimal = context.mcp_policy == McpPolicy::Minimal;
+        let mcp_readback = if enforce_minimal {
+            Self::read_mcp_status(
+                client,
+                context.mcp_allow,
+                context.own_mcp_server,
+                context.metadata_secrets,
+                true,
+            )
+            .await
+            .map_err(|error| {
+                pre_dispatch_read_error(
+                    error,
+                    "profile_error",
+                    "Codex minimal MCP isolation could not be verified",
+                )
+            })?
+        } else {
+            // Inherit keeps the exact previous startup path: no inventory
+            // RPCs on the readiness path. Each inventory RPC owns up to the
+            // whole outer `agent.start` budget, so even an optional read
+            // regresses default startup; the set stays unknown instead.
+            McpReadback::unverified()
+        };
+
         if !context.route.requires_chatgpt() {
             return Ok((
                 context.route.optional_effort(requested_effort)?,
                 native_scope,
+                mcp_readback,
             ));
         }
 
@@ -1292,7 +1379,69 @@ impl CodexPlugin {
             // model exists; no medium/xhigh value is fabricated here.
             None => None,
         };
-        Ok((effort, native_scope))
+        Ok((effort, native_scope, mcp_readback))
+    }
+
+    /// Read the native MCP inventory for requested-vs-observed reporting.
+    /// Names only: tool/resource payloads are never retained. A page that
+    /// echoes a known credential fails the read; truncation of the page loop
+    /// leaves the inventory incomplete, which is also a failure the caller
+    /// maps per policy (minimal aborts, inherit reports unknown).
+    async fn read_mcp_status(
+        client: &NativeClient,
+        allow: &[String],
+        own_mcp_server: &str,
+        metadata_secrets: &[String],
+        enforce_minimal: bool,
+    ) -> Result<McpReadback> {
+        let mut accumulated: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut cursor: Option<String> = None;
+        let mut incomplete = true;
+        for _ in 0..crate::mcp::MAX_MCP_STATUS_PAGES {
+            let mut params = json!({"detail": "toolsAndAuthOnly", "limit": 100});
+            if let Some(cursor) = cursor.as_deref() {
+                params["cursor"] = Value::String(cursor.to_owned());
+            }
+            let response = client
+                .call("mcpServerStatus/list", params, Instant::now() + RPC_TIMEOUT)
+                .await
+                .map_err(|error| {
+                    // Only prerequisite reads ran; no thread or input was dispatched.
+                    pre_dispatch_read_error(
+                        error,
+                        "native_readback",
+                        "Codex mcpServerStatus/list read failed",
+                    )
+                })?;
+            let page = parse_status_page(&response, allow, own_mcp_server)?;
+            let names = Value::Array(page.effective.iter().cloned().map(Value::String).collect());
+            if SecretPolicy::new(metadata_secrets.iter().cloned()).contains_value(&names) {
+                return Err(Error::new(
+                    "secret_in_payload",
+                    "Codex MCP inventory contains a known secret",
+                ));
+            }
+            cursor = merge_status_page(&mut accumulated, &mut seen, page, enforce_minimal)?;
+            if cursor.is_none() {
+                incomplete = false;
+                break;
+            }
+        }
+        if incomplete {
+            return Err(Error::new(
+                "native_readback",
+                "Codex MCP inventory is paginated beyond its bound",
+            ));
+        }
+        if enforce_minimal {
+            // The completed inventory must show Eliot's own Agent-scoped
+            // server as present and enabled; an empty inventory or a
+            // disabled own entry proves nothing and fails closed here,
+            // before any thread or input.
+            require_minimal_own_server(&accumulated, own_mcp_server)?;
+        }
+        Ok(McpReadback::verified(accumulated))
     }
 
     async fn command(&mut self, raw: &Value) -> Result<Value> {

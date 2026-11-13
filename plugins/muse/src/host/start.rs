@@ -78,7 +78,7 @@ pub(super) fn prepare_profile(
         })?;
     validate_source_plan(
         "Muse",
-        &["session", "turn", "message", "request"],
+        &["session", "turn", "message", "tool", "request"],
         params.source_plan.as_ref(),
     )?;
     let frozen_profile = params

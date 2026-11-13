@@ -22,7 +22,7 @@ use std::{
 use tokio::{
     sync::{Mutex, watch},
     task::JoinSet,
-    time::{Instant, timeout_at},
+    time::{Instant, timeout, timeout_at},
 };
 use tokio_util::codec::{Framed, LinesCodec};
 use tokio_util::sync::CancellationToken;
@@ -31,6 +31,10 @@ use ulid::Ulid;
 pub const MAX_RPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CLIENTS: usize = 128;
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(35);
+/// Bound for one server-side response write. A peer that stops reading must
+/// not hold its connection task past this deadline: the task ends and finishes
+/// response bookkeeping while the committed result stays readable by retry.
+const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Open the private local daemon, recover durable state without replaying any
 /// external effects, and serve concurrent local RPC connections.
@@ -765,6 +769,29 @@ fn decode_client_result<R: DeserializeOwned>(method: &str, result: Result<Value>
 }
 
 async fn serve_connection(stream: IpcStream, router: Router, policy: Arc<SecretPolicy>) {
+    serve_connection_with_write_timeout(stream, router, policy, RESPONSE_WRITE_TIMEOUT).await;
+}
+
+/// Bound one server-side response write. A peer that stops reading must not
+/// hold its connection task past `write_timeout`; the caller ends the task and
+/// finishes response bookkeeping instead of retrying the effect.
+async fn send_response_frame(
+    framed: &mut Framed<IpcStream, LinesCodec>,
+    frame: String,
+    write_timeout: Duration,
+) -> bool {
+    match timeout(write_timeout, framed.send(frame)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) | Err(_) => false,
+    }
+}
+
+async fn serve_connection_with_write_timeout(
+    stream: IpcStream,
+    router: Router,
+    policy: Arc<SecretPolicy>,
+    write_timeout: Duration,
+) {
     let mut framed = Framed::new(
         stream,
         LinesCodec::new_with_max_length(MAX_RPC_FRAME_BYTES.saturating_sub(1)),
@@ -818,9 +845,9 @@ async fn serve_connection(stream: IpcStream, router: Router, policy: Arc<SecretP
         Ok(None) | Err(_) => return,
     };
 
-    let send_result = match serde_json::to_string(&response) {
+    let wrote_response = match serde_json::to_string(&response) {
         Ok(frame) if frame.len().saturating_add(1) <= MAX_RPC_FRAME_BYTES => {
-            framed.send(frame).await
+            send_response_frame(&mut framed, frame, write_timeout).await
         }
         _ => {
             let fallback = RpcResponse {
@@ -834,12 +861,12 @@ async fn serve_connection(stream: IpcStream, router: Router, policy: Arc<SecretP
                 }),
             };
             match serde_json::to_string(&fallback) {
-                Ok(frame) => framed.send(frame).await,
+                Ok(frame) => send_response_frame(&mut framed, frame, write_timeout).await,
                 Err(_) => return,
             }
         }
     };
-    if send_result.is_err() {
+    if !wrote_response {
         logging::record(&policy, "rpc.response_write_failed", &[], None);
     }
     router.response_finished(arm_shutdown);
@@ -909,6 +936,10 @@ fn rpc_error(mut error: Error, policy: &SecretPolicy) -> RpcError {
     for diagnostic in &mut error.diagnostics {
         diagnostic.snapshot.text = policy.redact_text(&diagnostic.snapshot.text);
     }
+    if let Some(detail) = error.details.as_mut() {
+        detail.field = policy.redact_text(&detail.field);
+        detail.expected = policy.redact_text(&detail.expected);
+    }
     bound_stderr_diagnostics(&mut error.diagnostics, MAX_STDERR_DIAGNOSTIC_BYTES);
     let code = match error.code.as_str() {
         "unsupported" => -32601,
@@ -934,6 +965,11 @@ fn core_error(error: RpcError, policy: &SecretPolicy) -> Error {
         .unwrap_or("internal")
         .to_owned();
     let message = policy.redact_text(&error.message);
+    for field in ["field", "expected"] {
+        if let Some(Value::String(value)) = data.get_mut("details").and_then(|d| d.get_mut(field)) {
+            *value = policy.redact_text(value);
+        }
+    }
     if let Some(values) = data.get_mut("diagnostics").and_then(Value::as_array_mut) {
         for diagnostic in values.iter_mut().take(2) {
             if let Some(Value::String(text)) = diagnostic.pointer_mut("/snapshot/text") {
@@ -1363,5 +1399,84 @@ mod tests {
             }
             _ => panic!("expected Agent identity"),
         }
+    }
+
+    fn test_router() -> Router {
+        let store =
+            eliot_store::Store::open(std::path::Path::new(":memory:")).expect("memory store");
+        Router::new(
+            PathBuf::from("test-data-root"),
+            "owner-credential".to_owned(),
+            Arc::new(Mutex::new(store)),
+            crate::bus::Bus::new(16),
+        )
+    }
+
+    #[tokio::test]
+    async fn connection_task_ends_when_peer_stops_reading() {
+        use tokio::io::AsyncWriteExt as _;
+        let router = test_router();
+        let progress = router.progress_receiver();
+        let policy = Arc::new(SecretPolicy::new(["owner-credential"]));
+        // Small buffer with no reader: the error reply below cannot drain, so
+        // an unbounded write would hold this connection task indefinitely.
+        let (mut peer, server) = tokio::io::duplex(64);
+        peer.write_all(b"not-json\n")
+            .await
+            .expect("request fits the empty buffer");
+        // The clone keeps the progress sender alive so the assertion below can
+        // observe the bookkeeping signal after the connection task has ended.
+        let task = tokio::spawn(serve_connection_with_write_timeout(
+            IpcStream::from_test_stream(server),
+            router.clone(),
+            policy,
+            Duration::from_millis(200),
+        ));
+        let started = Instant::now();
+        timeout(Duration::from_secs(5), task)
+            .await
+            .expect("connection task ends within the outer bound")
+            .expect("connection task panicked");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            progress.has_changed().expect("progress channel stays open"),
+            "response bookkeeping finishes after an undelivered write"
+        );
+    }
+
+    #[tokio::test]
+    async fn large_response_write_times_out_when_peer_stops_reading() {
+        let (_peer, server) = tokio::io::duplex(64);
+        let mut framed = Framed::new(
+            IpcStream::from_test_stream(server),
+            LinesCodec::new_with_max_length(MAX_RPC_FRAME_BYTES.saturating_sub(1)),
+        );
+        let started = Instant::now();
+        let wrote = send_response_frame(
+            &mut framed,
+            "x".repeat(256 * 1024),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(!wrote, "a peer that stops reading fails the write deadline");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn response_write_succeeds_when_peer_reads() {
+        use tokio::io::AsyncBufReadExt as _;
+        let (peer, server) = tokio::io::duplex(1_024);
+        let mut framed = Framed::new(
+            IpcStream::from_test_stream(server),
+            LinesCodec::new_with_max_length(MAX_RPC_FRAME_BYTES.saturating_sub(1)),
+        );
+        let mut peer = tokio::io::BufReader::new(peer);
+        let wrote = send_response_frame(&mut framed, "ok".to_owned(), Duration::from_secs(5)).await;
+        assert!(wrote);
+        let mut line = String::new();
+        peer.read_line(&mut line)
+            .await
+            .expect("peer reads the frame");
+        assert_eq!(line, "ok\n");
     }
 }

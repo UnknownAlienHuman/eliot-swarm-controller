@@ -35,9 +35,9 @@ use eliot_core::{
     Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage,
     GitSnapshot, InjectPoint, NativeEvent, NativeStoreBinding, PendingRequest, ProcessIdentity,
     ProcessRecord, ProcessSnapshot, ProcessState, SourceBatch, SourceGap, SourceGapAck,
-    SubmitCommand, Turn, TurnState, TurnUsage, WorkspaceCancelOutcome, WorkspaceCreationOutcome,
-    WorkspacePhase, WorkspacePreparation, WorkspacePreparationInput, WorkspaceRemovalOutcome,
-    WorkspaceSetupArg, WorkspaceSetupOutcome, parse_agent_id,
+    SubmitCommand, Turn, TurnOutcome, TurnState, TurnUsage, WorkspaceCancelOutcome,
+    WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation, WorkspacePreparationInput,
+    WorkspaceRemovalOutcome, WorkspaceSetupArg, WorkspaceSetupOutcome, parse_agent_id,
 };
 pub use eliot_core::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -705,39 +705,6 @@ impl Store {
         result
     }
 
-    /// Persist one local user event for an existing dispatched command.
-    /// The command must already exist (ordinary admission committed it);
-    /// settlement remains the caller's separate `settle` step.
-    pub fn commit_user_event(
-        &mut self,
-        command_id: &str,
-        kind: &str,
-        data: Value,
-        now: i64,
-    ) -> Result<Change<Event>> {
-        self.ensure_writer_healthy()?;
-        let result = (|| {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            load_command_record(&tx, command_id)?
-                .ok_or_else(|| Error::new("not_found", "user-event command was not found"))?;
-            let event = insert_daemon_event_for_command(
-                &tx,
-                command_id,
-                DaemonEventInput::new(now, kind, "user", None, None, data),
-            )?;
-            commit_transaction(tx, &self.write_faulted)?;
-            Ok(Change {
-                value: event,
-                events: vec![],
-            })
-        })();
-        self.fault_on_persistence_error(&result);
-        result
-    }
-
     pub fn get_agent(&self, id: &str) -> Result<Option<Agent>> {
         let agent_num = parse_agent_id(id)?;
         load_agent_by_num(&self.connection, agent_num)
@@ -1137,17 +1104,18 @@ impl Store {
     pub fn list_turns(&self, agent: &str, generation: i64, limit: usize) -> Result<Vec<Turn>> {
         validate_limit(limit)?;
         let agent_num = parse_agent_id(agent)?;
-        if load_agent_by_num(&self.connection, agent_num)?.is_none() {
+        let Some(agent_row) = load_agent_by_num(&self.connection, agent_num)? else {
             return Err(Error::new(
                 "not_found",
                 format!("Agent {agent} was not found"),
             ));
-        }
+        };
+        let harness = agent_row.harness;
         let mut statement = self
             .connection
             .prepare(
-                "SELECT agent, generation, turn_id, state, status, final_text,
-                        started_at, completed_at, usage
+                "SELECT agent, generation, turn_id, state, status, outcome, native_status,
+                        final_text, started_at, completed_at, usage
                  FROM turns WHERE agent = ?1 AND generation = ?2
                  ORDER BY COALESCE(started_at, completed_at, 0) DESC, turn_id DESC
                  LIMIT ?3",
@@ -1161,7 +1129,7 @@ impl Store {
             .map_err(sql_error)?;
         let mut turns = Vec::new();
         for row in rows {
-            turns.push(turn_from_record(row.map_err(sql_error)?)?);
+            turns.push(turn_from_record(row.map_err(sql_error)?, &harness)?);
         }
         enforce_page_bytes(&mut turns)?;
         Ok(turns)
@@ -2567,6 +2535,8 @@ struct TurnRecord {
     turn_id: String,
     state: String,
     status: Option<String>,
+    outcome: Option<String>,
+    native_status: Option<String>,
     final_text: Option<String>,
     started_at: Option<i64>,
     completed_at: Option<i64>,
@@ -2763,6 +2733,8 @@ struct TurnInsert<'a> {
     turn_id: &'a str,
     state: TurnState,
     status: Option<&'a str>,
+    outcome: Option<&'a str>,
+    native_status: Option<&'a str>,
     final_text: Option<&'a str>,
     started_at: Option<i64>,
     completed_at: Option<i64>,
@@ -3799,21 +3771,40 @@ fn turn_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord>
         turn_id: row.get(2)?,
         state: row.get(3)?,
         status: row.get(4)?,
-        final_text: row.get(5)?,
-        started_at: row.get(6)?,
-        completed_at: row.get(7)?,
-        usage: row.get(8)?,
+        outcome: row.get(5)?,
+        native_status: row.get(6)?,
+        final_text: row.get(7)?,
+        started_at: row.get(8)?,
+        completed_at: row.get(9)?,
+        usage: row.get(10)?,
     })
 }
 
-fn turn_from_record(record: TurnRecord) -> Result<Turn> {
+fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
     let usage = record.usage.as_deref().map(decode_turn_usage).transpose()?;
+    let state: TurnState = parse_enum(&record.state, "turn state")?;
+    // Rows written before canonical outcomes existed carry no stored outcome:
+    // classify them explicitly from the legacy status with the stored
+    // harness (Claude rows carry the raw terminal reason), never as success.
+    let outcome = match record.outcome.as_deref() {
+        Some(value) => Some(
+            TurnOutcome::parse(value)
+                .ok_or_else(|| Error::new("internal", "invalid stored turn outcome"))?,
+        ),
+        None if state == TurnState::Completed => Some(
+            TurnOutcome::classify_legacy_status_for_harness(harness, record.status.as_deref()),
+        ),
+        None => None,
+    };
+    let native_status = record.native_status.filter(|value| !value.is_empty());
     Ok(Turn {
         agent: format_agent_id(record.agent),
         generation: record.generation,
         turn_id: record.turn_id,
-        state: parse_enum(&record.state, "turn state")?,
+        state,
         status: record.status,
+        outcome,
+        native_status,
         final_text: record.final_text,
         started_at: record.started_at,
         completed_at: record.completed_at,
@@ -3834,28 +3825,47 @@ fn load_turn(
 ) -> Result<Option<Turn>> {
     let record = connection
         .query_row(
-            "SELECT agent, generation, turn_id, state, status, final_text,
-                    started_at, completed_at, usage
+            "SELECT agent, generation, turn_id, state, status, outcome, native_status,
+                    final_text, started_at, completed_at, usage
              FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
             params![agent, generation, turn_id],
             turn_record_from_row,
         )
         .optional()
         .map_err(sql_error)?;
-    record.map(turn_from_record).transpose()
+    record
+        .map(|record| {
+            let harness = load_harness_by_num(connection, agent)?;
+            turn_from_record(record, &harness)
+        })
+        .transpose()
+}
+
+/// Stored harness for one agent row, used to classify legacy turn rows that
+/// carry no canonical outcome. Missing agent rows classify generically.
+fn load_harness_by_num(connection: &Connection, agent: i64) -> Result<String> {
+    connection
+        .query_row("SELECT harness FROM agents WHERE id = ?1", [agent], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(sql_error)
+        .map(|harness| harness.unwrap_or_default())
 }
 
 fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
     db!(tx.execute(
-        "INSERT INTO turns(agent, generation, turn_id, state, status, final_text,
-                           started_at, completed_at, usage)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO turns(agent, generation, turn_id, state, status, outcome, native_status,
+                           final_text, started_at, completed_at, usage)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             turn.agent,
             turn.generation,
             turn.turn_id,
             turn_state_name(turn.state),
             turn.status,
+            turn.outcome,
+            turn.native_status,
             turn.final_text,
             turn.started_at,
             turn.completed_at,
@@ -4789,19 +4799,37 @@ fn validate_limit(limit: usize) -> Result<()> {
 }
 
 fn enforce_page_bytes<T: serde::Serialize>(items: &mut Vec<T>) -> Result<()> {
-    let had_items = !items.is_empty();
-    while encode_json(items)?.len() > MAX_PAGE_BYTES {
-        items.pop();
-        if items.is_empty() {
+    if items.is_empty() {
+        return Ok(());
+    }
+    // Linear sizing: serialize each candidate entry once (escaped JSON bytes)
+    // and account for the enclosing brackets plus one comma per gap, matching
+    // exactly how `serde_json` encodes `Vec<T>` (`[` entries `,` `]`).
+    // The result is the longest fitting prefix, identical to reserializing
+    // each shrinking prefix but without the quadratic work under the Store
+    // mutex. `MAX_PAGE_BYTES` (900 KiB) leaves headroom for the 1 MiB
+    // response frame envelope.
+    let mut total = 2_usize;
+    let mut keep = 0_usize;
+    for (index, item) in items.iter().enumerate() {
+        let len = encode_json(item)?.len();
+        let next = total
+            .saturating_add(len)
+            .saturating_add(if index == 0 { 0 } else { 1 });
+        if next > MAX_PAGE_BYTES {
             break;
         }
+        total = next;
+        keep = index + 1;
     }
-    if had_items && items.is_empty() {
+    if keep == 0 {
+        items.clear();
         return Err(Error::new(
             "frame_too_large",
             "one page entry exceeds the 900 KiB response bound",
         ));
     }
+    items.truncate(keep);
     Ok(())
 }
 

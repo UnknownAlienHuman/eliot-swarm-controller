@@ -74,7 +74,7 @@ impl CapacityScope {
 }
 
 /// Structured provider restriction facts accepted from an exact native result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderRestrictionKind {
     RateLimit,
@@ -101,7 +101,7 @@ pub struct ProviderRestriction {
     pub retry_after: Option<i64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderHoldState {
     Held,
@@ -117,7 +117,7 @@ impl ProviderHoldState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderHold {
     pub scope: String,
