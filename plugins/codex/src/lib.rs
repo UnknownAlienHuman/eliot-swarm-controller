@@ -4,6 +4,7 @@ mod discovery;
 mod events;
 mod host;
 mod live_recovery;
+mod mcp;
 mod native;
 mod native_child;
 mod observe;
