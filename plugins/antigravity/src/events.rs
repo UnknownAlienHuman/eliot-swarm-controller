@@ -563,7 +563,7 @@ impl State {
             AgyFrame::StreamFault(fault) => {
                 self.lose(&format!(
                     "Antigravity stream contained an invalid frame ({})",
-                    fault.label()
+                    fault.describe()
                 ))
                 .await;
                 Ok(())
@@ -1151,7 +1151,7 @@ async fn note_stream_fault(state: &Shared, current: StreamState) {
                 .await
                 .lose(&format!(
                     "Antigravity stream contained an invalid frame ({})",
-                    fault.label()
+                    fault.describe()
                 ))
                 .await;
         }

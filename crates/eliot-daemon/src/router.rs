@@ -349,6 +349,8 @@ impl Router {
         let _store = self.inner.store.lock().await;
         let _run_workers = self.inner.run_workers.lock_recover();
         self.inner.mode.store(MODE_FORCE, Ordering::SeqCst);
+        self.inner.workspaces.close_startup_admission();
+        self.inner.plugin_host.close_startup_admission();
         self.inner.run_cancellation.send_replace(true);
         self.inner.shutdown_ready.store(true, Ordering::SeqCst);
         drop(_store);
@@ -375,6 +377,8 @@ impl Router {
             let _store = self.inner.store.lock().await;
             let mut workers = self.inner.run_workers.lock_recover();
             self.inner.mode.fetch_max(MODE_FORCE, Ordering::SeqCst);
+            self.inner.workspaces.close_startup_admission();
+            self.inner.plugin_host.close_startup_admission();
             self.inner.run_cancellation.send_replace(true);
             workers.drain().collect::<Vec<_>>()
         };
@@ -564,28 +568,11 @@ impl Router {
                 return Err(error);
             }
         };
-        let PreparedSubmission {
-            request,
-            workspace: preparation,
-        } = prepared;
-
         let submitted = {
             let mut store = self.inner.store.lock().await;
             let principal = principal_name(principal);
-            let validation = if request.verb == "answer" {
-                validate_answer_request(&store, &request)
-            } else {
-                Ok(())
-            };
-            let submitted = validation.and_then(|()| {
-                store.submit_with_remote_context(
-                    &principal,
-                    request.clone(),
-                    preparation,
-                    remote,
-                    now_ms(),
-                )
-            });
+            let submitted =
+                self.admit_prepared_submission(&mut store, &principal, prepared, remote);
             match submitted {
                 Ok(admission) => {
                     if !admission.events.is_empty() {
@@ -625,6 +612,41 @@ impl Router {
             admission.linked_command.as_ref(),
         ))
         .map_err(|_| Error::new("internal", "command admission result could not be encoded"))
+    }
+
+    // Caller holds the writer used by shutdown to change mode. Retained reads
+    // precede both the shutdown gate and Store's writer-health check, including
+    // when an identical admission won during asynchronous preparation.
+    fn admit_prepared_submission(
+        &self,
+        store: &mut eliot_store::Store,
+        principal: &str,
+        prepared: PreparedSubmission,
+        remote: Option<&eliot_core::RemoteCallContext>,
+    ) -> Result<Admission> {
+        let PreparedSubmission { request, workspace } = prepared;
+        if let Some(admission) = store.replay_command_submission(principal, &request, remote)? {
+            return Ok(admission);
+        }
+        self.check_command_admission_mode(&request.verb)?;
+        if request.verb == "answer" {
+            validate_answer_request(store, &request)?;
+        }
+        store.submit_with_remote_context(principal, request, workspace, remote, now_ms())
+    }
+
+    fn check_command_admission_mode(&self, verb: &str) -> Result<()> {
+        let mode = self.inner.mode.load(Ordering::SeqCst);
+        if mode == MODE_FORCE {
+            return Err(Error::new("unavailable", "daemon is forcing shutdown"));
+        }
+        if matches!(verb, "launch" | "resume" | "send" | "attach") && mode != MODE_OPEN {
+            return Err(Error::new(
+                "unavailable",
+                "daemon is draining and rejects new launch, resume, send, or attach commands",
+            ));
+        }
+        Ok(())
     }
 
     async fn replay_command_submission(
@@ -714,13 +736,8 @@ impl Router {
         let principal_name = principal_name(principal);
         let admission = {
             let mut store = self.inner.store.lock().await;
-            let result = store.submit_with_remote_context(
-                &principal_name,
-                prepared.request,
-                None,
-                remote,
-                now_ms(),
-            );
+            let result =
+                self.admit_prepared_submission(&mut store, &principal_name, prepared, remote);
             match result {
                 Ok(admission) => {
                     self.publish_locked(&admission.events);
@@ -890,9 +907,7 @@ impl Router {
         definition.validate()?;
         let timeout_ms = crate::automation::git_fetch_timeout_ms(definition.timeout.as_deref())?;
         let _binding_args = definition.binding_args(timeout_ms)?;
-        if self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE {
-            return Err(Error::new("unavailable", "daemon is forcing shutdown"));
-        }
+        self.check_command_admission_mode(&request.verb)?;
 
         let registration = match principal {
             Principal::Owner => self
@@ -1394,22 +1409,9 @@ impl Router {
         if !project_authority_preverified {
             self.verify_native_control_target(&request).await?;
         }
-        let mode = self.inner.mode.load(Ordering::SeqCst);
-        if mode == MODE_FORCE {
-            return Err(Error::new("unavailable", "daemon is forcing shutdown"));
-        }
+        self.check_command_admission_mode(&request.verb)?;
         if request.verb == "detach" {
             self.hydrate_detach_generation(&mut request).await?;
-        }
-        if matches!(
-            request.verb.as_str(),
-            "launch" | "resume" | "send" | "attach"
-        ) && mode != MODE_OPEN
-        {
-            return Err(Error::new(
-                "unavailable",
-                "daemon is draining and rejects new launch, resume, send, or attach commands",
-            ));
         }
         let mut workspace = None;
         if request.verb == "launch" {
@@ -3079,8 +3081,8 @@ impl Router {
                 Err(_error) if mode == ShutdownMode::Force && store.is_write_faulted() => None,
                 Err(error) => return Err(error),
             };
-            // Rule admissions serialize their final mode check under this same
-            // writer guard, so no firing crosses the drain/force boundary.
+            // Command and rule admissions serialize their final mode check
+            // under this same writer guard.
             let _run_workers = self.inner.run_workers.lock_recover();
             self.inner.mode.fetch_max(
                 if mode == ShutdownMode::Force {
@@ -3092,6 +3094,8 @@ impl Router {
             );
             self.inner.shutdown_ready.store(false, Ordering::SeqCst);
             if mode == ShutdownMode::Force {
+                self.inner.workspaces.close_startup_admission();
+                self.inner.plugin_host.close_startup_admission();
                 self.inner.run_cancellation.send_replace(true);
             }
             write
@@ -4830,7 +4834,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_git_fetch_replay_uses_literal_binding_after_registration_changes() {
+    async fn shutdown_boundary_rechecks_prepared_commands_and_replays_concurrent_winners() {
+        for mode in ["drain", "force"] {
+            let router = router();
+            let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+            request.expected_generation = Some(0);
+            request.args = json!({
+                "project":"shutdown-boundary", "workspace":"unused-workspace",
+                "harness":"codex", "profile":"fixture", "profile_snapshot":{},
+            });
+            // Preparation has finished, but no admission has acquired the writer.
+            let mut winner = request.clone();
+            winner.id = ulid::Ulid::new().to_string();
+            let retained = router
+                .inner
+                .store
+                .lock()
+                .await
+                .submit("owner", winner.clone(), now_ms())
+                .unwrap()
+                .command;
+            router
+                .shutdown(
+                    &json!({"id":ulid::Ulid::new().to_string(), "mode":mode}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap();
+
+            let mut store = router.inner.store.lock().await;
+            let before = store.high_water().unwrap();
+            for verb in ["launch", "resume", "send", "attach"] {
+                let mut late = request.clone();
+                late.verb = verb.to_owned();
+                assert_eq!(
+                    router
+                        .admit_prepared_submission(
+                            &mut store,
+                            "owner",
+                            PreparedSubmission {
+                                request: late,
+                                workspace: None
+                            },
+                            None,
+                        )
+                        .unwrap_err()
+                        .code,
+                    "unavailable"
+                );
+                assert!(store.get_command(&request.id).unwrap().is_none());
+            }
+            let replay = router
+                .admit_prepared_submission(
+                    &mut store,
+                    "owner",
+                    PreparedSubmission {
+                        request: winner.clone(),
+                        workspace: None,
+                    },
+                    None,
+                )
+                .unwrap();
+            assert!(!replay.is_new);
+            assert!(replay.events.is_empty());
+            assert_eq!(replay.command, retained);
+            winner.args["text"] = json!("different payload");
+            assert_eq!(
+                router
+                    .admit_prepared_submission(
+                        &mut store,
+                        "owner",
+                        PreparedSubmission {
+                            request: winner,
+                            workspace: None
+                        },
+                        None,
+                    )
+                    .unwrap_err()
+                    .code,
+                "id_conflict"
+            );
+            assert_eq!(store.high_water().unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_boundary_direct_git_fetch_replay_uses_literal_binding_after_registration_changes()
+     {
         let router = router();
         let checkout = std::fs::canonicalize(std::env::current_dir().unwrap())
             .unwrap()
@@ -4890,7 +4980,7 @@ mod tests {
             .store
             .lock()
             .await
-            .submit("owner", retained_request, now_ms())
+            .submit("owner", retained_request.clone(), now_ms())
             .unwrap();
         assert_ne!(raw.args, retained.command.args);
 
@@ -4932,6 +5022,58 @@ mod tests {
                 .unwrap(),
             expected
         );
+
+        for mode in ["drain", "force"] {
+            router
+                .shutdown(
+                    &json!({"id":ulid::Ulid::new().to_string(), "mode":mode}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                router
+                    .submit(&serde_json::to_value(&raw).unwrap(), &Principal::Owner)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            let mut store = router.inner.store.lock().await;
+            let before = store.high_water().unwrap();
+            let replay = router
+                .admit_prepared_submission(
+                    &mut store,
+                    "owner",
+                    PreparedSubmission {
+                        request: retained_request.clone(),
+                        workspace: None,
+                    },
+                    None,
+                )
+                .unwrap();
+            assert!(!replay.is_new);
+            assert_eq!(replay.command, retained.command);
+            if mode == "force" {
+                let mut late = retained_request.clone();
+                late.id = ulid::Ulid::new().to_string();
+                assert_eq!(
+                    router
+                        .admit_prepared_submission(
+                            &mut store,
+                            "owner",
+                            PreparedSubmission {
+                                request: late,
+                                workspace: None
+                            },
+                            None,
+                        )
+                        .unwrap_err()
+                        .code,
+                    "unavailable"
+                );
+            }
+            assert_eq!(store.high_water().unwrap(), before);
+        }
 
         for (field, value) in [
             ("repository", Value::String("other-project".to_owned())),

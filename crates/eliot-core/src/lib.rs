@@ -18,6 +18,7 @@ mod command;
 mod context;
 mod diagnostics;
 mod ids;
+mod mcp_policy;
 mod native_child;
 mod native_store;
 mod remote_call;
@@ -37,6 +38,10 @@ pub use diagnostics::{
     bound_stderr_diagnostics,
 };
 pub use ids::parse_agent_id;
+pub use mcp_policy::{
+    MAX_MCP_ALLOW_ENTRIES, MAX_MCP_SERVER_NAME_LEN, MCP_POLICY_INHERIT, MCP_POLICY_MINIMAL,
+    McpPolicy, parse_snapshot_allow_list, validate_allow_list,
+};
 pub use native_child::{
     CODEX_NATIVE_CHILD_FAMILIES, ChildRegistration, ChildRegistrationAck,
     MUSE_NATIVE_CHILD_FAMILIES, NATIVE_CHILD_FAMILIES, native_child_families_for_harness,

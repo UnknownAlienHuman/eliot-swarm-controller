@@ -2309,6 +2309,7 @@ fn muse_manifest() -> PluginManifest {
         ("message".to_owned(), "stream".to_owned()),
         ("request".to_owned(), "stream".to_owned()),
         ("session".to_owned(), "stream".to_owned()),
+        ("tool".to_owned(), "stream".to_owned()),
         ("turn".to_owned(), "stream".to_owned()),
     ]);
     PluginManifest {
@@ -2438,7 +2439,7 @@ mod tests {
 
     #[test]
     fn source_plan_requires_the_connected_stream_families() {
-        const FAMILIES: &[&str] = &["session", "turn", "message", "request"];
+        const FAMILIES: &[&str] = &["session", "turn", "message", "tool", "request"];
         assert!(validate_source_plan("Muse", FAMILIES, None).is_err());
         assert!(
             validate_source_plan(
@@ -2446,7 +2447,7 @@ mod tests {
                 FAMILIES,
                 Some(&json!({
                     "session": "stream", "turn": "stream", "message": "stream",
-                    "request": "stream",
+                    "tool": "stream", "request": "stream",
                 }))
             )
             .is_ok()
@@ -2457,7 +2458,7 @@ mod tests {
                 FAMILIES,
                 Some(&json!({
                     "session": "stream", "turn": "stream", "message": "stream",
-                    "request": "stream", "tool": "stream",
+                    "tool": "stream", "request": "stream", "goal": "stream",
                 }))
             )
             .is_ok()
@@ -2584,7 +2585,8 @@ mod tests {
             "generation": 1,
             "command_id": "018f0a00-0000-7000-8000-000000000001",
             "source_plan": {
-                "session": "stream", "turn": "stream", "message": "stream", "request": "stream"
+                "session": "stream", "turn": "stream", "message": "stream",
+                "tool": "stream", "request": "stream"
             },
             "profile": {
                 "harness": "muse",
