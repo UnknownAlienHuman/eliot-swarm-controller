@@ -66,9 +66,11 @@ the owned CLI and is removed after confirmed stop and drain.
 
 The additive per-run config above is the `inherit` policy (the default):
 other native MCP sources keep Claude Code's normal behavior. Profiles may
-select `mcp = "minimal"` with an optional `mcp_allow` list, frozen in the
-profile snapshot. `minimal` adds the installed `--strict-mcp-config` flag
-ahead of `--mcp-config`, so only the per-run file applies. Verified
+select `mcp = "minimal"`, frozen in the profile snapshot; a non-empty
+`mcp_allow` is rejected as `unsupported` at config load because Claude has
+no selective-inclusion mechanism. `minimal` adds the installed
+`--strict-mcp-config` flag ahead of `--mcp-config`, so only the per-run
+file applies. Verified
 read-only against installed Claude Code 2.1.278 (`claude --help`):
 `--strict-mcp-config` means "Only use MCP servers from `--mcp-config`,
 ignoring all other MCP configurations". Eliot never writes Claude's user

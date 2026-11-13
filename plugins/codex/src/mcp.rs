@@ -210,6 +210,25 @@ pub(super) fn merge_status_page(
     Ok(page.next_cursor)
 }
 
+/// Fail closed when the completed minimal inventory has no non-disabled own
+/// Agent-scoped server entry. A disabled own server never reaches the
+/// accumulated set (absence, not a null status, is absence), and an empty
+/// inventory merges acceptably, so neither proves isolation: the caller runs
+/// this over the completed inventory before accepting `minimal`.
+pub(super) fn require_minimal_own_server(
+    accumulated: &[String],
+    own_server_name: &str,
+) -> Result<()> {
+    if accumulated.iter().any(|name| name == own_server_name) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "profile_error",
+            "Codex minimal MCP inventory omits the Agent-scoped server, so isolation is unverified",
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +371,30 @@ mod tests {
 
         let broken = json!({"mcp": "isolated"});
         assert!(policy_from_profile(broken.as_object().unwrap()).is_err());
+    }
+
+    #[test]
+    fn minimal_verification_requires_own_server_present() {
+        assert!(require_minimal_own_server(&["eliot_swarm_x".to_owned()], "eliot_swarm_x").is_ok());
+        for inventory in [Vec::new(), vec!["owner-a".to_owned()]] {
+            let error = require_minimal_own_server(&inventory, "eliot_swarm_x").unwrap_err();
+            assert_eq!(error.code, "profile_error");
+        }
+        // A disabled own server never reaches the accumulated set, and an
+        // empty inventory merges acceptably, so the completed inventory still
+        // fails closed here.
+        let disabled_own = parse_status_page(
+            &json!({"data": [{"name": "eliot_swarm_x", "runtimeStatus": "disabled"}]}),
+            &[],
+            "eliot_swarm_x",
+        )
+        .unwrap();
+        assert!(disabled_own.acceptable);
+        assert!(disabled_own.effective.is_empty());
+        assert!(require_minimal_own_server(&disabled_own.effective, "eliot_swarm_x").is_err());
+
+        let empty = parse_status_page(&json!({"data": []}), &[], "eliot_swarm_x").unwrap();
+        assert!(empty.acceptable);
+        assert!(require_minimal_own_server(&empty.effective, "eliot_swarm_x").is_err());
     }
 }

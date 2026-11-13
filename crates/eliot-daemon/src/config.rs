@@ -1164,8 +1164,11 @@ fn snapshot_from_entry(
         entry,
         table_offset,
         source,
-        "Codex",
-        true,
+        McpHarnessSupport {
+            harness: "Codex",
+            minimal: true,
+            allow: true,
+        },
     )?;
     insert_control(
         &mut snapshot,
@@ -1412,8 +1415,11 @@ fn muse_snapshot_from_entry(
         entry,
         table_offset,
         source,
-        "Muse",
-        false,
+        McpHarnessSupport {
+            harness: "Muse",
+            minimal: false,
+            allow: false,
+        },
     )?;
     snapshot.insert(
         "permissions".to_owned(),
@@ -1623,8 +1629,11 @@ fn claude_snapshot_from_entry(
         entry,
         table_offset,
         source,
-        "Claude",
-        true,
+        McpHarnessSupport {
+            harness: "Claude",
+            minimal: true,
+            allow: false,
+        },
     )?;
     snapshot.insert(
         "pass_env".to_owned(),
@@ -1749,8 +1758,11 @@ fn opencode_snapshot_from_entry(
         entry,
         table_offset,
         source,
-        "OpenCode",
-        false,
+        McpHarnessSupport {
+            harness: "OpenCode",
+            minimal: false,
+            allow: false,
+        },
     )?;
     insert_control(
         &mut snapshot,
@@ -1867,8 +1879,11 @@ fn antigravity_snapshot_from_entry(
         entry,
         table_offset,
         source,
-        "Antigravity",
-        false,
+        McpHarnessSupport {
+            harness: "Antigravity",
+            minimal: false,
+            allow: false,
+        },
     )?;
     insert_control(
         &mut snapshot,
@@ -2181,21 +2196,32 @@ fn insert_control(
     Ok(())
 }
 
+/// Which worker MCP policy pieces a harness plugin implements.
+struct McpHarnessSupport<'a> {
+    harness: &'a str,
+    minimal: bool,
+    allow: bool,
+}
+
 /// Validate the worker MCP inheritance policy and freeze it with the profile
-/// snapshot. `supports_minimal` names whether the harness plugin implements
-/// an isolation mechanism for `minimal` (Codex, Claude); other harnesses
-/// keep `inherit` only and reject `minimal` as unsupported. A non-empty
-/// allow list always requires `minimal`, so an allowed set cannot silently
-/// ride on the default.
+/// snapshot. `minimal`/`allow` name whether the harness plugin implements an
+/// isolation mechanism for `minimal` (Codex, Claude) and selective inclusion
+/// of named native servers (Codex only: Claude minimal is Eliot-only config
+/// plus `--strict-mcp-config`, so an allow list would be silently dropped);
+/// other harnesses keep `inherit` only and reject `minimal` as unsupported.
+/// A non-empty allow list always requires `minimal`, so an allowed set
+/// cannot silently ride on the default.
 fn freeze_mcp_policy(
     snapshot: &mut serde_json::Map<String, Value>,
     name: &str,
     entry: &ProfileEntry,
     table_offset: usize,
     source: &str,
-    harness: &str,
-    supports_minimal: bool,
+    support: McpHarnessSupport<'_>,
 ) -> core::Result<()> {
+    let harness = support.harness;
+    let supports_minimal = support.minimal;
+    let supports_allow = support.allow;
     let policy = core::McpPolicy::parse(entry.mcp.as_deref()).map_err(|error| {
         profile_field_error(
             source,
@@ -2234,6 +2260,16 @@ fn freeze_mcp_policy(
             name,
             "mcp",
             &format!("mcp = \"minimal\" has no {harness} mapping"),
+            "unsupported",
+        ));
+    }
+    if !allow.is_empty() && !supports_allow {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "mcp_allow",
+            &format!("mcp_allow has no {harness} mapping"),
             "unsupported",
         ));
     }
@@ -3582,19 +3618,39 @@ permissions = "workspace-write"
             assert_eq!(error.code, "profile_error", "{source}");
         }
 
-        // Claude implements minimal; Muse, OpenCode and Antigravity keep
-        // inherit only until a harness isolation mechanism is verified.
+        // Claude implements minimal without selective inclusion, so a
+        // non-empty allow list is unsupported there; only Codex maps it.
+        // Muse, OpenCode and Antigravity keep inherit only until a harness
+        // isolation mechanism is verified.
         let claude_cmd = if cfg!(windows) {
             "C:/Users/test/.local/bin/claude.exe"
         } else {
             "/tmp/eliot-claude-cmd-test/claude"
         };
         let source = format!(
-            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='{claude_cmd}'\nmcp='minimal'\nmcp_allow=['owner-search']\n"
+            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='{claude_cmd}'\nmcp='minimal'\n"
         );
         let snapshot = resolve_text_profile(&source, "claude").unwrap();
         assert_eq!(snapshot["mcp"], "minimal");
-        assert_eq!(snapshot["mcp_allow"], json!(["owner-search"]));
+        assert_eq!(snapshot["mcp_allow"], json!([]));
+
+        for (source, code) in [
+            (
+                format!(
+                    "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='{claude_cmd}'\nmcp='minimal'\nmcp_allow=['owner-search']\n"
+                ),
+                "unsupported",
+            ),
+            (
+                format!(
+                    "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='{claude_cmd}'\nmcp_allow=['owner-search']\n"
+                ),
+                "profile_error",
+            ),
+        ] {
+            let error = resolve_text_profile(&source, "claude").expect_err("must reject");
+            assert_eq!(error.code, code, "{source}");
+        }
 
         for (name, source, code) in [
             (

@@ -2,6 +2,7 @@ use crate::{
     events::{self, EventConfig, EventHandle, TurnFacts},
     mcp::{
         McpReadback, compute_disables, merge_status_page, parse_status_page, policy_from_profile,
+        require_minimal_own_server,
     },
     native::{
         NativeClient, NativeLaunch, NativeProcess,
@@ -706,6 +707,7 @@ impl CodexPlugin {
             };
             let enumerated = crate::discovery::read_effective_mcp_server_names(
                 &probe,
+                &frozen_store,
                 &metadata_secrets,
                 &secrets,
                 Instant::now() + RPC_TIMEOUT,
@@ -1319,7 +1321,9 @@ impl CodexPlugin {
         // Requested vs observed MCP surface: read the installed
         // `mcpServerStatus/list` inventory (verified in the 0.167.1
         // app-server schema) and keep names only. Minimal fails closed
-        // when the visible surface cannot be verified; inherit reports
+        // when the visible surface cannot be verified, shows an enabled
+        // non-allowed server, or omits the Agent-scoped server; inherit
+        // performs no inventory readback on the readiness path and reports
         // the set as unknown instead of echoing the requested set.
         let enforce_minimal = context.mcp_policy == McpPolicy::Minimal;
         let mcp_readback = if enforce_minimal {
@@ -1339,15 +1343,11 @@ impl CodexPlugin {
                 )
             })?
         } else {
-            Self::read_mcp_status(
-                client,
-                context.mcp_allow,
-                context.own_mcp_server,
-                context.metadata_secrets,
-                false,
-            )
-            .await
-            .unwrap_or_else(|_| McpReadback::unverified())
+            // Inherit keeps the exact previous startup path: no inventory
+            // RPCs on the readiness path. Each inventory RPC owns up to the
+            // whole outer `agent.start` budget, so even an optional read
+            // regresses default startup; the set stays unknown instead.
+            McpReadback::unverified()
         };
 
         if !context.route.requires_chatgpt() {
@@ -1433,6 +1433,13 @@ impl CodexPlugin {
                 "native_readback",
                 "Codex MCP inventory is paginated beyond its bound",
             ));
+        }
+        if enforce_minimal {
+            // The completed inventory must show Eliot's own Agent-scoped
+            // server as present and enabled; an empty inventory or a
+            // disabled own entry proves nothing and fails closed here,
+            // before any thread or input.
+            require_minimal_own_server(&accumulated, own_mcp_server)?;
         }
         Ok(McpReadback::verified(accumulated))
     }

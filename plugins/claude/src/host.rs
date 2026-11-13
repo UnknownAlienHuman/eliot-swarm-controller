@@ -586,6 +586,7 @@ impl ClaudePlugin {
             .map_err(|error| Error::new("profile_error", format!("Claude {}", error.message)))?;
         let requested_mcp_allow = eliot_core::parse_snapshot_allow_list(profile)
             .map_err(|error| Error::new("profile_error", format!("Claude {}", error.message)))?;
+        check_mcp_allow_empty(&requested_mcp_allow)?;
         let workspace = params
             .workspace
             .as_deref()
@@ -2077,6 +2078,22 @@ fn setter_error(error: Error, subtype: &str) -> Error {
     }
 }
 
+/// Claude has no selective-inclusion mechanism: minimal is the Eliot-only
+/// per-run config plus `--strict-mcp-config`, so a non-empty allow list
+/// would be silently dropped. Reject it as unsupported at config load, so a
+/// stale snapshot fails closed instead of losing explicitly allowed
+/// integrations.
+fn check_mcp_allow_empty(allow: &[String]) -> Result<()> {
+    if allow.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "unsupported",
+            "Claude mcp_allow has no selective-inclusion mapping",
+        ))
+    }
+}
+
 /// MCP argv pair for the frozen policy. Minimal adds `--strict-mcp-config`
 /// ahead of the per-run config so only it applies (installed CLI 2.1.278:
 /// the flag ignores all other MCP configurations); inherit passes only the
@@ -2194,7 +2211,9 @@ fn target_environment(
 
 #[cfg(test)]
 mod tests {
-    use super::{claude_manifest, claude_scope, mcp_argv, new_uuid, setter_error};
+    use super::{
+        check_mcp_allow_empty, claude_manifest, claude_scope, mcp_argv, new_uuid, setter_error,
+    };
     use eliot_core::Error;
     use eliot_core::McpPolicy;
     use eliot_plugin::session::{parse_resume_subject, validate_source_plan};
@@ -2239,6 +2258,13 @@ mod tests {
                 std::ffi::OsString::from("agent-mcp.json"),
             ]
         );
+    }
+
+    #[test]
+    fn claude_mcp_allow_is_unsupported() {
+        assert!(check_mcp_allow_empty(&[]).is_ok());
+        let error = check_mcp_allow_empty(&["owner-search".to_owned()]).unwrap_err();
+        assert_eq!(error.code, "unsupported");
     }
 
     #[test]

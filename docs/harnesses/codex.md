@@ -123,15 +123,19 @@ plus the explicitly allowed servers:
 
 - Before spawn, a short-lived metadata reader (initialize, one `config/read`
   with the worker cwd, close; no thread) enumerates the worker-visible
-  `mcp_servers` keys. Every enumerated server outside the allow list gets its
-  own `-c mcp_servers.<name>.enabled=false` override; a name no `-c` path can
-  address (Codex splits override paths on literal dots before decoding)
-  fails the start closed instead of silently inheriting.
+  `mcp_servers` keys. The reader is pinned to the frozen native-store
+  binding the same way the worker launch is pinned, and the pin is verified
+  before the enumeration is trusted. Every enumerated server outside the
+  allow list gets its own `-c mcp_servers.<name>.enabled=false` override; a
+  name no `-c` path can address (Codex splits override paths on literal dots
+  before decoding) fails the start closed instead of silently inheriting.
 - After initialize, the installed `mcpServerStatus/list` inventory is read
   back (names only, secret-checked) and reported as `effective.mcp_servers`
   with `mcp_servers_verified`. `minimal` fails closed when the visible
-  surface cannot be verified or shows an enabled non-allowed server;
-  `inherit` reports the set when available and `null` / unverified otherwise.
+  surface cannot be verified, shows an enabled non-allowed server, or omits
+  the Agent-scoped server (an empty inventory or a disabled own entry proves
+  nothing); `inherit` performs no inventory readback on the readiness path
+  and reports `null` / unverified.
 
 Requested vs observed: `requested` carries `mcp_policy` and `mcp_allow`;
 `effective` carries `mcp_policy`, `mcp_servers` (native-readback names, or

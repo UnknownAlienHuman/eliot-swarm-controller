@@ -145,11 +145,16 @@ changes native-store/observer bindings.
 
 Only the Codex and Claude harnesses implement `minimal`, each with its
 installed isolation mechanism; Muse, OpenCode and Antigravity keep
-`inherit` only and reject `minimal` as unsupported. See the owning harness
-pages. Requested vs observed: the effective server set is reported from
-native readback only where the harness supports it (`mcp_servers` with
-`mcp_servers_verified`); otherwise it stays unknown (`null` / unverified),
-never an echo of the requested set.
+`inherit` only and reject `minimal` as unsupported. Only Codex implements
+selective inclusion: a non-empty `mcp_allow` with `minimal` on any other
+harness is rejected as `unsupported` at config load (Claude `minimal` is the
+Eliot-only per-run config plus `--strict-mcp-config`, so an allow list
+would be silently dropped; with `inherit` an allow list is already rejected
+because it requires `minimal`). See the owning harness pages. Requested vs
+observed: the
+effective server set is reported from native readback only where the harness
+supports it (`mcp_servers` with `mcp_servers_verified`); otherwise it stays
+unknown (`null` / unverified), never an echo of the requested set.
 
 ## Owner workspace setup
 
