@@ -821,18 +821,17 @@ pub(crate) async fn run_goal_driver(
                             &mut pending_reconcile,
                             follow,
                         );
-                    } else {
-                        drain_pending_reconcile(
-                            &router,
-                            run_check,
-                            &mut rounds,
-                            &mut in_flight,
-                            &mut pending,
-                            &mut pending_reconcile,
-                            &agent,
-                        )
-                        .await;
                     }
+                    drain_pending_reconcile(
+                        &router,
+                        run_check,
+                        &mut rounds,
+                        &mut in_flight,
+                        &mut pending,
+                        &mut pending_reconcile,
+                        &agent,
+                    )
+                    .await;
                 }
             }
         }
@@ -1204,9 +1203,9 @@ async fn reconcile_idle_goals(
 /// Drive waiting retained subjects when a round resolves: the joined
 /// Goal's own revision-bound follow-up first, then the oldest queued
 /// subject in Agent order while a scheduler slot is free. Each subject
-/// is revalidated against the Store — same generation, same unconsumed
-/// idle key — so a subject spent while it waited stays silent without
-/// taking the freed slot.
+/// is revalidated against the Store — same generation and revision, same
+/// unconsumed idle key — so a subject spent while it waited stays silent
+/// without taking the freed slot.
 async fn drain_pending_reconcile(
     router: &Router,
     run_check: GoalCheckRunner,
@@ -1247,6 +1246,7 @@ async fn drain_pending_reconcile(
                     .find(|candidate| candidate.agent == agent)
                     .is_some_and(|candidate| {
                         candidate.generation == generation
+                            && candidate.revision == revision
                             && candidate.idle_seq == Some(seq)
                             && !candidate.key_consumed
                     }),
@@ -3149,11 +3149,18 @@ mod tests {
             set_goal(&router, &agent, definition("keep green")).await;
             agents.push((agent, high_water(&router).await));
         }
-        // Spend the first four keys: continued rounds stay active with a
-        // burned subject, so the sweep must skip them before the cap.
+        // Burn the first four keys without admitting a continuation: an
+        // unknown round spends its key through the marker, stays active
+        // and appends no Agent events, so the sweep must skip the still
+        // current consumed keys before the cap.
         for (agent, key) in &agents[..MAX_CONCURRENT_AUTO_ROUNDS] {
-            drive_event(&router, failing_runner, idle_event(agent, 1, *key)).await;
-            assert_eq!(stored_goal(&router, agent).await.counters.rounds, 1);
+            drive_event(&router, unknown_runner, idle_event(agent, 1, *key)).await;
+            let view = stored_goal(&router, agent).await;
+            assert_eq!(view.counters.rounds, 0);
+            assert_eq!(view.last_round_key, None);
+            let marker = view.round_marker.expect("burned key stays visible");
+            assert_eq!(marker.round_key, format!("idle:{key}"));
+            assert_eq!(marker.state, eliot_core::api::GoalMarkerState::Unknown);
         }
         let mut rounds: JoinSet<(String, i64)> = JoinSet::new();
         let mut in_flight: HashMap<String, InFlightAutoRound> = HashMap::new();
@@ -3209,9 +3216,9 @@ mod tests {
             assert_eq!(view.counters.rounds, 1);
             assert_eq!(view.last_round_key, Some(format!("idle:{key}")));
         }
-        // The spent Goals never rounded again.
+        // The spent Goals never rounded.
         for (agent, _) in &agents[..MAX_CONCURRENT_AUTO_ROUNDS] {
-            assert_eq!(stored_goal(&router, agent).await.counters.rounds, 1);
+            assert_eq!(stored_goal(&router, agent).await.counters.rounds, 0);
         }
     }
 
@@ -3285,7 +3292,102 @@ mod tests {
         .await
         .expect("follow-up round resolves");
         let view = stored_goal(&router, &agent).await;
-        assert_eq!(view.counters.rounds, 2);
+        // The definition replacement resets the counters, so the
+        // revision-bound follow-up is the first counted round.
+        assert_eq!(view.counters.rounds, 1);
         assert_eq!(view.last_round_key, Some(format!("idle:{key}")));
+    }
+
+    static DRAIN_STARTED: AtomicUsize = AtomicUsize::new(0);
+    static DRAIN_RELEASE: OnceLock<Notify> = OnceLock::new();
+
+    fn drain_runner(
+        _: TokioCommand,
+        _: Vec<u8>,
+        _: Duration,
+        _: Arc<SecretPolicy>,
+        _: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>> {
+        Box::pin(async {
+            DRAIN_STARTED.fetch_add(1, Ordering::SeqCst);
+            DRAIN_RELEASE.get_or_init(Notify::new).notified().await;
+            completed_outcome(0, b"all green", true)
+        })
+    }
+
+    #[tokio::test]
+    async fn goal_driver_drains_queued_reconcile_after_a_follow_up_join() {
+        DRAIN_STARTED.store(0, Ordering::SeqCst);
+        let router = router();
+        let mut agents = Vec::new();
+        for index in 0..MAX_CONCURRENT_AUTO_ROUNDS + 1 {
+            let agent = ready_agent(&router, &format!("goal-drain-follow-up-{index}")).await;
+            set_goal(&router, &agent, definition("keep green")).await;
+            agents.push((agent, high_water(&router).await));
+        }
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let driver = tokio::spawn(run_goal_driver(router.clone(), drain_runner, shutdown_rx));
+        // Fill the cap with four slow rounds.
+        publish_until(&router, &agents[0].0, 1, agents[0].1, &DRAIN_STARTED).await;
+        for (agent, key) in &agents[1..MAX_CONCURRENT_AUTO_ROUNDS] {
+            router.inner.bus.publish(&[idle_event(agent, 1, *key)]);
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while DRAIN_STARTED.load(Ordering::SeqCst) < MAX_CONCURRENT_AUTO_ROUNDS {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cap fills with running checks");
+        // Queue the fifth goal past the cap through a reconcile sweep.
+        set_goal(
+            &router,
+            &agents[MAX_CONCURRENT_AUTO_ROUNDS].0,
+            definition("keep green"),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Newer non-idle events for the running goals: follow-ups that
+        // must not spawn, but must not suppress the drain either.
+        for (agent, key) in &agents[..MAX_CONCURRENT_AUTO_ROUNDS] {
+            router
+                .inner
+                .bus
+                .publish(&[busy_event(agent, 1, *key + 1, AgentState::Waiting)]);
+        }
+        // Release the slow checks; every join carries a follow-up, so the
+        // queued fifth goal rounds only if the join drains after it.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                DRAIN_RELEASE.get_or_init(Notify::new).notify_waiters();
+                if stored_goal(&router, &agents[MAX_CONCURRENT_AUTO_ROUNDS].0)
+                    .await
+                    .counters
+                    .rounds
+                    == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("queued goal rounds after follow-up joins");
+        let queued = &agents[MAX_CONCURRENT_AUTO_ROUNDS].0;
+        let view = stored_goal(&router, queued).await;
+        assert_eq!(
+            view.last_round_key,
+            Some(format!("idle:{}", agents[MAX_CONCURRENT_AUTO_ROUNDS].1))
+        );
+        // The follow-ups never spawned extra rounds.
+        for (agent, _) in &agents[..MAX_CONCURRENT_AUTO_ROUNDS] {
+            assert_eq!(stored_goal(&router, agent).await.counters.rounds, 1);
+        }
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), driver)
+            .await
+            .expect("driver joins")
+            .unwrap()
+            .unwrap();
     }
 }
