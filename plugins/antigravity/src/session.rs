@@ -44,12 +44,20 @@ struct RetainedCommand {
     outcome: Result<Value>,
 }
 
-struct OwnedHookConfig {
+pub(crate) struct OwnedHookConfig {
     path: PathBuf,
+    root: PathBuf,
     remove_agents_dir: bool,
+    remove_root: bool,
 }
 
-struct HookConfigGuard(Option<OwnedHookConfig>);
+impl OwnedHookConfig {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+pub(crate) struct HookConfigGuard(pub(crate) Option<OwnedHookConfig>);
 
 impl Drop for HookConfigGuard {
     fn drop(&mut self) {
@@ -133,7 +141,7 @@ impl Session {
         plan: &Plan,
         peer: &PeerClient,
         credential: &str,
-        instance_dir: &Path,
+        hook_config: OwnedHookConfig,
         hooks: HookServer,
     ) -> Result<Self> {
         let reserved = [
@@ -151,18 +159,14 @@ impl Session {
                 "Antigravity hook environment names are reserved for this generation",
             ));
         }
-        let helper = std::env::current_exe()
-            .map_err(|_| Error::new("io_error", "Could not locate the Eliot hook helper"))?;
-        if !helper.is_absolute() || !helper.is_file() {
+        if hook_config.root() != plan.hook_discovery {
             return Err(Error::new(
                 "invalid",
-                "Eliot hook helper path is not an existing absolute executable",
+                "Antigravity hook discovery root changed after staging",
             ));
         }
-        let mut hook_config = HookConfigGuard(Some(
-            install_hook_config(instance_dir, &plan.launch.cwd, &helper)
-                .map_err(|error| error.with_code("native_not_dispatched"))?,
-        ));
+        let helper = hook_helper_path()?;
+        let mut hook_config = HookConfigGuard(Some(hook_config));
         let mut environment = plan.launch.environment.clone();
         environment.extend(hooks.endpoint_env());
         environment.push((hooks::ENV_HOOK_HELPER.into(), helper.into_os_string()));
@@ -1124,7 +1128,25 @@ pub(crate) fn unknown_steer(command_id: &str, turn_id: &str, reason: &str) -> Va
     })
 }
 
-fn install_hook_config(
+pub(crate) fn hook_helper_path() -> Result<PathBuf> {
+    let helper = std::env::current_exe()
+        .map_err(|_| Error::new("io_error", "Could not locate the Eliot hook helper"))?;
+    if !helper.is_absolute() || !helper.is_file() {
+        return Err(Error::new(
+            "invalid",
+            "Eliot hook helper path is not an existing absolute executable",
+        ));
+    }
+    Ok(helper)
+}
+
+/// Stage the dedicated hook-discovery root for one generation: a sibling of
+/// the private instance directory holding nothing but `.agents/hooks.json`
+/// (no tokens, logs, state, or sockets). The native CLI discovers hooks
+/// through `--add-dir`, so this root — never the instance directory — is
+/// the only `--add-dir` value. Both fresh starts and resumed sessions stage
+/// a new root on this same path; hook delivery itself is unchanged.
+pub(crate) fn stage_hook_config(
     instance_dir: &Path,
     workspace: &Path,
     helper: &Path,
@@ -1144,12 +1166,53 @@ fn install_hook_config(
             "Antigravity private instance directory overlaps its workspace",
         ));
     }
+    let parent = private_root.parent().ok_or_else(|| {
+        Error::new(
+            "invalid",
+            "Antigravity private instance directory has no parent",
+        )
+    })?;
+    let basename = private_root.file_name().ok_or_else(|| {
+        Error::new(
+            "invalid",
+            "Antigravity private instance directory has no name",
+        )
+    })?;
+    let mut root_name = basename.to_owned();
+    root_name.push("-hooks");
+    let root = parent.join(root_name);
+    // Fail closed on a pre-existing directory: never reuse or merge into an
+    // unowned root.
+    if fs::create_dir(&root).is_err() {
+        return Err(Error::new(
+            "io_error",
+            "Could not create the owned Antigravity hook discovery directory",
+        ));
+    }
+    let root = match fs::canonicalize(&root) {
+        Ok(path) if path.is_dir() && path.starts_with(parent) => path,
+        _ => {
+            let _ = fs::remove_dir(&root);
+            return Err(Error::new(
+                "invalid",
+                "Antigravity hook discovery directory is not contained by its parent",
+            ));
+        }
+    };
+    if root.starts_with(&workspace) || workspace.starts_with(&root) {
+        let _ = fs::remove_dir(&root);
+        return Err(Error::new(
+            "invalid",
+            "Antigravity hook discovery directory overlaps its workspace",
+        ));
+    }
 
-    let agents_dir = private_root.join(".agents");
+    let agents_dir = root.join(".agents");
     let remove_agents_dir = match fs::create_dir(&agents_dir) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(_) => {
+            let _ = fs::remove_dir(&root);
             return Err(Error::new(
                 "io_error",
                 "Could not create the private Antigravity hooks directory",
@@ -1157,14 +1220,15 @@ fn install_hook_config(
         }
     };
     let agents_dir = match fs::canonicalize(&agents_dir) {
-        Ok(path) if path.is_dir() && path.starts_with(&private_root) => path,
+        Ok(path) if path.is_dir() && path.starts_with(&root) => path,
         _ => {
             if remove_agents_dir {
                 let _ = fs::remove_dir(&agents_dir);
             }
+            let _ = fs::remove_dir(&root);
             return Err(Error::new(
                 "invalid",
-                "Antigravity hooks directory is not contained by its private instance",
+                "Antigravity hooks directory is not contained by its hook discovery root",
             ));
         }
     };
@@ -1176,6 +1240,7 @@ fn install_hook_config(
             if remove_agents_dir {
                 let _ = fs::remove_dir(&agents_dir);
             }
+            let _ = fs::remove_dir(&root);
             return Err(Error::new(
                 "internal",
                 "Could not encode Antigravity hook config",
@@ -1190,6 +1255,7 @@ fn install_hook_config(
             if remove_agents_dir {
                 let _ = fs::remove_dir(&agents_dir);
             }
+            let _ = fs::remove_dir(&root);
             return Err(Error::new(
                 "io_error",
                 "Could not create the owned Antigravity hook config",
@@ -1202,6 +1268,7 @@ fn install_hook_config(
         if remove_agents_dir {
             let _ = fs::remove_dir(&agents_dir);
         }
+        let _ = fs::remove_dir(&root);
         return Err(Error::new(
             "io_error",
             "Could not write the owned Antigravity hook config",
@@ -1209,7 +1276,9 @@ fn install_hook_config(
     }
     Ok(OwnedHookConfig {
         path,
+        root,
         remove_agents_dir,
+        remove_root: true,
     })
 }
 
@@ -1264,6 +1333,11 @@ fn remove_hook_config(config: &OwnedHookConfig) {
         && let Some(parent) = config.path.parent()
     {
         let _ = fs::remove_dir(parent);
+    }
+    // `remove_dir` only removes an empty directory, so an unexpected
+    // non-empty root is left in place rather than deleted.
+    if config.remove_root {
+        let _ = fs::remove_dir(&config.root);
     }
 }
 
@@ -1371,5 +1445,92 @@ mod tests {
             }
             _ => panic!("expected retained unknown error outcome"),
         }
+    }
+
+    fn stage_dirs(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("eliot-agy-stage-{tag}-{}", ulid::Ulid::new()));
+        let instance_dir = base.join("instance-1");
+        let workspace = base.join("workspace");
+        fs::create_dir_all(&instance_dir).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        (base, instance_dir, workspace)
+    }
+
+    fn hook_command_for(helper: &str) -> String {
+        let expected = hooks::hooks_json(
+            hooks::DEFAULT_HOOK_NAME,
+            &format!("{helper} plugin antigravity-hook"),
+        );
+        serde_json::to_string(&expected).unwrap()
+    }
+
+    #[test]
+    fn staged_hook_root_holds_only_hooks_json() {
+        let (base, instance_dir, workspace) = stage_dirs("only");
+        let helper = Path::new("eliot-hook-helper");
+        let config = stage_hook_config(&instance_dir, &workspace, helper).unwrap();
+        // The discovery root is a sibling of the instance directory, never
+        // the instance directory itself.
+        assert_ne!(config.root(), instance_dir);
+        assert_eq!(
+            config.root().parent().unwrap(),
+            fs::canonicalize(&base).unwrap()
+        );
+        let mut root_entries: Vec<_> = fs::read_dir(config.root())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        root_entries.sort();
+        assert_eq!(root_entries, [std::ffi::OsString::from(".agents")]);
+        let mut agents_entries: Vec<_> = fs::read_dir(config.root().join(".agents"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        agents_entries.sort();
+        assert_eq!(agents_entries, [std::ffi::OsString::from("hooks.json")]);
+        assert_eq!(
+            fs::read_to_string(&config.path).unwrap(),
+            hook_command_for("eliot-hook-helper") + "\n"
+        );
+        // The private instance directory gains no hook material.
+        assert!(fs::read_dir(&instance_dir).unwrap().next().is_none());
+        remove_hook_config(&config);
+        assert!(!config.path.exists());
+        assert!(!config.root().exists());
+        assert!(instance_dir.is_dir());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn staging_fails_closed_on_an_existing_root() {
+        let (base, instance_dir, workspace) = stage_dirs("exists");
+        let helper = Path::new("eliot-hook-helper");
+        let squat = base.join("instance-1-hooks");
+        fs::create_dir_all(&squat).unwrap();
+        let error = match stage_hook_config(&instance_dir, &workspace, helper) {
+            Ok(_) => panic!("expected staging to fail on an existing root"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "io_error");
+        // The unowned directory is left untouched.
+        assert!(squat.is_dir());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn staging_rejects_an_overlapping_workspace() {
+        let (base, instance_dir, _) = stage_dirs("overlap");
+        let helper = Path::new("eliot-hook-helper");
+        // A workspace covering the instance tree is rejected before any
+        // hook root is staged.
+        let error = match stage_hook_config(&instance_dir, &base, helper) {
+            Ok(_) => panic!("expected staging to fail on an overlapping workspace"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "invalid");
+        assert!(!base.join("instance-1-hooks").exists());
+        assert!(base.is_dir());
+        let _ = fs::remove_dir_all(&base);
     }
 }
