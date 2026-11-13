@@ -112,6 +112,46 @@ MCP approval when the profile policy is never. This leaves the profile approval 
 and workspace permissions unchanged; Eliot still authorizes every call as the exact
 Agent generation.
 
+### Worker MCP policy
+
+The generated Agent MCP override adds one `mcp_servers.<name>` entry; it does
+not suppress other native servers. Profiles therefore select an explicit
+policy (`mcp = "inherit"` or `"minimal"`, default `inherit`) with an optional
+`mcp_allow` server list, frozen in the profile snapshot. `inherit` keeps the
+additive behavior above. `minimal` starts only Eliot's Agent-scoped server
+plus the explicitly allowed servers:
+
+- Before spawn, a short-lived metadata reader (initialize, one `config/read`
+  with the worker cwd, close; no thread) enumerates the worker-visible
+  `mcp_servers` keys. Every enumerated server outside the allow list gets its
+  own `-c mcp_servers.<name>.enabled=false` override; a name no `-c` path can
+  address (Codex splits override paths on literal dots before decoding)
+  fails the start closed instead of silently inheriting.
+- After initialize, the installed `mcpServerStatus/list` inventory is read
+  back (names only, secret-checked) and reported as `effective.mcp_servers`
+  with `mcp_servers_verified`. `minimal` fails closed when the visible
+  surface cannot be verified or shows an enabled non-allowed server;
+  `inherit` reports the set when available and `null` / unverified otherwise.
+
+Requested vs observed: `requested` carries `mcp_policy` and `mcp_allow`;
+`effective` carries `mcp_policy`, `mcp_servers` (native-readback names, or
+`null` when unobserved) and `mcp_servers_verified`. The requested set is
+never echoed as observed. Servers added to the owner config between
+enumeration and spawn are still suppressed by the per-server overrides only
+when they were enumerated; the status/list verification fails the start when
+it sees them.
+
+Verified read-only against installed Codex 0.167.1 (`codex --help`,
+`codex app-server --help`, `generate-json-schema`): `app-server` has no
+`--ignore-user-config` or strict-MCP flag (`exec` has the former, the
+app-server does not), `-c mcp_servers={}` merges with file config instead of
+replacing it (an isolated-`CODEX_HOME` `mcp list --json` probe still showed
+the file server), per-server `-c mcp_servers.<name>.enabled=false` disables
+that server (probe showed `enabled: false`), and `mcpServerStatus/list`
+exists in the app-server protocol (v2 schema: `{data: [{name,
+runtimeStatus, ...}], nextCursor}`). The owner's global config is never
+edited and `auth.json` is never copied.
+
 Example lifecycle:
 
 ```powershell

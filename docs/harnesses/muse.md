@@ -138,6 +138,14 @@ so effective permissions are reported as unknown (`permissions: null`,
 unproven wire alias. The host flag remains applied at birth; a real native tool probe
 is still required to confirm effective posture.
 
+## Worker MCP policy
+
+This harness keeps `inherit` only: the frozen profile always records
+`mcp = "inherit"`, and a non-`inherit` policy is rejected as `unsupported`
+at config load. Verified read-only (`muse --help`, `muse mcp --help`): `muse
+mcp` covers OAuth login/logout only, and no `serve` isolation flag for MCP
+sources was observed, so no `minimal` mechanism is implemented.
+
 ## Workflow children (native, observe-only)
 
 The Muse plugin observes actual `workflow` item revisions through the existing

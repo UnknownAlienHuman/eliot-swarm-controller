@@ -5,7 +5,7 @@ use crate::{
         types::{InitializeReadback, OutboundUserInput, OutboundUserMessage},
     },
 };
-use eliot_core::{ContextItem, Error, InjectPoint, Result, SecretPolicy};
+use eliot_core::{ContextItem, Error, InjectPoint, McpPolicy, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -105,6 +105,8 @@ struct StartPlan {
     session_id: String,
     requested_model: String,
     requested_permission_mode: Option<String>,
+    requested_mcp_policy: McpPolicy,
+    requested_mcp_allow: Vec<String>,
     resume_ref: Option<String>,
 }
 
@@ -578,6 +580,12 @@ impl ClaudePlugin {
         // unset means the CLI-default posture.
         let requested_permission_mode =
             optional_profile_text(profile, "permission_mode", "Claude")?;
+        // Frozen worker MCP policy: inherit keeps the normal MCP precedence,
+        // minimal is enforced with the installed `--strict-mcp-config` flag.
+        let requested_mcp_policy = McpPolicy::parse_snapshot(profile)
+            .map_err(|error| Error::new("profile_error", format!("Claude {}", error.message)))?;
+        let requested_mcp_allow = eliot_core::parse_snapshot_allow_list(profile)
+            .map_err(|error| Error::new("profile_error", format!("Claude {}", error.message)))?;
         let workspace = params
             .workspace
             .as_deref()
@@ -664,6 +672,8 @@ impl ClaudePlugin {
             session_id,
             requested_model,
             requested_permission_mode,
+            requested_mcp_policy,
+            requested_mcp_allow,
             resume_ref,
         })
     }
@@ -877,12 +887,18 @@ impl ClaudePlugin {
         // reported on an actual native assistant record (message.completed).
         // Requested vs effective permission mode is reported, never forced:
         // launching with `manual` reads back `default` on the installed CLI.
+        // The installed stream-json protocol (2.1.278) exposes no MCP
+        // inventory record, so the effective server set stays unknown (null,
+        // unverified) for both policies instead of echoing the requested set.
         let effective = with_context_points(
             json!({
                 "model": null,
                 "permission_mode": effective_mode,
                 "session_state": readback.session_state,
                 "pid": readback.pid,
+                "mcp_policy": plan.requested_mcp_policy.as_str(),
+                "mcp_servers": null,
+                "mcp_servers_verified": false,
             }),
             &[InjectPoint::NextInput, InjectPoint::TurnSafePoint],
         );
@@ -931,6 +947,8 @@ impl ClaudePlugin {
                 "model": plan.requested_model.clone(),
                 "permission_mode": plan.requested_permission_mode.clone(),
                 "cwd": plan.workspace.to_string_lossy(),
+                "mcp_policy": plan.requested_mcp_policy.as_str(),
+                "mcp_allow": plan.requested_mcp_allow.clone(),
             },
             "effective": effective,
         });
@@ -1937,10 +1955,10 @@ async fn launch_session(
         argv.push(OsString::from("--permission-mode"));
         argv.push(OsString::from(mode));
     }
-    // Use an additive per-run config. Never pass --strict-mcp-config: other
-    // native MCP sources remain governed by Claude Code's normal precedence.
-    argv.push(OsString::from("--mcp-config"));
-    argv.push(mcp_config.path().as_os_str().to_owned());
+    argv.extend(mcp_argv(
+        plan.requested_mcp_policy,
+        mcp_config.path().as_os_str(),
+    ));
     // The CLI keeps its own login (not the desktop app's): check it, and run
     // its browser login when it is logged out, before any native resource.
     crate::native::ensure_logged_in(&plan.program, &plan.workspace, &plan.environment).await?;
@@ -2059,6 +2077,20 @@ fn setter_error(error: Error, subtype: &str) -> Error {
     }
 }
 
+/// MCP argv pair for the frozen policy. Minimal adds `--strict-mcp-config`
+/// ahead of the per-run config so only it applies (installed CLI 2.1.278:
+/// the flag ignores all other MCP configurations); inherit passes only the
+/// additive per-run config and keeps the normal precedence.
+fn mcp_argv(policy: McpPolicy, config_path: &std::ffi::OsStr) -> Vec<OsString> {
+    let mut argv = Vec::with_capacity(3);
+    if policy == McpPolicy::Minimal {
+        argv.push(OsString::from("--strict-mcp-config"));
+    }
+    argv.push(OsString::from("--mcp-config"));
+    argv.push(config_path.to_owned());
+    argv
+}
+
 fn claude_manifest() -> PluginManifest {
     let controlled = BTreeMap::from([
         ("message".to_owned(), "stream".to_owned()),
@@ -2162,8 +2194,9 @@ fn target_environment(
 
 #[cfg(test)]
 mod tests {
-    use super::{claude_manifest, claude_scope, new_uuid, setter_error};
+    use super::{claude_manifest, claude_scope, mcp_argv, new_uuid, setter_error};
     use eliot_core::Error;
+    use eliot_core::McpPolicy;
     use eliot_plugin::session::{parse_resume_subject, validate_source_plan};
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, HashSet};
@@ -2186,6 +2219,26 @@ mod tests {
             );
             assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
         }
+    }
+
+    #[test]
+    fn mcp_argv_is_strict_only_for_minimal() {
+        let config = std::ffi::OsStr::new("agent-mcp.json");
+        assert_eq!(
+            mcp_argv(McpPolicy::Inherit, config),
+            vec![
+                std::ffi::OsString::from("--mcp-config"),
+                std::ffi::OsString::from("agent-mcp.json"),
+            ]
+        );
+        assert_eq!(
+            mcp_argv(McpPolicy::Minimal, config),
+            vec![
+                std::ffi::OsString::from("--strict-mcp-config"),
+                std::ffi::OsString::from("--mcp-config"),
+                std::ffi::OsString::from("agent-mcp.json"),
+            ]
+        );
     }
 
     #[test]
