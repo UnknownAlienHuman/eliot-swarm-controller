@@ -3717,6 +3717,190 @@ fn terminal_turn_persists_canonical_outcome_and_legacy_status_classifies() {
 }
 
 #[test]
+fn claude_legacy_rows_classify_from_the_raw_terminal_reason() {
+    // Pre-outcome Claude rows carry the raw terminal reason in `status`
+    // (`success`, `api_error*`), not the normalized lifecycle status, so a
+    // harness-blind read reports them as unknown. Retrying the identical
+    // retained command with `--wait` must exit 0/1, not 4.
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let launch_id = Ulid::new().to_string();
+    let admission = store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: launch_id.clone(),
+                target: None,
+                selector: None,
+                verb: "launch".to_owned(),
+                args: json!({"project":"claude-legacy", "workspace":"synthetic-workspace", "harness":"claude", "profile":"claude-fixture", "profile_snapshot":{}}),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit claude launch");
+    let agent = admission.command.target.expect("launch target");
+    store.dispatch(&launch_id, now).expect("dispatch launch");
+    let plan = ["session", "turn", "message", "tool", "request"]
+        .into_iter()
+        .map(|family| (family.to_owned(), "stream".to_owned()))
+        .collect();
+    store
+        .install_plugin_sources(&agent, 1, &launch_id, &plan, now)
+        .expect("install stream source owners");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "ready".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: "ready".to_owned(),
+                    data: json!({"command_id":launch_id}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit ready");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now)
+        .expect("settle start");
+
+    let legacy_turn = |store: &mut Store, status: &str, now: i64| -> String {
+        let send_id = Ulid::new().to_string();
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: send_id.clone(),
+                    target: Some(agent.clone()),
+                    selector: None,
+                    verb: "send".to_owned(),
+                    args: json!({"text":"legacy"}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .expect("admit send");
+        store.dispatch(&send_id, now).expect("dispatch send");
+        let turn_id = format!("turn-{send_id}");
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{turn_id}:started"),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "turn.started".to_owned(),
+                        native_id: format!("{turn_id}:started"),
+                        data: json!({"command_id":send_id, "turn_id":turn_id}),
+                    }],
+                    cursor: None,
+                },
+                now + 1,
+            )
+            .expect("commit turn start");
+        // No `outcome`: a row written before canonical outcomes existed.
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{turn_id}:terminal"),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "turn.completed".to_owned(),
+                        native_id: format!("{turn_id}:terminal"),
+                        data: json!({"command_id":send_id, "turn_id":turn_id, "status":status}),
+                    }],
+                    cursor: None,
+                },
+                now + 2,
+            )
+            .expect("commit legacy terminal turn");
+        turn_id
+    };
+
+    let mut tick = 0;
+    for (status, expected) in [
+        ("success", TurnOutcome::Success),
+        ("api_error", TurnOutcome::Failure),
+        ("api_error_rate_limited", TurnOutcome::Failure),
+        ("error", TurnOutcome::Failure),
+        ("cancelled", TurnOutcome::Interrupted),
+        ("completed", TurnOutcome::Unknown),
+        ("bogus", TurnOutcome::Unknown),
+    ] {
+        tick += 10;
+        let turn_id = legacy_turn(&mut store, status, now + tick);
+        let turn = store
+            .get_turn(&agent, 1, &turn_id)
+            .expect("read legacy turn")
+            .expect("legacy turn exists");
+        assert_eq!(turn.state, TurnState::Completed, "status={status}");
+        assert_eq!(turn.outcome, Some(expected), "status={status}");
+        assert_eq!(turn.status.as_deref(), Some(status), "status={status}");
+    }
+
+    // The v30 backfill materializes the same outcomes for already-stored
+    // rows, so a retained command retried with `--wait` exits 0/1, not 4.
+    super::schema::backfill_legacy_turn_outcomes(&mut store.connection)
+        .expect("backfill legacy outcomes");
+    let unfilled: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM turns WHERE outcome IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count unfilled turns");
+    assert_eq!(unfilled, 0);
+
+    // The harness-aware read also feeds the list path, not just `get_turn`.
+    let turns = store.list_turns(&agent, 1, 50).expect("list legacy turns");
+    assert!(
+        turns
+            .iter()
+            .any(|turn| turn.status.as_deref() == Some("success")
+                && turn.outcome == Some(TurnOutcome::Success)),
+        "list_turns must classify the claude success row"
+    );
+    assert!(
+        turns
+            .iter()
+            .any(|turn| turn.status.as_deref() == Some("api_error")
+                && turn.outcome == Some(TurnOutcome::Failure)),
+        "list_turns must classify the claude api_error row"
+    );
+    // The backfilled rows agree with the read-path classification.
+    for (status, expected) in [
+        ("cancelled", TurnOutcome::Interrupted),
+        ("completed", TurnOutcome::Unknown),
+        ("bogus", TurnOutcome::Unknown),
+    ] {
+        assert!(
+            turns.iter().any(
+                |turn| turn.status.as_deref() == Some(status) && turn.outcome == Some(expected)
+            ),
+            "backfill must persist status={status} as {expected:?}"
+        );
+    }
+}
+
+#[test]
 fn secret_question_answer_is_rejected_before_command_persistence() {
     assert!(contains_secret_marker(
         &json!({"questions": [{"is_secret": true}]})

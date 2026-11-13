@@ -617,6 +617,38 @@ impl TurnOutcome {
             _ => Self::Unknown,
         }
     }
+
+    /// Harness-aware classification for rows written before canonical
+    /// outcomes existed, using the stored harness and that adapter's
+    /// recognized native reasons. Claude rows carry the raw terminal reason
+    /// (`success` -> success; `cancelled`/`interrupted` -> interrupted;
+    /// `error`/`failed`/`failure` and the `api_error*` family -> failure).
+    /// Every other harness carries the normalized lifecycle status and uses
+    /// [`Self::classify_legacy_status`]. Anything else is unknown, never
+    /// success.
+    pub fn classify_legacy_status_for_harness(harness: &str, status: Option<&str>) -> Self {
+        if harness != "claude" {
+            return Self::classify_legacy_status(status);
+        }
+        match status.map(str::trim) {
+            Some("success") => Self::Success,
+            Some("cancelled") | Some("interrupted") => Self::Interrupted,
+            Some("error") | Some("failed") | Some("failure") => Self::Failure,
+            Some(reason) => {
+                let lower = reason.to_lowercase();
+                if lower.starts_with("api_error")
+                    || lower.starts_with("error")
+                    || lower.starts_with("failed")
+                    || lower.starts_with("failure")
+                {
+                    Self::Failure
+                } else {
+                    Self::Unknown
+                }
+            }
+            None => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -633,8 +665,8 @@ pub struct Turn {
     pub usage: Option<TurnUsage>,
     /// Canonical outcome decided at the plugin boundary. `None` only for
     /// running turns; terminal turns written before outcomes existed read
-    /// back through [`TurnOutcome::classify_legacy_status`]. Trailing field
-    /// so existing positional wire order stays stable.
+    /// back through [`TurnOutcome::classify_legacy_status_for_harness`].
+    /// Trailing field so existing positional wire order stays stable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<TurnOutcome>,
     /// Raw native terminal reason preserved next to the canonical outcome
@@ -1395,6 +1427,75 @@ mod outcome_tests {
         ] {
             assert_eq!(
                 TurnOutcome::classify_legacy_status(status),
+                TurnOutcome::Unknown,
+                "status={status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_classification_uses_the_stored_harness_for_claude() {
+        // Claude legacy rows carry the raw terminal reason, not the
+        // normalized lifecycle status: `success` and the `api_error*`
+        // family must not read back as unknown.
+        // Non-Claude harnesses keep the normalized lifecycle mapping.
+        for harness in ["codex", "muse", "opencode", "antigravity", "", "fake"] {
+            for status in [
+                Some("completed"),
+                Some("failed"),
+                Some("success"),
+                Some("api_error"),
+                None,
+            ] {
+                assert_eq!(
+                    TurnOutcome::classify_legacy_status_for_harness(harness, status),
+                    TurnOutcome::classify_legacy_status(status),
+                    "harness={harness} status={status:?}"
+                );
+            }
+        }
+        assert_eq!(
+            TurnOutcome::classify_legacy_status_for_harness("claude", Some("success")),
+            TurnOutcome::Success,
+        );
+        for status in [
+            Some("cancelled"),
+            Some("interrupted"),
+            Some(" interrupted "),
+        ] {
+            assert_eq!(
+                TurnOutcome::classify_legacy_status_for_harness("claude", status),
+                TurnOutcome::Interrupted,
+                "status={status:?}"
+            );
+        }
+        for status in [
+            Some("api_error"),
+            Some("api_error_rate_limited"),
+            Some("API_ERROR_TIMEOUT"),
+            Some("error"),
+            Some("ErrorBudget"),
+            Some("failed"),
+            Some("failed_to_start"),
+            Some("failure"),
+        ] {
+            assert_eq!(
+                TurnOutcome::classify_legacy_status_for_harness("claude", status),
+                TurnOutcome::Failure,
+                "status={status:?}"
+            );
+        }
+        for status in [
+            None,
+            Some("completed"),
+            Some("end_turn"),
+            Some("inProgress"),
+            Some(""),
+            Some("max_tokens"),
+            Some("bogus"),
+        ] {
+            assert_eq!(
+                TurnOutcome::classify_legacy_status_for_harness("claude", status),
                 TurnOutcome::Unknown,
                 "status={status:?}"
             );

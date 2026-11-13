@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 29;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 30;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -704,6 +704,56 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 30 {
+            backfill_legacy_turn_outcomes(&mut self.connection)?;
+            self.connection
+                .execute_batch("INSERT INTO schema_migrations(version) VALUES (30);")
+                .map_err(sql_error)?;
+        }
         Ok(())
     }
+}
+
+/// Backfill the canonical outcome for rows written before outcomes existed,
+/// using the stored harness and that adapter's recognized native reasons:
+/// Claude rows carry the raw terminal reason (`success`, the `api_error*`
+/// family, `error`/`failed`/`failure`, `cancelled`/`interrupted`), every
+/// other harness carries the normalized lifecycle status. Anything else
+/// stays unknown, never success. Rows already carrying an outcome and
+/// non-completed rows are untouched.
+pub(super) fn backfill_legacy_turn_outcomes(connection: &mut Connection) -> Result<()> {
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sql_error)?;
+    tx.execute_batch(
+        "UPDATE turns SET outcome = (
+             SELECT CASE
+               WHEN agents.harness = 'claude' THEN
+                 CASE
+                   WHEN trim(turns.status) = 'success' THEN 'success'
+                   WHEN trim(turns.status) IN ('cancelled', 'interrupted') THEN 'interrupted'
+                   WHEN trim(turns.status) IN ('error', 'failed', 'failure') THEN 'failure'
+                   WHEN lower(trim(turns.status)) LIKE 'api\\_error%' ESCAPE '\\' THEN 'failure'
+                   WHEN lower(trim(turns.status)) LIKE 'error%' THEN 'failure'
+                   WHEN lower(trim(turns.status)) LIKE 'failed%' THEN 'failure'
+                   WHEN lower(trim(turns.status)) LIKE 'failure%' THEN 'failure'
+                   ELSE 'unknown'
+                 END
+               ELSE
+                 CASE turns.status
+                   WHEN 'completed' THEN 'success'
+                   WHEN 'failed' THEN 'failure'
+                   WHEN 'error' THEN 'failure'
+                   WHEN 'interrupted' THEN 'interrupted'
+                   WHEN 'cancelled' THEN 'interrupted'
+                   ELSE 'unknown'
+                 END
+             END
+             FROM agents WHERE agents.id = turns.agent
+         )
+         WHERE outcome IS NULL AND state = 'completed';",
+    )
+    .map_err(sql_error)?;
+    tx.commit().map_err(sql_error)?;
+    Ok(())
 }

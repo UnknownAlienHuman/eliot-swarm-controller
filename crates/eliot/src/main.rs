@@ -1710,6 +1710,8 @@ async fn dispatch(
                 let exit_code = turn_exit_code(&turn);
                 (turn_value(turn)?, exit_code)
             } else {
+                // Promptless launch carries no turn to judge: readiness is
+                // the root command applying, not a turn outcome.
                 let command = wait_for_command(&data_dir, root_id, deadline).await?;
                 let exit_code = response_exit_code(command.state);
                 (command_value(command)?, exit_code)
@@ -1788,6 +1790,8 @@ async fn dispatch(
                 let exit_code = turn_exit_code(&turn);
                 (turn_value(turn)?, exit_code)
             } else {
+                // Promptless resume carries no turn to judge: readiness is
+                // the root command applying, not a turn outcome.
                 let command = wait_for_command(&data_dir, &submitted.command_id, deadline).await?;
                 let exit_code = response_exit_code(command.state);
                 (command_value(command)?, exit_code)
@@ -2805,12 +2809,13 @@ fn response_exit_code(state: CommandState) -> u8 {
     }
 }
 
-/// Exit code for one settled turn. Lifecycle (`TurnState::Completed`) and
-/// outcome stay separate facts: only a positively recognized `success`
+/// Exit code for one settled prompted wait. Lifecycle (`TurnState::Completed`)
+/// and outcome stay separate facts: only a positively recognized `success`
 /// exits 0. Supported native failures exit 1, interruption/cancellation
-/// exits 7, and unknown or unclassified terminal statuses exit 4. Rows
-/// written before canonical outcomes existed classify explicitly from
-/// their legacy status, never as success.
+/// exits 7, and unknown or unclassified terminal statuses exit 4. The stored
+/// outcome is already harness-aware for rows written before canonical
+/// outcomes existed; the inline fallback classifies generically and never as
+/// success.
 fn turn_exit_code(turn: &CoreTurn) -> u8 {
     match turn.state {
         TurnState::Completed => {

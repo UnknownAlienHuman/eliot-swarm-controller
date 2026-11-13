@@ -1132,12 +1132,13 @@ impl Store {
     pub fn list_turns(&self, agent: &str, generation: i64, limit: usize) -> Result<Vec<Turn>> {
         validate_limit(limit)?;
         let agent_num = parse_agent_id(agent)?;
-        if load_agent_by_num(&self.connection, agent_num)?.is_none() {
+        let Some(agent_row) = load_agent_by_num(&self.connection, agent_num)? else {
             return Err(Error::new(
                 "not_found",
                 format!("Agent {agent} was not found"),
             ));
-        }
+        };
+        let harness = agent_row.harness;
         let mut statement = self
             .connection
             .prepare(
@@ -1156,7 +1157,7 @@ impl Store {
             .map_err(sql_error)?;
         let mut turns = Vec::new();
         for row in rows {
-            turns.push(turn_from_record(row.map_err(sql_error)?)?);
+            turns.push(turn_from_record(row.map_err(sql_error)?, &harness)?);
         }
         enforce_page_bytes(&mut turns)?;
         Ok(turns)
@@ -3789,19 +3790,20 @@ fn turn_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord>
     })
 }
 
-fn turn_from_record(record: TurnRecord) -> Result<Turn> {
+fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
     let usage = record.usage.as_deref().map(decode_turn_usage).transpose()?;
     let state: TurnState = parse_enum(&record.state, "turn state")?;
     // Rows written before canonical outcomes existed carry no stored outcome:
-    // classify them explicitly from the legacy status, never as success.
+    // classify them explicitly from the legacy status with the stored
+    // harness (Claude rows carry the raw terminal reason), never as success.
     let outcome = match record.outcome.as_deref() {
         Some(value) => Some(
             TurnOutcome::parse(value)
                 .ok_or_else(|| Error::new("internal", "invalid stored turn outcome"))?,
         ),
-        None if state == TurnState::Completed => Some(TurnOutcome::classify_legacy_status(
-            record.status.as_deref(),
-        )),
+        None if state == TurnState::Completed => Some(
+            TurnOutcome::classify_legacy_status_for_harness(harness, record.status.as_deref()),
+        ),
         None => None,
     };
     let native_status = record.native_status.filter(|value| !value.is_empty());
@@ -3841,7 +3843,24 @@ fn load_turn(
         )
         .optional()
         .map_err(sql_error)?;
-    record.map(turn_from_record).transpose()
+    record
+        .map(|record| {
+            let harness = load_harness_by_num(connection, agent)?;
+            turn_from_record(record, &harness)
+        })
+        .transpose()
+}
+
+/// Stored harness for one agent row, used to classify legacy turn rows that
+/// carry no canonical outcome. Missing agent rows classify generically.
+fn load_harness_by_num(connection: &Connection, agent: i64) -> Result<String> {
+    connection
+        .query_row("SELECT harness FROM agents WHERE id = ?1", [agent], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(sql_error)
+        .map(|harness| harness.unwrap_or_default())
 }
 
 fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {

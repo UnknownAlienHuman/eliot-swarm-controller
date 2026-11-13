@@ -543,9 +543,14 @@ CREATE TABLE turns (
 native terminal vocabulary; `turns.native_status` preserves the raw native
 reason next to it. Lifecycle (`state`) and outcome stay separate facts. Rows
 written before canonical outcomes existed carry no stored outcome and read
-back through explicit legacy classification (`completed` to success,
-`failed`/`error` to failure, `interrupted`/`cancelled` to interrupted,
-anything else to unknown), never defaulting to success.
+back through explicit harness-aware legacy classification: Claude rows carry
+the raw terminal reason (`success` to success, `cancelled`/`interrupted` to
+interrupted, `error`/`failed`/`failure` and the `api_error*` family to
+failure, anything else to unknown); every other harness carries the
+normalized lifecycle status (`completed` to success, `failed`/`error` to
+failure, `interrupted`/`cancelled` to interrupted, anything else to unknown),
+never defaulting to success. The v30 migration backfills the outcome for
+completed rows with no stored outcome from that same table.
 CREATE TABLE pending_requests (
   agent INTEGER NOT NULL REFERENCES agents(id), generation INTEGER NOT NULL,
   request_id TEXT NOT NULL, turn_id TEXT NOT NULL, kind TEXT NOT NULL,
