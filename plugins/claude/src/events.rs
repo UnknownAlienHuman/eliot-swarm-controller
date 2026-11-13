@@ -2764,7 +2764,7 @@ impl EventProcessor {
                 // drain in case this immediate record is blocked.
                 let reason = format!(
                     "Claude stream contained an invalid frame ({})",
-                    fault.label()
+                    fault.describe()
                 );
                 if self.pending_fault_gap.is_none() {
                     self.pending_fault_gap = Some(reason.clone());
