@@ -3704,6 +3704,7 @@ fn goal_reconcile_candidates_cover_only_active_idle_keyed_goals() {
     assert_eq!(candidates[0].revision, 1);
     assert_eq!(candidates[0].agent_state, AgentState::Idle);
     assert_eq!(candidates[0].idle_seq, Some(key));
+    assert!(!candidates[0].key_consumed);
     // A paused Goal takes no rounds until resumed.
     store
         .goal_pause(
@@ -3739,4 +3740,60 @@ fn goal_reconcile_candidates_cover_only_active_idle_keyed_goals() {
         .map(|candidate| candidate.agent)
         .collect();
     assert_eq!(agents, vec![agent]);
+}
+
+#[test]
+fn goal_reconcile_candidate_names_the_consumed_key() {
+    let mut store = store();
+    let now = now_ms();
+    let agent = ready_agent(&mut store, "goal-reconcile-burn", now);
+    let view = store
+        .goal_set(
+            &agent,
+            "eliot",
+            &Ulid::new().to_string(),
+            "owner",
+            &definition("green"),
+            now,
+        )
+        .unwrap();
+    let key = store.high_water().unwrap();
+    let fresh = store.goal_reconcile_candidates().unwrap();
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].idle_seq, Some(key));
+    assert!(!fresh[0].key_consumed);
+    // A continued round stays active but spends its idle key.
+    let continued = commit_for(
+        &agent,
+        view.revision,
+        key,
+        Some(failed_check("digest-a")),
+        None,
+        Some(GoalContinuation {
+            id: Ulid::new().to_string(),
+            text: "keep going".to_owned(),
+        }),
+    );
+    claim(&mut store, &agent, view.revision, key, now + 1);
+    let committed = store.goal_commit_round(&continued, now + 1).unwrap();
+    assert_eq!(committed.view.status, GoalStatus::Active);
+    let spent = store.goal_reconcile_candidates().unwrap();
+    assert_eq!(spent.len(), 1);
+    assert_eq!(spent[0].idle_seq, Some(key));
+    assert!(spent[0].key_consumed);
+    // A new definition rearms the still-current subject.
+    store
+        .goal_set(
+            &agent,
+            "eliot",
+            &Ulid::new().to_string(),
+            "owner",
+            &definition("greener"),
+            now + 2,
+        )
+        .unwrap();
+    let rearmed = store.goal_reconcile_candidates().unwrap();
+    assert_eq!(rearmed.len(), 1);
+    assert_eq!(rearmed[0].idle_seq, Some(key));
+    assert!(!rearmed[0].key_consumed);
 }

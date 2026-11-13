@@ -197,6 +197,11 @@ impl GoalRoundCommitResult {
 /// still names an idle event of the Goal's generation; otherwise the
 /// retained evidence is pruned, superseded or never existed and the
 /// Router waits for a real event instead of inventing one.
+/// `key_consumed` names the same burn the probe and claim enforce: the
+/// committed key matches or a non-live marker already spent this
+/// generation's idle key. The Router skips consumed subjects before
+/// taking a scheduler slot, so one burned key cannot starve an
+/// eligible Goal past the concurrency cap.
 #[derive(Clone, Debug)]
 pub struct GoalReconcileCandidate {
     pub agent: String,
@@ -204,6 +209,7 @@ pub struct GoalReconcileCandidate {
     pub revision: i64,
     pub agent_state: AgentState,
     pub idle_seq: Option<i64>,
+    pub key_consumed: bool,
 }
 
 /// A duplicate claim returns its original reply, without another check.
@@ -517,12 +523,32 @@ impl Store {
             } else {
                 None
             };
+            // Name the burn the probe and claim enforce, so the Router
+            // skips spent subjects before taking a scheduler slot.
+            let mut key_consumed = false;
+            if let Some(seq) = idle_seq {
+                let key = GoalRoundKey::Idle(seq);
+                if let Some(row) = load_goal_row(&self.connection, agent_num, "eliot")? {
+                    if row.last_round_key.as_deref() == Some(&key.text()) {
+                        key_consumed = true;
+                    } else {
+                        let markers = load_goal_markers(&self.connection, agent_num, "eliot")?;
+                        key_consumed = markers.iter().any(|marker| {
+                            marker.round_key == key.value()
+                                && marker.kind == key.kind()
+                                && marker.generation == generation
+                                && !marker.is_live(&self.goal_holder)
+                        });
+                    }
+                }
+            }
             candidates.push(GoalReconcileCandidate {
                 agent: format_agent_id(agent_num),
                 generation,
                 revision,
                 agent_state: agent_row.state,
                 idle_seq,
+                key_consumed,
             });
         }
         Ok(candidates)

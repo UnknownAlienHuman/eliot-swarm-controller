@@ -942,9 +942,9 @@ generations, and anything while automation is draining; it waits while an
 active native Goal drives. Each automatic round runs in its own task, at most
 one per Goal and four Goals at once, so a slow check never stalls another
 Goal's round; a newer event for a Goal with a round in flight is driven as
-a follow-up when that round resolves. Events dropped past the cap or to bus
-lag are logged, as are stale rounds. Other races against explicit rounds
-resolve through the
+a follow-up when that round resolves. Bus events dropped past the cap or to
+bus lag are logged, as are queued waits and stale rounds. Other races
+against explicit rounds resolve through the
 single-flight marker and the burn and stay silent. Shutdown cancels every
 in-flight automatic check through its custody cancellation and waits only for
 the rounds to resolve their markers (`unknown`, never rerun).
@@ -954,10 +954,14 @@ retained exact-generation idle subject: the set/resume wakes the driver,
 which sweeps every active non-cadenced Goal bound to its Agent's current
 generation and reserves a round on the latest event only when that row
 still names an idle event of that generation. The sweep uses the same
-reservation as a bus event — same scope, enablement, single-flight and
-cap — without re-offering mail, and waits for a real event when the
+reservation as a bus event — same scope, enablement and single-flight —
+without re-offering mail, and waits for a real event when the
 subject is missing (pruned, superseded or never retained), leaving the
-Goal's marker and counters untouched on the readback. A busy Agent or a
+Goal's marker and counters untouched on the readback. A spent subject is
+skipped before taking a scheduler slot, so burned keys cannot starve
+eligible Goals past the cap; a retained subject that finds its Goal busy
+or the cap full waits in revision-bound order and is revalidated when a
+round resolves. A busy Agent or a
 drifted generation skips silently; a set/resume never resumes a lost
 Agent, and only the round path itself may pause a drifted Goal. Startup
 performs no sweep: the restart marks every owned session lost, so no
