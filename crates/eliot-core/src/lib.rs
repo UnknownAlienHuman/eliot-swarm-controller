@@ -44,7 +44,8 @@ pub use mcp_policy::{
 };
 pub use native_child::{
     CODEX_NATIVE_CHILD_FAMILIES, ChildRegistration, ChildRegistrationAck,
-    MUSE_NATIVE_CHILD_FAMILIES, NATIVE_CHILD_FAMILIES, native_child_families_for_harness,
+    MUSE_NATIVE_CHILD_FAMILIES, NATIVE_CHILD_FAMILIES, NativeChildActivity,
+    NativeChildActivityState, native_child_families_for_harness,
 };
 pub use native_store::NativeStoreBinding;
 pub use remote_call::{RemoteCallContext, RemoteIdentity};
@@ -405,6 +406,8 @@ pub struct Agent {
     #[serde(default)]
     pub effective: Option<Value>,
     pub state: AgentState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<NativeChildActivity>,
     pub active_turn: Option<String>,
     #[serde(default)]
     pub pending: Vec<PendingRequest>,
@@ -445,6 +448,7 @@ impl Agent {
             base_oid: None,
             effective: None,
             state: AgentState::Created,
+            activity: None,
             active_turn: None,
             pending: Vec::new(),
             created_at: now,

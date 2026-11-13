@@ -113,6 +113,9 @@ mod goals;
 mod hierarchy;
 mod lifecycle;
 mod native_children;
+pub use native_children::{
+    NATIVE_CHILD_ATTENTION_PAGE_SIZE, NativeChildrenAttention, NativeChildrenAttentionPage,
+};
 mod native_events;
 mod observer;
 mod observer_live;
@@ -749,8 +752,8 @@ impl Store {
         Ok(agents)
     }
 
-    /// Page only routed Agents whose current projections can need attention.
-    /// Historical and terminal rows do not consume the page limit.
+    /// Page routed attention candidates. Registration existence is an indexed
+    /// candidate check; child activity is inspected in separate bounded pages.
     pub fn list_attention_agents(&self, after: Option<&str>, limit: usize) -> Result<Vec<Agent>> {
         validate_limit(limit)?;
         let after_num = after.map(parse_agent_id).transpose()?.unwrap_or(0);
@@ -762,7 +765,9 @@ impl Store {
                         pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
                         parent, root, depth, control
                  FROM agents
-                 WHERE id > ?1 AND observe_only = 0 AND state IN ('busy', 'waiting')
+                 WHERE id > ?1 AND observe_only = 0 AND (state IN ('busy', 'waiting')
+                   OR EXISTS(SELECT 1 FROM native_child_registrations r
+                     WHERE r.producer = agents.id AND r.producer_generation = agents.generation))
                  ORDER BY id LIMIT ?2",
             )
             .map_err(sql_error)?;
@@ -1740,22 +1745,31 @@ impl Store {
     /// Ownership was verified on commit; later handoff cannot erase those facts.
     pub fn last_model_progress(&self, agent: &str, generation: i64) -> Result<Option<i64>> {
         let agent_num = parse_agent_id(agent)?;
-        self.connection
+        let exists: bool = self
+            .connection
             .query_row(
-                "SELECT MAX(e.ts) FROM events e
-                 WHERE e.agent = ?1 AND e.generation = ?2
-                   AND EXISTS(SELECT 1 FROM agents a WHERE a.id = e.agent)
-                   AND ((e.source NOT IN ('os', 'daemon', 'git', 'workspace_process') AND e.native_id IS NOT NULL
-                   AND e.kind IN ('turn.started', 'turn.completed', 'message.completed',
-                                  'tool.started', 'tool.completed',
-                                  'request.opened', 'request.resolved', 'request.closed'))
-                     OR (e.source = 'git' AND e.kind = 'file.changed'))",
-                params![agent_num, generation],
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
+                [agent_num],
                 |row| row.get(0),
             )
-            .map_err(sql_error)
+            .map_err(sql_error)?;
+        if !exists {
+            return Ok(None);
+        }
+        let native = native_children::native_progress(&self.connection, agent_num, generation)?;
+        let git: Option<i64> = self
+            .connection
+            .query_row(GIT_PROGRESS_SQL, params![agent_num, generation], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(sql_error)?;
+        Ok(native.into_iter().chain(git).max())
     }
 }
+
+const GIT_PROGRESS_SQL: &str = "SELECT ts FROM events WHERE agent = ?1 AND generation = ?2
+    AND source = 'git' AND kind = 'file.changed' ORDER BY ts DESC LIMIT 1";
 
 impl Store {
     pub fn ensure_git_source(
@@ -2801,6 +2815,15 @@ fn agent_from_record(connection: &Connection, record: AgentRecord) -> Result<Age
             .map(|value| decode_json(&value))
             .transpose()?,
         state: parse_enum(&record.state, "Agent state")?,
+        activity: if record.origin == "native" && record.observe_only {
+            Some(native_children::activity(
+                connection,
+                record.id,
+                record.generation,
+            )?)
+        } else {
+            None
+        },
         active_turn: record.active_turn,
         pending,
         created_at: record.created_at,
