@@ -549,8 +549,8 @@ interrupted, `error`/`failed`/`failure` and the `api_error*` family to
 failure, anything else to unknown); every other harness carries the
 normalized lifecycle status (`completed` to success, `failed`/`error` to
 failure, `interrupted`/`cancelled` to interrupted, anything else to unknown),
-never defaulting to success. The v30 migration backfills the outcome for
-completed rows with no stored outcome from that same table.
+never defaulting to success. No stored outcome is backfilled: NULL-outcome
+rows keep classifying at read time.
 CREATE TABLE pending_requests (
   agent INTEGER NOT NULL REFERENCES agents(id), generation INTEGER NOT NULL,
   request_id TEXT NOT NULL, turn_id TEXT NOT NULL, kind TEXT NOT NULL,

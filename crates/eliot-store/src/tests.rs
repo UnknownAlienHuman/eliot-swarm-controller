@@ -3855,21 +3855,8 @@ fn claude_legacy_rows_classify_from_the_raw_terminal_reason() {
         assert_eq!(turn.status.as_deref(), Some(status), "status={status}");
     }
 
-    // The v30 backfill materializes the same outcomes for already-stored
-    // rows, so a retained command retried with `--wait` exits 0/1, not 4.
-    super::schema::backfill_legacy_turn_outcomes(&mut store.connection)
-        .expect("backfill legacy outcomes");
-    let unfilled: i64 = store
-        .connection
-        .query_row(
-            "SELECT COUNT(*) FROM turns WHERE outcome IS NULL",
-            [],
-            |row| row.get(0),
-        )
-        .expect("count unfilled turns");
-    assert_eq!(unfilled, 0);
-
-    // The harness-aware read also feeds the list path, not just `get_turn`.
+    // The harness-aware read also feeds the list path, not just `get_turn`,
+    // so a retained command retried with `--wait` exits 0/1, not 4.
     let turns = store.list_turns(&agent, 1, 50).expect("list legacy turns");
     assert!(
         turns
@@ -3885,7 +3872,7 @@ fn claude_legacy_rows_classify_from_the_raw_terminal_reason() {
                 && turn.outcome == Some(TurnOutcome::Failure)),
         "list_turns must classify the claude api_error row"
     );
-    // The backfilled rows agree with the read-path classification.
+    // The list path agrees with the `get_turn` classification.
     for (status, expected) in [
         ("cancelled", TurnOutcome::Interrupted),
         ("completed", TurnOutcome::Unknown),
@@ -3895,7 +3882,7 @@ fn claude_legacy_rows_classify_from_the_raw_terminal_reason() {
             turns.iter().any(
                 |turn| turn.status.as_deref() == Some(status) && turn.outcome == Some(expected)
             ),
-            "backfill must persist status={status} as {expected:?}"
+            "list_turns must classify status={status} as {expected:?}"
         );
     }
 }
