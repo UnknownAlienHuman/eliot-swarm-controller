@@ -1085,6 +1085,38 @@ impl Session {
         result
     }
 
+    pub async fn wait_for_native_exit(&mut self) {
+        eliot_plugin::native_lifecycle::wait_for_native_exit(Some(&mut self.native.transport))
+            .await;
+    }
+
+    /// Native EOF already settles fenced prompt/load and hook waiters. Drain
+    /// that task before retiring; `ended` is reserved for actual native End.
+    pub async fn retire_native_exit(&mut self) -> Result<()> {
+        let drained =
+            eliot_plugin::native_lifecycle::drain_native_exit(&mut self.native.transport, async {
+                if let Some(task) = self.task.as_mut() {
+                    task.await.map_err(|_| {
+                        Error::new("unknown", "Antigravity native event task failed")
+                    })?;
+                }
+                Ok(())
+            })
+            .await;
+        if let Some(task) = self.task.take()
+            && !task.is_finished()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+        self.state.lock().await.cancel_pending_steer();
+        if let Some(config) = self.hook_config.take() {
+            remove_hook_config(&config);
+        }
+        self.ready = false;
+        drained
+    }
+
     pub async fn terminate(&mut self, force: bool) -> Result<()> {
         {
             let mut state = self.state.lock().await;

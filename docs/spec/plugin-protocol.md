@@ -493,6 +493,22 @@ confirms owned plugin-tree cleanup before marking the Agent `lost`. The signal d
 resolve the native effect or permit replay. Without all three native-exit facts, the
 ordinary unknown-start behavior remains in force.
 
+For every controlled session, including an unknown start/resume, the plugin
+subscribes to its existing owned native-process waiter. A confirmed exit retires
+that exact per-generation plugin after bounded native-reader and event-queue
+drain, including commit acknowledgements and pending RPC settlement. A stream
+gap, EOF or failed wait alone does not prove process death. Buffered terminal
+turn evidence is committed before retirement; retirement never manufactures
+`session.ended` or changes an already-applied command. The daemon independently
+confirms its owned plugin exit and drains the plugin reader before its existing
+generation-fenced loss settlement. Without a committed terminal turn, the running
+turn becomes `unknown`; completed turns remain completed. Retiring or duplicate
+exit observations cannot settle a newer generation and never authorize replay.
+An event owner closing before the tail barrier or a drain deadline expiring is
+an explicit unknown retirement error, never successful tail settlement. Retirement
+still ends the unusable plugin; the daemon records missing native evidence as gaps
+and preserves unknown outcomes after its separate custody and reader settlement.
+
 Public requests and answers are universal: `request.opened` details and kinds use the
 shared [`eliot_core::requests`](../../crates/eliot-core/src/requests.rs) shapes
 (`QuestionRequest`/`ApprovalRequest`), and `answer` args use `AnswerArgs`. Only the

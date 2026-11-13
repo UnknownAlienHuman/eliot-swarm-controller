@@ -57,6 +57,7 @@ const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventStatus {
+    pub native_drained: bool,
     pub ready: bool,
     pub connected: bool,
     pub session_id: Option<String>,
@@ -522,6 +523,11 @@ impl EventHandle {
         if self.control.send(Control::Close { reply }).await.is_ok() {
             let _ = timeout_at(Instant::now() + EVENT_DEADLINE, response).await;
         }
+    }
+
+    pub async fn drain_native(&self) -> Result<()> {
+        eliot_plugin::native_lifecycle::wait_for_native_tail(&self.status, |s| s.native_drained)
+            .await
     }
 
     /// Wait until `ready` for the association of `command_id`: its turn
@@ -2811,6 +2817,7 @@ async fn run(
             }
         }
         processor.expire_pending_hooks();
+        processor.status.native_drained = processor.frames_drained;
         let _ = status_tx.send(processor.status.clone());
     }
     processor.abort_context_hooks();

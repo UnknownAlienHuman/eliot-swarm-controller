@@ -152,6 +152,8 @@ pub(crate) async fn run() -> Result<()> {
 
     let mut plugin = CodexPlugin::default();
     let mut completed_shutdown = false;
+    let mut native_endpoint_retired = false;
+    let mut native_retirement = Ok(());
     let mut live_ticks = interval(LIVE_POLL_INTERVAL);
     live_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut pending_request = None;
@@ -161,6 +163,22 @@ pub(crate) async fn run() -> Result<()> {
         } else {
             tokio::select! {
                 biased;
+                () = eliot_plugin::native_lifecycle::wait_for_native_exit(
+                    plugin.session.as_mut().map(|session| &mut session.native.transport)
+                ) => {
+                    if let Some(session) = plugin.session.as_mut() {
+                        native_retirement = eliot_plugin::native_lifecycle::drain_native_exit(
+                            &mut session.native.transport,
+                            async {
+                                session.events.drain_native().await?;
+                                session.events.close().await;
+                                Ok(())
+                            },
+                        ).await;
+                    }
+                    native_endpoint_retired = true;
+                    break;
+                }
                 request = requests.recv() => request,
                 _ = live_ticks.tick(), if plugin.observer.as_ref().is_some_and(ObserverSession::live_poll_enabled) => {
                     let initialized = plugin
@@ -231,12 +249,14 @@ pub(crate) async fn run() -> Result<()> {
         }
     }
 
-    if !completed_shutdown {
+    if !completed_shutdown && !native_endpoint_retired {
         plugin.shutdown_owned().await;
     }
     reader.abort();
     let _ = reader.await;
-    if completed_shutdown {
+    if native_endpoint_retired {
+        native_retirement
+    } else if completed_shutdown {
         Ok(())
     } else {
         Err(Error::new(

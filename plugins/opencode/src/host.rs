@@ -202,12 +202,35 @@ pub(crate) async fn run() -> Result<()> {
 
     let mut plugin = OpenCodePlugin::default();
     let mut completed_shutdown = false;
+    let mut native_endpoint_retired = false;
+    let mut native_retirement = Ok(());
     let mut pending_request = None;
     loop {
         let request = if let Some(request) = pending_request.take() {
             Some(request)
         } else {
-            requests.recv().await
+            tokio::select! {
+                biased;
+                () = async {
+                    match plugin.session.as_mut() {
+                        Some(session) => session.server.wait_for_process_exit().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(session) = plugin.session.as_mut() {
+                        let deadline = Instant::now() + RPC_TIMEOUT;
+                        native_retirement = timeout_at(deadline, async {
+                            session.events.drain_native().await?;
+                            session.events.close().await;
+                            Ok(())
+                        }).await.unwrap_or_else(|_| Err(Error::new("unknown", "OpenCode native event tail settlement timed out")));
+                        session.server.finish_diagnostics(deadline).await;
+                    }
+                    native_endpoint_retired = true;
+                    break;
+                }
+                request = requests.recv() => request,
+            }
         };
         let Some(request) = request else {
             break;
@@ -255,12 +278,14 @@ pub(crate) async fn run() -> Result<()> {
         }
     }
 
-    if !completed_shutdown {
+    if !completed_shutdown && !native_endpoint_retired {
         plugin.shutdown_owned().await;
     }
     reader.abort();
     let _ = reader.await;
-    if completed_shutdown {
+    if native_endpoint_retired {
+        native_retirement
+    } else if completed_shutdown {
         Ok(())
     } else {
         Err(Error::new(

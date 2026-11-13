@@ -52,6 +52,7 @@ const CHILD_GAP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventStatus {
+    pub native_drained: bool,
     pub ready: bool,
     pub thread_id: Option<String>,
     pub active_command_id: Option<String>,
@@ -556,6 +557,11 @@ impl EventHandle {
         if self.control.send(Control::Close { reply }).await.is_ok() {
             let _ = timeout_at(Instant::now() + EVENT_DEADLINE, response).await;
         }
+    }
+
+    pub async fn drain_native(&self) -> Result<()> {
+        eliot_plugin::native_lifecycle::wait_for_native_tail(&self.status, |s| s.native_drained)
+            .await
     }
 
     pub fn status(&self) -> EventStatus {
@@ -2814,6 +2820,7 @@ async fn run(
                 processor.apply_gap_attempt(&attempt.child_thread, &attempt.gap, &result);
             }
         }
+        processor.status.native_drained = processor.frames_drained;
         let _ = status_tx.send(processor.status.clone());
     }
 }
