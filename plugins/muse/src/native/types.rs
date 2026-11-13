@@ -1,10 +1,11 @@
 //! Minimal MSP wire DTOs for the launch/send/stop path (PR1), the resume
 //! path (PR2) and the native-request path (A1: approve/deny/answer), derived
 //! from the installed host's exported stable schema
-//! (`muse schema generate-json-schema`, Muse Code 1.4.0, bundle fingerprint
-//! `sha256:36466f63…0d3d7f`, re-verified for A1). Only the session-start,
-//! session-resume, turn-start, view-event, stop/close, request/decide/answer
-//! and readback shapes this path uses are modelled. Unknown fields are
+//! (`muse schema generate-json-schema`, Muse Code 1.4.0-R4161.1, bundle
+//! fingerprint `sha256:36466f63…0d3d7f`, re-verified for A1 and for item
+//! normalization). Only the session-start, session-resume, turn-start,
+//! view-event, stop/close, request/decide/answer, readback and item
+//! tool-identity shapes this path uses are modelled. Unknown fields are
 //! ignored: the schema rules additive-optional evolution, so a strict DTO
 //! would reject valid host frames.
 //!
@@ -550,8 +551,13 @@ pub struct NativeTurnCompletedNotification {
     pub reason: Option<String>,
 }
 
-/// One transcript item at one revision. Only the common identity fields and
-/// the `agentMessage` text used by PR1 are modelled.
+/// One transcript item at one revision. Only the common identity fields, the
+/// `agentMessage` text used by PR1, and the `toolCall`/`userShell` tool
+/// identity consumed by item normalization are modelled: `tool` is the
+/// `toolCall` tool name (`userShell` carries none and normalizes under its
+/// kind). Every other per-kind field (`args`, `visibleOutput`, `outputRef`,
+/// `patchRef`, `patchSummary`, `commandText`, ...) stays unparsed: unknown
+/// fields are ignored, so additive schema evolution never rejects a frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeItem {
@@ -561,6 +567,8 @@ pub struct NativeItem {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
 }

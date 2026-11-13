@@ -126,6 +126,34 @@ for its pointer set and opens only what still binds to the live turn; anything
 naming the dead generation's turn is receipted and dropped as an orphan, never
 answered, and a failed pull never fails the resume.
 
+## Item normalization (MSP 1.4 stream)
+
+Item shapes are established from the installed host's exported stable schema,
+not from another harness or a guessed payload: `muse schema
+generate-json-schema` from `muse-bin-1.4.0-R4161.1` (channel `muse-stable`,
+bundle fingerprint `sha256:36466f634c8c78a812462ec941187fd4547b232ee06153e5feb2a1482f0d3d7f`;
+the experimental surface carries the same nine `ItemKind` values). The adapter
+normalizes only what that schema defines: `toolCall` (tool calls, command
+execution and edit-family calls) and turn-bound `userShell` (command
+execution) revisions into the shared `tool.started`/`tool.completed` events
+with the Codex adapter's DTO fields (`command_id`, `turn_id`, `item_id`,
+`tool`, plus the verbatim native `status` on completion), bound to the exact
+session/turn while the turn runs ([`NativeItem`](../../plugins/muse/src/native/types.rs)).
+`callId`, `args` and result payloads are never persisted. `item/updated`
+folds no per-delta events; the authoritative terminal `item/completed` carries
+every committed tool fact. Turn-less `userShell` (the one kind outside any
+turn) stays unmapped, as do `agentMessage` (already `message.completed`),
+`workflow` (the workflow-child observer above) and unknown future kinds.
+These committed facts advance liveness model progress like Codex tool events;
+CPU alone still never counts.
+
+The 1.4 item carries no inline workspace paths: edit-family `toolCall`
+revisions reference their diff through a stored `patchRef`/`patchSummary`
+whose body is fetched out of band (`item/readOutput`), never in the stream.
+The adapter therefore attaches no `changed_paths` to Muse `tool.completed`
+events, so native file-change hint attribution (`swarm edits`) still depends
+on the Git observer for Muse turns.
+
 ## Host permissions
 
 Sandbox posture is fixed at owned host birth (`muse serve` flags); MSP session/turn
