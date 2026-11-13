@@ -34,6 +34,11 @@ use tokio::{
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 const SAMPLE_TTL_MS: i64 = 4_000;
 const PAGE_LIMIT: usize = 1_000;
+/// Maximum Git bindings snapshotted under one Store mutex acquisition.
+/// Each binding costs a handful of small reads plus one bounded hint page
+/// (at most `PAGE_LIMIT` entries); chunking keeps that work bounded while
+/// filesystem and native probe work stays outside the lock.
+const GIT_INPUTS_PER_SNAPSHOT: usize = 32;
 const GIT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const GIT_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 const WATCH_RETRY: Duration = Duration::from_secs(30);
@@ -759,15 +764,22 @@ impl Monitoring {
 
     async fn git_inputs(&self) -> Result<HashMap<String, GitGroup>> {
         let bindings = self.inner.git_bindings.lock_recover().clone();
+        // Deterministic chunk order so the per-acquisition bound does not
+        // depend on `HashMap` iteration order.
+        let mut ordered: Vec<(Key, String)> = bindings.into_iter().collect();
+        ordered.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
         let mut groups: HashMap<String, GitGroup> = HashMap::new();
         let mut retired = Vec::new();
-        {
+        // Bounded snapshot per Store mutex acquisition: each chunk shares one
+        // high-water barrier, keeping generation/source/cursor fields exact
+        // while filesystem and native probe work stays outside the lock.
+        for chunk in ordered.chunks(GIT_INPUTS_PER_SNAPSHOT) {
             let store = self.inner.store.lock().await;
             let barrier = u64::try_from(store.high_water()?)
                 .map_err(|_| Error::new("internal", "Git high-water is invalid"))?;
-            for (key, workspace) in bindings {
+            for (key, workspace) in chunk {
                 let Some(current) = store.get_agent(&key.0)? else {
-                    retired.push(key);
+                    retired.push(key.clone());
                     continue;
                 };
                 if key.1 > current.generation {
@@ -785,14 +797,14 @@ impl Monitoring {
                         .get("state")
                         .and_then(Value::as_str)
                         == Some("closed");
-                let group = match groups.entry(workspace.clone()) {
+                let group = match groups.entry(workspace.to_owned()) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         let (edited_paths, paths_complete) =
-                            store.git_edit_paths(&workspace, PAGE_LIMIT)?;
+                            store.git_edit_paths(workspace, PAGE_LIMIT)?;
                         entry.insert(GitGroup {
-                            baseline: store.git_baseline(&workspace)?,
+                            baseline: store.git_baseline(workspace)?,
                             base_oid: store
-                                .get_workspace_by_path(&workspace)?
+                                .get_workspace_by_path(workspace)?
                                 .map(|row| row.base_oid),
                             inputs: Vec::new(),
                             edited_paths,
@@ -804,7 +816,7 @@ impl Monitoring {
                 let cursor = store.git_cursor(&key.0, key.1)?;
                 let page = store.git_hint_page(&key.0, key.1, cursor, PAGE_LIMIT)?;
                 group.inputs.push(GitBindingInput {
-                    key,
+                    key: key.clone(),
                     terminal: historical || current.is_terminal(),
                     native_closed,
                     cursor,
