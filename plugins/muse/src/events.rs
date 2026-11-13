@@ -40,8 +40,8 @@ use crate::native::{
         NativeSessionViewHealthChangedNotification, NativeTurnCompletedNotification,
         NativeTurnError, NativeTurnStartedNotification, NativeTurnTerminal,
         NativeUserInputAnswerResult, NativeUserInputCancelResult,
-        NativeUserInputSettledNotification, NativeViewHealth, NativeWorkflowChild,
-        NativeWorkflowItemNotification,
+        NativeUserInputSettledNotification, NativeViewHealth, NativeViewSubscribeParams,
+        NativeViewSubscribeResult, NativeWorkflowChild, NativeWorkflowItemNotification,
     },
 };
 
@@ -50,6 +50,12 @@ const EARLY_EVENT_LIMIT: usize = 128;
 const EARLY_EVENT_BYTES: usize = 256 * 1024;
 const MAX_PENDING_REQUESTS: usize = 128;
 const RESOLVED_REQUEST_HISTORY: usize = 128;
+
+struct ViewRecovery {
+    head: Option<String>,
+    head_seen: bool,
+    deadline: Instant,
+}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventStatus {
@@ -63,6 +69,7 @@ pub(crate) struct EventStatus {
     pub source_unknown: bool,
     /// Lost live view; a private history read cannot re-arm that producer.
     pub view_unavailable: bool,
+    pub view_unavailable_reason: Option<NativeHistoryNoneReason>,
     pub stopped: bool,
     /// Local observation counter: bumped on every stream observation that
     /// touches the pending-request set. An in-memory race guard for stale
@@ -283,6 +290,9 @@ struct EventProcessor {
     transport_loss: bool,
     /// The one accompanying `stale` update was attempted (never replayed).
     source_health_attempted: bool,
+    /// Advance only after successful processing/commit on this actor.
+    last_view_cursor: Option<String>,
+    view_recovery: Option<ViewRecovery>,
     final_text: Option<String>,
     pending_requests: HashMap<String, PendingNativeRequest>,
     /// Native approval/user-input id to public pending id.
@@ -518,6 +528,8 @@ impl EventProcessor {
             gap_reported: false,
             transport_loss: false,
             source_health_attempted: false,
+            last_view_cursor: None,
+            view_recovery: None,
             final_text: None,
             pending_requests: HashMap::new(),
             native_index: HashMap::new(),
@@ -694,6 +706,7 @@ impl EventProcessor {
                 if !self.status.ready || self.status.active_turn_id.is_none() {
                     self.buffer_frame(BufferedNativeFrame::Request { id, method, params });
                 } else if let Err(error) = self.process_request(id, method, params).await {
+                    self.invalidate_view_recovery();
                     self.status.source_unknown = true;
                     if !self.gap_reported && !self.writes_blocked {
                         let _ = self
@@ -717,6 +730,7 @@ impl EventProcessor {
                 if !bypass_buffer && self.should_buffer(&method) {
                     self.buffer_frame(BufferedNativeFrame::Notification { method, params });
                 } else if let Err(error) = self.process_notification(method, params).await {
+                    self.invalidate_view_recovery();
                     self.status.source_unknown = true;
                     if !self.gap_reported && !self.writes_blocked {
                         let _ = self
@@ -753,6 +767,7 @@ impl EventProcessor {
     }
 
     fn defer_gap(&mut self, reason: impl Into<String>) {
+        self.invalidate_view_recovery();
         if self.loss_reason.is_none() {
             self.loss_reason = Some(reason.into());
         }
@@ -1944,6 +1959,52 @@ impl EventProcessor {
     }
 
     async fn process_notification(&mut self, method: String, params: Value) -> Result<()> {
+        let cursor = self
+            .status
+            .session_id
+            .as_deref()
+            .is_some_and(|session_id| {
+                params.get("sessionId").and_then(Value::as_str) == Some(session_id)
+            })
+            .then(|| params.get("viewCursor").and_then(Value::as_str))
+            .flatten()
+            .filter(|cursor| !cursor.trim().is_empty())
+            .map(str::to_owned);
+        if let Err(error) = self.apply_notification(method, params).await {
+            self.invalidate_view_recovery();
+            return Err(error);
+        }
+        if let Some(cursor) = cursor {
+            let live = self.view_recovery.as_mut().is_some_and(|recovery| {
+                if recovery.head.as_ref() == Some(&cursor) {
+                    recovery.head_seen = true;
+                    false
+                } else {
+                    recovery.head.is_some() && recovery.head_seen
+                }
+            });
+            self.last_view_cursor = Some(cursor);
+            if live && !self.writes_blocked {
+                if self
+                    .set_source_health("ok", Instant::now() + EVENT_DEADLINE)
+                    .await
+                {
+                    self.view_recovery = None;
+                    self.status.view_unavailable = false;
+                    self.status.view_unavailable_reason = None;
+                    self.status.source_unknown = false;
+                    self.status.failure = None;
+                    self.gap_reported = false;
+                    self.source_health_attempted = false;
+                } else {
+                    self.invalidate_view_recovery();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_notification(&mut self, method: String, params: Value) -> Result<()> {
         if is_workflow_item_frame(&method, &params) {
             return self.observe_workflow_item(params).await;
         }
@@ -2081,8 +2142,15 @@ impl EventProcessor {
                         )
                     })?;
                 if self.status.session_id.as_deref() == Some(notification.session_id.as_str()) {
+                    self.invalidate_view_recovery();
                     return self
-                        .record_gap("Muse view stream reported a delivery gap")
+                        .stream_source()
+                        .record_gap_range_until(
+                            "Muse view stream reported a delivery gap",
+                            Some(notification.after),
+                            Some(notification.next),
+                            Instant::now() + EVENT_DEADLINE,
+                        )
                         .await;
                 }
             }
@@ -3226,13 +3294,48 @@ impl EventProcessor {
         reason: NativeHistoryNoneReason,
     ) -> Result<()> {
         self.bind_view_session(session_id)?;
+        if self.status.view_unavailable {
+            return Ok(());
+        }
+        let can_recover = self.status.ready
+            && self.status.active_turn_id.is_some()
+            && !self.status.source_unknown
+            && !self.writes_blocked;
         self.status.source_unknown = true;
         self.status.view_unavailable = true;
+        self.status.view_unavailable_reason = Some(reason);
+        // This changes only the subscription, never a session/turn or input.
+        // The actor applies no replayed frame until the gap is acknowledged.
+        let after = self.last_view_cursor.clone();
+        let subscribe_deadline = Instant::now() + EVENT_DEADLINE;
+        let head = if can_recover && let Some(after) = after.as_ref() {
+            let params = NativeViewSubscribeParams {
+                session_id: session_id.to_owned(),
+                after: after.clone(),
+            };
+            match serde_json::to_value(params) {
+                Ok(params) => self
+                    .native
+                    .call("view/subscribe", params, subscribe_deadline)
+                    .await
+                    .ok()
+                    .and_then(|value| {
+                        serde_json::from_value::<NativeViewSubscribeResult>(value).ok()
+                    })
+                    .map(|result| result.view_cursor)
+                    .filter(|cursor| !cursor.trim().is_empty()),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         let health_deadline = Instant::now() + EVENT_DEADLINE;
         let gap_result = if !self.gap_reported && !self.writes_blocked {
             self.stream_source()
-                .record_gap_until(
+                .record_gap_range_until(
                     &format!("Muse native view is unavailable ({})", reason.label()),
+                    after.clone(),
+                    head.clone(),
                     health_deadline,
                 )
                 .await
@@ -3240,7 +3343,35 @@ impl EventProcessor {
             Ok(())
         };
         self.mark_source_stale(health_deadline).await;
+        if self.status.active_turn_id.is_some() {
+            let recoverable = gap_result.is_ok() && !self.writes_blocked && head.is_some();
+            self.view_recovery = Some(ViewRecovery {
+                head_seen: head.is_some() && after == head,
+                head,
+                deadline: if recoverable {
+                    Instant::now() + EVENT_DEADLINE
+                } else {
+                    Instant::now()
+                },
+            });
+        }
         gap_result
+    }
+
+    async fn expire_view_recovery(&mut self) {
+        self.view_recovery = None;
+        self.status.source_unknown = true;
+        self.status.failure = Some(
+            "Muse native view recovery did not prove live delivery after the recorded gap"
+                .to_owned(),
+        );
+    }
+
+    fn invalidate_view_recovery(&mut self) {
+        if let Some(recovery) = self.view_recovery.as_mut() {
+            recovery.head = None;
+            recovery.deadline = Instant::now();
+        }
     }
 
     /// One explicit `stale` health update for a degraded or lost native stream/view,
@@ -3251,15 +3382,19 @@ impl EventProcessor {
             return;
         }
         self.source_health_attempted = true;
+        self.set_source_health("stale", deadline).await;
+    }
+
+    async fn set_source_health(&mut self, health: &str, deadline: Instant) -> bool {
         let update =
-            SourceHealthUpdate::new(self.agent_id.clone(), self.generation, "stream", "stale");
+            SourceHealthUpdate::new(self.agent_id.clone(), self.generation, "stream", health);
         let Ok(mut request) = serde_json::to_value(&update) else {
             self.status.source_unknown = true;
-            return;
+            return false;
         };
         if update.validate().is_err() {
             self.status.source_unknown = true;
-            return;
+            return false;
         }
         request["credential"] = json!(self.credential);
         let acknowledgement = self.host.call("source.health", request, deadline).await;
@@ -3267,7 +3402,7 @@ impl EventProcessor {
             serde_json::from_value::<SourceHealthUpdate>(value.clone())
                 .is_ok_and(|ack| ack == update)
         }) {
-            return;
+            return true;
         }
 
         // A lost health acknowledgement is settled by readback, never by replay.
@@ -3289,14 +3424,16 @@ impl EventProcessor {
                 && state.get("generation").and_then(Value::as_i64) == Some(self.generation)
                 && state.get("source").and_then(Value::as_str) == Some("stream")
                 && state.get("state").and_then(Value::as_str) == Some("open")
-                && state.get("health").and_then(Value::as_str) == Some("stale")
+                && state.get("health").and_then(Value::as_str) == Some(health)
         });
         if !confirmed {
             self.status.source_unknown = true;
         }
+        confirmed
     }
 
     async fn record_gap(&mut self, reason: &str) -> Result<()> {
+        self.invalidate_view_recovery();
         self.stream_source().record_gap(reason).await
     }
 
@@ -3330,6 +3467,10 @@ async fn run(
 ) {
     loop {
         let accept_frames = processor.accept_frames;
+        let recovery_deadline = processor
+            .view_recovery
+            .as_ref()
+            .map(|recovery| recovery.deadline);
         // Frames win over controls when both are ready: a `CheckTurn`
         // arriving after the queued terminal frame must see the finished
         // turn, never a still-live one.
@@ -3350,6 +3491,9 @@ async fn run(
                 };
                 processor.handle_stream_state(current).await;
                 processor.report_gap_if_queue_empty(frames.is_empty()).await;
+            }
+            _ = tokio::time::sleep_until(recovery_deadline.unwrap_or_else(Instant::now)), if recovery_deadline.is_some() => {
+                processor.expire_view_recovery().await;
             }
             control = controls.recv() => {
                 match control {

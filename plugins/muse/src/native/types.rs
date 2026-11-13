@@ -606,7 +606,7 @@ pub struct NativeSessionClosedNotification {
     pub view_cursor: Option<String>,
 }
 
-/// `view/gap` params: push delivery dropped `(after, next]`; delivery
+/// `view/gap` params: push delivery dropped `(after, next)`; delivery
 /// continues from `next`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -658,6 +658,20 @@ pub struct NativeViewPageResult {
     #[serde(default)]
     pub events: Vec<NativeUnframedViewEvent>,
     pub next_cursor: Option<String>,
+}
+
+/// Read-only reattachment: replay `(after, head]` before live view delivery.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeViewSubscribeParams {
+    pub session_id: String,
+    pub after: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeViewSubscribeResult {
+    pub view_cursor: String,
 }
 
 /// The closed reasoning-effort tier vocabulary (SS3.2), spelled identically

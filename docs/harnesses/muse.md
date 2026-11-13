@@ -54,9 +54,8 @@ where the installed API guarantees it. Otherwise record a gap and reconcile curr
 state, never replay full history as new turns.
 
 `session/viewHealthChanged` with `health="unavailable"` applies only to the owned
-native session in that Agent generation. It records an explicit source gap, propagates
-explicit degraded `source.health` (`"stale"`), and latches observation unknown without
-ending the session or completing its turn. A foreign session's notification and an
+native session in that Agent generation. It records an explicit source gap and
+propagates degraded `source.health` (`"stale"`). A foreign session's notification and an
 unrecognized health value do not change that source. The push is best-effort:
 read/resume also retain `history.noneReason`. `projectionUnavailable` degrades
 observation and requires explicit degraded health on the unavailable view even when
@@ -64,6 +63,37 @@ the push is lost; `excluded` alone is normal history omission. Missing or unknow
 reasons remain uncertain.
 Private readback cannot clear a live-source gap, replay history or acknowledge a
 terminal effect. A later healthy read does not establish live-edge recovery.
+
+Verified 2026-11-13 using the installed host's offline stable and experimental
+JSON/TypeScript exports: Muse Code `1.4.0-R4161.1`, executable SHA-256
+`B33B493069A2593E97CC63F9A4063FEB64269BF7F07A233F5DB2DB681AD5D950`, stable
+bundle fingerprint `sha256:36466f634c8c78a812462ec941187fd4547b232ee06153e5feb2a1482f0d3d7f`.
+`projectionUnavailable` is the projection-failed-closed health reason on the
+command plane, independent of view subscription membership. It is distinct from
+`view/gap`, whose opaque `after`/`next` cursors are exclusive bounds on dropped
+delivery. The schema documents cursor replay through `view/subscribe` and
+contiguous forward `view/page` reads (1–1000 events, short pages allowed), but no
+projection rebuild method or guaranteed re-arm after projection failure. v1 emits
+only `unavailable` health. No numeric projection size/time threshold is published;
+`projectionReadLimit`, `viewTruncated`, and `pageEventTooLarge` describe coverage
+limits without supplying such a threshold. `item/readOutput` fetches known item
+output; there is no dedicated turn-read method.
+
+During an associated turn, the adapter attempts one read-only `view/subscribe`
+with `after` equal to its last successfully applied owned-session cursor. It
+records that lower bound and the returned subscription head (when available)
+on the source gap before processing replay. Replay uses the same event actor and
+exact session/turn/command binding as live delivery. Only a successfully processed
+cursor after the observed subscription head, followed by acknowledged `ok` source
+health, can restore live observation; the historical gap stays visible. An actual
+replayed terminal can complete the exact turn while source health remains stale.
+An interrupt refused during the gap names the unavailable-view reason explicitly.
+Subscription admission alone, a private page, or a timer never proves native turn
+completion or process/session exit. Live recovery after projection failure remains
+unqualified until exercised through Swarm by the controller.
+PR #422's shared native-exit lifecycle helper applies after actual endpoint exit;
+projection unavailability alone cannot invoke that exit path. This adapter does
+not copy that helper or report a stopped session to stand in for lost observation.
 
 Guard a pending-request snapshot with a local observation counter so a newer stream
 resolution cannot be overwritten by stale snapshot data. This is an in-memory race guard,
