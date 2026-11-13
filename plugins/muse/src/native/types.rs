@@ -552,12 +552,14 @@ pub struct NativeTurnCompletedNotification {
 }
 
 /// One transcript item at one revision. Only the common identity fields, the
-/// `agentMessage` text used by PR1, and the `toolCall`/`userShell` tool
-/// identity consumed by item normalization are modelled: `tool` is the
-/// `toolCall` tool name (`userShell` carries none and normalizes under its
-/// kind). Every other per-kind field (`args`, `visibleOutput`, `outputRef`,
-/// `patchRef`, `patchSummary`, `commandText`, ...) stays unparsed: unknown
-/// fields are ignored, so additive schema evolution never rejects a frame.
+/// `agentMessage` text used by PR1, the `toolCall`/`userShell` tool identity
+/// and the `toolCall` verbatim argument JSON consumed by item normalization
+/// are modelled: `tool` is the `toolCall` tool name (`userShell` carries none
+/// and normalizes under its kind), and `args` carries the model-authored
+/// argument JSON whose inline file target feeds native file-change hints.
+/// Every other per-kind field (`visibleOutput`, `outputRef`, `patchRef`,
+/// `patchSummary`, `commandText`, ...) stays unparsed: unknown fields are
+/// ignored, so additive schema evolution never rejects a frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeItem {
@@ -569,6 +571,8 @@ pub struct NativeItem {
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
 }
