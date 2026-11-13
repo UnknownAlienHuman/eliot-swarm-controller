@@ -554,8 +554,9 @@ only after a verified v1 binding. An owned longpoll claims through the same auth
 confirmed `applied`/`empty` may emit a receipt.
 
 The Antigravity `PreInvocation` hook (`before_model`) is the third consumer. The adapter
-installs a private generation-scoped hook group in `.agents/hooks.json` invoking an authenticated
-helper command. When the vendor runner executes the hook, the helper connects to the session-owned
+stages a private generation-scoped hook group in a dedicated hook-only directory's
+`.agents/hooks.json` (the only `--add-dir` native root; the private instance directory
+is never exposed) invoking an authenticated helper command. When the vendor runner executes the hook, the helper connects to the session-owned
 loopback listener and proves its kernel birth identity. The plugin claims FIFO `turn_safe_point`
 context through the existing authenticated `hook.event` channel, combines it with any pending
 exact-turn steer retained inside the plugin, and packages both into one `HookOutput` with native

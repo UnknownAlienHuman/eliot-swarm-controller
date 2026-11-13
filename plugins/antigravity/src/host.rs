@@ -406,7 +406,19 @@ impl Plugin {
             return outcome.clone();
         }
         let hooks = HookServer::bind().await?;
-        let plan = crate::profile::Plan::new(&params, &credential, hooks.token(), &instance_dir)?;
+        // Stage the dedicated hook-discovery root before planning: it is the
+        // only `--add-dir` native root, and the private instance directory
+        // is never exposed to the native CLI.
+        let helper = crate::session::hook_helper_path()?;
+        let workspace_path = params
+            .workspace
+            .as_deref()
+            .map_or_else(PathBuf::new, PathBuf::from);
+        let hook_config =
+            crate::session::stage_hook_config(&instance_dir, &workspace_path, &helper)
+                .map_err(|error| error.with_code("native_not_dispatched"))?;
+        let plan =
+            crate::profile::Plan::new(&params, &credential, hooks.token(), hook_config.root())?;
         // Latch before creating a native conversation. Any failure after spawn
         // is retained; this generation never starts a second process on retry.
         self.start = Some((
@@ -417,7 +429,7 @@ impl Plugin {
             )),
         ));
         let result =
-            match Session::spawn(&params, &plan, peer, &credential, &instance_dir, hooks).await {
+            match Session::spawn(&params, &plan, peer, &credential, hook_config, hooks).await {
                 Ok(session) => {
                     self.session = Some(session);
                     let session = self
