@@ -1146,8 +1146,8 @@ mod tests {
             ),
             (
                 "Muse",
-                &["session", "turn", "message", "request"][..],
-                "session, turn, message, and request",
+                &["session", "turn", "message", "tool", "request"][..],
+                "session, turn, message, tool, and request",
             ),
             (
                 "Claude",

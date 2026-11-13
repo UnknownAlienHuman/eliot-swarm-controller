@@ -706,7 +706,7 @@ impl EventProcessor {
             StreamState::Malformed(fault) => {
                 self.defer_gap(format!(
                     "Codex app-server stream contained an invalid frame ({})",
-                    fault.label()
+                    fault.describe()
                 ));
                 self.transport_loss = true;
             }

@@ -101,10 +101,21 @@ impl CodexRoute {
         swarm_executable: &Path,
         data_dir: &Path,
         cwd: &Path,
+        mcp_disables: &[String],
     ) -> Result<Vec<OsString>> {
         if !swarm_executable.is_absolute() || !data_dir.is_absolute() || !cwd.is_absolute() {
             return Err(route_error(
                 "Codex Agent MCP command, data directory, and cwd must be absolute",
+            ));
+        }
+        if server_name.is_empty()
+            || server_name.chars().any(char::is_control)
+            || mcp_disables
+                .iter()
+                .any(|name| !crate::mcp::is_addressable_override_name(name))
+        {
+            return Err(route_error(
+                "Codex Agent MCP server names must be plain override segments",
             ));
         }
         let args = self.args()?;
@@ -124,6 +135,17 @@ impl CodexRoute {
             &format!("mcp_servers.{server_name}"),
             server,
         );
+        // Minimal policy: suppress every inherited server explicitly. A bare
+        // `mcp_servers={}` override merges with file config instead of
+        // replacing it (verified on 0.167.1), so each server needs its own
+        // `enabled=false` override; unaddressable names fail before spawn.
+        for name in mcp_disables {
+            push_override(
+                &mut mcp_override,
+                &format!("mcp_servers.{name}.enabled"),
+                "false".to_owned(),
+            );
+        }
         let mut result = Vec::with_capacity(args.len() + mcp_override.len());
         result.extend(args[..app_server_index].iter().cloned());
         result.extend(mcp_override);
@@ -384,6 +406,66 @@ mod tests {
                 .verify_config(&json!({"model_provider":"other"}), &[])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn agent_mcp_argv_adds_own_server_and_minimal_disables() {
+        let route = CodexRoute::from_profile(&json!({"harness": "codex"})).unwrap();
+        let (exe, data, cwd) = if cfg!(windows) {
+            (
+                Path::new(r"C:\Tools\Swarm\swarm.exe"),
+                Path::new(r"C:\Data\Eliot"),
+                Path::new(r"C:\Work\proj"),
+            )
+        } else {
+            (
+                Path::new("/bin/swarm"),
+                Path::new("/data/eliot"),
+                Path::new("/work/proj"),
+            )
+        };
+        let args = route
+            .args_with_agent_mcp("eliot_swarm_x", exe, data, cwd, &[])
+            .unwrap()
+            .into_iter()
+            .map(|value| value.into_string().unwrap())
+            .collect::<Vec<_>>();
+        let app_server = args.iter().position(|arg| arg == "app-server").unwrap();
+        let own = args
+            .iter()
+            .position(|arg| arg.starts_with("mcp_servers.eliot_swarm_x="))
+            .unwrap();
+        assert!(own < app_server);
+        assert!(args.iter().all(|arg| !arg.contains("enabled=false")));
+
+        // Minimal adds one `enabled=false` override per inherited server,
+        // before `app-server`, and rejects names no `-c` path can address.
+        let args = route
+            .args_with_agent_mcp(
+                "eliot_swarm_x",
+                exe,
+                data,
+                cwd,
+                &["owner-a".to_owned(), "owner-b".to_owned()],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|value| value.into_string().unwrap())
+            .collect::<Vec<_>>();
+        let app_server = args.iter().position(|arg| arg == "app-server").unwrap();
+        for name in ["owner-a", "owner-b"] {
+            let position = args
+                .iter()
+                .position(|arg| arg == &format!("mcp_servers.{name}.enabled=false"))
+                .unwrap();
+            assert!(position < app_server);
+        }
+        assert!(
+            route
+                .args_with_agent_mcp("eliot_swarm_x", exe, data, cwd, &["owner.x".to_owned()])
+                .is_err()
+        );
+        assert!(route.args_with_agent_mcp("", exe, data, cwd, &[]).is_err());
     }
 
     #[test]

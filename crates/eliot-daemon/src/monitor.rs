@@ -34,6 +34,11 @@ use tokio::{
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 const SAMPLE_TTL_MS: i64 = 4_000;
 const PAGE_LIMIT: usize = 1_000;
+/// Maximum Git bindings snapshotted under one Store mutex acquisition.
+/// Each binding costs a handful of small reads plus one bounded hint page
+/// (at most `PAGE_LIMIT` entries); chunking keeps that work bounded while
+/// filesystem and native probe work stays outside the lock.
+const GIT_INPUTS_PER_SNAPSHOT: usize = 32;
 const GIT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const GIT_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 const WATCH_RETRY: Duration = Duration::from_secs(30);
@@ -246,10 +251,10 @@ impl Monitoring {
         let events = store.ensure_git_source(&agent.id, agent.generation, workspace, now_ms())?;
         self.inner.bus.publish(&events);
         drop(store);
-        self.inner
-            .git_bindings
-            .lock_recover()
-            .insert((agent.id.clone(), agent.generation), workspace.to_owned());
+        // Registration and retirement take these locks in the same order. Keep
+        // the binding visible until its cache slot is installed as one operation.
+        let mut bindings = self.inner.git_bindings.lock_recover();
+        bindings.insert((agent.id.clone(), agent.generation), workspace.to_owned());
         self.inner
             .git_workspaces
             .lock_recover()
@@ -281,7 +286,15 @@ impl Monitoring {
             targets.insert(key, Arc::clone(&target));
         }
         // A failed read-only probe leaves unknown observation; it does not fail native startup.
-        let _ = self.sample_target(&target).await;
+        // Controlled startup holds its cleanup gate here. Bound this initial
+        // sample, including its Store wait, by the existing sampling cadence.
+        // The target stays registered; a timed-out blocking read has no native
+        // effect, and its dropped future cannot later commit a stale snapshot.
+        let _ = timeout_at(
+            Instant::now() + SAMPLE_INTERVAL,
+            self.sample_target(&target),
+        )
+        .await;
         Ok(())
     }
 
@@ -759,15 +772,22 @@ impl Monitoring {
 
     async fn git_inputs(&self) -> Result<HashMap<String, GitGroup>> {
         let bindings = self.inner.git_bindings.lock_recover().clone();
+        // Deterministic chunk order so the per-acquisition bound does not
+        // depend on `HashMap` iteration order.
+        let mut ordered: Vec<(Key, String)> = bindings.into_iter().collect();
+        ordered.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
         let mut groups: HashMap<String, GitGroup> = HashMap::new();
         let mut retired = Vec::new();
-        {
+        // Bounded snapshot per Store mutex acquisition: each chunk shares one
+        // high-water barrier, keeping generation/source/cursor fields exact
+        // while filesystem and native probe work stays outside the lock.
+        for chunk in ordered.chunks(GIT_INPUTS_PER_SNAPSHOT) {
             let store = self.inner.store.lock().await;
             let barrier = u64::try_from(store.high_water()?)
                 .map_err(|_| Error::new("internal", "Git high-water is invalid"))?;
-            for (key, workspace) in bindings {
+            for (key, workspace) in chunk {
                 let Some(current) = store.get_agent(&key.0)? else {
-                    retired.push(key);
+                    retired.push(key.clone());
                     continue;
                 };
                 if key.1 > current.generation {
@@ -785,14 +805,14 @@ impl Monitoring {
                         .get("state")
                         .and_then(Value::as_str)
                         == Some("closed");
-                let group = match groups.entry(workspace.clone()) {
+                let group = match groups.entry(workspace.to_owned()) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         let (edited_paths, paths_complete) =
-                            store.git_edit_paths(&workspace, PAGE_LIMIT)?;
+                            store.git_edit_paths(workspace, PAGE_LIMIT)?;
                         entry.insert(GitGroup {
-                            baseline: store.git_baseline(&workspace)?,
+                            baseline: store.git_baseline(workspace)?,
                             base_oid: store
-                                .get_workspace_by_path(&workspace)?
+                                .get_workspace_by_path(workspace)?
                                 .map(|row| row.base_oid),
                             inputs: Vec::new(),
                             edited_paths,
@@ -804,7 +824,7 @@ impl Monitoring {
                 let cursor = store.git_cursor(&key.0, key.1)?;
                 let page = store.git_hint_page(&key.0, key.1, cursor, PAGE_LIMIT)?;
                 group.inputs.push(GitBindingInput {
-                    key,
+                    key: key.clone(),
                     terminal: historical || current.is_terminal(),
                     native_closed,
                     cursor,
@@ -908,6 +928,26 @@ impl Monitoring {
         }
     }
 
+    fn retire_git_workspaces(&self) {
+        let retired = {
+            let bindings = self.inner.git_bindings.lock_recover();
+            let needed: HashSet<_> = bindings.values().collect();
+            let mut workspaces = self.inner.git_workspaces.lock_recover();
+            let mut retired = Vec::new();
+            workspaces.retain(|workspace, target| {
+                if needed.contains(workspace) {
+                    return true;
+                }
+                // Retain the last Arc until outside both maps: dropping a watcher
+                // or a completed pending registration can stop backend threads.
+                retired.push(Arc::clone(target));
+                false
+            });
+            retired
+        };
+        drop(retired);
+    }
+
     fn update_watcher(target: &GitWorkspace, workspace: &str, live: bool) -> bool {
         let (dirty, registration, retired) = {
             let mut slot = target.watch.lock_recover();
@@ -976,6 +1016,7 @@ impl Monitoring {
             Err(error) => {
                 self.release_inactive_watchers(&HashSet::new(), false);
                 self.note_git_read_error(&error.code);
+                self.retire_git_workspaces();
                 return;
             }
         };
@@ -1116,6 +1157,10 @@ impl Monitoring {
                 }
             }
         }
+        // Final bindings remain registered through hint attribution and source
+        // closure. Consult the current registry, not this sweep's input snapshot,
+        // so a concurrent new binding keeps its shared cache slot.
+        self.retire_git_workspaces();
     }
 
     async fn commit_git_pages(
@@ -1302,6 +1347,7 @@ impl Monitoring {
             }
             Err(error) => self.mark_git_unavailable(&error.code),
         }
+        self.retire_git_workspaces();
     }
 
     fn note_git_read_error(&self, code: &str) {

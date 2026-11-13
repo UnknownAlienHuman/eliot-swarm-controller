@@ -9,7 +9,7 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
 pub struct DiscoverSubject {
     pub native_ref: String,
     pub workspace: Option<String>,
@@ -20,13 +20,13 @@ pub struct DiscoverSubject {
     pub ephemeral: Option<bool>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
 pub struct DiscoverCoverage {
     pub kind: String,
     pub complete: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
 pub struct DiscoverPage {
     pub harness: String,
     pub native_scope: String,
@@ -65,7 +65,7 @@ impl ObservationQuery {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize)]
 pub struct ObservationPage {
     pub agent_id: String,
     pub generation: i64,

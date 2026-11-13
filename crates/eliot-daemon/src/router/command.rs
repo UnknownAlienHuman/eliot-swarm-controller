@@ -724,8 +724,10 @@ impl Router {
     }
 
     /// Execute a dispatched local `notify`/`emit`: commit its validated DTO
-    /// as one persisted `x.user.*` event, publish it on the bus, log it, and
-    /// settle Applied with the standard command readback. No external send.
+    /// as one persisted `x.user.*` event together with its Applied
+    /// settlement in a single Store transaction, publishing the committed
+    /// batch in order while still serialized with the writer. No external
+    /// send.
     async fn execute_user_event_command(&self, id: &str, dispatched: Command) {
         let (kind, mut data) = match super::user_event_kind_data(&dispatched.verb, &dispatched.args)
         {
@@ -744,27 +746,21 @@ impl Router {
         self.redact_native_value(&mut data);
         let committed = {
             let mut store = self.inner.store.lock().await;
-            store.commit_user_event(id, &kind, data.clone(), now_ms())
+            let result = store.commit_user_event_applied(id, &kind, data, now_ms());
+            if let Ok(change) = &result
+                && !change.events.is_empty()
+            {
+                self.publish_locked(&change.events);
+            }
+            result
         };
-        match committed {
-            Ok(change) => {
-                let event = change.value.clone();
-                self.publish_locked(std::slice::from_ref(&event));
-                self.settle(
-                    id,
-                    CommandState::Applied,
-                    Some(json!({"kind": kind, "seq": event.seq})),
-                )
-                .await;
-            }
-            Err(error) => {
-                self.settle(
-                    id,
-                    CommandState::Unknown,
-                    Some(json!({"code": error.code, "cause": "user_event_commit_failed"})),
-                )
-                .await;
-            }
+        if let Err(error) = committed {
+            self.settle(
+                id,
+                CommandState::Unknown,
+                Some(json!({"code": error.code, "cause": "user_event_commit_failed"})),
+            )
+            .await;
         }
         self.signal_progress();
     }

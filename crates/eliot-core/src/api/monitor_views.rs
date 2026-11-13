@@ -7,7 +7,7 @@ use crate::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum ObservationView {
     Data(Box<ObservationData>),
@@ -27,7 +27,7 @@ impl ObservationView {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ObservationData {
     pub processes_truncated: bool,
     #[serde(deserialize_with = "process_records")]
@@ -42,7 +42,7 @@ pub struct ObservationData {
     pub git: GitView,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProcessStatsView {
     pub available: bool,
     #[serde(deserialize_with = "nullable")]
@@ -64,7 +64,7 @@ pub struct ProcessStatsView {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StatsCoverage {
     Unknown,
@@ -73,7 +73,7 @@ pub enum StatsCoverage {
     Partial,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LivenessView {
     pub state: AgentState,
     #[serde(deserialize_with = "nullable")]
@@ -86,13 +86,13 @@ pub struct LivenessView {
     pub source_healthy: Option<bool>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LivenessBasis {
     CommittedNativeFacts,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum WorkspaceView {
     Data(Box<WorkspaceObservation>),
@@ -112,7 +112,7 @@ impl WorkspaceView {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceObservation {
     pub owner: String,
     pub target_generation: i64,
@@ -127,7 +127,7 @@ pub struct WorkspaceObservation {
     pub source: Option<SourceState>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum GitView {
     Data(Box<GitObservation>),
@@ -159,7 +159,7 @@ impl GitView {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GitObservation {
     pub available: bool,
     pub workspace: String,
@@ -205,7 +205,7 @@ pub struct GitObservation {
 }
 
 /// Exact `read_source_state` projection: digests, but no list-view owners.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonitoringSourceState {
     pub agent_id: String,
     pub generation: i64,
@@ -237,7 +237,7 @@ pub struct MonitoringSourceState {
     pub gap_seq: Option<i64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilesystemInvalidationView {
     pub state: FilesystemInvalidationState,
     // An absent watch slot omits this field; an existing inactive slot emits null.
@@ -258,7 +258,7 @@ impl FilesystemInvalidationView {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FilesystemInvalidationState {
     Healthy,

@@ -4,7 +4,7 @@ use crate::{Command, Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TimerSchedule {
     Interval {
@@ -51,7 +51,7 @@ pub enum CatchUp {
     None,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TimerStateView {
     pub id: String,
@@ -100,16 +100,18 @@ impl TimerStateView {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TimerGetRequest {
     #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_project"
     )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub project: Option<String>,
 }
 
@@ -149,18 +151,21 @@ impl TimerGetRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TimerRunRequest {
     #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
     #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub rule: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_project"
     )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub project: Option<String>,
 }
 
