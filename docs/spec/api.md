@@ -261,9 +261,11 @@ a fresh caller-retained mutation ULID rather than reusing the illustrative examp
 `api.identity` returns the authenticated principal kind, Agent id/generation when present,
 and its allowed scope patterns. An Agent's variable scope defaults to its actual project;
 mailbox access is self-only. Owners explicitly select variable scopes and mailboxes.
-Help's `scopes` describes only the requested method's domain, rather than inheriting
-the caller-wide list from `api.identity`. A mailbox scope denotes the `agent` mailbox
-selector, not a `scope` request field; methods without a scope domain return an empty list.
+Help's `scopes` describes only coordination authorization scopes relevant to the
+requested method, rather than inheriting the caller-wide list from `api.identity`.
+A mailbox scope denotes the `agent` mailbox selector, not a `scope` request field.
+Other methods return an empty list; native, process and provider selector values
+remain described by their owning request DTO fields.
 Unsupported mail presentation modes, tree variable scopes and native Goal/cost controls
 are described as unsupported, not advertised as available native capabilities. Use
 `agent.get` for target-generation capabilities before `command.submit`.
