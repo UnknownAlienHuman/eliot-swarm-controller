@@ -281,7 +281,15 @@ impl Monitoring {
             targets.insert(key, Arc::clone(&target));
         }
         // A failed read-only probe leaves unknown observation; it does not fail native startup.
-        let _ = self.sample_target(&target).await;
+        // Controlled startup holds its cleanup gate here. Bound this initial
+        // sample, including its Store wait, by the existing sampling cadence.
+        // The target stays registered; a timed-out blocking read has no native
+        // effect, and its dropped future cannot later commit a stale snapshot.
+        let _ = timeout_at(
+            Instant::now() + SAMPLE_INTERVAL,
+            self.sample_target(&target),
+        )
+        .await;
         Ok(())
     }
 

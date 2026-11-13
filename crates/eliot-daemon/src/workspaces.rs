@@ -57,6 +57,60 @@ struct Slot {
     operation: AsyncMutex<()>,
     active: Mutex<Option<ActiveRun>>,
     last: Mutex<Option<RunResult>>,
+    removal: Mutex<Option<RemovalProgress>>,
+}
+
+struct RemovalProgress {
+    command_id: String,
+    may_have_begun: bool,
+}
+
+impl Slot {
+    fn begin_removal(&self, command_id: &str, preparation: &WorkspacePreparation) {
+        let mut removal = self.removal.lock_recover();
+        if removal
+            .as_ref()
+            .is_none_or(|state| state.command_id != command_id)
+        {
+            *removal = Some(RemovalProgress {
+                command_id: command_id.to_owned(),
+                may_have_begun: native_removal_may_have_begun(preparation),
+            });
+        }
+    }
+
+    fn note_removal_effect(&self, command_id: &str) {
+        *self.removal.lock_recover() = Some(RemovalProgress {
+            command_id: command_id.to_owned(),
+            may_have_begun: true,
+        });
+    }
+
+    fn removal_may_have_begun(&self, command_id: &str, preparation: &WorkspacePreparation) -> bool {
+        if preparation.phase != WorkspacePhase::Removing {
+            return true;
+        }
+        self.removal
+            .lock_recover()
+            .as_ref()
+            .filter(|state| state.command_id == command_id)
+            .map_or_else(
+                || native_removal_may_have_begun(preparation),
+                |state| state.may_have_begun,
+            )
+    }
+
+    fn refuse_removal(
+        &self,
+        command_id: &str,
+        preparation: &WorkspacePreparation,
+    ) -> WorkspaceRemovalOutcome {
+        if self.removal_may_have_begun(command_id, preparation) {
+            removal_unknown("workspace_removal_may_have_begun")
+        } else {
+            removal_refused()
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -454,6 +508,10 @@ impl WorkspaceManager {
             .ok_or_else(|| problem("not_found", "managed workspace was not found"))?;
         let slot = self.register_slot(&preparation).await?;
         let _operation = slot.operation.lock().await;
+        {
+            let _gate = slot.gate.clone().lock_owned().await;
+            slot.begin_removal(&command.id, &preparation);
+        }
         let outcome = match WorkspaceGit::new() {
             Ok(git) => {
                 self.remove_prepared(command, &preparation, &slot, &git)
@@ -463,7 +521,8 @@ impl WorkspaceManager {
         };
         let _gate = slot.gate.clone().lock_owned().await;
         let outcome = if matches!(&outcome, WorkspaceRemovalOutcome::Failed { .. })
-            && self.require_removing(&preparation, command).await.is_err()
+            && (slot.removal_may_have_begun(&command.id, &preparation)
+                || self.require_removing(&preparation, command).await.is_err())
         {
             removal_unknown("workspace_removal_marker_changed")
         } else {
@@ -537,38 +596,19 @@ impl WorkspaceManager {
                 }
                 files.push(file);
             }
-            let mut deleted = false;
-            for file in files {
-                let _gate = slot.gate.clone().lock_owned().await;
-                let _startup = self.inner.startup_gate.lock().await;
-                if self.inner.startup_closed.load(Ordering::SeqCst) {
-                    return removal_unknown("workspace_shutdown");
-                }
-                if self.require_removing(preparation, command).await.is_err() {
-                    return removal_unknown("workspace_removal_marker_changed");
-                }
-                if Instant::now() >= deadline {
-                    return removal_unknown("workspace_scratch_deadline");
-                }
-                // Recheck immediately before each individual unlink, under the same
-                // gate as forced shutdown. Never hold Store while doing filesystem I/O.
-                let file = match self.checked_scratch_file(preparation, &scratch, &file) {
-                    Ok(file) => file,
-                    Err(_) => return removal_unknown("workspace_scratch_path_changed"),
-                };
-                if fs::remove_file(&file).is_err() {
-                    return removal_unknown("workspace_scratch_delete_unknown");
-                }
-                deleted = true;
-                if Instant::now() >= deadline {
-                    return removal_unknown("workspace_scratch_deadline");
-                }
+            if let Err(outcome) = self
+                .remove_scratch_files(command, preparation, slot, &scratch, files, deadline)
+                .await
+            {
+                return outcome;
             }
             // Empty directories are left to ordinary Git removal; never recurse over
             // a scratch root that might also contain clean tracked files.
             let mutator = match timeout_at(deadline, git.prepare_remove(preparation)).await {
                 Ok(Ok(command)) => command,
-                Ok(Err(error)) if !deleted => return removal_preflight_error(&error),
+                Ok(Err(error)) if !slot.removal_may_have_begun(&command.id, preparation) => {
+                    return removal_preflight_error(&error);
+                }
                 Ok(Err(_)) => return removal_unknown("workspace_remove_after_scratch"),
                 Err(_) => return removal_unknown("workspace_remove_deadline"),
             };
@@ -619,6 +659,9 @@ impl WorkspaceManager {
                             ),
                         )
                         .await;
+                    if result.code == "workspace_process_not_started" {
+                        return slot.refuse_removal(&command.id, preparation);
+                    }
                     if !result.quiescent {
                         return removal_unknown(result.code);
                     }
@@ -631,6 +674,42 @@ impl WorkspaceManager {
                 }
             }
         }
+    }
+
+    async fn remove_scratch_files(
+        &self,
+        command: &CoreCommand,
+        preparation: &WorkspacePreparation,
+        slot: &Arc<Slot>,
+        scratch: &[String],
+        files: Vec<PathBuf>,
+        deadline: Instant,
+    ) -> std::result::Result<(), WorkspaceRemovalOutcome> {
+        for file in files {
+            let _gate = slot.gate.clone().lock_owned().await;
+            let _startup = self.inner.startup_gate.lock().await;
+            if self.inner.startup_closed.load(Ordering::SeqCst) {
+                return Err(slot.refuse_removal(&command.id, preparation));
+            }
+            if self.require_removing(preparation, command).await.is_err() {
+                return Err(removal_unknown("workspace_removal_marker_changed"));
+            }
+            if Instant::now() >= deadline {
+                return Err(removal_unknown("workspace_scratch_deadline"));
+            }
+            // Recheck immediately before unlink under the cleanup gate. The
+            // effect fact is command-bound and survives repository-fence retries.
+            let file = self
+                .checked_scratch_file(preparation, scratch, &file)
+                .map_err(|_| removal_unknown("workspace_scratch_path_changed"))?;
+            slot.note_removal_effect(&command.id);
+            fs::remove_file(&file)
+                .map_err(|_| removal_unknown("workspace_scratch_delete_unknown"))?;
+            if Instant::now() >= deadline {
+                return Err(removal_unknown("workspace_scratch_deadline"));
+            }
+        }
+        Ok(())
     }
 
     async fn wait_git_sources_closed(
@@ -903,10 +982,18 @@ impl WorkspaceManager {
                     continue;
                 };
                 let mut store = self.inner.store.lock().await;
+                let Ok(Some(current)) = store.get_workspace(&preparation.agent) else {
+                    continue;
+                };
+                // A worker may have settled while the preparation snapshot was
+                // collected. Never replace an already uncertain/settled outcome.
+                if current.phase != WorkspacePhase::Removing {
+                    continue;
+                }
                 let Ok(change) = store.settle_workspace_removal(
                     id,
                     preparation.target_generation,
-                    removal_unknown("workspace_shutdown"),
+                    slot.refuse_removal(id, &current),
                     now_ms(),
                 ) else {
                     continue;
@@ -1251,6 +1338,9 @@ impl WorkspaceManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if context.role == "workspace_remove" {
+            slot.note_removal_effect(&context.command_id);
+        }
         let mut child = match OwnedChild::spawn(command) {
             Ok(child) => child,
             Err(_) => {
@@ -1543,6 +1633,21 @@ fn removal_refused() -> WorkspaceRemovalOutcome {
     }
 }
 
+fn native_removal_may_have_begun(preparation: &WorkspacePreparation) -> bool {
+    // Recovery marks interrupted removals Unknown: a false Git marker alone
+    // cannot rule out scratch deletion before restart. Only a live Removing
+    // intent can seed no-effect progress; missing markers stay conservative.
+    if preparation.phase != WorkspacePhase::Removing {
+        return true;
+    }
+    preparation
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("native_git_write_dispatched"))
+        .and_then(Value::as_bool)
+        != Some(false)
+}
+
 fn removal_preflight_error(error: &Error) -> WorkspaceRemovalOutcome {
     if matches!(
         error.code.as_str(),
@@ -1594,6 +1699,184 @@ fn safe_removal(outcome: WorkspaceRemovalOutcome) -> WorkspaceRemovalOutcome {
 mod tests {
     use super::*;
     use std::process::Command as GitCommand;
+
+    #[tokio::test]
+    async fn shutdown_boundary_scratch_refusal_and_force_preserve_no_effect_restoration() {
+        for (deleted_earlier, restarted) in [(false, false), (true, false), (true, true)] {
+            let root = TestRoot(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(".403-removal-{}", Ulid::new())),
+            );
+            let data_root = root.0.join("data");
+            let checkout = root.0.join("checkout");
+            let worktree = data_root.join("worktrees").join("subject");
+            fs::create_dir_all(&checkout).unwrap();
+            fs::create_dir_all(worktree.join("scratch")).unwrap();
+            let pending = worktree.join("scratch/pending.tmp");
+            let earlier = worktree.join("scratch/earlier.tmp");
+            fs::write(&pending, "retained").unwrap();
+            fs::write(&earlier, "earlier").unwrap();
+            let input = WorkspacePreparationInput {
+                project: checkout.display().to_string(),
+                repo_path: checkout.display().to_string(),
+                repo_common_dir: checkout.join(".git").display().to_string(),
+                requested_branch: "codex/shutdown-removal".to_owned(),
+                base_ref: Some("HEAD".to_owned()),
+                base_oid: "a".repeat(40),
+                worktree_path: worktree.display().to_string(),
+                frozen_setup: Vec::new(),
+            };
+            let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
+            let launch_id = Ulid::new().to_string();
+            let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
+            launch.expected_generation = Some(0);
+            launch.args = json!({"project":input.project, "workspace":input.repo_path,
+                "worktree":input.requested_branch, "harness":"codex", "profile":"fixture",
+                "profile_snapshot":{"scratch":["scratch/"]}});
+            let agent = store
+                .submit_with_workspace("owner", launch, input.clone(), now_ms())
+                .unwrap()
+                .command
+                .target
+                .unwrap();
+            let ready = store
+                .settle_workspace_creation(
+                    &launch_id,
+                    1,
+                    WorkspaceCreationOutcome::Verified {
+                        repo_path: input.repo_path,
+                        repo_common_dir: input.repo_common_dir,
+                        worktree_path: input.worktree_path,
+                        branch: input.requested_branch,
+                        head: input.base_oid,
+                    },
+                    now_ms(),
+                )
+                .unwrap()
+                .value;
+            store.dispatch(&launch_id, now_ms()).unwrap();
+            store
+                .install_plugin_sources(
+                    &agent,
+                    1,
+                    &launch_id,
+                    &std::collections::BTreeMap::from([(
+                        "session".to_owned(),
+                        "stream".to_owned(),
+                    )]),
+                    now_ms(),
+                )
+                .unwrap();
+            store.put_batch(eliot_core::SourceBatch {
+                batch_id:Ulid::new().to_string(), agent_id:agent.clone(), generation:1,
+                source:"stream".to_owned(), cursor:None,
+                events:vec![eliot_core::NativeEvent {
+                    ts:None, kind:"session.ready".to_owned(), native_id:"ready".to_owned(),
+                    data:json!({"command_id":launch_id, "native_scope":"scope", "native_ref":"subject"}),
+                }, eliot_core::NativeEvent {
+                    ts:None, kind:"session.ended".to_owned(), native_id:"ended".to_owned(), data:json!({}),
+                }],
+            }, now_ms()).unwrap();
+            store
+                .settle(&launch_id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            let removal_id = Ulid::new().to_string();
+            let mut removal = SubmitCommand::new(removal_id.clone(), "worktree.remove");
+            removal.target = Some(agent.clone());
+            removal.expected_generation = Some(1);
+            store.submit("owner", removal, now_ms()).unwrap();
+            let command = store.dispatch(&removal_id, now_ms()).unwrap().value;
+            let preparation = store.get_workspace(&agent).unwrap().unwrap();
+            assert_eq!(preparation.phase, WorkspacePhase::Removing);
+            let store = Arc::new(AsyncMutex::new(store));
+            let bus = Bus::new(32);
+            let secrets: SecretSet = Arc::new(Mutex::new(HashSet::new()));
+            let (progress, _) = watch::channel(0_u64);
+            let monitoring = Monitoring::new(store.clone(), bus.clone(), secrets.clone());
+            let manager =
+                WorkspaceManager::new(data_root, store.clone(), bus, secrets, progress, monitoring);
+            let slot = manager.register_slot(&preparation).await.unwrap();
+            slot.begin_removal(&removal_id, &preparation);
+            let scratch = vec!["scratch/".to_owned()];
+            // Read-only classification and path verification finish before FORCE.
+            let pending = manager
+                .checked_scratch_file(&preparation, &scratch, &pending)
+                .unwrap();
+            if deleted_earlier {
+                manager
+                    .remove_scratch_files(
+                        &command,
+                        &preparation,
+                        &slot,
+                        &scratch,
+                        vec![earlier.clone()],
+                        Instant::now() + GIT_TIME,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!earlier.exists());
+                // Starting another preflight/fence iteration cannot erase this fact.
+                slot.begin_removal(&removal_id, &preparation);
+            }
+            if restarted {
+                let recovered = {
+                    let mut store = store.lock().await;
+                    store.recover_on_restart(now_ms()).unwrap();
+                    store.get_workspace(&agent).unwrap().unwrap()
+                };
+                assert_eq!(recovered.phase, WorkspacePhase::Unknown);
+                assert_eq!(
+                    recovered.outcome.as_ref().unwrap()["native_git_write_dispatched"],
+                    false
+                );
+                let recovered_slot = Slot::default();
+                recovered_slot.begin_removal(&removal_id, &recovered);
+                assert!(matches!(
+                    recovered_slot.refuse_removal(&removal_id, &recovered),
+                    WorkspaceRemovalOutcome::Unknown { .. }
+                ));
+            }
+            manager.close_startup_admission();
+            let refusal = manager
+                .remove_scratch_files(
+                    &command,
+                    &preparation,
+                    &slot,
+                    &scratch,
+                    vec![pending.clone()],
+                    Instant::now() + GIT_TIME,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                matches!(refusal, WorkspaceRemovalOutcome::Unknown { .. }),
+                deleted_earlier
+            );
+            assert!(matches!(refusal, WorkspaceRemovalOutcome::Failed { .. }) || deleted_earlier);
+            assert_eq!(fs::read_to_string(&pending).unwrap(), "retained");
+            manager.stop_all(true).await;
+            let store = store.lock().await;
+            let settled = store.get_workspace(&agent).unwrap().unwrap();
+            assert_eq!(settled.setup_index, ready.setup_index);
+            assert_eq!(
+                settled.phase,
+                if deleted_earlier {
+                    WorkspacePhase::Unknown
+                } else {
+                    ready.phase
+                }
+            );
+            assert_eq!(
+                store.get_command(&removal_id).unwrap().unwrap().state,
+                if deleted_earlier {
+                    CommandState::Unknown
+                } else {
+                    CommandState::Failed
+                }
+            );
+            assert_eq!(fs::read_to_string(&pending).unwrap(), "retained");
+            assert!(worktree.exists());
+        }
+    }
 
     struct TestRoot(PathBuf);
 
