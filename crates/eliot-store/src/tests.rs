@@ -10555,3 +10555,140 @@ fn claude_project_resume_passes_the_projects_gate_with_linked_input() {
         CommandState::Applied
     );
 }
+
+#[test]
+fn local_notify_commits_user_event_and_applied_atomically() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let id = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: id.clone(),
+                target: None,
+                selector: None,
+                verb: "notify".to_owned(),
+                args: json!({"message": "hello"}),
+                expected_generation: None,
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit notify");
+    store.dispatch(&id, now + 1).expect("dispatch notify");
+    let change = store
+        .commit_user_event_applied(&id, "x.user.notify", json!({"message": "hello"}), now + 2)
+        .expect("atomic notify commit");
+    assert_eq!(change.value.state, CommandState::Applied);
+    assert_eq!(change.events.len(), 2);
+    assert_eq!(change.events[0].kind, "x.user.notify");
+    assert_eq!(change.events[1].kind, "command.applied");
+    assert_eq!(
+        change.value.outcome,
+        Some(json!({"kind": "x.user.notify", "seq": change.events[0].seq}))
+    );
+    let event_count: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .expect("count events after atomic commit");
+    // An exact retry returns the recorded result without a new event.
+    let retry = store
+        .commit_user_event_applied(&id, "x.user.notify", json!({"message": "hello"}), now + 3)
+        .expect("idempotent notify retry");
+    assert_eq!(retry.value.state, CommandState::Applied);
+    assert_eq!(retry.value.outcome, change.value.outcome);
+    assert!(retry.events.is_empty());
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count events after retry"),
+        event_count
+    );
+}
+
+#[test]
+fn local_user_event_atomic_commit_rejects_mismatch_and_leaves_unknown() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let id = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: id.clone(),
+                target: None,
+                selector: None,
+                verb: "emit".to_owned(),
+                args: json!({"topic": "alerts", "data": {"n": 1}}),
+                expected_generation: None,
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit emit");
+    store.dispatch(&id, now + 1).expect("dispatch emit");
+    let error = store
+        .commit_user_event_applied(&id, "x.user.other", json!({"data": {"n": 1}}), now + 2)
+        .expect_err("kind mismatch is rejected");
+    assert_eq!(error.code, "invalid");
+    assert_eq!(
+        store.get_command(&id).unwrap().unwrap().state,
+        CommandState::Dispatched
+    );
+    let change = store
+        .commit_user_event_applied(&id, "x.user.alerts", json!({"data": {"n": 1}}), now + 3)
+        .expect("atomic emit commit");
+    assert_eq!(change.value.state, CommandState::Applied);
+    assert_eq!(change.events.len(), 2);
+    assert_eq!(change.events[0].kind, "x.user.alerts");
+    assert_eq!(change.events[1].kind, "command.applied");
+    // Legacy crash rows stay Unknown: no reconciliation without retained evidence.
+    let legacy = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: legacy.clone(),
+                target: None,
+                selector: None,
+                verb: "notify".to_owned(),
+                args: json!({"message": "legacy"}),
+                expected_generation: None,
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now + 4,
+        )
+        .expect("admit legacy notify");
+    store
+        .dispatch(&legacy, now + 5)
+        .expect("dispatch legacy notify");
+    store
+        .settle(
+            &legacy,
+            CommandState::Unknown,
+            Some(json!({"reason": "daemon_restart"})),
+            now + 6,
+        )
+        .expect("legacy crash row stays unknown");
+    let error = store
+        .commit_user_event_applied(
+            &legacy,
+            "x.user.notify",
+            json!({"message": "legacy"}),
+            now + 7,
+        )
+        .expect_err("legacy unknown is left alone");
+    assert_eq!(error.code, "bad_state");
+    let command = store.get_command(&legacy).unwrap().unwrap();
+    assert_eq!(command.state, CommandState::Unknown);
+    assert_eq!(command.outcome, Some(json!({"reason": "daemon_restart"})));
+}
