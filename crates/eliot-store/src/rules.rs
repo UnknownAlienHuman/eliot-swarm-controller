@@ -7459,6 +7459,220 @@ mod tests {
     }
 
     #[test]
+    fn coordination_owner_and_project_children_dispatch_apply_and_replay_once() {
+        for principal in ["owner", "project:project-test"] {
+            for verb in ["mail.send", "var.set"] {
+                let mut store = store();
+                let (agent_num, agent_id) = insert_test_agent(&mut store);
+                let now = 1_800_000_000_000;
+                if principal != "owner" {
+                    store
+                        .upsert_project_registration(
+                            "owner",
+                            &ProjectRegistrationInput {
+                                id: "project-test".to_owned(),
+                                checkout: "registered-checkout".to_owned(),
+                                repo_common_dir: "registered-common".to_owned(),
+                                git: None,
+                                profiles: Vec::new(),
+                                actions: vec![verb.to_owned()],
+                                interpreters: std::collections::BTreeMap::new(),
+                                run_env: Vec::new(),
+                            },
+                            now,
+                        )
+                        .unwrap();
+                }
+                let args = if verb == "mail.send" {
+                    json!({"to": [agent_id], "text": "completed"})
+                } else {
+                    json!({"scope": "project:project-test", "key": "result", "value": "done", "expect_version": 0})
+                };
+                let mut action = args.clone();
+                action["action"] = json!(verb);
+                let value = json!({"id": "coordination", "enabled": true, "do": [action]});
+                let input = RuleDefinitionInput {
+                    id: "coordination".to_owned(),
+                    canonical_definition: serde_json::to_string(&value).unwrap(),
+                    definition_digest: core::canonical_json_sha256(&value).unwrap(),
+                    enabled: true,
+                };
+                let state = store.ensure_rule_state(principal, &input, now).unwrap();
+                let seq = insert_test_turn_completed(&mut store, agent_num, now);
+                let mut request = SubmitCommand::new("", verb);
+                request.args = args;
+                let admission = store
+                    .admit_rule_action(principal, &state, seq, request.clone(), now)
+                    .unwrap();
+                let child = admission
+                    .child
+                    .as_ref()
+                    .expect("coordination child")
+                    .command
+                    .clone();
+                let dispatched = store.dispatch(&child.id, now + 1).unwrap();
+                assert_eq!(dispatched.value.state, CommandState::Dispatched);
+                assert_eq!(dispatched.events.last().unwrap().kind, "command.dispatched");
+                let apply = |store: &mut Store| {
+                    if verb == "mail.send" {
+                        store.commit_mail_send_applied(
+                            &child.id,
+                            core::api::MailLimits::default(),
+                            now + 2,
+                        )
+                    } else {
+                        store.commit_var_set_applied(&child.id, now + 2)
+                    }
+                    .unwrap()
+                };
+                let applied = apply(&mut store);
+                assert_eq!(applied.value.state, CommandState::Applied);
+                assert!(applied.events.iter().all(|event| {
+                    event
+                        .cause
+                        .as_ref()
+                        .is_some_and(|cause| cause.command_id == child.id && cause.depth == 1)
+                }));
+                if verb == "mail.send" {
+                    let delivery =
+                        applied.value.outcome.as_ref().unwrap()["deliveries"][0]["delivery_id"]
+                            .as_str()
+                            .unwrap();
+                    let head = delivery
+                        .split_once('/')
+                        .unwrap()
+                        .0
+                        .strip_prefix("rule:")
+                        .unwrap();
+                    assert_eq!(ulid_timestamp_ms(head), Some(now));
+                    assert_eq!(
+                        store
+                            .connection
+                            .query_row("SELECT COUNT(*) FROM messages", [], |row| row
+                                .get::<_, i64>(0))
+                            .unwrap(),
+                        1
+                    );
+                } else {
+                    assert_eq!(applied.events[0].kind, "var.changed");
+                    assert_eq!(applied.events[1].kind, "command.applied");
+                    assert_eq!(applied.value.outcome.as_ref().unwrap()["version"], 1);
+                }
+                let replay = store
+                    .admit_rule_action(principal, &state, seq, request, now + 3)
+                    .unwrap();
+                assert!(!replay.is_new);
+                assert_eq!(replay.child.unwrap().command.id, child.id);
+                assert!(replay.events.is_empty());
+                let repeated = apply(&mut store);
+                assert_eq!(repeated.value, applied.value);
+                assert!(repeated.events.is_empty());
+                assert_eq!(
+                    store
+                        .connection
+                        .query_row("SELECT COUNT(*) FROM writes", [], |row| row
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coordination_var_changed_preserves_cause_through_depth_five() {
+        let mut store = store();
+        let mut state = store
+            .ensure_rule_state("owner", &definition("var-loop", true), 10)
+            .unwrap();
+        let mut seq = insert_test_event(&mut store, "var.changed", 11);
+        for depth in 1..=6 {
+            let mut request = SubmitCommand::new("", "var.set");
+            request.args = json!({"scope": "global", "key": "loop", "value": depth});
+            let admission = store
+                .admit_rule_action("owner", &state, seq, request, 12 + i64::from(depth))
+                .unwrap();
+            state = admission.state;
+            if depth == 6 {
+                assert!(admission.parent.is_none());
+                assert!(admission.child.is_none());
+                assert!(admission.events.is_empty());
+                break;
+            }
+            let child = admission.child.unwrap().command;
+            store.dispatch(&child.id, 20).unwrap();
+            let applied = store.commit_var_set_applied(&child.id, 21).unwrap();
+            let event = &applied.events[0];
+            assert_eq!(event.kind, "var.changed");
+            let cause = event.cause.as_ref().expect("verified variable producer");
+            assert_eq!(cause.command_id, child.id);
+            assert_eq!(cause.depth, depth);
+            seq = event.seq;
+        }
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT version FROM vars WHERE key = 'loop'", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn coordination_rule_mail_ack_survives_pruned_delivery() {
+        let mut store = store();
+        let (agent_num, agent_id) = insert_test_agent(&mut store);
+        let now = 1_800_000_000_000;
+        let state = store
+            .ensure_rule_state("owner", &definition("mail-result", true), now)
+            .unwrap();
+        let seq = insert_test_turn_completed(&mut store, agent_num, now);
+        let mut request = SubmitCommand::new("", "mail.send");
+        request.args = json!({"to": [agent_id], "text": "completed"});
+        let child = store
+            .admit_rule_action("owner", &state, seq, request, now)
+            .unwrap()
+            .child
+            .unwrap()
+            .command;
+        store.dispatch(&child.id, now).unwrap();
+        let applied = store
+            .commit_mail_send_applied(&child.id, core::api::MailLimits::default(), now)
+            .unwrap();
+        let delivery = applied.value.outcome.unwrap()["deliveries"][0]["delivery_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let ack = core::api::MailAckRequest {
+            id: Ulid::from_parts(now as u64, 1).to_string(),
+            agent: Some(agent_id),
+            deliveries: vec![delivery],
+        };
+        store.mail_ack("owner", &ack, now).unwrap();
+        let later = now + 31 * 24 * 60 * 60 * 1_000;
+        assert_eq!(
+            store
+                .prune_retention(None, None, Some(30), later)
+                .unwrap()
+                .mail_deleted,
+            1
+        );
+        let fresh_ack = core::api::MailAckRequest {
+            id: Ulid::from_parts(later as u64, 2).to_string(),
+            ..ack
+        };
+        assert_eq!(
+            store
+                .mail_ack("owner", &fresh_ack, later)
+                .unwrap()
+                .value
+                .acked,
+            fresh_ack.deliveries
+        );
+    }
+
+    #[test]
     fn stop_admission_counts_only_children_and_recovers_undispatched_children() {
         let mut store = store();
         let (agent_num, agent_id) = insert_test_agent(&mut store);

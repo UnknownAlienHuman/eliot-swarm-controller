@@ -258,8 +258,8 @@ impl Store {
     /// still serialized with the writer. An already Applied child returns its
     /// recorded result without a new delivery; any other non-Dispatched state
     /// (including legacy Unknown rows) is rejected and left untouched. Never
-    /// touches the public write-id namespace: deliveries are prefixed with
-    /// the child command id and deduplicated by the child's own Applied state.
+    /// touches the public write-id namespace: deliveries use a rule-prefixed
+    /// ULID dated by admission and deduplicated by the child's own Applied state.
     pub fn commit_mail_send_applied(
         &mut self,
         command_id: &str,
@@ -298,9 +298,11 @@ impl Store {
             if record.state != CommandState::Dispatched {
                 return Err(Error::new("bad_state", "mail command is not dispatched"));
             }
+            projects::validate_project_command_dispatch_tx(&tx, &record)?;
             let sender = super::coordination::Sender::Owner;
+            let delivery_prefix = rule_mail_delivery_prefix(&record.command)?;
             let response =
-                Self::mail_effect_tx(&tx, &sender, &definition, limits, command_id, now)?;
+                Self::mail_effect_tx(&tx, &sender, &definition, limits, &delivery_prefix, now)?;
             if response.deliveries.len() != definition.to.len() {
                 return Err(Error::new("internal", "mail effect did not fan out"));
             }
@@ -418,6 +420,7 @@ impl Store {
                     "variable command is not dispatched",
                 ));
             }
+            projects::validate_project_command_dispatch_tx(&tx, &record)?;
             let encoded_value = encode_json(&definition.value)?;
             if encoded_value.len() > core::api::MAX_VAR_VALUE_BYTES {
                 return Err(Error::new(
@@ -431,6 +434,7 @@ impl Store {
                 &encoded_scope,
                 &definition,
                 &encoded_value,
+                Some(command_id),
                 now,
             )?;
             let outcome = serde_json::to_value(&response)
@@ -498,6 +502,21 @@ impl Store {
         self.fault_on_persistence_error(&result);
         result
     }
+}
+
+fn rule_mail_delivery_prefix(command: &Command) -> Result<String> {
+    let admitted_at = u64::try_from(command.created_at)
+        .ok()
+        .filter(|timestamp| *timestamp < (1_u64 << 48))
+        .ok_or_else(|| Error::new("source_integrity", "mail admission timestamp is invalid"))?;
+    let digest = canonical::digest(&json!({
+        "domain": "rule-mail-delivery-v1",
+        "command_id": command.id,
+    }))?;
+    let mut entropy = [0_u8; 16];
+    entropy[6..].copy_from_slice(&digest[..10]);
+    let id = Ulid::from_parts(admitted_at, u128::from_be_bytes(entropy));
+    Ok(format!("rule:{id}"))
 }
 
 fn validate_settle_outcome(state: CommandState, outcome: &Option<Value>) -> Result<()> {

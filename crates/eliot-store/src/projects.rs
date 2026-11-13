@@ -319,7 +319,7 @@ pub(super) fn capture_project_command_binding_tx(
     } else if command.verb == "run" {
         require_project_registration_action(&registration, "run")?;
         targetless_project_command_binding(registration.revision)
-    } else if matches!(command.verb, "notify" | "emit") {
+    } else if matches!(command.verb, "notify" | "emit" | "mail.send" | "var.set") {
         require_project_registration_action(&registration, command.verb)?;
         targetless_project_command_binding(registration.revision)
     } else {
@@ -416,12 +416,17 @@ pub(super) fn validate_project_command_dispatch_tx(
         }
         return Ok(());
     }
-    if command.target.is_none() && matches!(command.command.verb.as_str(), "notify" | "emit") {
+    if command.target.is_none()
+        && matches!(
+            command.command.verb.as_str(),
+            "notify" | "emit" | "mail.send" | "var.set"
+        )
+    {
         require_project_registration_action(&registration, &command.command.verb)?;
         if binding != targetless_project_command_binding(registration.revision) {
             return Err(Error::new(
                 "not_allowed",
-                "project notify/emit binding does not match its saved registration",
+                "project targetless action binding does not match its saved registration",
             ));
         }
         return Ok(());
@@ -937,6 +942,8 @@ fn is_supported_project_action(action: &str) -> bool {
             | "git.fetch"
             | "notify"
             | "emit"
+            | "mail.send"
+            | "var.set"
     )
 }
 

@@ -12,10 +12,11 @@
 //! version 0, so `expect_version: 0` creates.
 
 use super::{
-    Change, Error, MAX_EVENT_BYTES, Result, Store, canonical, command_binding, commit_transaction,
-    decode_json, encode_json, enforce_page_bytes, has_pending_send_input, has_unknown_gate,
-    history_expired, insert_daemon_event, load_agent_by_num, load_command_record, provider_holds,
-    sql_error, validate_id_age, validate_limit, write_binding,
+    Change, DaemonEventInput, Error, MAX_EVENT_BYTES, Result, Store, canonical, command_binding,
+    commit_transaction, decode_json, encode_json, enforce_page_bytes, has_pending_send_input,
+    has_unknown_gate, history_expired, insert_daemon_event_for_command, insert_daemon_event_input,
+    load_agent_by_num, load_command_record, provider_holds, sql_error, validate_id_age,
+    validate_limit, write_binding,
 };
 use eliot_core::{
     Agent, AgentState, CommandState,
@@ -1008,6 +1009,7 @@ impl Store {
             encoded_scope,
             &definition,
             encoded_value,
+            None,
             now,
         )?;
         request.validate_response(&value)?;
@@ -1144,6 +1146,7 @@ impl Store {
         encoded_scope: &str,
         definition: &VarDefinitionArgs,
         encoded_value: &str,
+        command_id: Option<&str>,
         now: i64,
     ) -> Result<(VarSetResponse, super::Event)> {
         let key = &definition.key;
@@ -1191,8 +1194,7 @@ impl Store {
                 now
             ],
         ));
-        let event = insert_daemon_event(
-            tx,
+        let input = DaemonEventInput::new(
             now,
             "var.changed",
             "coordination",
@@ -1204,7 +1206,11 @@ impl Store {
                 "version": version,
                 "set_by": principal,
             }),
-        )?;
+        );
+        let event = match command_id {
+            Some(id) => insert_daemon_event_for_command(tx, id, input)?,
+            None => insert_daemon_event_input(tx, input)?,
+        };
         let response = VarSetResponse {
             scope: encoded_scope.to_owned(),
             key: key.to_owned(),
@@ -1494,8 +1500,9 @@ fn mailbox_name(num: i64) -> String {
 }
 
 /// Whether an absent delivery of an already-authorized mailbox may have been
-/// pruned: the recipient suffix must name this mailbox, and the write id must
-/// be older than the retry window plus the allowed clock skew, exactly the
+/// pruned: the recipient suffix must name this mailbox, and the prefix's ULID
+/// (public write ID or rule-tagged admission ID) must be older than the retry
+/// window plus the allowed clock skew, exactly the
 /// admission `id_expired` age rule shared with command history. Retention
 /// keeps every younger mail row, so any other absent delivery never existed.
 /// Pure: a function of the caller's own input, so it leaks nothing across
@@ -1507,7 +1514,7 @@ fn delivery_may_be_pruned(delivery_id: &str, mailbox: i64, now: i64) -> bool {
     if tail != mailbox_name(mailbox) {
         return false;
     }
-    history_expired(head, now)
+    history_expired(head.strip_prefix("rule:").unwrap_or(head), now)
 }
 
 /// Error for an absent delivery of an already-authorized mailbox:

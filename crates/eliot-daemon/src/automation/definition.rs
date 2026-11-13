@@ -148,6 +148,43 @@ enum ActionDefinition {
     Var { definition: VarDefinitionArgs },
 }
 
+// Track the DTO's own field path, but never forward Serde's rejected scalar
+// values (or TOML source excerpts) into rule/reload diagnostics.
+fn decode_action<T: serde::de::DeserializeOwned>(action: &str, value: Value) -> Result<T, String> {
+    serde_path_to_error::deserialize(value).map_err(|error| {
+        let message = error.inner().to_string();
+        let mut field = error.path().to_string();
+        let reason = if let Some(missing) = message.strip_prefix("missing field `") {
+            field = missing.split('`').next().unwrap_or("<field>").to_owned();
+            "missing required field"
+        } else if let Some(unknown) = message.strip_prefix("unknown field `") {
+            field = unknown.split('`').next().unwrap_or("<field>").to_owned();
+            "unknown field"
+        } else if message.starts_with("invalid type:") {
+            "wrong type"
+        } else {
+            "invalid value"
+        };
+        let field = if !field.is_empty()
+            && field.len() <= 80
+            && field
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.[]-".contains(&byte))
+        {
+            field.as_str()
+        } else {
+            "<field>"
+        };
+        let action = match action {
+            "run" | "git.fetch" | "notify" | "emit" | "mail.send" | "msg.send" | "var.set"
+            | "stop" | "send" | "interrupt" | "steer" | "approve" | "deny" | "answer"
+            | "resume" | "launch" => action,
+            _ => "<unknown>",
+        };
+        format!("rule action {action} field {field}: {reason}")
+    })
+}
+
 impl<'de> Deserialize<'de> for ActionDefinition {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -156,55 +193,58 @@ impl<'de> Deserialize<'de> for ActionDefinition {
         let value = Value::deserialize(deserializer)?;
         let object = value
             .as_object()
-            .ok_or_else(|| D::Error::custom("rule action must be an object"))?;
+            .ok_or_else(|| D::Error::custom("rule action <unknown> field do: wrong type"))?;
         let action = object
             .get("action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| D::Error::custom("rule action kind is missing"))?
+            .ok_or_else(|| {
+                D::Error::custom("rule action <unknown> field action: missing required field")
+            })?
+            .as_str()
+            .ok_or_else(|| D::Error::custom("rule action <unknown> field action: wrong type"))?
             .to_owned();
         if action == "run" {
             let mut fields = object.clone();
             fields.remove("action");
             let definition =
-                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+                decode_action(&action, Value::Object(fields)).map_err(D::Error::custom)?;
             return Ok(Self::Run { definition });
         }
         if action == "git.fetch" {
             let mut fields = object.clone();
             fields.remove("action");
             let definition =
-                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+                decode_action(&action, Value::Object(fields)).map_err(D::Error::custom)?;
             return Ok(Self::GitFetch { definition });
         }
         if action == "notify" {
             let mut fields = object.clone();
             fields.remove("action");
             let definition =
-                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+                decode_action(&action, Value::Object(fields)).map_err(D::Error::custom)?;
             return Ok(Self::Notify { definition });
         }
         if action == "emit" {
             let mut fields = object.clone();
             fields.remove("action");
             let definition =
-                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+                decode_action(&action, Value::Object(fields)).map_err(D::Error::custom)?;
             return Ok(Self::Emit { definition });
         }
         if action == "mail.send" || action == "msg.send" {
             let mut fields = object.clone();
             fields.remove("action");
             let definition =
-                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+                decode_action(&action, Value::Object(fields)).map_err(D::Error::custom)?;
             return Ok(Self::Mail { definition });
         }
         if action == "var.set" {
             let mut fields = object.clone();
             fields.remove("action");
             let definition =
-                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+                decode_action(&action, Value::Object(fields)).map_err(D::Error::custom)?;
             return Ok(Self::Var { definition });
         }
-        serde_json::from_value::<AgentActionDefinition>(value)
+        decode_action::<AgentActionDefinition>(&action, value)
             .map(Self::Agent)
             .map_err(D::Error::custom)
     }
@@ -546,9 +586,17 @@ pub fn load(reader: impl Read) -> Result<Vec<RuleDefinition>, Error> {
     let mut ids = HashSet::with_capacity(file.rule.len());
     for raw in file.rule {
         reject_unimplemented_options(&raw)?;
-        let mut rule: RuleDefinition = raw
-            .try_into()
-            .map_err(|_| Error::new("invalid", "rule definition is malformed"))?;
+        let mut rule: RuleDefinition = raw.try_into().map_err(|error: toml::de::Error| {
+            let message = error.message();
+            Error::new(
+                "invalid",
+                if message.starts_with("rule action ") {
+                    message.to_owned()
+                } else {
+                    "rule definition is malformed".to_owned()
+                },
+            )
+        })?;
         validate_rule(&mut rule)?;
         if !ids.insert(rule.id.clone()) {
             return Err(Error::new("invalid", "rule file contains duplicate ids"));
@@ -1946,7 +1994,7 @@ do = [{ action = 'resume', target = '${event.agent}', expected_generation = '${e
         );
 
         let unsupported = [
-            RULE.replace("action = 'stop'", "action = 'notify'"),
+            RULE.replace("action = 'stop'", "action = 'git.push'"),
             RULE.replace("'subject.harness' = 'fake'", "'subject.labels.role' = 'writer'"),
             RULE.replace("'subject.harness' = 'fake'", "'event.parent' = 'command-id'"),
             RULE.replace(
@@ -3273,6 +3321,76 @@ do = [{ action = 'git.fetch', repository = 'project-one', remote = 'origin', sou
 
         let mixed = INTERVAL_TIMER.replace("every = '30m'", "every = '30m', cron = '0 12 * * *'");
         assert_eq!(load(Cursor::new(mixed)).unwrap_err().code, "invalid");
+    }
+
+    #[test]
+    fn coordination_decode_errors_keep_action_field_reason_without_values() {
+        for (fields, reason) in [
+            ("text = 'REJECTED_VALUE'", "missing required field"),
+            ("action = 987654321", "wrong type"),
+        ] {
+            let source = format!(
+                "[[rule]]\nid = 'decode'\non = {{ event = 'turn.completed' }}\ndo = [{{ {fields} }}]\n"
+            );
+            let error = load(Cursor::new(source)).unwrap_err();
+            assert!(
+                error.message.contains(&format!("field action: {reason}")),
+                "{error:?}"
+            );
+            assert!(!error.message.contains("REJECTED_VALUE"), "{error:?}");
+            assert!(!error.message.contains("987654321"), "{error:?}");
+        }
+        for (action, fields, field, reason) in [
+            (
+                "mail.send",
+                "to = 'REJECTED_VALUE', text = 'ok'",
+                "to",
+                "wrong type",
+            ),
+            (
+                "mail.send",
+                "to = [987654321], text = 'ok'",
+                "to[0]",
+                "wrong type",
+            ),
+            (
+                "mail.send",
+                "to = ['a7'], text = 987654321",
+                "text",
+                "wrong type",
+            ),
+            (
+                "mail.send",
+                "text = 'REJECTED_VALUE'",
+                "to",
+                "missing required field",
+            ),
+            (
+                "mail.send",
+                "to = ['a7'], text = 'ok', typo = 'REJECTED_VALUE'",
+                "typo",
+                "unknown field",
+            ),
+            (
+                "var.set",
+                "key = 'k', value = 'ok', expect_version = 'REJECTED_VALUE'",
+                "expect_version",
+                "wrong type",
+            ),
+        ] {
+            let source = format!(
+                "[[rule]]\nid = 'decode'\non = {{ event = 'turn.completed' }}\ndo = [{{ action = '{action}', {fields} }}]\n"
+            );
+            let error = load(Cursor::new(source)).unwrap_err();
+            assert_eq!(error.code, "invalid");
+            assert!(error.message.contains(action), "{error:?}");
+            assert!(
+                error.message.contains(&format!("field {field}: {reason}")),
+                "{error:?}"
+            );
+            assert!(!error.message.contains("REJECTED_VALUE"), "{error:?}");
+            assert!(!error.message.contains("987654321"), "{error:?}");
+        }
     }
 
     #[test]

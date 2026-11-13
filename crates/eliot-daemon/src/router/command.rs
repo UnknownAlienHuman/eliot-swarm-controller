@@ -816,7 +816,7 @@ impl Router {
             Err(error) => {
                 self.settle(
                     id,
-                    CommandState::Unknown,
+                    coordination_commit_error_state(&error.code),
                     Some(json!({"code": error.code, "cause": "mail_commit_failed"})),
                 )
                 .await;
@@ -853,7 +853,7 @@ impl Router {
         if let Err(error) = committed {
             self.settle(
                 id,
-                CommandState::Unknown,
+                coordination_commit_error_state(&error.code),
                 Some(json!({"code": error.code, "cause": "var_commit_failed"})),
             )
             .await;
@@ -1773,11 +1773,108 @@ fn capture_dispatch_seq(command: &Command, events: &[Event]) -> Option<i64> {
     matched_seq
 }
 
+// These local Store helpers roll back their transaction on a validation or
+// capacity/CAS refusal. Persistence errors remain uncertain; this classification
+// is deliberately separate from errors returned by a native adapter after I/O.
+fn coordination_commit_error_state(code: &str) -> CommandState {
+    match code {
+        "invalid" | "not_allowed" | "not_found" | "stale_generation" | "secret_in_payload"
+        | "history_gap" | "version_conflict" | "mailbox_full" => CommandState::Rejected,
+        _ => CommandState::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Command, capture_dispatch_seq, validate_retained_resume_agent};
     use eliot_core::{Agent, AgentState, CommandState, Event};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn coordination_stale_cas_settles_rejected_without_a_second_write() {
+        let router = super::super::tests::router();
+        let now = crate::common::now_ms();
+        let child_id = {
+            let mut store = router.inner.store.lock().await;
+            let definition = json!({"id": "cas-refusal", "enabled": true});
+            let state = store
+                .ensure_rule_state(
+                    "owner",
+                    &eliot_store::RuleDefinitionInput {
+                        id: "cas-refusal".to_owned(),
+                        canonical_definition: definition.to_string(),
+                        definition_digest: eliot_core::canonical_json_sha256(&definition).unwrap(),
+                        enabled: true,
+                    },
+                    now,
+                )
+                .unwrap();
+            let seed = store
+                .var_set(
+                    "owner",
+                    &eliot_core::api::VarSetRequest {
+                        id: ulid::Ulid::new().to_string(),
+                        scope: Some("global".to_owned()),
+                        key: "result".to_owned(),
+                        value: json!("original"),
+                        expect_version: Some(0),
+                        note: None,
+                    },
+                    now,
+                )
+                .unwrap();
+            assert!(seed.events[0].cause.is_none(), "standalone event semantics");
+            let mut request = eliot_core::SubmitCommand::new("", "var.set");
+            request.args = json!({"scope": "global", "key": "result", "value": "replacement", "expect_version": 0});
+            store
+                .admit_rule_action("owner", &state, seed.events[0].seq, request, now)
+                .unwrap()
+                .child
+                .unwrap()
+                .command
+                .id
+        };
+        router
+            .clone()
+            .process_command_inner(child_id.clone(), None)
+            .await;
+        let store = router.inner.store.lock().await;
+        let command = store.get_command(&child_id).unwrap().unwrap();
+        assert_eq!(command.state, CommandState::Rejected);
+        assert_eq!(command.outcome.unwrap()["code"], "version_conflict");
+        let value = store
+            .var_get(
+                "owner",
+                &eliot_core::api::VarGetRequest {
+                    scope: Some("global".to_owned()),
+                    key: "result".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(value.version, 1);
+        assert_eq!(value.value, json!("original"));
+    }
+
+    #[test]
+    fn coordination_commit_classification_keeps_persistence_unknown() {
+        for code in [
+            "mailbox_full",
+            "version_conflict",
+            "not_allowed",
+            "history_gap",
+        ] {
+            assert_eq!(
+                super::coordination_commit_error_state(code),
+                CommandState::Rejected
+            );
+        }
+        for code in ["internal", "unavailable", "source_integrity", "bad_state"] {
+            assert_eq!(
+                super::coordination_commit_error_state(code),
+                CommandState::Unknown
+            );
+        }
+    }
 
     fn resume_command(agent_id: &str) -> Command {
         Command {
