@@ -631,11 +631,20 @@ fn normalize_live_event(
             Some(_) => return Err(integrity()),
         }
     }
-    data["status"] = json!(if aborted || has_error {
-        "failed"
+    let (status, outcome) = if aborted || has_error {
+        ("failed", "failure")
     } else {
-        "completed"
-    });
+        ("completed", "success")
+    };
+    data["status"] = json!(status);
+    data["outcome"] = json!(outcome);
+    // Keep the raw native reason next to the outcome: the abort reason when
+    // the turn never ran to a native terminal, otherwise the rollout line type.
+    if aborted && let Some(reason) = payload.get("reason").and_then(Value::as_str) {
+        data["native_status"] = json!(reason);
+    } else {
+        data["native_status"] = json!(event_type);
+    }
     state.current_turn_id = None;
     state.calls.retain(|_, call| call.turn_id != turn);
     // The terminal's own final_text is retained without emitting a duplicate

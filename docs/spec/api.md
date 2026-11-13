@@ -1030,7 +1030,21 @@ remains unavailable.
 
 Only current-layer commands appear in help and Agent guidance. Exit codes: 0 success/
 queued; 1 definite failure; 2 usage; 3 pre-effect rejection; 4 unknown; 5 wait timeout;
-6 still dispatched/pending. A queued/applied input is not successful task completion.
+6 still dispatched/pending; 7 interrupted/cancelled. A queued/applied input is not
+successful task completion.
+
+`launch --wait`, `send --wait` and `resume --wait` return 0 only for a positively
+recognized `success` outcome. Lifecycle (`Completed`) and outcome stay separate facts:
+a completed turn still exits nonzero unless its canonical outcome is success. Supported
+native failures (for example Claude `api_error`) exit 1, interruption or cancellation
+of the waited task exits 7, and unknown or unclassified terminal statuses exit 4. A
+successful `interrupt` command itself exits 0; waiting on the interrupted original
+does not. Rows written before canonical outcomes existed classify explicitly from
+their legacy status (`completed` to success, `failed`/`error` to failure,
+`interrupted`/`cancelled` to interrupted, anything else to unknown); an unrecognized
+value never defaults to success. The ACP normal stop reasons `max_tokens` and
+`max_turn_requests` end the turn normally: they are success with their native reason
+preserved, not task failure (and not Goal fulfilment either).
 
 `processes`, `stats`, `git-status` and `edits` make one read call and print the bounded
 JSON response. They do not start a daemon or submit a mutation. The `--after` strings

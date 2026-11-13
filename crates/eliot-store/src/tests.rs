@@ -4,11 +4,12 @@ use super::{
 };
 use eliot_core::api::{
     ProviderClearHoldRequest, ProviderCorrectiveEvidence, RuleCatchUpRequest, ScriptInterpreter,
+    TurnResolveRequest, TurnResolveStatus,
 };
 use eliot_core::{
     AgentState, CommandState, EventCause, NativeEvent, NativeStoreBinding, ProcessIdentity,
     ProcessRecord, ProcessState, ProviderHoldState, ProviderRestrictionKind, SourceBatch,
-    SourceGap, SubmitCommand, TurnState,
+    SourceGap, SubmitCommand, TurnOutcome, TurnState,
 };
 use eliot_core::{
     WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparationInput,
@@ -3474,6 +3475,245 @@ fn send_association_emits_applied_once_with_native_batch_ack() {
             .count(),
         1
     );
+}
+
+#[test]
+fn terminal_turn_persists_canonical_outcome_and_legacy_status_classifies() {
+    // Canonical outcomes decided at the plugin boundary persist next to the
+    // raw native reason; rows written without one classify explicitly from
+    // the legacy status and never as success.
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let launch_id = Ulid::new().to_string();
+    let admission = store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: launch_id.clone(),
+                target: None,
+                selector: None,
+                verb: "launch".to_owned(),
+                args: json!({"project":"outcome-turn", "workspace":"synthetic-workspace", "harness":"codex", "profile":"codex-fixture", "profile_snapshot":{}}),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit codex launch");
+    let agent = admission.command.target.expect("launch target");
+    store.dispatch(&launch_id, now).expect("dispatch launch");
+    let plan = ["session", "turn", "message", "tool", "request"]
+        .into_iter()
+        .map(|family| (family.to_owned(), "stream".to_owned()))
+        .collect();
+    store
+        .install_plugin_sources(&agent, 1, &launch_id, &plan, now)
+        .expect("install stream source owners");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "ready".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: "ready".to_owned(),
+                    data: json!({"command_id":launch_id}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit ready");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now)
+        .expect("settle start");
+
+    let complete_turn = |store: &mut Store,
+                         send_id: &str,
+                         turn_id: &str,
+                         status: &str,
+                         outcome: Option<&str>,
+                         native_status: Option<&str>,
+                         now: i64| {
+        let mut data = json!({"command_id":send_id, "turn_id":turn_id, "status":status});
+        if let Some(outcome) = outcome {
+            data["outcome"] = json!(outcome);
+        }
+        if let Some(native_status) = native_status {
+            data["native_status"] = json!(native_status);
+        }
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{turn_id}:terminal"),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "turn.completed".to_owned(),
+                        native_id: format!("{turn_id}:terminal"),
+                        data,
+                    }],
+                    cursor: None,
+                },
+                now,
+            )
+            .expect("commit terminal turn");
+    };
+    let start_turn = |store: &mut Store, send_id: &str, turn_id: &str, now: i64| {
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{turn_id}:started"),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "turn.started".to_owned(),
+                        native_id: format!("{turn_id}:started"),
+                        data: json!({"command_id":send_id, "turn_id":turn_id}),
+                    }],
+                    cursor: None,
+                },
+                now,
+            )
+            .expect("commit turn start");
+    };
+    let send_and_start = |store: &mut Store, text: &str, now: i64| -> (String, String) {
+        let send_id = Ulid::new().to_string();
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: send_id.clone(),
+                    target: Some(agent.clone()),
+                    selector: None,
+                    verb: "send".to_owned(),
+                    args: json!({"text":text}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .expect("admit send");
+        store.dispatch(&send_id, now).expect("dispatch send");
+        let turn_id = format!("turn-{send_id}");
+        start_turn(store, &send_id, &turn_id, now + 1);
+        (send_id, turn_id)
+    };
+
+    // Interrupted turn with the adapter's canonical outcome and raw reason.
+    let (send_id, turn_id) = send_and_start(&mut store, "interrupt me", now + 1);
+    complete_turn(
+        &mut store,
+        &send_id,
+        &turn_id,
+        "interrupted",
+        Some("interrupted"),
+        Some("cancelled"),
+        now + 2,
+    );
+    let turn = store
+        .get_turn(&agent, 1, &turn_id)
+        .expect("read turn")
+        .expect("turn exists");
+    assert_eq!(turn.state, TurnState::Completed);
+    assert_eq!(turn.outcome, Some(TurnOutcome::Interrupted));
+    assert_eq!(turn.native_status.as_deref(), Some("cancelled"));
+
+    // Legacy row without a stored outcome classifies from its status.
+    let (legacy_send, legacy_turn) = send_and_start(&mut store, "legacy", now + 3);
+    complete_turn(
+        &mut store,
+        &legacy_send,
+        &legacy_turn,
+        "completed",
+        None,
+        None,
+        now + 4,
+    );
+    let legacy = store
+        .get_turn(&agent, 1, &legacy_turn)
+        .expect("read legacy turn")
+        .expect("legacy turn exists");
+    assert_eq!(legacy.outcome, Some(TurnOutcome::Success));
+    assert_eq!(legacy.native_status, None);
+
+    // An unrecognized legacy status is unknown, never success.
+    let (unknown_send, unknown_turn) = send_and_start(&mut store, "unknown", now + 5);
+    complete_turn(
+        &mut store,
+        &unknown_send,
+        &unknown_turn,
+        "bogus",
+        None,
+        None,
+        now + 6,
+    );
+    let unknown = store
+        .get_turn(&agent, 1, &unknown_turn)
+        .expect("read unknown turn")
+        .expect("unknown turn exists");
+    assert_eq!(unknown.outcome, Some(TurnOutcome::Unknown));
+
+    // Owner resolution of a lost turn records its asserted outcome.
+    let (lost_send, lost_turn) = send_and_start(&mut store, "lost", now + 7);
+    let _ = lost_send;
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{lost_turn}:ended"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: format!("{lost_turn}:ended"),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now + 8,
+        )
+        .expect("commit session end");
+    let lost = store
+        .get_turn(&agent, 1, &lost_turn)
+        .expect("read lost turn")
+        .expect("lost turn exists");
+    assert_eq!(lost.state, TurnState::Unknown);
+    assert_eq!(lost.outcome, None);
+    store
+        .resolve_turn(
+            "owner",
+            &TurnResolveRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.clone(),
+                generation: 1,
+                turn_id: lost_turn.clone(),
+                status: TurnResolveStatus::Interrupted,
+                reason: "owner asserts the lost turn was interrupted".to_owned(),
+            },
+            None,
+            now + 9,
+        )
+        .expect("resolve lost turn");
+    let resolved = store
+        .get_turn(&agent, 1, &lost_turn)
+        .expect("read resolved turn")
+        .expect("resolved turn exists");
+    assert_eq!(resolved.state, TurnState::Completed);
+    assert_eq!(resolved.status.as_deref(), Some("interrupted"));
+    assert_eq!(resolved.outcome, Some(TurnOutcome::Interrupted));
 }
 
 #[test]

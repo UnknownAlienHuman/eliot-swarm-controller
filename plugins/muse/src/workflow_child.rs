@@ -226,11 +226,25 @@ pub(crate) fn start_event_data(key: &WorkflowChildKey) -> Value {
     json!({ "turn_id": key.turn_id() })
 }
 
-/// Observed `turn.completed` data: turn key plus mapped status only. Final
-/// text is unknown (`resultRef` is never dereferenced), usage is never
-/// totaled, and no timestamp is invented from `durationMs`.
+/// Observed `turn.completed` data: turn key plus mapped status, canonical
+/// outcome and native reason. Final text is unknown (`resultRef` is never
+/// dereferenced), usage is never totaled, and no timestamp is invented from
+/// `durationMs`. The mapped status doubles as the native reason here: the
+/// wire `cancelled` folds to `interrupted` at this boundary, exactly as the
+/// stored status does.
 pub(crate) fn complete_event_data(key: &WorkflowChildKey, status: &str) -> Value {
-    json!({ "turn_id": key.turn_id(), "status": status })
+    let outcome = match status {
+        "completed" => "success",
+        "failed" => "failure",
+        "interrupted" => "interrupted",
+        _ => "unknown",
+    };
+    json!({
+        "turn_id": key.turn_id(),
+        "status": status,
+        "outcome": outcome,
+        "native_status": status,
+    })
 }
 
 /// The single-parent binding the producer needs before publishing child facts.
@@ -788,7 +802,7 @@ mod tests {
             );
             assert_eq!(
                 complete_event_data(&key, "completed"),
-                json!({"turn_id": turn_id, "status": "completed"})
+                json!({"turn_id": turn_id, "status": "completed", "outcome": "success", "native_status": "completed"})
             );
             assert_eq!(
                 child_event_id(&key, "turn.completed").expect("complete identity"),
@@ -1030,7 +1044,7 @@ mod tests {
         let completed = complete_event_data(&key(), "completed");
         assert_eq!(
             completed,
-            json!({ "turn_id": key().turn_id(), "status": "completed" })
+            json!({ "turn_id": key().turn_id(), "status": "completed", "outcome": "success", "native_status": "completed" })
         );
         for data in [&started, &completed] {
             let fields = data.as_object().expect("event data is an object");

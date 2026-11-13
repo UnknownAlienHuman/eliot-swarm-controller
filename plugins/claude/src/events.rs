@@ -194,6 +194,32 @@ struct PendingNativeRequest {
     reply_state: NativeReplyState,
 }
 
+/// Canonical outcome for one Claude terminal reason, decided here at the
+/// plugin boundary; the verbatim reason is preserved as `native_status`
+/// next to it. `success` is the only recognized success. `cancelled` and
+/// `interrupted` are interrupts; supported native failures (`error`,
+/// `failed`, `failure` and the `api_error...` family) fail. Anything else
+/// is unknown: an unrecognized reason never defaults to success.
+fn claude_outcome(reason: &str) -> &'static str {
+    match reason.trim() {
+        "success" => "success",
+        "cancelled" | "interrupted" => "interrupted",
+        "error" | "failed" | "failure" => "failure",
+        reason => {
+            let lower = reason.to_lowercase();
+            if lower.starts_with("api_error")
+                || lower.starts_with("error")
+                || lower.starts_with("failed")
+                || lower.starts_with("failure")
+            {
+                "failure"
+            } else {
+                "unknown"
+            }
+        }
+    }
+}
+
 /// Compose a decision-relevant plain-text summary of a `can_use_tool` ask:
 /// the tool name plus its semantic string arguments (command, description,
 /// cwd, file/path targets) flattened from the native input. This is plain
@@ -2621,6 +2647,8 @@ impl EventProcessor {
             "command_id": command_id.clone(),
             "turn_id": turn_id.clone(),
             "status": terminal_reason.clone(),
+            "outcome": claude_outcome(&terminal_reason),
+            "native_status": terminal_reason.clone(),
         });
         // Optional native main-loop turn usage: absent/malformed usage never
         // blocks or gaps this terminal; it simply leaves `data.usage` unset.
@@ -2948,6 +2976,25 @@ mod tests {
         processor.status.ready = true;
         processor.status.session_id = Some("test-session".to_owned());
         processor
+    }
+
+    #[test]
+    fn terminal_reasons_classify_without_defaulting_to_success() {
+        assert_eq!(claude_outcome("success"), "success");
+        assert_eq!(claude_outcome("cancelled"), "interrupted");
+        assert_eq!(claude_outcome("interrupted"), "interrupted");
+        for reason in [
+            "api_error",
+            "api_error_rate_limited",
+            "error",
+            "failed",
+            "failure",
+        ] {
+            assert_eq!(claude_outcome(reason), "failure", "reason={reason}");
+        }
+        for reason in ["", "completed", "end_turn", "inProgress", "bogus"] {
+            assert_eq!(claude_outcome(reason), "unknown", "reason={reason}");
+        }
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use eliot_core::{
     Command as CoreCommand, CommandState, Error as CoreError, InjectArgs, InjectPoint,
-    SubmitCommand, Turn as CoreTurn, TurnState,
+    SubmitCommand, Turn as CoreTurn, TurnOutcome, TurnState,
     api::{
         AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
         AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
@@ -2759,6 +2759,7 @@ async fn wait_for_turn(
 
 /// True means applied; false means still open. Known terminal errors retain their
 /// contract exit code and never imply that the native effect can be retried.
+/// A cancelled command is an interrupted wait (exit 7), never success.
 fn command_state_result(command: &CoreCommand) -> Result<bool, Failure> {
     match command.state {
         CommandState::Applied => Ok(true),
@@ -2773,10 +2774,19 @@ fn command_state_result(command: &CoreCommand) -> Result<bool, Failure> {
             "command outcome is unknown",
             command,
         )),
-        CommandState::Cancelled => Err(Failure::from_command(1, "command was cancelled", command)),
+        CommandState::Cancelled => Err(Failure::from_command(
+            INTERRUPTED_EXIT_CODE,
+            "command was cancelled",
+            command,
+        )),
         CommandState::Accepted | CommandState::Queued | CommandState::Dispatched => Ok(false),
     }
 }
+
+/// Exit code for an interrupted or cancelled wait: the waited task ended
+/// without success but not as a definite failure. A successful `interrupt`
+/// command itself still exits 0; waiting on the interrupted original does not.
+const INTERRUPTED_EXIT_CODE: u8 = 7;
 
 async fn sleep_before_deadline(deadline: Instant) -> Result<(), Failure> {
     timeout_at(deadline, sleep(WAIT_POLL_INTERVAL))
@@ -2788,18 +2798,32 @@ fn response_exit_code(state: CommandState) -> u8 {
     match state {
         CommandState::Accepted | CommandState::Queued | CommandState::Applied => 0,
         CommandState::Rejected => 3,
-        CommandState::Failed | CommandState::Cancelled => 1,
+        CommandState::Failed => 1,
+        CommandState::Cancelled => INTERRUPTED_EXIT_CODE,
         CommandState::Unknown => 4,
         CommandState::Dispatched => 6,
     }
 }
 
+/// Exit code for one settled turn. Lifecycle (`TurnState::Completed`) and
+/// outcome stay separate facts: only a positively recognized `success`
+/// exits 0. Supported native failures exit 1, interruption/cancellation
+/// exits 7, and unknown or unclassified terminal statuses exit 4. Rows
+/// written before canonical outcomes existed classify explicitly from
+/// their legacy status, never as success.
 fn turn_exit_code(turn: &CoreTurn) -> u8 {
     match turn.state {
-        TurnState::Completed => match turn.status.as_deref() {
-            Some("failed" | "error") => 1,
-            _ => 0,
-        },
+        TurnState::Completed => {
+            let outcome = turn
+                .outcome
+                .unwrap_or_else(|| TurnOutcome::classify_legacy_status(turn.status.as_deref()));
+            match outcome {
+                TurnOutcome::Success => 0,
+                TurnOutcome::Failure => 1,
+                TurnOutcome::Interrupted => INTERRUPTED_EXIT_CODE,
+                TurnOutcome::Unknown => 4,
+            }
+        }
         TurnState::Unknown => 4,
         TurnState::Running => 6,
     }

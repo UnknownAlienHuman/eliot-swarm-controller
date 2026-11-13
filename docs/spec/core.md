@@ -532,10 +532,20 @@ CREATE UNIQUE INDEX commands_children ON commands(parent_command,ordinal)
   WHERE parent_command IS NOT NULL;
 CREATE TABLE turns (
   agent INTEGER NOT NULL, generation INTEGER NOT NULL, turn_id TEXT NOT NULL,
-  state TEXT NOT NULL, status TEXT, resolution_source TEXT,
+  state TEXT NOT NULL, status TEXT, outcome TEXT, native_status TEXT,
+  resolution_source TEXT,
   final_text TEXT, usage TEXT, started_at INTEGER, completed_at INTEGER,
   PRIMARY KEY(agent,generation,turn_id)
 );
+
+`turns.outcome` is the canonical task outcome (`success` | `failure` |
+`interrupted` | `unknown`) decided at the plugin boundary from the adapter's
+native terminal vocabulary; `turns.native_status` preserves the raw native
+reason next to it. Lifecycle (`state`) and outcome stay separate facts. Rows
+written before canonical outcomes existed carry no stored outcome and read
+back through explicit legacy classification (`completed` to success,
+`failed`/`error` to failure, `interrupted`/`cancelled` to interrupted,
+anything else to unknown), never defaulting to success.
 CREATE TABLE pending_requests (
   agent INTEGER NOT NULL REFERENCES agents(id), generation INTEGER NOT NULL,
   request_id TEXT NOT NULL, turn_id TEXT NOT NULL, kind TEXT NOT NULL,
