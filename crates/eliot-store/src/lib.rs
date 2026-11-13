@@ -702,39 +702,6 @@ impl Store {
         result
     }
 
-    /// Persist one local user event for an existing dispatched command.
-    /// The command must already exist (ordinary admission committed it);
-    /// settlement remains the caller's separate `settle` step.
-    pub fn commit_user_event(
-        &mut self,
-        command_id: &str,
-        kind: &str,
-        data: Value,
-        now: i64,
-    ) -> Result<Change<Event>> {
-        self.ensure_writer_healthy()?;
-        let result = (|| {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            load_command_record(&tx, command_id)?
-                .ok_or_else(|| Error::new("not_found", "user-event command was not found"))?;
-            let event = insert_daemon_event_for_command(
-                &tx,
-                command_id,
-                DaemonEventInput::new(now, kind, "user", None, None, data),
-            )?;
-            commit_transaction(tx, &self.write_faulted)?;
-            Ok(Change {
-                value: event,
-                events: vec![],
-            })
-        })();
-        self.fault_on_persistence_error(&result);
-        result
-    }
-
     pub fn get_agent(&self, id: &str) -> Result<Option<Agent>> {
         let agent_num = parse_agent_id(id)?;
         load_agent_by_num(&self.connection, agent_num)
@@ -4766,19 +4733,37 @@ fn validate_limit(limit: usize) -> Result<()> {
 }
 
 fn enforce_page_bytes<T: serde::Serialize>(items: &mut Vec<T>) -> Result<()> {
-    let had_items = !items.is_empty();
-    while encode_json(items)?.len() > MAX_PAGE_BYTES {
-        items.pop();
-        if items.is_empty() {
+    if items.is_empty() {
+        return Ok(());
+    }
+    // Linear sizing: serialize each candidate entry once (escaped JSON bytes)
+    // and account for the enclosing brackets plus one comma per gap, matching
+    // exactly how `serde_json` encodes `Vec<T>` (`[` entries `,` `]`).
+    // The result is the longest fitting prefix, identical to reserializing
+    // each shrinking prefix but without the quadratic work under the Store
+    // mutex. `MAX_PAGE_BYTES` (900 KiB) leaves headroom for the 1 MiB
+    // response frame envelope.
+    let mut total = 2_usize;
+    let mut keep = 0_usize;
+    for (index, item) in items.iter().enumerate() {
+        let len = encode_json(item)?.len();
+        let next = total
+            .saturating_add(len)
+            .saturating_add(if index == 0 { 0 } else { 1 });
+        if next > MAX_PAGE_BYTES {
             break;
         }
+        total = next;
+        keep = index + 1;
     }
-    if had_items && items.is_empty() {
+    if keep == 0 {
+        items.clear();
         return Err(Error::new(
             "frame_too_large",
             "one page entry exceeds the 900 KiB response bound",
         ));
     }
+    items.truncate(keep);
     Ok(())
 }
 

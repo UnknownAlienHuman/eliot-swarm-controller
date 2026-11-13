@@ -40,7 +40,11 @@ authority.
 
 Frames are at most 4 MiB, semantic fields smaller. Multiplex requests so one wait does
 not block unrelated calls. Bound all lists and histories; never hold a read transaction
-open while waiting for a client or native process.
+open while waiting for a client or native process. Each connection carries one request
+and its response; the daemon bounds that write with `RESPONSE_WRITE_TIMEOUT`
+([daemon.rs](../../crates/eliot-daemon/src/daemon.rs)), so a peer that stops reading
+cannot hold its connection task past the deadline. An undelivered mutation result stays
+readable by exact retry; the daemon never replays the effect to deliver it.
 
 Background `daemon` startup reports `starting`; use `daemon.status` for readiness.
 Windows starts that independent process without inheriting caller handles, so captured
@@ -1021,8 +1025,21 @@ write result. When present, `store_write_faulted` is true.
 
 Drain rejects new turn-producing work and new automation, while continuing pre-admitted
 work and allowing exact stop/interrupt/request replies/cancel/detach/readback. Unknown
-outcomes remain visible blockers. Force terminates only owned custody, never adopted
-services. Degraded Unix reports possible orphans, not exact clean success.
+outcomes remain visible blockers. Command admission retains its early per-verb mode check
+and repeats it after preparation under the same Store writer lock that changes shutdown
+mode. Ordinary and dedicated `git.fetch` admission resolve an exact retained command
+before this final check and before writer-health gates, including an identical admission
+that won during preparation. Retained readback remains available after drain, force or
+a writer fault when the Store can prove committed reads.
+
+Force closes workspace and controlled-plugin startup admission before cleanup snapshots.
+Startup/cleanup gates cover workspace effect ownership and the first controlled-plugin
+filesystem effect through registration of its owned child; cleanup waits for an in-flight
+handoff before enumerating children. Native readiness and I/O run outside the Store lock,
+and the controlled-startup gate is released before waiting for native readiness. Effects
+that already began retain their unknown-outcome semantics. Force terminates only owned
+custody, never adopted services. Degraded Unix reports possible orphans, not exact clean
+success.
 
 ## CLI
 

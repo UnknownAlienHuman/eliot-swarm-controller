@@ -10453,6 +10453,69 @@ fn claude_resume_passes_admission_and_dispatch_gates_with_exact_linked_input() {
 }
 
 #[test]
+fn enforce_page_bytes_keeps_longest_fitting_prefix() {
+    // Reference quadratic sizing: reserialize each shrinking prefix.
+    fn reference_keep(items: &[String]) -> usize {
+        let mut keep = items.len();
+        while serde_json::to_vec(&items[..keep])
+            .expect("encode prefix")
+            .len()
+            > super::MAX_PAGE_BYTES
+        {
+            keep -= 1;
+            if keep == 0 {
+                break;
+            }
+        }
+        keep
+    }
+
+    // Mixed entry sizes, including bytes that must be escaped in JSON
+    // (quotes, backslashes, control characters) so the byte count covers
+    // escaped output rather than in-memory length.
+    let small = "a\"b\\c\n\u{1f600}".to_owned();
+    let medium = "m".repeat(1_000);
+    let large = "L\"\\".repeat(200_000);
+    let tail = "t".repeat(500);
+    let candidates = vec![small.clone(), medium.clone(), large.clone(), tail.clone()];
+    let expected = reference_keep(&candidates);
+
+    let mut sized = candidates.clone();
+    super::enforce_page_bytes(&mut sized).expect("mixed page fits a prefix");
+    assert_eq!(
+        sized.len(),
+        expected,
+        "linear sizing must keep the same prefix as reserializing each prefix"
+    );
+    assert_eq!(&sized, &candidates[..expected]);
+    let encoded = serde_json::to_vec(&sized).expect("encode kept prefix");
+    assert!(encoded.len() <= super::MAX_PAGE_BYTES);
+    if expected < candidates.len() {
+        let mut extended = sized.clone();
+        extended.push(candidates[expected].clone());
+        assert!(
+            serde_json::to_vec(&extended)
+                .expect("encode overflow")
+                .len()
+                > super::MAX_PAGE_BYTES,
+            "kept prefix must be the longest fitting one"
+        );
+    }
+}
+
+#[test]
+fn enforce_page_bytes_rejects_oversized_first_entry() {
+    let oversized = "x".repeat(super::MAX_PAGE_BYTES);
+    let mut items = vec![oversized];
+    let error = super::enforce_page_bytes(&mut items).expect_err("first entry cannot fit");
+    assert_eq!(error.code, "frame_too_large");
+    assert!(items.is_empty());
+
+    let mut empty: Vec<String> = Vec::new();
+    super::enforce_page_bytes(&mut empty).expect("empty page stays empty");
+}
+
+#[test]
 fn claude_project_resume_passes_the_projects_gate_with_linked_input() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
@@ -10554,4 +10617,141 @@ fn claude_project_resume_passes_the_projects_gate_with_linked_input() {
         store.get_command(&send_id).unwrap().unwrap().state,
         CommandState::Applied
     );
+}
+
+#[test]
+fn local_notify_commits_user_event_and_applied_atomically() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let id = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: id.clone(),
+                target: None,
+                selector: None,
+                verb: "notify".to_owned(),
+                args: json!({"message": "hello"}),
+                expected_generation: None,
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit notify");
+    store.dispatch(&id, now + 1).expect("dispatch notify");
+    let change = store
+        .commit_user_event_applied(&id, "x.user.notify", json!({"message": "hello"}), now + 2)
+        .expect("atomic notify commit");
+    assert_eq!(change.value.state, CommandState::Applied);
+    assert_eq!(change.events.len(), 2);
+    assert_eq!(change.events[0].kind, "x.user.notify");
+    assert_eq!(change.events[1].kind, "command.applied");
+    assert_eq!(
+        change.value.outcome,
+        Some(json!({"kind": "x.user.notify", "seq": change.events[0].seq}))
+    );
+    let event_count: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .expect("count events after atomic commit");
+    // An exact retry returns the recorded result without a new event.
+    let retry = store
+        .commit_user_event_applied(&id, "x.user.notify", json!({"message": "hello"}), now + 3)
+        .expect("idempotent notify retry");
+    assert_eq!(retry.value.state, CommandState::Applied);
+    assert_eq!(retry.value.outcome, change.value.outcome);
+    assert!(retry.events.is_empty());
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count events after retry"),
+        event_count
+    );
+}
+
+#[test]
+fn local_user_event_atomic_commit_rejects_mismatch_and_leaves_unknown() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let id = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: id.clone(),
+                target: None,
+                selector: None,
+                verb: "emit".to_owned(),
+                args: json!({"topic": "alerts", "data": {"n": 1}}),
+                expected_generation: None,
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit emit");
+    store.dispatch(&id, now + 1).expect("dispatch emit");
+    let error = store
+        .commit_user_event_applied(&id, "x.user.other", json!({"data": {"n": 1}}), now + 2)
+        .expect_err("kind mismatch is rejected");
+    assert_eq!(error.code, "invalid");
+    assert_eq!(
+        store.get_command(&id).unwrap().unwrap().state,
+        CommandState::Dispatched
+    );
+    let change = store
+        .commit_user_event_applied(&id, "x.user.alerts", json!({"data": {"n": 1}}), now + 3)
+        .expect("atomic emit commit");
+    assert_eq!(change.value.state, CommandState::Applied);
+    assert_eq!(change.events.len(), 2);
+    assert_eq!(change.events[0].kind, "x.user.alerts");
+    assert_eq!(change.events[1].kind, "command.applied");
+    // Legacy crash rows stay Unknown: no reconciliation without retained evidence.
+    let legacy = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: legacy.clone(),
+                target: None,
+                selector: None,
+                verb: "notify".to_owned(),
+                args: json!({"message": "legacy"}),
+                expected_generation: None,
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now + 4,
+        )
+        .expect("admit legacy notify");
+    store
+        .dispatch(&legacy, now + 5)
+        .expect("dispatch legacy notify");
+    store
+        .settle(
+            &legacy,
+            CommandState::Unknown,
+            Some(json!({"reason": "daemon_restart"})),
+            now + 6,
+        )
+        .expect("legacy crash row stays unknown");
+    let error = store
+        .commit_user_event_applied(
+            &legacy,
+            "x.user.notify",
+            json!({"message": "legacy"}),
+            now + 7,
+        )
+        .expect_err("legacy unknown is left alone");
+    assert_eq!(error.code, "bad_state");
+    let command = store.get_command(&legacy).unwrap().unwrap();
+    assert_eq!(command.state, CommandState::Unknown);
+    assert_eq!(command.outcome, Some(json!({"reason": "daemon_restart"})));
 }

@@ -472,8 +472,8 @@ hidden wait/acceptance state to the router.
 | `launch` | targetless ordinary launch command at generation 0; optional nonblank text creates the normal linked `send` |
 | `msg.send`, `var.set` | scoped coordination command; available after L5 |
 | `run` | targetless `SubmitCommand` via Router; bounded child under saved authority; emitted commands become ordered children |
-| `notify` | targetless ordinary command; Store commits one persisted `x.user.notify` event (local log only) |
-| `emit` | targetless ordinary command; Store commits one persisted `x.user.<topic>` event (local log only) |
+| `notify` | targetless ordinary command; Store atomically commits one persisted `x.user.notify` event with its Applied outcome (local log only) |
+| `emit` | targetless ordinary command; Store atomically commits one persisted `x.user.<topic>` event with its Applied outcome (local log only) |
 | `git.fetch` | targetless ordinary `SubmitCommand` through Router/Store with frozen intent and readback |
 | `git.push`, `git.worktree` | unsupported in this fetch-only increment |
 
@@ -486,9 +486,11 @@ webhook, and no external message is sent. Both are targetless ordinary commands
 [`NotifyDefinitionArgs`/`EmitDefinitionArgs`](../../crates/eliot-core/src/api/notify.rs)
 are validated literally at admission (no templates; bounded, secret-checked
 payloads). Execution commits exactly one persisted event — `x.user.notify`
-with `{message,title?}` or `x.user.<topic>` with `{data}` — publishes it on
-the bus, and settles Applied with that event's kind and seq as the standard
-command readback; a commit failure settles Unknown. A future desktop or
+with `{message,title?}` or `x.user.<topic>` with `{data}` — together with its
+Applied settlement in a single Store transaction, then publishes the committed
+batch (the user event first, then `command.applied`) on the bus; the Applied
+readback carries that event's kind and seq as the standard command readback,
+and a commit failure settles Unknown. A future desktop or
 approved-webhook increment must add its own delivery binding and must not
 reuse this local path as a transport.
 

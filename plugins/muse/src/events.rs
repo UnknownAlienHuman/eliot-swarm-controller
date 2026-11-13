@@ -34,7 +34,7 @@ use crate::native::{
     },
     types::{
         NativeApprovalDecideResult, NativeApprovalResolvedNotification,
-        NativeApprovalUpdatedNotification, NativeHistoryNoneReason,
+        NativeApprovalUpdatedNotification, NativeHistoryNoneReason, NativeItem,
         NativeItemCompletedNotification, NativeItemStartedNotification,
         NativeSessionClosedNotification, NativeSessionStartedNotification,
         NativeSessionViewHealthChangedNotification, NativeTurnCompletedNotification,
@@ -1999,10 +1999,13 @@ impl EventProcessor {
                     &notification.session_id,
                     notification.item.turn_id.as_ref(),
                 )?;
+                self.start_tool(&notification.item).await?;
             }
             "item/updated" => {
-                // Full re-emission at a higher revision; PR1 folds only the
-                // authoritative terminal object from `item/completed`.
+                // Full re-emission at a higher revision; no per-delta event
+                // is folded. The authoritative terminal object from
+                // `item/completed` carries every committed tool fact, so an
+                // update alone normalizes nothing.
                 let notification: NativeItemCompletedNotification = serde_json::from_value(params)
                     .map_err(|_| {
                         Error::new(
@@ -2034,6 +2037,8 @@ impl EventProcessor {
                     let turn_id = notification.item.turn_id.as_deref().unwrap_or_default();
                     self.complete_message(turn_id, &notification.item.item_id, text)
                         .await?;
+                } else {
+                    self.complete_tool(&notification.item).await?;
                 }
             }
             "turn/completed" => {
@@ -2086,8 +2091,9 @@ impl EventProcessor {
         Ok(())
     }
 
-    /// Items outside the exact active turn are gaps; `userShell` is the one
-    /// kind outside any turn and is ignored in PR1.
+    /// Items outside the exact active turn are gaps. A turn-less item (only
+    /// `userShell`) carries no Eliot turn binding and stays unmapped; a
+    /// turn-bound `userShell` normalizes like `toolCall` under its kind.
     fn validate_item_turn(&self, session_id: &str, turn_id: Option<&String>) -> Result<()> {
         if self.status.session_id.as_deref() != Some(session_id) {
             return Err(Error::new(
@@ -2144,6 +2150,129 @@ impl EventProcessor {
         self.final_text = Some(text);
         self.commit_event("message.completed", native_id, data)
             .await
+    }
+
+    /// Commit `tool.started` for a turn-bound tool item, mirroring the Codex
+    /// adapter's start DTO (`command_id`, `turn_id`, `item_id`, `tool`).
+    /// Tool calls, command execution and edit-family calls all arrive as
+    /// `toolCall`; a turn-bound `userShell` normalizes under its kind. Only
+    /// the tool identity is persisted: `callId`, `args` and result payloads
+    /// never leave the native frame.
+    async fn start_tool(&mut self, item: &NativeItem) -> Result<()> {
+        let Some(tool) = tool_label(item) else {
+            if tool_item_kind(&item.kind) {
+                return self
+                    .record_gap("Muse tool item omitted its tool name")
+                    .await;
+            }
+            return Ok(());
+        };
+        let Some((command_id, turn_id)) = self.tool_binding(item)? else {
+            // Turn-less `userShell` carries no Eliot turn binding and stays
+            // unmapped, as before.
+            return Ok(());
+        };
+        if item.item_id.trim().is_empty() {
+            return self
+                .record_gap("Muse tool start omitted its exact item id")
+                .await;
+        }
+        let data = json!({
+            "command_id": command_id,
+            "turn_id": turn_id,
+            "item_id": item.item_id,
+            "tool": tool,
+        });
+        if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
+            return self
+                .record_gap("Muse tool start exceeded the persisted-event bound")
+                .await;
+        }
+        let native_id = event_id(
+            self.status.session_id.as_deref().unwrap_or_default(),
+            &turn_id,
+            &item.item_id,
+            "tool.started",
+        )?;
+        self.commit_event("tool.started", native_id, data).await
+    }
+
+    /// Commit `tool.completed` for the terminal revision of a turn-bound
+    /// tool item, mirroring the Codex adapter's completion DTO (the start
+    /// fields plus the verbatim native `status`). Non-terminal revisions
+    /// carry no committed fact; their terminal `item/completed` follows.
+    /// The 1.4 item carries no inline workspace paths (`patchRef` names a
+    /// stored patch document whose body is fetched out of band, never in
+    /// the stream), so no `changed_paths` are attached here.
+    async fn complete_tool(&mut self, item: &NativeItem) -> Result<()> {
+        let Some(tool) = tool_label(item) else {
+            if tool_item_kind(&item.kind) {
+                return self
+                    .record_gap("Muse tool item omitted its tool name")
+                    .await;
+            }
+            return Ok(());
+        };
+        if !is_terminal_item_status(&item.status) {
+            return Ok(());
+        }
+        let Some((command_id, turn_id)) = self.tool_binding(item)? else {
+            // Turn-less `userShell` carries no Eliot turn binding and stays
+            // unmapped, as before.
+            return Ok(());
+        };
+        if item.item_id.trim().is_empty() {
+            return self
+                .record_gap("Muse tool completion omitted its exact item id")
+                .await;
+        }
+        let data = json!({
+            "command_id": command_id,
+            "turn_id": turn_id,
+            "item_id": item.item_id,
+            "tool": tool,
+            "status": item.status,
+        });
+        if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
+            return self
+                .record_gap("Muse tool completion exceeded the persisted-event bound")
+                .await;
+        }
+        let native_id = event_id(
+            self.status.session_id.as_deref().unwrap_or_default(),
+            &turn_id,
+            &item.item_id,
+            "tool.completed",
+        )?;
+        self.commit_event("tool.completed", native_id, data).await
+    }
+
+    /// The exact Eliot turn/command a tool item binds to, or `None` for a
+    /// turn-less `userShell` (the one kind outside any turn), which stays
+    /// unmapped. `validate_item_turn` already proved the session and the
+    /// exact active turn; anything else here is a binding failure.
+    fn tool_binding(&self, item: &NativeItem) -> Result<Option<(String, String)>> {
+        let turn_id = item.turn_id.as_deref().filter(|turn| !turn.is_empty());
+        let Some(turn_id) = turn_id else {
+            if item.kind == "userShell" {
+                return Ok(None);
+            }
+            return Err(Error::new(
+                "source_integrity",
+                "Muse toolCall omitted its turn binding",
+            ));
+        };
+        if self.status.active_turn_id.as_deref() != Some(turn_id) {
+            return Err(Error::new(
+                "source_integrity",
+                "Muse tool item was outside the exact active turn",
+            ));
+        }
+        let command_id =
+            self.status.active_command_id.clone().ok_or_else(|| {
+                Error::new("unknown", "Muse tool item has no exact Eliot command")
+            })?;
+        Ok(Some((command_id, turn_id.to_owned())))
     }
 
     async fn complete_turn(&mut self, params: Value) -> Result<()> {
@@ -3181,7 +3310,7 @@ impl EventProcessor {
             generation: self.generation,
             harness: "Muse",
             id_prefix: "muse",
-            families: &["session", "turn", "message", "request"],
+            families: &["session", "turn", "message", "tool", "request"],
             writes_blocked: &mut self.writes_blocked,
             gap_reported: &mut self.gap_reported,
             gap_number: &mut self.gap_number,
@@ -3337,6 +3466,36 @@ fn pending_native_id(request: &CorePending) -> Option<&str> {
     }
 }
 
+/// MSP 1.4 item kinds normalized into the shared tool events, mirroring the
+/// Codex adapter's tool-item coverage: `toolCall` (tool calls, including
+/// command execution and edit-family calls) and `userShell` (command
+/// execution; bound only when it names the exact active turn). Every other
+/// kind keeps its existing mapping (`agentMessage` to `message.completed`,
+/// `workflow` to the workflow-child observer) or stays unmapped; unknown
+/// future kinds never become tool facts.
+fn tool_item_kind(kind: &str) -> bool {
+    matches!(kind, "toolCall" | "userShell")
+}
+
+/// Display tool for a normalized item: the `toolCall` tool name, or the
+/// `userShell` kind itself. A `userShell` `commandText` is a full shell
+/// invocation and is never persisted; a blank `toolCall` tool name proves
+/// nothing and the caller gaps instead.
+fn tool_label(item: &NativeItem) -> Option<String> {
+    match item.kind.as_str() {
+        "toolCall" => item.tool.clone().filter(|tool| !tool.trim().is_empty()),
+        "userShell" => Some("userShell".to_owned()),
+        _ => None,
+    }
+}
+
+/// Terminal item revisions commit tool facts. The schema folds terminal as
+/// anything other than `inProgress`; unknown statuses stay
+/// terminal-unknown and still commit under their verbatim status.
+fn is_terminal_item_status(status: &str) -> bool {
+    status != "inProgress"
+}
+
 /// Map the MSP terminal to the stored turn status. `cancelled` folds to
 /// `interrupted`, matching the Codex path; an unknown wire terminal settles
 /// nothing and the caller records a gap instead. Shared with the
@@ -3467,6 +3626,104 @@ mod tests {
         assert!(unknown.contains("error_code=other"));
         assert!(!unknown.contains("untrusted method value"));
         assert!(!unknown.contains("untrusted error value"));
+    }
+
+    #[test]
+    fn tool_kinds_cover_tool_calls_and_turn_bound_shell() {
+        for kind in ["toolCall", "userShell"] {
+            assert!(tool_item_kind(kind), "kind={kind}");
+        }
+        for kind in [
+            "userMessage",
+            "agentMessage",
+            "reasoning",
+            "subagent",
+            "workflow",
+            "reminderChild",
+            "compaction",
+            "futureKind",
+            "",
+        ] {
+            assert!(!tool_item_kind(kind), "kind={kind}");
+        }
+    }
+
+    #[test]
+    fn tool_label_keeps_arguments_and_payloads_out() {
+        let call = NativeItem {
+            item_id: "item-1".to_owned(),
+            kind: "toolCall".to_owned(),
+            revision: 1,
+            status: "inProgress".to_owned(),
+            text: None,
+            tool: Some("shell".to_owned()),
+            turn_id: Some("turn-1".to_owned()),
+        };
+        assert_eq!(tool_label(&call), Some("shell".to_owned()));
+        let blank = NativeItem {
+            tool: Some("  ".to_owned()),
+            ..call.clone()
+        };
+        assert_eq!(tool_label(&blank), None);
+        let shell = NativeItem {
+            kind: "userShell".to_owned(),
+            tool: None,
+            ..call.clone()
+        };
+        assert_eq!(tool_label(&shell), Some("userShell".to_owned()));
+        let message = NativeItem {
+            kind: "agentMessage".to_owned(),
+            ..call
+        };
+        assert_eq!(tool_label(&message), None);
+    }
+
+    #[test]
+    fn tool_facts_commit_on_any_non_in_progress_status() {
+        assert!(!is_terminal_item_status("inProgress"));
+        for status in [
+            "completed",
+            "failed",
+            "cancelled",
+            "rejected",
+            "timedOut",
+            "future",
+        ] {
+            assert!(is_terminal_item_status(status), "status={status}");
+        }
+    }
+
+    #[test]
+    fn tool_items_decode_the_schema_field_names() {
+        // `muse schema generate-json-schema` (stable, 1.4.0-R4161.1): the
+        // `toolCall` tool name, `userShell` command execution and the common
+        // identity fields. Per-kind payloads (`args`, `commandText`,
+        // `patchRef`, `visibleOutput`, ...) stay unparsed and must not
+        // break decoding.
+        let call: NativeItem = serde_json::from_value(json!({
+            "itemId": "item-1",
+            "kind": "toolCall",
+            "revision": 1,
+            "status": "inProgress",
+            "turnId": "turn-1",
+            "tool": "shell",
+            "callId": "call-1",
+            "args": "{\"command\":\"cargo build\"}",
+        }))
+        .expect("toolCall decodes");
+        assert_eq!(tool_label(&call), Some("shell".to_owned()));
+        let shell: NativeItem = serde_json::from_value(json!({
+            "itemId": "item-2",
+            "kind": "userShell",
+            "revision": 2,
+            "status": "completed",
+            "turnId": null,
+            "commandText": "cargo test",
+            "exitCode": 0,
+        }))
+        .expect("userShell decodes");
+        assert_eq!(tool_label(&shell), Some("userShell".to_owned()));
+        assert_eq!(shell.turn_id, None);
     }
 
     #[test]

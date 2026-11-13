@@ -181,6 +181,14 @@ impl Drop for IpcListener {
 }
 
 impl IpcStream {
+    #[cfg(test)]
+    pub(crate) fn from_test_stream<S>(stream: S) -> Self
+    where
+        S: IpcStreamIo + 'static,
+    {
+        Self(Box::new(stream))
+    }
+
     pub async fn connect(endpoint: &str, until: Instant) -> Result<Self> {
         #[cfg(unix)]
         {
