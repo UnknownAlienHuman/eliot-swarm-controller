@@ -59,6 +59,15 @@ impl OwnedHookConfig {
 
 pub(crate) struct HookConfigGuard(pub(crate) Option<OwnedHookConfig>);
 
+impl HookConfigGuard {
+    pub(crate) fn root(&self) -> &Path {
+        self.0
+            .as_ref()
+            .expect("armed Antigravity hook config guard")
+            .root()
+    }
+}
+
 impl Drop for HookConfigGuard {
     fn drop(&mut self) {
         if let Some(config) = &self.0 {
@@ -141,7 +150,7 @@ impl Session {
         plan: &Plan,
         peer: &PeerClient,
         credential: &str,
-        hook_config: OwnedHookConfig,
+        mut hook_config: HookConfigGuard,
         hooks: HookServer,
     ) -> Result<Self> {
         let reserved = [
@@ -166,7 +175,6 @@ impl Session {
             ));
         }
         let helper = hook_helper_path()?;
-        let mut hook_config = HookConfigGuard(Some(hook_config));
         let mut environment = plan.launch.environment.clone();
         environment.extend(hooks.endpoint_env());
         environment.push((hooks::ENV_HOOK_HELPER.into(), helper.into_os_string()));
@@ -1150,7 +1158,7 @@ pub(crate) fn stage_hook_config(
     instance_dir: &Path,
     workspace: &Path,
     helper: &Path,
-) -> Result<OwnedHookConfig> {
+) -> Result<HookConfigGuard> {
     let command = hook_command(helper)?;
     let private_root = fs::canonicalize(instance_dir).map_err(|_| {
         Error::new(
@@ -1274,12 +1282,12 @@ pub(crate) fn stage_hook_config(
             "Could not write the owned Antigravity hook config",
         ));
     }
-    Ok(OwnedHookConfig {
+    Ok(HookConfigGuard(Some(OwnedHookConfig {
         path,
         root,
         remove_agents_dir,
         remove_root: true,
-    })
+    })))
 }
 
 fn hook_command(helper: &Path) -> Result<String> {
@@ -1469,35 +1477,60 @@ mod tests {
     fn staged_hook_root_holds_only_hooks_json() {
         let (base, instance_dir, workspace) = stage_dirs("only");
         let helper = Path::new("eliot-hook-helper");
-        let config = stage_hook_config(&instance_dir, &workspace, helper).unwrap();
+        let guard = stage_hook_config(&instance_dir, &workspace, helper).unwrap();
         // The discovery root is a sibling of the instance directory, never
         // the instance directory itself.
-        assert_ne!(config.root(), instance_dir);
+        assert_ne!(guard.root(), instance_dir);
         assert_eq!(
-            config.root().parent().unwrap(),
+            guard.root().parent().unwrap(),
             fs::canonicalize(&base).unwrap()
         );
-        let mut root_entries: Vec<_> = fs::read_dir(config.root())
+        let mut root_entries: Vec<_> = fs::read_dir(guard.root())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
         root_entries.sort();
         assert_eq!(root_entries, [std::ffi::OsString::from(".agents")]);
-        let mut agents_entries: Vec<_> = fs::read_dir(config.root().join(".agents"))
+        let mut agents_entries: Vec<_> = fs::read_dir(guard.root().join(".agents"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
         agents_entries.sort();
         assert_eq!(agents_entries, [std::ffi::OsString::from("hooks.json")]);
+        let (root, path) = {
+            let inner = guard.0.as_ref().unwrap();
+            (inner.root().to_owned(), inner.path.clone())
+        };
         assert_eq!(
-            fs::read_to_string(&config.path).unwrap(),
+            fs::read_to_string(&path).unwrap(),
             hook_command_for("eliot-hook-helper") + "\n"
         );
         // The private instance directory gains no hook material.
         assert!(fs::read_dir(&instance_dir).unwrap().next().is_none());
-        remove_hook_config(&config);
-        assert!(!config.path.exists());
-        assert!(!config.root().exists());
+        drop(guard);
+        assert!(!path.exists());
+        assert!(!root.exists());
+        assert!(instance_dir.is_dir());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dropped_guard_cleans_root_so_restaging_succeeds() {
+        let (base, instance_dir, workspace) = stage_dirs("retry");
+        let helper = Path::new("eliot-hook-helper");
+        let guard = stage_hook_config(&instance_dir, &workspace, helper).unwrap();
+        let root = guard.root().to_owned();
+        assert!(root.is_dir());
+        // Simulate a planning error after staging: the armed guard drops
+        // without transfer to `Session`.
+        drop(guard);
+        assert!(!root.exists());
+        // A corrected start with the same instance stages cleanly again.
+        let guard = stage_hook_config(&instance_dir, &workspace, helper).unwrap();
+        assert_eq!(guard.root(), root);
+        assert!(guard.root().is_dir());
+        drop(guard);
+        assert!(!root.exists());
         assert!(instance_dir.is_dir());
         let _ = fs::remove_dir_all(&base);
     }
