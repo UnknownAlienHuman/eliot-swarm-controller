@@ -282,14 +282,27 @@ impl ServerHandler for EliotMcpHandler {
                     };
                     Ok(CallToolResult::structured(output).into())
                 }
-                Err(error) => Ok(CallToolResult::structured_error(json!({
-                    "code": error.code,
-                    "message": error.message,
-                }))
-                .into()),
+                Err(error) => Ok(CallToolResult::structured_error(mcp_error_value(&error)).into()),
             }
         }
     }
+}
+
+/// Serialize a daemon [`eliot_core::Error`] for MCP `structuredContent`.
+///
+/// Uses the Core error serializer so tool failures keep `code`, `message`
+/// and the optional bounded, redacted `diagnostics` (source labels plus
+/// truncation/EOF/read-error flags) that local RPC already carries. The
+/// serializer bounds the payload, keeping the MCP response frame within
+/// limit. Serialization cannot fail for a typed error; the fallback keeps
+/// the primary code/message rather than replacing the failure.
+fn mcp_error_value(error: &eliot_core::Error) -> Value {
+    serde_json::to_value(error).unwrap_or_else(|_| {
+        json!({
+            "code": error.code,
+            "message": error.message,
+        })
+    })
 }
 
 fn tool_definition() -> Tool {
@@ -649,4 +662,79 @@ fn owner_notification(level: LoggingLevel, data: Value) -> ServerNotification {
     ServerNotification::LoggingMessageNotification(LoggingMessageNotification::new(
         LoggingMessageNotificationParam::new(level, data).with_logger(NOTIFY_LOGGER),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_core::{StderrSnapshot, StderrSource};
+
+    #[test]
+    fn mcp_error_keeps_code_and_message_without_diagnostics() {
+        let error = eliot_core::Error::new("not_found", "missing command");
+        let value = mcp_error_value(&error);
+        assert_eq!(value.get("code").and_then(Value::as_str), Some("not_found"));
+        assert_eq!(
+            value.get("message").and_then(Value::as_str),
+            Some("missing command")
+        );
+        assert!(value.get("diagnostics").is_none());
+        let result = CallToolResult::structured_error(value);
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[test]
+    fn mcp_error_keeps_bounded_diagnostics_with_source_and_flags() {
+        let error = eliot_core::Error::new("failed", "native exit").with_stderr(
+            StderrSource::Plugin,
+            StderrSnapshot {
+                text: "tail output".to_owned(),
+                truncated: false,
+                eof: true,
+                read_error: false,
+            },
+        );
+        let value = mcp_error_value(&error);
+        assert_eq!(value.get("code").and_then(Value::as_str), Some("failed"));
+        let diagnostics = value
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .expect("diagnostics array");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].get("source").and_then(Value::as_str),
+            Some("plugin")
+        );
+        let snapshot = diagnostics[0].get("snapshot").expect("diagnostic snapshot");
+        assert_eq!(
+            snapshot.get("text").and_then(Value::as_str),
+            Some("tail output")
+        );
+        assert_eq!(snapshot.get("eof"), Some(&Value::Bool(true)));
+        let result = CallToolResult::structured_error(value);
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[test]
+    fn mcp_error_oversize_diagnostics_stay_within_budget() {
+        let error = eliot_core::Error::new("failed", "native exit").with_stderr(
+            StderrSource::Plugin,
+            StderrSnapshot {
+                text: "x".repeat(128 * 1024),
+                truncated: false,
+                eof: true,
+                read_error: false,
+            },
+        );
+        let value = mcp_error_value(&error);
+        assert_eq!(value.get("code").and_then(Value::as_str), Some("failed"));
+        assert_eq!(
+            value.get("message").and_then(Value::as_str),
+            Some("native exit")
+        );
+        let encoded = serde_json::to_vec(&value).expect("error value encodes");
+        assert!(encoded.len() <= 64 * 1024);
+        let result = CallToolResult::structured_error(value);
+        assert_eq!(result.is_error, Some(true));
+    }
 }
