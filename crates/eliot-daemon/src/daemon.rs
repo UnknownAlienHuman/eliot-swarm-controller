@@ -936,6 +936,10 @@ fn rpc_error(mut error: Error, policy: &SecretPolicy) -> RpcError {
     for diagnostic in &mut error.diagnostics {
         diagnostic.snapshot.text = policy.redact_text(&diagnostic.snapshot.text);
     }
+    if let Some(detail) = error.details.as_mut() {
+        detail.field = policy.redact_text(&detail.field);
+        detail.expected = policy.redact_text(&detail.expected);
+    }
     bound_stderr_diagnostics(&mut error.diagnostics, MAX_STDERR_DIAGNOSTIC_BYTES);
     let code = match error.code.as_str() {
         "unsupported" => -32601,
@@ -961,6 +965,11 @@ fn core_error(error: RpcError, policy: &SecretPolicy) -> Error {
         .unwrap_or("internal")
         .to_owned();
     let message = policy.redact_text(&error.message);
+    for field in ["field", "expected"] {
+        if let Some(Value::String(value)) = data.get_mut("details").and_then(|d| d.get_mut(field)) {
+            *value = policy.redact_text(value);
+        }
+    }
     if let Some(values) = data.get_mut("diagnostics").and_then(Value::as_array_mut) {
         for diagnostic in values.iter_mut().take(2) {
             if let Some(Value::String(text)) = diagnostic.pointer_mut("/snapshot/text") {

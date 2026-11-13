@@ -4,6 +4,7 @@ mod auth;
 mod command;
 mod context;
 mod coordination;
+mod discovery;
 mod goals;
 mod hierarchy;
 mod resolution;
@@ -142,15 +143,7 @@ pub(crate) struct PreparedSubmission {
     pub(crate) workspace: Option<WorkspacePreparationInput>,
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProjectGetRequest {
-    id: String,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProjectListRequest {}
+use eliot_core::api::discovery::{ProjectGetRequest, ProjectListRequest};
 
 impl Router {
     /// Test harness constructor with default `[mail]` limits; production
@@ -247,10 +240,13 @@ impl Router {
             .map_err(|_| Error::new("not_allowed", "invalid remote context"))?;
         authorize_rpc_method(&principal, method)?;
         let result = match method {
+            "api.methods" => self.methods(&params, &principal).await,
+            "api.help" => self.method_help(&params, &principal).await,
+            "api.identity" => self.caller_identity(&params, &principal).await,
             "daemon.status" => {
                 require_owner(&principal)?;
-                let request: DaemonStatusRequest = serde_json::from_value(params)
-                    .map_err(|_| Error::new("invalid", "daemon.status params are invalid"))?;
+                let request: DaemonStatusRequest =
+                    eliot_core::api::discovery::decode_params(params.clone())?;
                 request.validate()?;
                 self.status().await
             }
@@ -523,8 +519,8 @@ impl Router {
         principal: &Principal,
         remote: Option<&eliot_core::RemoteCallContext>,
     ) -> Result<Value> {
-        let mut request: CommandSubmitRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "command.submit params are malformed"))?;
+        let mut request: CommandSubmitRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
         if request.verb == "git.fetch" {
             return self.submit_git_fetch(request, principal, remote).await;
         }
@@ -706,8 +702,10 @@ impl Router {
         remote: Option<&eliot_core::RemoteCallContext>,
     ) -> Result<Value> {
         request.validate()?;
-        let definition = serde_json::from_value::<GitFetchDefinitionArgs>(request.args.clone())
-            .map_err(|_| Error::new("invalid", "git.fetch definition is malformed"))?;
+        let definition = eliot_core::api::discovery::decode_params_at::<GitFetchDefinitionArgs>(
+            request.args.clone(),
+            "params.args",
+        )?;
         definition.validate()?;
         let timeout_ms = crate::automation::git_fetch_timeout_ms(definition.timeout.as_deref())?;
 
@@ -902,8 +900,10 @@ impl Router {
                 "git.fetch request contains a known credential",
             ));
         }
-        let definition = serde_json::from_value::<GitFetchDefinitionArgs>(request.args.clone())
-            .map_err(|_| Error::new("invalid", "git.fetch definition is malformed"))?;
+        let definition = eliot_core::api::discovery::decode_params_at::<GitFetchDefinitionArgs>(
+            request.args.clone(),
+            "params.args",
+        )?;
         definition.validate()?;
         let timeout_ms = crate::automation::git_fetch_timeout_ms(definition.timeout.as_deref())?;
         let _binding_args = definition.binding_args(timeout_ms)?;
@@ -1006,8 +1006,8 @@ impl Router {
                 "Owner event Run must be targetless and unbound",
             ));
         }
-        let definition: RunDefinitionArgs = serde_json::from_value(request.args.clone())
-            .map_err(|_| Error::new("invalid", "Owner Run args are malformed"))?;
+        let definition: RunDefinitionArgs =
+            eliot_core::api::discovery::decode_params_at(request.args.clone(), "params.args")?;
         let automation = crate::config::load_automation_config(&self.inner.data_root)?;
         let policy = self.secret_policy_snapshot();
         let frozen = crate::scripts::freeze::freeze_global_run(
@@ -1047,8 +1047,10 @@ impl Router {
         context.validate()?;
         match project {
             Some(registration) => {
-                let definition: RunDefinitionArgs = serde_json::from_value(request.args.clone())
-                    .map_err(|_| Error::new("invalid", "project Run args are malformed"))?;
+                let definition: RunDefinitionArgs = eliot_core::api::discovery::decode_params_at(
+                    request.args.clone(),
+                    "params.args",
+                )?;
                 let policy = self.secret_policy_snapshot();
                 let frozen = crate::scripts::freeze_project_run(
                     definition,
@@ -1714,8 +1716,8 @@ impl Router {
 
     async fn provider_holds(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
-        let request: ProviderHoldsRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "provider.holds params are invalid"))?;
+        let request: ProviderHoldsRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let response = self
             .inner
@@ -1735,8 +1737,8 @@ impl Router {
                 "provider correction contains a known credential",
             ));
         }
-        let request: ProviderClearHoldRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "provider.clear_hold params are invalid"))?;
+        let request: ProviderClearHoldRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let change = {
             let mut store = self.inner.store.lock().await;
@@ -1751,11 +1753,8 @@ impl Router {
 
     async fn project_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
-        let request: ProjectGetRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "project.get params are invalid"))?;
-        if request.id.trim().is_empty() {
-            return Err(Error::new("invalid", "project id must be nonempty"));
-        }
+        let request: ProjectGetRequest = eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
         let registration = self
             .inner
             .store
@@ -1770,8 +1769,7 @@ impl Router {
 
     async fn project_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
-        let _: ProjectListRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "project.list params are invalid"))?;
+        let _: ProjectListRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         let registrations = self
             .inner
             .store
@@ -1787,8 +1785,7 @@ impl Router {
 
     async fn rule_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
-        let request: RuleGetRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "rule.get params are invalid"))?;
+        let request: RuleGetRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let rule_principal = rule_principal(request.project.as_deref());
         let state = self
@@ -1810,8 +1807,7 @@ impl Router {
 
     async fn timer_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
-        let request: TimerGetRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "timer.get params are invalid"))?;
+        let request: TimerGetRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let rule_principal = rule_principal(request.project.as_deref());
         let state = self
@@ -2143,8 +2139,7 @@ impl Router {
     }
 
     async fn command_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        let request: CommandGetRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "command.get params are invalid"))?;
+        let request: CommandGetRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         if let Principal::Run { run_command_id, .. } = principal
             && request.id.as_str() != run_command_id.as_str()
@@ -2182,8 +2177,8 @@ impl Router {
 
     async fn agent_discover(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
-        let request: AgentDiscoverRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "agent.discover params are invalid"))?;
+        let request: AgentDiscoverRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Err(Error::new(
@@ -2232,8 +2227,8 @@ impl Router {
 
     async fn agent_history(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
-        let request: AgentHistoryRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "agent.history params are invalid"))?;
+        let request: AgentHistoryRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let id = request.id.as_str();
         let generation = request.generation;
@@ -2359,8 +2354,7 @@ impl Router {
     }
 
     async fn agent_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        let request: AgentGetRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "agent.get params are invalid"))?;
+        let request: AgentGetRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let id = request.id.as_str();
         let (agent, source_states, observer_active) = {
@@ -2423,8 +2417,8 @@ impl Router {
     }
 
     async fn agent_processes(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        let request: AgentProcessesRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "agent.processes params are invalid"))?;
+        let request: AgentProcessesRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let id = request.id.as_str();
         let generation = request.generation;
@@ -2500,8 +2494,7 @@ impl Router {
     }
 
     async fn agent_git(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        let request: AgentGitRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "agent.git params are invalid"))?;
+        let request: AgentGitRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let id = request.id.as_str();
         let expected = request.generation;
@@ -2530,8 +2523,7 @@ impl Router {
     }
 
     async fn agent_edits(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        let request: AgentEditsRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "agent.edits params are invalid"))?;
+        let request: AgentEditsRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let id = request.id.as_str();
         let generation = request.generation;
@@ -2566,8 +2558,7 @@ impl Router {
     }
 
     async fn agent_stats(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        let request: AgentStatsRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "agent.stats params are invalid"))?;
+        let request: AgentStatsRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let id = request.id.as_str();
         let expected = request.generation;
@@ -2593,8 +2584,7 @@ impl Router {
     }
 
     async fn agent_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        let request: AgentListRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "agent.list params are invalid"))?;
+        let request: AgentListRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let after = request.after.as_deref();
         let limit = request.limit;
@@ -2673,8 +2663,8 @@ impl Router {
     }
 
     async fn agent_result(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        let request: AgentResultRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "agent.result params are invalid"))?;
+        let request: AgentResultRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let id = request.id.as_str();
         let (agent_metadata, generation, mut turns) = {
@@ -2704,8 +2694,7 @@ impl Router {
     }
 
     async fn turn_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        let request: TurnGetRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "turn.get params are invalid"))?;
+        let request: TurnGetRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let agent = request.agent.as_str();
         let generation = request.generation;
@@ -2723,8 +2712,8 @@ impl Router {
     }
 
     async fn events_bounds(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        let request: EventsBoundsRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "events.bounds params are invalid"))?;
+        let request: EventsBoundsRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         authorize_event_filter(request.filter, principal)?;
         let bounds = self.inner.store.lock().await.event_bounds()?;
@@ -2734,8 +2723,7 @@ impl Router {
     }
 
     async fn events_read(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        let request: EventsReadRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "events.read params are invalid"))?;
+        let request: EventsReadRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let filter = authorize_event_filter(request.filter, principal)?;
         let (events, next, high_water, truncated, _) = self
@@ -2757,8 +2745,8 @@ impl Router {
     }
 
     async fn events_subscribe(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        let request: EventsSubscribeRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "events.subscribe params are invalid"))?;
+        let request: EventsSubscribeRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let limit = request.limit;
         let wait_ms = request.wait_ms.min(LIVE_WAIT_MAX_MS);
@@ -3040,8 +3028,8 @@ impl Router {
 
     async fn shutdown(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
-        let request: DaemonShutdownRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "daemon.shutdown params are malformed"))?;
+        let request: DaemonShutdownRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let mode = request.mode;
         let id = request.id.as_str();
@@ -4178,8 +4166,10 @@ fn normalize_resume(request: &mut SubmitCommand) -> Result<()> {
 fn user_event_kind_data(verb: &str, args: &Value) -> Result<(String, Value)> {
     match verb {
         "notify" => {
-            let definition = serde_json::from_value::<NotifyDefinitionArgs>(args.clone())
-                .map_err(|_| Error::new("invalid", "notify definition is malformed"))?;
+            let definition = eliot_core::api::discovery::decode_params_at::<NotifyDefinitionArgs>(
+                args.clone(),
+                "params.args",
+            )?;
             definition.validate()?;
             let mut data = json!({"message": definition.message});
             if let Some(title) = definition.title {
@@ -4188,8 +4178,10 @@ fn user_event_kind_data(verb: &str, args: &Value) -> Result<(String, Value)> {
             Ok(("x.user.notify".to_owned(), data))
         }
         "emit" => {
-            let definition = serde_json::from_value::<EmitDefinitionArgs>(args.clone())
-                .map_err(|_| Error::new("invalid", "emit definition is malformed"))?;
+            let definition = eliot_core::api::discovery::decode_params_at::<EmitDefinitionArgs>(
+                args.clone(),
+                "params.args",
+            )?;
             definition.validate()?;
             Ok((
                 format!("x.user.{}", definition.topic),
@@ -4831,6 +4823,49 @@ mod tests {
             Arc::new(AsyncMutex::new(store)),
             Bus::new(16),
         )
+    }
+
+    #[tokio::test]
+    async fn audit_390_nested_command_action_diagnostics() {
+        let router = router();
+        let private_text = "rejected-payload-must-stay-private";
+        for (verb, args, field) in [
+            (
+                "notify",
+                json!({"message":private_text,"title":17}),
+                "title",
+            ),
+            ("emit", json!({"topic":17,"data":private_text}), "topic"),
+        ] {
+            let id = ulid::Ulid::new().to_string();
+            let error = router
+                .handle(
+                    "command.submit",
+                    json!({
+                        "_auth":{"kind":"owner","credential":"owner-credential"},
+                        "_payload":{"id":id,"verb":verb,"args":args},
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "invalid");
+            let details = error.details.as_ref().unwrap();
+            assert_eq!(details.field, format!("params.args.{field}"));
+            assert!(details.expected.contains("string"));
+            let encoded = serde_json::to_string(&error).unwrap();
+            assert!(!encoded.contains(private_text));
+            assert!(!encoded.contains("owner-credential"));
+            assert!(
+                router
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .get_command(&id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]

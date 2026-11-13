@@ -100,7 +100,7 @@ pub struct WorkspacePreparationInput {
     pub frozen_setup: Vec<WorkspaceSetup>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspacePhase {
     Creating,
@@ -188,20 +188,20 @@ pub enum WorkspaceRemovalOutcome {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitPathStatus {
     pub path: String,
     pub status: String,
     pub original_path: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitCommit {
     pub oid: String,
     pub paths: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitBaseline {
     pub head: Option<String>,
     pub updated_at: i64,
@@ -234,7 +234,7 @@ pub struct FileChangeHint {
     pub ts: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEdit {
     pub agent: String,
     pub generation: i64,
@@ -249,14 +249,16 @@ pub struct GitHintPage {
     pub through: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct ProcessIdentity {
     pub host_boot_id: String,
     pub pid: u32,
     pub start_time: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessState {
     Running,
@@ -264,7 +266,7 @@ pub enum ProcessState {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessRecord {
     pub identity: ProcessIdentity,
     pub owner: String,
@@ -275,7 +277,7 @@ pub struct ProcessRecord {
 }
 
 /// Ephemeral OS counters; absent values remain unknown and are not model progress.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessSample {
     pub record: ProcessRecord,
     pub cpu_time_ns: Option<u64>,
@@ -288,7 +290,7 @@ pub struct ProcessSnapshot {
     pub complete: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentState {
     Unknown,
@@ -302,7 +304,9 @@ pub enum AgentState {
     Lost,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentOrigin {
     #[default]
@@ -312,7 +316,9 @@ pub enum AgentOrigin {
 }
 
 /// Frozen command scope of an Agent principal, from its profile `control`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentControl {
     #[default]
@@ -350,7 +356,7 @@ impl AgentState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PendingRequest {
     pub id: String,
     pub turn_id: String,
@@ -359,7 +365,7 @@ pub struct PendingRequest {
     pub details: Value,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Agent {
     pub id: String,
     pub generation: i64,
@@ -451,7 +457,7 @@ impl Agent {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventSubject {
     pub project: String,
     pub harness: String,
@@ -473,7 +479,7 @@ impl From<&Agent> for EventSubject {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandState {
     Accepted,
@@ -495,7 +501,7 @@ impl CommandState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Command {
     pub id: String,
     pub principal: String,
@@ -518,7 +524,7 @@ pub struct Command {
     pub probe: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventCause {
     pub command_id: String,
@@ -553,7 +559,7 @@ impl EventCause {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub seq: i64,
     pub ts: i64,
@@ -569,7 +575,7 @@ pub struct Event {
     pub cause: Option<EventCause>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnState {
     Running,
@@ -577,7 +583,7 @@ pub enum TurnState {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Turn {
     pub agent: String,
     pub generation: i64,
@@ -595,7 +601,7 @@ pub struct Turn {
 /// nullable: absent native data stays null, never zero. `scope` names the
 /// native attribution (`message` for the final assistant message of the
 /// bound turn); unknown fields are ignored so harnesses decode forward.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TurnUsage {
     #[serde(default)]
     pub scope: Option<String>,
@@ -617,7 +623,7 @@ pub struct TurnUsage {
     pub total_tokens: Option<i64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitCommand {
     pub id: String,
@@ -783,20 +789,46 @@ pub enum Effect {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Error {
     pub code: String,
     pub message: String,
     #[serde(default, deserialize_with = "diagnostics::deserialize_diagnostics")]
+    #[schemars(skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<StderrDiagnostic>,
+    #[serde(default)]
+    #[schemars(skip_serializing_if = "Option::is_none")]
+    pub details: Option<InvalidParam>,
+}
+
+/// Parameter diagnostics contain schema-owned names/expectations, never values.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvalidParam {
+    pub field: String,
+    pub expected: String,
 }
 
 impl Error {
+    /// A bounded, schema-owned field path and expectation; never a rejected value.
+    pub fn invalid_field(field: impl Into<String>, expected: impl Into<String>) -> Self {
+        Self::new("invalid", "invalid parameters").with_field(field, expected)
+    }
+
+    pub fn with_field(mut self, field: impl Into<String>, expected: impl Into<String>) -> Self {
+        let field: String = field.into().chars().take(256).collect();
+        let expected: String = expected.into().chars().take(512).collect();
+        self.message = format!("{field}: expected {expected}");
+        self.details = Some(InvalidParam { field, expected });
+        self
+    }
+
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
             diagnostics: Vec::new(),
+            details: None,
         }
     }
 
@@ -853,6 +885,8 @@ impl Serialize for Error {
             message: &'a str,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             diagnostics: Vec<StderrDiagnostic>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            details: Option<InvalidParam>,
         }
         let mut diagnostics = self.diagnostics.clone();
         bound_stderr_diagnostics(
@@ -863,6 +897,10 @@ impl Serialize for Error {
             code: &self.code,
             message: &self.message,
             diagnostics,
+            details: self.details.as_ref().map(|detail| InvalidParam {
+                field: detail.field.chars().take(256).collect(),
+                expected: detail.expected.chars().take(512).collect(),
+            }),
         }
         .serialize(serializer)
     }
