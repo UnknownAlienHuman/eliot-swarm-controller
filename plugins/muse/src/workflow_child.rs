@@ -33,7 +33,7 @@ use eliot_plugin::{
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
-use crate::events::turn_status;
+use crate::events::{native_terminal, turn_status};
 use crate::native::types::NativeTurnTerminal;
 
 /// Bound on DETAILED in-memory tracking per generation. An over-limit
@@ -226,11 +226,25 @@ pub(crate) fn start_event_data(key: &WorkflowChildKey) -> Value {
     json!({ "turn_id": key.turn_id() })
 }
 
-/// Observed `turn.completed` data: turn key plus mapped status only. Final
-/// text is unknown (`resultRef` is never dereferenced), usage is never
-/// totaled, and no timestamp is invented from `durationMs`.
-pub(crate) fn complete_event_data(key: &WorkflowChildKey, status: &str) -> Value {
-    json!({ "turn_id": key.turn_id(), "status": status })
+/// Observed `turn.completed` data: turn key plus mapped status, canonical
+/// outcome and the raw wire terminal. Final text is unknown (`resultRef` is
+/// never dereferenced), usage is never totaled, and no timestamp is invented
+/// from `durationMs`. The raw wire terminal rides as `native_status` next to
+/// the normalized `status`: wire `cancelled` normalizes to `interrupted`
+/// while its raw `cancelled` is preserved for readback.
+pub(crate) fn complete_event_data(key: &WorkflowChildKey, status: &str, native: &str) -> Value {
+    let outcome = match status {
+        "completed" => "success",
+        "failed" => "failure",
+        "interrupted" => "interrupted",
+        _ => "unknown",
+    };
+    json!({
+        "turn_id": key.turn_id(),
+        "status": status,
+        "outcome": outcome,
+        "native_status": native,
+    })
 }
 
 /// The single-parent binding the producer needs before publishing child facts.
@@ -304,8 +318,12 @@ pub(crate) enum PlannedAction {
     /// Commit the ONE `turn.started`.
     Start,
     /// Commit the ONE `turn.completed`, starting first when the live states
-    /// were never observed.
-    Complete { status: &'static str },
+    /// were never observed. `status` is the normalized turn status;
+    /// `native` is the raw wire terminal preserved as `native_status`.
+    Complete {
+        status: &'static str,
+        native: &'static str,
+    },
     /// Record a child-scoped gap; optionally stop expecting more revisions.
     ChildGap {
         reason: &'static str,
@@ -401,13 +419,15 @@ impl WorkflowChildState {
             return PlannedAction::Register;
         }
         if let Some(term) = terminal {
-            match turn_status(&NativeTurnTerminal::parse_workflow_terminal(term)) {
-                Some(status_text) => {
+            let parsed = NativeTurnTerminal::parse_workflow_terminal(term);
+            match (turn_status(&parsed), native_terminal(&parsed)) {
+                (Some(status_text), Some(native_text)) => {
                     return PlannedAction::Complete {
                         status: status_text,
+                        native: native_text,
                     };
                 }
-                None => {
+                _ => {
                     return PlannedAction::ChildGap {
                         reason: "Muse workflow child terminal is unknown",
                         mark_unknown: true,
@@ -608,10 +628,10 @@ mod tests {
                 state.started = true;
                 PlannedAction::Start
             }
-            PlannedAction::Complete { status } => {
+            PlannedAction::Complete { status, native } => {
                 state.started = true;
                 state.completed_status = Some(status.to_owned());
-                PlannedAction::Complete { status }
+                PlannedAction::Complete { status, native }
             }
             PlannedAction::ChildGap {
                 reason,
@@ -782,13 +802,14 @@ mod tests {
             assert_eq!(
                 state.plan(&terminal_child.status, terminal_child.terminal.as_deref()),
                 PlannedAction::Complete {
-                    status: "completed"
+                    status: "completed",
+                    native: "completed"
                 },
                 "attempt={attempt}"
             );
             assert_eq!(
-                complete_event_data(&key, "completed"),
-                json!({"turn_id": turn_id, "status": "completed"})
+                complete_event_data(&key, "completed", "completed"),
+                json!({"turn_id": turn_id, "status": "completed", "outcome": "success", "native_status": "completed"})
             );
             assert_eq!(
                 child_event_id(&key, "turn.completed").expect("complete identity"),
@@ -925,7 +946,8 @@ mod tests {
                 PlannedAction::Ignore,
                 PlannedAction::Ignore,
                 PlannedAction::Complete {
-                    status: "completed"
+                    status: "completed",
+                    native: "completed"
                 },
                 PlannedAction::Ignore,
             ]
@@ -954,16 +976,28 @@ mod tests {
 
     #[test]
     fn explicit_terminal_completes_with_the_existing_muse_mapping() {
-        for (terminal, status) in [
-            ("completed", "completed"),
-            ("failed", "failed"),
-            ("cancelled", "interrupted"),
+        for (terminal, status, native) in [
+            ("completed", "completed", "completed"),
+            ("failed", "failed", "failed"),
+            ("cancelled", "interrupted", "cancelled"),
         ] {
             let mut state = registered();
             state.started = true;
             assert_eq!(
                 state.plan("terminal", Some(terminal)),
-                PlannedAction::Complete { status },
+                PlannedAction::Complete { status, native },
+                "terminal={terminal}"
+            );
+            // The raw wire terminal is preserved as `native_status` next to
+            // the normalized status.
+            let outcome = match status {
+                "completed" => "success",
+                "failed" => "failure",
+                _ => "interrupted",
+            };
+            assert_eq!(
+                complete_event_data(&key(), status, native),
+                json!({"turn_id": key().turn_id(), "status": status, "outcome": outcome, "native_status": native}),
                 "terminal={terminal}"
             );
         }
@@ -973,7 +1007,8 @@ mod tests {
         assert_eq!(
             unseen.plan("terminal", Some("completed")),
             PlannedAction::Complete {
-                status: "completed"
+                status: "completed",
+                native: "completed"
             }
         );
         // An unmapped terminal gaps the child and stops expectations.
@@ -1027,10 +1062,10 @@ mod tests {
     fn turn_data_carry_no_settlement_totals_or_timestamps() {
         let started = start_event_data(&key());
         assert_eq!(started, json!({ "turn_id": key().turn_id() }));
-        let completed = complete_event_data(&key(), "completed");
+        let completed = complete_event_data(&key(), "completed", "completed");
         assert_eq!(
             completed,
-            json!({ "turn_id": key().turn_id(), "status": "completed" })
+            json!({ "turn_id": key().turn_id(), "status": "completed", "outcome": "success", "native_status": "completed" })
         );
         for data in [&started, &completed] {
             let fields = data.as_object().expect("event data is an object");

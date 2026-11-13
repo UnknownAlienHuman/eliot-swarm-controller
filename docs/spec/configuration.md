@@ -116,6 +116,46 @@ permissions stay unknown (`null` / unverified) until a real native tool probe co
 posture. `collaboration_mode` and `approval_policy`
 presets stay rejected. See the [Muse page](../harnesses/muse.md).
 
+### Worker MCP policy
+
+Every profile selects a worker MCP inheritance policy in `mcp`: `inherit`
+(the default) or `minimal`, plus an optional `mcp_allow` list of native
+server names:
+
+```toml
+[profiles.codex-minimal]
+harness = "codex"
+model = "gpt-6-luna"
+mcp = "minimal"
+mcp_allow = ["owner-search"]
+```
+
+The resolved policy and allow list are frozen in the profile snapshot
+(`mcp`, `mcp_allow`) and the requested policy is reported in secret-free
+diagnostics and effective settings. Unknown policies are rejected at config
+load, and a non-empty allow list requires `minimal`.
+
+`inherit` keeps the current behavior: the worker receives Eliot's
+Agent-scoped server in addition to the owner's native MCP surface.
+`minimal` starts only the intended MCP surface: Eliot's Agent-scoped server
+plus the explicitly allowed native servers. Eliot's scoped
+`swarm mcp --require-agent` server is always present in both policies, and
+no policy edits the owner's global native config, copies `auth.json`, or
+changes native-store/observer bindings.
+
+Only the Codex and Claude harnesses implement `minimal`, each with its
+installed isolation mechanism; Muse, OpenCode and Antigravity keep
+`inherit` only and reject `minimal` as unsupported. Only Codex implements
+selective inclusion: a non-empty `mcp_allow` with `minimal` on any other
+harness is rejected as `unsupported` at config load (Claude `minimal` is the
+Eliot-only per-run config plus `--strict-mcp-config`, so an allow list
+would be silently dropped; with `inherit` an allow list is already rejected
+because it requires `minimal`). See the owning harness pages. Requested vs
+observed: the
+effective server set is reported from native readback only where the harness
+supports it (`mcp_servers` with `mcp_servers_verified`); otherwise it stays
+unknown (`null` / unverified), never an echo of the requested set.
+
 ## Owner workspace setup
 
 Global profiles accept ordered setup entries only for an explicit `launch --worktree`.
@@ -456,7 +496,7 @@ Agents without a binding refuse before control rather than selecting a store ane
 ```text
 ProfileSnapshot {
   profile_name, harness, plugin,
-  model?, effort?, permissions, control, args,
+  model?, effort?, permissions, control, args, mcp, mcp_allow,
   literal_env, pass_env_values, secret_env_names, inherit_env,
   account?, proxy?, billing?, workspace_mode, git_identity,
   route_binding?, capacity_scopes[], labels, stall_after, notify_parent, wake_on_mail,

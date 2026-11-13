@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 28;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 29;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -685,6 +685,21 @@ impl Store {
                      target, generation, json_extract(args, '$.point'), turn_id, created_at
                  ) WHERE verb = 'inject' AND state IN ('accepted', 'queued');
                  INSERT INTO schema_migrations(version) VALUES (28);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 29 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE turns ADD COLUMN outcome TEXT
+                     CHECK(outcome IS NULL OR outcome IN ('success','failure','interrupted','unknown'));
+                 ALTER TABLE turns ADD COLUMN native_status TEXT
+                     CHECK(native_status IS NULL OR length(native_status) > 0);
+                 INSERT INTO schema_migrations(version) VALUES (29);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

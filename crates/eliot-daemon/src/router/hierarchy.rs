@@ -345,8 +345,8 @@ impl Router {
         params: &Value,
         principal: &Principal,
     ) -> Result<Value> {
-        let request: CommandChildrenRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "command.children params are invalid"))?;
+        let request: CommandChildrenRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let id = request.id.as_str();
         let store = self.inner.store.lock().await;

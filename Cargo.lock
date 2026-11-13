@@ -517,8 +517,10 @@ name = "eliot-core"
 version = "0.2.0-dev"
 dependencies = [
  "globset",
+ "schemars",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "sha2",
  "url",
 ]
@@ -541,6 +543,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rusqlite",
+ "schemars",
  "serde",
  "serde_json",
  "serde_path_to_error",

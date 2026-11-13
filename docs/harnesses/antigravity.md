@@ -11,8 +11,20 @@ advertised session selectors.
 Subject: `(canonical auth/config scope, exact ACP sessionId)`.
 
 ```text
-agy acp --stdio --dangerously-skip-permissions=false|true
+agy acp --stdio --dangerously-skip-permissions=false|true --add-dir <hook-discovery-root>
 ```
+
+Installed CLI surface (observed 2026-11-13, read-only `--version`/`--help`):
+`agy.exe` reports version 1.5.3. `agy acp` accepts `--add-dir` (repeatable),
+`--agent`, `--app-data-dir`, `--cli_dir_name`, `--cli_log_file`/`--log-file`,
+`--cloud_code_endpoint`, `--dangerously-skip-permissions`, `--disable-telemetry`,
+`--gemini-dir`, `--ide-mcp-port`, `--include-default-customizations`,
+`--sandbox`, `--stdio`, `--process-per-session`, `--worker`, and auth/endpoint
+flags; it accepts no hook-config location or registration flag, and the
+top-level `--settings` flag is a print-mode session option, not an `acp`
+option. The install directory ships no bundled docs or settings schema, so
+hook discovery truly requires a directory root. The manifest's native version
+(`1.5.2`) stays diagnostic metadata, not a startup version gate.
 
 The adapter speaks Agent Client Protocol v1 (pinned schema
 `v1-7ec5185c.json`, AGY 1.5.2) over bounded NDJSON JSON-RPC stdio through
@@ -107,11 +119,26 @@ includes `conversationId`, zero-indexed `invocationNum`, and
 `initialNumSteps` (trajectory step count). The current recommended output is
 `{"injectSteps":[{"systemMessage":{"systemMessage":"..."}}]}`;
 `ephemeralMessage` and `hookEphemeralMessage` are deprecated. The plugin
-writes one named group (`eliot-system-context`) to the generation's private `.agents/hooks.json`
-and passes that private directory with `--add-dir`; the real workspace
-remains the ACP cwd. The adapter does not write global or user-project hook
-files, copy authentication, or change login/native-store paths. The private
-config is removed when the generation ends.
+stages one named group (`eliot-system-context`) in a dedicated hook-only
+directory (`<instance>-hooks/.agents/hooks.json`, a sibling of the private
+instance directory holding nothing else: no tokens, logs, state, or sockets)
+and passes that directory as the only `--add-dir` root, for both fresh starts
+and resumed sessions; hook delivery itself is unchanged. The real workspace
+remains the ACP cwd, and the private instance directory is never a native
+root. The adapter does not write global or user-project hook files, copy
+authentication, or change login/native-store paths. The staged config, its
+`.agents` directory, and the discovery root are removed when the generation
+ends. Requested and effective settings carry each native root with its purpose
+(`native_roots.workspace` vs `native_roots.hook_discovery`).
+
+Native tool-access restrictions stay at the existing posture: the ACP
+`initialize` advertises no filesystem or terminal capability
+(`fs.readTextFile`/`writeTextFile: false`, `terminal: false`,
+`auth.terminal: false`), and agent-to-client requests are always rejected.
+The CLI also offers `--sandbox`, which is not enabled: it would change
+execution semantics beyond hook discovery. Same-user filesystem access is not
+a hostile-agent boundary; the guarantee is that secrets and state are never
+under a writable native root, not a sandbox.
 
 Each managed ACP generation receives `ELIOT_AGY_HOOK_HELPER` pointing to the
 current Eliot executable plus its own loopback endpoint
@@ -199,6 +226,15 @@ Mutations require caller-supplied ULIDs in `params`; the server adds no auto-gen
 automatic retries, defaults, or speculative rollbacks. Output frames and stdio line writes are
 strictly bounded to [`MAX_RPC_FRAME_BYTES`](../../crates/eliot-daemon/src/daemon.rs) (4 MiB) via
 [`BoundedLineWriter`](../../crates/eliot/src/mcp/bounded_io.rs).
+
+## Worker MCP policy
+
+This harness keeps `inherit` only: the frozen profile always records
+`mcp = "inherit"`, and a non-`inherit` policy is rejected as `unsupported`
+at config load. Verified read-only (`agy acp --help`): the ACP server flags
+expose no MCP isolation mechanism (no strict/ignore-MCP flag; `--settings`
+is an unverified session-settings surface, not a verified isolation
+mechanism), so no `minimal` mechanism is implemented.
 
 ## Permissions and final checks
 

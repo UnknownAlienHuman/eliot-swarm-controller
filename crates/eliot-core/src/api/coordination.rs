@@ -67,7 +67,7 @@ impl MailLimits {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MailMode {
     Queue,
@@ -87,44 +87,71 @@ impl MailMode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailSendRequest {
+    #[schemars(
+        description = "Nonblank caller-retained mutation id; use a fresh ULID for a new write."
+    )]
     pub id: String,
+    #[schemars(length(min = 1, max = MAX_MAIL_RECIPIENTS), extend("uniqueItems" = true), description = "Distinct concrete canonical a<positive i64> Agent ids.")]
     pub to: Vec<String>,
+    #[schemars(
+        description = "Only queue is implemented; send/steer/inject parse but return unsupported."
+    )]
     pub mode: MailMode,
+    #[schemars(extend("x-maxBytes" = MAX_MAIL_TEXT_BYTES), description = "Mail body, at most 32768 UTF-8 bytes, no NUL; empty text is allowed.")]
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-maxBytes" = MAX_MAIL_THREAD_BYTES), description = "Optional nonblank thread label, no control characters.")]
     pub thread: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Exact <write-id>/<recipient-agent> delivery id, at most 512 bytes, no NUL."
+    )]
     pub reply_to_delivery: Option<String>,
 }
 
 impl MailSendRequest {
     pub fn validate(&self) -> Result<()> {
-        validate_write_id(&self.id)?;
+        validate_write_id(&self.id)
+            .map_err(|e| e.with_field("params.id", "nonblank mutation id"))?;
         if self.to.is_empty() || self.to.len() > MAX_MAIL_RECIPIENTS {
-            return Err(Error::new(
-                "invalid",
-                "mail recipients require 1 to 100 Agent ids",
+            return Err(Error::invalid_field(
+                "params.to",
+                "1 to 100 concrete Agent ids",
             ));
         }
         let mut seen = HashSet::new();
         for recipient in &self.to {
-            parse_agent_id(recipient)?;
+            parse_agent_id(recipient).map_err(|e| {
+                e.with_field("params.to", "distinct canonical a<positive i64> Agent ids")
+            })?;
             if !seen.insert(recipient) {
-                return Err(Error::new(
-                    "invalid",
-                    "mail recipients must not repeat an Agent",
-                ));
+                return Err(Error::invalid_field("params.to", "distinct Agent ids"));
             }
         }
-        validate_mail_text(&self.text)?;
+        validate_mail_text(&self.text).map_err(|e| {
+            e.with_field(
+                "params.text",
+                "string at most 32768 UTF-8 bytes, without NUL",
+            )
+        })?;
         if let Some(thread) = self.thread.as_deref() {
-            validate_mail_thread(thread)?;
+            validate_mail_thread(thread).map_err(|e| {
+                e.with_field(
+                    "params.thread",
+                    "nonblank label at most 256 bytes, without control characters",
+                )
+            })?;
         }
         if let Some(reply) = self.reply_to_delivery.as_deref() {
-            validate_delivery_id(reply)?;
+            validate_delivery_id(reply).map_err(|e| {
+                e.with_field(
+                    "params.reply_to_delivery",
+                    "<write-id>/<recipient-agent> delivery id, at most 512 bytes, no NUL",
+                )
+            })?;
         }
         Ok(())
     }
@@ -151,7 +178,7 @@ impl MailSendRequest {
 /// no mode field. Field-for-field it mirrors `MailSendRequest` without the
 /// public write id: the Store derives the child command id deterministically
 /// and never reuses the public write-id namespace.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailDefinitionArgs {
     pub to: Vec<String>,
@@ -191,7 +218,7 @@ impl MailDefinitionArgs {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailDeliverySummary {
     pub delivery_id: String,
@@ -199,13 +226,13 @@ pub struct MailDeliverySummary {
     pub recipient_generation: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailSendResponse {
     pub deliveries: Vec<MailDeliverySummary>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailDelivery {
     pub delivery_id: String,
@@ -279,14 +306,19 @@ impl MailDelivery {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailInboxRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Owner must name a concrete Agent mailbox; Agent callers may omit for self, never another mailbox."
+    )]
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = MAX_MAIL_INBOX_ROWS))]
     pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Exact last delivery id returned by this mailbox selection.")]
     pub after: Option<String>,
 }
 
@@ -348,7 +380,7 @@ impl MailInboxRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailInboxResponse {
     pub deliveries: Vec<MailDelivery>,
@@ -356,7 +388,7 @@ pub struct MailInboxResponse {
     pub next: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailReadRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -396,12 +428,13 @@ impl MailReadRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailAckRequest {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    #[schemars(length(min = 1, max = MAX_MAIL_ACK_IDS), extend("uniqueItems" = true), description = "Distinct exact delivery ids; reading a delivery never acknowledges it.")]
     pub deliveries: Vec<String>,
 }
 
@@ -442,7 +475,7 @@ impl MailAckRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailAckResponse {
     pub acked: Vec<String>,
@@ -494,36 +527,62 @@ pub fn parse_var_scope(scope: &str) -> Result<VarScope> {
     ))
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VarSetRequest {
+    #[schemars(
+        description = "Nonblank caller-retained mutation id; use a fresh ULID for a new write."
+    )]
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-maxBytes" = MAX_VAR_SCOPE_BYTES), description = "global (Owner only) or project:<nonempty name>, no NUL. Omission defaults to the Agent project; Owner must supply scope. tree is unsupported.")]
     pub scope: Option<String>,
+    #[schemars(extend("x-maxBytes" = MAX_VAR_KEY_BYTES), description = "Nonblank variable key, at most 256 UTF-8 bytes, no NUL.")]
     pub key: String,
+    #[schemars(extend("x-maxEncodedBytes" = MAX_VAR_VALUE_BYTES), description = "Any JSON value, including null; compact encoded JSON is at most 16384 bytes.")]
     pub value: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        range(min = 0),
+        description = "Optional CAS version: zero creates an absent key; a stale version conflicts."
+    )]
     pub expect_version: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-maxBytes" = MAX_VAR_NOTE_BYTES), description = "Optional note, at most 1024 UTF-8 bytes, no NUL.")]
     pub note: Option<String>,
 }
 
 impl VarSetRequest {
     pub fn validate(&self) -> Result<()> {
-        validate_write_id(&self.id)?;
+        validate_write_id(&self.id)
+            .map_err(|e| e.with_field("params.id", "nonblank mutation id"))?;
         if let Some(scope) = self.scope.as_deref() {
-            parse_var_scope(scope)?;
+            parse_var_scope(scope).map_err(|e| {
+                e.with_field(
+                    "params.scope",
+                    "global or project:<nonempty name>; tree is unsupported",
+                )
+            })?;
         }
-        validate_var_key(&self.key)?;
-        validate_var_value(&self.value)?;
+        validate_var_key(&self.key).map_err(|e| {
+            e.with_field(
+                "params.key",
+                "nonblank string at most 256 UTF-8 bytes, no NUL",
+            )
+        })?;
+        validate_var_value(&self.value).map_err(|e| {
+            e.with_field("params.value", "JSON value encoded in at most 16384 bytes")
+        })?;
         if self.expect_version.is_some_and(|version| version < 0) {
-            return Err(Error::new(
-                "invalid",
-                "expected variable version must be zero or positive",
+            return Err(Error::invalid_field(
+                "params.expect_version",
+                "integer zero or greater",
             ));
         }
         if let Some(note) = self.note.as_deref() {
-            validate_var_note(note)?;
+            validate_var_note(note).map_err(|e| {
+                e.with_field("params.note", "string at most 1024 UTF-8 bytes, no NUL")
+            })?;
         }
         Ok(())
     }
@@ -553,7 +612,7 @@ impl VarSetRequest {
 /// resolved under the saved originating principal at admission and again at
 /// execution: an omitted scope means the principal's own project, `global`
 /// stays Owner-only, and any other project scope is rejected.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VarDefinitionArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -586,7 +645,7 @@ impl VarDefinitionArgs {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VarSetResponse {
     pub scope: String,
@@ -595,20 +654,34 @@ pub struct VarSetResponse {
     pub set_by: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VarGetRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "global (readable by Agents; Owner-only writes) or project:<name>; omitted for the Agent project, required for Owner. tree is unsupported."
+    )]
     pub scope: Option<String>,
+    #[schemars(extend("x-maxBytes" = MAX_VAR_KEY_BYTES), description = "Nonblank key, no NUL.")]
     pub key: String,
 }
 
 impl VarGetRequest {
     pub fn validate(&self) -> Result<()> {
         if let Some(scope) = self.scope.as_deref() {
-            parse_var_scope(scope)?;
+            parse_var_scope(scope).map_err(|e| {
+                e.with_field(
+                    "params.scope",
+                    "global or project:<nonempty name>; tree is unsupported",
+                )
+            })?;
         }
-        validate_var_key(&self.key)?;
+        validate_var_key(&self.key).map_err(|e| {
+            e.with_field(
+                "params.key",
+                "nonblank string at most 256 UTF-8 bytes, no NUL",
+            )
+        })?;
         Ok(())
     }
 
@@ -640,7 +713,7 @@ impl VarGetRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VarGetResponse {
     pub scope: String,
@@ -932,7 +1005,7 @@ fn validate_claim_note(note: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimSetRequest {
     pub id: String,
@@ -1005,7 +1078,7 @@ impl ClaimSetRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimConflict {
     pub agent: String,
@@ -1027,7 +1100,7 @@ impl ClaimConflict {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimSetResponse {
     pub agent: String,
@@ -1041,7 +1114,7 @@ pub struct ClaimSetResponse {
     pub truncated: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimView {
     pub agent: String,
@@ -1067,7 +1140,7 @@ impl ClaimView {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimListRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1125,14 +1198,14 @@ impl ClaimListRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimListResponse {
     pub claims: Vec<ClaimView>,
     pub truncated: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimReleaseRequest {
     pub id: String,
@@ -1176,7 +1249,7 @@ impl ClaimReleaseRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimReleaseResponse {
     pub agent: String,
@@ -1184,7 +1257,7 @@ pub struct ClaimReleaseResponse {
     pub glob: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WhoRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1233,7 +1306,7 @@ impl WhoRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WhoWorker {
     pub agent: String,
@@ -1299,7 +1372,7 @@ impl WhoWorker {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WhoSharedWorkspace {
     pub workspace: String,
@@ -1322,7 +1395,7 @@ impl WhoSharedWorkspace {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WhoResponse {
     pub workers: Vec<WhoWorker>,

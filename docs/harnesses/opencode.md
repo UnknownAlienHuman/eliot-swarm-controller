@@ -135,3 +135,11 @@ backend omits it); it is readback-only and does not change `model_verified` (pro
 L7 verifies two-session isolation when shared mode is selected, adopted-service safety,
 204-vs-execution, lost stream/input, snapshot races, pagination, exact controls and no
 historical lifecycle duplication. Unsupported API semantics remain explicit.
+
+## Worker MCP policy
+
+This harness keeps `inherit` only: the frozen profile always records
+`mcp = "inherit"`, and a non-`inherit` policy is rejected as `unsupported`
+at config load. No verified native MCP isolation mechanism was established
+for the installed server (the plugin owns no MCP surface of its own), so no
+`minimal` mechanism is implemented.
