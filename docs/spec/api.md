@@ -40,7 +40,11 @@ authority.
 
 Frames are at most 4 MiB, semantic fields smaller. Multiplex requests so one wait does
 not block unrelated calls. Bound all lists and histories; never hold a read transaction
-open while waiting for a client or native process.
+open while waiting for a client or native process. Each connection carries one request
+and its response; the daemon bounds that write with `RESPONSE_WRITE_TIMEOUT`
+([daemon.rs](../../crates/eliot-daemon/src/daemon.rs)), so a peer that stops reading
+cannot hold its connection task past the deadline. An undelivered mutation result stays
+readable by exact retry; the daemon never replays the effect to deliver it.
 
 Background `daemon` startup reports `starting`; use `daemon.status` for readiness.
 Windows starts that independent process without inheriting caller handles, so captured
