@@ -440,11 +440,16 @@ when the vendor emitted no intermediate start notification; it is not a syntheti
 completion inferred from silence. Persist the durable `command.applied` association
 event in the same transaction as the source batch that proves it. An exact duplicate
 batch/readback does not publish another `command.applied`. The event means the input was
-associated with its exact turn; it is not the turn's terminal result. Final text precedes
-the terminal turn; process exit or silence is not a turn result. Cumulative usage replaces
+associated with its exact turn; it is not the turn's terminal result. Final text, when
+available, precedes the terminal turn; process exit or silence is not a turn result.
+Cumulative usage replaces
 its prior scope value rather than being summed. OpenCode attributes its final assistant
 message's native token usage to the bound turn's terminal event at message scope; a
 repeated message id replaces, and the value is never presented as a turn or session total.
+An exactly associated OpenCode SSE execution terminal proves its status even when
+HTTP transcript enrichment is unavailable, including after the native server exits.
+Commit that status without final text or usage; unavailable enrichment is not a
+contradictory transcript, and neither permits inferring a missing terminal event.
 
 On a failed terminal event, preserve its exact command/turn binding, status and structured
 provider restriction before optional final text. The following final-text budget rule
@@ -508,6 +513,13 @@ An event owner closing before the tail barrier or a drain deadline expiring is
 an explicit unknown retirement error, never successful tail settlement. Retirement
 still ends the unusable plugin; the daemon records missing native evidence as gaps
 and preserves unknown outcomes after its separate custody and reader settlement.
+Every plugin command runs through the shared `native_lifecycle::run_plugin_entry`
+runtime owner. After adapter drains and replies finish, it flushes stdout with a
+one-second deadline and bounds runtime shutdown to one second. An open daemon
+stdin cannot keep an uncancellable Tokio blocking read alive indefinitely at
+runtime teardown. This bound is not proof of native or plugin custody exit.
+Failed-start native-exit evidence remains bound to the exact Agent generation
+and start command until retirement, independently of start-response delivery.
 
 Public requests and answers are universal: `request.opened` details and kinds use the
 shared [`eliot_core::requests`](../../crates/eliot-core/src/requests.rs) shapes
@@ -546,6 +558,11 @@ NDJSON line whose JSON or envelope is invalid is record-local: the typed
 The recorded fault is sticky: EOF, exit-drain, and stop handling never
 overwrite it with a healthy-looking closure, so a busy consumer cannot miss
 it. Frame/codec/UTF-8/IO errors never continue without a proven line boundary.
+Antigravity's fenced load/prompt replies and record-local fault markers share
+one ordered queue. Consume the retained pre-fault prefix before applying the
+fault; frames after the marker cannot settle a turn. A full fault-marker queue
+latches overflow and suppresses subsequent emitted frames. Fatal/overflow watch
+faults apply after their retained prefix drains, preserving any committed terminal.
 Owner drop/cancel fences writer and response router before aborting either
 task (no await in `Drop`, no lock held over IO): already-written calls
 resolve `unknown`, fresh writes are refused `native_not_dispatched`.

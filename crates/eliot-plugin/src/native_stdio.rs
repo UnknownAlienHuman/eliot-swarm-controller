@@ -173,6 +173,7 @@ impl<C: NativeStdioConfig> StdioProcess<C> {
             C::ID_PREFIX,
             PumpMode::LossyOverflow,
             classify_jsonrpc_frame::<C>,
+            None,
         )
         .await?;
         let client = StdioClient {

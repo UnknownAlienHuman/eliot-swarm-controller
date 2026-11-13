@@ -55,6 +55,9 @@ struct FailedStart {
     generation: i64,
     command_id: String,
     error: Error,
+    /// Retained with the exact start binding after native exit and output drain;
+    /// retirement does not depend on delivery of the start RPC response.
+    endpoint_exited: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -190,6 +193,14 @@ pub(crate) async fn run() -> Result<()> {
     let mut native_retirement = Ok(());
     let mut pending_request = None;
     loop {
+        if plugin
+            .failed_start
+            .as_ref()
+            .is_some_and(|failed| failed.endpoint_exited)
+        {
+            native_endpoint_retired = true;
+            break;
+        }
         let Some(mut waiter) = plugin.deferred_steer.take() else {
             let request = if let Some(request) = pending_request.take() {
                 Some(request)
@@ -439,6 +450,19 @@ async fn respond_deferred(client: &PeerClient, request_id: Value, result: Result
 }
 
 impl ClaudePlugin {
+    /// Called only after native exit and reader cleanup succeeded. Keep this
+    /// exact binding until the host loop retires, even if its RPC reply is late.
+    fn retain_exited_start(&mut self, params: &AgentStartParams, error: Error) -> Error {
+        self.failed_start = Some(FailedStart {
+            agent_id: params.agent_id.clone(),
+            generation: params.generation,
+            command_id: params.command_id.clone(),
+            error: error.clone(),
+            endpoint_exited: true,
+        });
+        error
+    }
+
     async fn dispatch(&mut self, request: &RpcRequest, client: &PeerClient) -> DispatchOutcome {
         let result = match request.method.as_str() {
             "initialize" => self.initialize(&request.params),
@@ -751,13 +775,7 @@ impl ClaudePlugin {
             return contextual_error(error, "unknown", message);
         }
         let error = session.native_client.diagnostic_error(error);
-        self.failed_start = Some(FailedStart {
-            agent_id: params.agent_id.clone(),
-            generation: params.generation,
-            command_id: params.command_id.clone(),
-            error: error.clone(),
-        });
-        error
+        self.retain_exited_start(params, error)
     }
 
     /// Discard a failed start and retain its error for replays. A start
@@ -810,13 +828,7 @@ impl ClaudePlugin {
             error
         };
         let error = session.native_client.diagnostic_error(error);
-        self.failed_start = Some(FailedStart {
-            agent_id: params.agent_id.clone(),
-            generation: params.generation,
-            command_id: params.command_id.clone(),
-            error: error.clone(),
-        });
-        error
+        self.retain_exited_start(params, error)
     }
 
     /// Run `initialize` and check the effective profile BEFORE readiness: on
@@ -2213,13 +2225,32 @@ fn target_environment(
 
 #[cfg(test)]
 mod tests {
-    use super::{claude_manifest, claude_scope, new_uuid, setter_error};
+    use super::{ClaudePlugin, claude_manifest, claude_scope, new_uuid, setter_error};
     use eliot_core::Error;
     use eliot_plugin::session::{parse_resume_subject, validate_source_plan};
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, HashSet};
 
     const FAMILIES: &[&str] = &["session", "turn", "message", "request"];
+
+    #[test]
+    fn exited_start_retires_without_response_delivery_and_keeps_exact_replay() {
+        let mut plugin = ClaudePlugin::default();
+        let params = eliot_plugin::AgentStartParams::new("a7", 4, "start-4");
+        let error =
+            plugin.retain_exited_start(&params, Error::new("unknown", "registration timed out"));
+        // No peer/respond operation occurs: exit evidence is owned by the
+        // plugin, rather than by acknowledgement of the expired start RPC.
+        assert!(plugin.failed_start.as_ref().unwrap().endpoint_exited);
+        assert!(plugin.session.is_none());
+        let replay = plugin.replay_start(&params).unwrap().unwrap_err();
+        assert_eq!(replay, error);
+        let newer = eliot_plugin::AgentStartParams::new("a7", 5, "start-5");
+        assert_eq!(
+            plugin.replay_start(&newer).unwrap().unwrap_err().code,
+            "bad_state"
+        );
+    }
 
     #[test]
     fn uuid_mints_unique_hyphenated_ids() {

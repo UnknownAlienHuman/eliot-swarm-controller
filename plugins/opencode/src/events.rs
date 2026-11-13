@@ -1778,16 +1778,15 @@ impl EventProcessor {
             "session.execution.failed" => "failed",
             _ => "interrupted",
         };
-        let readback = self
-            .read_terminal_messages(&terminal.session_id)
-            .await
-            .map_err(|error| {
-                Error::new(
-                    "unknown",
-                    format!("OpenCode terminal readback failed: {}", error.message),
-                )
-            })?;
-        if readback.outcome != status {
+        // The exactly associated stream terminal proves status independently
+        // of optional HTTP text/usage enrichment. A dead server cannot revoke
+        // terminal evidence already received on this generation's stream.
+        let readback =
+            optional_terminal_readback(self.read_terminal_messages(&terminal.session_id).await)?;
+        if readback
+            .as_ref()
+            .is_some_and(|readback| readback.outcome != status)
+        {
             self.record_gap("OpenCode terminal event disagreed with its idle message")
                 .await?;
             return Err(Error::new(
@@ -1796,7 +1795,9 @@ impl EventProcessor {
             ));
         }
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
-        if let Some(text) = readback.final_text.as_deref() {
+        if let Some(readback) = readback.as_ref()
+            && let Some(text) = readback.final_text.as_deref()
+        {
             let data = json!({
                 "command_id": command_id,
                 "turn_id": turn_id,
@@ -1822,26 +1823,14 @@ impl EventProcessor {
             self.commit_event("message.completed", native_id, data)
                 .await?;
         }
-        let mut data = json!({
-            "command_id": command_id.clone(),
-            "turn_id": turn_id,
-            "status": status,
-        });
-        if let Some(text) = readback.final_text.as_deref() {
-            attach_final_text(
-                &mut data,
-                &secrets.redact_text(text),
-                status == "failed",
-                &secrets,
-            );
-        }
-        let native_error = terminal.error.as_ref().or(readback.idle_error.as_ref());
-        attach_native_error(
-            &mut data,
-            native_error.map(|error| error.message.as_str()),
+        let data = terminal_turn_data(
+            &command_id,
+            &turn_id,
+            status,
+            &terminal,
+            readback.as_ref(),
             &secrets,
         );
-        data["usage"] = serde_json::to_value(&readback.usage).unwrap_or(Value::Null);
         let native_id = event_id(
             &terminal.session_id,
             &turn_id,
@@ -1858,7 +1847,7 @@ impl EventProcessor {
             command_id,
             turn_id: turn_id.clone(),
             status: Some(status.to_owned()),
-            final_text: readback.final_text,
+            final_text: readback.and_then(|readback| readback.final_text),
             terminal: true,
         });
         self.status.active_turn_id = None;
@@ -1874,7 +1863,8 @@ impl EventProcessor {
     /// final assistant message's native token usage in that same exact
     /// user-to-selected-idle slice, attributed at message scope. Anything
     /// else (missing user message, missing idle, contradictory outcome) is
-    /// a gap, never an inference.
+    /// a gap, never an inference. Only HTTP `native_readback` unavailability
+    /// permits status-only settlement from the exactly associated SSE terminal.
     async fn read_terminal_messages(&self, session_id: &str) -> Result<TerminalReadback> {
         let inbox_id = self
             .open_inbox_id
@@ -2552,6 +2542,54 @@ impl EventProcessor {
     }
 }
 
+fn optional_terminal_readback(
+    result: Result<TerminalReadback>,
+) -> Result<Option<TerminalReadback>> {
+    match result {
+        Ok(readback) => Ok(Some(readback)),
+        Err(error) if error.code == "native_readback" => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn terminal_turn_data(
+    command_id: &str,
+    turn_id: &str,
+    status: &str,
+    terminal: &ExecutionEventData,
+    readback: Option<&TerminalReadback>,
+    secrets: &SecretPolicy,
+) -> Value {
+    let mut data = json!({
+        "command_id": command_id,
+        "turn_id": turn_id,
+        "status": status,
+    });
+    if let Some(readback) = readback {
+        if let Some(text) = readback.final_text.as_deref() {
+            attach_final_text(
+                &mut data,
+                &secrets.redact_text(text),
+                status == "failed",
+                secrets,
+            );
+        }
+        if let Some(usage) = readback.usage.as_ref() {
+            data["usage"] = serde_json::to_value(usage).unwrap_or(Value::Null);
+        }
+    }
+    let native_error = terminal
+        .error
+        .as_ref()
+        .or_else(|| readback.and_then(|readback| readback.idle_error.as_ref()));
+    attach_native_error(
+        &mut data,
+        native_error.map(|error| error.message.as_str()),
+        secrets,
+    );
+    data
+}
+
 struct TerminalReadback {
     idle_id: String,
     outcome: String,
@@ -2832,6 +2870,58 @@ mod tests {
         Control, EventConfig, EventHandle, EventProcessor, EventStatus, StreamState, TurnFacts,
     };
     use tokio::time::Instant;
+
+    #[test]
+    fn unavailable_terminal_enrichment_preserves_bound_status_without_text_or_usage() {
+        for status in ["completed", "failed", "interrupted"] {
+            let readback = super::optional_terminal_readback(Err(eliot_core::Error::new(
+                "native_readback",
+                "server exited",
+            )))
+            .unwrap();
+            let terminal = crate::native::types::ExecutionEventData {
+                session_id: "session-1".to_owned(),
+                error: None,
+                reason: None,
+            };
+            let data = super::terminal_turn_data(
+                "send-1",
+                "turn-1",
+                status,
+                &terminal,
+                readback.as_ref(),
+                &eliot_core::SecretPolicy::default(),
+            );
+            assert_eq!(data["command_id"], "send-1");
+            assert_eq!(data["turn_id"], "turn-1");
+            assert_eq!(data["status"], status);
+            assert!(data.get("final_text").is_none());
+            assert!(data.get("usage").is_none());
+        }
+    }
+
+    #[test]
+    fn terminal_enrichment_keeps_binding_errors_and_contradictory_evidence() {
+        let error = super::optional_terminal_readback(Err(eliot_core::Error::new(
+            "unknown",
+            "missing exact input association",
+        )))
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "unknown");
+        let readback = super::optional_terminal_readback(Ok(super::TerminalReadback {
+            idle_id: "idle-1".to_owned(),
+            outcome: "failed".to_owned(),
+            idle_error: None,
+            final_text: None,
+            usage: None,
+        }))
+        .unwrap()
+        .unwrap();
+        // Successful conflicting evidence is retained for complete_turn's
+        // contradiction check; it is never downgraded to unavailable enrichment.
+        assert_eq!(readback.outcome, "failed");
+    }
 
     fn handle_with(status: EventStatus) -> EventHandle {
         let (control, _) = tokio::sync::mpsc::channel(1);

@@ -25,8 +25,8 @@ use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
 use eliot_plugin::{
     StderrView,
     native_transport::{
-        NativeChild, NativeLabels, NativeLaunch, NativeWriter, PendingCalls, PendingGuard,
-        PumpAction, PumpMode, encode_frame, spawn_pumped,
+        NativeChild, NativeLabels, NativeLaunch, NativeStreamFault, NativeWriter, PendingCalls,
+        PendingGuard, PumpAction, PumpMode, encode_frame, spawn_pumped,
     },
 };
 use serde::Serialize;
@@ -55,6 +55,8 @@ pub(crate) enum FencedKind {
 /// One ACP stream record for the event task, in wire order.
 #[derive(Debug)]
 pub(crate) enum AgyFrame {
+    /// Ordered record-local fault, behind every retained pre-fault frame.
+    StreamFault(NativeStreamFault),
     /// A `session/update` notification body.
     Update(Value),
     /// The terminal reply of a fenced `session/prompt` call.
@@ -169,6 +171,7 @@ impl AgyProcess {
             ID_PREFIX,
             PumpMode::LossyOverflow,
             move |value| classify_agy_frame(value, &fenced_classify),
+            Some(AgyFrame::StreamFault),
         )
         .await?;
         let client = AgyClient {

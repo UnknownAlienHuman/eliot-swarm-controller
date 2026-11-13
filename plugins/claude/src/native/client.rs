@@ -67,6 +67,7 @@ impl ClaudeProcess {
             ID_PREFIX,
             PumpMode::LossyOverflow,
             classify_claude_frame,
+            None,
         )
         .await?;
         let client = ClaudeClient {

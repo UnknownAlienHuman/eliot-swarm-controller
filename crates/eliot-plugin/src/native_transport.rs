@@ -1162,6 +1162,8 @@ pub fn encode_frame(server: &'static str, message: &impl Serialize) -> Result<St
 /// The caller selects the pump mode explicitly: JSON-RPC keeps
 /// [`PumpMode::LossyOverflow`], only the reply-less stream-json caller
 /// selects [`PumpMode::LosslessBackpressure`].
+/// Fenced event consumers may map record-local faults into this same ordered
+/// queue. Other consumers keep their existing watch-only fault contract.
 pub async fn spawn_pumped<Frame, Classify>(
     launch: NativeLaunch,
     policy: SecretPolicy,
@@ -1169,6 +1171,7 @@ pub async fn spawn_pumped<Frame, Classify>(
     id_prefix: &'static str,
     mode: PumpMode,
     classify: Classify,
+    ordered_fault: Option<fn(NativeStreamFault) -> Frame>,
 ) -> Result<(
     NativeChild,
     PendingCalls,
@@ -1193,6 +1196,7 @@ where
         process_exit,
         mode,
         classify,
+        ordered_fault,
     ));
     transport.set_output_reader(output_reader);
     Ok((transport, pending, frame_rx, stream_rx))
@@ -1299,6 +1303,7 @@ async fn pump_framed_lines<Frame, Classify>(
     mut process_exit: watch::Receiver<Option<ProcessExit>>,
     mode: PumpMode,
     mut classify: Classify,
+    ordered_fault: Option<fn(NativeStreamFault) -> Frame>,
 ) -> Result<()>
 where
     Frame: Send + 'static,
@@ -1406,6 +1411,12 @@ where
                 // Record-local: the bounded UTF-8 line boundary is proven, so
                 // record the typed fault, fail current pending Unknown, and
                 // keep this same reader routing later well-formed records.
+                overflowed = queue_ordered_fault(
+                    &frames,
+                    ordered_fault,
+                    NativeStreamFault::Json,
+                    overflowed,
+                );
                 record_stream_fault(
                     &stream,
                     &pending,
@@ -1447,6 +1458,12 @@ where
                 // Record-local envelope fault: same bounded-line boundary as
                 // invalid JSON above; record typed fault, fail current
                 // pending Unknown, continue with later well-formed records.
+                overflowed = queue_ordered_fault(
+                    &frames,
+                    ordered_fault,
+                    NativeStreamFault::Envelope,
+                    overflowed,
+                );
                 record_stream_fault(&stream, &pending, NativeStreamFault::Envelope, &message);
                 recorded_fault = true;
             }
@@ -1482,6 +1499,19 @@ where
         format!("{server} stream closed while an outcome may be pending"),
     ));
     Ok(())
+}
+
+/// A fenced terminal response shares this queue with its preceding updates.
+/// Put record-local faults on that same boundary before publishing the watch,
+/// so the consumer never applies a later fault to an earlier terminal. If the
+/// marker cannot fit, preserve the queued prefix and suppress subsequent emits.
+fn queue_ordered_fault<Frame>(
+    frames: &mpsc::Sender<Frame>,
+    make_frame: Option<fn(NativeStreamFault) -> Frame>,
+    fault: NativeStreamFault,
+    overflowed: bool,
+) -> bool {
+    overflowed || make_frame.is_some_and(|make| frames.try_send(make(fault)).is_err())
 }
 
 fn native_codec_fault(error: LinesCodecError) -> NativeStreamFault {
@@ -1524,6 +1554,45 @@ fn record_stream_fault(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_fault_keeps_terminal_prefix_ahead_of_fault_and_suffix() {
+        let (frames, mut received) = mpsc::channel(3);
+        frames.try_send("terminal").unwrap();
+        assert!(!queue_ordered_fault(
+            &frames,
+            Some(NativeStreamFault::label),
+            NativeStreamFault::Json,
+            false,
+        ));
+        frames.try_send("later response").unwrap();
+        assert_eq!(received.try_recv().unwrap(), "terminal");
+        assert_eq!(received.try_recv().unwrap(), "invalid_json");
+        assert_eq!(received.try_recv().unwrap(), "later response");
+    }
+
+    #[test]
+    fn full_ordered_fault_queue_preserves_prefix_and_latches_overflow() {
+        let (frames, mut received) = mpsc::channel(1);
+        frames.try_send("terminal").unwrap();
+        let overflowed = queue_ordered_fault(
+            &frames,
+            Some(NativeStreamFault::label),
+            NativeStreamFault::Envelope,
+            false,
+        );
+        assert!(overflowed);
+        assert_eq!(received.try_recv().unwrap(), "terminal");
+        // Once a fault marker was lost, the pump keeps its overflow fence even
+        // if queue space reappears; later emits cannot cross the missing gap.
+        assert!(queue_ordered_fault(
+            &frames,
+            Some(NativeStreamFault::label),
+            NativeStreamFault::Json,
+            overflowed,
+        ));
+        assert!(received.try_recv().is_err());
+    }
 
     #[cfg(unix)]
     fn exit_status() -> ExitStatus {
