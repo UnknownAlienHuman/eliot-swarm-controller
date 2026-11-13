@@ -24,7 +24,7 @@ pub enum NativeChildActivityState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeChildActivity {
     pub state: NativeChildActivityState,
-    pub open_turns: usize,
+    pub has_open_turn: bool,
     pub last_progress_at: Option<i64>,
 }
 

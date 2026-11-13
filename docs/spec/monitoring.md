@@ -515,8 +515,15 @@ per Store lock, including finished/no-facts rows; the registration cursor advanc
 over every visited row. Store is released between pages and the manager generation
 and parent turn are rechecked after each page and before publishing. Each capture
 freezes its last registration ID so concurrent child creation cannot extend the pass
-indefinitely. Open-turn, latest terminal and native-progress reads use matching
-indexes rather than scanning retained turn/event history.
+indefinitely. Open-turn reads stop at the first indexed match; latest terminal and
+native-progress reads likewise use indexed limit queries, never per-child counts.
+A transactional `agents.native_child_revision` stamp tracks relevant child
+registration, turn/progress and native source changes, including pruned child
+progress facts. Capture validates that same stamp across every page and final
+readback. A mutation discards the capture for the next sweep. The stamp is checked
+again under Store before freezing an incident or retiring its finished cohort, so
+an omitted new child or a changing existing child cannot falsely clear/rearm it.
+Unrelated mail, CPU and Git events do not invalidate this child-cohort stamp.
 
 One frozen report covers an unfinished child cohort per manager generation. Parent
 turn changes, mail wakes, manager progress and child fanout do not rearm it. It retires

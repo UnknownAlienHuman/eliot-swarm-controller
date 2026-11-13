@@ -124,7 +124,8 @@ closed, gapped, unhealthy or superseded; `idle` after the latest terminal turn, 
 `interrupted` for an interrupted/cancelled terminal turn; `unknown` without sufficient
 turn facts. Partial message facts without a terminal receipt also leave an observed
 turn open; source loss/restart and event retention do not silently clear that work.
-Open turns take precedence over terminal history. Progress comes only
+Open turns take precedence over terminal history. `has_open_turn` is a bounded
+existence fact, never a count of unresolved turns. Progress comes only
 from committed native turn/message/tool/request facts, never CPU, Git or mail.
 The projection is derived from existing turns, events and source/registration rows,
 with no new activity table. Retention can leave the progress timestamp unknown.

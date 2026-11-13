@@ -11,8 +11,8 @@ use eliot_core::{NativeChildActivity, NativeChildActivityState};
 use std::collections::BTreeMap;
 
 pub const NATIVE_CHILD_ATTENTION_PAGE_SIZE: usize = 32;
-const OPEN_TURNS_SQL: &str = "SELECT COUNT(*) FROM turns WHERE agent = ?1 AND generation = ?2
-    AND state IN ('running', 'unknown')";
+const OPEN_TURN_SQL: &str = "SELECT 1 FROM turns WHERE agent = ?1 AND generation = ?2
+    AND state IN ('running', 'unknown') LIMIT 1";
 const NATIVE_PROGRESS_SQL: &str = "SELECT ts FROM events WHERE agent = ?1 AND generation = ?2
     AND native_id IS NOT NULL AND source NOT IN ('daemon', 'os', 'git', 'workspace_process')
     AND kind IN ('turn.started', 'turn.completed', 'message.completed',
@@ -59,13 +59,13 @@ pub(super) fn activity(
     child: i64,
     generation: i64,
 ) -> Result<NativeChildActivity> {
-    let open_turns: i64 = connection
-        .query_row(OPEN_TURNS_SQL, params![child, generation], |row| row.get(0))
-        .map_err(sql_error)?;
-    let open_turns = usize::try_from(open_turns)
-        .map_err(|_| Error::new("internal", "native child open-turn count overflowed"))?;
+    let has_open_turn = connection
+        .query_row(OPEN_TURN_SQL, params![child, generation], |_| Ok(()))
+        .optional()
+        .map_err(sql_error)?
+        .is_some();
     let last_progress_at = native_progress(connection, child, generation)?;
-    let state = if open_turns > 0 {
+    let state = if has_open_turn {
         let binding: Option<(i64, i64, i64, i64)> = connection
             .query_row(
                 "SELECT producer, producer_generation, parent, parent_generation
@@ -105,7 +105,7 @@ pub(super) fn activity(
     };
     Ok(NativeChildActivity {
         state,
-        open_turns,
+        has_open_turn,
         last_progress_at,
     })
 }
@@ -141,6 +141,14 @@ pub(super) fn native_progress(
 }
 
 impl Store {
+    /// A constant-time stamp for all committed activity changes in this cohort.
+    pub fn native_children_revision(&self, manager: &str, generation: i64) -> Result<Option<i64>> {
+        self.connection.query_row(
+            "SELECT native_child_revision FROM agents WHERE id = ?1 AND generation = ?2 AND observe_only = 0",
+            params![parse_agent_id(manager)?, generation], |row| row.get(0),
+        ).optional().map_err(sql_error)
+    }
+
     /// Freeze the finite registration range before a multi-page capture.
     pub fn native_children_attention_end(
         &self,

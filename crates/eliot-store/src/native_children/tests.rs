@@ -118,7 +118,7 @@ fn activity_projection_preserves_control_state_and_prefers_open_turns() {
         .unwrap();
     let lost = store.get_agent(&child.agent.id).unwrap().unwrap();
     assert_eq!(lost.state, AgentState::Unknown);
-    assert_eq!(lost.activity.as_ref().unwrap().open_turns, 1);
+    assert!(lost.activity.as_ref().unwrap().has_open_turn);
     assert_eq!(lost.activity.unwrap().state, NativeChildActivityState::Lost);
     assert_eq!(
         attention_summary(&store, &root, 1, NOW + 1002, 1000).lost,
@@ -282,7 +282,7 @@ fn activity_query_plans_seek_indexes_instead_of_retained_history() {
     let store = store();
     // These are the production query strings, planned by bundled rusqlite.
     for (sql, args, expected) in [
-        (OPEN_TURNS_SQL, vec![1i64, 1], "turns_native_activity"),
+        (OPEN_TURN_SQL, vec![1i64, 1], "turns_native_activity"),
         (
             NATIVE_PROGRESS_SQL,
             vec![1, 1],
@@ -315,6 +315,147 @@ fn activity_query_plans_seek_indexes_instead_of_retained_history() {
         );
         println!("{expected}: {details}");
     }
+}
+
+#[test]
+fn activity_open_turn_lookup_stops_with_many_unresolved_turns() {
+    let mut store = store();
+    let root = producer(&mut store, "root");
+    let child = register(&mut store, &root, request(&root, "root", "many-turns"));
+    let child_num = parse_agent_id(&child.agent.id).unwrap();
+    store.connection.execute(
+        "WITH RECURSIVE n(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM n WHERE value < 10000)
+         INSERT INTO turns(agent, generation, turn_id, state)
+         SELECT ?1, 1, printf('turn-%d', value), 'unknown' FROM n", [child_num],
+    ).unwrap();
+    let mut statement = store.connection.prepare(OPEN_TURN_SQL).unwrap();
+    assert!(
+        statement
+            .query_row(params![child_num, 1], |_| Ok(()))
+            .optional()
+            .unwrap()
+            .is_some()
+    );
+    let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+    assert!(
+        steps < 100,
+        "open-turn existence traversed unresolved rows: {steps} VM steps"
+    );
+    println!("open-turn presence with 10000 unresolved turns: {steps} VM steps");
+    assert!(
+        store
+            .get_agent(&child.agent.id)
+            .unwrap()
+            .unwrap()
+            .activity
+            .unwrap()
+            .has_open_turn
+    );
+}
+
+#[test]
+fn activity_revision_is_transactional_scoped_and_survives_progress_pruning() {
+    let mut store = store();
+    let root = producer(&mut store, "root");
+    let foreign = producer(&mut store, "foreign");
+    let before = store.native_children_revision(&root, 1).unwrap().unwrap();
+    let binding = request(&root, "root", "child");
+    let child = register(&mut store, &root, binding.clone());
+    let registered = store.native_children_revision(&root, 1).unwrap().unwrap();
+    assert!(registered > before);
+    register(&mut store, &root, binding);
+    assert_eq!(
+        store.native_children_revision(&root, 1).unwrap(),
+        Some(registered)
+    );
+    start_child_turn(&mut store, &root, &child.agent.id, "open");
+    let progressed = store.native_children_revision(&root, 1).unwrap().unwrap();
+    assert!(progressed > registered);
+    assert_eq!(
+        store.native_children_revision(&foreign, 1).unwrap(),
+        Some(0)
+    );
+    let tx = store.connection.transaction().unwrap();
+    insert_daemon_event(
+        &tx,
+        NOW + 3,
+        "turn.completed",
+        "turn",
+        Some(parse_agent_id(&child.agent.id).unwrap()),
+        Some(1),
+        json!({"turn_id":"open"}),
+    )
+    .unwrap();
+    tx.rollback().unwrap();
+    assert_eq!(
+        store.native_children_revision(&root, 1).unwrap(),
+        Some(progressed)
+    );
+    let tx = store.connection.transaction().unwrap();
+    for (kind, data) in [
+        ("x.user.noise", json!({})),
+        ("source.health", json!({"source":"os"})),
+        ("source.health", json!({"source":"git"})),
+    ] {
+        insert_daemon_event(
+            &tx,
+            NOW + 3,
+            kind,
+            "source",
+            Some(parse_agent_id(&root).unwrap()),
+            Some(1),
+            data,
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    assert_eq!(
+        store.native_children_revision(&root, 1).unwrap(),
+        Some(progressed)
+    );
+    let tx = store.connection.transaction().unwrap();
+    insert_daemon_event(
+        &tx,
+        NOW + 4,
+        "source.health",
+        "source",
+        Some(parse_agent_id(&root).unwrap()),
+        Some(1),
+        json!({"source":"stream"}),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let source_changed = store.native_children_revision(&root, 1).unwrap().unwrap();
+    assert!(source_changed > progressed);
+    store
+        .put_batch(
+            batch(
+                &root,
+                "parent-ended",
+                vec![event("session.ended", "parent-ended", json!({}))],
+            ),
+            NOW + 5,
+        )
+        .unwrap();
+    let parent_ended = store.native_children_revision(&root, 1).unwrap().unwrap();
+    assert!(parent_ended > source_changed);
+    store
+        .connection
+        .execute(
+            "DELETE FROM events WHERE agent = ?1 AND kind = 'turn.started'",
+            [parse_agent_id(&child.agent.id).unwrap()],
+        )
+        .unwrap();
+    assert!(store.native_children_revision(&root, 1).unwrap().unwrap() > parent_ended);
+    assert!(
+        store
+            .get_agent(&child.agent.id)
+            .unwrap()
+            .unwrap()
+            .activity
+            .unwrap()
+            .has_open_turn
+    );
 }
 
 #[test]
