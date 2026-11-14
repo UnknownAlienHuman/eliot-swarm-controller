@@ -5990,7 +5990,7 @@ fn format_agent_id(id: i64) -> String {
 }
 
 fn validate_ulid(id: &str) -> Result<Ulid> {
-    Ulid::from_string(id).map_err(|_| Error::new("invalid", "mutation id must be a ULID"))
+    Ulid::from_string(id).map_err(|_| Error::invalid_mutation_id())
 }
 
 /// ULID timestamp of `id` in commit-clock milliseconds, or `None` when the
@@ -6008,7 +6008,11 @@ fn validate_id_age(id: &str, now: i64) -> Result<()> {
     if now.saturating_sub(created_at) > RETRY_WINDOW_MS {
         return Err(Error::new(
             "id_expired",
-            "an absent mutation id is older than the 24-hour retry window",
+            "mutation id is older than the 24-hour retry window",
+        )
+        .with_field(
+            "params.id",
+            "ULID minted within the last 24 hours; the window has passed, so mint a fresh ULID for a new write (retries reuse the id returned by the first write)",
         ));
     }
     // A ULID further ahead than the allowed generator-clock skew is a client
@@ -6019,6 +6023,10 @@ fn validate_id_age(id: &str, now: i64) -> Result<()> {
         return Err(Error::new(
             "invalid",
             "mutation id is more than the allowed clock skew in the future",
+        )
+        .with_field(
+            "params.id",
+            "ULID with a timestamp within 5 minutes of the daemon clock; check the caller clock and mint a fresh ULID",
         ));
     }
     Ok(())

@@ -397,4 +397,46 @@ mod tests {
         assert!(empty.acceptable);
         assert!(require_minimal_own_server(&empty.effective, "eliot_swarm_x").is_err());
     }
+
+    #[test]
+    fn status_page_extracts_names_only_at_observed_inventory_scale() {
+        // Live-observed 2026-11-14: a minimal-policy `mcpServerStatus/list`
+        // (`toolsAndAuthOnly`) response reached 1,990,613 bytes. The parser
+        // keeps names only; the embedded tool catalogs that size the frame
+        // must never reach the accumulated report.
+        let big_tool = json!({
+            "name": "search",
+            "description": "x".repeat(1_500_000),
+            "inputSchema": {"type": "object", "padding": "y".repeat(600_000)},
+        });
+        let response = json!({"data": [
+            {
+                "name": "eliot_swarm_x",
+                "runtimeStatus": "connected",
+                "authStatus": "unknown",
+                "resources": [],
+                "resourceTemplates": [],
+                "tools": {"search": big_tool},
+            },
+            {"name": "owner-a", "runtimeStatus": "disabled", "authStatus": "unknown",
+             "resources": [], "resourceTemplates": [], "tools": {"search": {"name": "search", "inputSchema": {}}}},
+        ]});
+        let wire_len = serde_json::to_vec(&response)
+            .expect("response encodes")
+            .len();
+        assert!(
+            wire_len >= 1_990_613,
+            "test payload under observed scale: {wire_len}"
+        );
+        let page = parse_status_page(&response, &[], "eliot_swarm_x").expect("names-only parse");
+        assert!(page.acceptable);
+        assert_eq!(page.effective, vec!["eliot_swarm_x".to_owned()]);
+        let accumulated_len = serde_json::to_vec(&page.effective)
+            .expect("names encode")
+            .len();
+        assert!(
+            accumulated_len < 1024,
+            "tool payload leaked: {accumulated_len}"
+        );
+    }
 }

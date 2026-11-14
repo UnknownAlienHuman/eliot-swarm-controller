@@ -1460,18 +1460,18 @@ mod tests {
             // the v23 block backfills them exactly as it would on upgrade.
             // The v24 claims table postdates the downgrade target, so it
             // goes too; the reopen migrates 22 through the current version.
-            // Drop the v35 digest, v34 config, v33 session-usage tables first
-            // so the reopen exercises their migration blocks, then the v32
-            // attention-wake table.
+            // Drop the v37 digest, v34 config and v33 session-usage tables
+            // first and undo the v36/v35 column adds, so the reopen exercises
+            // their migration blocks, then the v32 attention-wake table.
             let legacy = rusqlite::Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
-                    "DROP TABLE IF EXISTS completion_digests;
-                                         ALTER TABLE agents DROP COLUMN profile_inherited;
-                                         DROP TABLE agent_config;
-                                         DELETE FROM schema_migrations WHERE version = 37;
-                                         DELETE FROM schema_migrations WHERE version = 36;
-                                         DELETE FROM schema_migrations WHERE version = 35;
+                    "DROP TABLE completion_digests;
+                     DELETE FROM schema_migrations WHERE version = 37;
+                     DROP TABLE agent_config;
+                     ALTER TABLE agents DROP COLUMN profile_inherited;
+                     DELETE FROM schema_migrations WHERE version = 36;
+                     DELETE FROM schema_migrations WHERE version = 35;
                      DELETE FROM schema_migrations WHERE version = 34;
                      ALTER TABLE commands DROP COLUMN config_revision;
                      ALTER TABLE turns DROP COLUMN config_revision;

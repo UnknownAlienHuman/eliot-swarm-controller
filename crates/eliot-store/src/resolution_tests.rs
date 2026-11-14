@@ -380,6 +380,75 @@ fn resolve_unknown_interrupt_to_applied_keeps_turn_binding_and_turn_gate() {
 }
 
 #[test]
+fn unknown_turn_on_live_generation_blocks_next_send_until_owner_resolves() {
+    let mut store = store();
+    let now = now_ms();
+    let agent = ready_agent(&mut store, "unknown-turn-gate", now);
+
+    let first = send_request(&agent, "first input");
+    let first_id = first.id.clone();
+    store.submit("owner", first, now).expect("admit first send");
+    store.dispatch(&first_id, now).expect("dispatch first send");
+    store
+        .put_batch(
+            native_batch(
+                &agent,
+                1,
+                "turn.started",
+                json!({"command_id": first_id, "turn_id": "turn-1"}),
+            ),
+            now,
+        )
+        .expect("commit exact turn association");
+    // Projection-gap style unknown on the live generation: the Agent returns
+    // to idle with no active turn, but the turn outcome stays uncertain.
+    store
+        .put_batch(
+            native_batch(
+                &agent,
+                1,
+                "turn.unknown",
+                json!({"command_id": first_id, "turn_id": "turn-1"}),
+            ),
+            now,
+        )
+        .expect("commit turn unknown");
+    let agent_row = store.get_agent(&agent).unwrap().unwrap();
+    assert_eq!(agent_row.state, AgentState::Idle);
+    assert_eq!(agent_row.active_turn, None);
+    let turn = store.get_turn(&agent, 1, "turn-1").unwrap().unwrap();
+    assert_eq!(turn.state, TurnState::Unknown);
+
+    // The uncertain turn must not be overtaken: the next send queues at
+    // admission and stays queued at dispatch (core.md turn/input gates).
+    let next = send_request(&agent, "later input");
+    let next_id = next.id.clone();
+    let admitted = store.submit("owner", next, now).expect("admit later send");
+    assert_eq!(admitted.command.state, CommandState::Queued);
+    let held = store.dispatch(&next_id, now).unwrap().value;
+    assert_eq!(held.state, CommandState::Queued);
+    assert!(store.get_turn(&agent, 1, "turn-2").unwrap().is_none());
+
+    // Owner resolution with a native readback proving the exact turn
+    // inactive releases only this turn gate; the queued send dispatches.
+    let proof = TurnInactiveProof {
+        turn_id: "turn-1".to_owned(),
+    };
+    store
+        .resolve_turn(
+            "owner",
+            &resolve_turn_request(&agent, 1, "turn-1", TurnResolveStatus::Failed),
+            Some(&proof),
+            now,
+        )
+        .expect("resolve unknown turn");
+    let resolved = store.get_turn(&agent, 1, "turn-1").unwrap().unwrap();
+    assert_eq!(resolved.state, TurnState::Completed);
+    let released = store.dispatch(&next_id, now).unwrap().value;
+    assert_eq!(released.state, CommandState::Dispatched);
+}
+
+#[test]
 fn resolve_send_with_lost_turn_association_invents_nothing() {
     let mut store = store();
     let now = now_ms();

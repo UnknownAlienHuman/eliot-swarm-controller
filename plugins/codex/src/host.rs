@@ -131,7 +131,11 @@ struct AgentSession {
     phase: SessionPhase,
     thread_id: Option<String>,
     native_scope: String,
-    requested_model: String,
+    /// Native-selected model id (requested or the `isDefault` native
+    /// default): what thread and turn wire fields actually carry. The
+    /// requested value (present or absent) is reported once in the start
+    /// result; the effective value is this selection plus native readback.
+    selected_model: String,
     /// Pinned reasoning effort, or `None` when the profile omitted it and
     /// the native/provider default is preserved by omitting the wire field.
     selected_effort: Option<String>,
@@ -178,9 +182,6 @@ struct NativeStartContext<'a> {
     route: &'a CodexRoute,
     store: &'a NativeStoreBinding,
     metadata_secrets: &'a [String],
-    mcp_policy: McpPolicy,
-    mcp_allow: &'a [String],
-    own_mcp_server: &'a str,
 }
 
 pub(crate) async fn run() -> Result<()> {
@@ -317,6 +318,7 @@ impl CodexPlugin {
             "initialize" => self.initialize(&request.params),
             "discover" => self.discover(&request.params).await,
             "profile.store" => self.profile_store(&request.params).await,
+            "model.list" => self.model_list(&request.params).await,
             "agent.attach" => self.attach(&request.params).await,
             "agent.detach" => self.detach(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
@@ -407,6 +409,50 @@ impl CodexPlugin {
         let (launch, secrets, metadata_secrets) =
             self.reader_launch(&params.profile, &params.target_environment)?;
         crate::discovery::discover(params, launch, secrets, metadata_secrets).await
+    }
+
+    /// Read-only native model catalogue for `harness.models`. A dedicated
+    /// reader plugin instance pages `model/list` with no thread, no input
+    /// and no inference; the default entry is the native `isDefault`.
+    async fn model_list(&self, raw: &Value) -> Result<Value> {
+        if self.session.is_some() || self.failed_start.is_some() || self.observer.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Codex model.list requires a dedicated reader plugin instance",
+            ));
+        }
+        let profile: Value = decode(raw, "Codex model.list params are invalid")?;
+        let snapshot = profile.get("profile").unwrap_or(&profile);
+        if snapshot.get("harness").and_then(Value::as_str) != Some("codex") {
+            return Err(Error::new(
+                "profile_error",
+                "Codex model.list received another harness",
+            ));
+        }
+        let (launch, secrets, metadata_secrets) = self.reader_launch(snapshot, &json!({}))?;
+        let entries = crate::discovery::list_models(
+            launch,
+            &metadata_secrets,
+            &secrets,
+            tokio::time::Instant::now() + crate::discovery::READ_TIMEOUT,
+        )
+        .await?;
+        let default = entries
+            .iter()
+            .find(|entry| entry.is_default)
+            .map(|entry| entry.id.clone());
+        let models: Vec<Value> = entries
+            .into_iter()
+            .map(|entry| {
+                json!({
+                    "id": entry.id,
+                    "default": entry.is_default,
+                    "efforts": entry.supported_reasoning_efforts.into_iter().map(|effort| effort.reasoning_effort).collect::<Vec<_>>(),
+                    "default_effort": entry.default_reasoning_effort,
+                })
+            })
+            .collect();
+        Ok(json!({"models": models, "default": default}))
     }
 
     fn reader_launch(
@@ -690,12 +736,14 @@ impl CodexPlugin {
         }
         let route = CodexRoute::from_profile(frozen_profile)?;
         let frozen_store = frozen_store_binding(profile)?;
-        let requested_model = profile
+        // An omitted model selects the harness native default (`isDefault`)
+        // at start; an explicit model must match exactly or fail honestly
+        // with no substitution. Requested-absent stays null in readback.
+        let requested_model: Option<String> = profile
             .get("model")
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| Error::new("profile_error", "Codex profile requires an exact model id"))?
-            .to_owned();
+            .map(str::to_owned);
         let requested_effort = optional_profile_text(profile, "effort", "Codex")?;
         let collaboration_mode =
             match optional_profile_text(profile, "collaboration_mode", "Codex")?.as_deref() {
@@ -866,7 +914,7 @@ impl CodexPlugin {
             phase: SessionPhase::Unknown,
             thread_id: None,
             native_scope: String::new(),
-            requested_model: requested_model.clone(),
+            selected_model: String::new(),
             selected_effort: None,
             native_effort: None,
             collaboration_mode,
@@ -919,24 +967,21 @@ impl CodexPlugin {
             return Err(error);
         }
 
-        let (selected_effort, native_scope, mcp_readback) = match Self::initialize_native(
+        let (selected_model, selected_effort, native_scope) = match Self::initialize_native(
             &session.native_client,
             &workspace,
-            &requested_model,
+            requested_model.as_deref(),
             requested_effort.as_deref(),
             collaboration_mode.is_some(),
             NativeStartContext {
                 route: &route,
                 store: &frozen_store,
                 metadata_secrets: &metadata_secrets,
-                mcp_policy,
-                mcp_allow: &mcp_allow,
-                own_mcp_server: &mcp_server_name,
             },
         )
         .await
         {
-            Ok((effort, scope, mcp_readback)) => (effort, scope, mcp_readback),
+            Ok((model, effort, scope)) => (model, effort, scope),
             Err(error) => {
                 let error = discard_failed_start(&mut session, error).await;
                 return Err(self.settle_pre_dispatch_outcome(
@@ -947,6 +992,7 @@ impl CodexPlugin {
                 ));
             }
         };
+        session.selected_model = selected_model.clone();
         session.selected_effort = selected_effort.clone();
         session.native_scope = native_scope;
 
@@ -995,7 +1041,7 @@ impl CodexPlugin {
             let params = NativeThreadResumeParams {
                 thread_id: subject.native_ref.clone(),
                 exclude_turns: true,
-                model: Some(requested_model.clone()),
+                model: Some(selected_model.clone()),
                 model_provider: Some(route.provider().to_owned()),
                 cwd: Some(workspace.to_string_lossy().into_owned()),
                 sandbox: Some(sandbox_mode),
@@ -1020,7 +1066,7 @@ impl CodexPlugin {
         } else {
             let params = NativeThreadStartParams {
                 cwd: Some(workspace.to_string_lossy().into_owned()),
-                model: Some(requested_model.clone()),
+                model: Some(selected_model.clone()),
                 model_provider: Some(route.provider().to_owned()),
                 sandbox: Some(sandbox_mode),
                 approval_policy: Some(json!(approval_policy.clone())),
@@ -1137,6 +1183,45 @@ impl CodexPlugin {
                 "Codex thread/resume did not prove the resumed thread idle; no input was sent",
             ));
         }
+        // Requested vs observed MCP surface: read the thread-scoped
+        // `mcpServerStatus/list` inventory now that the owned thread is
+        // loaded (pre-thread runtimes are unavailable per the installed
+        // schema, so this read cannot move earlier). Minimal fails closed
+        // here when the surface is unverifiable, shows an enabled
+        // non-allowed server, or omits the Agent-scoped server; inherit
+        // performs no inventory readback and reports the set as unknown
+        // instead of echoing the requested set. No input has been sent: the
+        // thread is empty, and a failed start settles deterministically
+        // like any rejected dispatch.
+        let mcp_readback = if mcp_policy == McpPolicy::Minimal {
+            match Self::read_mcp_status(
+                &session.native_client,
+                &readback.thread.id,
+                &mcp_allow,
+                &mcp_server_name,
+                &metadata_secrets,
+            )
+            .await
+            {
+                Ok(inventory) => inventory,
+                Err(error) => {
+                    let error = discard_failed_start(&mut session, error).await;
+                    self.failed_start = Some(FailedStart {
+                        agent_id: params.agent_id.clone(),
+                        generation: params.generation,
+                        command_id: params.command_id.clone(),
+                        error: error.clone(),
+                    });
+                    return Err(error);
+                }
+            }
+        } else {
+            // Inherit keeps the exact previous startup path: no inventory
+            // RPCs. Each inventory RPC owns up to the whole outer
+            // `agent.start` budget, so even an optional read regresses
+            // default startup; the set stays unknown instead.
+            McpReadback::unverified()
+        };
         // Only a requested effort is verified/enforced. An omitted effort
         // leaves the native default in `effective.effort`, reported
         // separately from `requested.effort` (null).
@@ -1168,7 +1253,12 @@ impl CodexPlugin {
             effective,
             &[InjectPoint::NextInput, InjectPoint::ActiveTurn],
         );
-        let settings_match = readback.model == requested_model
+        // An omitted request accepts the native-selected model as
+        // effective; an explicit request must match exactly.
+        let settings_match = requested_model
+            .as_deref()
+            .is_none_or(|requested| readback.model == requested)
+            && readback.model == selected_model
             && readback.model_provider == route.provider()
             && paths_equal(Path::new(&readback.cwd), &workspace)
             && sandbox_matches(&readback.sandbox, &permissions, &workspace)
@@ -1282,11 +1372,11 @@ impl CodexPlugin {
     async fn initialize_native(
         client: &NativeClient,
         workspace: &Path,
-        requested_model: &str,
+        requested_model: Option<&str>,
         requested_effort: Option<&str>,
         experimental_api: bool,
         context: NativeStartContext<'_>,
-    ) -> Result<(Option<String>, String, McpReadback)> {
+    ) -> Result<(String, Option<String>, String)> {
         let init_params = NativeInitializeParams {
             client_info: NativeClientInfo {
                 name: "eliot".to_owned(),
@@ -1421,43 +1511,24 @@ impl CodexPlugin {
             .route
             .verify_config(effective_config, context.metadata_secrets)?;
 
-        // Requested vs observed MCP surface: read the installed
-        // `mcpServerStatus/list` inventory (verified in the 0.167.1
-        // app-server schema) and keep names only. Minimal fails closed
-        // when the visible surface cannot be verified, shows an enabled
-        // non-allowed server, or omits the Agent-scoped server; inherit
-        // performs no inventory readback on the readiness path and reports
-        // the set as unknown instead of echoing the requested set.
-        let enforce_minimal = context.mcp_policy == McpPolicy::Minimal;
-        let mcp_readback = if enforce_minimal {
-            Self::read_mcp_status(
-                client,
-                context.mcp_allow,
-                context.own_mcp_server,
-                context.metadata_secrets,
-                true,
-            )
-            .await
-            .map_err(|error| {
-                pre_dispatch_read_error(
-                    error,
-                    "profile_error",
-                    "Codex minimal MCP isolation could not be verified",
-                )
-            })?
-        } else {
-            // Inherit keeps the exact previous startup path: no inventory
-            // RPCs on the readiness path. Each inventory RPC owns up to the
-            // whole outer `agent.start` budget, so even an optional read
-            // regresses default startup; the set stays unknown instead.
-            McpReadback::unverified()
-        };
-
+        // Requested vs observed MCP surface is read after thread dispatch
+        // (see `read_mcp_status`): the installed `mcpServerStatus/list`
+        // reports per-thread runtime state, and without a loaded thread
+        // every entry's status is unavailable, so a pre-thread read cannot
+        // prove anything about the isolated surface. Inherit performs no
+        // inventory readback at all and reports the set as unknown instead
+        // of echoing the requested set.
         if !context.route.requires_chatgpt() {
+            let requested = requested_model.ok_or_else(|| {
+                Error::new(
+                    "profile_error",
+                    "Codex Responses route requires an explicit model id",
+                )
+            })?;
             return Ok((
+                requested.to_owned(),
                 context.route.optional_effort(requested_effort)?,
                 native_scope,
-                mcp_readback,
             ));
         }
 
@@ -1478,31 +1549,41 @@ impl CodexPlugin {
                 ));
             }
             // Omitted effort: preserve the native default by omitting the
-            // wire field. The catalog lookup above still proves the exact
-            // model exists; no medium/xhigh value is fabricated here.
+            // wire field. The catalog lookup above still proves the
+            // selected model exists; no medium/xhigh value is fabricated.
             None => None,
         };
-        Ok((effort, native_scope, mcp_readback))
+        Ok((model.id.clone(), effort, native_scope))
     }
 
-    /// Read the native MCP inventory for requested-vs-observed reporting.
-    /// Names only: tool/resource payloads are never retained. A page that
-    /// echoes a known credential fails the read; truncation of the page loop
-    /// leaves the inventory incomplete, which is also a failure the caller
-    /// maps per policy (minimal aborts, inherit reports unknown).
+    /// Read the native MCP inventory for requested-vs-observed reporting,
+    /// scoped to the owned thread. The installed `mcpServerStatus/list`
+    /// reports per-thread runtime state (null/unavailable without a loaded
+    /// thread per the 0.167.1 schema), so only a thread-scoped read can
+    /// prove which servers are actually present and enabled; callers run
+    /// this after thread/start|resume and before any input. Names only:
+    /// tool/resource payloads are never retained. A page that echoes a
+    /// known credential fails the read; truncation of the page loop leaves
+    /// the inventory incomplete. The inventory itself is a read, so a failed
+    /// read stays deterministic: no input was dispatched and the caller
+    /// settles the empty thread without replaying an uncertain effect.
     async fn read_mcp_status(
         client: &NativeClient,
+        thread_id: &str,
         allow: &[String],
         own_mcp_server: &str,
         metadata_secrets: &[String],
-        enforce_minimal: bool,
     ) -> Result<McpReadback> {
         let mut accumulated: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut cursor: Option<String> = None;
         let mut incomplete = true;
         for _ in 0..crate::mcp::MAX_MCP_STATUS_PAGES {
-            let mut params = json!({"detail": "toolsAndAuthOnly", "limit": 100});
+            let mut params = json!({
+                "detail": "toolsAndAuthOnly",
+                "limit": 100,
+                "threadId": thread_id,
+            });
             if let Some(cursor) = cursor.as_deref() {
                 params["cursor"] = Value::String(cursor.to_owned());
             }
@@ -1510,11 +1591,12 @@ impl CodexPlugin {
                 .call("mcpServerStatus/list", params, Instant::now() + RPC_TIMEOUT)
                 .await
                 .map_err(|error| {
-                    // Only prerequisite reads ran; no thread or input was dispatched.
+                    // The inventory is a read: no input was dispatched, so a
+                    // failed read stays deterministic.
                     pre_dispatch_read_error(
                         error,
                         "native_readback",
-                        "Codex mcpServerStatus/list read failed",
+                        "Codex mcpServerStatus/list read failed; no input was sent",
                     )
                 })?;
             let page = parse_status_page(&response, allow, own_mcp_server)?;
@@ -1525,7 +1607,7 @@ impl CodexPlugin {
                     "Codex MCP inventory contains a known secret",
                 ));
             }
-            cursor = merge_status_page(&mut accumulated, &mut seen, page, enforce_minimal)?;
+            cursor = merge_status_page(&mut accumulated, &mut seen, page, true)?;
             if cursor.is_none() {
                 incomplete = false;
                 break;
@@ -1537,13 +1619,12 @@ impl CodexPlugin {
                 "Codex MCP inventory is paginated beyond its bound",
             ));
         }
-        if enforce_minimal {
-            // The completed inventory must show Eliot's own Agent-scoped
-            // server as present and enabled; an empty inventory or a
-            // disabled own entry proves nothing and fails closed here,
-            // before any thread or input.
-            require_minimal_own_server(&accumulated, own_mcp_server)?;
-        }
+        // The completed thread-scoped inventory must show Eliot's own
+        // Agent-scoped server as present and enabled; an empty inventory or
+        // a disabled own entry proves nothing and fails closed here, before
+        // any input. The empty thread is retained like any stopped Agent's
+        // thread; it never receives input.
+        require_minimal_own_server(&accumulated, own_mcp_server)?;
         Ok(McpReadback::verified(accumulated))
     }
 
@@ -1680,7 +1761,7 @@ impl CodexPlugin {
         let model = params
             .model_override
             .clone()
-            .unwrap_or_else(|| session.requested_model.clone());
+            .unwrap_or_else(|| session.selected_model.clone());
         let effort = params
             .effort_override
             .clone()
@@ -2375,7 +2456,45 @@ async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error
     session.native_client.diagnostic_error(error)
 }
 
-async fn discover_model(client: &NativeClient, requested_model: &str) -> Result<NativeModelEntry> {
+/// Pure native catalogue selection shared by start and `model.list`.
+/// An explicit request matches exactly or fails honestly with no
+/// substitution; an omitted request uses the native `isDefault` entry or
+/// fails honestly when the catalogue names none (e.g. an empty catalogue
+/// serves no default to fall back to).
+fn select_launch_model(
+    entries: &[NativeModelEntry],
+    requested_model: Option<&str>,
+) -> Result<NativeModelEntry> {
+    if let Some(requested) = requested_model {
+        entries
+            .iter()
+            .find(|model| model.id == requested && model.model == requested)
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(
+                    "profile_error",
+                    "The exact requested Codex model is unavailable in this account catalogue",
+                )
+            })
+    } else {
+        entries
+            .iter()
+            .find(|model| model.is_default)
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(
+                    "profile_error",
+                    "Codex model/list reported no default model; use an explicit model",
+                )
+            })
+    }
+}
+
+async fn discover_model(
+    client: &NativeClient,
+    requested_model: Option<&str>,
+) -> Result<NativeModelEntry> {
+    let mut entries: Vec<NativeModelEntry> = Vec::new();
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
     for _ in 0..MAX_MODEL_PAGES {
@@ -2407,13 +2526,7 @@ async fn discover_model(client: &NativeClient, requested_model: &str) -> Result<
                 "Codex model/list page did not match the installed schema",
             )
         })?;
-        if let Some(model) = page
-            .data
-            .into_iter()
-            .find(|model| model.id == requested_model && model.model == requested_model)
-        {
-            return Ok(model);
-        }
+        entries.extend(page.data);
         match page.next_cursor {
             Some(next) if !next.is_empty() && seen_cursors.insert(next.clone()) => {
                 cursor = Some(next)
@@ -2424,12 +2537,10 @@ async fn discover_model(client: &NativeClient, requested_model: &str) -> Result<
                     "Codex model/list returned a repeated or invalid cursor",
                 ));
             }
-            None => {
-                return Err(Error::new(
-                    "profile_error",
-                    "The exact requested Codex model is unavailable in this account catalogue",
-                ));
-            }
+            // End of catalogue: select from all pages at once so an omitted
+            // request sees the default wherever it is paged. Requested
+            // selection still fails honestly with no substitution.
+            None => return select_launch_model(&entries, requested_model),
         }
     }
     Err(Error::new(
@@ -3419,7 +3530,7 @@ mod tests {
             phase: SessionPhase::Unknown,
             thread_id: None,
             native_scope: String::new(),
-            requested_model: "test-model".to_owned(),
+            selected_model: "test-model".to_owned(),
             selected_effort: None,
             native_effort: None,
             collaboration_mode: None,
@@ -3553,5 +3664,72 @@ mod tests {
             Some("low"),
             "full collaboration settings keep the native readback, never a null clear"
         );
+    }
+
+    fn recorded_catalogue() -> Vec<crate::native::types::NativeModelEntry> {
+        // Recorded `model/list` shape: ids repeat in `id` and `model`, one
+        // entry carries `isDefault`, each names its default effort and the
+        // efforts it supports.
+        let page = serde_json::json!({
+            "data": [
+                {
+                    "id": "gpt-6-luna",
+                    "model": "gpt-6-luna",
+                    "displayName": "Luna",
+                    "description": "recorded",
+                    "hidden": false,
+                    "isDefault": true,
+                    "defaultReasoningEffort": "medium",
+                    "supportedReasoningEfforts": [
+                        {"description": "recorded", "reasoningEffort": "low"},
+                        {"description": "recorded", "reasoningEffort": "medium"},
+                        {"description": "recorded", "reasoningEffort": "high"}
+                    ]
+                },
+                {
+                    "id": "gpt-6-mini",
+                    "model": "gpt-6-mini",
+                    "displayName": "Mini",
+                    "description": "recorded",
+                    "hidden": false,
+                    "isDefault": false,
+                    "defaultReasoningEffort": "low",
+                    "supportedReasoningEfforts": [
+                        {"description": "recorded", "reasoningEffort": "low"}
+                    ]
+                }
+            ]
+        });
+        let response: crate::native::types::NativeModelListResponse =
+            serde_json::from_value(page).expect("recorded model/list decodes");
+        response.data
+    }
+
+    #[test]
+    fn absent_model_selects_the_native_default_without_substitution() {
+        let entries = recorded_catalogue();
+        let selected = super::select_launch_model(&entries, None).expect("default selected");
+        assert_eq!(selected.id, "gpt-6-luna");
+        assert_eq!(selected.default_reasoning_effort, "medium");
+    }
+
+    #[test]
+    fn explicit_model_matches_exactly_and_unavailable_fails_without_substitution() {
+        let entries = recorded_catalogue();
+        let selected =
+            super::select_launch_model(&entries, Some("gpt-6-mini")).expect("exact match");
+        assert_eq!(selected.id, "gpt-6-mini");
+        assert!(!selected.is_default);
+        let error = super::select_launch_model(&entries, Some("gpt-9-ghost")).unwrap_err();
+        assert_eq!(error.code, "profile_error");
+    }
+
+    #[test]
+    fn empty_catalogue_names_no_default_and_fails_honestly() {
+        // The installed Muse 1.4.20 shape: an empty catalogue serves no
+        // default to fall back to, so an omitted request fails instead of
+        // substituting another model.
+        let error = super::select_launch_model(&[], None).unwrap_err();
+        assert_eq!(error.code, "profile_error");
     }
 }

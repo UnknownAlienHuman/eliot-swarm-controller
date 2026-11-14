@@ -864,7 +864,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
             tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS completion_digests (
+                "CREATE TABLE completion_digests (
                      id TEXT PRIMARY KEY,
                      parent INTEGER NOT NULL REFERENCES agents(id),
                      mode TEXT NOT NULL CHECK(mode IN ('all', 'any')),
@@ -877,7 +877,7 @@ impl Store {
                      payload_digest BLOB NOT NULL,
                      hidden TEXT NOT NULL
                  );
-                 CREATE INDEX IF NOT EXISTS completion_digests_pending
+                 CREATE INDEX completion_digests_pending
                      ON completion_digests(delivered_at, created_at);
                  INSERT INTO schema_migrations(version) VALUES (37);",
             )

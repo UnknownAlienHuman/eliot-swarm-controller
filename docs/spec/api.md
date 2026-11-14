@@ -84,11 +84,15 @@ fail with `not_allowed`. Each tool call still uses the existing local client and
 which validates the Agent credential and current generation. `--require-agent --http` is a
 usage error; ordinary Owner MCP stdio and StreamableHTTP behavior are unchanged.
 
-The caller supplies and retains the mutation ULID in `params` before a write. A retry
-must carry the same id, principal, method and semantic payload; a different binding is
-`id_conflict`, and an expired id is `id_expired`. Unknown outcomes keep the existing exact
-readback/resolution contract. The server does not mint or rewrite ids, automatically
-retry uncertain calls, or treat cancellation as rollback.
+A mutation call may omit `params.id`: the MCP server mints one fresh ULID for that
+call, forwards it, and returns it as top-level `id` in the tool result, so the caller
+retains it for exact retry. An explicit id is forwarded untouched and still validated
+by the daemon. A retry must carry the same id, principal, method and semantic payload;
+a different binding is `id_conflict`, and an expired id is `id_expired`. Unknown outcomes
+keep the existing exact readback/resolution contract. The server never automatically
+retries uncertain calls and never treats cancellation as rollback. Id admission errors
+(`invalid` shape, `id_expired`, future-skew `invalid`) name `params.id` with the ULID
+format and the retry window, matching the DTO field errors.
 
 The stdio transport MUST bound each frame to [`MAX_RPC_FRAME_BYTES`](../../crates/eliot-daemon/src/daemon.rs)
 (4 MiB) using [`BoundedLineWriter`](../../crates/eliot/src/mcp/bounded_io.rs). Forwarded RPC data and list/history
@@ -172,7 +176,9 @@ implements it.
 
 ## Mutation ids
 
-External writes carry a ULID generated/printed before send. Bind it to principal,
+External writes carry a ULID generated/printed before send, except that MCP callers
+may omit `params.id` and the MCP server mints and returns one per the
+[MCP stdio server](#mcp-stdio-server) contract. Bind the id to principal,
 method and canonical semantic payload. Exclude JSON-RPC id, output format, paging and
 wait timeout. Same binding returns the retained result; different binding is
 `id_conflict`; absent expired id is `id_expired`. A ULID more than the allowed
@@ -265,7 +271,8 @@ the summary, example, mutation rules, scope/capability limits and CLI aliases. C
 are not RPC names. Every registered Router method has a descriptor. Help is capped at
 256 KiB; it never includes credentials or another principal's identity. Examples naming
 existing resources require actual retained IDs/profile/source/view; new writes require
-a fresh caller-retained mutation ULID rather than reusing the illustrative example ID.
+a fresh caller-retained mutation ULID rather than reusing the illustrative example ID,
+or omit `id` on MCP so the server mints one.
 
 `api.identity` returns the authenticated principal kind, Agent id/generation when present,
 and its allowed scope patterns. An Agent's variable scope defaults to its actual project;
@@ -592,8 +599,18 @@ Worktree creation is opt-in on the same launch command:
 
 ```text
 command.submit {id, verb:"launch",
-  args:{profile?:NAME, workspace, worktree?:BRANCH, base?:REF, parent?:AGENT, text?}}
+  args:{profile?:NAME, harness?:HARNESS, model?:MODEL, effort?:EFFORT,
+        workspace, worktree?:BRANCH, base?:REF, parent?:AGENT, text?}}
 ```
+
+A parentless Owner launch names either a stored `profile` or an ad-hoc
+`harness` (mutually exclusive); `model`/`effort` are ad-hoc only and require
+`harness`. Ad-hoc launch is Owner-only and freezes a profile-equivalent
+snapshot from built-in safe defaults plus flags (see
+[configuration](configuration.md#ad-hoc-owner-launch-no-stored-profile));
+Agent principals keep the profile and `child_profiles` rules and cannot
+ad-hoc launch. Same-ID retries bind the exact requested payload: a changed
+ad-hoc model is `id_conflict`, while the frozen snapshot stays replay-stable.
 
 Without `worktree`, `workspace` remains the existing execution directory. With it,
 `workspace` names the source repository; the daemon chooses the managed destination.
@@ -893,6 +910,13 @@ restores revoked control; unknown blocks another takeover.
 
 `agent.discover` uses `AgentDiscoverRequest`/`DiscoverPage`; `agent.history` uses
 `AgentHistoryRequest`/`ObservationPage` from the canonical native metadata DTOs.
+`harness.list` (`HarnessListRequest`/`HarnessListResponse`, no params) reports
+per-harness installation facts (installed, resolved `cmd`, `--version`);
+`harness.models` (`HarnessModelsRequest`/`HarnessModelsResponse`) returns the
+harness's own read-only catalogue (Codex/Muse native `model/list`, the OpenCode
+provider/model list; Claude reports aliases plus the CLI default, Antigravity
+reports no catalogue). Both are owner-only, read-only, and start no model turn
+and no inference (`swarm harnesses`, `swarm models --harness H`).
 `profile` and `id` are required nonempty strings. Present strings are checked for
 nonemptiness after trimming but are preserved as supplied. For `agent.discover`, optional
 `harness`, `native_scope` and `cursor` may be omitted or `null` to mean absent. For

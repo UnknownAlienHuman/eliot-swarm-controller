@@ -69,6 +69,16 @@ const METHODS: &[Method] = &[
     method!("command.resolve", CommandResolveRequest, CommandResolveResponse, true, true, "Record an owner resolution of an uncertain command; never replay its effect.", {"id":EXAMPLE_ID,"command_id":"previous-command","as":"failed","reason":"Owner verified failure."}),
     method!("agent.get", AgentGetRequest, AgentGetResponse, false, false, "Read Agent state, native capabilities and source health.", {"id":"a1"}),
     method!("agent.discover", AgentDiscoverRequest, DiscoverPage, true, false, "Discover native metadata through an installed profile without creating Agents.", {"profile":"codex","limit":20}),
+    method!(
+        "harness.list",
+        HarnessListRequest,
+        HarnessListResponse,
+        true,
+        false,
+        "List installed harness executables with versions; starts no model turn and performs no inference.",
+        {}
+    ),
+    method!("harness.models", HarnessModelsRequest, HarnessModelsResponse, true, false, "Read a harness native model catalogue through its own read-only method; starts no model turn and performs no inference.", {"harness":"codex"}),
     method!("agent.history", AgentHistoryRequest, ObservationPage, true, false, "Read a bounded native history view advertised by agent.get.", {"id":"a1","source":"native","view":"turns","limit":20}),
     method!("agent.list", AgentListRequest, AgentListResponse, false, false, "List scoped compact Agent summaries with indexed state/project/harness/parent/root filters, counts and explicit truncation.", {"limit":20,"state":"busy"}),
     method!("agent.result", AgentResultRequest, AgentResultResponse, false, false, "Read retained turns/results for one Agent.", {"id":"a1","limit":20}),
@@ -277,7 +287,7 @@ impl Router {
             cli_aliases:aliases.iter().map(|s| (*s).to_owned()).collect(),
             request_schema:(method.input)(), response_schema:(method.output)(),
             example:json!({"method":method.name,"params":example}),
-            mutation_id:if method.mutation { "Supply a fresh caller-retained ULID in id before the first write. Retry only with that same id, principal, method and identical semantic payload. Never mint another id after an uncertain outcome; read back the retained result. The example id is illustrative; replace it for a new write." } else { "Read-only; no mutation id is required." }.to_owned(),
+            mutation_id:if method.mutation { "id is optional on MCP: omit it and the server mints a ULID and returns it in the reply; retry with that same id. Otherwise supply a fresh caller-retained ULID in id before the first write. Retry only with that same id, principal, method and identical semantic payload. Never mint another id after an uncertain outcome; read back the retained result. The example id is illustrative; replace it for a new write." } else { "Read-only; no mutation id is required." }.to_owned(),
             scopes, limits:format!("{} Responses retain their DTO pagination and daemon 4 MiB frame bounds; one help result is at most 256 KiB. Examples for existing resources require their actual retained ids/profile/source/view.", method_limits(method.name)), unsupported,
         })
     }
@@ -450,6 +460,31 @@ mod tests {
             assert!((method.output)().is_object());
         }
         assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn audit_390_mutation_help_states_the_mcp_omission_rule() {
+        let router = super::super::tests::router();
+        for method in METHODS.iter().filter(|m| m.mutation) {
+            let help = router
+                .method_help(&json!({"method": method.name}), &Principal::Owner)
+                .await
+                .unwrap();
+            let text = help["mutation_id"].as_str().expect("mutation help text");
+            assert!(
+                text.contains("omit") && text.contains("retry with that same id"),
+                "{} must state the MCP omission and retry rule",
+                method.name
+            );
+        }
+        let help = router
+            .method_help(&json!({"method": "var.get"}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            help["mutation_id"],
+            json!("Read-only; no mutation id is required.")
+        );
     }
 
     #[test]

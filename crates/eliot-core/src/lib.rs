@@ -1077,6 +1077,17 @@ impl Error {
         Self::new("invalid", "invalid parameters").with_field(field, expected)
     }
 
+    /// Mutation-id format rejection shared by Store admission and the Router
+    /// `goal.round` pre-check. It names `params.id` with the ULID format and
+    /// the MCP omission rule, so a fresh agent learns the retry contract
+    /// instead of hand-minting ids.
+    pub fn invalid_mutation_id() -> Self {
+        Self::new("invalid", "mutation id must be a ULID").with_field(
+            "params.id",
+            "ULID (26 uppercase Crockford base32 characters); omit id on MCP and the server mints one, or mint a fresh ULID for a new write",
+        )
+    }
+
     pub fn with_field(mut self, field: impl Into<String>, expected: impl Into<String>) -> Self {
         let field: String = field.into().chars().take(256).collect();
         let expected: String = expected.into().chars().take(512).collect();
@@ -1385,8 +1396,11 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
         }
         "turn.unknown" => {
             // Live-host projection loss with failed view recovery: settle only
-            // the active turn unknown, keep the session alive for a later
-            // send/stop. Never a success or failure outcome.
+            // the active turn unknown. The host stays alive for stop/readback
+            // and owner resolution, but the uncertain turn still fences the
+            // next turn: a later send queues behind the unknown-turn gate
+            // until the turn is explicitly resolved. Never a success or
+            // failure outcome.
             require_live_turn(agent, event)?;
             let command_id = required_text(event, "command_id")?;
             let turn_id = required_text(event, "turn_id")?;
