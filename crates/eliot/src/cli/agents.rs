@@ -1,9 +1,9 @@
 //! Agent lifecycle and coordination writes.
 use super::args::{
     AnswerArgs, ApproveArgs, AttachArgs, ConfigureArgs, DenyArgs, DetachArgs, DiscoverArgs,
-    GenerationArgs, InjectCliArgs, InterruptArgs, LaunchArgs, PageArgs, ReadGenerationArgs,
-    ResumeArgs, SendArgs, SteerArgs, StopArgs, WaitArgs, WorktreeArgs, WorktreeCommand,
-    WorktreeRemoveArgs,
+    GenerationArgs, InjectCliArgs, InterruptArgs, LaunchArgs, ModelsArgs, PageArgs,
+    ReadGenerationArgs, ResumeArgs, SendArgs, SteerArgs, StopArgs, WaitArgs, WorktreeArgs,
+    WorktreeCommand, WorktreeRemoveArgs,
 };
 use super::support::read_and_print;
 use super::support::{
@@ -13,7 +13,8 @@ use super::support::{
     wait_for_command, wait_for_linked_turn, wait_for_turn,
 };
 use eliot_core::api::{
-    AgentDiscoverRequest, AgentGetRequest, AgentGetResponse, DiscoverPage, MAX_SWARM_WAIT_TARGETS,
+    AgentDiscoverRequest, AgentGetRequest, AgentGetResponse, DiscoverPage, HarnessListRequest,
+    HarnessListResponse, HarnessModelsRequest, HarnessModelsResponse, MAX_SWARM_WAIT_TARGETS,
     SwarmWaitRequest, SwarmWaitResponse, WaitTurnRef,
 };
 use eliot_core::{InjectArgs, InjectPoint, SubmitCommand};
@@ -55,6 +56,33 @@ pub(crate) async fn run_discover(
     )
 }
 
+pub(crate) async fn run_harnesses(data_dir: PathBuf, json_output: bool) -> Result<u8, Failure> {
+    read_and_print!(
+        &data_dir,
+        json_output,
+        "harness.list",
+        HarnessListRequest {},
+        HarnessListResponse
+    )
+}
+
+pub(crate) async fn run_models(
+    ModelsArgs { harness }: ModelsArgs,
+    data_dir: PathBuf,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    if harness.trim().is_empty() {
+        return Err(Failure::new(2, "--harness must not be empty"));
+    }
+    read_and_print!(
+        &data_dir,
+        json_output,
+        "harness.models",
+        HarnessModelsRequest { harness },
+        HarnessModelsResponse
+    )
+}
+
 pub(crate) async fn run_attach(
     AttachArgs {
         profile,
@@ -84,6 +112,9 @@ pub(crate) async fn run_attach(
 pub(crate) async fn run_launch(
     LaunchArgs {
         profile,
+        harness,
+        model,
+        effort,
         workspace,
         worktree,
         base,
@@ -101,10 +132,31 @@ pub(crate) async fn run_launch(
     {
         return Err(Failure::new(2, "--profile must not be empty"));
     }
-    if profile.is_none() && parent.is_none() {
+    if let Some(name) = &harness
+        && name.trim().is_empty()
+    {
+        return Err(Failure::new(2, "--harness must not be empty"));
+    }
+    if harness.is_some() && parent.is_some() {
+        return Err(Failure::new(2, "ad-hoc launch cannot have a parent"));
+    }
+    if harness.is_none() {
+        if model.is_some() || effort.is_some() {
+            return Err(Failure::new(2, "--model/--effort require --harness"));
+        }
+    } else if let Some(name) = &model
+        && name.trim().is_empty()
+    {
+        return Err(Failure::new(2, "--model must not be empty"));
+    } else if let Some(name) = &effort
+        && name.trim().is_empty()
+    {
+        return Err(Failure::new(2, "--effort must not be empty"));
+    }
+    if profile.is_none() && harness.is_none() && parent.is_none() {
         return Err(Failure::new(
             2,
-            "--profile is required for a parentless launch",
+            "--profile or --harness is required for a parentless launch",
         ));
     }
     validate_text(prompt.as_deref())?;
@@ -114,6 +166,15 @@ pub(crate) async fn run_launch(
     });
     if let Some(profile) = profile {
         args["profile"] = Value::String(profile);
+    }
+    if let Some(harness) = harness {
+        args["harness"] = Value::String(harness);
+    }
+    if let Some(model) = model {
+        args["model"] = Value::String(model);
+    }
+    if let Some(effort) = effort {
+        args["effort"] = Value::String(effort);
     }
     if let Some(worktree) = worktree {
         args["worktree"] = Value::String(worktree);

@@ -59,13 +59,21 @@ const ELIOT_CONTEXT_PLUGIN_FILE: &str = "eliot-context.ts";
 /// credentials: the Agent runs the server defaults, and the selected native
 /// credential arrives through the pre-serve auth transfer into the isolated
 /// store, never through this document.
-fn agent_config_json(model: &str) -> String {
-    serde_json::json!({
+/// The generated per-Agent config: the frozen profile model when one was
+/// requested, otherwise no `model` key so the configured native default
+/// applies. An explicitly empty MCP set. No permissions, providers, plugins
+/// or credentials: the Agent runs the server defaults, and the selected
+/// native credential arrives through the pre-serve auth transfer into the
+/// isolated store, never through this document.
+fn agent_config_json(model: Option<&str>) -> String {
+    let mut config = serde_json::json!({
         "$schema": "https://opencode.ai/config.json",
-        "model": model,
         "mcp": {},
-    })
-    .to_string()
+    });
+    if let Some(model) = model {
+        config["model"] = serde_json::Value::String(model.to_owned());
+    }
+    config.to_string()
 }
 
 pub struct ServerLaunch {
@@ -75,7 +83,7 @@ pub struct ServerLaunch {
     pub store_root: PathBuf,
     pub agent_id: String,
     pub environment: Vec<(OsString, OsString)>,
-    pub model: String,
+    pub model: Option<String>,
     pub auth: AuthSetup,
 }
 
@@ -135,12 +143,14 @@ impl OwnedServer {
             )
         })?;
         let config_path = config_dir.join("opencode.jsonc");
-        std::fs::write(&config_path, agent_config_json(&launch.model)).map_err(|error| {
-            Error::new(
-                "native_spawn",
-                format!("OpenCode per-Agent config could not be written: {error}"),
-            )
-        })?;
+        std::fs::write(&config_path, agent_config_json(launch.model.as_deref())).map_err(
+            |error| {
+                Error::new(
+                    "native_spawn",
+                    format!("OpenCode per-Agent config could not be written: {error}"),
+                )
+            },
+        )?;
         // Vendor-native context-hook producer: one auto-discovered plugin
         // file under the isolated root, written before `serve` starts. This
         // adds nothing to `opencode.jsonc` (model/mcp/auth behavior
@@ -457,7 +467,8 @@ mod tests {
     #[test]
     fn generated_config_pins_model_and_empty_mcp() {
         let parsed: serde_json::Value =
-            serde_json::from_str(&agent_config_json("opencode/big-pickle")).expect("valid JSON");
+            serde_json::from_str(&agent_config_json(Some("opencode/big-pickle")))
+                .expect("valid JSON");
         assert_eq!(parsed["model"], "opencode/big-pickle");
         assert_eq!(parsed["mcp"], serde_json::json!({}));
         assert_eq!(
@@ -465,6 +476,16 @@ mod tests {
             3,
             "no other keys: {parsed}"
         );
+    }
+
+    #[test]
+    fn absent_model_omits_the_key_for_the_native_default() {
+        // Requested-absent: no `model` key, so the configured native default
+        // applies; the effective value is read back from the session.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&agent_config_json(None)).expect("valid JSON");
+        assert!(parsed.get("model").is_none(), "native default applies");
+        assert_eq!(parsed["mcp"], serde_json::json!({}));
     }
 
     #[test]

@@ -9,7 +9,8 @@ use crate::{
         types::{
             NativeClientInfo, NativeDiscoveryConfigReadResponse, NativeDiscoverySourceKind,
             NativeDiscoveryStatus, NativeDiscoveryThread, NativeInitializeParams,
-            NativeInitializeResponse, NativeThreadListParams, NativeThreadListResponse,
+            NativeInitializeResponse, NativeModelEntry, NativeModelListParams,
+            NativeModelListResponse, NativeThreadListParams, NativeThreadListResponse,
         },
     },
 };
@@ -190,6 +191,69 @@ pub(crate) async fn read_effective_mcp_server_names(
             metadata_secrets,
         )?;
         Ok(names)
+    }
+    .await;
+    finish_reader(&mut probe, Some(drainer)).await?;
+    let probe_result = probe_result.map_err(|error| probe.client().diagnostic_error(error));
+    drop(probe);
+    probe_result
+}
+
+/// Read-only native model catalogue: a short-lived metadata reader runs
+/// initialize, pages `model/list`, then closes. It never starts a thread,
+/// sends input, or performs inference.
+pub(crate) async fn list_models(
+    launch: NativeLaunch,
+    metadata_secrets: &[String],
+    diagnostic_secrets: &[String],
+    deadline: Instant,
+) -> Result<Vec<NativeModelEntry>> {
+    let (mut probe, drainer) = start_reader(launch, diagnostic_secrets, deadline).await?;
+    let probe_result: Result<Vec<NativeModelEntry>> = async {
+        let client = probe.client();
+        let _initialized = initialize_reader(&client, metadata_secrets, deadline).await?;
+        let mut entries: Vec<NativeModelEntry> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        for _ in 0..100usize {
+            let response = client
+                .call(
+                    "model/list",
+                    serde_json::to_value(NativeModelListParams {
+                        cursor: cursor.clone(),
+                        include_hidden: Some(true),
+                        limit: Some(100),
+                    })
+                    .map_err(|_| invalid_page())?,
+                    deadline,
+                )
+                .await
+                .map_err(|error| {
+                    contextual_error(
+                        error,
+                        "native_readback",
+                        "Codex model/list did not return a catalogue page",
+                    )
+                })?;
+            let page: NativeModelListResponse =
+                serde_json::from_value(response).map_err(|_| invalid_page())?;
+            entries.extend(page.data);
+            match page.next_cursor {
+                Some(next) if !next.is_empty() && seen_cursors.insert(next.clone()) => {
+                    cursor = Some(next);
+                }
+                Some(_) => {
+                    return Err(Error::new(
+                        "native_readback",
+                        "Codex model/list returned a repeated or invalid cursor",
+                    ));
+                }
+                None => break,
+            }
+        }
+        let value = serde_json::to_value(&entries).map_err(|_| invalid_page())?;
+        reject_secrets(&value, metadata_secrets)?;
+        Ok(entries)
     }
     .await;
     finish_reader(&mut probe, Some(drainer)).await?;

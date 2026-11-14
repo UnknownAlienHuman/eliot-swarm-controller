@@ -147,6 +147,25 @@ pub fn list_argv() -> [&'static str; 5] {
     ["auth", "list", "--format", "json", "--standalone"]
 }
 
+/// Read-only provider list for `model.list`: canonical `auth list`
+/// metadata (provider IDs + connection counts). No server, no session, no
+/// model turn and no inference. Stderr is discarded like every other
+/// helper; only nonsecret IDs/counts leave this module.
+pub async fn list_providers(program: &OsStr, deadline: Instant) -> Result<Vec<(String, usize)>> {
+    let mut command = Command::new(program);
+    command
+        .args(list_argv())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let entries = run_list(command, deadline).await?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| (entry.id, entry.connections.len()))
+        .collect())
+}
+
 /// Move the selected canonical credential into the isolated native store.
 /// On explicit resume a correctly present integration is reused without
 /// I/O beyond the isolated list; otherwise the canonical list must show

@@ -2,6 +2,7 @@ use crate::{
     events::{EventConfig, EventHandle, EventStatus, InboxRecord, SteerVerdict, TurnFacts},
     native::{
         AuthSetup, HttpOutcome, IntegrationSelector, OpenCodeHttp, OwnedServer, ServerLaunch,
+        list_providers,
         types::{InboxUser, ModelRef, SessionInfo},
     },
 };
@@ -134,8 +135,12 @@ struct ControlBinding {
 /// integration, and redaction secrets.
 struct ParsedStart {
     params: AgentStartParams,
-    requested_model: String,
-    model_ref: ModelRef,
+    /// Requested `provider/model`, or `None` when the profile omitted it and
+    /// the configured native default applies. Requested stays absent
+    /// separately from the effective readback.
+    requested_model: Option<String>,
+    /// Split model ref, present exactly when a model was requested.
+    model_ref: Option<ModelRef>,
     requested_agent: Option<String>,
     workspace: PathBuf,
     program: OsString,
@@ -299,6 +304,7 @@ impl OpenCodePlugin {
     async fn dispatch(&mut self, request: &RpcRequest, client: &PeerClient) -> Result<Value> {
         let result = match request.method.as_str() {
             "initialize" => self.initialize(&request.params),
+            "model.list" => self.model_list(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
             "agent.command" => self.command(&request.params).await,
             "agent.snapshot" => self.snapshot(&request.params).await,
@@ -387,6 +393,51 @@ impl OpenCodePlugin {
             error: error.clone(),
         });
         error
+    }
+
+    /// Read-only provider list for `harness.models`: canonical `auth list`
+    /// metadata (provider IDs). No server, no session, no model turn and no
+    /// inference. Provider entries carry no model catalogue: the configured
+    /// native default model resolves at launch and is read back from the
+    /// session.
+    async fn model_list(&self, raw: &Value) -> Result<Value> {
+        if self.session.is_some() || self.failed_start.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "OpenCode model.list requires a dedicated reader plugin instance",
+            ));
+        }
+        let profile: Value = decode(raw, "OpenCode model.list params are invalid")?;
+        let snapshot = profile.get("profile").unwrap_or(&profile);
+        if snapshot.get("harness").and_then(Value::as_str) != Some("opencode") {
+            return Err(Error::new(
+                "profile_error",
+                "OpenCode model.list received another harness",
+            ));
+        }
+        let program = snapshot
+            .get("cmd")
+            .and_then(Value::as_str)
+            .filter(|cmd| !cmd.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "profile_error",
+                    "OpenCode model.list requires a discovered native cmd",
+                )
+            })?;
+        let providers =
+            list_providers(std::ffi::OsStr::new(program), Instant::now() + RPC_TIMEOUT).await?;
+        let models: Vec<Value> = providers
+            .into_iter()
+            .map(|(provider, connections)| {
+                json!({
+                    "id": provider,
+                    "default": false,
+                    "connections": connections,
+                })
+            })
+            .collect();
+        Ok(json!({"models": models, "default": Value::Null}))
     }
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
@@ -680,7 +731,7 @@ impl OpenCodePlugin {
             .http
             .create_session(
                 &title,
-                &parsed.model_ref,
+                parsed.model_ref.as_ref(),
                 &directory,
                 Instant::now() + RPC_TIMEOUT,
             )
@@ -729,7 +780,12 @@ impl OpenCodePlugin {
             .model
             .as_ref()
             .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()));
-        let model_verified = effective_model.as_deref() == Some(parsed.requested_model.as_str());
+        // An omitted request accepts the configured native default as
+        // effective; an explicit request must match exactly.
+        let model_verified = parsed
+            .requested_model
+            .as_deref()
+            .is_none_or(|requested| effective_model.as_deref() == Some(requested));
         let location_ok = created
             .location
             .as_ref()
@@ -1114,11 +1170,14 @@ impl OpenCodePlugin {
                 "OpenCode retained session directory is not the frozen workspace",
             ));
         }
-        let model_needed = current
-            .model
-            .as_ref()
-            .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()))
-            != Some(parsed.requested_model.clone());
+        // An omitted request keeps the retained server-selected model.
+        let model_needed = parsed.requested_model.as_deref().is_some_and(|requested| {
+            current
+                .model
+                .as_ref()
+                .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()))
+                != Some(requested.to_owned())
+        });
         let agent_needed = parsed
             .requested_agent
             .as_ref()
@@ -1149,10 +1208,16 @@ impl OpenCodePlugin {
             )?;
         }
         if model_needed {
+            let model_ref = parsed.model_ref.as_ref().ok_or_else(|| {
+                Error::new(
+                    "internal",
+                    "OpenCode resume needs a model ref for its requested model",
+                )
+            })?;
             Self::resume_switch(
                 session
                     .http
-                    .switch_model(session_id, &parsed.model_ref, deadline)
+                    .switch_model(session_id, model_ref, deadline)
                     .await,
                 "model",
             )?;
@@ -1170,11 +1235,13 @@ impl OpenCodePlugin {
                     ),
                 )
             })?;
-        let model_verified = effective
-            .model
-            .as_ref()
-            .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()))
-            == Some(parsed.requested_model.clone());
+        let model_verified = parsed.requested_model.as_deref().is_none_or(|requested| {
+            effective
+                .model
+                .as_ref()
+                .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()))
+                == Some(requested.to_owned())
+        });
         let agent_verified = parsed
             .requested_agent
             .as_ref()
@@ -2315,26 +2382,26 @@ fn start_auth_selector(profile: &serde_json::Map<String, Value>) -> Result<Integ
 }
 
 /// The frozen profile model: an exact `provider/id` selection plus its
-/// native reference.
-fn start_model_ref(profile: &serde_json::Map<String, Value>) -> Result<(String, ModelRef)> {
-    let requested_model = profile
+/// native reference, or absent when the profile omitted it and the
+/// configured native default applies.
+fn start_model_ref(
+    profile: &serde_json::Map<String, Value>,
+) -> Result<(Option<String>, Option<ModelRef>)> {
+    let requested_model: Option<String> = profile
         .get("model")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            Error::new(
-                "profile_error",
-                "OpenCode profile requires an exact model id",
-            )
-        })?
-        .to_owned();
-    let model_ref = split_model(&requested_model).ok_or_else(|| {
+        .map(str::to_owned);
+    let Some(requested) = requested_model else {
+        return Ok((None, None));
+    };
+    let model_ref = split_model(&requested).ok_or_else(|| {
         Error::new(
             "profile_error",
             "OpenCode profile model must be provider/model with non-empty slash segments and no variant suffix",
         )
     })?;
-    Ok((requested_model, model_ref))
+    Ok((Some(requested), Some(model_ref)))
 }
 
 /// The frozen start paths: an existing workspace directory and the explicit
@@ -2635,7 +2702,8 @@ mod tests {
         let requested = "openrouter/stealth/crouton-alpha";
         let profile = json!({"model":requested});
         let (frozen, model) = start_model_ref(profile.as_object().unwrap()).unwrap();
-        assert_eq!(frozen, requested);
+        assert_eq!(frozen.as_deref(), Some(requested));
+        let model = model.expect("requested model splits");
         assert_eq!(model.provider_id, "openrouter");
         assert_eq!(model.id, "stealth/crouton-alpha");
         assert_eq!(model.variant, None);
@@ -2644,8 +2712,15 @@ mod tests {
             json!({"providerID":"openrouter", "id":"stealth/crouton-alpha"})
         );
         assert_eq!(format!("{}/{}", model.provider_id, model.id), requested);
+        // Omitted model defers to the configured native default: requested
+        // stays absent separately from the effective readback.
+        let absent = json!({});
+        let (frozen, model) = start_model_ref(absent.as_object().unwrap()).unwrap();
+        assert!(frozen.is_none(), "requested absent");
+        assert!(model.is_none(), "no ref without a request");
+        // Empty is absent (native default), not malformed: the daemon
+        // profile path still rejects empty models before the plugin.
         for malformed in [
-            "",
             "noprovider",
             "/model",
             "openrouter/",

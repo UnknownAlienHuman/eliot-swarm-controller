@@ -6,6 +6,7 @@ mod coordination;
 pub mod discovery;
 mod git;
 mod goals;
+pub mod harness;
 mod hierarchy;
 mod monitor_views;
 mod mutation_validation;
@@ -56,6 +57,10 @@ pub use goals::{
     GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalSetRequest,
     GoalStatus, GoalView, MAX_GOAL_CADENCE_MS, MAX_GOAL_LIMIT, MAX_GOAL_OBSERVATION_BYTES,
     MIN_GOAL_CADENCE_MS,
+};
+pub use harness::{
+    HarnessEntry, HarnessListRequest, HarnessListResponse, HarnessModelEntry, HarnessModelsRequest,
+    HarnessModelsResponse,
 };
 pub use hierarchy::{
     DEFAULT_MAX_CHILDREN_PER_AGENT, DEFAULT_MAX_DEPTH, DEFAULT_MAX_SELECTOR_TARGETS,
