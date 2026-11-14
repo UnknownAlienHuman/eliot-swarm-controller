@@ -1363,7 +1363,10 @@ failure rather than only the linked cancellation.
 Only current-layer commands appear in help and Agent guidance. Exit codes: 0 success/
 queued; 1 definite failure; 2 usage; 3 pre-effect rejection; 4 unknown; 5 wait timeout;
 6 still dispatched/pending; 7 interrupted/cancelled. A queued/applied input is not
-successful task completion.
+successful task completion. Every mutation prints its generated command id as `id=...`
+on stderr so stdout stays pure response JSON; Windows PowerShell 5.1 turns that stderr
+line into an error record when merged with `2>&1`, so callers must read the raw process
+exit code (`$LASTEXITCODE` / `%ERRORLEVEL%`) rather than `$?`.
 
 `steer` and `interrupt` do not require `--generation`/`--turn`. When either flag
 is omitted the CLI reads the Agent's current generation and active turn, prints
