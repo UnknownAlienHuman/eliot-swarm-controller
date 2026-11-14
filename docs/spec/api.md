@@ -238,7 +238,9 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `command.resolve`, `turn.resolve` | constrained owner resolution of unknown outcomes; owner-only |
 | `command.children` | implemented scoped, paged child readback for a retained expansion |
 | `project.list/get` | owner-only read of registered project authority |
-| `rule.get/catch_up` | owner-only rule read and finite committed-history catch-up |
+| `rule.list/get/catch_up` | owner-only paged rule list (state, timer state, canonical definition), one rule read, and finite committed-history catch-up |
+| `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
+| `config.profiles.read/save` | owner-only read and validated, revision-guarded replacement of the `[profiles.*]` sections of `config.toml` |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
 | `goal.set/get/pause/clear/resume/round` | owner-only Eliot-mode Goal with explicit and automatic idle rounds plus explicit cadence slot rounds; automatic driving needs `max_turns` or `max_rounds`, native mode and cost limits are `unsupported` |
 | `provider.holds/clear_hold` | owner-only provider hold readback and constrained correction |
@@ -247,7 +249,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `agent.history` | owner-only bounded history of an exact observed subject |
 | `mail.send/inbox/read/ack`, `var.set/get` | addressed queued mail with separate acknowledgement, shared variables with CAS |
 | `who`, `claim.set/list/release` | current-worker file areas plus advisory claims with coalesced conflict notices |
-| `rule.*` except `rule.get/catch_up` | later automation; effects remain commands |
+| `rule.*` except `rule.list/get/catch_up` | later automation; effects remain commands; no rule or timer pause/resume operation exists |
 
 Canonical public wire types are re-exported by
 [`eliot_core::api`](../../crates/eliot-core/src/api.rs). These DTOs and their validators
@@ -957,6 +959,24 @@ read-only, deduplicated per account through the same bounded per-scope cache,
 and start no model turn and no inference
 (`swarm harnesses`, `swarm models --harness H [--profile P]`,
 `swarm quota --harness H [--profile P]`).
+`profile.list` (`ProfileListRequest`/`ProfileListResponse`, no params) returns the
+current `config.toml` revision, whether it parses, and per profile the name,
+harness, requested model/effort (absent = native default), permissions,
+approval policy, control, proxy/account names, `max_live`, `child_profiles`
+and whether launch-time resolution succeeds now (`launchable`, else `error`).
+It reads no environment value, and a profile whose summary would carry a value
+known to the daemon's secret policy is omitted from the list; parse diagnostics
+are redacted with that policy before they enter the reply. `config.profiles.read`
+and `config.profiles.save` follow [configuration](configuration.md#profile-editing).
+`rule.list` (`RuleListRequest`/`RuleListResponse`) pages one rule namespace
+(global, or `project`) by rule id with `after`/`limit`; each entry carries the
+stored `RuleStateView`, its `TimerStateView` when the rule is a timer, and the
+canonical stored definition (`on`, `do`, `limit`, `catch_up`). Entries whose
+stored state, timer state or definition carry a value known to the daemon's
+secret policy (keys included) are withheld, and `next` names the last returned
+id. Like `agent.list`, every nonempty page sets `next` to its last id and the
+caller continues until an empty page; a page shortened by the byte budget never
+hides later rules. It changes nothing.
 `profile` and `id` are required nonempty strings. Present strings are checked for
 nonemptiness after trimming but are preserved as supplied. For `agent.discover`, optional
 `harness`, `native_scope` and `cursor` may be omitted or `null` to mean absent. For

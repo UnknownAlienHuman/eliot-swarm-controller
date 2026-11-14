@@ -14,8 +14,11 @@ use eliot_core::api::{
     AgentGetRequest, AgentGetResponse, AgentListRequest, AgentListResponse, AgentResultRequest,
     AgentResultResponse, CommandGetRequest, CommandSubmitRequest, CommandSubmitResponse,
     EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
-    EventsSubscribeRequest, EventsSubscribeResponse, ProjectRegistrationView, UsageSummaryRequest,
-    UsageSummaryResponse, discovery::ProjectListRequest,
+    EventsSubscribeRequest, EventsSubscribeResponse, HarnessModelsRequest, HarnessModelsResponse,
+    ProfileListRequest, ProfileListResponse, ProfilesReadRequest, ProfilesReadResponse,
+    ProfilesSaveRequest, ProfilesSaveResponse, ProjectRegistrationView, RuleListEntry,
+    RuleListRequest, RuleListResponse, UsageSummaryRequest, UsageSummaryResponse,
+    discovery::ProjectListRequest,
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -290,27 +293,56 @@ pub async fn read_command(data_dir: &Path, id: &str) -> Result<Command> {
     Ok(command)
 }
 
+/// What a launch freezes: a stored profile, or the Owner ad-hoc snapshot
+/// of one harness with optional model/effort (absent = native default).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchTarget {
+    Profile(String),
+    Adhoc {
+        harness: String,
+        model: Option<String>,
+        effort: Option<String>,
+    },
+}
+
 /// First prompt as one submission: nonblank text rides the launch admission
-/// and the linked `<id>/send` command must appear in the reply.
+/// and the linked `<id>/send` command must appear in the reply. Overrides
+/// exist only on the ad-hoc path, which the daemon validates; a profile
+/// launch freezes the profile as configured.
 pub async fn submit_launch(
     data_dir: &Path,
     mutation_id: String,
-    profile: Option<String>,
+    target: LaunchTarget,
     workspace: &str,
     text: Option<String>,
 ) -> Result<CommandSubmitResponse> {
-    if profile.as_deref().is_none_or(|profile| profile.is_empty()) {
-        return Err(Error::new(
-            "invalid",
-            "a profile is required for a parentless launch",
-        ));
-    }
     if let Some(text) = text.as_deref() {
         check_text(text)?;
     }
     let mut args = serde_json::json!({ "workspace": workspace });
-    if let Some(profile) = profile {
-        args["profile"] = Value::String(profile);
+    match target {
+        LaunchTarget::Profile(profile) if !profile.trim().is_empty() => {
+            args["profile"] = Value::String(profile);
+        }
+        LaunchTarget::Profile(_) => {
+            return Err(Error::new(
+                "invalid",
+                "a profile is required for a profile launch",
+            ));
+        }
+        LaunchTarget::Adhoc {
+            harness,
+            model,
+            effort,
+        } => {
+            args["harness"] = Value::String(harness);
+            if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
+                args["model"] = Value::String(model);
+            }
+            if let Some(effort) = effort.filter(|effort| !effort.trim().is_empty()) {
+                args["effort"] = Value::String(effort);
+            }
+        }
     }
     if let Some(text) = text {
         args["text"] = Value::String(text);
@@ -320,6 +352,123 @@ pub async fn submit_launch(
         &submit_request(mutation_id, None, "launch", args)?,
     )
     .await
+}
+
+/// Mid-run model/effort overlay for the next turn of exactly the generation
+/// shown at click time; the daemon refuses harnesses without a verified
+/// per-turn mechanism.
+pub async fn submit_configure(
+    data_dir: &Path,
+    mutation_id: String,
+    agent: &str,
+    generation: i64,
+    model: Option<String>,
+    effort: Option<String>,
+) -> Result<CommandSubmitResponse> {
+    let mut args = serde_json::Map::new();
+    if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
+        args.insert("model".to_owned(), Value::String(model));
+    }
+    if let Some(effort) = effort.filter(|effort| !effort.trim().is_empty()) {
+        args.insert("effort".to_owned(), Value::String(effort));
+    }
+    if args.is_empty() {
+        return Err(Error::new(
+            "invalid",
+            "configure needs a model or an effort",
+        ));
+    }
+    let mut request = submit_request(
+        mutation_id,
+        Some(agent.to_owned()),
+        "configure",
+        Value::Object(args),
+    )?;
+    request.expected_generation = Some(generation);
+    submit(data_dir, &request).await
+}
+
+/// Sanitized configured-profile summaries for the launch picker.
+pub async fn list_profiles(data_dir: &Path) -> Result<ProfileListResponse> {
+    let params = ProfileListRequest {};
+    params.validate()?;
+    let reply: ProfileListResponse =
+        eliot_daemon::client_call_typed(data_dir, "profile.list", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// The `[profiles.*]` source text and the file revision.
+pub async fn read_profiles_source(data_dir: &Path) -> Result<ProfilesReadResponse> {
+    let params = ProfilesReadRequest {};
+    params.validate()?;
+    let reply: ProfilesReadResponse =
+        eliot_daemon::client_call_typed(data_dir, "config.profiles.read", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// Validate (dry run) or save the profile draft from `expected_revision`.
+pub async fn save_profiles(
+    data_dir: &Path,
+    expected_revision: Option<String>,
+    source: String,
+    dry_run: bool,
+) -> Result<ProfilesSaveResponse> {
+    let params = ProfilesSaveRequest {
+        expected_revision,
+        source,
+        dry_run,
+    };
+    params.validate()?;
+    let reply: ProfilesSaveResponse =
+        eliot_daemon::client_call_typed(data_dir, "config.profiles.save", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// Rules of one namespace (global when `project` is absent), paging until
+/// an empty page, at most `RULE_PAGES` pages; `true` when more remain.
+pub async fn list_rules(
+    data_dir: &Path,
+    project: Option<String>,
+) -> Result<(Vec<RuleListEntry>, bool)> {
+    const RULE_PAGES: usize = 5;
+    let mut rules = Vec::new();
+    let mut after = None;
+    for _ in 0..RULE_PAGES {
+        let params = RuleListRequest {
+            project: project.clone(),
+            after: after.clone(),
+            limit: 200,
+        };
+        params.validate()?;
+        let reply: RuleListResponse =
+            eliot_daemon::client_call_typed(data_dir, "rule.list", &params).await?;
+        params.validate_response(&reply)?;
+        if reply.rules.is_empty() {
+            return Ok((rules, false));
+        }
+        after = reply.next.clone();
+        rules.extend(reply.rules);
+        if after.is_none() {
+            return Ok((rules, false));
+        }
+    }
+    Ok((rules, true))
+}
+
+/// The harness catalogue with its default model/effort.
+pub async fn harness_models(data_dir: &Path, harness: &str) -> Result<HarnessModelsResponse> {
+    let params = HarnessModelsRequest {
+        harness: harness.to_owned(),
+        profile: None,
+    };
+    params.validate()?;
+    let reply: HarnessModelsResponse =
+        eliot_daemon::client_call_typed(data_dir, "harness.models", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
 }
 
 /// Follow-up input to an existing Agent: plain SEND admission, no turn

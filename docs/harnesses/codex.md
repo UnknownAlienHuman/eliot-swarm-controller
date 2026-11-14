@@ -138,7 +138,13 @@ plus the explicitly allowed servers:
   enabled; the ChatGPT-backed Apps runtime (`codex_apps`, likewise absent
   from `mcp_servers`) gets a synthetic transport-carrying disable with a
   nonexistent command alongside `enabled=false`. An explicit `mcp_allow`
-  entry for a plugin-backed server or `codex_apps` keeps it enabled.
+  entry for a plugin-backed server or `codex_apps` keeps it enabled. The
+  MCP policy pins no prompt-surface flags: `include_*`
+  instruction/environment text, `agents.enabled` / `features.multi_agent`
+  (subagents), `web_search` and the other `features.*` were measured (see
+  below) but are deliberately not applied — `mcp = "minimal"` is a
+  tool-surface policy and must not silently change worker capabilities or
+  safety context.
 - After `thread/start` (or `thread/resume`) and before any input, the
   installed `mcpServerStatus/list` inventory is read back scoped to the
   owned thread (`threadId`; names only, secret-checked) and reported as
@@ -146,11 +152,20 @@ plus the explicitly allowed servers:
   required: the installed 0.167.1 schema reports per-thread runtime state,
   and without a loaded thread every entry's status is unavailable, so a
   pre-thread read cannot prove the isolated surface. `minimal` fails closed
-  when the visible surface cannot be verified, shows an enabled non-allowed
-  server, or omits the Agent-scoped server (an empty inventory or a
-  disabled own entry proves nothing); the empty thread is retained like
-  any stopped Agent's thread and never receives input. `inherit` performs
-  no inventory readback and reports `null` / unverified.
+  when the visible surface cannot be verified, shows a serving unexpected
+  server (`connected`, or a missing/null status), shows an unexpected server
+  from the enumerated config surface in any non-disabled state, or omits
+  the Agent-scoped server (an empty inventory or a disabled own entry proves
+  nothing); the empty thread is retained like any stopped Agent's thread
+  and never receives input. `inherit` performs no inventory readback and
+  reports `null` / unverified. There is no tolerance for unexpected
+  servers: the synthetic `codex_apps` disable makes the Apps runtime report
+  `disabled` (absent from the inventory like any disabled entry), the
+  suppressed bundled plugins leave the inventory the same way, and any
+  other unexpected server in any non-disabled state fails the start closed
+  — including a newly added owner server that is still starting — as does
+  any unexpected server that is serving (`connected`, or a missing/null
+  status).
 
 Requested vs observed: `requested` carries `mcp_policy` and `mcp_allow`;
 `effective` carries `mcp_policy`, `mcp_servers` (native-readback names, or
@@ -185,6 +200,61 @@ reports `disabled`; the command can never run). `mcpServerStatus/list`
 exists in the app-server protocol (v2 schema: `{data: [{name,
 runtimeStatus, ...}], nextCursor}`). The owner's global config is never
 edited and `auth.json` is never copied.
+
+### Minimal-context measurement (2026-11-14)
+
+Same trivial prompt (`Reply with exactly 42 and nothing else.`), model
+`gpt-6.1-sol`, effort `low`, per-turn `input_tokens` from the
+`thread/tokenUsage/updated` readback (turn expenditure = latest `total`
+minus the turn-start baseline; single-response turns report `last == total`).
+Single samples; prompt caching varied between runs (`input_tokens` counts
+cached tokens too) and the owner surface below is one machine's, so treat
+deltas as indicative, not budgets.
+
+Owner surface at the time: 106 effective config keys, 6 `mcp_servers`
+(`node_repl`, `github_oauth`, `cloudflare-api`, `eliot-research-remote`,
+`eliot_swarm`, `eliot-search`), 17 enabled `plugins`, 18 installed ChatGPT
+account apps (17 enabled), `features.multi_agent/memories` on, all
+`include_*` instruction flags on, `project_doc_max_bytes = 32768`.
+
+| Variant | `input_tokens` | Δ vs baseline |
+| --- | --- | --- |
+| (a) `inherit` via Swarm daemon | 27,060 | — baseline |
+| (a′) same prompt, raw app-server (no Eliot tool) | 26,971 | −89 (Eliot's own `swarm` tool schema) |
+| 6 MCP servers disabled only, raw probe | 26,840 | −131 |
+| 17 plugins disabled only, raw probe (all enumerated plugins) | 25,151 | −1,820 |
+| (b) `minimal` via Swarm daemon after this change | 25,046 | −2,014 (MCP servers + 3 bundled plugins + synthetic `codex_apps` disable) |
+| Prompt-surface flags only, experimental (5× `include_*=false`, `web_search="disabled"`) | 24,150 | −2,821, not applied by the policy |
+| Agent/feature flags only, experimental (`agents.enabled=false`, 5× `features.*=false`) | 20,808 | −6,163, not applied by the policy |
+| (c) all of the above combined, experimental (35 `-c` overrides) | 15,386 | −11,585 (−43%), not applied by the policy |
+
+The (c) rows were measured with experimental per-run `-c` overrides through
+a raw app-server probe and are deliberately not applied: hiding
+`include_permissions_instructions` / `include_environment_context` removes
+sandbox, approval and cwd rules from the model, and
+`agents.enabled=false` / `features.multi_agent=false` (plus `web_search`
+and the other `features.*`) remove capabilities the owner relies on. An MCP
+policy must not make those calls.
+
+Before the plugin/Apps suppression (#471), `minimal` could not start on
+this surface at all: the thread inventory always shows the `codex_apps`
+account-connector aggregator (568 tools, perpetually `starting`) plus the
+plugin-contributed `cua_repl` (`connected`), so verification failed closed
+with `plugin_outcome_unknown` (`profile_error`: unexpected enabled
+server). Asking the model for its `adobe.*` tools returns NONE with and
+without the strip, so `codex_apps` contributes zero model-side tokens. The
+runtime inventory also explains the 2.2 MB readback that sized the 8 MiB
+frame cap: disabled servers report `tools: 0`, while every listed server
+embeds its full tool catalogs, dominated by the `codex_apps` entry.
+
+Live proof on the merged code, private daemon (debug build of the merge):
+trivial prompt under `minimal` returns `42` with 25,046 input tokens and
+`effective.mcp_servers = ["eliot_swarm_<own>"]` (the synthetic disable
+makes `codex_apps` report `disabled`, so it is absent like any disabled
+entry), `mcp_servers_verified = true`; a real small coding task under
+`minimal` (`Create hello.txt containing exactly hello without a newline`,
+workspace-write) succeeds with the single Agent-scoped `eliot_swarm`
+server present and verified, producing exactly `hello` with no newline.
 
 Native frame budget: the inbound NDJSON frame cap for the Codex host is 8 MiB
 (`CodexStdioConfig::MAX_FRAME_BYTES`; every other adapter except Muse keeps

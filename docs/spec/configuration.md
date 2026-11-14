@@ -238,10 +238,18 @@ load, and a non-empty allow list requires `minimal`.
 `inherit` keeps the current behavior: the worker receives Eliot's
 Agent-scoped server in addition to the owner's native MCP surface.
 `minimal` starts only the intended MCP surface: Eliot's Agent-scoped server
-plus the explicitly allowed native servers. Eliot's scoped
-`swarm mcp --require-agent` server is always present in both policies, and
-no policy edits the owner's global native config, copies `auth.json`, or
-changes native-store/observer bindings.
+plus the explicitly allowed native servers, with every other enumerated
+`mcp_servers` entry disabled through transport-carrying per-run `-c`
+overrides, the known MCP-serving bundled plugins (`computer-use`,
+`unified-computer-use`, `codex-app-tools`) disabled when present and
+enabled, and the ChatGPT-backed Apps runtime (`codex_apps`) suppressed by
+a synthetic transport-carrying disable. An explicit `mcp_allow` entry for a
+plugin-backed server, plugin, or `codex_apps` keeps it enabled. No
+prompt-surface flags are pinned: the policy is a tool-surface policy and
+must not silently change worker capabilities or safety context. Eliot's
+scoped `swarm mcp --require-agent` server is always present in both
+policies, and no policy edits the owner's global native config, copies
+`auth.json`, or changes native-store/observer bindings.
 
 Only the Codex and Claude harnesses implement `minimal`, each with its
 installed isolation mechanism; Muse, OpenCode and Antigravity keep
@@ -254,7 +262,11 @@ because it requires `minimal`). See the owning harness pages. Requested vs
 observed: the
 effective server set is reported from native readback only where the harness
 supports it (`mcp_servers` with `mcp_servers_verified`); otherwise it stays
-unknown (`null` / unverified), never an echo of the requested set.
+unknown (`null` / unverified), never an echo of the requested set. Codex
+`minimal` verification fails closed on any unexpected server in any
+non-disabled state: the synthetic `codex_apps` disable and the bundled
+plugin suppressions make those runtimes report `disabled` (absent from the
+inventory), so anything else unexpected fails the start.
 
 ## Owner workspace setup
 
@@ -696,6 +708,48 @@ frozen values together; turn and command readbacks carry their retained
 model/effort, revision, provenance, profile name) resolved from the exact
 retained generation and revision for the same original-request versus
 resolved-configuration distinction.
+
+## Profile editing
+
+Launch admission resolves its profile from `config.toml` at admission (above), so the
+saved file is what the next launch uses and running or queued work keeps its frozen
+snapshot; only a successful `configure` changes a live Agent's next-turn model/effort.
+Daemon settings loaded once at startup (`[daemon]`, `[mail]`, `[automation]`) are not
+edited through this path.
+
+`config.profiles.read` returns the file revision (lowercase hex SHA-256 of its bytes)
+and the verbatim text of the `[profiles.*]` table blocks in file order. Every other
+section stays server-side. Comment and blank lines that end a profile block and precede
+another section belong to that section. The source is withheld (`editable=false` with a
+reason) when the file is not valid TOML, when profiles are defined outside
+`[profiles.*]` tables, when the profile text contains a value the daemon's secret
+policy knows, or when the profiles fail the daemon's strict field and URL
+validation (unknown fields and credential-bearing URLs are never handed to the
+editor as safe source). Profile sections carry environment and credential names, never values.
+
+[`config.profiles.save`](../../crates/eliot-daemon/src/config/profiles_edit.rs) takes
+the full replacement text for those blocks, the revision it was read from, and
+`dry_run`. It accepts a draft only when all of these hold:
+
+- the draft holds only `[profiles.*]` tables;
+- splicing it in place of the old blocks keeps the text of every other section in
+  place (only boundary newlines may be added) and every non-profile value unchanged;
+- the strict config parser, launch-time resolution of every profile (including child
+  profiles and route binding) and project validation accept the result, within the
+  128 KiB bound;
+- the file still has the expected revision, otherwise `conflict`.
+
+A draft carrying the redaction marker fails request validation (`invalid`). A known
+secret value, in the raw text or in any decoded value, is `not_allowed`. A dry run
+stops after validation. A save rechecks the revision immediately before it writes a
+private temporary file in the data directory and renames it over `config.toml`. Only
+saves inside one daemon are serialized, so an external writer in the instant between
+that recheck and the rename can still be overwritten. A failure after the rename
+reports `unknown`, never "unchanged". The draft keeps the file's line ending. A
+leading UTF-8 BOM is preserved outside the profile blocks and is never handed
+to the editor. An identical result writes nothing. An invalid draft is never written, so the file keeps
+its last valid revision and the editor keeps the draft. The daemon holds no separate
+in-memory profile set to reload: the next admission reads the saved file.
 
 ## Frozen files
 

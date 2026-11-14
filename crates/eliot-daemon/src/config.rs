@@ -20,6 +20,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+pub(crate) mod profiles_edit;
+
 const MAX_CONFIG_BYTES: usize = 128 * 1024;
 const MAX_PROFILE_NAME_LEN: usize = 128;
 const MAX_PROFILES: usize = 256;
@@ -460,6 +462,16 @@ pub(crate) fn load_project_registration_config(
     let Some((config, source)) = read_config(data_root)? else {
         return Ok(Vec::new());
     };
+    project_registrations_in(&config, &source)
+}
+
+/// Project registration validation over already parsed source text (also
+/// run on an edited profile draft: a project may not keep naming a profile
+/// the draft removed).
+fn project_registrations_in(
+    config: &FileConfig,
+    source: &str,
+) -> core::Result<Vec<ProjectRegistrationConfig>> {
     if config.projects.is_empty() {
         return Ok(Vec::new());
     }
@@ -478,7 +490,7 @@ pub(crate) fn load_project_registration_config(
         let offset = spanned.span().start;
         if validate_profile_name(id).is_err() {
             return Err(config_error_at(
-                &source,
+                source,
                 offset,
                 &format!("projects.{id}"),
                 "invalid project id",
@@ -493,7 +505,7 @@ pub(crate) fn load_project_registration_config(
             || !Path::new(path).is_absolute()
         {
             return Err(config_error_at(
-                &source,
+                source,
                 offset,
                 &format!("projects.{id}.path"),
                 "must be a nonempty absolute checkout path of at most 4096 characters",
@@ -503,19 +515,14 @@ pub(crate) fn load_project_registration_config(
 
         let profiles = normalize_project_allowlist(
             &entry.profiles,
-            &source,
+            source,
             offset,
             id,
             "profiles",
             |profile| global_profiles.contains(profile) && validate_profile_name(profile).is_ok(),
         )?;
-        let actions = normalize_project_allowlist(
-            &entry.actions,
-            &source,
-            offset,
-            id,
-            "actions",
-            |action| {
+        let actions =
+            normalize_project_allowlist(&entry.actions, source, offset, id, "actions", |action| {
                 matches!(
                     action,
                     "launch"
@@ -534,17 +541,16 @@ pub(crate) fn load_project_registration_config(
                         | "mail.send"
                         | "var.set"
                 )
-            },
-        )?;
+            })?;
         let git = entry.git.clone();
         if let Some(git) = &git {
-            validate_project_git_config(git, &source, offset, id)?;
+            validate_project_git_config(git, source, offset, id)?;
         }
         let run_grant = normalize_run_grant(
             &entry.interpreters,
             &entry.run_env,
             &route_credential_env_names,
-            &source,
+            source,
             offset,
             &format!("projects.{id}"),
         )?;
@@ -841,6 +847,14 @@ pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Valu
             format!("config.toml: profiles.{name}: profile not found"),
         ));
     };
+    resolve_profile_in(&config, &source, name)
+}
+
+/// Launch-time profile resolution over already parsed source text. The same
+/// path validates an edited draft before `config.profiles.save` replaces
+/// the file, so a saved profile is one the next launch can resolve.
+fn resolve_profile_in(config: &FileConfig, source: &str, name: &str) -> core::Result<Value> {
+    validate_profile_name(name)?;
     if config.profiles.len() > MAX_PROFILES {
         return Err(core::Error::new(
             "profile_error",
@@ -850,7 +864,7 @@ pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Valu
     for (profile_name, entry) in &config.profiles {
         if validate_profile_name(profile_name).is_err() {
             return Err(config_error_at(
-                &source,
+                source,
                 entry.span().start,
                 "profiles",
                 "invalid profile name",
@@ -861,7 +875,7 @@ pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Valu
     for (account_name, entry) in &config.accounts {
         if validate_profile_name(account_name).is_err() {
             return Err(config_error_at(
-                &source,
+                source,
                 entry.span().start,
                 "accounts",
                 "invalid account name",
@@ -872,7 +886,7 @@ pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Valu
     for (proxy_name, entry) in &config.proxies {
         if validate_profile_name(proxy_name).is_err() {
             return Err(config_error_at(
-                &source,
+                source,
                 entry.span().start,
                 "proxies",
                 "invalid proxy name",
@@ -886,21 +900,21 @@ pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Valu
             format!("config.toml: profiles.{name}: profile not found"),
         )
     })?;
-    let snapshot = snapshot_from_entry(name, entry.get_ref(), entry.span().start, &source)?;
+    let snapshot = snapshot_from_entry(name, entry.get_ref(), entry.span().start, source)?;
     let snapshot = freeze_child_profiles(
         name,
         entry.get_ref(),
-        &config,
+        config,
         entry.span().start,
-        &source,
+        source,
         snapshot,
     )?;
     bind_route_and_capacity(
         name,
         entry.get_ref(),
-        &config,
+        config,
         entry.span().start,
-        &source,
+        source,
         snapshot,
     )
 }
@@ -970,6 +984,21 @@ fn freeze_child_profiles(
     Ok(snapshot)
 }
 fn read_config(data_root: &Path) -> core::Result<Option<(FileConfig, String)>> {
+    let Some(source) = read_config_source(data_root)? else {
+        return Ok(None);
+    };
+    let config = parse_config(&source)?;
+    Ok(Some((config, source)))
+}
+
+/// The one `config.toml` parser: strict (`deny_unknown_fields`) with
+/// located errors.
+fn parse_config(source: &str) -> core::Result<FileConfig> {
+    toml::from_str(source).map_err(|error| map_toml_error(source, error))
+}
+
+/// Raw `config.toml` text within the size bound; `None` when absent.
+fn read_config_source(data_root: &Path) -> core::Result<Option<String>> {
     let file = match std::fs::File::open(data_root.join("config.toml")) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -994,11 +1023,9 @@ fn read_config(data_root: &Path) -> core::Result<Option<(FileConfig, String)>> {
             "config.toml: file exceeds the 128 KiB bound",
         ));
     }
-    let source = String::from_utf8(bytes)
-        .map_err(|_| core::Error::new("profile_error", "config.toml: invalid UTF-8"))?;
-    let config: FileConfig =
-        toml::from_str(&source).map_err(|error| map_toml_error(&source, error))?;
-    Ok(Some((config, source)))
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| core::Error::new("profile_error", "config.toml: invalid UTF-8"))
 }
 
 pub(crate) fn load_automation_config(data_root: &Path) -> core::Result<AutomationConfig> {
