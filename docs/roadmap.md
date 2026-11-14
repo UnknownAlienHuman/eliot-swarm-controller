@@ -307,8 +307,9 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
 - [x] Crash at admission, native effect, event commit, reply and source-drain boundaries;
       verify no repeated prompt/setup/script/push and no false terminal result.
       Qualified 2026-11-14, including 3 in-window kills between terminal commit and reply.
-- [ ] Live runs for the
+- [x] Live runs for the
       selected harnesses/routes. Verify effective model/account/permissions.
+      Qualified 2026-11-14 on Codex, Claude, Muse, OpenCode and Antigravity (release 492640C8).
 - [x] Rules/timers/hot reload, Goal limits, mail/ack, CAS, hierarchy and Git recovery.
       Qualified 2026-11-14 with real Muse Agents on a private daemon.
 - [ ] Windows Job/handles/paths; supported Linux behavior and honest degraded custody;
