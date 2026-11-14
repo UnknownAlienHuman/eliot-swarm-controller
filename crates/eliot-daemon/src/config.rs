@@ -518,6 +518,8 @@ pub(crate) fn load_project_registration_config(
                         | "run"
                         | "notify"
                         | "emit"
+                        | "mail.send"
+                        | "var.set"
                 )
             },
         )?;
@@ -2942,6 +2944,26 @@ mod tests {
                 "profile_error"
             );
         }
+    }
+
+    #[test]
+    fn project_coordination_actions_are_explicit_canonical_grants() {
+        let fixture = AutomationConfigFixture::new();
+        let project_path = format!("{:?}", fixture.root.to_string_lossy());
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path}\nactions = ['mail.send', 'var.set']\n"
+        ));
+        let configured = load_project_registration_config(&fixture.root).unwrap();
+        assert_eq!(configured[0].actions, vec!["mail.send", "var.set"]);
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path}\nactions = ['msg.send']\n"
+        ));
+        assert_eq!(
+            load_project_registration_config(&fixture.root)
+                .unwrap_err()
+                .code,
+            "profile_error"
+        );
     }
 
     #[test]

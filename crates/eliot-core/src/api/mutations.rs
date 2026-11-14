@@ -59,6 +59,18 @@ impl CommandSubmitRequest {
                 "notify/emit are targetless and have no Agent bindings",
             ));
         }
+        if matches!(self.verb.as_str(), "mail.send" | "var.set")
+            && (self.target.is_some()
+                || self.expected_generation.is_some()
+                || self.expected_turn_id.is_some()
+                || self.request_id.is_some()
+                || self.probe)
+        {
+            return Err(Error::new(
+                "invalid",
+                "mail.send/var.set are targetless and have no Agent bindings",
+            ));
+        }
         Ok(())
     }
 }

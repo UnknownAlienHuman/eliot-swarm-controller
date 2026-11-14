@@ -2,7 +2,8 @@ use eliot_core::{
     Error, Event, SubmitCommand,
     api::{
         CatchUp, CommandSubmitRequest, EmitDefinitionArgs, GitFetchDefinitionArgs,
-        NotifyDefinitionArgs, RuleLimit, RuleLimitScope, RunDefinitionArgs, TimerSchedule,
+        MailDefinitionArgs, NotifyDefinitionArgs, RuleLimit, RuleLimitScope, RunDefinitionArgs,
+        TimerSchedule, VarDefinitionArgs,
     },
     canonical_json_sha256,
     limits::{MAX_EVENT_BYTES, MAX_TEXT_BYTES},
@@ -166,6 +167,8 @@ enum ActionDefinition {
     GitFetch { definition: GitFetchDefinitionArgs },
     Notify { definition: NotifyDefinitionArgs },
     Emit { definition: EmitDefinitionArgs },
+    Mail { definition: MailDefinitionArgs },
+    Var { definition: VarDefinitionArgs },
 }
 
 impl<'de> Deserialize<'de> for ActionDefinition {
@@ -214,6 +217,20 @@ impl ActionDefinition {
             let definition =
                 eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
             return Ok(Self::Emit { definition });
+        }
+        if action == "mail.send" || action == "msg.send" {
+            let mut fields = object.clone();
+            fields.remove("action");
+            let definition =
+                eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
+            return Ok(Self::Mail { definition });
+        }
+        if action == "var.set" {
+            let mut fields = object.clone();
+            fields.remove("action");
+            let definition =
+                eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
+            return Ok(Self::Var { definition });
         }
         let mut fields = object.clone();
         fields.remove("action");
@@ -314,6 +331,32 @@ impl Serialize for ActionDefinition {
                         }
                     };
                 fields.insert("action".to_owned(), Value::String("emit".to_owned()));
+                Value::Object(fields).serialize(serializer)
+            }
+            Self::Mail { definition } => {
+                let mut fields =
+                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
+                        Value::Object(fields) => fields,
+                        _ => {
+                            return Err(serde::ser::Error::custom(
+                                "mail.send definition must serialize as an object",
+                            ));
+                        }
+                    };
+                fields.insert("action".to_owned(), Value::String("mail.send".to_owned()));
+                Value::Object(fields).serialize(serializer)
+            }
+            Self::Var { definition } => {
+                let mut fields =
+                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
+                        Value::Object(fields) => fields,
+                        _ => {
+                            return Err(serde::ser::Error::custom(
+                                "var.set definition must serialize as an object",
+                            ));
+                        }
+                    };
+                fields.insert("action".to_owned(), Value::String("var.set".to_owned()));
                 Value::Object(fields).serialize(serializer)
             }
         }
@@ -717,6 +760,12 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         ActionDefinition::Emit { definition } => {
             return submit_emit_command(definition).map(Some);
         }
+        ActionDefinition::Mail { definition } => {
+            return submit_mail_command(definition).map(Some);
+        }
+        ActionDefinition::Var { definition } => {
+            return submit_var_command(definition).map(Some);
+        }
         ActionDefinition::Agent(action) => action,
     };
     let roots = TemplateRoots {
@@ -904,6 +953,36 @@ fn submit_emit_command(definition: &EmitDefinitionArgs) -> Result<SubmitCommand,
     Ok(command)
 }
 
+fn submit_mail_command(definition: &MailDefinitionArgs) -> Result<SubmitCommand, Error> {
+    definition.validate().map_err(|error| {
+        Error::new(
+            error.code.clone(),
+            format!("mail.send definition invalid: {}", error.message),
+        )
+    })?;
+    let args = serde_json::to_value(definition)
+        .map_err(|_| Error::new("invalid", "mail.send definition cannot be encoded"))?;
+    let mut command = CommandSubmitRequest::new(String::new(), "mail.send");
+    command.args = args;
+    command.validate()?;
+    Ok(command)
+}
+
+fn submit_var_command(definition: &VarDefinitionArgs) -> Result<SubmitCommand, Error> {
+    definition.validate().map_err(|error| {
+        Error::new(
+            error.code.clone(),
+            format!("var.set definition invalid: {}", error.message),
+        )
+    })?;
+    let args = serde_json::to_value(definition)
+        .map_err(|_| Error::new("invalid", "var.set definition cannot be encoded"))?;
+    let mut command = CommandSubmitRequest::new(String::new(), "var.set");
+    command.args = args;
+    command.validate()?;
+    Ok(command)
+}
+
 fn submit_git_fetch_command(definition: &GitFetchDefinitionArgs) -> Result<SubmitCommand, Error> {
     validate_git_fetch_definition(definition)?;
     let args = serde_json::to_value(definition)
@@ -1006,6 +1085,9 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
                                     | "git.fetch"
                                     | "notify"
                                     | "emit"
+                                    | "mail.send"
+                                    | "msg.send"
+                                    | "var.set"
                             )
                         })
                 })
@@ -1171,6 +1253,22 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
         }
         ActionDefinition::Notify { definition } => return definition.validate(),
         ActionDefinition::Emit { definition } => return definition.validate(),
+        ActionDefinition::Mail { definition } => {
+            return definition.validate().map_err(|error| {
+                Error::new(
+                    error.code.clone(),
+                    format!("mail.send definition invalid: {}", error.message),
+                )
+            });
+        }
+        ActionDefinition::Var { definition } => {
+            return definition.validate().map_err(|error| {
+                Error::new(
+                    error.code.clone(),
+                    format!("var.set definition invalid: {}", error.message),
+                )
+            });
+        }
         ActionDefinition::Agent(action) => action,
     };
     if let AgentActionDefinition::Launch(LaunchActionDefinition {
@@ -1307,6 +1405,8 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
         ActionDefinition::GitFetch { definition } => return submit_git_fetch_command(definition),
         ActionDefinition::Notify { definition } => return submit_notify_command(definition),
         ActionDefinition::Emit { definition } => return submit_emit_command(definition),
+        ActionDefinition::Mail { definition } => return submit_mail_command(definition),
+        ActionDefinition::Var { definition } => return submit_var_command(definition),
         ActionDefinition::Agent(action) => action,
     };
     let (target_value, generation_value, args) = match action {
@@ -3383,5 +3483,109 @@ do = [{ action = 'git.fetch', repository = 'project-one', remote = 'origin', sou
 
         let mixed = INTERVAL_TIMER.replace("every = '30m'", "every = '30m', cron = '0 12 * * *'");
         assert_eq!(load(Cursor::new(mixed)).unwrap_err().code, "invalid");
+    }
+
+    #[test]
+    fn coordination_decode_errors_keep_action_field_reason_without_values() {
+        for (fields, field) in [
+            ("text = 'REJECTED_VALUE'", "action"),
+            ("action = 987654321", "action"),
+        ] {
+            let source = format!(
+                "[[rule]]\nid = 'decode'\non = {{ event = 'turn.completed' }}\ndo = [{{ {fields} }}]\n"
+            );
+            let error = load(Cursor::new(source)).unwrap_err();
+            assert_eq!(error.code, "invalid");
+            let details = error.details.as_ref().expect("field details");
+            assert_eq!(details.field, format!("rule[0].do[0].{field}"));
+            assert!(
+                !serde_json::to_string(&error)
+                    .unwrap()
+                    .contains("REJECTED_VALUE"),
+                "{error:?}"
+            );
+            assert!(
+                !serde_json::to_string(&error).unwrap().contains("987654321"),
+                "{error:?}"
+            );
+        }
+        for (action, fields, field) in [
+            ("mail.send", "to = 'REJECTED_VALUE', text = 'ok'", "to"),
+            ("mail.send", "to = [987654321], text = 'ok'", "to[0]"),
+            ("mail.send", "to = ['a7'], text = 987654321", "text"),
+            ("mail.send", "text = 'REJECTED_VALUE'", "to"),
+            (
+                "mail.send",
+                "to = ['a7'], text = 'ok', typo = 'REJECTED_VALUE'",
+                "<unknown-field>",
+            ),
+            (
+                "var.set",
+                "key = 'k', value = 'ok', expect_version = 'REJECTED_VALUE'",
+                "expect_version",
+            ),
+        ] {
+            let source = format!(
+                "[[rule]]\nid = 'decode'\non = {{ event = 'turn.completed' }}\ndo = [{{ action = '{action}', {fields} }}]\n"
+            );
+            let error = load(Cursor::new(source)).unwrap_err();
+            assert_eq!(error.code, "invalid");
+            let details = error.details.as_ref().expect("field details");
+            assert_eq!(details.field, format!("rule[0].do[0].{field}"));
+            let encoded = serde_json::to_string(&error).unwrap();
+            assert!(!encoded.contains("REJECTED_VALUE"), "{error:?}");
+            assert!(!encoded.contains("987654321"), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn mail_and_var_rule_actions_admit_canonical_names_and_alias() {
+        const MAIL_RULE: &str = r#"
+[[rule]]
+id = 'mail-on-result'
+on = { event = 'turn.completed' }
+do = [{ action = 'mail.send', to = ['a7'], text = 'done' }]
+"#;
+        const MSG_ALIAS_RULE: &str = r#"
+[[rule]]
+id = 'mail-on-result'
+on = { event = 'turn.completed' }
+do = [{ action = 'msg.send', to = ['a7'], text = 'done' }]
+"#;
+        const VAR_RULE: &str = r#"
+[[rule]]
+id = 'var-on-result'
+on = { event = 'turn.completed' }
+do = [{ action = 'var.set', scope = 'project:app', key = 'k', value = 'v' }]
+"#;
+        for source in [MAIL_RULE, MSG_ALIAS_RULE] {
+            let rules = load(Cursor::new(source)).expect("mail rule loads");
+            let action = evaluate(&rules[0], &event())
+                .expect("mail evaluates")
+                .expect("mail matches");
+            assert_eq!(action.verb, "mail.send");
+            assert!(action.target.is_none());
+            let definition: MailDefinitionArgs =
+                serde_json::from_value(action.args).expect("mail args decode");
+            assert_eq!(definition.to, vec!["a7".to_owned()]);
+        }
+        let rules = load(Cursor::new(VAR_RULE)).expect("var rule loads");
+        let action = evaluate(&rules[0], &event())
+            .expect("var evaluates")
+            .expect("var matches");
+        assert_eq!(action.verb, "var.set");
+        let definition: VarDefinitionArgs =
+            serde_json::from_value(action.args).expect("var args decode");
+        assert_eq!(definition.key, "k");
+
+        let bad_mail = MAIL_RULE.replace("to = ['a7']", "to = []");
+        let error = load(Cursor::new(bad_mail)).unwrap_err();
+        assert_eq!(error.code, "invalid");
+        assert!(error.message.contains("mail.send"), "{error:?}");
+
+        let bad_var = VAR_RULE.replace("key = 'k'", "key = ''");
+        let error = load(Cursor::new(bad_var)).unwrap_err();
+        assert_eq!(error.code, "invalid");
+        assert!(error.message.contains("var.set"), "{error:?}");
     }
 }

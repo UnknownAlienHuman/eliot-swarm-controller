@@ -470,7 +470,8 @@ hidden wait/acceptance state to the router.
 | --- | --- |
 | Agent verb | router with generation/turn/request binding |
 | `launch` | targetless ordinary launch command at generation 0; optional nonblank text creates the normal linked `send` |
-| `msg.send`, `var.set` | scoped coordination command; available after L5 |
+| `mail.send` | targetless ordinary command; Store atomically commits one scoped queued-mail fanout with its Applied outcome |
+| `var.set` | targetless ordinary command; Store atomically commits one versioned variable write with its Applied outcome |
 | `run` | targetless `SubmitCommand` via Router; bounded child under saved authority; emitted commands become ordered children |
 | `notify` | targetless ordinary command; Store atomically commits one persisted `x.user.notify` event with its Applied outcome (local log only) |
 | `emit` | targetless ordinary command; Store atomically commits one persisted `x.user.<topic>` event with its Applied outcome (local log only) |
@@ -493,6 +494,44 @@ readback carries that event's kind and seq as the standard command readback,
 and a commit failure settles Unknown. A future desktop or
 approved-webhook increment must add its own delivery binding and must not
 reuse this local path as a transport.
+
+`mail.send` and `var.set` are scoped coordination actions through the existing
+Router/admission path, not a new executor. Both are targetless ordinary
+commands (`target = null`, no generation/turn/request binding) whose Core
+[`MailDefinitionArgs`/`VarDefinitionArgs`](../../crates/eliot-core/src/api/coordination.rs)
+are validated literally at admission (no templates; bounded, secret-checked
+payloads); the rule file also accepts `msg.send` as a compatibility alias for
+`mail.send`, and the canonical verb is `mail.send` (the CLI spells the same
+effect `msg send`). Admission freezes recipient/project scope under the saved
+originating principal: Owner reaches any existing Agent and names its variable
+scope explicitly, while a project principal `project:ID` reaches only Agents in
+its own project and writes only its own `project:ID` scope (an omitted scope
+defaults to it). Project registration must grant each canonical verb explicitly in `actions`;
+the captured registration revision is checked at dispatch and effect commit.
+Execution reuses the existing authorization, payload validation, mailbox limits,
+compare-and-swap/version semantics and
+delivery/acknowledgement semantics; a stale or unauthorized destination fails
+explicitly. Each admitted rule child commits its effect together with its
+Applied settlement in a single Store transaction without entering the public
+write-id namespace, then publishes the committed batch in order while still
+serialized with the writer: `mail.send` publishes `command.applied` carrying
+the delivery readback and fans out mailbox wakes only after commit through the
+existing coordination wake path; `var.set` publishes `var.changed` first, then
+`command.applied` carrying the write readback. These rule-produced events carry
+the exact child command's verified cause, preserving the depth-five guard;
+standalone coordination events keep their existing semantics. Mail delivery IDs
+use `rule:<ULID>/<recipient>` outside the public write namespace: the ULID's
+timestamp is the child's persisted admission time and its entropy is derived
+deterministically from the child identity. Pruned deliveries therefore retain
+the ordinary idempotent acknowledgement age semantics. Definite validation,
+authority, mailbox-capacity and CAS refusals settle Rejected with their code;
+uncertain persistence or commit failures remain Unknown.
+Malformed action fields report the recognized action, field path and reason
+without including rejected values or rule source excerpts.
+Replayed or restarted source events never duplicate the effect: an
+already Applied child returns its recorded result without a new delivery or
+write. Direct control actions stay bound to their event subject, and scripts
+are not turned into Owner RPC clients.
 
 ## Git actions
 

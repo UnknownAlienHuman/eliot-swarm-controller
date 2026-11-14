@@ -1459,10 +1459,13 @@ impl Router {
         ) {
             validate_plugin_command_args(&request)?;
         }
-        // Emit data is arbitrary JSON: its object keys can smuggle a known
-        // credential past the values-only check. Block keys before
-        // admission; never persist or log the offending key.
-        let secret_hit = if matches!(request.verb.as_str(), "notify" | "emit") {
+        // Emit data and variable values are arbitrary JSON: their object keys
+        // can smuggle a known credential past the values-only check. Block
+        // keys before admission; never persist or log the offending key.
+        let secret_hit = if matches!(
+            request.verb.as_str(),
+            "notify" | "emit" | "mail.send" | "var.set"
+        ) {
             contains_known_secret_including_keys(&request.args, &self.inner.secrets)
         } else {
             contains_known_secret(&request.args, &self.inner.secrets)
