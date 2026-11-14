@@ -2,7 +2,9 @@
 mod workflow_child;
 
 use eliot_core::{
-    ContextItem, Error, ProviderRestriction, Result, SecretPolicy, SessionUsage, SourceHealthUpdate,
+    ContextItem, Error, MUSE_VIEW_UNAVAILABLE_REASON_PREFIX, MUSE_VIEW_UNKNOWN_REASON_PREFIX,
+    ProviderRestriction, Result, SecretPolicy, SessionUsage, SourceHealthUpdate,
+    VIEW_RECOVERY_MARKER_FIELD, VIEW_RECOVERY_READBACK,
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
@@ -2231,7 +2233,7 @@ impl EventProcessor {
                 }
             }
             "turn/completed" => {
-                self.complete_turn(params).await?;
+                self.complete_turn(params, false).await?;
             }
             "session/tokenUsage" => {
                 self.observe_session_token_usage(params).await?;
@@ -2679,7 +2681,13 @@ impl EventProcessor {
         Ok(Some((command_id, turn_id.to_owned())))
     }
 
-    async fn complete_turn(&mut self, params: Value) -> Result<()> {
+    /// Commit one turn terminal. `readback_recovery` is true only when the
+    /// terminal was proven from a bounded durable `view/page` scan after the
+    /// live view was lost: the committed fact gains one fixed machine marker
+    /// so the daemon can count the recovery without re-parsing native
+    /// history. The marker never alters the terminal shape the reducer and
+    /// readbacks validate.
+    async fn complete_turn(&mut self, params: Value, readback_recovery: bool) -> Result<()> {
         let notification: NativeTurnCompletedNotification = serde_json::from_value(params)
             .map_err(|_| {
                 Error::new(
@@ -2743,6 +2751,9 @@ impl EventProcessor {
                 .map(|error| error.message.as_str()),
             &secrets,
         );
+        if readback_recovery {
+            mark_readback_recovery(&mut data);
+        }
         let native_id = event_id(
             self.status.session_id.as_deref().unwrap_or_default(),
             &notification.turn_id,
@@ -3691,7 +3702,7 @@ impl EventProcessor {
         let gap_result = if !self.gap_reported && !self.writes_blocked {
             self.stream_source()
                 .record_gap_range_until(
-                    &format!("Muse native view is unavailable ({})", reason.label()),
+                    &format!("{MUSE_VIEW_UNAVAILABLE_REASON_PREFIX} ({})", reason.label()),
                     after.clone(),
                     head.clone(),
                     health_deadline,
@@ -3872,7 +3883,7 @@ impl EventProcessor {
             self.applied_view_cursors
                 .insert(applied_fact_key("item/completed", cursor, &params));
         }
-        if self.complete_turn(turn_params.clone()).await.is_err() {
+        if self.complete_turn(turn_params.clone(), true).await.is_err() {
             return false;
         }
         if let Some(cursor) = turn_params.get("viewCursor").and_then(Value::as_str)
@@ -3926,9 +3937,7 @@ impl EventProcessor {
             .view_unavailable_reason
             .map(|reason| reason.label().to_owned())
             .unwrap_or_else(|| "unknown".to_owned());
-        let reason = format!(
-            "Muse native view recovery did not prove live delivery after the recorded gap ({reason_label})"
-        );
+        let reason = format!("{MUSE_VIEW_UNKNOWN_REASON_PREFIX} ({reason_label})");
         let session_id = self.status.session_id.clone().unwrap_or_default();
         let data = json!({
             "command_id": command_id.clone(),
@@ -4362,6 +4371,14 @@ fn tool_label(item: &NativeItem) -> Option<String> {
         "userShell" => Some("userShell".to_owned()),
         _ => None,
     }
+}
+
+/// Attach the fixed readback-recovery marker to an otherwise unchanged
+/// `turn.completed`: the daemon counts the recovery from this exact key and
+/// value without re-parsing native history. Only the readback-recovery path
+/// calls this; live terminals never carry the marker.
+fn mark_readback_recovery(data: &mut Value) {
+    data[VIEW_RECOVERY_MARKER_FIELD] = Value::from(VIEW_RECOVERY_READBACK);
 }
 
 /// Muse edit-family tool names: workspace mutators whose terminal revision
@@ -5424,6 +5441,21 @@ mod tests {
             &latched_no_turn,
             false
         ));
+    }
+
+    #[test]
+    fn readback_recovery_marks_the_terminal_with_the_counted_signal() {
+        let mut data = json!({"command_id": "command", "turn_id": "turn", "status": "completed"});
+        mark_readback_recovery(&mut data);
+        assert_eq!(
+            data.get(VIEW_RECOVERY_MARKER_FIELD),
+            Some(&Value::from(VIEW_RECOVERY_READBACK))
+        );
+        // The marker is the only addition: terminal shape is unchanged.
+        let mut expected =
+            json!({"command_id": "command", "turn_id": "turn", "status": "completed"});
+        expected[VIEW_RECOVERY_MARKER_FIELD] = Value::from(VIEW_RECOVERY_READBACK);
+        assert_eq!(data, expected);
     }
 
     #[test]

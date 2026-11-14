@@ -1000,6 +1000,19 @@ pub struct SourceGapAck {
     pub seq: i64,
 }
 
+/// Bounded machine signal for Muse native view-health episodes. The Muse
+/// plugin authors these exact reason strings and the readback marker; the
+/// three outcomes are exactly countable from the journal (see the Muse
+/// harness page). Prefixes (not full reasons) are matched
+/// so cursor-bearing suffixes stay free to evolve without breaking the count.
+pub const MUSE_VIEW_UNAVAILABLE_REASON_PREFIX: &str = "Muse native view is unavailable";
+pub const MUSE_VIEW_UNKNOWN_REASON_PREFIX: &str =
+    "Muse native view recovery did not prove live delivery after the recorded gap";
+/// Marker key the readback-recovery path attaches to an otherwise unchanged
+/// `turn.completed`; its only legal value is [`VIEW_RECOVERY_READBACK`].
+pub const VIEW_RECOVERY_MARKER_FIELD: &str = "view_recovery";
+pub const VIEW_RECOVERY_READBACK: &str = "readback";
+
 /// Store-facing facts derived by the reducer; callers persist them atomically with
 /// the event and next Agent projection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

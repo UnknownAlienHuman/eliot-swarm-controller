@@ -50,6 +50,12 @@ independent fields in the same `source_state` row. Recording a gap does not clos
 source or transfer family ownership. After exact readback and live-edge recovery, health
 may return to `ok` while the historical gap remains visible.
 
+Muse view-health needs no extra state: the same committed journal signals
+count unavailable-view episodes and their outcomes per agent. Count
+`source.gap` events whose reason starts with the shared unavailable prefix,
+`turn.unknown` events whose reason starts with the shared unknown prefix, and
+`turn.completed` events carrying the fixed `view_recovery: "readback"` marker.
+
 ## Process identity and custody
 
 Process identity is `(host_boot_id,pid,start_time)`, never PID alone. Windows birth time
