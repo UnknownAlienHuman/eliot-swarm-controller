@@ -7,9 +7,9 @@
 //! stay open: unknown fields are ignored, required fields are checked by the
 //! caller that consumes them.
 
-use eliot_core::{SessionCost, SessionUsage, TurnUsage};
+use eliot_core::{MAX_MCP_SERVER_NAME_LEN, SessionCost, SessionUsage, TurnUsage};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Outbound stdin control envelope.
 #[derive(Serialize)]
@@ -266,6 +266,80 @@ pub(crate) fn result_session_usage(record: &Value) -> Option<SessionUsage> {
     })
 }
 
+/// One proven MCP server entry from a `system`/`init` record: the native
+/// name plus its connection status. Only these two bounded fields are
+/// retained; every other init field (commands, paths, sources) stays out
+/// of persisted data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InitMcpServer {
+    pub name: String,
+    pub status: String,
+}
+
+/// Bound matching the daemon's other per-profile entry lists.
+const MAX_INIT_MCP_SERVERS: usize = 64;
+/// Native statuses are short words (`connected`, `failed` on installed
+/// 2.1.321); anything longer is not a status.
+const MAX_INIT_MCP_STATUS_LEN: usize = 64;
+
+/// Extract the proven MCP server surface from a `system`/`init` record.
+/// `None` means no provable inventory (absent or malformed list, over
+/// bound, duplicated or unusable entries): the caller keeps the effective
+/// set unknown instead of echoing a guess. An observed empty list proves
+/// an empty surface and returns an empty vec.
+pub(crate) fn init_mcp_servers(record: &Value) -> Option<Vec<InitMcpServer>> {
+    let servers = record.get("mcp_servers")?.as_array()?;
+    if servers.len() > MAX_INIT_MCP_SERVERS {
+        return None;
+    }
+    let mut out = Vec::with_capacity(servers.len());
+    for server in servers {
+        let entry = server.as_object()?;
+        let name = entry.get("name")?.as_str()?.trim();
+        let status = entry.get("status")?.as_str()?.trim();
+        if name.is_empty()
+            || name.len() > MAX_MCP_SERVER_NAME_LEN
+            || name.chars().any(char::is_control)
+            || status.is_empty()
+            || status.len() > MAX_INIT_MCP_STATUS_LEN
+            || status.chars().any(char::is_control)
+        {
+            return None;
+        }
+        if out.iter().any(|kept: &InitMcpServer| kept.name == name) {
+            return None;
+        }
+        out.push(InitMcpServer {
+            name: name.to_owned(),
+            status: status.to_owned(),
+        });
+    }
+    out.sort_by(|left, right| left.name.cmp(&right.name));
+    Some(out)
+}
+
+/// Attach a retained init readback to a terminal's event data. Only a
+/// proven (observed) readback is attached, with verified true; no retained
+/// readback leaves the data untouched so the effective set stays unknown.
+pub(crate) fn attach_mcp_readback(data: &mut Value, servers: Option<&[InitMcpServer]>) {
+    let Some(servers) = servers else {
+        return;
+    };
+    let Some(object) = data.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "mcp_servers".to_owned(),
+        Value::Array(
+            servers
+                .iter()
+                .map(|server| json!({"name": server.name, "status": server.status}))
+                .collect(),
+        ),
+    );
+    object.insert("mcp_servers_verified".to_owned(), Value::Bool(true));
+}
+
 /// Extract the model reported by an `assistant` record's message.
 /// Only a non-empty string scalar is observed; missing/null is unobserved.
 pub(crate) fn assistant_model(record: &Value) -> Option<String> {
@@ -434,5 +508,77 @@ mod tests {
         assert_eq!(readback.current_permission_mode.as_deref(), Some("default"));
         assert_eq!(readback.pid, Some(1234));
         assert_eq!(readback.session_state.as_deref(), Some("idle"));
+    }
+
+    #[test]
+    fn init_mcp_servers_keeps_sorted_names_and_statuses() {
+        let record = json!({
+            "type": "system",
+            "subtype": "init",
+            "mcp_servers": [
+                {"name": "probe_dummy", "status": "failed", "source": "dynamic"},
+                {"name": "eliot-search", "status": "connected", "source": "user"},
+            ],
+        });
+        assert_eq!(
+            init_mcp_servers(&record).expect("proven inventory"),
+            vec![
+                InitMcpServer {
+                    name: "eliot-search".to_owned(),
+                    status: "connected".to_owned(),
+                },
+                InitMcpServer {
+                    name: "probe_dummy".to_owned(),
+                    status: "failed".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(
+            init_mcp_servers(&json!({"type": "system", "subtype": "init", "mcp_servers": []})),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn init_mcp_servers_stays_unknown_without_proof() {
+        assert_eq!(init_mcp_servers(&json!({"type": "system"})), None);
+        assert_eq!(init_mcp_servers(&json!({"mcp_servers": null})), None);
+        assert_eq!(init_mcp_servers(&json!({"mcp_servers": {"a": {}}})), None);
+        // One unusable entry voids the whole inventory, never a partial echo.
+        for record in [
+            json!({"mcp_servers": [{"name": "", "status": "connected"}]}),
+            json!({"mcp_servers": [{"name": "a", "status": ""}]}),
+            json!({"mcp_servers": [{"name": "a"}]}),
+            json!({"mcp_servers": ["a"]}),
+            json!({"mcp_servers": [{"name": "a", "status": "connected"}, {"name": "a", "status": "failed"}]}),
+            json!({"mcp_servers": [{"name": "x".repeat(129), "status": "connected"}]}),
+            json!({"mcp_servers": [{"name": "a", "status": "x".repeat(65)}]}),
+        ] {
+            assert_eq!(init_mcp_servers(&record), None);
+        }
+        let oversized: Vec<Value> = (0..65)
+            .map(|index| json!({"name": format!("server-{index}"), "status": "connected"}))
+            .collect();
+        assert_eq!(init_mcp_servers(&json!({"mcp_servers": oversized})), None);
+    }
+
+    #[test]
+    fn attach_mcp_readback_verifies_only_proven_sets() {
+        let mut data = json!({"command_id": "c1", "turn_id": "t1", "status": "completed"});
+        attach_mcp_readback(&mut data, None);
+        assert_eq!(data.get("mcp_servers"), None);
+        assert_eq!(data.get("mcp_servers_verified"), None);
+        attach_mcp_readback(
+            &mut data,
+            Some(&[InitMcpServer {
+                name: "eliot-swarm".to_owned(),
+                status: "connected".to_owned(),
+            }]),
+        );
+        assert_eq!(
+            data["mcp_servers"],
+            json!([{"name": "eliot-swarm", "status": "connected"}])
+        );
+        assert_eq!(data["mcp_servers_verified"], json!(true));
     }
 }

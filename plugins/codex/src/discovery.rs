@@ -144,25 +144,35 @@ pub(crate) async fn profile_store(
     .native_binding(metadata_secrets)
 }
 
-/// Enumerate the worker-visible native MCP server names for a minimal
-/// policy. A short-lived metadata reader runs initialize, one `config/read`
-/// with the worker's cwd, then closes; it never starts a thread. The
-/// worker's per-server `enabled=false` overrides are computed from these
-/// keys before the long-lived process is born. The reader is pinned to the
-/// frozen native-store binding the same way the worker launch is pinned,
-/// and the pin is verified before the enumeration `config/read` is trusted.
-pub(crate) async fn read_effective_mcp_server_names(
+/// Worker-visible native MCP surface for a minimal policy: the effective
+/// `mcp_servers` entries plus the effective `plugins` states, both read
+/// from one short-lived metadata reader (initialize, one `config/read`
+/// with the worker's cwd, close; it never starts a thread). The worker's
+/// per-server transport-carrying `enabled=false` overrides and per-plugin
+/// `enabled=false` overrides are computed from this surface before the
+/// long-lived process is born. The reader is pinned to the frozen
+/// native-store binding the same way the worker launch is pinned, and the
+/// pin is verified before the enumeration `config/read` is trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EffectiveMcpSurface {
+    pub(crate) servers: Vec<crate::mcp::EffectiveMcpServer>,
+    pub(crate) plugins: Vec<crate::mcp::EffectiveMcpPlugin>,
+}
+
+/// Enumerate the worker-visible native MCP surface (servers plus plugin
+/// states) with one short-lived metadata reader.
+pub(crate) async fn read_effective_mcp_surface(
     launch: &NativeLaunch,
     binding: &NativeStoreBinding,
     metadata_secrets: &[String],
     diagnostic_secrets: &[String],
     deadline: Instant,
-) -> Result<Vec<String>> {
+) -> Result<EffectiveMcpSurface> {
     let cwd = launch.cwd.clone();
     let pinned = pinned_launch_for_binding(launch, binding)?;
     let (mut probe, drainer, initialized) =
         start_initialized_reader(pinned, metadata_secrets, diagnostic_secrets, deadline).await?;
-    let probe_result: Result<Vec<String>> = async {
+    let probe_result: Result<EffectiveMcpSurface> = async {
         let client = probe.client();
         verify_initialized_store(
             &client,
@@ -194,12 +204,23 @@ pub(crate) async fn read_effective_mcp_server_names(
                     "Codex MCP server enumeration failed before worker spawn",
                 )
             })?;
-        let names = mcp_server_names(&config)?;
+        let entries = mcp_server_entries(&config)?;
+        let plugins = mcp_plugin_states(&config)?;
         reject_secrets(
-            &serde_json::to_value(&names).map_err(|_| invalid_page())?,
+            &serde_json::to_value(
+                entries
+                    .iter()
+                    .map(|entry| &entry.name)
+                    .chain(plugins.iter().map(|plugin| &plugin.id))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|_| invalid_page())?,
             metadata_secrets,
         )?;
-        Ok(names)
+        Ok(EffectiveMcpSurface {
+            servers: entries,
+            plugins,
+        })
     }
     .await;
     finish_reader(&mut probe, Some(drainer)).await?;
@@ -574,9 +595,12 @@ fn project_token_usage(raw: &Value) -> Option<Value> {
     Some(Value::Object(out))
 }
 
-/// Project the effective `mcp_servers` table keys. Absent means no
-/// configured servers; anything else must be an object.
-fn mcp_server_names(config_response: &Value) -> Result<Vec<String>> {
+/// Project the effective `mcp_servers` entries: each table key plus the
+/// `command`/`url` transport the native `-c` bootstrap validates, so the
+/// minimal spawn can re-emit the transport alongside `enabled=false`.
+/// Entry tables that are not objects, or carry a non-string `command`/`url`,
+/// fail the enumeration instead of projecting a partial transport.
+fn mcp_server_entries(config_response: &Value) -> Result<Vec<crate::mcp::EffectiveMcpServer>> {
     const MAX_ENUMERATED_SERVERS: usize = 1024;
     const MAX_ENUMERATED_NAME_BYTES: usize = 256;
     let config = config_response
@@ -594,22 +618,110 @@ fn mcp_server_names(config_response: &Value) -> Result<Vec<String>> {
             if servers.len() > MAX_ENUMERATED_SERVERS {
                 return Err(too_large());
             }
-            let mut names = Vec::with_capacity(servers.len());
-            for name in servers.keys() {
+            let mut entries = Vec::with_capacity(servers.len());
+            for (name, entry) in servers {
                 check_text(name, MAX_ENUMERATED_NAME_BYTES, true).map_err(|_| {
                     Error::new(
                         "native_readback",
                         "Codex MCP server enumeration failed before worker spawn",
                     )
                 })?;
-                names.push(name.clone());
+                let table = entry.as_object().ok_or_else(|| {
+                    Error::new(
+                        "native_readback",
+                        "Codex MCP server enumeration failed before worker spawn",
+                    )
+                })?;
+                for key in ["command", "url"] {
+                    if table
+                        .get(key)
+                        .is_some_and(|value| !value.is_null() && !value.is_string())
+                    {
+                        return Err(Error::new(
+                            "native_readback",
+                            "Codex MCP server enumeration failed before worker spawn",
+                        ));
+                    }
+                }
+                entries.push(crate::mcp::EffectiveMcpServer {
+                    name: name.clone(),
+                    command: table
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    url: table.get("url").and_then(Value::as_str).map(str::to_owned),
+                });
             }
-            names.sort();
-            Ok(names)
+            entries.sort_by(|left, right| left.name.cmp(&right.name));
+            Ok(entries)
         }
         Some(_) => Err(Error::new(
             "native_readback",
             "Codex MCP server enumeration failed before worker spawn",
+        )),
+    }
+}
+
+/// Project the effective `plugins` states: each table id plus whether it
+/// is enabled, so the minimal spawn can suppress plugin-backed MCP servers
+/// (which never appear in `mcp_servers`) with their own `enabled=false`
+/// overrides. Absent means no controllable plugins; entry tables that are
+/// not objects, or carry a non-boolean `enabled`, fail the enumeration
+/// instead of projecting a partial surface. A missing `enabled` flag means
+/// enabled: the installed schema defaults plugin entries to enabled.
+fn mcp_plugin_states(config_response: &Value) -> Result<Vec<crate::mcp::EffectiveMcpPlugin>> {
+    const MAX_ENUMERATED_PLUGINS: usize = 1024;
+    const MAX_ENUMERATED_PLUGIN_ID_BYTES: usize = 256;
+    let config = config_response
+        .get("config")
+        .filter(|config| config.is_object())
+        .ok_or_else(|| {
+            Error::new(
+                "native_readback",
+                "Codex MCP plugin enumeration failed before worker spawn",
+            )
+        })?;
+    match config.get("plugins") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Object(plugins)) => {
+            if plugins.len() > MAX_ENUMERATED_PLUGINS {
+                return Err(too_large());
+            }
+            let mut states = Vec::with_capacity(plugins.len());
+            for (id, entry) in plugins {
+                check_text(id, MAX_ENUMERATED_PLUGIN_ID_BYTES, true).map_err(|_| {
+                    Error::new(
+                        "native_readback",
+                        "Codex MCP plugin enumeration failed before worker spawn",
+                    )
+                })?;
+                let table = entry.as_object().ok_or_else(|| {
+                    Error::new(
+                        "native_readback",
+                        "Codex MCP plugin enumeration failed before worker spawn",
+                    )
+                })?;
+                let enabled = match table.get("enabled") {
+                    None | Some(Value::Null) => true,
+                    Some(Value::Bool(enabled)) => *enabled,
+                    Some(_) => {
+                        return Err(Error::new(
+                            "native_readback",
+                            "Codex MCP plugin enumeration failed before worker spawn",
+                        ));
+                    }
+                };
+                states.push(crate::mcp::EffectiveMcpPlugin {
+                    id: id.clone(),
+                    enabled,
+                });
+            }
+            states.sort_by(|left, right| left.id.cmp(&right.id));
+            Ok(states)
+        }
+        Some(_) => Err(Error::new(
+            "native_readback",
+            "Codex MCP plugin enumeration failed before worker spawn",
         )),
     }
 }
@@ -1517,9 +1629,10 @@ fn too_large() -> Error {
 mod tests {
     use super::{
         CURSOR_PREFIX, Cursor, NativeLaunch, READ_TIMEOUT, StoreContext, binding_paths,
-        decode_cursor, fingerprint, mcp_server_names, native_scope, pinned_launch,
-        pinned_launch_for_binding, read_effective_mcp_server_names, request_binding, select_store,
-        sqlite_environment, start_initialized_reader, store_scope, validate_pin, validate_store,
+        decode_cursor, fingerprint, mcp_plugin_states, mcp_server_entries, native_scope,
+        pinned_launch, pinned_launch_for_binding, read_effective_mcp_surface, request_binding,
+        select_store, sqlite_environment, start_initialized_reader, store_scope, validate_pin,
+        validate_store,
     };
     use crate::native::types::NativeDiscoveryConfigReadResponse;
     use eliot_core::{NativeStoreBinding, SecretPolicy};
@@ -1681,7 +1794,7 @@ mod tests {
             "native_scope": "fixture-scope",
         }))
         .unwrap();
-        let error = read_effective_mcp_server_names(
+        let error = read_effective_mcp_surface(
             &launch,
             &relative,
             &[],
@@ -1709,7 +1822,7 @@ mod tests {
             "native_scope": "fixture-scope",
         }))
         .unwrap();
-        let error = read_effective_mcp_server_names(
+        let error = read_effective_mcp_surface(
             &launch,
             &binding,
             &[],
@@ -1933,15 +2046,23 @@ mod tests {
     }
 
     #[test]
-    fn mcp_server_names_projects_only_the_table_keys() {
-        assert!(mcp_server_names(&json!({"config": {}})).unwrap().is_empty());
+    fn mcp_server_entries_projects_only_the_table_keys() {
         assert!(
-            mcp_server_names(&json!({"config": {"mcp_servers": null}}))
+            mcp_server_entries(&json!({"config": {}}))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            mcp_server_entries(&json!({"config": {"mcp_servers": null}}))
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            mcp_server_names(&json!({"config": {"mcp_servers": {"b": {}, "a": {}}}})).unwrap(),
+            mcp_server_entries(&json!({"config": {"mcp_servers": {"b": {}, "a": {}}}}))
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
             vec!["a".to_owned(), "b".to_owned()]
         );
         for response in [
@@ -1950,7 +2071,90 @@ mod tests {
             json!({"config": {"mcp_servers": []}}),
             json!({"config": {"mcp_servers": {"": {}}}}),
         ] {
-            assert!(mcp_server_names(&response).is_err());
+            assert!(mcp_server_entries(&response).is_err());
+        }
+    }
+
+    #[test]
+    fn mcp_server_entries_project_command_and_url_transports() {
+        let entries = mcp_server_entries(&json!({"config": {"mcp_servers": {
+            "stdio": {"command": "s.exe", "args": ["stdio"]},
+            "remote": {"url": "https://remote.example/mcp"},
+            "bare": {},
+        }}}))
+        .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (
+                    entry.name.as_str(),
+                    entry.command.as_deref(),
+                    entry.url.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("bare", None, None),
+                ("remote", None, Some("https://remote.example/mcp")),
+                ("stdio", Some("s.exe"), None),
+            ]
+        );
+        // Non-object tables and non-string transports fail the enumeration
+        // instead of projecting a partial transport.
+        for response in [
+            json!({"config": {"mcp_servers": {"bad": []}}}),
+            json!({"config": {"mcp_servers": {"bad": {"command": 1}}}}),
+            json!({"config": {"mcp_servers": {"bad": {"url": {"nested": true}}}}}),
+        ] {
+            assert!(mcp_server_entries(&response).is_err());
+        }
+        // Null transports project as absent, like a bare table.
+        let entries = mcp_server_entries(&json!({"config": {"mcp_servers": {
+            "nulled": {"command": null, "url": null},
+        }}}))
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "nulled");
+        assert!(entries[0].command.is_none());
+        assert!(entries[0].url.is_none());
+    }
+
+    #[test]
+    fn mcp_plugin_states_project_id_and_enabled_flag() {
+        assert!(
+            mcp_plugin_states(&json!({"config": {}}))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            mcp_plugin_states(&json!({"config": {"plugins": null}}))
+                .unwrap()
+                .is_empty()
+        );
+        let states = mcp_plugin_states(&json!({"config": {"plugins": {
+            "b@openai-bundled": {"enabled": true},
+            "a@openai-bundled": {"enabled": false},
+            "defaulted@openai-bundled": {},
+        }}}))
+        .unwrap();
+        assert_eq!(
+            states
+                .iter()
+                .map(|plugin| (plugin.id.as_str(), plugin.enabled))
+                .collect::<Vec<_>>(),
+            vec![
+                ("a@openai-bundled", false),
+                ("b@openai-bundled", true),
+                ("defaulted@openai-bundled", true),
+            ]
+        );
+        // Non-object tables and non-boolean flags fail the enumeration
+        // instead of projecting a partial surface.
+        for response in [
+            json!({"config": {"plugins": []}}),
+            json!({"config": {"plugins": {"bad": []}}}),
+            json!({"config": {"plugins": {"bad": {"enabled": "yes"}}}}),
+        ] {
+            assert!(mcp_plugin_states(&response).is_err());
         }
     }
 

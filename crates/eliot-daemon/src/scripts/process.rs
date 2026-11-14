@@ -1258,11 +1258,29 @@ mod tests {
             }
         ));
 
+        // Synchronize on observable process state before the timing-sensitive
+        // interrupt below: a generous-deadline run of the short-lived
+        // descendant must complete, proving the spawn path is live and hot.
+        // The interrupt then only has to land inside the multi-second window
+        // where the root has exited and the held descendant is still running,
+        // instead of winning a millisecond race against loaded process
+        // startup.
         let (_sender, receiver) = cancellation();
         let outcome = run_owned_process(
             fixture_command("descendant"),
             Vec::new(),
-            Duration::from_millis(100),
+            Duration::from_secs(30),
+            Arc::new(SecretPolicy::default()),
+            receiver,
+        )
+        .await;
+        assert!(matches!(outcome, ProcessOutcome::Completed(_)));
+
+        let (_sender, receiver) = cancellation();
+        let outcome = run_owned_process(
+            fixture_command("descendant-hold"),
+            Vec::new(),
+            Duration::from_secs(2),
             Arc::new(SecretPolicy::default()),
             receiver,
         )

@@ -7,14 +7,19 @@
 //! flag for `app-server` (`exec` has `--ignore-user-config`, `app-server`
 //! does not); `-c mcp_servers={}` merges with file config instead of
 //! replacing it (an isolated-`CODEX_HOME` `mcp list --json` probe still
-//! shows the file server), while `-c mcp_servers.<name>.enabled=false`
-//! disables that server. Minimal mode therefore enumerates the worker's
-//! effective `mcp_servers` keys pre-spawn and disables every non-allowed
-//! server explicitly, then verifies the visible surface with the installed
+//! shows the file server). A bare `-c mcp_servers.<name>.enabled=false`
+//! disables that server only when its transport lives in the user file
+//! config; for names contributed by project layers, plugins or builtins the
+//! bootstrap rejects the touched table (`invalid transport in
+//! 'mcp_servers.<name>'`). Re-emitting the effective `command`/`url`
+//! alongside `enabled=false` disables those servers cleanly. Minimal mode
+//! therefore enumerates the worker's effective `mcp_servers` entries
+//! pre-spawn and disables every non-allowed server with its own transport
+//! explicitly, then verifies the visible surface with the installed
 //! `mcpServerStatus/list` app-server method (v2 schema: `{data:
 //! [{name, runtimeStatus, ...}], nextCursor}`).
 
-use eliot_core::{Error, McpPolicy, Result};
+use eliot_core::{Error, McpPolicy, Result, SecretPolicy};
 use serde_json::Value;
 use std::collections::HashSet;
 
@@ -34,33 +39,197 @@ pub(super) fn is_addressable_override_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
-/// Names the worker must suppress: enumerated effective servers minus the
-/// allowed set minus Eliot's own Agent-scoped server. Sorted for
-/// deterministic argv. A non-allowed name that cannot be addressed fails
-/// closed instead of silently inheriting.
+/// One worker-visible native MCP server as enumerated from the effective
+/// `config/read` response: the table key plus the transport the native
+/// bootstrap validates. Only `command`/`url` are projected; env, timeouts
+/// and tool gates merge from the owner layers and never reach argv.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EffectiveMcpServer {
+    pub(super) name: String,
+    pub(super) command: Option<String>,
+    pub(super) url: Option<String>,
+}
+
+/// Bound one re-emitted MCP transport value carried in a spawn `-c`
+/// override: long enough for real install paths, short enough to keep the
+/// spawn argv bounded. Anything longer fails closed instead of silently
+/// truncating a transport.
+pub(super) const MAX_MCP_TRANSPORT_BYTES: usize = 2048;
+
+/// Spawn-safe overrides for a minimal worker: every enumerated effective
+/// server outside the allow set minus Eliot's own Agent-scoped server,
+/// sorted for deterministic argv. Each entry carries its effective
+/// transport because the native `-c` bootstrap validates a touched
+/// `mcp_servers.<name>` table on its own. A non-allowed server that cannot
+/// be addressed, has no usable transport, or would leak a known secret into
+/// argv fails closed instead of silently inheriting.
 pub(super) fn compute_disables(
-    enumerated: &[String],
+    enumerated: &[EffectiveMcpServer],
     allow: &[String],
     own_server_name: &str,
-) -> Result<Vec<String>> {
+    metadata_secrets: &[String],
+) -> Result<Vec<EffectiveMcpServer>> {
     let allowed: HashSet<&str> = allow.iter().map(String::as_str).collect();
-    let mut disables: Vec<String> = Vec::new();
-    for name in enumerated {
-        if name == own_server_name || allowed.contains(name.as_str()) {
+    let secrets = SecretPolicy::new(metadata_secrets.iter().cloned());
+    let mut disables: Vec<EffectiveMcpServer> = Vec::new();
+    for server in enumerated {
+        if server.name == own_server_name || allowed.contains(server.name.as_str()) {
             continue;
         }
-        if !is_addressable_override_name(name) {
+        if !is_addressable_override_name(&server.name) {
             return Err(Error::new(
                 "profile_error",
                 "Codex minimal MCP cannot suppress a native server whose name is not a plain override segment",
             ));
         }
-        if !disables.iter().any(|kept| kept == name) {
-            disables.push(name.clone());
+        let command = clean_transport(server.command.as_deref())?;
+        let url = clean_transport(server.url.as_deref())?;
+        if command.is_none() && url.is_none() {
+            return Err(Error::new(
+                "profile_error",
+                "Codex minimal MCP cannot suppress a native server without a usable command or url transport",
+            ));
+        }
+        for transport in command.iter().chain(url.iter()) {
+            if secrets.contains_value(&Value::String(transport.clone())) {
+                return Err(Error::new(
+                    "secret_in_payload",
+                    "Codex minimal MCP transport carries a known secret",
+                ));
+            }
+        }
+        if !disables.iter().any(|kept| kept.name == server.name) {
+            disables.push(EffectiveMcpServer {
+                name: server.name.clone(),
+                command,
+                url,
+            });
+        }
+    }
+    disables.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(disables)
+}
+
+/// Project one effective transport value for a `-c` override: absent when
+/// empty, bounded and control-free otherwise. The value itself never
+/// reaches the error message.
+fn clean_transport(value: Option<&str>) -> Result<Option<String>> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.len() > MAX_MCP_TRANSPORT_BYTES || value.chars().any(char::is_control) {
+        return Err(Error::new(
+            "profile_error",
+            "Codex minimal MCP cannot suppress a native server with an unusable transport",
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+/// Bundled Codex plugins that contribute MCP servers outside the
+/// `mcp_servers` table, so transport-carrying server disables cannot
+/// address them. Verified live against installed Codex 0.167.1: disabling
+/// `computer-use`/`unified-computer-use` removes the `cua_repl` server from
+/// the thread-scoped inventory, and `codex-app-tools` backs the `codex_app`
+/// server. None of these ids contains a dot, so each takes a plain
+/// `-c plugins.<id>.enabled=false` override. Candidates absent from the
+/// worker's effective config are skipped (a renamed marketplace fails the
+/// readback closed instead of breaking the bootstrap). Each entry also
+/// names the MCP servers it is known to back, so an explicit `mcp_allow`
+/// entry for the plugin or one of its servers keeps the plugin enabled.
+const MCP_PLUGIN_SUPPRESSIONS: &[(&str, &[&str])] = &[
+    ("computer-use@openai-bundled", &["cua_repl"]),
+    ("unified-computer-use@openai-bundled", &["cua_repl"]),
+    ("codex-app-tools@openai-bundled", &["codex_app"]),
+];
+
+/// Bound one effective plugin id carried in a spawn `-c` override.
+pub(super) const MAX_MCP_PLUGIN_ID_BYTES: usize = 256;
+
+/// The ChatGPT-backed Apps runtime. It never appears in `config/read`
+/// `mcp_servers` (`codex mcp get codex_apps` reports no such server) and a
+/// bare `-c mcp_servers.codex_apps.enabled=false` breaks the native
+/// bootstrap (`invalid transport in 'mcp_servers.codex_apps'`, verified on
+/// 0.167.1: the touched table has no transport to validate). Re-emitting a
+/// synthetic table with a nonexistent command alongside `enabled=false` is
+/// accepted, and the thread-scoped inventory reports `codex_apps` as
+/// `disabled`. The command can never run: a disabled server is never
+/// spawned, and if a future native ever ignored the flag the missing
+/// executable fails the readback closed instead of inheriting a live
+/// server.
+pub(super) const CODEX_APPS_SERVER_NAME: &str = "codex_apps";
+
+/// A plugin id is addressable as a `-c` override path segment only when it
+/// cannot disturb neighbouring keys. Codex splits override paths on
+/// literal dots before decoding, so ids are restricted to the observed
+/// bundled shape (no dots); anything else fails the start closed instead
+/// of silently inheriting its servers.
+pub(super) fn is_suppressible_plugin_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_MCP_PLUGIN_ID_BYTES
+        && id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'@' || byte == b'-' || byte == b'_'
+        })
+}
+
+/// One worker-visible native plugin as enumerated from the effective
+/// `config/read` response: the plugin id plus whether it is enabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EffectiveMcpPlugin {
+    pub(super) id: String,
+    pub(super) enabled: bool,
+}
+
+/// Plugin ids to suppress for a minimal worker: the known MCP-serving
+/// bundled plugins that are present and enabled in the worker-visible
+/// config, minus any plugin (or server it backs) the owner explicitly
+/// allowed. Sorted for deterministic argv. A malformed candidate entry
+/// fails the start closed instead of silently inheriting its servers.
+pub(super) fn compute_plugin_disables(
+    plugins: &[EffectiveMcpPlugin],
+    allow: &[String],
+) -> Result<Vec<String>> {
+    let allowed: HashSet<&str> = allow.iter().map(String::as_str).collect();
+    let mut disables: Vec<String> = Vec::new();
+    for (candidate, backed) in MCP_PLUGIN_SUPPRESSIONS {
+        if allowed.contains(candidate) || backed.iter().any(|server| allowed.contains(server)) {
+            continue;
+        }
+        let Some(entry) = plugins.iter().find(|plugin| plugin.id == *candidate) else {
+            continue;
+        };
+        if !is_suppressible_plugin_id(&entry.id) {
+            return Err(Error::new(
+                "profile_error",
+                "Codex minimal MCP cannot suppress a native plugin whose id is not a plain override segment",
+            ));
+        }
+        if entry.enabled && !disables.iter().any(|kept| kept == &entry.id) {
+            disables.push(entry.id.clone());
         }
     }
     disables.sort();
     Ok(disables)
+}
+
+/// Synthetic suppression for the ChatGPT-backed Apps runtime (see
+/// [`CODEX_APPS_SERVER_NAME`]): a transport-carrying `enabled=false`
+/// entry like any enumerated disable, so the route re-emits a valid table
+/// the native bootstrap accepts. Skipped when the owner explicitly allows
+/// `codex_apps`.
+pub(super) fn synthetic_apps_disable(allow: &[String]) -> Option<EffectiveMcpServer> {
+    if allow.iter().any(|name| name == CODEX_APPS_SERVER_NAME) {
+        return None;
+    }
+    Some(EffectiveMcpServer {
+        name: CODEX_APPS_SERVER_NAME.to_owned(),
+        command: Some(if cfg!(windows) {
+            r"C:\eliot-minimal-suppressed-mcp-server.exe".to_owned()
+        } else {
+            "/eliot-minimal-suppressed-mcp-server".to_owned()
+        }),
+        url: None,
+    })
 }
 
 /// Read the frozen worker MCP policy back. Legacy snapshots without `mcp`
@@ -234,25 +403,68 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn server(name: &str, command: Option<&str>, url: Option<&str>) -> EffectiveMcpServer {
+        EffectiveMcpServer {
+            name: name.to_owned(),
+            command: command.map(str::to_owned),
+            url: url.map(str::to_owned),
+        }
+    }
+
     #[test]
     fn disables_skip_own_and_allowed_and_sort() {
         let disables = compute_disables(
             &[
-                "owner-a".to_owned(),
-                "eliot_swarm_x".to_owned(),
-                "allowed".to_owned(),
-                "owner-a".to_owned(),
-                "owner-b".to_owned(),
+                server("owner-a", Some("a.exe"), None),
+                server("eliot_swarm_x", Some("swarm.exe"), None),
+                server("allowed", None, Some("https://allow.example/mcp")),
+                server("owner-a", Some("a.exe"), None),
+                server("owner-b", None, Some("https://b.example/mcp")),
             ],
             &["allowed".to_owned()],
             "eliot_swarm_x",
+            &[],
         )
         .unwrap();
-        assert_eq!(disables, vec!["owner-a".to_owned(), "owner-b".to_owned()]);
+        assert_eq!(
+            disables,
+            vec![
+                server("owner-a", Some("a.exe"), None),
+                server("owner-b", None, Some("https://b.example/mcp")),
+            ]
+        );
         assert!(
-            !compute_disables(&["plain".to_owned()], &[], "eliot_swarm_x")
-                .unwrap()
-                .is_empty()
+            !compute_disables(
+                &[server("plain", Some("p.exe"), None)],
+                &[],
+                "eliot_swarm_x",
+                &[]
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn disables_carry_both_transports_when_present() {
+        let disables = compute_disables(
+            &[server(
+                "both",
+                Some("both.exe"),
+                Some("https://both.example/mcp"),
+            )],
+            &[],
+            "eliot_swarm_x",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            disables,
+            vec![server(
+                "both",
+                Some("both.exe"),
+                Some("https://both.example/mcp")
+            )]
         );
     }
 
@@ -267,12 +479,138 @@ mod tests {
             &"x".repeat(129),
         ] {
             assert!(
-                compute_disables(&[name.to_owned()], &[], "eliot_swarm_x").is_err(),
+                compute_disables(
+                    &[server(name, Some("s.exe"), None)],
+                    &[],
+                    "eliot_swarm_x",
+                    &[]
+                )
+                .is_err(),
                 "accepted {name:?}"
             );
         }
         assert!(is_addressable_override_name("owner-search_1"));
         assert!(!is_addressable_override_name("owner.search"));
+    }
+
+    #[test]
+    fn disables_fail_closed_without_a_usable_transport() {
+        // Neither transport: nothing spawn-safe to re-emit, so the start
+        // must fail instead of emitting a bootstrap-breaking override.
+        for entry in [
+            server("notransport", None, None),
+            server("empty", Some(""), Some("")),
+        ] {
+            let error = compute_disables(&[entry], &[], "eliot_swarm_x", &[]).unwrap_err();
+            assert_eq!(error.code, "profile_error");
+        }
+        // Control characters or an overlong value can never be quoted into
+        // a `-c` override safely.
+        for entry in [
+            server("control", Some("bad\nexe"), None),
+            server("long", Some(&"x".repeat(MAX_MCP_TRANSPORT_BYTES + 1)), None),
+        ] {
+            let error = compute_disables(&[entry], &[], "eliot_swarm_x", &[]).unwrap_err();
+            assert_eq!(error.code, "profile_error");
+            assert!(!error.message.contains("bad"));
+        }
+    }
+
+    #[test]
+    fn disables_fail_closed_when_a_transport_carries_a_known_secret() {
+        let error = compute_disables(
+            &[server(
+                "token-url",
+                None,
+                Some("https://example.example/mcp?key=hunter2"),
+            )],
+            &[],
+            "eliot_swarm_x",
+            &["hunter2".to_owned()],
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "secret_in_payload");
+        assert!(!error.message.contains("hunter2"));
+    }
+
+    fn plugin(id: &str, enabled: bool) -> EffectiveMcpPlugin {
+        EffectiveMcpPlugin {
+            id: id.to_owned(),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn plugin_disables_cover_only_present_enabled_bundled_plugins() {
+        let plugins = vec![
+            plugin("computer-use@openai-bundled", true),
+            plugin("unified-computer-use@openai-bundled", true),
+            plugin("codex-app-tools@openai-bundled", false),
+            plugin("browser@openai-bundled", true),
+            plugin("other@openai-bundled", true),
+        ];
+        assert_eq!(
+            compute_plugin_disables(&plugins, &[]).unwrap(),
+            vec![
+                "computer-use@openai-bundled".to_owned(),
+                "unified-computer-use@openai-bundled".to_owned(),
+            ]
+        );
+        // Absent candidates are skipped, never fabricated.
+        assert!(compute_plugin_disables(&[], &[]).unwrap().is_empty());
+        assert!(
+            compute_plugin_disables(&[plugin("browser@openai-bundled", true)], &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn plugin_disables_respect_allow_list() {
+        let plugins = vec![
+            plugin("computer-use@openai-bundled", true),
+            plugin("unified-computer-use@openai-bundled", true),
+            plugin("codex-app-tools@openai-bundled", true),
+        ];
+        // Allowing a backed server keeps its plugins enabled.
+        assert_eq!(
+            compute_plugin_disables(&plugins, &["cua_repl".to_owned()]).unwrap(),
+            vec!["codex-app-tools@openai-bundled".to_owned()]
+        );
+        // Allowing the plugin id itself also keeps it enabled.
+        assert_eq!(
+            compute_plugin_disables(&plugins, &["computer-use@openai-bundled".to_owned()]).unwrap(),
+            vec![
+                "codex-app-tools@openai-bundled".to_owned(),
+                "unified-computer-use@openai-bundled".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plugin_ids_fail_closed_on_unaddressable_segments() {
+        assert!(is_suppressible_plugin_id("computer-use@openai-bundled"));
+        for id in [
+            "owner.search",
+            "owner/server",
+            "owner server",
+            "",
+            &"x".repeat(257),
+        ] {
+            assert!(!is_suppressible_plugin_id(id), "accepted {id:?}");
+        }
+    }
+
+    #[test]
+    fn synthetic_apps_disable_is_suppressible_unless_allowed() {
+        let entry = synthetic_apps_disable(&[]).expect("synthetic disable");
+        assert_eq!(entry.name, CODEX_APPS_SERVER_NAME);
+        let command = entry.command.expect("synthetic transport");
+        assert!(!command.is_empty());
+        assert!(!command.chars().any(char::is_control));
+        assert!(is_addressable_override_name(&entry.name));
+        assert!(entry.url.is_none());
+        assert!(synthetic_apps_disable(&[CODEX_APPS_SERVER_NAME.to_owned()]).is_none());
     }
 
     #[test]
