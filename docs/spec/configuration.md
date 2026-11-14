@@ -635,8 +635,11 @@ catalog or quota failure at the next turn fails that turn honestly; it never
 selects another model or account. The cached readback behind that rule is
 `harness.models` (bounded per-route/account catalogue with freshness and
 credential identity) and the separate `harness.quota` (timestamp, scope and
-an explicit supported/unsupported/unknown status, deduplicated per account);
-neither performs an inference probe nor polls per Agent.
+an explicit supported/unsupported/unknown status with provider-verbatim
+`details` when supported: Codex `account/rateLimits/read` plus
+`account/usage/read` when useful, Muse `usage/read`; never secrets or
+personal data, deduplicated per account); neither performs an inference
+probe nor polls per Agent.
 
 Each admitted command that executes natively under a configuration
 (`launch`, `resume`, `send`) records which configuration it runs under: the

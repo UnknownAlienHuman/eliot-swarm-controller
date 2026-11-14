@@ -6,9 +6,11 @@
 //! provider/model list; Claude exposes aliases plus the CLI default, and
 //! Antigravity has no catalogue), cached per native route/account with a
 //! freshness timestamp and a nonsecret credential identity. `harness.quota`
-//! reports provider-supported account quota readback with timestamp, scope
-//! and an explicit supported/unsupported/unknown status; it performs no
-//! inference and never polls per Agent.
+//! reports provider-supported account quota readback with timestamp, scope,
+//! an explicit supported/unsupported/unknown status and provider-verbatim
+//! `details` when supported (Codex `account/rateLimits/read` plus
+//! `account/usage/read`; Muse `usage/read`); it performs no inference and
+//! never polls per Agent.
 
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -27,6 +29,9 @@ pub const MAX_HARNESS_SCOPE_BYTES: usize = 512;
 pub const MAX_HARNESS_CREDENTIAL_BYTES: usize = 256;
 /// Maximum quota note length.
 pub const MAX_HARNESS_QUOTA_NOTE_BYTES: usize = 1024;
+/// Maximum encoded bytes for structured quota details (provider-verbatim
+/// quota signals, never secrets or personal data).
+pub const MAX_HARNESS_QUOTA_DETAILS_BYTES: usize = 8192;
 /// Freshness bound for cached catalogue/quota readback: five minutes.
 pub const HARNESS_READ_TTL_MS: u64 = 300_000;
 /// Maximum freshness bound the daemon may serve.
@@ -306,6 +311,10 @@ pub const HARNESS_QUOTA_UNKNOWN: &str = "unknown";
 /// Response for `harness.quota`: provider-supported account quota readback.
 /// Carries only read-only provider signals with timestamp, scope and status;
 /// it starts no model turn, performs no inference and never polls per Agent.
+/// A `supported` response carries provider-verbatim quota signals in
+/// `details` (Codex rate-limit windows with used percent, reset time,
+/// credits and plan; Muse subscription usage windows with used percent,
+/// reset time and tier); never secrets or personal data.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessQuotaResponse {
     pub harness: String,
@@ -325,6 +334,12 @@ pub struct HarnessQuotaResponse {
     /// unsupported reason. Never a credential value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Provider-verbatim quota signals for `supported` reads (an object:
+    /// Codex `rateLimits` windows or Muse `usage` windows). Omitted unless
+    /// `status` is `supported`; never carries secrets, emails, labels or
+    /// other personal data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 impl HarnessQuotaResponse {
@@ -344,6 +359,28 @@ impl HarnessQuotaResponse {
             return Err(Error::new(
                 "invalid",
                 "harness quota note must be at most 1024 characters with no controls",
+            ));
+        }
+        if let Some(details) = self.details.as_ref() {
+            if !details.is_object() {
+                return Err(Error::new(
+                    "invalid",
+                    "harness quota details must be an object",
+                ));
+            }
+            let encoded = serde_json::to_vec(details)
+                .map_err(|_| Error::new("invalid", "harness quota details could not be encoded"))?;
+            if encoded.len() > MAX_HARNESS_QUOTA_DETAILS_BYTES {
+                return Err(Error::new(
+                    "invalid",
+                    "harness quota details exceeds 8192 encoded bytes",
+                ));
+            }
+        }
+        if self.status.as_str() != HARNESS_QUOTA_SUPPORTED && self.details.is_some() {
+            return Err(Error::new(
+                "invalid",
+                "harness quota details requires supported status",
             ));
         }
         validate_scope(&self.scope)?;
@@ -470,6 +507,7 @@ mod tests {
             credential: "ambient".to_owned(),
             status: status.to_owned(),
             note: None,
+            details: None,
         }
     }
 
@@ -522,5 +560,28 @@ mod tests {
             request.validate_response(&other).unwrap_err().code,
             "invalid"
         );
+    }
+
+    #[test]
+    fn quota_response_validates_details_object() {
+        let mut supported = quota_response(HARNESS_QUOTA_SUPPORTED);
+        supported.details = Some(serde_json::json!({
+            "rateLimits": {"primary": {"usedPercent": 12, "resetsAt": 1_700_000_000}},
+        }));
+        supported.validate().unwrap();
+        let mut non_object = quota_response(HARNESS_QUOTA_SUPPORTED);
+        non_object.details = Some(serde_json::json!([1, 2, 3]));
+        assert_eq!(non_object.validate().unwrap_err().code, "invalid");
+        let mut unsupported_with_details = quota_response(HARNESS_QUOTA_UNSUPPORTED);
+        unsupported_with_details.details = Some(serde_json::json!({"usage": {}}));
+        assert_eq!(
+            unsupported_with_details.validate().unwrap_err().code,
+            "invalid"
+        );
+        let mut oversize = quota_response(HARNESS_QUOTA_SUPPORTED);
+        oversize.details = Some(serde_json::json!({
+            "blob": "x".repeat(MAX_HARNESS_QUOTA_DETAILS_BYTES)
+        }));
+        assert_eq!(oversize.validate().unwrap_err().code, "invalid");
     }
 }

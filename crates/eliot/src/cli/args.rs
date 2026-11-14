@@ -73,9 +73,9 @@ pub(crate) enum CliCommand {
     /// Read a harness native model catalogue through its own read-only
     /// method. Starts no model turn and performs no inference.
     Models(ModelsArgs),
-    /// Read provider-supported account quota with timestamp, scope and
-    /// unsupported/unknown status. Starts no model turn and performs no
-    /// inference.
+    /// Read provider-supported account quota with timestamp, scope,
+    /// status and details when supported. Starts no model turn and performs
+    /// no inference.
     Quota(QuotaArgs),
     /// Attach to an exact native subject without taking control of it.
     Attach(AttachArgs),

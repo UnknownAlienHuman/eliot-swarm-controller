@@ -2636,11 +2636,13 @@ impl Router {
     /// Provider-supported account quota readback: timestamp, scope and an
     /// explicit supported/unsupported/unknown status, cached per account.
     /// Starts no model turn, performs no inference and never polls per
-    /// Agent. The installed Codex/Muse/OpenCode schemas expose no read-only
-    /// quota surface (their model/list and auth-list inventories carry no
-    /// quota), so those report `unsupported` naming the checked surface; a
-    /// future provider-owned read-only endpoint plugs into the match below.
-    /// A quota failure never selects another model or account.
+    /// Agent. Codex reads `account/rateLimits/read` (plus `account/usage/read`
+    /// when useful) and Muse reads `usage/read` through a dedicated metadata
+    /// reader; OpenCode/Claude/Antigravity expose no read-only quota surface,
+    /// so those report `unsupported` naming the checked surface. A method-not-
+    /// found or schema mismatch stays `unsupported` or `unknown` naming the
+    /// checked method; no numbers are fabricated. A quota failure never
+    /// selects another model or account.
     async fn harness_quota(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
         let request: eliot_core::api::HarnessQuotaRequest =
@@ -2667,17 +2669,97 @@ impl Router {
             return serde_json::to_value(hit)
                 .map_err(|_| Error::new("internal", "harness quota could not be encoded"));
         }
+        if matches!(harness.as_str(), "codex" | "muse") {
+            let Some(snapshot) = snapshot else {
+                return Err(Error::new(
+                    "internal",
+                    "live harness quota requires a frozen snapshot",
+                ));
+            };
+            let checked = match harness.as_str() {
+                "codex" => "account/rateLimits/read",
+                _ => "usage/read",
+            };
+            let response = match self.inner.plugin_host.quota(snapshot).await {
+                Ok(raw) => {
+                    let details = raw
+                        .get("details")
+                        .cloned()
+                        .filter(|details| details.is_object());
+                    match details {
+                        Some(details) => {
+                            let empty = details.as_object().is_some_and(|map| map.is_empty());
+                            let note = if harness == "codex" {
+                                Some(
+                                    "Codex quota from account/rateLimits/read \
+                                     (account/usage/read when available); windows carry used \
+                                     percent, reset time, credits and plan"
+                                        .to_owned(),
+                                )
+                            } else if empty {
+                                Some(
+                                    "Muse usage/read reports no observed subscription usage"
+                                        .to_owned(),
+                                )
+                            } else {
+                                Some(
+                                    "Muse quota from usage/read \
+                                     (window and weekly used percent, reset time, tier)"
+                                        .to_owned(),
+                                )
+                            };
+                            eliot_core::api::HarnessQuotaResponse {
+                                harness: harness.clone(),
+                                scope: scope.clone(),
+                                fetched_at_ms: now_ms(),
+                                ttl_ms: catalog::CATALOG_TTL_MS,
+                                credential: credential.clone(),
+                                status: eliot_core::api::HARNESS_QUOTA_SUPPORTED.to_owned(),
+                                note,
+                                details: Some(details),
+                            }
+                        }
+                        None => Self::quota_unavailable(
+                            &harness,
+                            &scope,
+                            &credential,
+                            checked,
+                            "unknown",
+                            format!("{checked} result did not match the installed schema"),
+                        ),
+                    }
+                }
+                Err(error) => {
+                    let message = error.message.to_ascii_lowercase();
+                    let status = if error.code == "unsupported"
+                        || message.contains("method not found")
+                        || message.contains("not implemented")
+                        || message.contains("unknown method")
+                        || message.contains("no such method")
+                    {
+                        eliot_core::api::HARNESS_QUOTA_UNSUPPORTED
+                    } else {
+                        eliot_core::api::HARNESS_QUOTA_UNKNOWN
+                    };
+                    Self::quota_unavailable(
+                        &harness,
+                        &scope,
+                        &credential,
+                        checked,
+                        status,
+                        format!("{checked}: {}", error.message),
+                    )
+                }
+            };
+            request.validate_response(&response)?;
+            self.inner
+                .catalog_cache
+                .lock_recover()
+                .insert_quota(response.clone());
+            return serde_json::to_value(response)
+                .map_err(|_| Error::new("internal", "harness quota could not be encoded"));
+        }
         let note = match harness.as_str() {
-            "codex" => Some(
-                "Codex app-server exposes no read-only account rate-limit/usage endpoint \
-                 in the installed schema; model/list carries models only"
-                    .to_owned(),
-            ),
-            "muse" => Some(
-                "Muse exposes no read-only account quota endpoint in the installed schema; \
-                 model/list carries the provider catalogue only and session/read is per-session"
-                    .to_owned(),
-            ),
             "opencode" => Some(
                 "OpenCode exposes no read-only account quota endpoint; auth list carries \
                  providers and model inventory carries limits only"
@@ -2705,6 +2787,7 @@ impl Router {
             credential: credential.clone(),
             status: eliot_core::api::HARNESS_QUOTA_UNSUPPORTED.to_owned(),
             note,
+            details: None,
         };
         request.validate_response(&response)?;
         self.inner
@@ -2713,6 +2796,31 @@ impl Router {
             .insert_quota(response.clone());
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "harness quota could not be encoded"))
+    }
+
+    fn quota_unavailable(
+        harness: &str,
+        scope: &str,
+        credential: &str,
+        checked: &str,
+        status: &str,
+        detail: String,
+    ) -> eliot_core::api::HarnessQuotaResponse {
+        const MAX_DETAIL: usize = 512;
+        let mut note = format!("{checked}; {detail}");
+        if note.len() > MAX_DETAIL {
+            note.truncate(MAX_DETAIL);
+        }
+        eliot_core::api::HarnessQuotaResponse {
+            harness: harness.to_owned(),
+            scope: scope.to_owned(),
+            fetched_at_ms: now_ms(),
+            ttl_ms: catalog::CATALOG_TTL_MS,
+            credential: credential.to_owned(),
+            status: status.to_owned(),
+            note: Some(note),
+            details: None,
+        }
     }
 
     async fn agent_history(&self, params: &Value, principal: &Principal) -> Result<Value> {

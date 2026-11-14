@@ -271,6 +271,309 @@ pub(crate) async fn list_models(
     probe_result
 }
 
+/// Read-only native account quota: a short-lived metadata reader calls
+/// `account/rateLimits/read`, plus `account/usage/read` when useful, then
+/// closes. It never starts a thread, sends input, or performs inference.
+/// Only quota signals are projected; account identity (including any email
+/// from `account/read`, which is never called) is omitted.
+pub(crate) async fn read_quota(
+    launch: NativeLaunch,
+    metadata_secrets: &[String],
+    diagnostic_secrets: &[String],
+    deadline: Instant,
+) -> Result<Value> {
+    let (mut probe, drainer, _initialized) =
+        start_initialized_reader(launch, metadata_secrets, diagnostic_secrets, deadline).await?;
+    let probe_result: Result<Value> = async {
+        let client = probe.client();
+        let rates = client
+            .call("account/rateLimits/read", json!({}), deadline)
+            .await
+            .map_err(|error| {
+                contextual_error(
+                    error,
+                    "native_readback",
+                    "Codex account/rateLimits/read did not return quota",
+                )
+            })?;
+        reject_secrets(&rates, metadata_secrets)?;
+        let mut details = project_rate_limits(&rates)?;
+        // Best-effort enrichment: token activity when the native surface
+        // offers it. A missing method or malformed payload never fails the
+        // primary rate-limit readback.
+        if let Ok(usage) = client.call("account/usage/read", json!({}), deadline).await
+            && reject_secrets(&usage, metadata_secrets).is_ok()
+            && let Some(token_usage) = project_token_usage(&usage)
+            && let Value::Object(map) = &mut details
+        {
+            map.insert("tokenUsage".to_owned(), token_usage);
+        }
+        let value = serde_json::to_value(&details).map_err(|_| invalid_page())?;
+        reject_secrets(&value, metadata_secrets)?;
+        if serde_json::to_vec(&value)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX)
+            > 8192
+        {
+            return Err(Error::new(
+                "native_readback",
+                "Codex account quota readback exceeds 8192 encoded bytes",
+            ));
+        }
+        Ok(details)
+    }
+    .await;
+    finish_reader(&mut probe, Some(drainer)).await?;
+    let probe_result = probe_result.map_err(|error| probe.client().diagnostic_error(error));
+    drop(probe);
+    probe_result
+}
+
+/// Project only quota signals from `account/rateLimits/read`. Account
+/// identifiers and any identity fields are dropped; only windows, used
+/// percent, reset time, credits and plan survive.
+fn project_rate_limits(raw: &Value) -> Result<Value> {
+    let raw = raw.as_object().ok_or_else(invalid_page)?;
+    let Some(rate_limits) = raw.get("rateLimits") else {
+        return Err(invalid_page());
+    };
+    if !rate_limits.is_object() {
+        return Err(invalid_page());
+    }
+    let mut details = serde_json::Map::new();
+    details.insert(
+        "rateLimits".to_owned(),
+        project_rate_limit_snapshot(rate_limits)?,
+    );
+    if let Some(by_limit) = raw.get("rateLimitsByLimitId") {
+        match by_limit {
+            Value::Null => {}
+            Value::Object(map) => {
+                if map.len() > 32 {
+                    return Err(invalid_page());
+                }
+                let mut projected = serde_json::Map::new();
+                for (key, snapshot) in map {
+                    check_text(key, MAX_REFERENCE_BYTES, true).map_err(|_| invalid_page())?;
+                    if !snapshot.is_object() {
+                        return Err(invalid_page());
+                    }
+                    projected.insert(key.clone(), project_rate_limit_snapshot(snapshot)?);
+                }
+                details.insert("rateLimitsByLimitId".to_owned(), Value::Object(projected));
+            }
+            _ => return Err(invalid_page()),
+        }
+    }
+    if let Some(allowed) = raw.get("ordinaryUsageAllowed") {
+        match allowed {
+            Value::Null | Value::Bool(_) => {
+                details.insert("ordinaryUsageAllowed".to_owned(), allowed.clone());
+            }
+            _ => return Err(invalid_page()),
+        }
+    }
+    if let Some(credits) = raw.get("rateLimitResetCredits") {
+        match credits {
+            Value::Null => {
+                details.insert("rateLimitResetCredits".to_owned(), Value::Null);
+            }
+            Value::Object(_) => {
+                details.insert(
+                    "rateLimitResetCredits".to_owned(),
+                    project_reset_credits(credits)?,
+                );
+            }
+            _ => return Err(invalid_page()),
+        }
+    }
+    Ok(Value::Object(details))
+}
+
+fn project_rate_limit_snapshot(snapshot: &Value) -> Result<Value> {
+    let snapshot = snapshot.as_object().ok_or_else(invalid_page)?;
+    let mut out = serde_json::Map::new();
+    for key in ["primary", "secondary"] {
+        match snapshot.get(key) {
+            None | Some(Value::Null) => {}
+            Some(window) => {
+                out.insert(key.to_owned(), project_rate_window(window)?);
+            }
+        }
+    }
+    match snapshot.get("planType") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(plan)) => {
+            check_text(plan, 64, true).map_err(|_| invalid_page())?;
+            out.insert("planType".to_owned(), Value::String(plan.clone()));
+        }
+        Some(_) => return Err(invalid_page()),
+    }
+    for key in ["limitId", "limitName"] {
+        match snapshot.get(key) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(name)) => {
+                check_text(name, 128, true).map_err(|_| invalid_page())?;
+                out.insert(key.to_owned(), Value::String(name.clone()));
+            }
+            Some(_) => return Err(invalid_page()),
+        }
+    }
+    match snapshot.get("credits") {
+        None | Some(Value::Null) => {}
+        Some(credits) => {
+            out.insert("credits".to_owned(), project_credits(credits)?);
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+fn project_rate_window(window: &Value) -> Result<Value> {
+    let window = window.as_object().ok_or_else(invalid_page)?;
+    let used = window
+        .get("usedPercent")
+        .and_then(Value::as_i64)
+        .ok_or_else(invalid_page)?;
+    if !(0..=1000).contains(&used) {
+        return Err(invalid_page());
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("usedPercent".to_owned(), Value::from(used));
+    match window.get("windowDurationMins") {
+        None | Some(Value::Null) => {}
+        Some(value) => {
+            let mins = value.as_i64().ok_or_else(invalid_page)?;
+            if mins <= 0 || mins > 1_000_000 {
+                return Err(invalid_page());
+            }
+            out.insert("windowDurationMins".to_owned(), Value::from(mins));
+        }
+    }
+    match window.get("resetsAt") {
+        None | Some(Value::Null) => {}
+        Some(value) => {
+            let resets = value.as_i64().ok_or_else(invalid_page)?;
+            if resets < 0 {
+                return Err(invalid_page());
+            }
+            out.insert("resetsAt".to_owned(), Value::from(resets));
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+fn project_credits(credits: &Value) -> Result<Value> {
+    let credits = credits.as_object().ok_or_else(invalid_page)?;
+    let mut out = serde_json::Map::new();
+    for key in ["hasCredits", "unlimited"] {
+        let flag = credits
+            .get(key)
+            .and_then(Value::as_bool)
+            .ok_or_else(invalid_page)?;
+        out.insert(key.to_owned(), Value::from(flag));
+    }
+    match credits.get("balance") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(balance)) => {
+            check_text(balance, 64, true).map_err(|_| invalid_page())?;
+            out.insert("balance".to_owned(), Value::String(balance.clone()));
+        }
+        Some(_) => return Err(invalid_page()),
+    }
+    Ok(Value::Object(out))
+}
+
+fn project_reset_credits(credits: &Value) -> Result<Value> {
+    let credits = credits.as_object().ok_or_else(invalid_page)?;
+    let available = credits
+        .get("availableCount")
+        .and_then(Value::as_i64)
+        .ok_or_else(invalid_page)?;
+    if !(0..=1_000_000).contains(&available) {
+        return Err(invalid_page());
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("availableCount".to_owned(), Value::from(available));
+    match credits.get("credits") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(rows)) => {
+            if rows.len() > 32 {
+                return Err(invalid_page());
+            }
+            let mut projected_rows = Vec::with_capacity(rows.len());
+            for row in rows {
+                projected_rows.push(project_reset_credit(row)?);
+            }
+            out.insert("credits".to_owned(), Value::Array(projected_rows));
+        }
+        Some(_) => return Err(invalid_page()),
+    }
+    Ok(Value::Object(out))
+}
+
+fn project_reset_credit(row: &Value) -> Result<Value> {
+    let row = row.as_object().ok_or_else(invalid_page)?;
+    let mut out = serde_json::Map::new();
+    for key in ["status", "resetType"] {
+        match row.get(key) {
+            Some(Value::String(value)) => {
+                check_text(value, 64, true).map_err(|_| invalid_page())?;
+                out.insert(key.to_owned(), Value::String(value.clone()));
+            }
+            _ => return Err(invalid_page()),
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+fn project_token_usage(raw: &Value) -> Option<Value> {
+    let raw = raw.as_object()?;
+    let summary = raw.get("summary")?.as_object()?;
+    let mut out = serde_json::Map::new();
+    for key in [
+        "lifetimeTokens",
+        "currentStreakDays",
+        "longestStreakDays",
+        "peakDailyTokens",
+        "longestRunningTurnSec",
+    ] {
+        match summary.get(key) {
+            None | Some(Value::Null) => {}
+            Some(value) => {
+                let number = value.as_i64()?;
+                if number < 0 {
+                    return None;
+                }
+                out.insert(key.to_owned(), Value::from(number));
+            }
+        }
+    }
+    match raw.get("dailyUsageBuckets") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(buckets)) => {
+            if buckets.len() > 31 {
+                return None;
+            }
+            let mut projected = Vec::with_capacity(buckets.len());
+            for bucket in buckets {
+                let bucket = bucket.as_object()?;
+                let date = bucket.get("startDate")?.as_str()?;
+                if date.len() > 32 || date.trim().is_empty() {
+                    return None;
+                }
+                let tokens = bucket.get("tokens")?.as_i64()?;
+                if tokens < 0 {
+                    return None;
+                }
+                projected.push(json!({"startDate": date, "tokens": tokens}));
+            }
+            out.insert("dailyUsageBuckets".to_owned(), Value::Array(projected));
+        }
+        Some(_) => return None,
+    }
+    Some(Value::Object(out))
+}
+
 /// Project the effective `mcp_servers` table keys. Absent means no
 /// configured servers; anything else must be an object.
 fn mcp_server_names(config_response: &Value) -> Result<Vec<String>> {

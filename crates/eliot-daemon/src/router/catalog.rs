@@ -250,6 +250,7 @@ mod tests {
             credential: "ambient".to_owned(),
             status: "unsupported".to_owned(),
             note: None,
+            details: None,
         };
         cache.insert_quota(entry);
         assert!(
@@ -277,6 +278,7 @@ mod tests {
                 credential: "ambient".to_owned(),
                 status: "unsupported".to_owned(),
                 note: None,
+                details: None,
             });
         }
         assert!(cache.len().1 <= MAX_CACHED_SCOPES);

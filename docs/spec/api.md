@@ -925,9 +925,17 @@ retained verbatim and a failed read never selects another model or account.
 `harness.quota` (`HarnessQuotaRequest`/`HarnessQuotaResponse`) is the separate
 provider-supported account quota readback: timestamp (`fetched_at_ms`,
 `ttl_ms`), `scope` and `credential` as above, plus an explicit `status` of
-`supported`, `unsupported` or `unknown` naming the checked native surface.
-The installed Codex/Muse/OpenCode schemas expose no read-only quota endpoint,
-so they report `unsupported`; support stays provider-gated and never comes
+`supported`, `unsupported` or `unknown` naming the checked native surface and,
+when `supported`, provider-verbatim quota signals in `details` (an object, at
+most 8192 encoded bytes; never secrets or personal data). Codex reads
+`account/rateLimits/read` plus `account/usage/read` when useful (windows with
+used percent, reset time, credits and plan; `account/read` is never called so
+no email enters the response, logs or Store); Muse reads `usage/read`
+(window and weekly used percent, reset time, tier and arrival stamp; an empty
+`details` object means the host observed nothing and no numbers are
+fabricated). A method-not-found or schema mismatch stays `unsupported` or
+`unknown` naming the checked method. OpenCode/Claude/Antigravity expose no
+read-only quota endpoint, so they report `unsupported`. Support never comes
 from an inference probe or per-Agent polling. Both reads are owner-only,
 read-only, deduplicated per account through the same bounded per-scope cache,
 and start no model turn and no inference
