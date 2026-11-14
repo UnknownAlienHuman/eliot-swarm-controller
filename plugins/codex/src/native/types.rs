@@ -495,6 +495,59 @@ pub struct NativeTurnCompletedNotification {
     pub turn: NativeTurn,
 }
 
+/// One per-response token delta from installed 0.167.1
+/// `thread/tokenUsage/updated` (`tokenUsage.last`). Usage flows once per
+/// upstream model response inside a turn (see the installed
+/// `RawResponseCompletedNotification`: "the exact usage from one upstream
+/// Responses API completion", keyed by turn), so `last` is the latest
+/// response's delta, not the whole turn. The sibling `total` is the
+/// cumulative per-thread snapshot and `modelContextWindow` is capacity:
+/// neither is per-turn expenditure and neither is mapped to turn usage
+/// directly; the turn total is `total` minus the turn-start baseline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTokenUsageDelta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_input_tokens: Option<i64>,
+}
+
+/// Fresh `thread/tokenUsage/updated` notification (required: threadId +
+/// turnId + tokenUsage). `tokenUsage.last` is the latest per-response delta
+/// and `tokenUsage.total` the cumulative per-thread snapshot; turn
+/// expenditure is their difference against the turn-start baseline, never a
+/// raw `last`. `modelContextWindow` (capacity) stays unmapped so context
+/// occupancy can never read as turn tokens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeThreadTokenUsageUpdatedNotification {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub token_usage: NativeThreadTokenUsage,
+}
+
+/// Installed 0.167.1 `ThreadTokenUsage` body: `last` is the latest
+/// per-response delta for `turnId`, `total` the cumulative per-thread
+/// snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeThreadTokenUsage {
+    pub last: NativeTokenUsageDelta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<NativeTokenUsageDelta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_window: Option<i64>,
+}
+
 /// Assistant phase hint (fresh `MessagePhase`); `None` means unknown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

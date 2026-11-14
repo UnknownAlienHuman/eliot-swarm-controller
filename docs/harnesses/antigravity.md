@@ -198,10 +198,19 @@ The terminal `session/prompt` response (`stopReason`) is authoritative
 for turn completion, correlated with the single outstanding prompt
 prepared before dispatch in the same uninterrupted process. A soft-denied
 tool remains visible as a failed `tool_call_update` even under a
-successful final turn. Cumulative usage is not reported by ACP prompt
-responses, so snapshots carry `usage: null` and terminal facts carry no
-usage counters; requested, verified and served model are separate facts
-and one never stands in for another.
+successful final turn. ACP prompt responses report no usage counters, so
+snapshots carry `usage: null` and terminal facts carry no usage counters;
+requested, verified and served model are separate facts and one never
+stands in for another. ACP v1 `usage_update` carries context occupancy
+(`used` tokens currently in context, `size` context-window capacity) and
+optional cumulative session `cost` with its currency/unit: session-scoped
+facts, not per-turn input/output totals. The adapter ignores them for turn
+attribution, so occupancy changes (compaction can reduce `used`) can never
+read as token expenditure. Live emission of `usage_update` by the
+installed `agy` 1.5.3 server was not exercised (no model calls in this
+increment); when surfaced, occupancy and cost belong in separate
+session-scoped facts with units, source identity and freshness, never in
+`TurnUsage`.
 
 There is no replay cursor/history API. Snapshots expose retained stream
 facts, not a native history poll. Loss means an explicit gap. Do not

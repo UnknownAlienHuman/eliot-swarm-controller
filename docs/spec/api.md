@@ -46,7 +46,10 @@ and its response; the daemon bounds that write with `RESPONSE_WRITE_TIMEOUT`
 cannot hold its connection task past the deadline. An undelivered mutation result stays
 readable by exact retry; the daemon never replays the effect to deliver it.
 
-Background `daemon` startup reports `starting`; use `daemon.status` for readiness.
+Background `daemon` startup reports `starting`, then waits up to 30 s for
+`daemon.status` readiness and reports `ready` with the resolved data
+directory and boot id, or the logged `daemon.failed` code with its bounded
+sanitized diagnostics.
 Windows starts that independent process without inheriting caller handles, so captured
 CLI stdout/stderr reach EOF while the daemon remains alive. Its own private IPC and
 owned plugin/workspace custody establish subsequent authority.
@@ -1105,19 +1108,19 @@ The synopsis is target grammar; later-layer forms are not an inventory of curren
 swarm daemon [--foreground]
 swarm daemon stop [--drain|--force]
 swarm status
-swarm launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [PROMPT] [--wait]
+swarm launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [PROMPT] [--wait] [--timeout-seconds N]
 swarm worktree remove AGENT [--generation N]
 swarm ls | show A | watch [A|SELECTOR] [--after SEQ] | top
 swarm processes A [--scope agent|workspace] [--generation N] [--after CURSOR] [--limit N]
 swarm stats A [--generation N]
 swarm git-status A [--generation N]
 swarm edits A [--generation N] [--after PATH] [--limit N]
-swarm send A TEXT [--probe] [--wait] [--generation N]
+swarm send A TEXT [--probe] [--wait] [--timeout-seconds N] [--generation N]
 swarm steer A TEXT [--generation N] [--turn ID]
 swarm inject A TEXT --point next_input|turn_safe_point|active_turn [--generation N] [--turn ID] [--expires-at-ms MS]
 swarm interrupt|abort A [--generation N] [--turn ID]
 swarm stop A [--force] [--tree | --generation N]
-swarm resume A [PROMPT] [--wait]
+swarm resume A [PROMPT] [--wait] [--timeout-seconds N]
 swarm wait --all|--any --timeout-seconds N ID...
 swarm result A [--generation N] [--turns N]
 swarm turn show|resolve ...
@@ -1147,6 +1150,28 @@ In particular, `cmd cancel` is not an implemented CLI form. `cmd show`,
 `cmd children`, `cmd resolve`, and `turn resolve` are available; `turn show`
 remains unavailable. `swarm wait` implements only the frozen `--all`/`--any` set form
 above; single-target `--for turn|idle|stopped|goal` forms remain future (`agent.wait`).
+
+`swarm daemon` (background) prints `starting` with the resolved data directory
+and log path, then polls `daemon.status` for up to 30 s. It prints `ready`
+with the resolved data directory and boot id on success, or fails nonzero
+with the logged `daemon.failed` code newer than this start plus the last
+bounded sanitized diagnostics and the log path. The tail is read boundedly
+(64 KiB, 64 records) from the resolved private data directory only, and only
+codes, ids and the existing sanitized diagnostics are printed. `--foreground`
+runs the daemon in this process and is unchanged. No ACL bypass and no
+automatic store migration or repair occur.
+
+`swarm status` and the start output include the resolved data directory, so
+`--data-dir`, `ELIOT_HOME` and default-location differences are visible. When
+a client cannot reach the daemon pipe, the error names whether daemon
+metadata, lock and log files exist for that data directory and includes the
+last `daemon.failed` code from the bounded log tail when present and recent.
+It never prints secrets.
+
+`resume --wait` accepts the same `--timeout-seconds` handling as
+`launch`/`send`. When a launch or resume with new text fails and its linked
+SEND is cancelled as a result, a prompted wait reports the parent start
+failure rather than only the linked cancellation.
 
 Only current-layer commands appear in help and Agent guidance. Exit codes: 0 success/
 queued; 1 definite failure; 2 usage; 3 pre-effect rejection; 4 unknown; 5 wait timeout;

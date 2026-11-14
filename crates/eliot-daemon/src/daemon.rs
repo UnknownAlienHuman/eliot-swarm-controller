@@ -8,13 +8,16 @@ use crate::{
     router::Router,
 };
 use eliot_core::{
-    Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SecretPolicy, bound_stderr_diagnostics,
+    Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SecretPolicy, StderrDiagnostic,
+    bound_stderr_diagnostics,
 };
 use eliot_plugin::{RpcError, RpcRequest, RpcResponse};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -565,10 +568,13 @@ async fn client_call_with_identity(
     params: Value,
     identity: ClientIdentity,
 ) -> Result<Value> {
-    let data_dir = DataDir::open_existing(path)?;
+    let data_dir = DataDir::open_existing(path).map_err(|error| with_connect_hint(path, error))?;
     let info = data_dir
-        .read_daemon_info()?
-        .ok_or_else(|| Error::new("unavailable", "daemon is not running"))?;
+        .read_daemon_info()
+        .map_err(|error| with_connect_hint(path, error))?
+        .ok_or_else(|| {
+            with_connect_hint(path, Error::new("unavailable", "daemon is not running"))
+        })?;
     let auth = match identity {
         ClientIdentity::Owner => {
             let token = data_dir.read_owner_token()?;
@@ -598,7 +604,9 @@ async fn client_call_with_identity(
     };
     let credential = auth["credential"].as_str().unwrap_or("");
     let policy = SecretPolicy::new([credential]);
-    raw_client_call(&info.endpoint, method, params, auth, &policy).await
+    raw_client_call(&info.endpoint, method, params, auth, &policy)
+        .await
+        .map_err(|error| with_connect_hint(path, error))
 }
 
 fn validate_client_call(method: &str, params: &Value) -> Result<()> {
@@ -627,16 +635,21 @@ pub async fn client_call_with_owner_credential(
             "daemon RPC requires a method and object params",
         ));
     }
-    let data_dir = DataDir::open_existing(path)?;
+    let data_dir = DataDir::open_existing(path).map_err(|error| with_connect_hint(path, error))?;
     let info = data_dir
-        .read_daemon_info()?
-        .ok_or_else(|| Error::new("unavailable", "daemon is not running"))?;
+        .read_daemon_info()
+        .map_err(|error| with_connect_hint(path, error))?
+        .ok_or_else(|| {
+            with_connect_hint(path, Error::new("unavailable", "daemon is not running"))
+        })?;
     let auth = json!({
         "kind": "owner",
         "credential": owner_credential,
     });
     let policy = SecretPolicy::new([owner_credential]);
-    raw_client_call(&info.endpoint, method, params, auth, &policy).await
+    raw_client_call(&info.endpoint, method, params, auth, &policy)
+        .await
+        .map_err(|error| with_connect_hint(path, error))
 }
 
 /// HTTP bridge only: signed identity has already been checked at the origin.
@@ -651,14 +664,21 @@ pub async fn client_call_with_remote_context(
     if method.trim().is_empty() || !params.is_object() {
         return Err(Error::new("invalid", "invalid remote RPC"));
     }
-    let data_dir = DataDir::open_existing(path)?;
+    let data_dir = DataDir::open_existing(path).map_err(|error| with_connect_hint(path, error))?;
     let info = data_dir
-        .read_daemon_info()?
-        .ok_or_else(|| Error::new("unavailable", "daemon is not running"))?;
-    let token = data_dir.read_owner_token()?;
+        .read_daemon_info()
+        .map_err(|error| with_connect_hint(path, error))?
+        .ok_or_else(|| {
+            with_connect_hint(path, Error::new("unavailable", "daemon is not running"))
+        })?;
+    let token = data_dir
+        .read_owner_token()
+        .map_err(|error| with_connect_hint(path, error))?;
     let policy = SecretPolicy::new([token.as_str()]);
     let auth = json!({"kind":"owner", "credential": token, "remote_call": remote});
-    let result = raw_client_call(&info.endpoint, method, params, auth, &policy).await?;
+    let result = raw_client_call(&info.endpoint, method, params, auth, &policy)
+        .await
+        .map_err(|error| with_connect_hint(path, error))?;
     let echoed: eliot_core::RemoteCallContext =
         serde_json::from_value(result["remote_call"].clone())
             .map_err(|_| Error::new("unknown", "daemon omitted verified remote call binding"))?;
@@ -1130,6 +1150,152 @@ fn check_frame_size(frame: &str) -> Result<()> {
     }
 }
 
+/// Bounded startup-failure record from the private daemon log. Only the
+/// sanitized `error_code`, timestamp and already-redacted diagnostics are
+/// exposed; no raw messages or request payloads are ever read here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DaemonStartupFailure {
+    pub error_code: String,
+    pub ts_ms: u128,
+    pub diagnostics: Vec<StderrDiagnostic>,
+}
+
+const LOG_TAIL_BYTES: u64 = 64 * 1024;
+const LOG_TAIL_RECORDS: usize = 64;
+
+/// Newest `daemon.failed` record in the bounded log tail, if any.
+pub fn last_daemon_failure(data_dir: &Path) -> Option<DaemonStartupFailure> {
+    read_log_failures(data_dir).into_iter().next_back()
+}
+
+/// Newest `daemon.failed` record at or after `since_ms`, if any. Callers pass
+/// the start instant captured before spawning so an old failure is never
+/// reported for a new start.
+pub fn daemon_failure_since(data_dir: &Path, since_ms: u128) -> Option<DaemonStartupFailure> {
+    read_log_failures(data_dir)
+        .into_iter()
+        .rfind(|failure| failure.ts_ms >= since_ms)
+}
+
+fn read_log_failures(data_dir: &Path) -> Vec<DaemonStartupFailure> {
+    // Only the resolved private data dir is ever read. An unvalidated or
+    // missing root yields no records rather than an error with paths.
+    if DataDir::open_existing(data_dir).is_err() {
+        return Vec::new();
+    }
+    let log_path = data_dir.join("logs").join("daemon.log");
+    let mut file = match File::open(&log_path) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+    let size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let offset = size.saturating_sub(LOG_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return Vec::new();
+    }
+    let mut bytes = Vec::new();
+    // Bounded tail: at most 64 KiB plus the current line.
+    if file
+        .take(LOG_TAIL_BYTES.saturating_add(4096))
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let start = if offset > 0 {
+        // Skip a possible partial first line when seeking into the file.
+        text.find('\n').map(|index| index + 1).unwrap_or(text.len())
+    } else {
+        0
+    };
+    let mut failures = Vec::new();
+    let tail: Vec<&str> = text[start..].lines().rev().take(LOG_TAIL_RECORDS).collect();
+    for line in tail.into_iter().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if value.get("code").and_then(Value::as_str) != Some("daemon.failed") {
+            continue;
+        }
+        let ts_ms = value
+            .get("ts")
+            .and_then(Value::as_u64)
+            .map(|ts| ts as u128)
+            .unwrap_or(0);
+        let error_code = value
+            .get("error_code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .chars()
+            .take(64)
+            .collect::<String>();
+        let diagnostics = value
+            .get("diagnostics")
+            .and_then(|diagnostics| {
+                serde_json::from_value::<Vec<StderrDiagnostic>>(diagnostics.clone()).ok()
+            })
+            .unwrap_or_default();
+        failures.push(DaemonStartupFailure {
+            error_code,
+            ts_ms,
+            diagnostics,
+        });
+    }
+    failures
+}
+
+/// Bounded connect hint for an unreachable daemon. Names only lock/log
+/// presence and the last sanitized `daemon.failed` code; never secrets.
+pub fn daemon_connect_hint(data_dir: &Path) -> String {
+    let metadata = data_dir.join("daemon.json");
+    let lock = data_dir.join("daemon.lock");
+    let log = data_dir.join("logs").join("daemon.log");
+    let metadata_state = if metadata.is_file() {
+        "daemon metadata present"
+    } else {
+        "no daemon metadata"
+    };
+    let lock_state = if lock.is_file() {
+        "daemon lock present"
+    } else {
+        "no daemon lock"
+    };
+    let log_state = if log.is_file() {
+        "daemon log present"
+    } else {
+        "no daemon log"
+    };
+    let failure_state = match last_daemon_failure(data_dir) {
+        Some(failure) => format!("last failure {}", failure.error_code),
+        None => "no daemon.failed record".to_owned(),
+    };
+    format!(
+        "hint: data_dir={}; {metadata_state}; {lock_state}; {log_state}; {failure_state}",
+        data_dir.display()
+    )
+}
+
+fn with_connect_hint(path: &Path, mut error: Error) -> Error {
+    if !matches!(
+        error.code.as_str(),
+        "unavailable" | "platform_io" | "data_dir_unavailable"
+    ) {
+        return error;
+    }
+    let hint = daemon_connect_hint(path);
+    if !error.message.contains("hint: data_dir=") {
+        error.message = format!("{}; {}", error.message, hint);
+        bound_stderr_diagnostics(&mut error.diagnostics, MAX_STDERR_DIAGNOSTIC_BYTES);
+    }
+    error
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1478,5 +1644,75 @@ mod tests {
             .await
             .expect("peer reads the frame");
         assert_eq!(line, "ok\n");
+    }
+
+    #[test]
+    fn daemon_failure_tail_reports_only_codes_and_ids() {
+        let root = std::env::temp_dir().join(format!("eliot startup failure {}", Ulid::new()));
+        std::fs::create_dir_all(&root).expect("test root");
+        struct Guard(std::path::PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(root.clone());
+        let data = DataDir::open(&root).expect("private test data dir");
+        let logs = data.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        let old_ts = 1_700_000_000_000_u64;
+        let new_ts = 1_800_000_000_000_u64;
+        let secret = "connect-hint-secret-value";
+        let old = serde_json::json!({
+            "ts": old_ts,
+            "code": "daemon.failed",
+            "error_code": "old_code",
+        });
+        let unrelated = serde_json::json!({
+            "ts": new_ts,
+            "code": "daemon.ready",
+            "ids": {"boot_id": "boot-1"},
+        });
+        let diagnostic = serde_json::json!([{
+            "source": "harness",
+            "snapshot": {"text": "sanitized tail", "truncated": false, "eof": true, "read_error": false},
+        }]);
+        let mut new_record = serde_json::json!({
+            "ts": new_ts,
+            "code": "daemon.failed",
+            "error_code": "frame_too_large",
+            "diagnostics": diagnostic,
+        });
+        // A request payload must never enter the log tail report even if
+        // written by a faulty emitter.
+        new_record["request"] = serde_json::json!(secret);
+        std::fs::write(
+            logs.join("daemon.log"),
+            format!("{old}\n{unrelated}\n{new_record}\n"),
+        )
+        .expect("write test log");
+        let since_old = daemon_failure_since(data.path(), old_ts as u128)
+            .expect("failure at or after the old timestamp");
+        assert_eq!(since_old.error_code, "frame_too_large");
+        assert_eq!(since_old.ts_ms, new_ts as u128);
+        assert_eq!(since_old.diagnostics.len(), 1);
+        // An old failure is never reported for a new start.
+        assert!(
+            daemon_failure_since(data.path(), new_ts as u128 + 1).is_none(),
+            "old failure must not leak into a newer start"
+        );
+        let hint = daemon_connect_hint(data.path());
+        assert!(hint.contains("frame_too_large"), "hint names the code");
+        assert!(
+            hint.contains("daemon log present"),
+            "hint names log presence"
+        );
+        assert!(!hint.contains(secret), "hint never prints secrets");
+        let serialized = serde_json::to_string(&serde_json::json!({
+            "error_code": since_old.error_code,
+            "diagnostics": since_old.diagnostics,
+        }))
+        .expect("failure JSON");
+        assert!(!serialized.contains(secret));
     }
 }
