@@ -581,18 +581,44 @@ pub(crate) fn harness_installation(harness: &str) -> Value {
     }
 }
 
+/// Bound on one `<exe> --version` probe: a hung native executable must not
+/// stall `harness.list` for every harness.
+const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn native_version(program: &str) -> Value {
-    let output = std::process::Command::new(program)
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let Ok(mut child) = Command::new(program)
         .arg("--version")
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_owned();
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return Value::Null;
+    };
+    let deadline = std::time::Instant::now() + VERSION_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            // Timed out or unwaitable: kill only the child this probe started.
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    match status {
+        Some(status) if status.success() => {
+            let text = stdout.lines().next().unwrap_or_default().trim().to_owned();
             if text.is_empty() || text.len() > 256 {
                 Value::Null
             } else {

@@ -76,7 +76,7 @@ defaults for that harness plus the supplied flags, reproducible and
 replay-safe. Requested `model`/`effort` may be omitted; the freeze records the
 requested value as absent separately from the effective value the harness
 resolves at start (Codex `model/list` default entry and its default effort,
-Muse `model/list` default, Claude CLI default with `--model`/`--effort`
+Muse server default (after proving the `model/list` catalogue is non-empty; Muse names no default marker), Claude CLI default with `--model`/`--effort`
 omitted and effective read back, OpenCode configured default model), never a
 silent substitution: an unavailable requested model fails honestly. Authority
 fields default to the safe posture (Codex `workspace-write` + `never`,
