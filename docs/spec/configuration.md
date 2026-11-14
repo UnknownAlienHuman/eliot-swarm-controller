@@ -223,10 +223,18 @@ load, and a non-empty allow list requires `minimal`.
 `inherit` keeps the current behavior: the worker receives Eliot's
 Agent-scoped server in addition to the owner's native MCP surface.
 `minimal` starts only the intended MCP surface: Eliot's Agent-scoped server
-plus the explicitly allowed native servers. Eliot's scoped
-`swarm mcp --require-agent` server is always present in both policies, and
-no policy edits the owner's global native config, copies `auth.json`, or
-changes native-store/observer bindings.
+plus the explicitly allowed native servers, with every other enumerated
+`mcp_servers` entry disabled through transport-carrying per-run `-c`
+overrides, the known MCP-serving bundled plugins (`computer-use`,
+`unified-computer-use`, `codex-app-tools`) disabled when present and
+enabled, and the ChatGPT-backed Apps runtime (`codex_apps`) suppressed by
+a synthetic transport-carrying disable. An explicit `mcp_allow` entry for a
+plugin-backed server, plugin, or `codex_apps` keeps it enabled. No
+prompt-surface flags are pinned: the policy is a tool-surface policy and
+must not silently change worker capabilities or safety context. Eliot's
+scoped `swarm mcp --require-agent` server is always present in both
+policies, and no policy edits the owner's global native config, copies
+`auth.json`, or changes native-store/observer bindings.
 
 Only the Codex and Claude harnesses implement `minimal`, each with its
 installed isolation mechanism; Muse, OpenCode and Antigravity keep
@@ -239,7 +247,11 @@ because it requires `minimal`). See the owning harness pages. Requested vs
 observed: the
 effective server set is reported from native readback only where the harness
 supports it (`mcp_servers` with `mcp_servers_verified`); otherwise it stays
-unknown (`null` / unverified), never an echo of the requested set.
+unknown (`null` / unverified), never an echo of the requested set. Codex
+`minimal` verification fails closed on any unexpected server in any
+non-disabled state: the synthetic `codex_apps` disable and the bundled
+plugin suppressions make those runtimes report `disabled` (absent from the
+inventory), so anything else unexpected fails the start.
 
 ## Owner workspace setup
 
