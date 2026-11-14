@@ -223,6 +223,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `agent.git/edits` | current Git snapshot and paginated native-attributed edits |
 | `command.submit/get` | implemented immutable admission and command readback |
 | `turn.get` | implemented running/completed/unknown turn read |
+| `swarm.wait` | bounded wait over a frozen child command/turn set with all/any, timeout and honest per-entry outcomes |
 | `command.resolve`, `turn.resolve` | constrained owner resolution of unknown outcomes; owner-only |
 | `command.children` | implemented scoped, paged child readback for a retained expansion |
 | `project.list/get` | owner-only read of registered project authority |
@@ -518,8 +519,10 @@ hold at dispatch before native I/O. Over-limit hierarchy admission reads `fanout
 
 The current `command.submit` request has no `wait_ms`, and the daemon does not expose an
 `agent.wait` method. CLI `--wait` follows command and turn readbacks with a bounded client
-deadline; timeout does not cancel the admitted command. Server-side wait semantics below
-are retained for a future API layer, not part of the current request shape.
+deadline; timeout does not cancel the admitted command. `swarm.wait` below is the
+implemented bounded server wait over a frozen child command/turn set. Single-target
+server-side wait semantics further below are retained for a future API layer, not part
+of the current request shape.
 
 Generation-changing dispatch follows [core](core.md#generation-fence): advance and
 revoke before native I/O, no rollback, no replay after unknown. Terminal settlement
@@ -652,8 +655,11 @@ page is empty; a mismatch is the same fixed `unknown` error.
 
 `swarm cmd show`, `swarm cmd children` and `swarm result` exit 0 after a valid read
 even if a returned command or turn is `unknown`; that state is not a successful task
-outcome. The `swarm wait` flow treats an `unknown` command or turn as exit 4. A binding
-mismatch is also unknown and must not print the mismatched response.
+outcome. A binding mismatch is unknown and must not print the mismatched response.
+`swarm wait` prints its per-entry snapshot and exits 0 only when every waited entry
+succeeded (`--all`) or at least one succeeded (`--any`); timeout or an uncompleted
+snapshot exits 5, interrupted entries exit 7, `unknown`/`not_found`/`not_visible`
+entries exit 4, and plain failures exit 1.
 
 ## Input, turn and unknown gates
 
@@ -744,9 +750,29 @@ are defined in [monitoring](monitoring.md#provider-holds).
 
 ## Waiting
 
-The following server-side wait semantics are a future API contract; they do not add
-`agent.wait` to the current method set. Current CLI `--wait` behavior is described under
-Command admission.
+`swarm.wait` is the implemented bounded completion wait over an explicitly captured
+child set. The request carries `commands` (command ids) and/or `turns` (exact
+`agent`/`generation`/`turn_id` bindings), `mode` (`all` completes when every entry is
+terminal; `any` completes when any entry is terminal), and `wait_ms` (clamped to 30,000,
+matching `events.subscribe`). The set is frozen at request time: later turns or new
+children never join it. A child being idle is not success; each entry reports the
+terminal outcome of its exact captured command or turn. Per-entry `status` is one of
+`succeeded`, `failed`, `interrupted` or `unknown` (from the canonical `TurnOutcome`),
+`still_running` at timeout, or `not_found`/`not_visible` for ids outside the caller's
+scope. An Agent caller may wait only on what its frozen control scope permits, the same
+rule as `agent.list` and direct reads; the set holds at most 256 entries. The daemon
+reuses existing command/turn readback and its event bus for wakeups; there is no
+scheduler, digest, or persistent workflow. Run and project-rule principals are rejected;
+Owner and Agent principals are allowed. Timeout never cancels admitted work. The CLI is
+`swarm wait --all|--any --timeout-seconds N ID...`, where an `ID` containing `/` is an
+exact `agent/generation/turn_id` turn ref and any other `ID` is a command id. Exit codes
+follow the read section: 0 only when every entry succeeded (`--all`) or at least one
+succeeded (`--any`), 5 on timeout, 7 when an entry was interrupted, 4 for
+`unknown`/`not_found`/`not_visible`, 1 for plain failure.
+
+The following single-target server-side wait semantics are a future API contract; they
+do not add `agent.wait` to the current method set. Current CLI `--wait` behavior is
+described under Command admission.
 
 Capture generation at call start. `turn --after-command ID` follows that input's exact
 association/result; without an id, capture the current turn or the first after the call
@@ -1092,7 +1118,7 @@ swarm inject A TEXT --point next_input|turn_safe_point|active_turn [--generation
 swarm interrupt|abort A [--generation N] [--turn ID]
 swarm stop A [--force] [--tree | --generation N]
 swarm resume A [PROMPT] [--wait]
-swarm wait TARGET... [--for turn|idle|stopped|goal] [--after-command ID]
+swarm wait --all|--any --timeout-seconds N ID...
 swarm result A [--generation N] [--turns N]
 swarm turn show|resolve ...
 swarm approve|deny A [--request R] [--choice ID] [--feedback TEXT] | answer ... [--request R]
@@ -1119,7 +1145,8 @@ swarm plugin NAME | plugin-test ... | hook ... | mcp
 
 In particular, `cmd cancel` is not an implemented CLI form. `cmd show`,
 `cmd children`, `cmd resolve`, and `turn resolve` are available; `turn show`
-remains unavailable.
+remains unavailable. `swarm wait` implements only the frozen `--all`/`--any` set form
+above; single-target `--for turn|idle|stopped|goal` forms remain future (`agent.wait`).
 
 Only current-layer commands appear in help and Agent guidance. Exit codes: 0 success/
 queued; 1 definite failure; 2 usage; 3 pre-effect rejection; 4 unknown; 5 wait timeout;

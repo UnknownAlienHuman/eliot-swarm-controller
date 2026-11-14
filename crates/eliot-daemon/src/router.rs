@@ -27,7 +27,8 @@ use crate::{
 use eliot_core::{
     Agent, AgentOrigin, AgentState, Command, CommandState, Error, Event, FrozenScriptContext,
     FrozenScriptRun, NativeStoreBinding, Result, RunDefinitionArgs, ScriptProcessResult,
-    SecretPolicy, SubmitCommand, Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
+    SecretPolicy, SubmitCommand, Turn, TurnOutcome, TurnState, WorkspacePhase,
+    WorkspacePreparationInput,
     api::{
         AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
         AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
@@ -37,12 +38,13 @@ use eliot_core::{
         CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
         DaemonStatusResponse, DiscoverPage, EmitDefinitionArgs, EventsBoundsRequest, EventsFilter,
         EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
-        GitFetchDefinitionArgs, GitView, MAX_OBSERVATION_PAGE_BYTES, NotifyDefinitionArgs,
-        ObservationPage, ObservationQuery, ObservationView, ProcessPageCursor,
-        ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest,
-        RuleStateView, ShutdownMode, SourceState, StatusBlocker, TimerGetRequest, TimerStateView,
-        TurnGetRequest, UnsettledCommandSummary, WorkerTaskHealth, WorkerTaskStatus,
-        WorkspaceCustodyView,
+        GitFetchDefinitionArgs, GitView, MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS,
+        MAX_SWARM_WAIT_TARGETS, NotifyDefinitionArgs, ObservationPage, ObservationQuery,
+        ObservationView, ProcessPageCursor, ProjectRegistrationView, ProviderClearHoldRequest,
+        ProviderHoldsRequest, RuleGetRequest, RuleStateView, ShutdownMode, SourceState,
+        StatusBlocker, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView,
+        TurnGetRequest, UnsettledCommandSummary, WaitEntryResult, WorkerTaskHealth,
+        WorkerTaskStatus, WorkspaceCustodyView,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -282,6 +284,7 @@ impl Router {
             "events.bounds" => self.events_bounds(&params, &principal).await,
             "events.read" => self.events_read(&params, &principal).await,
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
+            "swarm.wait" => self.swarm_wait(&params, &principal).await,
             "project.get" => self.project_get(&params, &principal).await,
             "project.list" => self.project_list(&params, &principal).await,
             "rule.get" => self.rule_get(&params, &principal).await,
@@ -2884,6 +2887,240 @@ impl Router {
             truncated,
         })
         .map_err(|_| Error::new("internal", "events.subscribe response could not be encoded"))
+    }
+
+    async fn swarm_wait(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        let request: SwarmWaitRequest = eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        match principal {
+            Principal::Owner | Principal::Agent { .. } => {}
+            Principal::Run { .. } => {
+                return Err(Error::new(
+                    "not_allowed",
+                    "Run credentials may call only command.get",
+                ));
+            }
+            Principal::ProjectRule { .. } => {
+                return Err(Error::new(
+                    "not_allowed",
+                    "project rule authority cannot wait on tasks",
+                ));
+            }
+        }
+        if request.total() > MAX_SWARM_WAIT_TARGETS {
+            return Err(Error::new(
+                "invalid",
+                "wait requires 1..=256 captured entries",
+            ));
+        }
+        let wait_ms = request.wait_ms.min(MAX_SWARM_WAIT_MS);
+
+        // Subscribe before the first snapshot so commits are either replayed
+        // by the snapshot or buffered for the wait loop.
+        let mut receiver = self.inner.bus.subscribe();
+        let mut results = self.wait_snapshot(&request, principal).await?;
+        if Self::wait_mode_completed(request.mode.as_str(), &results) {
+            return Self::encode_wait(&request, results, false);
+        }
+        if wait_ms == 0 {
+            return Self::encode_wait(&request, results, true);
+        }
+        let deadline = Instant::now() + Duration::from_millis(wait_ms);
+        loop {
+            match timeout_at(deadline, receiver.recv()).await {
+                Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                    results = self.wait_snapshot(&request, principal).await?;
+                    if Self::wait_mode_completed(request.mode.as_str(), &results) {
+                        return Self::encode_wait(&request, results, false);
+                    }
+                    if Instant::now() >= deadline {
+                        return Self::encode_wait(&request, results, true);
+                    }
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    return Err(Error::new("unavailable", "event bus is closed"));
+                }
+                Err(_) => {
+                    results = self.wait_snapshot(&request, principal).await?;
+                    if Self::wait_mode_completed(request.mode.as_str(), &results) {
+                        return Self::encode_wait(&request, results, false);
+                    }
+                    return Self::encode_wait(&request, results, true);
+                }
+            }
+        }
+    }
+
+    fn wait_mode_completed(mode: &str, results: &[WaitEntryResult]) -> bool {
+        match mode {
+            "all" => results.iter().all(WaitEntryResult::is_terminal),
+            _ => results.iter().any(WaitEntryResult::is_terminal),
+        }
+    }
+
+    fn encode_wait(
+        request: &SwarmWaitRequest,
+        results: Vec<WaitEntryResult>,
+        timed_out: bool,
+    ) -> Result<Value> {
+        let completed = Self::wait_mode_completed(request.mode.as_str(), &results);
+        let response = SwarmWaitResponse {
+            mode: request.mode.clone(),
+            completed,
+            timed_out: timed_out && !completed,
+            results,
+        };
+        request
+            .validate_response(&response)
+            .map_err(|_| Error::new("internal", "swarm.wait response is invalid"))?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "swarm.wait response could not be encoded"))
+    }
+
+    async fn wait_snapshot(
+        &self,
+        request: &SwarmWaitRequest,
+        principal: &Principal,
+    ) -> Result<Vec<WaitEntryResult>> {
+        let mut results = Vec::with_capacity(request.total());
+        for id in &request.commands {
+            results.push(self.wait_entry_for_command(id, principal).await?);
+        }
+        for turn in &request.turns {
+            results.push(
+                self.wait_entry_for_turn(&turn.agent, turn.generation, &turn.turn_id, principal)
+                    .await?,
+            );
+        }
+        Ok(results)
+    }
+
+    async fn wait_entry_for_command(
+        &self,
+        id: &str,
+        principal: &Principal,
+    ) -> Result<WaitEntryResult> {
+        let command = {
+            let store = self.inner.store.lock().await;
+            let command = match store.get_command(id)? {
+                Some(command) => command,
+                None => {
+                    return Ok(WaitEntryResult::new("command", id, "not_found"));
+                }
+            };
+            if let Err(error) =
+                crate::router::hierarchy::authorize_command_read(&store, principal, &command)
+            {
+                if error.code == "not_allowed" {
+                    return Ok(WaitEntryResult::new("command", id, "not_visible"));
+                }
+                return Err(error);
+            }
+            command
+        };
+        // Uncertain commands are terminal unknown, never still running. This
+        // mirrors the command readback masking without mutating the row.
+        if command.state == CommandState::Unknown || self.unknown_cause(&command.id).is_some() {
+            return Ok(WaitEntryResult::new("command", id, "unknown"));
+        }
+        if let (Some(target), Some(generation), Some(turn_id)) = (
+            command.target.as_deref(),
+            command.generation,
+            command.turn_id.as_deref(),
+        ) {
+            let status = self
+                .wait_status_for_bound_turn(target, generation, turn_id, principal)
+                .await?;
+            return Ok(WaitEntryResult::new("command", id, status));
+        }
+        let status = match command.state {
+            CommandState::Applied => "succeeded",
+            CommandState::Rejected | CommandState::Failed => "failed",
+            CommandState::Cancelled => "interrupted",
+            CommandState::Unknown => "unknown",
+            CommandState::Accepted | CommandState::Queued | CommandState::Dispatched => {
+                "still_running"
+            }
+        };
+        Ok(WaitEntryResult::new("command", id, status))
+    }
+
+    async fn wait_status_for_bound_turn(
+        &self,
+        agent: &str,
+        generation: i64,
+        turn_id: &str,
+        principal: &Principal,
+    ) -> Result<&'static str> {
+        let mut turn = {
+            let store = self.inner.store.lock().await;
+            if let Err(error) = crate::router::hierarchy::authorize_agent_read(
+                &store,
+                principal,
+                agent,
+                Some(generation),
+            ) {
+                if error.code == "not_allowed" {
+                    return Ok("not_visible");
+                }
+                return Err(error);
+            }
+            match store.get_turn(agent, generation, turn_id)? {
+                Some(turn) => turn,
+                None => return Ok("unknown"),
+            }
+        };
+        self.mask_unknown_turns(agent, generation, std::slice::from_mut(&mut turn))
+            .await?;
+        Ok(Self::turn_entry_status(&turn))
+    }
+
+    async fn wait_entry_for_turn(
+        &self,
+        agent: &str,
+        generation: i64,
+        turn_id: &str,
+        principal: &Principal,
+    ) -> Result<WaitEntryResult> {
+        let canonical = format!("{agent}/{generation}/{turn_id}");
+        let mut turn = {
+            let store = self.inner.store.lock().await;
+            if let Err(error) = crate::router::hierarchy::authorize_agent_read(
+                &store,
+                principal,
+                agent,
+                Some(generation),
+            ) {
+                if error.code == "not_allowed" {
+                    return Ok(WaitEntryResult::new("turn", canonical, "not_visible"));
+                }
+                return Err(error);
+            }
+            match store.get_turn(agent, generation, turn_id)? {
+                Some(turn) => turn,
+                None => return Ok(WaitEntryResult::new("turn", canonical, "not_found")),
+            }
+        };
+        self.mask_unknown_turns(agent, generation, std::slice::from_mut(&mut turn))
+            .await?;
+        let status = Self::turn_entry_status(&turn);
+        Ok(WaitEntryResult::new("turn", canonical, status))
+    }
+
+    fn turn_entry_status(turn: &Turn) -> &'static str {
+        match turn.state {
+            TurnState::Running => "still_running",
+            TurnState::Unknown => "unknown",
+            TurnState::Completed => match turn
+                .outcome
+                .unwrap_or_else(|| TurnOutcome::classify_legacy_status(turn.status.as_deref()))
+            {
+                TurnOutcome::Success => "succeeded",
+                TurnOutcome::Failure => "failed",
+                TurnOutcome::Interrupted => "interrupted",
+                TurnOutcome::Unknown => "unknown",
+            },
+        }
     }
 
     async fn read_filtered(
@@ -11545,6 +11782,7 @@ do = [{ action = "stop", target = "${event.agent}", expected_generation = "${eve
 
 #[cfg(test)]
 mod run_authorization_tests {
+    use super::tests::{read_fixture_event, result_fixture, router};
     use super::*;
 
     pub(super) fn command(id: &str) -> Command {
@@ -11666,5 +11904,321 @@ mod run_authorization_tests {
             RunWorkerStart::ForceRequested
         );
         assert!(router.inner.run_workers.lock_recover().is_empty());
+    }
+
+    #[tokio::test]
+    async fn swarm_wait_rejects_malformed_params_before_lookup() {
+        let router = router();
+        for params in [
+            json!({}),
+            json!({"commands": [], "turns": [], "mode": "all", "wait_ms": 0}),
+            json!({"commands": [], "turns": [], "mode": "first", "wait_ms": 0}),
+            json!({"commands": [" "], "turns": [], "mode": "all", "wait_ms": 0}),
+            json!({"commands": [], "turns": [{"agent": "a1", "generation": -1, "turn_id": "t1"}], "mode": "any", "wait_ms": 0}),
+            json!({"commands": ["c1"], "turns": [], "mode": "all", "wait_ms": 0, "extra": 0}),
+        ] {
+            let error = router
+                .swarm_wait(&params, &Principal::Owner)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "invalid", "params: {params}");
+        }
+        for principal in [
+            Principal::Run {
+                run_command_id: "cmd-1".to_owned(),
+            },
+            Principal::ProjectRule {
+                registration: ProjectRegistrationView {
+                    id: "project-1".to_owned(),
+                    checkout: String::new(),
+                    repo_common_dir: String::new(),
+                    profiles: vec![],
+                    actions: vec![],
+                    interpreters: std::collections::BTreeMap::new(),
+                    run_env: vec![],
+                    git: None,
+                    revision: 0,
+                },
+            },
+        ] {
+            let error = router
+                .swarm_wait(
+                    &json!({"commands": ["c1"], "turns": [], "mode": "all", "wait_ms": 0}),
+                    &principal,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "not_allowed");
+        }
+    }
+
+    #[tokio::test]
+    async fn swarm_wait_reports_frozen_running_commands_and_turns() {
+        let router = router();
+        let (agent, send_id) = {
+            let mut store = router.inner.store.lock().await;
+            result_fixture(&mut store)
+        };
+        // Running command with a running turn is still_running, never success.
+        let response: SwarmWaitResponse = serde_json::from_value(
+            router
+                .swarm_wait(
+                    &json!({"commands": [send_id], "turns": [], "mode": "all", "wait_ms": 0}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response.mode, "all");
+        assert!(!response.completed);
+        assert!(response.timed_out);
+        assert_eq!(
+            response.results,
+            vec![WaitEntryResult::new("command", &send_id, "still_running")]
+        );
+        // Direct turn binding reports the same frozen running turn.
+        let response: SwarmWaitResponse = serde_json::from_value(
+            router
+                .swarm_wait(
+                    &json!({"commands": [], "turns": [{"agent": agent, "generation": 1, "turn_id": "turn-1"}], "mode": "any", "wait_ms": 0}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!response.completed);
+        assert_eq!(
+            response.results,
+            vec![WaitEntryResult::new(
+                "turn",
+                format!("{agent}/1/turn-1"),
+                "still_running"
+            )]
+        );
+        // Missing ids are honest not_found, not success.
+        let response: SwarmWaitResponse = serde_json::from_value(
+            router
+                .swarm_wait(
+                    &json!({"commands": ["missing-command"], "turns": [], "mode": "all", "wait_ms": 0}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(response.completed);
+        assert!(!response.timed_out);
+        assert_eq!(
+            response.results,
+            vec![WaitEntryResult::new(
+                "command",
+                "missing-command",
+                "not_found"
+            )]
+        );
+    }
+
+    fn result_fixture_with_scope(
+        store: &mut eliot_store::Store,
+        native_scope: &str,
+        native_ref: &str,
+    ) -> (String, String) {
+        let launch_id = ulid::Ulid::new().to_string();
+        let agent = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: launch_id.clone(),
+                    target: None,
+                    selector: None,
+                    verb: "launch".to_owned(),
+                    args: json!({
+                        "project":"typed-results", "workspace":"synthetic-workspace",
+                        "harness":"codex", "profile":"synthetic", "profile_snapshot":{},
+                    }),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now_ms(),
+            )
+            .unwrap()
+            .command
+            .target
+            .unwrap();
+        store.dispatch(&launch_id, now_ms()).unwrap();
+        crate::test_support::install_fixture_sources(store, &agent, &launch_id, 1, now_ms());
+        read_fixture_event(
+            store,
+            &agent,
+            "session.ready",
+            json!({"native_scope":native_scope, "native_ref":native_ref}),
+        );
+        store
+            .settle(&launch_id, CommandState::Applied, None, now_ms())
+            .unwrap();
+        let send_id = ulid::Ulid::new().to_string();
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: send_id.clone(),
+                    target: Some(agent.clone()),
+                    selector: None,
+                    verb: "send".to_owned(),
+                    args: json!({"text":"fixture input"}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now_ms(),
+            )
+            .unwrap();
+        store.dispatch(&send_id, now_ms()).unwrap();
+        read_fixture_event(
+            store,
+            &agent,
+            "turn.started",
+            json!({"command_id":send_id, "turn_id":"turn-1"}),
+        );
+        (agent, send_id)
+    }
+
+    #[tokio::test]
+    async fn swarm_wait_maps_terminal_turn_outcomes_and_all_any() {
+        let router = router();
+        let (first_agent, first_send, second_agent, second_send) = {
+            let mut store = router.inner.store.lock().await;
+            let (first_agent, first_send) = result_fixture(&mut store);
+            let (second_agent, second_send) = result_fixture_with_scope(
+                &mut store,
+                "swarm-wait-second-scope",
+                "swarm-wait-second-ref",
+            );
+            (first_agent, first_send, second_agent, second_send)
+        };
+        {
+            let mut store = router.inner.store.lock().await;
+            for (agent, send_id) in [(&first_agent, &first_send), (&second_agent, &second_send)] {
+                read_fixture_event(
+                    &mut store,
+                    agent,
+                    "turn.completed",
+                    json!({"command_id": send_id, "turn_id": "turn-1", "status": "completed"}),
+                );
+                if store.get_command(send_id).unwrap().unwrap().state == CommandState::Dispatched {
+                    store
+                        .settle(
+                            send_id,
+                            CommandState::Applied,
+                            Some(json!({"turn_id": "turn-1"})),
+                            now_ms(),
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        let response: SwarmWaitResponse = serde_json::from_value(
+            router
+                .swarm_wait(
+                    &json!({"commands": [first_send, second_send], "turns": [], "mode": "all", "wait_ms": 0}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(response.completed);
+        assert!(!response.timed_out);
+        assert!(
+            response
+                .results
+                .iter()
+                .all(|entry| entry.status == "succeeded")
+        );
+        // Any completes on the first terminal entry.
+        let response: SwarmWaitResponse = serde_json::from_value(
+            router
+                .swarm_wait(
+                    &json!({"commands": [first_send], "turns": [], "mode": "any", "wait_ms": 0}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(response.completed);
+        assert_eq!(response.results[0].status, "succeeded");
+    }
+
+    #[tokio::test]
+    async fn swarm_wait_scopes_agent_reads_to_frozen_control() {
+        let router = router();
+        let (first_agent, first_send, second_send) = {
+            let mut store = router.inner.store.lock().await;
+            let (first_agent, first_send) = result_fixture(&mut store);
+            let (_, second_send) = result_fixture_with_scope(
+                &mut store,
+                "swarm-wait-scope-scope",
+                "swarm-wait-scope-ref",
+            );
+            (first_agent, first_send, second_send)
+        };
+        let caller = Principal::Agent {
+            id: first_agent.clone(),
+            generation: 1,
+        };
+        let response: SwarmWaitResponse = serde_json::from_value(
+            router
+                .swarm_wait(
+                    &json!({"commands": [first_send, second_send], "turns": [], "mode": "all", "wait_ms": 0}),
+                    &caller,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!response.completed);
+        assert_eq!(response.results[0].status, "still_running");
+        assert_eq!(response.results[1].status, "not_visible");
+        // Owner sees the same second command instead of not_visible.
+        let response: SwarmWaitResponse = serde_json::from_value(
+            router
+                .swarm_wait(
+                    &json!({"commands": [second_send], "turns": [], "mode": "all", "wait_ms": 0}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response.results[0].status, "still_running");
+    }
+
+    #[tokio::test]
+    async fn swarm_wait_treats_unknown_commands_as_terminal_unknown() {
+        let router = router();
+        let (agent, send_id) = {
+            let mut store = router.inner.store.lock().await;
+            result_fixture(&mut store)
+        };
+        router.note_unknown_id(&send_id, "fixture_transport_loss");
+        let response: SwarmWaitResponse = serde_json::from_value(
+            router
+                .swarm_wait(
+                    &json!({"commands": [send_id], "turns": [], "mode": "all", "wait_ms": 0}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(response.completed);
+        assert_eq!(response.results[0].status, "unknown");
+        let _ = agent;
     }
 }
