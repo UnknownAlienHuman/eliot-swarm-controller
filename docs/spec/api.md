@@ -84,11 +84,15 @@ fail with `not_allowed`. Each tool call still uses the existing local client and
 which validates the Agent credential and current generation. `--require-agent --http` is a
 usage error; ordinary Owner MCP stdio and StreamableHTTP behavior are unchanged.
 
-The caller supplies and retains the mutation ULID in `params` before a write. A retry
-must carry the same id, principal, method and semantic payload; a different binding is
-`id_conflict`, and an expired id is `id_expired`. Unknown outcomes keep the existing exact
-readback/resolution contract. The server does not mint or rewrite ids, automatically
-retry uncertain calls, or treat cancellation as rollback.
+A mutation call may omit `params.id`: the MCP server mints one fresh ULID for that
+call, forwards it, and returns it as top-level `id` in the tool result, so the caller
+retains it for exact retry. An explicit id is forwarded untouched and still validated
+by the daemon. A retry must carry the same id, principal, method and semantic payload;
+a different binding is `id_conflict`, and an expired id is `id_expired`. Unknown outcomes
+keep the existing exact readback/resolution contract. The server never automatically
+retries uncertain calls and never treats cancellation as rollback. Id admission errors
+(`invalid` shape, `id_expired`, future-skew `invalid`) name `params.id` with the ULID
+format and the retry window, matching the DTO field errors.
 
 The stdio transport MUST bound each frame to [`MAX_RPC_FRAME_BYTES`](../../crates/eliot-daemon/src/daemon.rs)
 (4 MiB) using [`BoundedLineWriter`](../../crates/eliot/src/mcp/bounded_io.rs). Forwarded RPC data and list/history
@@ -172,7 +176,9 @@ implements it.
 
 ## Mutation ids
 
-External writes carry a ULID generated/printed before send. Bind it to principal,
+External writes carry a ULID generated/printed before send, except that MCP callers
+may omit `params.id` and the MCP server mints and returns one per the
+[MCP stdio server](#mcp-stdio-server) contract. Bind the id to principal,
 method and canonical semantic payload. Exclude JSON-RPC id, output format, paging and
 wait timeout. Same binding returns the retained result; different binding is
 `id_conflict`; absent expired id is `id_expired`. A ULID more than the allowed
@@ -264,7 +270,8 @@ the summary, example, mutation rules, scope/capability limits and CLI aliases. C
 are not RPC names. Every registered Router method has a descriptor. Help is capped at
 256 KiB; it never includes credentials or another principal's identity. Examples naming
 existing resources require actual retained IDs/profile/source/view; new writes require
-a fresh caller-retained mutation ULID rather than reusing the illustrative example ID.
+a fresh caller-retained mutation ULID rather than reusing the illustrative example ID,
+or omit `id` on MCP so the server mints one.
 
 `api.identity` returns the authenticated principal kind, Agent id/generation when present,
 and its allowed scope patterns. An Agent's variable scope defaults to its actual project;

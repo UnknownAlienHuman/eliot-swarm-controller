@@ -346,8 +346,7 @@ impl Router {
             GoalRoundRequest::validate,
         )?;
         require_eliot_mode(request.mode)?;
-        ulid::Ulid::from_string(&request.id)
-            .map_err(|_| Error::new("invalid", "mutation id must be a ULID"))?;
+        ulid::Ulid::from_string(&request.id).map_err(|_| Error::invalid_mutation_id())?;
         let principal = super::principal_name(principal);
         let mut store = self.inner.store.lock().await;
         if let Some(response) = store.goal_round_replay(&principal, &request, now_ms())? {

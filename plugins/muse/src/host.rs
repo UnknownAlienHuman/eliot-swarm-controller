@@ -44,8 +44,8 @@ use tokio::{
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const STOP_SETTLEMENT_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
 const STOP_RESPONSE_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
-const VIEW_PAGE_SIZE: i64 = 1000;
-const MAX_VIEW_PAGES: usize = 4;
+pub(crate) const VIEW_PAGE_SIZE: i64 = 1000;
+pub(crate) const MAX_VIEW_PAGES: usize = 4;
 
 #[derive(Default)]
 struct MusePlugin {
