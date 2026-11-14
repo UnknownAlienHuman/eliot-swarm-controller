@@ -2,7 +2,7 @@
 use super::SourceState;
 use crate::{
     AgentEdit, AgentState, GitBaseline, GitCommit, GitPathStatus, ProcessRecord, ProcessSample,
-    ViewHealthCounts, WorkspacePhase,
+    WorkspacePhase,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -29,11 +29,6 @@ impl ObservationView {
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ObservationData {
-    /// Agent-level Muse view-health rollup, summed over native sources.
-    /// `None` when no view-health episode was ever counted, so agents
-    /// without one keep their exact previous shape.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub view_health: Option<ViewHealthCounts>,
     pub processes_truncated: bool,
     #[serde(deserialize_with = "process_records")]
     pub processes: Vec<ProcessRecord>,
@@ -492,8 +487,7 @@ mod tests {
                 "owners":[{"family":"workspace_process","source":"workspace_process","mechanism":"os"}],
                 "state":"open", "health":"ok", "cursor":null, "last_store_seq":null,
                 "last_batch_id":null, "last_batch_first_seq":null, "last_batch_last_seq":null,
-                "gap_id":null, "gap_from":null, "gap_to":null, "gap_seq":null,
-                "view_unavailable":0, "view_readback_recovered":0, "view_settled_unknown":0
+                "gap_id":null, "gap_from":null, "gap_to":null, "gap_seq":null
             }
         });
         let view: WorkspaceView = serde_json::from_value(wire.clone()).unwrap();

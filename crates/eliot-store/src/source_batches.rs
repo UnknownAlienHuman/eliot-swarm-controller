@@ -77,9 +77,6 @@ impl Store {
                 "last_batch_id": state.last_batch_id, "last_batch_first_seq": state.last_batch_first_seq,
                 "last_batch_last_seq": state.last_batch_last_seq,
                 "gap_id": state.gap_id, "gap_from": state.gap_from, "gap_to": state.gap_to, "gap_seq": state.gap_seq,
-                "view_unavailable": state.view_unavailable.max(0) as u64,
-                "view_readback_recovered": state.view_recovered.max(0) as u64,
-                "view_settled_unknown": state.view_unknown.max(0) as u64,
             }));
         }
         if encode_json(&views)?.len() > MAX_PAGE_BYTES {
@@ -158,9 +155,6 @@ impl Store {
             "gap_from": state.gap_from,
             "gap_to": state.gap_to,
             "gap_seq": state.gap_seq,
-            "view_unavailable": state.view_unavailable.max(0) as u64,
-            "view_readback_recovered": state.view_recovered.max(0) as u64,
-            "view_settled_unknown": state.view_unknown.max(0) as u64,
             "last_handoff_digest": state.last_handoff_digest,
             "last_handoff": state.last_handoff.as_deref().map(decode_json).transpose()?,
             "owners": source_handoff::owner_bindings(&self.connection, agent_num, generation)?,
@@ -173,139 +167,6 @@ impl Store {
             ));
         }
         Ok(state)
-    }
-
-    /// Increment one Muse view-health counter on an existing source row and
-    /// return the updated totals. Diagnostics only: the journal stays the
-    /// source of truth, and a failed increment never alters the committed
-    /// event that triggered it. Rejects an unknown source row instead of
-    /// inventing one.
-    pub fn record_view_health(
-        &mut self,
-        agent: &str,
-        generation: i64,
-        source: &str,
-        outcome: eliot_core::ViewHealthOutcome,
-        now: i64,
-    ) -> Result<eliot_core::ViewHealthCounts> {
-        use eliot_core::ViewHealthOutcome;
-        self.ensure_writer_healthy()?;
-        let agent_num = parse_agent_id(agent)?;
-        require_nonempty(source, "source")?;
-        let column = match outcome {
-            ViewHealthOutcome::Unavailable => "view_unavailable",
-            ViewHealthOutcome::ReadbackRecovered => "view_recovered",
-            ViewHealthOutcome::SettledUnknown => "view_unknown",
-        };
-        let result = (|| {
-            let sql = format!(
-                "UPDATE source_state SET {column} = {column} + 1, updated_at = ?1 \
-                 WHERE agent = ?2 AND generation = ?3 AND source = ?4"
-            );
-            let changed = self
-                .connection
-                .execute(&sql, params![now, agent_num, generation, source])
-                .map_err(sql_error)?;
-            if changed != 1 {
-                return Err(Error::new(
-                    "source_integrity",
-                    "view-health source has no committed state",
-                ));
-            }
-            let counts = self
-                .connection
-                .query_row(
-                    "SELECT view_unavailable, view_recovered, view_unknown \
-                 FROM source_state WHERE agent = ?1 AND generation = ?2 AND source = ?3",
-                    params![agent_num, generation, source],
-                    |row| {
-                        Ok(eliot_core::ViewHealthCounts {
-                            unavailable: row.get::<_, i64>(0)?.max(0) as u64,
-                            readback_recovered: row.get::<_, i64>(1)?.max(0) as u64,
-                            settled_unknown: row.get::<_, i64>(2)?.max(0) as u64,
-                        })
-                    },
-                )
-                .map_err(sql_error)?;
-            Ok(counts)
-        })();
-        self.fault_on_persistence_error(&result);
-        result
-    }
-
-    /// Milliseconds since the agent's active turn started, if a turn is
-    /// active and its start was retained. Best-effort context for the
-    /// view-health log line; `None` never blocks the commit path.
-    pub fn active_turn_age_ms(
-        &self,
-        agent: &str,
-        generation: i64,
-        now: i64,
-    ) -> Result<Option<i64>> {
-        let agent_num = parse_agent_id(agent)?;
-        let active: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT active_turn FROM agents WHERE id = ?1 AND generation = ?2",
-                params![agent_num, generation],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql_error)?
-            .flatten();
-        let Some(turn_id) = active else {
-            return Ok(None);
-        };
-        let started: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT started_at FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
-                params![agent_num, generation, turn_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql_error)?
-            .flatten();
-        Ok(started
-            .and_then(|at| now.checked_sub(at))
-            .filter(|age| *age >= 0))
-    }
-
-    /// How many agents of one harness currently hold a live plugin session.
-    /// Live means a running generation state (`starting`, `idle`, `busy` or
-    /// `waiting`); terminal or never-started generations exert no host load.
-    pub fn count_live_harness_agents(&self, harness: &str) -> Result<i64> {
-        self.connection
-            .query_row(
-                "SELECT COUNT(*) FROM agents \
-                 WHERE harness = ?1 AND state IN ('starting', 'idle', 'busy', 'waiting')",
-                [harness],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)
-    }
-
-    /// Reason of the latest `source.gap` for one source, if any. Lets the
-    /// readback-recovery log line name the episode it closes; the gap event
-    /// itself carries no turn binding.
-    pub fn latest_gap_reason(
-        &self,
-        agent: &str,
-        generation: i64,
-        source: &str,
-    ) -> Result<Option<String>> {
-        let agent_num = parse_agent_id(agent)?;
-        self.connection
-            .query_row(
-                "SELECT json_extract(data, '$.reason') FROM events \
-                 WHERE agent = ?1 AND generation = ?2 AND kind = 'source.gap' \
-                   AND json_extract(data, '$.source') = ?3 \
-                 ORDER BY seq DESC LIMIT 1",
-                params![agent_num, generation, source],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql_error)
     }
 
     /// Commit one source-loss boundary and its retained acknowledgement.

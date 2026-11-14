@@ -50,15 +50,12 @@ independent fields in the same `source_state` row. Recording a gap does not clos
 source or transfer family ownership. After exact readback and live-edge recovery, health
 may return to `ok` while the historical gap remains visible.
 
-The same row carries bounded Muse view-health counters (`view_unavailable`,
-`view_readback_recovered`, `view_settled_unknown`): per-source counts of
-unavailable-view episodes and their outcomes, counted only from committed
-journal facts (unavailable-view gap, readback-marked `turn.completed`,
-projection-reason `turn.unknown`). The agent-level rollup appears as
-`observation.view_health` in `swarm show`; it is absent when nothing was ever
-counted. Each counted transition also emits one bounded daemon-log line with
-the cumulative counters and the per-event load context (live Muse hosts,
-active-turn age, harness RSS, reason label).
+Muse view-health needs no extra state: the same committed journal signals
+count unavailable-view episodes and their outcomes per agent. Count
+`source.gap` events whose reason starts with the shared unavailable prefix,
+`turn.unknown` events whose reason starts with the shared unknown prefix, and
+`turn.completed` events carrying the fixed `view_recovery: "readback"` marker
+(`classify_view_health_event` encodes the match).
 
 ## Process identity and custody
 

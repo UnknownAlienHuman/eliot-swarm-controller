@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 38;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 37;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -880,23 +880,6 @@ impl Store {
                  CREATE INDEX completion_digests_pending
                      ON completion_digests(delivered_at, created_at);
                  INSERT INTO schema_migrations(version) VALUES (37);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
-        }
-        if current < 38 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
-                "ALTER TABLE source_state ADD COLUMN view_unavailable INTEGER NOT NULL DEFAULT 0
-                     CHECK(view_unavailable >= 0);
-                 ALTER TABLE source_state ADD COLUMN view_recovered INTEGER NOT NULL DEFAULT 0
-                     CHECK(view_recovered >= 0);
-                 ALTER TABLE source_state ADD COLUMN view_unknown INTEGER NOT NULL DEFAULT 0
-                     CHECK(view_unknown >= 0);
-                 INSERT INTO schema_migrations(version) VALUES (38);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

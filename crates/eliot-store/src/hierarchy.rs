@@ -745,7 +745,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 38);
+        assert_eq!(version, 37);
         let mut columns: Vec<String> = store
             .connection
             .prepare("SELECT name FROM pragma_table_info('agents')")
@@ -1454,24 +1454,19 @@ mod tests {
         ));
         {
             let legacy_store = Store::open(&path).unwrap();
-            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 38);
+            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 37);
             drop(legacy_store);
             // Downgrade to the v22 shape with two legacy rows, then reopen so
             // the v23 block backfills them exactly as it would on upgrade.
             // The v24 claims table postdates the downgrade target, so it
             // goes too; the reopen migrates 22 through the current version.
             // Drop the v37 digest, v34 config and v33 session-usage tables
-            // first and undo the v38 view-health, v36/v35 column adds, so the
-            // reopen exercises their migration blocks, then the v32
-            // attention-wake table.
+            // first and undo the v36/v35 column adds, so the reopen exercises
+            // their migration blocks, then the v32 attention-wake table.
             let legacy = rusqlite::Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
-                    "ALTER TABLE source_state DROP COLUMN view_unavailable;
-                     ALTER TABLE source_state DROP COLUMN view_recovered;
-                     ALTER TABLE source_state DROP COLUMN view_unknown;
-                     DELETE FROM schema_migrations WHERE version = 38;
-                     DROP TABLE completion_digests;
+                    "DROP TABLE completion_digests;
                      DELETE FROM schema_migrations WHERE version = 37;
                      DROP TABLE agent_config;
                      ALTER TABLE agents DROP COLUMN profile_inherited;
@@ -1541,7 +1536,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 38);
+        assert_eq!(version, 37);
         for id in ["a1", "a2"] {
             let agent = store.get_agent(id).unwrap().expect("legacy row");
             assert_eq!(agent.root, id);

@@ -1002,9 +1002,9 @@ pub struct SourceGapAck {
 
 /// Bounded machine signal for Muse native view-health episodes. The Muse
 /// plugin authors these exact reason strings and the readback marker; the
-/// daemon counts them per agent through the existing source-health/gap path.
-/// Prefixes (not full reasons) are matched so cursor-bearing suffixes stay
-/// free to evolve without breaking the count.
+/// three outcomes are exactly countable from the journal through
+/// [`classify_view_health_event`]. Prefixes (not full reasons) are matched
+/// so cursor-bearing suffixes stay free to evolve without breaking the count.
 pub const MUSE_VIEW_UNAVAILABLE_REASON_PREFIX: &str = "Muse native view is unavailable";
 pub const MUSE_VIEW_UNKNOWN_REASON_PREFIX: &str =
     "Muse native view recovery did not prove live delivery after the recorded gap";
@@ -1013,47 +1013,12 @@ pub const MUSE_VIEW_UNKNOWN_REASON_PREFIX: &str =
 pub const VIEW_RECOVERY_MARKER_FIELD: &str = "view_recovery";
 pub const VIEW_RECOVERY_READBACK: &str = "readback";
 
-/// One counted Muse view-health transition.
+/// One Muse view-health transition countable from the journal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewHealthOutcome {
     Unavailable,
     ReadbackRecovered,
     SettledUnknown,
-}
-
-impl ViewHealthOutcome {
-    /// Bounded daemon-log code suffix for this outcome.
-    pub fn log_code(self) -> &'static str {
-        match self {
-            Self::Unavailable => "muse.view_unavailable",
-            Self::ReadbackRecovered => "muse.view_recovered",
-            Self::SettledUnknown => "muse.view_settled_unknown",
-        }
-    }
-}
-
-/// Per-agent Muse view-health counters. All three start at zero; only the
-/// daemon increments them, and only from journal facts (never estimates).
-#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ViewHealthCounts {
-    #[serde(default)]
-    pub unavailable: u64,
-    #[serde(default)]
-    pub readback_recovered: u64,
-    #[serde(default)]
-    pub settled_unknown: u64,
-}
-
-impl ViewHealthCounts {
-    pub fn total(&self) -> u64 {
-        self.unavailable
-            .saturating_add(self.readback_recovered)
-            .saturating_add(self.settled_unknown)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.total() == 0
-    }
 }
 
 /// Classify one committed journal event into a view-health outcome, if any.
@@ -1080,25 +1045,6 @@ pub fn classify_view_health_event(
             .filter(|marker| *marker == VIEW_RECOVERY_READBACK)
             .map(|_| ViewHealthOutcome::ReadbackRecovered),
         _ => None,
-    }
-}
-
-/// Extract the bounded `noneReason` label carried in parentheses at the end of
-/// a Muse view-health reason (`... (projectionUnavailable)`). Only labels the
-/// installed schema documents (plus `unknown`) are ever returned; anything
-/// else maps to `unknown` so the log line stays bounded and secret-free.
-pub fn muse_view_reason_label(reason: &str) -> &'static str {
-    let label = reason
-        .rsplit_once('(')
-        .map(|(_, tail)| tail.strip_suffix(')').unwrap_or(tail).trim())
-        .unwrap_or("");
-    match label {
-        "excluded" => "excluded",
-        "cursorSuffix" => "cursorSuffix",
-        "historyBudget" => "historyBudget",
-        "projectionUnavailable" => "projectionUnavailable",
-        "projectionReadLimit" => "projectionReadLimit",
-        _ => "unknown",
     }
 }
 
@@ -2487,27 +2433,5 @@ mod view_health_tests {
             format!("{MUSE_VIEW_UNKNOWN_REASON_PREFIX} (projectionUnavailable)")
                 .starts_with(MUSE_VIEW_UNKNOWN_REASON_PREFIX)
         );
-    }
-
-    #[test]
-    fn reason_labels_stay_bounded_and_secret_free() {
-        assert_eq!(
-            muse_view_reason_label("Muse native view is unavailable (projectionUnavailable)"),
-            "projectionUnavailable"
-        );
-        assert_eq!(
-            muse_view_reason_label(
-                "Muse native view recovery did not prove live delivery after the recorded gap (cursorSuffix)"
-            ),
-            "cursorSuffix"
-        );
-        for reason in [
-            "Muse native view is unavailable (futureReason)",
-            "Muse native view is unavailable",
-            "",
-            "injected (projectionUnavailable) trailing",
-        ] {
-            assert_eq!(muse_view_reason_label(reason), "unknown", "{reason}");
-        }
     }
 }
