@@ -559,14 +559,15 @@ may omit `profile` or specify the parent's same profile name, with no `worktree`
 and reuses the parent's frozen profile snapshot
 verbatim, without resolving a mutable named profile. It may instead name a profile
 from the parent snapshot's captured `child_profiles` allow-list; the daemon resolves
-that configured profile now and freezes its snapshot for the child. Any other name
-is rejected before any native effect. Then the authority check below applies
-independently of profile equality: control is narrowed or equal, the workspace is
-shared, no worktree is minted, and every authority knob the child snapshot carries
-(permissions/sandbox, approval policy, `pass_env`, MCP inheritance) is no broader
-than the parent's; model, effort and harness may differ. An Owner child launch may
-instead supply `profile`, a different workspace, and `worktree`, and remains
-unrestricted by that check (see [coordination](coordination.md#claims-and-hierarchy)).
+that configured profile now and freezes its snapshot for the child. Any other name,
+or a cross-harness profile, is rejected before any native effect. The child must
+use the parent's harness: only model and effort may differ, the child inherits the
+parent's captured credential bindings verbatim, and its capacity scopes keep every
+non-profile scope of the parent with the same bounds. Then the authority check below
+applies: control is narrowed or equal, the workspace is shared, and no worktree is
+minted. An Owner child launch may instead supply `profile`, a different workspace,
+and `worktree`, and remains unrestricted by that check
+(see [coordination](coordination.md#claims-and-hierarchy)).
 
 Removal uses the same command admission and readback path:
 

@@ -1734,7 +1734,10 @@ impl Router {
         // that differs from the parent's must be in the parent snapshot's
         // captured `child_profiles`; the captured list governs, so a later
         // config edit cannot widen an already-running manager. The allowed
-        // child profile resolves now, before any native effect.
+        // child profile resolves now, before any native effect, and must use
+        // the parent's harness; it inherits the parent's captured credential
+        // bindings verbatim and must match the parent snapshot except for
+        // model, effort, and its own profile scope.
         let agent_child_snapshot = if matches!(principal, Principal::Agent { .. })
             && request.args.get("parent").is_some()
         {
@@ -1784,6 +1787,20 @@ impl Router {
                     .filter(|harness| !harness.trim().is_empty())
                     .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
                     .to_owned();
+                // Cross-harness children are not supported: equal policy
+                // names mean different native surfaces on different
+                // harnesses. The child inherits the parent's captured
+                // credential bindings verbatim and never re-discovers them.
+                if harness != parent.harness {
+                    return Err(Error::new(
+                        "not_allowed",
+                        format!(
+                            "cross-harness child profiles are not supported: parent profile uses {0} but child profile {name} uses {harness}",
+                            parent.harness
+                        ),
+                    ));
+                }
+                hierarchy::inherit_parent_launch_bindings(&mut snapshot, &parent.profile_snapshot);
                 Some((name.to_owned(), harness, snapshot))
             } else {
                 Some((

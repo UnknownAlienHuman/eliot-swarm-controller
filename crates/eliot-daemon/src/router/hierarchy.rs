@@ -81,221 +81,111 @@ fn control_rank(control: AgentControl) -> u8 {
     }
 }
 
-/// Breadth rank for the frozen `permissions` sandbox knob: read-only is the
-/// narrowest, danger-full-access the broadest. Unknown values never allow.
-fn permission_rank(value: &str) -> Option<u8> {
-    match value {
-        "read-only" => Some(0),
-        "workspace-write" => Some(1),
-        "danger-full-access" => Some(2),
-        _ => None,
-    }
+/// Snapshot keys that may differ between an allow-listed child and its
+/// parent: a cheaper worker/reviewer model (and its effort) is the point of
+/// the allow-list, `child_profiles` governs the next hop rather than this
+/// launch, and `control` is checked separately as equal or narrower.
+fn ignored_child_snapshot_key(key: &str) -> bool {
+    matches!(key, "model" | "effort" | "child_profiles" | "control")
 }
 
-/// Breadth rank for the frozen Codex `approval_policy` knob. `never` runs
-/// without approval callbacks (unilateral); `on-request` must stop and ask.
-/// Unknown values never allow.
-fn approval_policy_rank(value: &str) -> Option<u8> {
-    match value {
-        "on-request" => Some(0),
-        "never" => Some(1),
-        _ => None,
-    }
-}
-
-/// Breadth rank for the frozen Muse `approval` knob, least to most
-/// permissive by name. Unknown values never allow.
-fn approval_rank(value: &str) -> Option<u8> {
-    match value {
-        "denyUnmatched" => Some(0),
-        "promptUnmatched" => Some(1),
-        "onRequest" => Some(2),
-        "allowAll" => Some(3),
-        _ => None,
-    }
-}
-
-/// Breadth rank for the frozen worker MCP inheritance policy: `minimal`
-/// starts only the Agent-scoped server plus the allow list, `inherit` keeps
-/// the owner's full native surface. Unknown values never allow.
-fn mcp_policy_rank(value: &str) -> Option<u8> {
-    match value {
-        "minimal" => Some(0),
-        "inherit" => Some(1),
-        _ => None,
-    }
-}
-
-fn snapshot_text<'a>(snapshot: &'a Value, key: &str) -> Option<&'a str> {
-    snapshot.get(key)?.as_str()
-}
-
-fn snapshot_allow_list(snapshot: &Value, key: &str) -> Result<Vec<String>> {
-    match snapshot.get(key) {
-        None => Ok(Vec::new()),
-        Some(Value::Array(values)) => values
-            .iter()
-            .map(|value| {
-                value.as_str().map(str::to_owned).ok_or_else(|| {
-                    Error::new(
-                        "invalid",
-                        format!("profile_snapshot.{key} must be an array of strings"),
-                    )
-                })
-            })
-            .collect(),
-        Some(_) => Err(Error::new(
-            "invalid",
-            format!("profile_snapshot.{key} must be an array of strings"),
-        )),
-    }
-}
-
-fn env_names_equal(left: &str, right: &str) -> bool {
-    if cfg!(windows) {
-        left.eq_ignore_ascii_case(right)
-    } else {
-        left == right
-    }
-}
-
-fn child_knob_exceeds(key: &str) -> Error {
-    Error::new(
-        "not_allowed",
-        format!("child {key} exceeds its parent's frozen profile"),
-    )
-}
-
-/// Ranked scalar authority knob: the child value must parse to a known rank
-/// at or below the parent's. A knob the child snapshot does not carry is not
-/// claimed; a knob it carries but the parent lacks (or either side carries
-/// with an unknown value) rejects instead of allowing.
-fn check_ranked_knob(
+/// "Same profile except model and effort" over frozen snapshots (#398
+/// follow-up). Cross-harness children are rejected at freeze, so both sides
+/// carry the same harness here. After removing the ignorable keys and each
+/// side's own `profile:<name>` capacity scope, every other key must be
+/// equal, including absent-vs-present: that covers permissions, approval
+/// policy, approval, MCP policy, pass_env, cmd, route/account/proxy,
+/// scratch, setup, native-mode knobs, and the inherited credential
+/// bindings. Anything else is a wider (or simply different) authority and
+/// rejects.
+fn child_snapshot_within_parent(
     child: &Value,
+    child_profile: &str,
     parent: &Value,
-    key: &str,
-    rank: fn(&str) -> Option<u8>,
+    parent_profile: &str,
 ) -> Result<()> {
-    if child.get(key).is_none() {
-        return Ok(());
-    }
-    match (
-        snapshot_text(child, key).and_then(rank),
-        snapshot_text(parent, key).and_then(rank),
-    ) {
-        (Some(child_rank), Some(parent_rank)) if child_rank <= parent_rank => Ok(()),
-        _ => Err(child_knob_exceeds(key)),
-    }
-}
-
-/// Exact-match authority knob: no breadth order is documented for these
-/// values, so the child value must equal the parent's. Same presence rules
-/// as ranked knobs.
-fn check_equal_knob(child: &Value, parent: &Value, key: &str) -> Result<()> {
-    if child.get(key).is_none() {
-        return Ok(());
-    }
-    let Some(parent_value) = parent.get(key) else {
-        return Err(child_knob_exceeds(key));
-    };
-    if child.get(key) == Some(parent_value) {
+    let child_stripped = stripped_child_snapshot(child, child_profile)?;
+    let parent_stripped = stripped_child_snapshot(parent, parent_profile)?;
+    if child_stripped == parent_stripped {
         Ok(())
     } else {
-        Err(child_knob_exceeds(key))
+        Err(Error::new(
+            "not_allowed",
+            "child profile snapshot differs from its parent's frozen profile beyond model and effort",
+        ))
     }
 }
 
-/// "No broader" over the frozen snapshot authority knobs (issue #398).
-/// Model, effort, harness and cmd may differ: changing them is the point
-/// and grants no authority. Dispatch-captured inputs (`pass_env_values`,
-/// `native_store_binding`), delegation metadata (`child_profiles`), and
-/// admission-enforced bindings (capacity scopes, route/account/proxy,
-/// scratch, setup) are not authority knobs and stay out of this comparison:
-/// nonempty setup is still refused without a worktree downstream and
-/// capacity stays enforced at admission. A knob the child does not carry is
-/// not claimed; any knob it carries must be bounded by the parent's same
-/// knob. Unknown or incomparable values reject; they never allow.
-fn child_snapshot_within_parent(child: &Value, parent: &Value) -> Result<()> {
-    check_ranked_knob(child, parent, "permissions", permission_rank)?;
-    check_ranked_knob(child, parent, "approval_policy", approval_policy_rank)?;
-    check_ranked_knob(child, parent, "approval", approval_rank)?;
-    check_equal_knob(child, parent, "permission_mode")?;
-    check_equal_knob(child, parent, "mode")?;
-    if let Some(child_skip) = child.get("dangerously_skip_permissions") {
-        let Some(child_skip) = child_skip.as_bool() else {
-            return Err(Error::new(
-                "invalid",
-                "profile_snapshot.dangerously_skip_permissions must be a boolean",
-            ));
-        };
-        if child_skip
-            && !parent
-                .get("dangerously_skip_permissions")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        {
-            return Err(child_knob_exceeds("dangerously_skip_permissions"));
+fn stripped_child_snapshot(snapshot: &Value, profile: &str) -> Result<Value> {
+    let Some(object) = snapshot.as_object() else {
+        return Err(Error::new(
+            "invalid",
+            "profile snapshot must be a JSON object",
+        ));
+    };
+    let mut stripped = serde_json::Map::with_capacity(object.len());
+    for (key, value) in object {
+        if ignored_child_snapshot_key(key) {
+            continue;
         }
+        if key == "capacity_scopes" {
+            stripped.insert(key.clone(), without_own_profile_scope(value, profile)?);
+            continue;
+        }
+        stripped.insert(key.clone(), value.clone());
     }
-    check_equal_knob(child, parent, "auth_integration")?;
-    check_equal_knob(child, parent, "collaboration_mode")?;
-    check_mcp_inheritance(child, parent)?;
-    check_pass_env_subset(child, parent)?;
-    Ok(())
+    Ok(Value::Object(stripped))
 }
 
-/// MCP inheritance is no broader than the parent's: the policy rank must not
-/// exceed the parent's, and an explicit allow list must stay within the
-/// parent's. A parent on `inherit` keeps the full native surface, so any
-/// explicit child allow list stays within it.
-fn check_mcp_inheritance(child: &Value, parent: &Value) -> Result<()> {
-    if child.get("mcp").is_none() {
-        return Ok(());
-    }
-    check_ranked_knob(child, parent, "mcp", mcp_policy_rank)?;
-    let child_allow = snapshot_allow_list(child, "mcp_allow")?;
-    if child_allow.is_empty() {
-        return Ok(());
-    }
-    if snapshot_text(child, "mcp") != Some("minimal") {
-        return Err(child_knob_exceeds("mcp_allow"));
-    }
-    if snapshot_text(parent, "mcp") == Some("inherit") {
-        return Ok(());
-    }
-    let parent_allow = snapshot_allow_list(parent, "mcp_allow")?;
-    for server in &child_allow {
-        if !parent_allow.iter().any(|bound| bound == server) {
-            return Err(child_knob_exceeds("mcp_allow"));
-        }
-    }
-    Ok(())
+/// The profile scope (`profile:<name>`) necessarily differs between parent
+/// and child; every other capacity scope (account/proxy/route) must match
+/// exactly, so a child cannot escape the parent's shared capacity bounds.
+fn without_own_profile_scope(scopes: &Value, profile: &str) -> Result<Value> {
+    let Some(scopes) = scopes.as_array() else {
+        return Err(Error::new(
+            "invalid",
+            "profile_snapshot.capacity_scopes must be an array",
+        ));
+    };
+    let own = format!("profile:{profile}");
+    Ok(Value::Array(
+        scopes
+            .iter()
+            .filter(|entry| entry.get("scope").and_then(Value::as_str) != Some(own.as_str()))
+            .cloned()
+            .collect(),
+    ))
 }
 
-/// Inherited environment names are no broader than the parent's: the child
-/// set must stay within the parent set.
-fn check_pass_env_subset(child: &Value, parent: &Value) -> Result<()> {
-    let child_env = snapshot_allow_list(child, "pass_env")?;
-    if child_env.is_empty() {
-        return Ok(());
-    }
-    let parent_env = snapshot_allow_list(parent, "pass_env")?;
-    for name in &child_env {
-        if !parent_env.iter().any(|bound| env_names_equal(name, bound)) {
-            return Err(child_knob_exceeds("pass_env"));
+/// The child inherits the parent's captured credential bindings verbatim
+/// and never re-discovers them: the parent's `pass_env_values` and
+/// `native_store_binding` (when the parent has them) replace the child's
+/// freshly captured ones, so dispatch derives the same native store.
+pub(super) fn inherit_parent_launch_bindings(child: &mut Value, parent: &Value) {
+    let Some(child) = child.as_object_mut() else {
+        return;
+    };
+    for key in ["pass_env_values", "native_store_binding"] {
+        match parent.get(key) {
+            Some(value) => {
+                child.insert(key.to_owned(), value.clone());
+            }
+            None => {
+                child.remove(key);
+            }
         }
     }
-    Ok(())
 }
 
 /// Agent launch confinement (spec coordination.md "Authority": children
 /// cannot widen parental authority). Owner launches are unrestricted. An
 /// Agent's child on the parent profile reuses the parent's frozen snapshot;
-/// a child on an allow-listed profile carries that profile's freshly frozen
-/// snapshot, with every authority knob no broader than the parent's. Either
-/// way the child shares the parent's workspace and mints no worktree: the
-/// spec grants children nothing beyond project/root inheritance. Runs after
-/// the profile freeze, before workspace preparation mints anything.
+/// a child on an allow-listed same-harness profile carries that profile's
+/// freshly frozen snapshot with only model and effort differing, and the
+/// parent's credential bindings and capacity scopes inherited. Control is
+/// equal or narrower, the workspace is shared, and no worktree is minted:
+/// the spec grants children nothing beyond project/root inheritance. Runs
+/// after the profile freeze, before workspace preparation mints anything.
 pub(super) fn check_agent_launch_authority(
     store: &Store,
     principal: &Principal,
@@ -339,10 +229,20 @@ pub(super) fn check_agent_launch_authority(
     }
     // The profile name gate lives at freeze: same-profile children reuse the
     // parent snapshot verbatim, allow-listed children carry their own
-    // profile's freshly frozen snapshot. Either way every authority knob the
-    // child carries must be no broader than the parent's same knob; model,
-    // effort and harness may differ.
-    child_snapshot_within_parent(snapshot, &parent.profile_snapshot)?;
+    // profile's freshly frozen snapshot. Either way the stripped snapshots
+    // must be identical: only model and effort may differ. The freeze always
+    // records the child profile name, so it is present here.
+    let child_profile = request
+        .args
+        .get("profile")
+        .and_then(Value::as_str)
+        .unwrap_or(parent.profile.as_str());
+    child_snapshot_within_parent(
+        snapshot,
+        child_profile,
+        &parent.profile_snapshot,
+        &parent.profile,
+    )?;
     if parent.workspace.as_deref() != request.args.get("workspace").and_then(Value::as_str) {
         return Err(Error::new(
             "not_allowed",
@@ -805,36 +705,32 @@ mod tests {
             .code,
             "not_allowed"
         );
-        // A different harness alone is not wider authority: model, effort
-        // and harness may differ (#398), and the profile-name allow-list
-        // gate lives at freeze. Broader permissions still refuse.
-        check_agent_launch_authority(
-            &store,
-            &principal,
-            &attempt(json!({
-                "parent": manager,
-                "workspace": "synthetic-workspace",
-                "profile_snapshot": {"control": "tree", "harness": "codex"},
-            })),
-        )
-        .unwrap();
-        assert_eq!(
-            check_agent_launch_authority(
-                &store,
-                &principal,
-                &attempt(json!({
-                    "parent": manager,
-                    "workspace": "synthetic-workspace",
-                    "profile_snapshot": {
-                        "control": "tree",
-                        "permissions": "danger-full-access",
-                    },
-                })),
-            )
-            .unwrap_err()
-            .code,
-            "not_allowed"
-        );
+        // Snapshots must match except for model and effort: an extra
+        // harness knob the parent snapshot lacks refuses here, and
+        // cross-harness children are rejected at freeze too (#398
+        // follow-up). A knob the parent does not bound refuses as well.
+        for snapshot in [
+            json!({"control": "tree", "harness": "codex"}),
+            json!({
+                "control": "tree",
+                "permissions": "danger-full-access",
+            }),
+        ] {
+            assert_eq!(
+                check_agent_launch_authority(
+                    &store,
+                    &principal,
+                    &attempt(json!({
+                        "parent": manager,
+                        "workspace": "synthetic-workspace",
+                        "profile_snapshot": snapshot,
+                    })),
+                )
+                .unwrap_err()
+                .code,
+                "not_allowed"
+            );
+        }
         // Another workspace is refused.
         assert_eq!(
             check_agent_launch_authority(
@@ -880,74 +776,111 @@ mod tests {
     }
 
     #[test]
-    fn child_snapshot_comparison_is_no_broader_and_fail_closed() {
+    fn child_snapshot_comparison_allows_only_model_and_effort_differences() {
         let parent = json!({
             "control": "tree",
             "harness": "codex",
             "model": "manager-model",
+            "effort": "medium",
             "permissions": "workspace-write",
             "approval_policy": "on-request",
-            "mcp": "minimal",
-            "mcp_allow": ["owner-search"],
+            "mcp": "inherit",
+            "mcp_allow": [],
             "pass_env": ["Q06_SHARED"],
+            "pass_env_values": {"CODEX_HOME": null, "CODEX_SQLITE_HOME": null},
+            "child_profiles": ["worker"],
+            "capacity_scopes": [
+                {"scope": "profile:manager", "max_live": null},
+                {"scope": "account:shared", "max_live": 1},
+            ],
+            "account": "shared",
+            "scratch": ["target/", "node_modules/"],
         });
         // An identical snapshot is within itself.
-        child_snapshot_within_parent(&parent, &parent).unwrap();
-        // Narrower-or-equal passes even with a different model and harness:
-        // changing them is the point and grants no authority.
-        child_snapshot_within_parent(
-            &json!({
-                "control": "self",
-                "harness": "codex",
-                "model": "worker-model",
-                "permissions": "read-only",
-                "approval_policy": "on-request",
-                "mcp": "minimal",
-                "mcp_allow": [],
-                "pass_env": ["Q06_SHARED"],
-            }),
-            &parent,
-        )
-        .unwrap();
-        // A broader permission, approval policy, pass_env entry, or MCP
-        // allow entry rejects.
-        for child in [
-            json!({"permissions": "danger-full-access"}),
-            json!({"approval_policy": "never"}),
-            json!({"pass_env": ["Q06_SHARED", "Q06_EXTRA"]}),
-            json!({"mcp_allow": ["owner-search", "other-server"]}),
-            json!({"mcp": "inherit", "mcp_allow": []}),
+        child_snapshot_within_parent(&parent, "manager", &parent, "manager").unwrap();
+        // Only model, effort, the next-hop allow-list, narrowed control and
+        // the child's own profile scope may differ.
+        let mut matching = parent.clone();
+        matching["model"] = json!("worker-model");
+        matching["effort"] = json!("low");
+        matching["control"] = json!("self");
+        matching["child_profiles"] = json!([]);
+        matching["capacity_scopes"] = json!([
+            {"scope": "profile:worker", "max_live": null},
+            {"scope": "account:shared", "max_live": 1},
+        ]);
+        child_snapshot_within_parent(&matching, "worker", &parent, "manager").unwrap();
+        // Any other difference rejects: harness, permissions, approval
+        // policy, MCP, pass_env, scratch, or the inherited bindings.
+        for (key, value) in [
+            ("harness", json!("muse")),
+            ("permissions", json!("read-only")),
+            ("approval_policy", json!("never")),
+            ("mcp", json!("minimal")),
+            ("mcp_allow", json!(["owner-search"])),
+            ("pass_env", json!([])),
+            ("scratch", json!([])),
+            (
+                "pass_env_values",
+                json!({"CODEX_HOME": null, "CODEX_SQLITE_HOME": null, "EXTRA": null}),
+            ),
+            ("cmd", json!("worker-cmd")),
         ] {
-            let mut child = child;
-            child["control"] = json!("self");
-            let mut merged = parent.clone();
-            for (key, value) in child.as_object().unwrap() {
-                merged[key] = value.clone();
-            }
+            let mut child = matching.clone();
+            child[key] = value;
             assert_eq!(
-                child_snapshot_within_parent(&merged, &parent)
+                child_snapshot_within_parent(&child, "worker", &parent, "manager")
                     .unwrap_err()
                     .code,
-                "not_allowed"
+                "not_allowed",
+                "key: {key}"
             );
         }
-        // Unknown values never allow.
-        let mut unknown = parent.clone();
-        unknown["permissions"] = json!("superuser");
+        // Absent-vs-present rejects in both directions: an omitted knob the
+        // parent carries, and an extra knob the parent lacks.
+        let mut omitted = matching.clone();
+        omitted.as_object_mut().unwrap().remove("pass_env");
         assert_eq!(
-            child_snapshot_within_parent(&unknown, &parent)
+            child_snapshot_within_parent(&omitted, "worker", &parent, "manager")
                 .unwrap_err()
                 .code,
             "not_allowed"
         );
-        // A knob the parent snapshot does not bound rejects.
-        let mut unbounded = parent.clone();
-        unbounded.as_object_mut().unwrap().remove("permissions");
+        let mut extra = matching.clone();
+        extra["approval"] = json!("allowAll");
         assert_eq!(
-            child_snapshot_within_parent(&parent, &unbounded)
+            child_snapshot_within_parent(&extra, "worker", &parent, "manager")
                 .unwrap_err()
                 .code,
             "not_allowed"
+        );
+        // A missing or loosened account scope rejects: dropping the shared
+        // scope would escape the parent's capacity bound (audit finding 3).
+        let mut no_account = matching.clone();
+        no_account["capacity_scopes"] = json!([{"scope": "profile:worker", "max_live": null}]);
+        assert_eq!(
+            child_snapshot_within_parent(&no_account, "worker", &parent, "manager")
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        let mut loose_account = matching.clone();
+        loose_account["capacity_scopes"] = json!([
+            {"scope": "profile:worker", "max_live": null},
+            {"scope": "account:shared", "max_live": 2},
+        ]);
+        assert_eq!(
+            child_snapshot_within_parent(&loose_account, "worker", &parent, "manager")
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        // A non-object snapshot is malformed, never silently allowed.
+        assert_eq!(
+            child_snapshot_within_parent(&json!([]), "worker", &parent, "manager")
+                .unwrap_err()
+                .code,
+            "invalid"
         );
     }
 
@@ -968,21 +901,27 @@ mod tests {
     }
 
     const CHILD_PROFILE_CONFIG: &str = concat!(
+        "[accounts.shared]\n",
+        "max_live = 2\n",
         "[profiles.manager]\n",
         "harness = \"codex\"\n",
         "model = \"manager-model\"\n",
+        "effort = \"medium\"\n",
         "control = \"tree\"\n",
         "permissions = \"workspace-write\"\n",
         "approval_policy = \"on-request\"\n",
         "pass_env = [\"Q06_SHARED\"]\n",
+        "account = \"shared\"\n",
         "child_profiles = [\"worker\"]\n",
         "[profiles.worker]\n",
         "harness = \"codex\"\n",
         "model = \"worker-model\"\n",
+        "effort = \"low\"\n",
         "control = \"self\"\n",
-        "permissions = \"read-only\"\n",
+        "permissions = \"workspace-write\"\n",
         "approval_policy = \"on-request\"\n",
         "pass_env = [\"Q06_SHARED\"]\n",
+        "account = \"shared\"\n",
         "[profiles.stranger]\n",
         "harness = \"codex\"\n",
         "model = \"stranger-model\"\n",
@@ -990,35 +929,74 @@ mod tests {
     );
 
     const WIDE_CHILD_CONFIG: &str = concat!(
+        "[accounts.shared]\n",
+        "max_live = 1\n",
+        "[accounts.other]\n",
+        "max_live = 1\n",
         "[profiles.manager]\n",
         "harness = \"codex\"\n",
         "model = \"manager-model\"\n",
+        "effort = \"medium\"\n",
         "control = \"tree\"\n",
         "permissions = \"workspace-write\"\n",
         "approval_policy = \"on-request\"\n",
         "pass_env = [\"Q06_SHARED\"]\n",
-        "child_profiles = [\"wide-perms\", \"wide-approval\", \"wide-env\"]\n",
+        "account = \"shared\"\n",
+        "child_profiles = [\"wide-perms\", \"wide-approval\", \"wide-env\", \"wide-cmd\", \"no-acct\", \"other-acct\"]\n",
         "[profiles.wide-perms]\n",
         "harness = \"codex\"\n",
         "model = \"wide-model\"\n",
+        "effort = \"medium\"\n",
         "control = \"self\"\n",
         "permissions = \"danger-full-access\"\n",
         "approval_policy = \"on-request\"\n",
         "pass_env = [\"Q06_SHARED\"]\n",
+        "account = \"shared\"\n",
         "[profiles.wide-approval]\n",
         "harness = \"codex\"\n",
         "model = \"wide-model\"\n",
+        "effort = \"medium\"\n",
         "control = \"self\"\n",
         "permissions = \"workspace-write\"\n",
         "approval_policy = \"never\"\n",
         "pass_env = [\"Q06_SHARED\"]\n",
+        "account = \"shared\"\n",
         "[profiles.wide-env]\n",
         "harness = \"codex\"\n",
         "model = \"wide-model\"\n",
+        "effort = \"medium\"\n",
         "control = \"self\"\n",
         "permissions = \"workspace-write\"\n",
         "approval_policy = \"on-request\"\n",
         "pass_env = [\"Q06_SHARED\", \"Q06_EXTRA\"]\n",
+        "account = \"shared\"\n",
+        "[profiles.wide-cmd]\n",
+        "harness = \"codex\"\n",
+        "model = \"wide-model\"\n",
+        "effort = \"medium\"\n",
+        "control = \"self\"\n",
+        "permissions = \"workspace-write\"\n",
+        "approval_policy = \"on-request\"\n",
+        "pass_env = [\"Q06_SHARED\"]\n",
+        "account = \"shared\"\n",
+        "cmd = \"C:/Tools/Codex/codex.exe\"\n",
+        "[profiles.no-acct]\n",
+        "harness = \"codex\"\n",
+        "model = \"wide-model\"\n",
+        "effort = \"medium\"\n",
+        "control = \"self\"\n",
+        "permissions = \"workspace-write\"\n",
+        "approval_policy = \"on-request\"\n",
+        "pass_env = [\"Q06_SHARED\"]\n",
+        "[profiles.other-acct]\n",
+        "harness = \"codex\"\n",
+        "model = \"wide-model\"\n",
+        "effort = \"medium\"\n",
+        "control = \"self\"\n",
+        "permissions = \"workspace-write\"\n",
+        "approval_policy = \"on-request\"\n",
+        "pass_env = [\"Q06_SHARED\"]\n",
+        "account = \"other\"\n",
     );
 
     async fn launch_manager(router: &Router, workspace: &std::path::Path, profile: &str) -> String {
@@ -1086,6 +1064,48 @@ mod tests {
             manager_row.profile_snapshot["child_profiles"],
             json!(["worker"])
         );
+        // Only model, effort, the next-hop allow-list, narrowed control and
+        // the child's own profile scope differ.
+        assert_eq!(child_row.profile_snapshot["effort"], "low");
+        assert_eq!(child_row.profile_snapshot["control"], "self");
+        assert_eq!(child_row.profile_snapshot["child_profiles"], json!([]));
+        // The child inherited the parent's credential bindings verbatim and
+        // kept the shared account scope with the same bounds (audit
+        // findings 2 and 3).
+        assert_eq!(
+            child_row.profile_snapshot["pass_env_values"],
+            manager_row.profile_snapshot["pass_env_values"]
+        );
+        assert_eq!(
+            child_row.profile_snapshot["capacity_scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|scope| scope["scope"] != "profile:worker")
+                .cloned()
+                .collect::<Vec<_>>(),
+            manager_row.profile_snapshot["capacity_scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|scope| scope["scope"] != "profile:manager")
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        let parent_account_scope = manager_row.profile_snapshot["capacity_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|scope| scope["scope"] == "account:shared")
+            .unwrap()
+            .clone();
+        assert!(
+            child_row.profile_snapshot["capacity_scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|scope| scope == &parent_account_scope)
+        );
         let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::remove_dir_all(&config_root);
     }
@@ -1112,14 +1132,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broader_authority_on_an_allowed_profile_is_rejected() {
+    async fn differing_snapshot_on_an_allowed_profile_is_rejected() {
         let (router, config_root) = router_with_profiles(WIDE_CHILD_CONFIG);
         let workspace = std::env::temp_dir().join(format!("eliot-hierarchy-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&workspace).unwrap();
         let manager = launch_manager(&router, &workspace, "manager").await;
-        // Broader permissions, a broader approval policy, and broader
-        // pass_env each reject even though the profile is allow-listed.
-        for profile in ["wide-perms", "wide-approval", "wide-env"] {
+        // Only model and effort may differ: differing permissions, approval
+        // policy, pass_env, cmd, or a missing or different account scope
+        // each reject even though the profile is allow-listed.
+        for profile in [
+            "wide-perms",
+            "wide-approval",
+            "wide-env",
+            "wide-cmd",
+            "no-acct",
+            "other-acct",
+        ] {
             assert_eq!(
                 launch_child(&router, &manager, &workspace, Some(profile))
                     .await
@@ -1129,6 +1157,55 @@ mod tests {
                 "profile: {profile}"
             );
         }
+        let store = router.inner.store.lock().await;
+        assert_eq!(store.agent_count().unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&config_root);
+    }
+
+    #[tokio::test]
+    async fn cross_harness_child_is_rejected_at_launch() {
+        let (router, config_root) = router_with_profiles(CHILD_PROFILE_CONFIG);
+        let workspace = std::env::temp_dir().join(format!("eliot-hierarchy-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let manager = launch_manager(&router, &workspace, "manager").await;
+        // The owner rewrites the allow-listed worker profile to another
+        // harness after the manager launched: the frozen allow-list still
+        // names it, but the launch-time harness check refuses (audit
+        // finding 1).
+        std::fs::write(
+            config_root.join("config.toml"),
+            concat!(
+                "[accounts.shared]\n",
+                "max_live = 1\n",
+                "[profiles.manager]\n",
+                "harness = \"codex\"\n",
+                "model = \"manager-model\"\n",
+                "effort = \"medium\"\n",
+                "control = \"tree\"\n",
+                "permissions = \"workspace-write\"\n",
+                "approval_policy = \"on-request\"\n",
+                "pass_env = [\"Q06_SHARED\"]\n",
+                "account = \"shared\"\n",
+                "child_profiles = [\"worker\"]\n",
+                "[profiles.worker]\n",
+                "harness = \"muse\"\n",
+                "model = \"worker-model\"\n",
+                "cmd = \"C:/Tools/Muse/muse.exe\"\n",
+                "control = \"self\"\n",
+                "permissions = \"workspace-write\"\n",
+                "pass_env = [\"Q06_SHARED\"]\n",
+                "account = \"shared\"\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            launch_child(&router, &manager, &workspace, Some("worker"))
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
         let store = router.inner.store.lock().await;
         assert_eq!(store.agent_count().unwrap(), 1);
         let _ = std::fs::remove_dir_all(&workspace);

@@ -896,10 +896,12 @@ pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Valu
 }
 
 /// Freeze the owner-configured Agent child allow-list for this profile.
-/// Each name must be an existing configured profile and a profile must not
-/// list itself. The frozen list is captured in the parent snapshot, so a
-/// later config edit cannot widen an already-running manager. Absent means
-/// empty: Agent children reuse the parent profile only.
+/// Each name must be an existing configured profile of the same harness and
+/// a profile must not list itself. Cross-harness children are not supported:
+/// equal policy names mean different native surfaces on different harnesses.
+/// The frozen list is captured in the parent snapshot, so a later config
+/// edit cannot widen an already-running manager. Absent means empty: Agent
+/// children reuse the parent profile only.
 fn freeze_child_profiles(
     profile_name: &str,
     entry: &ProfileEntry,
@@ -939,6 +941,15 @@ fn freeze_child_profiles(
         }
         if !config.profiles.contains_key(child) {
             return Err(fail(&format!("unknown child profile {child}")));
+        }
+        let child_harness = config
+            .profiles
+            .get(child)
+            .map(|entry| entry.get_ref().harness.trim());
+        if child_harness != Some(entry.harness.trim()) {
+            return Err(fail(&format!(
+                "child profile {child} uses a different harness (cross-harness child profiles are not supported)"
+            )));
         }
         if !seen.insert(child.to_owned()) {
             return Err(fail("contains a duplicate entry"));
@@ -2849,6 +2860,11 @@ mod tests {
                 "[profiles.manager]\nharness = \"codex\"\nmodel = \"fixture-model\"\nchild_profiles = [\"worker\", \"worker\"]\n\
                  [profiles.worker]\nharness = \"codex\"\nmodel = \"fixture-cheap\"\n",
                 "duplicate",
+            ),
+            (
+                "[profiles.manager]\nharness = \"codex\"\nmodel = \"fixture-model\"\nchild_profiles = [\"worker\"]\n\
+                 [profiles.worker]\nharness = \"muse\"\nmodel = \"fixture-model\"\ncmd = \"C:/Tools/Muse/muse.exe\"\n",
+                "different harness",
             ),
         ] {
             fixture.write(source);

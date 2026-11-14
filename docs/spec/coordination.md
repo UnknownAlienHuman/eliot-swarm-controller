@@ -195,11 +195,12 @@ launches only its own children. The child takes the parent's project label and t
 root at one deeper depth; the parent link is durable. A launch parent must be a
 controlled Agent: observe-only and unknown Agents cannot take children. Per
 Authority above, an Agent's child cannot widen parental authority: it carries the
-parent profile's frozen snapshot, or the freshly frozen snapshot of a profile from
-the parent snapshot's captured `child_profiles` allow-list, with control narrowed
-or equal (never widened) and every other authority knob no broader than the
-parent's; it shares the parent's workspace and mints no worktree; owner launches
-are unrestricted. Fanout limits (`[daemon.limits]`, checked at launch admission)
+parent profile's frozen snapshot, or the freshly frozen snapshot of a same-harness
+profile from the parent snapshot's captured `child_profiles` allow-list, with only
+model and effort differing, the parent's captured credential bindings inherited
+verbatim, and every non-profile capacity scope kept with the same bounds; control
+is narrowed or equal (never widened). It shares the parent's workspace and mints
+no worktree; owner launches are unrestricted. Fanout limits (`[daemon.limits]`, checked at launch admission)
 prevent accidental new work but never hide an Agent row that already exists.
 Above-limit children remain visible with no widened identity/control; over-limit
 admission reads `fanout_limit` and persists nothing. Terminal Agents (stopped,
