@@ -101,19 +101,26 @@ output; there is no dedicated turn-read method.
 During an associated turn, the adapter attempts one read-only `view/subscribe`
 with `after` equal to its last successfully applied owned-session cursor. It
 records that lower bound and the returned subscription head (when available)
-on the source gap before processing replay. Replay uses the same event actor and
-exact session/turn/command binding as live delivery. Only a successfully processed
-cursor after the observed subscription head, followed by acknowledged `ok` source
-health, can restore live observation; the historical gap stays visible. An actual
-replayed terminal can complete the exact turn while source health remains stale.
-An interrupt refused during the gap names the unavailable-view reason explicitly.
+on the source gap before processing replay. When the gap lands before turn
+association (while `turn/start` awaits its reply), the acknowledged association
+attempts the same subscribe and arms the same recovery deadline, so the turn
+cannot stay busy with no settlement. Replay uses the same event actor and
+exact session/turn/command binding as live delivery; a replayed cursor that was
+already applied skips normalization instead of committing twice. Only a
+successfully processed cursor after the observed subscription head, followed by
+acknowledged `ok` source health, can restore live observation; the historical
+gap stays visible. An actual replayed terminal can complete the exact turn while
+source health remains stale. An interrupt refused during the gap names the
+unavailable-view reason explicitly.
 When the recovery window expires without live proof (or recovery cannot be
 attempted), the adapter settles the active turn `unknown` with the recorded gap
 through the shared turn-unknown path (`turn.unknown` with the exact
-command/turn binding and the gap reason), never as success or failure. The
-plugin host stays alive and the Agent is not marked lost; the session remains
-for a later send/stop. Later facts for that turn gap instead of resurrecting
-it, and interrupt/stop afterwards behave as for any unknown turn.
+command/turn binding and the gap reason), never as success or failure. The turn
+binding clears only after that terminal write is acknowledged; a failed write
+keeps the binding and retries on the next opportunity instead of stranding the
+Store turn. The plugin host stays alive and the Agent is not marked lost; the
+session remains for a later send/stop. Later facts for that turn gap instead of
+resurrecting it, and interrupt/stop afterwards behave as for any unknown turn.
 Subscription admission alone, a private page, or a timer never proves native turn
 completion or process/session exit. Live recovery after projection failure remains
 unqualified until exercised through Swarm by the controller.
