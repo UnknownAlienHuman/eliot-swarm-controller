@@ -4628,8 +4628,17 @@ impl Store {
     /// the Agent generation, assigned here (not at admission) so concurrent
     /// admissions stay monotonic; `command_id` is unique so a reprocessed
     /// dispatch returns the retained row instead of bumping again.
-    /// Settlement to `applied` happens after this returns.
+    /// Settlement to `applied` happens after this returns. A pre-commit
+    /// persistence error latches the Store like every other mutation, so
+    /// the Router cannot settle the command `rejected` past the fault.
     pub fn apply_agent_config(&mut self, command_id: &str, now: i64) -> Result<AgentConfig> {
+        self.ensure_writer_healthy()?;
+        let result = self.apply_agent_config_inner(command_id, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn apply_agent_config_inner(&mut self, command_id: &str, now: i64) -> Result<AgentConfig> {
         self.ensure_writer_healthy()?;
         let tx = self
             .connection
@@ -5115,46 +5124,63 @@ fn earliest_pending_send(
         .map_err(sql_error)
 }
 
-/// Earliest not-yet-terminal `configure` for one Agent generation, in
-/// admission order. A dispatched or unknown configure holds the settings
-/// lane: later configures, and later sends, wait for its exact outcome.
-fn earliest_pending_configure(
+/// Admission order of one command as `(created_at, rowid)`: the shared
+/// settings-lane order for sends and configures. An earlier-admitted command
+/// passes a later one, and a later command waits for an earlier one.
+fn command_admission_key(connection: &Connection, id: &str) -> Result<(i64, i64)> {
+    connection
+        .query_row(
+            "SELECT created_at, rowid FROM commands WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .ok_or_else(|| Error::new("internal", "queued command disappeared"))
+}
+
+/// Earliest not-yet-terminal `configure` for one Agent generation, with its
+/// admission key. A dispatched or unknown configure holds the settings
+/// lane, but only for later-admitted sends: an earlier send still dispatches
+/// first so it never runs under newer configuration.
+fn earliest_pending_configure_key(
     connection: &Connection,
     agent_num: i64,
     generation: i64,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, i64, i64)>> {
     connection
         .query_row(
-            "SELECT id FROM commands
+            "SELECT id, created_at, rowid FROM commands
              WHERE target = ?1 AND generation = ?2 AND verb = 'configure'
                AND state IN ('accepted', 'queued', 'dispatched', 'unknown')
              ORDER BY created_at, rowid LIMIT 1",
             params![agent_num, generation],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(sql_error)
 }
 
-/// Committed but unassociated send input (dispatched or unknown, no turn):
-/// holds the settings lane for a later `configure` until the exact native
-/// turn association lands.
-fn has_unassociated_send_input(
+/// Earliest send input that has not frozen its revision or association yet
+/// (accepted, queued, or dispatched/unknown with no turn), with its
+/// admission key. An earlier one holds the settings lane for a later
+/// `configure` until it dispatches or its turn association lands.
+fn earliest_unresolved_send_key(
     connection: &Connection,
     agent_num: i64,
     generation: i64,
-) -> Result<bool> {
+) -> Result<Option<(String, i64, i64)>> {
     connection
         .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM commands
-                 WHERE target = ?1 AND generation = ?2 AND verb = 'send'
-                   AND state IN ('dispatched', 'unknown')
-                   AND turn_id IS NULL
-             )",
+            "SELECT id, created_at, rowid FROM commands
+             WHERE target = ?1 AND generation = ?2 AND verb = 'send'
+               AND (state IN ('accepted', 'queued')
+                    OR (state IN ('dispatched', 'unknown') AND turn_id IS NULL))
+             ORDER BY created_at, rowid LIMIT 1",
             params![agent_num, generation],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
+        .optional()
         .map_err(sql_error)
 }
 

@@ -53,8 +53,9 @@ pub(super) fn persist_effects(
             Effect::CommandTurnAssociated {
                 command_id,
                 turn_id,
+                effort,
             } => {
-                command_events.extend(persist_turn_associated(scope, command_id, turn_id)?);
+                command_events.extend(persist_turn_associated(scope, command_id, turn_id, effort)?);
             }
             Effect::RequestPending {
                 request_id,
@@ -130,6 +131,7 @@ fn persist_turn_associated(
     scope: EffectScope<'_, '_>,
     command_id: &str,
     turn_id: &str,
+    resolved_effort: &Option<String>,
 ) -> Result<Vec<PendingCommandEvent>> {
     let EffectScope {
         tx,
@@ -189,13 +191,29 @@ fn persist_turn_associated(
     // model/effort in its readback. Unchanged without an overlay.
     let mut outcome = json!({"turn_id": turn_id});
     if command.config_revision > 0 {
-        let config = get_agent_config_tx(tx, agent_num, generation, command.config_revision)?
+        let mut config = get_agent_config_tx(tx, agent_num, generation, command.config_revision)?
             .ok_or_else(|| {
-                Error::new(
-                    "source_integrity",
-                    "send command revision has no retained agent_config",
-                )
-            })?;
+            Error::new(
+                "source_integrity",
+                "send command revision has no retained agent_config",
+            )
+        })?;
+        // A plugin-reported effort is the native request's resolved value
+        // (for example the native readback a model-only configure left out
+        // of the overlay). Recording it keeps `requested` (what the owner
+        // asked) separate from `effective` (what the turn carried), so the
+        // turn and the generation readback show the effort actually sent.
+        // Absent reports invent nothing: the overlay stands as stored.
+        if let Some(resolved) = resolved_effort.as_deref()
+            && config.effort.as_deref() != Some(resolved)
+        {
+            db!(tx.execute(
+                "UPDATE agent_config SET effective = json_set(effective, '$.effort', ?3)
+                 WHERE agent = ?1 AND generation = ?2 AND revision = ?4",
+                params![agent_num, generation, resolved, config.revision],
+            ));
+            config.effort = Some(resolved.to_owned());
+        }
         outcome["config_revision"] = json!(config.revision);
         outcome["model"] = config
             .model
@@ -789,6 +807,7 @@ fn effect_cause_tx(
         Effect::CommandTurnAssociated {
             command_id,
             turn_id,
+            ..
         } => {
             let Some(command) = load_command_record(tx, command_id)? else {
                 return Ok(None);

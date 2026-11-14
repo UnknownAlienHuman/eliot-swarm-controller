@@ -1602,6 +1602,16 @@ impl CodexPlugin {
             .effort_override
             .clone()
             .or_else(|| session.selected_effort.clone());
+        // What the native turn request actually carries: the requested
+        // override, or the native readback when the profile (and the
+        // overlay) left effort absent. Reported through the turn association
+        // only under a `configure` overlay; plain sends keep their exact
+        // event shape.
+        let sent_effort = params
+            .config_revision
+            .is_some()
+            .then(|| effort.clone().or_else(|| session.native_effort.clone()))
+            .flatten();
         let turn_params = Self::turn_start_params(
             session
                 .thread_id
@@ -1666,7 +1676,12 @@ impl CodexPlugin {
             .insert(command_id.clone(), turn_id.clone());
         if session
             .events
-            .associate_turn(command_id.clone(), turn_id.clone(), params.context.clone())
+            .associate_turn(
+                command_id.clone(),
+                turn_id.clone(),
+                params.context.clone(),
+                sent_effort.clone(),
+            )
             .await
             .is_err()
         {
@@ -1684,7 +1699,7 @@ impl CodexPlugin {
         if let Some(revision) = params.config_revision {
             result["config_revision"] = json!(revision);
             result["model"] = json!(model);
-            result["effort"] = json!(effort);
+            result["effort"] = json!(sent_effort);
         }
         Ok(result)
     }

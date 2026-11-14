@@ -566,11 +566,17 @@ selects another model or account.
 Each send keeps the revision current at its own dispatch; a send committed
 before an overlay never runs under newer configuration, and a send admitted
 after it dispatches under it. Each turn records the revision it ran under.
-A configure admitted while send input is still unassociated waits on the
-settings lane, as does later input while a configure is still pending; the
-Router redispatches on lane release. `swarm show` (the `agent.get` view)
-reports the current effective values, the revision, and the original frozen
-values together.
+The settings lane is ordered by shared admission order: a configure does not
+apply while an earlier-admitted send is still queued or undispatched, an
+earlier queued send passes a later configure, and a later input waits for an
+earlier configure; the Router redispatches on lane release. When the native
+turn request carries a resolved effort the overlay left absent, the turn
+association records it on the overlay's effective values while the requested
+values stay exactly what the owner asked. Retention keeps every command a
+retained overlay references: pruning never deletes a command named by the
+overlay, so configuration provenance survives expiry. `swarm show` (the
+`agent.get` view) reports the current effective values, the revision, and the
+original frozen values together.
 
 ## Frozen files
 

@@ -509,9 +509,17 @@ effective values, the monotonically increasing `config_revision` for the
 generation, and `application:\"next_turn\"`. Each send keeps the revision
 current at its own dispatch, each turn records the revision it ran under, and
 the first overlay turn's readback repeats the effective values; a send
-committed before an overlay never runs under newer configuration. A configure
-admitted while send input is still unassociated waits on the settings lane,
-as does later input while a configure is still pending.
+committed before an overlay never runs under newer configuration. The lane is
+ordered by shared admission order: a configure does not apply while an
+earlier-admitted send is still queued or undispatched, an earlier queued send
+passes a later configure, and a later input waits for an earlier configure.
+When the native turn request carries a resolved effort the overlay left absent
+(for example a model-only configure on a profile with omitted effort), the
+turn association records it on the overlay, so the turn and the generation
+readback show the effort actually sent; the requested values stay exactly what
+the owner asked. Retention keeps every command a retained overlay references:
+pruning never deletes a command named by `agent_config`, so configuration
+provenance survives expiry.
 
 Resolve the target and validate principal/capability/state before persisting the command
 binding and events. Each verb checks `expected_generation` at its defined admission or
@@ -716,7 +724,9 @@ blocks further takeover. Exact stop/interrupt/request replies/readback remain av
 A dispatched or unknown `configure` also holds the settings lane: do not dispatch a
 later configure, new input or native/Eliot Goal start/resume until its exact outcome and
 effective settings are read back or explicitly resolved. Timeout does not release this
-hold, even when the observed Agent state is idle. This is a predicate over existing
+hold, even when the observed Agent state is idle. Admission order decides both
+directions of the lane: an earlier-admitted send passes a later configure, and
+a later send waits for an earlier configure. This is a predicate over existing
 command rows, not another queue/table. Stop/interrupt/request replies/readback still work.
 
 Owner resolution of unknown outcomes is implemented and owner-only. Both calls take

@@ -100,6 +100,7 @@ enum Control {
         command_id: String,
         turn_id: String,
         context: Vec<ContextItem>,
+        effort: Option<String>,
         reply: oneshot::Sender<Result<()>>,
     },
     BeginStop {
@@ -531,11 +532,13 @@ impl EventHandle {
         command_id: String,
         turn_id: String,
         context: Vec<ContextItem>,
+        effort: Option<String>,
     ) -> Result<()> {
         self.send(|reply| Control::AssociateTurn {
             command_id,
             turn_id,
             context,
+            effort,
             reply,
         })
         .await
@@ -672,9 +675,12 @@ impl EventProcessor {
                 command_id,
                 turn_id,
                 context,
+                effort,
                 reply,
             } => {
-                let result = self.associate_turn(command_id, turn_id, context).await;
+                let result = self
+                    .associate_turn(command_id, turn_id, context, effort)
+                    .await;
                 let _ = reply.send(result);
                 true
             }
@@ -1166,6 +1172,7 @@ impl EventProcessor {
         command_id: String,
         turn_id: String,
         context: Vec<ContextItem>,
+        effort: Option<String>,
     ) -> Result<()> {
         if !self.status.ready
             || self.status.thread_id.is_none()
@@ -1196,6 +1203,12 @@ impl EventProcessor {
         let thread_id = self.status.thread_id.as_deref().unwrap_or_default();
         let native_id = event_id(thread_id, &turn_id, &turn_id, "turn.started")?;
         let mut data = json!({"command_id": command_id, "turn_id": turn_id});
+        // Report the effort the native turn request actually carried, so the
+        // Store readback shows the resolved value instead of the overlay's
+        // absent override. Omitted when unknown: nothing is invented.
+        if let Some(effort) = effort.as_deref().filter(|effort| !effort.trim().is_empty()) {
+            data["effort"] = json!(effort);
+        }
         if !context.is_empty() {
             data["context_outcomes"] = json!(next_input_outcomes(&context, &command_id));
         }

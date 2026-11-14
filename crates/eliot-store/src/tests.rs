@@ -13040,3 +13040,317 @@ fn sends_run_under_their_dispatch_revision_and_turns_inherit_it() {
         "snapshot sends keep their exact outcome shape"
     );
 }
+
+#[test]
+fn configure_and_send_share_one_admission_order() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_configure_agent(
+        &mut store,
+        "configure-lane",
+        "codex",
+        json!({"model": "m0", "effort": "low"}),
+        now,
+    );
+    let state_of = |store: &Store, id: &str| {
+        store
+            .get_command(id)
+            .expect("load command")
+            .expect("command exists")
+            .state
+    };
+    let batch =
+        |batch_id: &str, kind: &str, native_id: &str, data: serde_json::Value| SourceBatch {
+            batch_id: batch_id.to_owned(),
+            agent_id: agent.clone(),
+            generation: 1,
+            source: "stream".to_owned(),
+            events: vec![NativeEvent {
+                ts: None,
+                kind: kind.to_owned(),
+                native_id: native_id.to_owned(),
+                data,
+            }],
+            cursor: None,
+        };
+
+    // Occupy the Agent with an associated active turn.
+    let active = send_request(&agent, 1, "occupying turn");
+    let active_id = active.id.clone();
+    store
+        .submit("owner", active, now + 1)
+        .expect("admit occupying send");
+    store
+        .dispatch(&active_id, now + 2)
+        .expect("dispatch occupying send");
+    store
+        .put_batch(
+            batch(
+                "configure-lane:occupying",
+                "turn.started",
+                "configure-lane:occupying:started",
+                json!({"command_id": active_id, "turn_id": "lane-turn-0"}),
+            ),
+            now + 3,
+        )
+        .expect("associate occupying turn");
+
+    // Admit SEND S, then configure C, on the busy Agent.
+    let send = send_request(&agent, 1, "queued input");
+    let send_id = send.id.clone();
+    store
+        .submit("owner", send, now + 4)
+        .expect("admit queued send");
+    let configure = configure_request(&agent, 1, json!({"model": "m1"}));
+    let configure_id = configure.id.clone();
+    store
+        .submit("owner", configure, now + 5)
+        .expect("admit configure");
+
+    // A configure never overtakes an earlier-admitted send: C queues behind
+    // the still-queued S instead of applying immediately.
+    store
+        .dispatch(&configure_id, now + 6)
+        .expect("queue configure");
+    assert_eq!(
+        state_of(&store, &configure_id),
+        CommandState::Queued,
+        "configure waits for the earlier queued send"
+    );
+
+    // Free the Agent; the earlier send dispatches first and freezes the
+    // snapshot revision even though a configure is pending.
+    store
+        .put_batch(
+            batch(
+                "configure-lane:free",
+                "turn.completed",
+                "configure-lane:free:completed",
+                json!({"command_id": active_id, "turn_id": "lane-turn-0", "status": "completed"}),
+            ),
+            now + 7,
+        )
+        .expect("complete occupying turn");
+    store
+        .dispatch(&send_id, now + 8)
+        .expect("dispatch earlier send");
+    assert_eq!(
+        state_of(&store, &send_id),
+        CommandState::Dispatched,
+        "earlier send passes the later configure"
+    );
+    assert!(
+        store
+            .send_effective_config(&send_id)
+            .expect("resolve earlier send")
+            .is_none(),
+        "earlier send runs under the frozen snapshot"
+    );
+
+    // C still waits for S's turn association, then applies as revision 1.
+    store
+        .dispatch(&configure_id, now + 9)
+        .expect("redispatch configure");
+    assert_eq!(
+        state_of(&store, &configure_id),
+        CommandState::Queued,
+        "configure waits for the earlier unassociated send"
+    );
+    store
+        .put_batch(
+            batch(
+                "configure-lane:associated",
+                "turn.started",
+                "configure-lane:associated:started",
+                json!({"command_id": send_id, "turn_id": "lane-turn-1"}),
+            ),
+            now + 10,
+        )
+        .expect("associate earlier send");
+    store
+        .dispatch(&configure_id, now + 11)
+        .expect("dispatch configure");
+    let applied = store
+        .apply_agent_config(&configure_id, now + 12)
+        .expect("apply configure");
+    assert_eq!(applied.revision, 1);
+    store
+        .settle(&configure_id, CommandState::Applied, None, now + 12)
+        .expect("settle configure");
+
+    // A later input waits for the earlier configure while otherwise ready,
+    // then runs under it.
+    store
+        .put_batch(
+            batch(
+                "configure-lane:done",
+                "turn.completed",
+                "configure-lane:done:completed",
+                json!({"command_id": send_id, "turn_id": "lane-turn-1", "status": "completed"}),
+            ),
+            now + 13,
+        )
+        .expect("complete earlier turn");
+    let configure_two = configure_request(&agent, 1, json!({"effort": "high"}));
+    let configure_two_id = configure_two.id.clone();
+    store
+        .submit("owner", configure_two, now + 14)
+        .expect("admit second configure");
+    store
+        .dispatch(&configure_two_id, now + 15)
+        .expect("dispatch second configure");
+    let later = send_request(&agent, 1, "later input");
+    let later_id = later.id.clone();
+    store
+        .submit("owner", later, now + 16)
+        .expect("admit later send");
+    store
+        .dispatch(&later_id, now + 17)
+        .expect("queue later send");
+    assert_eq!(
+        state_of(&store, &later_id),
+        CommandState::Queued,
+        "later input waits for the earlier configure"
+    );
+    let applied_two = store
+        .apply_agent_config(&configure_two_id, now + 18)
+        .expect("apply second configure");
+    assert_eq!(applied_two.revision, 2);
+    store
+        .settle(&configure_two_id, CommandState::Applied, None, now + 18)
+        .expect("settle second configure");
+    store
+        .dispatch(&later_id, now + 19)
+        .expect("dispatch later send");
+    assert_eq!(state_of(&store, &later_id), CommandState::Dispatched);
+    let effective = store
+        .send_effective_config(&later_id)
+        .expect("resolve later send")
+        .expect("overlay applies");
+    assert_eq!(effective.revision, 2, "next input runs under C");
+}
+
+#[test]
+fn turn_and_generation_readback_show_resolved_native_effort() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    // The profile omits effort while native startup resolves it (e.g. low).
+    let agent = ready_configure_agent(
+        &mut store,
+        "configure-effort",
+        "codex",
+        json!({"model": "m0"}),
+        now,
+    );
+
+    // A model-only configure stores no effective effort of its own.
+    let configure = configure_request(&agent, 1, json!({"model": "m1"}));
+    let configure_id = configure.id.clone();
+    store
+        .submit("owner", configure, now + 1)
+        .expect("admit configure");
+    store
+        .dispatch(&configure_id, now + 2)
+        .expect("dispatch configure");
+    let applied = store
+        .apply_agent_config(&configure_id, now + 3)
+        .expect("apply configure");
+    assert_eq!(applied.revision, 1);
+    assert_eq!(applied.effort, None, "no effort was requested or retained");
+    assert_eq!(applied.requested_effort, None);
+    store
+        .settle(&configure_id, CommandState::Applied, None, now + 3)
+        .expect("settle configure");
+
+    // The next send runs under the overlay; the native request carries the
+    // resolved effort, which the plugin reports on the turn association.
+    let send = send_request(&agent, 1, "first turn");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now + 4).expect("admit send");
+    store.dispatch(&send_id, now + 5).expect("dispatch send");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "configure-effort:turn".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: "configure-effort:turn:started".to_owned(),
+                    data: json!({"command_id": send_id, "turn_id": "effort-turn", "effort": "low"}),
+                }],
+                cursor: None,
+            },
+            now + 6,
+        )
+        .expect("associate turn");
+    let outcome = store
+        .get_command(&send_id)
+        .expect("load send")
+        .expect("send exists")
+        .outcome
+        .expect("send has an outcome");
+    assert_eq!(
+        outcome["effort"],
+        json!("low"),
+        "turn shows the effort actually sent"
+    );
+    assert_eq!(outcome["model"], json!("m1"));
+    let current = store
+        .get_agent_config_current(&agent, 1)
+        .expect("read overlay")
+        .expect("overlay exists");
+    assert_eq!(
+        current.effort.as_deref(),
+        Some("low"),
+        "generation readback shows the resolved effort"
+    );
+    assert_eq!(
+        current.requested_effort, None,
+        "requested override stays absent"
+    );
+    let turn = store
+        .get_turn(&agent, 1, "effort-turn")
+        .expect("load turn")
+        .expect("turn exists");
+    assert_eq!(turn.config_revision, 1);
+
+    // A later send under the same revision reads back the recorded effort.
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "configure-effort:done".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.completed".to_owned(),
+                    native_id: "configure-effort:done:completed".to_owned(),
+                    data: json!({"command_id": send_id, "turn_id": "effort-turn", "status": "completed"}),
+                }],
+                cursor: None,
+            },
+            now + 7,
+        )
+        .expect("complete turn");
+    let second = send_request(&agent, 1, "second turn");
+    let second_id = second.id.clone();
+    store
+        .submit("owner", second, now + 8)
+        .expect("admit second send");
+    store
+        .dispatch(&second_id, now + 9)
+        .expect("dispatch second send");
+    let effective = store
+        .send_effective_config(&second_id)
+        .expect("resolve second send")
+        .expect("overlay applies");
+    assert_eq!(
+        effective.effort.as_deref(),
+        Some("low"),
+        "recorded effort carries to the next input"
+    );
+}

@@ -979,6 +979,11 @@ pub enum Effect {
     CommandTurnAssociated {
         command_id: String,
         turn_id: String,
+        /// Effort the native turn request actually carried, when the plugin
+        /// reported one. `None` invents nothing: the Store keeps the
+        /// overlay value it already retained.
+        #[serde(default)]
+        effort: Option<String>,
     },
     RequestPending {
         request_id: String,
@@ -1191,11 +1196,13 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             }
             let command_id = required_text(event, "command_id")?;
             let turn_id = required_text(event, "turn_id")?;
+            let effort = optional_observed_effort(event)?;
             next.state = AgentState::Busy;
             next.active_turn = Some(turn_id.clone());
             effects.push(Effect::CommandTurnAssociated {
                 command_id,
                 turn_id,
+                effort,
             });
         }
         "message.completed" => {
@@ -1476,6 +1483,18 @@ fn optional_observed_model(event: &NativeEvent) -> Result<Option<String>> {
         Some(_) => Err(Error::new(
             "invalid",
             format!("{} field model must be a string", event.kind),
+        )),
+    }
+}
+
+fn optional_observed_effort(event: &NativeEvent) -> Result<Option<String>> {
+    match event.data.get("effort") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(Error::new(
+            "invalid",
+            format!("{} field effort must be a string", event.kind),
         )),
     }
 }
