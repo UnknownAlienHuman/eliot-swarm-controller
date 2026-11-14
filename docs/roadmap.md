@@ -277,6 +277,18 @@ Codex or for unrelated adapters.
 The selected local scope remains in progress while the applicable L7
 qualification is incomplete; do not describe it as feature complete.
 
+- [ ] **Local adopted backends via OpenCode.** One documented usable
+      OpenCode + adopted-backend profile (Strata, Unsloth Studio, LM Studio
+      and llama.cpp presets with Ollama/vLLM on the same OpenAI-compatible
+      provider path; managed startup deferred to adopted endpoints only).
+      Completion: installed backend/harness versions with model/quantization
+      and effective context recorded; a coding turn with an actual tool
+      result, context/output-limit handling, interrupt/stop, and two Agents
+      sharing the server without cross-stop or extra model loading;
+      missing-key rejection and conflicting project settings checked. No
+      owner-global configuration edits or automatic harness/model/account
+      fallback. Codex against these backends stays unsupported.
+
 ## L7 — Qualification, repair and release
 
 Implement the bounded retention path first, then build/run the complete campaign against

@@ -150,6 +150,76 @@ L7 verifies two-session isolation when shared mode is selected, adopted-service 
 204-vs-execution, lost stream/input, snapshot races, pagination, exact controls and no
 historical lifecycle duplication. Unsupported API semantics remain explicit.
 
+## Adopted local backends
+
+One documented OpenCode + adopted-backend profile points an owner-run local
+OpenAI-compatible endpoint at the existing isolated per-Agent root. Managed
+startup is deferred: only already-running adopted endpoints are supported,
+never an owned foreground `llama-server`/Strata launcher or a detached `lms`
+command under Agent custody. See [configuration](../spec/configuration.md)
+for the frozen profile shape.
+
+The frozen model must use the dedicated `eliot-local` provider segment
+(`eliot-local/<api-model-id>`), which has no canonical alias. Three frozen,
+explicit auth choices exist: the existing native `auth_integration` path for
+canonical integrations, an allowed `api_key_env` reference for backends that
+need a key, or no credentials at all (explicit no-auth mode). Local branches
+never import unrelated canonical credentials: `auth_integration` is rejected
+on a local profile, the required key reference must resolve to a non-empty
+runtime value before `serve` starts (a missing or empty key refuses, never
+silently becomes no-auth mode), the isolated store must hold no credential
+for `eliot-local`, and only the `{env:NAME}` reference — or no `apiKey` key
+at all — is rendered. An unresolved `{env:NAME}` would become an empty
+string and select `Auth.none` server-side, so Eliot rejects it first.
+
+The per-Agent document renders the installed native schema (2.0.32) into
+the existing isolated Agent root: `providers` (plural; the legacy singular
+`provider` stays migrated by the server), `package`
+`@opencode/ai/providers/openai-compatible`, `settings.baseURL` (plus
+`settings.apiKey` only in env-key mode), and one `models` entry carrying
+`tools: true` and the frozen `limit.context/output`. The built-in defaults
+(200,000 context / 32,000 output with tools and image input assumed
+supported) are never relied on: limits are explicit. Title and compaction
+auxiliary requests run on the same selected local model: the generated
+document sets only that model. Managed policy authority is preserved: no
+owner or project file is ever edited.
+
+Effective settings are read back, not assumed. The isolated XDG file is not
+the final authority (project config loads after global config), so before
+inference the plugin checks the exact provider through bounded native
+`GET /api/provider/:providerID`, selects the exact API model id locally from
+`GET /api/model` (the endpoint answers an array), and reads the backend's
+own passive `GET {base_url}/models` inventory — which never generates text,
+never sends `?reload=1` (that can unload running llama.cpp models), and
+never touches load/switch selectors. A known mismatch (foreign
+provider/package/endpoint, an absent catalogue id, divergent limits, or an
+inventory without the frozen id) refuses before inference; project overrides
+that retarget the route are rejected, never adopted. Absent observations
+report unavailable honestly instead of failing, and only nonsecret
+observations are retained — never a resolved key or raw configuration. The
+readback is a snapshot, not a guarantee about every request.
+
+Backend presets and metadata mappings are small presets through this same
+provider path, not separate Agent executors. Ollama and vLLM reuse it with
+an explicit local model.
+
+| Backend | Integration boundary |
+| --- | --- |
+| **Strata** | Adopt its selected engine HTTP endpoint. The server also serves unknown requested names, so validate the canonical model/aliases from metadata instead of trusting a successful response. Health separates reachable service (`status`) from loaded model (`loaded`). |
+| **Unsloth Studio** | Use its inference API with an explicit model and a scoped key reference, keeping the client's native function-tool loop. Owner tool/load policies (process-forced tool policy, model auto-switch) are respected and never changed; shared Agents keep one explicit model selector. |
+| **LM Studio** | Use OpenAI-compatible inference plus native model metadata. Prefer one explicitly loaded instance shared by all Agents and read that instance's `config.context_length`, not the model-level maximum. JIT inventory can list unloaded models and auto-evict can unload the previous selection; TTL/load policy stays owner-controlled. |
+| **llama.cpp** | Adopt a fixed-model server first, with the selected model's tool-capable template and function-call path. Keep discovery passive (props reads with `autoload=false`; never `/models?reload=1` for inventory) and configure the effective per-slot context, not pooled context. |
+| **Ollama / vLLM** | Same OpenAI-compatible provider path with an explicit local model. Ollama Responses is stateless; vLLM tool calling depends on model/parser/template. Deployment, clustering and hardware tuning stay outside this increment. |
+
+Several Agents may share one adopted server for inference while each keeps
+its own native session, history, tool execution and approvals; stop ends
+only the owned per-Agent server and never unloads a model or touches
+another Agent. Disconnect behavior varies by route, and unloading a model
+or killing its server is not turn cancellation. Codex profiles against
+these backends stay `unsupported`: readiness, catalog/context, history and
+exact tool formats are resolved separately before any Codex route is
+advertised as supported.
+
 ## Worker MCP policy
 
 This harness keeps `inherit` only: the frozen profile always records
