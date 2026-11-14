@@ -68,13 +68,26 @@ async fn check_ready(binding: &RouteBinding, until: Instant) -> Result<()> {
         }
         let status: Value = serde_json::from_slice(&body)
             .map_err(|_| Error::new("unavailable", "route readiness response is malformed"))?;
-        if status.get("status").and_then(Value::as_str) != Some("ready") {
+        if !readiness_healthy(&status) {
             return Err(Error::new("unavailable", "route has not reported ready"));
         }
         Ok(())
     })
     .await
     .map_err(|_| Error::new("unavailable", "route readiness deadline elapsed"))?
+}
+
+/// Adopted-backend readiness: the OpenCodex contract (`status == "ready"`)
+/// plus the healthy shapes Strata and llama.cpp actually serve
+/// (`status == "ok"`). A Strata health body also carries a separate
+/// `loaded` flag distinguishing reachable service from loaded model;
+/// readiness proves the service only, so `loaded: false` stays healthy
+/// here and surfaces through backend metadata instead of this gate.
+fn readiness_healthy(status: &Value) -> bool {
+    matches!(
+        status.get("status").and_then(Value::as_str),
+        Some("ready") | Some("ok")
+    )
 }
 
 fn readiness_url(binding: &RouteBinding) -> Result<Url> {
@@ -157,6 +170,54 @@ mod tests {
 
         let (malformed, _) = probe_response("200 OK", "not-json").await;
         assert_eq!(malformed.unwrap_err().code, "unavailable");
+    }
+
+    #[tokio::test]
+    async fn readiness_accepts_strata_and_llamacpp_ok_without_credentials() {
+        // Healthy Strata and llama.cpp endpoints report `status == "ok"`;
+        // the previous `ready`-only gate rejected them while healthy.
+        for body in [
+            r#"{"status":"ok"}"#,
+            r#"{"status":"ok","loaded":true}"#,
+            r#"{"status":"ok","loaded":false}"#,
+        ] {
+            let (healthy, request) = probe_response("200 OK", body).await;
+            healthy.unwrap_or_else(|error| panic!("healthy body rejected {body}: {error}"));
+            assert!(request.starts_with("get /readyz http/1.1\r\n"));
+            assert!(!request.contains("authorization:"));
+        }
+        // Near-miss shapes still refuse: readiness proves availability only.
+        for body in [
+            r#"{"status":"Ready"}"#,
+            r#"{"status":"OK"}"#,
+            r#"{"status":""}"#,
+            r#"{"loaded":true}"#,
+            r#"{"status":null}"#,
+        ] {
+            let (unhealthy, _) = probe_response("200 OK", body).await;
+            assert_eq!(
+                unhealthy.unwrap_err().code,
+                "unavailable",
+                "accepted {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_health_distinguishes_service_from_loaded_model() {
+        // `loaded: false` stays healthy: the gate proves the service, while
+        // the loaded flag is backend metadata, not a readiness refusal.
+        assert!(readiness_healthy(
+            &serde_json::json!({"status": "ok", "loaded": false})
+        ));
+        assert!(readiness_healthy(
+            &serde_json::json!({"status": "ok", "loaded": true})
+        ));
+        assert!(readiness_healthy(&serde_json::json!({"status": "ready"})));
+        assert!(!readiness_healthy(
+            &serde_json::json!({"status": "starting"})
+        ));
+        assert!(!readiness_healthy(&serde_json::json!({})));
     }
 
     #[tokio::test]

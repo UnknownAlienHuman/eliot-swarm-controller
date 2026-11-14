@@ -130,6 +130,43 @@ permissions stay unknown (`null` / unverified) until a real native tool probe co
 posture. `collaboration_mode` and `approval_policy`
 presets stay rejected. See the [Muse page](../harnesses/muse.md).
 
+An OpenCode adopted-backend profile points one frozen profile at a local
+OpenAI-compatible endpoint instead of a canonical integration:
+
+```toml
+[profiles.opencode-local]
+harness = "opencode"
+cmd = "C:/Tools/OpenCode/opencode.exe"
+model = "eliot-local/qwen3-8b"
+provider_base_url = "http://127.0.0.1:1234/v1"
+backend = "lmstudio"
+context_limit = 131072
+output_limit = 8192
+# api_key_env = "LOCAL_LLM_KEY"  # plus a pass_env entry, when the backend needs a key
+# pass_env = ["LOCAL_LLM_KEY"]
+```
+
+`backend` is one preset through the single OpenCode provider path:
+`strata`, `unsloth`, `lmstudio`, `llama.cpp`, `ollama`, `vllm` or `generic`
+(Ollama and vLLM reuse the same path, not separate executors). `model` must
+use the dedicated `eliot-local` provider segment, which has no canonical
+alias. `api_key_env` names one `pass_env`-allowed environment holding the
+backend key; absent means explicit no-auth mode, and a missing or empty
+required key refuses before startup instead of silently becoming no-auth.
+`auth_integration` must be absent on this path so no unrelated canonical
+credential is imported. `context_limit` and `output_limit` are the explicit
+effective limits; the plugin renders them with the installed
+`@opencode/ai/providers/openai-compatible` package and verifies the
+effective provider, catalogue entry, limits and passive backend inventory
+before any native session is created — every verification failure
+(including an unreachable backend) settles the launch as failed with a
+short safe reason, never unknown — rejecting project overrides that
+retarget the route.
+There is no harness/model/account fallback. Codex profiles against these
+backends stay `unsupported` until readiness, catalog/context, history and
+exact tool formats are resolved separately. See the
+[OpenCode harness page](../harnesses/opencode.md#adopted-local-backends).
+
 ### Worker MCP policy
 
 Every profile selects a worker MCP inheritance policy in `mcp`: `inherit`
