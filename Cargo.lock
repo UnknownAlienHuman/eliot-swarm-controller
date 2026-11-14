@@ -1479,6 +1479,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulldown-cmark"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83c41efbf8f90ac44de7f3a868f0867851d261b56291732d0cbf7cceaaeb55a6"
+dependencies = [
+ "bitflags",
+ "memchr",
+ "unicase",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2169,11 +2180,15 @@ version = "0.2.0-dev"
 dependencies = [
  "eliot-core",
  "eliot-daemon",
+ "futures-util",
+ "pulldown-cmark",
  "serde",
  "serde_json",
  "tokio",
  "ulid",
+ "url",
  "windows-reactor",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2452,6 +2467,12 @@ dependencies = [
  "rand 0.9.5",
  "web-time",
 ]
+
+[[package]]
+name = "unicase"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-ident"
