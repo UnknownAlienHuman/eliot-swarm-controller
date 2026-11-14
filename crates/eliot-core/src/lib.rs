@@ -658,17 +658,17 @@ impl TurnOutcome {
     /// Harness-aware classification for rows written before canonical
     /// outcomes existed, using the stored harness and that adapter's
     /// recognized native reasons. Claude rows carry the raw terminal reason
-    /// (`success` -> success; `cancelled`/`interrupted` -> interrupted;
-    /// `error`/`failed`/`failure` and the `api_error*` family -> failure).
-    /// Every other harness carries the normalized lifecycle status and uses
-    /// [`Self::classify_legacy_status`]. Anything else is unknown, never
-    /// success.
+    /// (`success`/`completed` -> success; `cancelled`/`interrupted` ->
+    /// interrupted; `error`/`failed`/`failure` and the `api_error*` family
+    /// -> failure). Every other harness carries the normalized lifecycle
+    /// status and uses [`Self::classify_legacy_status`]. Anything else is
+    /// unknown, never success.
     pub fn classify_legacy_status_for_harness(harness: &str, status: Option<&str>) -> Self {
         if harness != "claude" {
             return Self::classify_legacy_status(status);
         }
         match status.map(str::trim) {
-            Some("success") => Self::Success,
+            Some("success") | Some("completed") => Self::Success,
             Some("cancelled") | Some("interrupted") => Self::Interrupted,
             Some("error") | Some("failed") | Some("failure") => Self::Failure,
             Some(reason) => {
@@ -1803,8 +1803,8 @@ mod outcome_tests {
     #[test]
     fn legacy_classification_uses_the_stored_harness_for_claude() {
         // Claude legacy rows carry the raw terminal reason, not the
-        // normalized lifecycle status: `success` and the `api_error*`
-        // family must not read back as unknown.
+        // normalized lifecycle status: `success`/`completed` and the
+        // `api_error*` family must not read back as unknown.
         // Non-Claude harnesses keep the normalized lifecycle mapping.
         for harness in ["codex", "muse", "opencode", "antigravity", "", "fake"] {
             for status in [
@@ -1821,10 +1821,13 @@ mod outcome_tests {
                 );
             }
         }
-        assert_eq!(
-            TurnOutcome::classify_legacy_status_for_harness("claude", Some("success")),
-            TurnOutcome::Success,
-        );
+        for status in [Some("success"), Some("completed")] {
+            assert_eq!(
+                TurnOutcome::classify_legacy_status_for_harness("claude", status),
+                TurnOutcome::Success,
+                "status={status:?}"
+            );
+        }
         for status in [
             Some("cancelled"),
             Some("interrupted"),
@@ -1854,7 +1857,6 @@ mod outcome_tests {
         }
         for status in [
             None,
-            Some("completed"),
             Some("end_turn"),
             Some("inProgress"),
             Some(""),
