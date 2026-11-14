@@ -964,9 +964,14 @@ impl ClaudePlugin {
         // reported on an actual native assistant record (message.completed).
         // Requested vs effective permission mode is reported, never forced:
         // launching with `manual` reads back `default` on the installed CLI.
-        // The installed stream-json protocol (2.1.278) exposes no MCP
-        // inventory record, so the effective server set stays unknown (null,
-        // unverified) for both policies instead of echoing the requested set.
+        // initialize itself exposes no MCP inventory record, so the
+        // effective server set stays unknown (null, unverified) at readiness
+        // for both policies instead of echoing the requested set. The first
+        // post-input `system`/`init` record carries `mcp_servers` (name plus
+        // status per server, verified on installed 2.1.321); the event task
+        // retains that observed set and attaches it to the turn terminal, so
+        // the reducer merges it into the effective set with verified true.
+        // An absent or malformed init inventory stays unknown.
         let effective = with_context_points(
             json!({
                 "model": null,
