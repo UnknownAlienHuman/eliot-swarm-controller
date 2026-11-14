@@ -800,6 +800,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             probe: false,
+            config_revision: 0,
+            config: None,
         };
         let workspace = eliot_core::WorkspacePreparation {
             agent: agent.id.clone(),

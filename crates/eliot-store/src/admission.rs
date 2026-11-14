@@ -842,12 +842,26 @@ fn admit_launch_tx(
         Some(parent) => (Some(parent.num), parent.depth.saturating_add(1)),
         None => (None, 0),
     };
+    // Record the actual freeze decision, not an inferred resemblance: the
+    // snapshot is inherited only when an Agent launches its own child and
+    // reuses the parent's frozen snapshot verbatim. An Owner launch that
+    // resolves the same profile, or a child on an allowed different
+    // profile, freezes fresh and is not inherited.
+    let profile_inherited = match parent_link.as_ref() {
+        Some(parent) => {
+            matches!(
+                hierarchy::parse_caller(tx, principal)?,
+                hierarchy::Caller::Agent { num, .. } if num == parent.num
+            ) && profile_snapshot == parent.profile_snapshot
+        }
+        None => false,
+    };
     db!(tx.execute(
         "INSERT INTO agents(generation, project, harness, profile,
                                 profile_snapshot, workspace, state,
-                                parent, depth, control,
+                                parent, depth, control, profile_inherited,
                                 created_at, updated_at)
-             VALUES (0, ?1, ?2, ?3, ?4, ?5, 'created', ?6, ?7, ?8, ?9, ?9)",
+             VALUES (0, ?1, ?2, ?3, ?4, ?5, 'created', ?6, ?7, ?8, ?9, ?10, ?10)",
         params![
             project,
             harness,
@@ -857,6 +871,7 @@ fn admit_launch_tx(
             parent_num,
             depth,
             control,
+            i64::from(profile_inherited),
             now
         ],
     ));

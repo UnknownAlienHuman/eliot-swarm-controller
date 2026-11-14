@@ -25,7 +25,11 @@ impl CommandGetRequest {
         if self.validate().is_err()
             || response.id != self.id
             || response.generation.is_some_and(|generation| generation < 0)
+            || response.config_revision < 0
             || response.state == CommandState::Unknown && response.turn_id.is_some()
+            || response.config.as_ref().is_some_and(|config| {
+                config.validate().is_err() || config.revision != response.config_revision
+            })
         {
             return Err(binding_mismatch());
         }
@@ -63,9 +67,13 @@ impl TurnGetRequest {
     pub fn validate_response(&self, response: &Turn) -> Result<()> {
         if self.validate().is_err()
             || response.generation < 0
+            || response.config_revision < 0
             || response.agent != self.agent
             || response.generation != self.generation
             || response.turn_id != self.turn_id
+            || response.config.as_ref().is_some_and(|config| {
+                config.validate().is_err() || config.revision != response.config_revision
+            })
         {
             return Err(binding_mismatch());
         }
@@ -85,10 +93,14 @@ impl AgentResultRequest {
             || response.agent_metadata.generation < 0
             || response.generation != expected_generation
             || response.turns.len() > self.limit
-            || response
-                .turns
-                .iter()
-                .any(|turn| turn.agent != response.agent || turn.generation != response.generation)
+            || response.turns.iter().any(|turn| {
+                turn.agent != response.agent
+                    || turn.generation != response.generation
+                    || turn.config_revision < 0
+                    || turn.config.as_ref().is_some_and(|config| {
+                        config.validate().is_err() || config.revision != turn.config_revision
+                    })
+            })
         {
             return Err(binding_mismatch());
         }
@@ -144,6 +156,24 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             probe: false,
+            config_revision: 0,
+            config: None,
+        }
+    }
+
+    fn config_view(revision: i64) -> crate::api::AgentConfigView {
+        crate::api::AgentConfigView {
+            revision,
+            application: "next_turn".to_owned(),
+            provenance: "configure".to_owned(),
+            profile: "fixture".to_owned(),
+            profile_inherited: false,
+            requested_model: Some("m1".to_owned()),
+            requested_effort: None,
+            model: Some("m1".to_owned()),
+            effort: Some("low".to_owned()),
+            original_model: Some("m0".to_owned()),
+            original_effort: Some("low".to_owned()),
         }
     }
 
@@ -175,6 +205,7 @@ mod tests {
             completed_at: None,
             usage: None,
             config_revision: 0,
+            config: None,
         }
     }
 
@@ -391,6 +422,73 @@ mod tests {
             ..request
         };
         zero.validate_response(&turn("a1", 0, "turn-1")).unwrap();
+    }
+
+    #[test]
+    fn command_and_turn_bindings_reject_negative_config_revisions() {
+        let command_request = CommandGetRequest::new("command-1");
+        let mut negative_command = command();
+        negative_command.config_revision = -1;
+        assert_unknown(command_request.validate_response(&negative_command));
+
+        let turn_request = TurnGetRequest {
+            agent: "a1".to_owned(),
+            generation: 2,
+            turn_id: "turn-1".to_owned(),
+        };
+        let mut negative_turn = turn("a1", 2, "turn-1");
+        negative_turn.config_revision = -1;
+        assert_unknown(turn_request.validate_response(&negative_turn));
+
+        let mut negative_result = response(2, vec![turn("a1", 2, "turn-1")]);
+        negative_result.turns[0].config_revision = -1;
+        assert_unknown(request(Some(2), None, 100).validate_response(&negative_result));
+    }
+
+    #[test]
+    fn command_and_turn_bindings_check_their_retained_config_views() {
+        let command_request = CommandGetRequest::new("command-1");
+        let mut with_view = command();
+        with_view.config_revision = 1;
+        with_view.config = Some(config_view(1));
+        command_request.validate_response(&with_view).unwrap();
+
+        let mut mismatched = with_view.clone();
+        mismatched.config = Some(config_view(2));
+        assert_unknown(command_request.validate_response(&mismatched));
+
+        let mut invalid = with_view.clone();
+        invalid.config = Some(crate::api::AgentConfigView {
+            revision: -1,
+            ..config_view(-1)
+        });
+        assert_unknown(command_request.validate_response(&invalid));
+
+        let mut blank_profile = with_view.clone();
+        blank_profile.config = Some(crate::api::AgentConfigView {
+            profile: "  ".to_owned(),
+            ..config_view(1)
+        });
+        assert_unknown(command_request.validate_response(&blank_profile));
+
+        let turn_request = TurnGetRequest {
+            agent: "a1".to_owned(),
+            generation: 2,
+            turn_id: "turn-1".to_owned(),
+        };
+        let mut turn_view = turn("a1", 2, "turn-1");
+        turn_view.config_revision = 1;
+        turn_view.config = Some(config_view(1));
+        turn_request.validate_response(&turn_view).unwrap();
+
+        let mut turn_mismatched = turn_view.clone();
+        turn_mismatched.config = Some(config_view(2));
+        assert_unknown(turn_request.validate_response(&turn_mismatched));
+
+        let result_request = request(Some(2), None, 100);
+        result_request
+            .validate_response(&response(2, vec![turn_view]))
+            .unwrap();
     }
 
     #[test]
