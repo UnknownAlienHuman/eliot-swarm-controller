@@ -475,6 +475,9 @@ impl Router {
             store.list_command_children(&parent, request.after.as_deref(), request.limit)?;
         for child in &mut page.children {
             authorize_command_read(&store, principal, child)?;
+            // Historical configuration from each child's exact retained
+            // generation and revision, never the current overlay.
+            child.config = store.command_config_view(child)?;
             self.adjust_command_for_read(child);
         }
         let response = CommandChildrenResponse {
@@ -1069,6 +1072,10 @@ mod tests {
         assert_eq!(child_row.profile_snapshot["effort"], "low");
         assert_eq!(child_row.profile_snapshot["control"], "self");
         assert_eq!(child_row.profile_snapshot["child_profiles"], json!([]));
+        assert!(
+            !child_row.profile_inherited,
+            "a child on an allowed different profile freezes fresh"
+        );
         // The child inherited the parent's credential bindings verbatim and
         // kept the shared account scope with the same bounds (audit
         // findings 2 and 3).
@@ -1218,6 +1225,17 @@ mod tests {
         let workspace = std::env::temp_dir().join(format!("eliot-hierarchy-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&workspace).unwrap();
         let manager = launch_manager(&router, &workspace, "fixture").await;
+        {
+            let store = router.inner.store.lock().await;
+            assert!(
+                !store
+                    .get_agent(&manager)
+                    .unwrap()
+                    .unwrap()
+                    .profile_inherited,
+                "an Owner root launch never inherits its profile"
+            );
+        }
         // An explicit same-profile name and an omitted profile both reuse
         // the parent snapshot verbatim.
         for profile in [Some("fixture"), None] {
@@ -1231,6 +1249,10 @@ mod tests {
             let manager_row = store.get_agent(&manager).unwrap().unwrap();
             assert_eq!(child_row.profile, "fixture");
             assert_eq!(child_row.profile_snapshot, manager_row.profile_snapshot);
+            assert!(
+                child_row.profile_inherited,
+                "an Agent child reusing its parent snapshot verbatim is inherited"
+            );
         }
         let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::remove_dir_all(&config_root);
@@ -1264,6 +1286,232 @@ mod tests {
             "not_allowed"
         );
         let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&config_root);
+    }
+
+    #[tokio::test]
+    async fn retained_generation_survives_a_real_config_file_reload() {
+        const RELOADABLE_CONFIG: &str = concat!(
+            "[profiles.reloadable]\n",
+            "harness = \"codex\"\n",
+            "model = \"m0\"\n",
+            "effort = \"low\"\n",
+        );
+        let (router, config_root) = router_with_profiles(RELOADABLE_CONFIG);
+        let workspace = std::env::temp_dir().join(format!("eliot-reload-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        // The launch freezes its snapshot from config.toml through the
+        // daemon's resolve path: the daemon keeps no cached copy, so every
+        // fresh resolve is the reload.
+        let agent = launch_manager(&router, &workspace, "reloadable").await;
+        {
+            let store = router.inner.store.lock().await;
+            let row = store.get_agent(&agent).unwrap().unwrap();
+            assert_eq!(row.profile_snapshot["model"], "m0");
+            assert!(!row.profile_inherited);
+        }
+
+        // Ready the Agent, apply revision 1, then run a turn while a second
+        // send stays pending.
+        let now = now_ms();
+        let launch_id = {
+            let store = router.inner.store.lock().await;
+            store
+                .list_unsettled_commands(100)
+                .unwrap()
+                .into_iter()
+                .find(|command| command.target.as_deref() == Some(agent.as_str()))
+                .unwrap()
+                .id
+        };
+        {
+            let mut store = router.inner.store.lock().await;
+            store.dispatch(&launch_id, now).unwrap();
+            crate::test_support::install_fixture_sources(&mut store, &agent, &launch_id, 1, now);
+            store
+                .put_batch(
+                    eliot_core::SourceBatch {
+                        batch_id: "reload-proof:ready".to_owned(),
+                        agent_id: agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![eliot_core::NativeEvent {
+                            ts: None,
+                            kind: "session.ready".to_owned(),
+                            native_id: "reload-proof:ready".to_owned(),
+                            data: json!({"command_id": launch_id}),
+                        }],
+                        cursor: None,
+                    },
+                    now,
+                )
+                .unwrap();
+            store
+                .settle(&launch_id, CommandState::Applied, None, now)
+                .unwrap();
+        }
+        let configure_id = ulid::Ulid::new().to_string();
+        {
+            let mut store = router.inner.store.lock().await;
+            let mut configure = SubmitCommand::new(configure_id.clone(), "configure");
+            configure.target = Some(agent.clone());
+            configure.expected_generation = Some(1);
+            configure.args = json!({"model": "m1"});
+            store.submit("owner", configure, now + 1).unwrap();
+            store.dispatch(&configure_id, now + 2).unwrap();
+            let applied = store.apply_agent_config(&configure_id, now + 3).unwrap();
+            assert_eq!(applied.revision, 1);
+            store
+                .settle(&configure_id, CommandState::Applied, None, now + 3)
+                .unwrap();
+        }
+        let first_id = ulid::Ulid::new().to_string();
+        {
+            let mut store = router.inner.store.lock().await;
+            let mut send = SubmitCommand::new(first_id.clone(), "send");
+            send.target = Some(agent.clone());
+            send.expected_generation = Some(1);
+            send.args = json!({"text": "first turn"});
+            store.submit("owner", send, now + 4).unwrap();
+            store.dispatch(&first_id, now + 5).unwrap();
+            store
+                .put_batch(
+                    eliot_core::SourceBatch {
+                        batch_id: "reload-proof:turn".to_owned(),
+                        agent_id: agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![eliot_core::NativeEvent {
+                            ts: None,
+                            kind: "turn.started".to_owned(),
+                            native_id: "reload-proof:turn:started".to_owned(),
+                            data: json!({"command_id": first_id, "turn_id": "reload-turn"}),
+                        }],
+                        cursor: None,
+                    },
+                    now + 5,
+                )
+                .unwrap();
+        }
+        let pending_id = ulid::Ulid::new().to_string();
+        {
+            let mut store = router.inner.store.lock().await;
+            let mut pending = SubmitCommand::new(pending_id.clone(), "send");
+            pending.target = Some(agent.clone());
+            pending.expected_generation = Some(1);
+            pending.args = json!({"text": "pending turn"});
+            store.submit("owner", pending, now + 6).unwrap();
+            store
+                .put_batch(
+                    eliot_core::SourceBatch {
+                        batch_id: "reload-proof:done".to_owned(),
+                        agent_id: agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![eliot_core::NativeEvent {
+                            ts: None,
+                            kind: "turn.completed".to_owned(),
+                            native_id: "reload-proof:done:completed".to_owned(),
+                            data: json!({"command_id": first_id, "turn_id": "reload-turn", "status": "completed"}),
+                        }],
+                        cursor: None,
+                    },
+                    now + 6,
+                )
+                .unwrap();
+        }
+
+        // The owner edits the profile in the file: the daemon's next
+        // resolve is the reload, and a new launch observes the edit.
+        std::fs::write(
+            config_root.join("config.toml"),
+            RELOADABLE_CONFIG.replace("model = \"m0\"", "model = \"m-edited\""),
+        )
+        .unwrap();
+        let reloaded_workspace =
+            std::env::temp_dir().join(format!("eliot-reload-after-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&reloaded_workspace).unwrap();
+        let reloaded = launch_manager(&router, &reloaded_workspace, "reloadable").await;
+        {
+            let store = router.inner.store.lock().await;
+            let reloaded_row = store.get_agent(&reloaded).unwrap().unwrap();
+            assert_eq!(
+                reloaded_row.profile_snapshot["model"], "m-edited",
+                "a launch after the edit resolves the reloaded profile"
+            );
+            let retained_row = store.get_agent(&agent).unwrap().unwrap();
+            assert_eq!(
+                retained_row.profile_snapshot["model"], "m0",
+                "the reload never rewrites a retained generation"
+            );
+        }
+
+        // The pending send dispatches under its retained revision, then the
+        // restart fence marks it unknown: both still read back revision 1.
+        {
+            let mut store = router.inner.store.lock().await;
+            store.dispatch(&pending_id, now + 7).unwrap();
+            store.recover_on_restart(now + 8).unwrap();
+            let unknown = store.get_command(&pending_id).unwrap().unwrap();
+            assert_eq!(unknown.state, CommandState::Unknown);
+            assert_eq!(unknown.config_revision, 1);
+            let view = store
+                .command_config_view(&unknown)
+                .unwrap()
+                .expect("pending command keeps its view");
+            assert_eq!(view.revision, 1);
+            assert_eq!(view.provenance, "configure");
+            assert_eq!(view.profile, "reloadable");
+            assert_eq!(view.model.as_deref(), Some("m1"));
+            assert_eq!(view.original_model.as_deref(), Some("m0"));
+            let agent_row = store.get_agent(&agent).unwrap().unwrap();
+            let turn = store.get_turn(&agent, 1, "reload-turn").unwrap().unwrap();
+            let turn_view = store
+                .turn_config_view(&agent_row, &turn)
+                .unwrap()
+                .expect("retained turn keeps its view");
+            assert_eq!(turn_view.revision, 1);
+            assert_eq!(turn_view.model.as_deref(), Some("m1"));
+        }
+
+        // The public readbacks expose the same retained views, and the
+        // readback validators accept them.
+        let command_value = router
+            .command_get(&json!({"id": pending_id}), &Principal::Owner)
+            .await
+            .unwrap();
+        let command: eliot_core::Command = serde_json::from_value(command_value).unwrap();
+        eliot_core::api::CommandGetRequest::new(&pending_id)
+            .validate_response(&command)
+            .unwrap();
+        let command_view = command.config.expect("command readback carries its view");
+        assert_eq!(command_view.revision, 1);
+        assert_eq!(command_view.provenance, "configure");
+        assert_eq!(command_view.profile, "reloadable");
+        assert_eq!(command_view.model.as_deref(), Some("m1"));
+
+        let turn_value = router
+            .turn_get(
+                &json!({"agent": agent, "generation": 1, "turn_id": "reload-turn"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        let turn: eliot_core::Turn = serde_json::from_value(turn_value).unwrap();
+        eliot_core::api::TurnGetRequest {
+            agent: agent.clone(),
+            generation: 1,
+            turn_id: "reload-turn".to_owned(),
+        }
+        .validate_response(&turn)
+        .unwrap();
+        let read_turn_view = turn.config.expect("turn readback carries its view");
+        assert_eq!(read_turn_view.revision, 1);
+        assert_eq!(read_turn_view.model.as_deref(), Some("m1"));
+        assert_eq!(read_turn_view.profile, "reloadable");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&reloaded_workspace);
         let _ = std::fs::remove_dir_all(&config_root);
     }
 

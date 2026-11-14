@@ -592,12 +592,17 @@ and the readback shows it. Retention keeps every command a retained overlay
 references, including the resume command of an inherited revision and the
 source configure it inherited from: pruning never deletes a command named by
 `agent_config`, so configuration provenance survives expiry. `swarm show`
-(the `agent.get` view) reports the retained profile name, whether the Agent
-snapshot was inherited verbatim from a parent launch, the overlay provenance
-(`configure` or `inherited_from`), the revision, the requested overrides,
-the effective values, and the original frozen values together; turn and
-command readbacks carry their retained `config_revision` for the same
-original-request versus resolved-configuration distinction.
+(the `agent.get` view) reports the retained profile name, the launch-time
+`profile_inherited` decision (recorded at launch freeze and exposed
+independently of overlays: true only for an Agent child that reused its own
+parent's snapshot verbatim, never for an Owner launch that resolves the same
+profile), the overlay provenance (`configure` or `inherited_from`), the
+revision, the requested overrides, the effective values, and the original
+frozen values together; turn and command readbacks carry their retained
+`config_revision` plus the full configuration view (requested and effective
+model/effort, revision, provenance, profile name) resolved from the exact
+retained generation and revision for the same original-request versus
+resolved-configuration distinction.
 
 ## Frozen files
 

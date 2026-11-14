@@ -3692,6 +3692,7 @@ mod tests {
             updated_at: 0,
             probe: false,
             config_revision: 2,
+            config: None,
         };
         let config = eliot_store::AgentConfig {
             agent: "a1".to_owned(),
@@ -3747,6 +3748,7 @@ mod tests {
             updated_at: 0,
             probe: false,
             config_revision: 0,
+            config: None,
         };
         assert_eq!(resume_source_generation(&command).unwrap(), 2);
 
@@ -5484,6 +5486,7 @@ mod tests {
             updated_at: 0,
             probe: false,
             config_revision: 0,
+            config: None,
         }
     }
 

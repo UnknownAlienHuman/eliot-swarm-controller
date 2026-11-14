@@ -7098,6 +7098,8 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
         .connection
         .execute_batch(
             "DROP TABLE agent_config;
+             ALTER TABLE agents DROP COLUMN profile_inherited;
+             DELETE FROM schema_migrations WHERE version = 36;
              DELETE FROM schema_migrations WHERE version = 35;
              DELETE FROM schema_migrations WHERE version = 34;
              ALTER TABLE commands DROP COLUMN config_revision;
@@ -13700,5 +13702,192 @@ fn retained_config_survives_config_file_reload_for_pending_and_unknown() {
             .as_deref(),
         Some("m1"),
         "retained turn keeps its original configuration"
+    );
+}
+
+#[test]
+fn retained_command_and_turn_views_survive_later_revisions() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let snapshot = json!({"model": "m0", "effort": "low"});
+    let agent = ready_configure_agent(
+        &mut store,
+        "configure-view-history",
+        "codex",
+        snapshot.clone(),
+        now,
+    );
+
+    // Revision 1, then a send and a completed turn under it.
+    let first_configure = configure_request(&agent, 1, json!({"model": "m1"}));
+    let first_configure_id = first_configure.id.clone();
+    store
+        .submit("owner", first_configure, now + 1)
+        .expect("admit first configure");
+    store
+        .dispatch(&first_configure_id, now + 2)
+        .expect("dispatch first configure");
+    store
+        .apply_agent_config(&first_configure_id, now + 3)
+        .expect("apply first configure");
+    store
+        .settle(&first_configure_id, CommandState::Applied, None, now + 3)
+        .expect("settle first configure");
+
+    let first = send_request(&agent, 1, "first turn");
+    let first_id = first.id.clone();
+    store
+        .submit("owner", first, now + 4)
+        .expect("admit first send");
+    store
+        .dispatch(&first_id, now + 5)
+        .expect("dispatch first send");
+    for (kind, native_id, data) in [
+        (
+            "turn.started",
+            "configure-view-history:turn:started",
+            json!({"command_id": first_id, "turn_id": "view-turn"}),
+        ),
+        (
+            "message.completed",
+            "configure-view-history:turn:message",
+            json!({"command_id": first_id, "turn_id": "view-turn", "text": "first reply"}),
+        ),
+        (
+            "turn.completed",
+            "configure-view-history:turn:completed",
+            json!({"command_id": first_id, "turn_id": "view-turn", "status": "completed"}),
+        ),
+    ] {
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("configure-view-history:{native_id}"),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: kind.to_owned(),
+                        native_id: native_id.to_owned(),
+                        data,
+                    }],
+                    cursor: None,
+                },
+                now + 6,
+            )
+            .expect("commit first turn event");
+    }
+
+    let agent_row = store
+        .get_agent(&agent)
+        .expect("load agent")
+        .expect("agent exists");
+    let first_command = store
+        .get_command(&first_id)
+        .expect("load first send")
+        .expect("send exists");
+    let first_view = store
+        .command_config_view(&first_command)
+        .expect("resolve first command view")
+        .expect("revision 1 view exists");
+    assert_eq!(first_view.revision, 1);
+    assert_eq!(first_view.provenance, "configure");
+    assert_eq!(first_view.profile, "fake");
+    assert_eq!(first_view.requested_model.as_deref(), Some("m1"));
+    assert_eq!(first_view.model.as_deref(), Some("m1"));
+    assert_eq!(first_view.effort.as_deref(), Some("low"));
+    assert_eq!(first_view.original_model.as_deref(), Some("m0"));
+
+    let first_turn = store
+        .get_turn(&agent, 1, "view-turn")
+        .expect("load turn")
+        .expect("turn exists");
+    assert_eq!(first_turn.config_revision, 1);
+    let turn_view = store
+        .turn_config_view(&agent_row, &first_turn)
+        .expect("resolve turn view")
+        .expect("revision 1 turn view exists");
+    assert_eq!(turn_view, first_view);
+    assert!(!turn_view.profile_inherited);
+
+    // Revision 2 applies afterwards: the retained revision-1 command and
+    // turn still read back revision 1, while a new send reads revision 2.
+    let second_configure = configure_request(&agent, 1, json!({"model": "m2"}));
+    let second_configure_id = second_configure.id.clone();
+    store
+        .submit("owner", second_configure, now + 7)
+        .expect("admit second configure");
+    store
+        .dispatch(&second_configure_id, now + 8)
+        .expect("dispatch second configure");
+    store
+        .apply_agent_config(&second_configure_id, now + 9)
+        .expect("apply second configure");
+    store
+        .settle(&second_configure_id, CommandState::Applied, None, now + 9)
+        .expect("settle second configure");
+
+    let retained_command = store
+        .get_command(&first_id)
+        .expect("reload first send")
+        .expect("send exists");
+    assert_eq!(
+        store
+            .command_config_view(&retained_command)
+            .expect("resolve retained command view")
+            .expect("revision 1 view survives"),
+        first_view,
+        "later revisions never rewrite a retained command view"
+    );
+    let retained_turn = store
+        .get_turn(&agent, 1, "view-turn")
+        .expect("reload turn")
+        .expect("turn exists");
+    assert_eq!(
+        store
+            .turn_config_view(&agent_row, &retained_turn)
+            .expect("resolve retained turn view")
+            .expect("revision 1 turn view survives"),
+        first_view,
+        "later revisions never rewrite a retained turn view"
+    );
+
+    let second = send_request(&agent, 1, "second turn");
+    let second_id = second.id.clone();
+    store
+        .submit("owner", second, now + 10)
+        .expect("admit second send");
+    store
+        .dispatch(&second_id, now + 11)
+        .expect("dispatch second send");
+    let second_command = store
+        .get_command(&second_id)
+        .expect("load second send")
+        .expect("send exists");
+    let second_view = store
+        .command_config_view(&second_command)
+        .expect("resolve second command view")
+        .expect("revision 2 view exists");
+    assert_eq!(second_view.revision, 2);
+    assert_eq!(second_view.model.as_deref(), Some("m2"));
+    assert_eq!(second_view.profile, "fake");
+
+    // Commands without a native configuration expose no view.
+    let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+    stop.target = Some(agent.clone());
+    stop.expected_generation = Some(1);
+    let stop_id = stop.id.clone();
+    store.submit("owner", stop, now + 12).expect("admit stop");
+    let stop_command = store
+        .get_command(&stop_id)
+        .expect("load stop")
+        .expect("stop exists");
+    assert_eq!(
+        store
+            .command_config_view(&stop_command)
+            .expect("resolve stop view"),
+        None,
+        "non-native commands expose no configuration view"
     );
 }

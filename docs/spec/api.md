@@ -509,17 +509,24 @@ effective values, the monotonically increasing `config_revision` for the
 generation, `application:\"next_turn\"`, and provenance `\"configure\"`.
 Each admitted native command (`launch`, `resume`, `send`) records the
 configuration it runs under as the retained profile-snapshot identity plus
-its stamped `config_revision` (exposed on the command readback; `launch`
-without an overlay stays at 0, `send` freezes the revision current at its own
-dispatch, `resume` carries its inherited revision); each turn records the
-revision it ran under, and the first overlay turn's readback repeats the
-effective values. A send committed before an overlay never runs under newer
-configuration, and a config-file reload never rewrites a retained generation,
-a pending command, or an unknown-outcome resolution: readback resolves only
-from retained rows. A `resume` explicitly inherits the previous generation's
-latest overlay as its new generation's revision 1 with provenance
-`\"inherited_from\"` (the frozen snapshot is unchanged; generations without
-an overlay start at 0). The lane is ordered by shared admission order: a
+its stamped `config_revision`; each turn records the revision it ran under.
+`command.get` and `command.children` return the command's retained
+`config_revision` plus its `config` view (requested and effective
+model/effort, revision, provenance, profile name), and `turn.get` and
+`agent.result` return the same view for each turn: the view resolves from
+the command's or turn's exact retained generation and revision, never from
+the current overlay or the live file. `launch` without an overlay stays at
+0 with no view, `send` freezes the revision current at its own dispatch,
+and `resume` carries its inherited revision. A send committed before an
+overlay never runs under newer configuration, and a config-file reload
+never rewrites a retained generation, a pending command, or an
+unknown-outcome resolution: after revision 2 applies, a retained
+revision-1 turn still reads back revision 1's configuration. Readback
+validators reject a negative `config_revision` and a `config` view whose
+revision does not match the stamped revision. A `resume` explicitly inherits
+the previous generation's latest overlay as its new generation's revision 1
+with provenance `\"inherited_from\"` (the frozen snapshot is unchanged;
+generations without an overlay start at 0). The lane is ordered by shared admission order: a
 configure does not apply while an earlier-admitted send is still queued or
 undispatched, an earlier queued send passes a later configure, and a later
 input waits for an earlier configure. When the native turn request carries a
@@ -531,8 +538,10 @@ every command a retained overlay references, including inherited revisions
 and their source configures: pruning never deletes a command named by
 `agent_config`, so configuration provenance survives expiry. `agent.get`
 distinguishes the original request (profile name and requested overrides,
-plus whether the profile snapshot was inherited from a parent launch) from
-the resolved configuration (effective values, provenance, and revision).
+plus the launch-time `profile_inherited` decision: true only for an Agent
+child that reused its own parent's snapshot verbatim, never for an Owner
+launch that resolves the same profile) from the resolved configuration
+(effective values, provenance, and revision).
 
 Resolve the target and validate principal/capability/state before persisting the command
 binding and events. Each verb checks `expected_generation` at its defined admission or

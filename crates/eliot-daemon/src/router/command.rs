@@ -2043,6 +2043,7 @@ mod tests {
             updated_at: 0,
             probe: false,
             config_revision: 0,
+            config: None,
         }
     }
 
@@ -2131,6 +2132,7 @@ mod tests {
             updated_at: 0,
             probe: false,
             config_revision: 0,
+            config: None,
         }
     }
 

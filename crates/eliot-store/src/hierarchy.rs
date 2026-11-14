@@ -745,7 +745,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 35);
+        assert_eq!(version, 36);
         let mut columns: Vec<String> = store
             .connection
             .prepare("SELECT name FROM pragma_table_info('agents')")
@@ -851,6 +851,60 @@ mod tests {
             "stale_generation"
         );
         assert_eq!(agent_count(&store), 3);
+    }
+
+    #[test]
+    fn launch_records_the_actual_profile_source_decision() {
+        let mut store = store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "profile-source", now);
+        assert!(
+            !store
+                .get_agent(&parent)
+                .unwrap()
+                .expect("parent row")
+                .profile_inherited,
+            "a root launch never inherits a profile"
+        );
+        // An Owner launch that resolves the same snapshot content is a fresh
+        // resolution, not an inheritance: only an Agent child reusing its
+        // own parent's snapshot verbatim counts.
+        let owner_child = launch_child(&mut store, "owner", &parent, json!({}), now + 1);
+        assert!(
+            !store
+                .get_agent(&owner_child)
+                .unwrap()
+                .expect("owner child row")
+                .profile_inherited,
+            "an Owner child with identical content is not inherited"
+        );
+        // The Agent reusing its parent's snapshot verbatim is inherited.
+        let principal = agent_principal(&parent);
+        let inherited = launch_child(&mut store, &principal, &parent, json!({}), now + 2);
+        assert!(
+            store
+                .get_agent(&inherited)
+                .unwrap()
+                .expect("inherited child row")
+                .profile_inherited,
+            "an Agent child reusing its parent snapshot is inherited"
+        );
+        // The Agent resolving a different profile freezes fresh instead.
+        let distinct = launch_child(
+            &mut store,
+            &principal,
+            &parent,
+            json!({"model": "other"}),
+            now + 3,
+        );
+        assert!(
+            !store
+                .get_agent(&distinct)
+                .unwrap()
+                .expect("distinct child row")
+                .profile_inherited,
+            "an Agent child on a different profile is not inherited"
+        );
     }
 
     #[test]
@@ -1400,7 +1454,7 @@ mod tests {
         ));
         {
             let legacy_store = Store::open(&path).unwrap();
-            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 35);
+            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 36);
             drop(legacy_store);
             // Downgrade to the v22 shape with two legacy rows, then reopen so
             // the v23 block backfills them exactly as it would on upgrade.
@@ -1412,6 +1466,8 @@ mod tests {
             legacy
                 .execute_batch(
                     "DROP TABLE agent_config;
+                     ALTER TABLE agents DROP COLUMN profile_inherited;
+                     DELETE FROM schema_migrations WHERE version = 36;
                      DELETE FROM schema_migrations WHERE version = 35;
                      DELETE FROM schema_migrations WHERE version = 34;
                      ALTER TABLE commands DROP COLUMN config_revision;
@@ -1477,13 +1533,14 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 35);
+        assert_eq!(version, 36);
         for id in ["a1", "a2"] {
             let agent = store.get_agent(id).unwrap().expect("legacy row");
             assert_eq!(agent.root, id);
             assert_eq!(agent.parent, None);
             assert_eq!(agent.depth, 0);
             assert_eq!(agent.control, AgentControl::Slf);
+            assert!(!agent.profile_inherited);
         }
         std::fs::remove_file(&path).ok();
     }

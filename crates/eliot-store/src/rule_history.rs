@@ -566,6 +566,7 @@ fn insert_catch_up_parent(
             updated_at: now,
             probe: false,
             config_revision: 0,
+            config: None,
         },
         event,
     ))
