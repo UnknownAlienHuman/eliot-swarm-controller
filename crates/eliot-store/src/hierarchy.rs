@@ -435,7 +435,8 @@ pub(super) fn snapshot_selector_members(
 /// Admit one validated selector expansion: one concrete child per snapshotted
 /// member with the ordinary per-target gates, then the Store-only applied
 /// parent. Any live-member failure rejects the whole expansion with nothing
-/// persisted; `send` skips terminal members instead of failing on them.
+/// persisted; `send` skips terminal members instead of failing on them, and
+/// `stop` skips observe-only members instead of failing on them.
 pub(super) fn admit_selector_expansion(
     tx: &Transaction<'_>,
     principal: &str,
@@ -451,14 +452,21 @@ pub(super) fn admit_selector_expansion(
     let members = snapshot_selector_members(tx, principal, selector, limits)?;
     let mut events = Vec::new();
     let mut child_ids = Vec::with_capacity(members.len());
+    let mut skipped = Vec::new();
     // Admit members unlinked first (the parent row does not exist yet for
     // the commands.parent_command foreign key), then link them once the
     // parent is inserted, mirroring rule-action expansion.
     for member in members.iter() {
         // `send` skips terminal members instead of failing the expansion;
-        // `stop` still names them (stopping a terminal Agent is a no-op row,
-        // not an error). An all-terminal send applies with no children.
+        // `stop` still names terminal members (stopping a terminal Agent is
+        // a no-op row, not an error) but skips observe-only native children,
+        // whose lifecycle belongs to their manager/native harness. An
+        // all-terminal send applies with no children.
         if request.verb == "send" && member.state.is_terminal() {
+            continue;
+        }
+        if request.verb == "stop" && member.observe_only {
+            skipped.push(json!({"agent": member.id, "reason": "observe_only"}));
             continue;
         }
         observer::require_controlled(member)?;
@@ -498,7 +506,7 @@ pub(super) fn admit_selector_expansion(
         }
         child_ids.push(child_id);
     }
-    let outcome = json!({"children": child_ids});
+    let outcome = json!({"children": child_ids, "skipped": skipped});
     let parent = CommandInsert {
         id: &request.id,
         principal,
@@ -1335,6 +1343,53 @@ mod tests {
             child_ids(&store, &stop_id),
             vec![format!("{stop_id}/{parent}"), format!("{stop_id}/{child}")]
         );
+    }
+
+    #[test]
+    fn tree_stop_skips_observe_only_native_children() {
+        let mut store = store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "skip-observe-only", now);
+        let controlled = launch_child(&mut store, "owner", &parent, json!({}), now + 1);
+        ready_launched_agent(&mut store, &controlled, now + 2);
+        let observed = launch_child(&mut store, "owner", &parent, json!({}), now + 3);
+        let observed_num = parse_agent_id(&observed).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET observe_only = 1, state = 'unknown', token = NULL WHERE id = ?1",
+                params![observed_num],
+            )
+            .unwrap();
+        // `send` still rejects the expansion while an observe-only member remains.
+        let mut send = SubmitCommand::new(Ulid::new().to_string(), "send");
+        send.selector = Some(format!("tree:{parent}"));
+        send.args = json!({"text": "hello tree"});
+        assert_eq!(
+            store.submit("owner", send, now + 4).unwrap_err().code,
+            "not_allowed"
+        );
+        // A tree `stop` applies to the controlled members and reports the
+        // observe-only native child as skipped.
+        let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+        stop.selector = Some(format!("tree:{parent}"));
+        let stop_id = stop.id.clone();
+        let admission = store
+            .submit("owner", stop, now + 5)
+            .expect("tree stop skips observe-only");
+        let outcome = admission.command.outcome.expect("selector outcome");
+        assert_eq!(
+            outcome["children"],
+            json!([
+                format!("{stop_id}/{parent}"),
+                format!("{stop_id}/{controlled}")
+            ])
+        );
+        assert_eq!(
+            outcome["skipped"],
+            json!([{"agent": observed, "reason": "observe_only"}])
+        );
+        assert_eq!(child_ids(&store, &stop_id).len(), 2);
     }
 
     #[test]

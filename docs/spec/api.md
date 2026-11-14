@@ -576,7 +576,11 @@ A tree selector snapshots its members once at admission: the parent snapshots/so
 concrete ids in one bounded transaction (bounded by `max_selector_targets`) and reads
 applied for the expansion itself; children settle independently with the ordinary
 per-target gates, except `send` skips terminal members instead of failing on them
-(an all-terminal send applies with no children). Parent applied means expansion only.
+(an all-terminal send applies with no children), and `stop` skips observe-only
+native children instead of failing on them. A tree `stop` parent outcome carries
+the admitted `children` plus a bounded `skipped` list naming each skipped
+observe-only member as `{"agent": AGENT, "reason": "observe_only"}`; their
+lifecycle stays with their manager/native harness. Parent applied means expansion only.
 `command.children` pages that fixed set; a child created after admission is never
 part of it. Retain/prune parent sets transactionally so a caller never sees a partly
 pruned expansion; after removal return `history_gap`. Ordered rule actions reuse the
@@ -807,7 +811,8 @@ configuration; retained retries keep their original subject/profile. Attachment 
 the canonical scope/reference row. A controlled row or an active observer returns
 `busy`; this increment does not convert control or grant a second identity. Attach
 commits its generation/source fence before reader I/O and installs no Agent token.
-All native control verbs reject observe-only targets, including owner-issued stop.
+All native control verbs reject observe-only targets, including an owner-issued
+targeted stop; only a tree `stop` expansion skips them and reports them as skipped.
 `mode:"control"` is unsupported. The vendor plugin method is `agent.attach`; it is not
 a second public mutation method.
 

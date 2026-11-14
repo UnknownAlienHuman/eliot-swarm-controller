@@ -206,9 +206,13 @@ the Agent plus its descendants in Agent-id order) expand once at admission for
 `send` and `stop` only, using the Store-only parent plus ordered concrete children
 representation with `<id>/<agent>` child ids; parent applied means expansion, not
 children finished, and children settle independently with the same gates as targeted
-commands. Any live-member failure rejects the whole expansion. `send` skips
+commands. Any live-member failure rejects the whole expansion, except a tree
+`stop` skips observe-only native children and reports them in the parent outcome
+`skipped` list with reason `observe_only` instead of failing; their lifecycle
+stays with their manager/native harness. `send` skips
 terminal members instead of failing on them (an all-terminal send applies with no
-children); `stop` still names every member. A plain `stop` affects only its target:
+children); `stop` still names every controlled member, including terminal ones.
+A plain `stop` affects only its target:
 parent completion or stop never marks children complete and sends nothing to them.
 `stop --tree` is the only stop that names a subtree, as an explicit expansion, not
 a cascade. Native-child observation is implemented for Codex (3 families) and Muse
