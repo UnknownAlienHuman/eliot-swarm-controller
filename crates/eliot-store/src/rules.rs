@@ -1102,6 +1102,15 @@ fn validate_project_rule_action_tx(
         super::projects::capture_project_command_binding_tx(tx, &command)?;
         return Ok(None);
     }
+    if matches!(request.verb.as_str(), "mail.send" | "var.set") {
+        if rule_project_id(principal)?.is_none() {
+            return Ok(None);
+        }
+        let payload_digest = [0_u8; 32];
+        let command = CommandInsert::targetless_admitted(principal, request, &payload_digest, 0);
+        super::projects::capture_project_command_binding_tx(tx, &command)?;
+        return Ok(None);
+    }
     if request.verb == "git.fetch" {
         let Some(project_id) = rule_project_id(principal)? else {
             return Ok(None);
@@ -1744,6 +1753,9 @@ fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
     if matches!(request.verb.as_str(), "notify" | "emit") {
         return valid_targetless_user_event_request(request);
     }
+    if matches!(request.verb.as_str(), "mail.send" | "var.set") {
+        return valid_targetless_coordination_request(request);
+    }
     let reply = matches!(request.verb.as_str(), "approve" | "deny" | "answer");
     if request.verb != "steer" && !reply {
         return valid_rule_action_request(request, true);
@@ -1791,6 +1803,17 @@ fn valid_targetless_rule_run_request(request: &SubmitCommand) -> bool {
 fn valid_targetless_user_event_request(request: &SubmitCommand) -> bool {
     request.validate().is_ok()
         && matches!(request.verb.as_str(), "notify" | "emit")
+        && request.target.is_none()
+        && request.expected_generation.is_none()
+        && request.expected_turn_id.is_none()
+        && request.request_id.is_none()
+        && !request.probe
+        && request.args.is_object()
+}
+
+fn valid_targetless_coordination_request(request: &SubmitCommand) -> bool {
+    request.validate().is_ok()
+        && matches!(request.verb.as_str(), "mail.send" | "var.set")
         && request.target.is_none()
         && request.expected_generation.is_none()
         && request.expected_turn_id.is_none()
@@ -2058,23 +2081,24 @@ pub(super) fn gate_rule_action_dispatch_tx(
             let current = load_command_record(tx, command_id)?
                 .ok_or_else(|| Error::new("source_integrity", "rule-action child disappeared"))?;
             if current.state == CommandState::Accepted {
-                let target = current.target.ok_or_else(|| {
-                    Error::new("source_integrity", "rule-action child has no target")
-                })?;
+                let target = current.target;
                 let generation = current
                     .command
                     .generation
-                    .or(current.command.expected_generation)
-                    .ok_or_else(|| {
-                        Error::new("source_integrity", "rule-action child has no generation")
-                    })?;
+                    .or(current.command.expected_generation);
+                if target.is_some() != generation.is_some() {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "rule-action child has inconsistent target binding",
+                    ));
+                }
                 update_command_state(tx, command_id, CommandState::Queued, None, None, now)?;
                 events.push(insert_daemon_command_event(
                     tx,
                     now,
                     "command.queued",
-                    Some(target),
-                    Some(generation),
+                    target,
+                    generation,
                     command_id,
                     json!({
                         "command_id": command_id,
@@ -2114,23 +2138,24 @@ pub(super) fn gate_rule_action_dispatch_tx(
             let current = load_command_record(tx, command_id)?
                 .ok_or_else(|| Error::new("source_integrity", "rule-action child disappeared"))?;
             if current.state == CommandState::Accepted {
-                let current_target = current.target.ok_or_else(|| {
-                    Error::new("source_integrity", "rule-action child has no target")
-                })?;
+                let current_target = current.target;
                 let current_generation = current
                     .command
                     .generation
-                    .or(current.command.expected_generation)
-                    .ok_or_else(|| {
-                        Error::new("source_integrity", "rule-action child has no generation")
-                    })?;
+                    .or(current.command.expected_generation);
+                if current_target.is_some() != current_generation.is_some() {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "rule-action child has inconsistent target binding",
+                    ));
+                }
                 update_command_state(tx, command_id, CommandState::Queued, None, None, now)?;
                 events.push(insert_daemon_command_event(
                     tx,
                     now,
                     "command.queued",
-                    Some(current_target),
-                    Some(current_generation),
+                    current_target,
+                    current_generation,
                     command_id,
                     json!({
                         "command_id": command_id,
@@ -2146,43 +2171,73 @@ pub(super) fn gate_rule_action_dispatch_tx(
         if !matches!(sibling_state, CommandState::Accepted | CommandState::Queued) {
             continue;
         }
-        let target = row.4.ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "undispatched rule-action child has no target",
-            )
-        })?;
-        let generation = row.5.or(row.6).ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "undispatched rule-action child has no generation",
-            )
-        })?;
         let sibling = load_command_record(tx, &row.0)?
             .ok_or_else(|| Error::new("source_integrity", "rule-action sibling disappeared"))?;
-        cancel_pending_command_tx(
-            tx,
-            target,
-            generation,
-            &row.0,
-            "rule_action_predecessor_terminal",
-            now,
-            events,
-        )?;
-        if sibling.command.verb == "launch" {
-            super::capacity::release_unstarted_tx(tx, target, 1, &row.0)?;
-            super::fail_unstarted_launch_tx(tx, target, &row.0, now, events)?;
-        } else if sibling.command.verb == "resume" {
-            super::lifecycle::cancel_unstarted_resume_input_tx(
+        if sibling.target.is_some() {
+            let target = row.4.ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "undispatched rule-action child has no target",
+                )
+            })?;
+            let generation = row.5.or(row.6).ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "undispatched rule-action child has no generation",
+                )
+            })?;
+            cancel_pending_command_tx(
                 tx,
                 target,
+                generation,
                 &row.0,
                 "rule_action_predecessor_terminal",
                 now,
                 events,
-                false,
             )?;
+            if sibling.command.verb == "launch" {
+                super::capacity::release_unstarted_tx(tx, target, 1, &row.0)?;
+                super::fail_unstarted_launch_tx(tx, target, &row.0, now, events)?;
+            } else if sibling.command.verb == "resume" {
+                super::lifecycle::cancel_unstarted_resume_input_tx(
+                    tx,
+                    target,
+                    &row.0,
+                    "rule_action_predecessor_terminal",
+                    now,
+                    events,
+                    false,
+                )?;
+            }
+            continue;
         }
+        if row.4.is_some() || row.5.is_some() || row.6.is_some() {
+            return Err(Error::new(
+                "source_integrity",
+                "targetless rule-action child has an Agent binding",
+            ));
+        }
+        let outcome = json!({"reason": "rule_action_predecessor_terminal"});
+        update_command_state(
+            tx,
+            &row.0,
+            CommandState::Cancelled,
+            Some(&outcome),
+            None,
+            now,
+        )?;
+        events.push(insert_daemon_command_event(
+            tx,
+            now,
+            "command.cancelled",
+            None,
+            None,
+            &row.0,
+            json!({
+                "command_id": row.0,
+                "reason": "rule_action_predecessor_terminal",
+            }),
+        )?);
     }
     Ok(RuleActionDispatchGate::Cancelled)
 }
@@ -2538,7 +2593,7 @@ fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand)
     }
     if matches!(
         request.verb.as_str(),
-        "launch" | "git.fetch" | "notify" | "emit"
+        "launch" | "git.fetch" | "notify" | "emit" | "mail.send" | "var.set"
     ) {
         return None;
     }
@@ -5518,6 +5573,104 @@ mod tests {
     }
 
     #[test]
+    fn catch_up_targetless_predecessor_rejection_cancels_follower() {
+        let mut store = store();
+        let request_id = Ulid::new();
+        let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 10;
+        let first_event = insert_test_event(&mut store, "var.changed", now - 2);
+        let second_event = insert_test_event(&mut store, "var.changed", now - 1);
+        let rule = definition("targetless-sibling-cancel", true);
+        let state = store.ensure_rule_state("owner", &rule, now).unwrap();
+        let captured_through = state.current_cursor;
+        assert!(second_event <= captured_through);
+
+        let mut first_request = SubmitCommand::new("", "var.set");
+        first_request.args = json!({"scope": "global", "key": "sibling-key", "value": 1});
+        let mut second_request = SubmitCommand::new("", "var.set");
+        second_request.args = json!({"scope": "global", "key": "sibling-key", "value": 2});
+        let request = core::api::RuleCatchUpRequest::new(
+            request_id.to_string(),
+            "targetless-sibling-cancel",
+            first_event - 1,
+            Some(captured_through),
+        );
+        let actions = [
+            RuleCatchUpAction::command(first_event, first_request),
+            RuleCatchUpAction::command(second_event, second_request),
+        ];
+        let admission = store
+            .admit_rule_catch_up("owner", &request, &state, captured_through, &actions, now)
+            .unwrap();
+        assert_eq!(admission.children.len(), 2);
+        let first_child_id = admission.children[0].command.id.clone();
+        let second_child_id = admission.children[1].command.id.clone();
+        assert_eq!(admission.children[0].command.verb, "var.set");
+        assert_eq!(admission.children[1].command.verb, "var.set");
+        assert!(admission.children[1].command.target.is_none());
+
+        let held = store.dispatch(&second_child_id, now + 1).unwrap();
+        assert_eq!(held.value.state, CommandState::Queued);
+        let queued_event = held
+            .events
+            .iter()
+            .find(|event| event.kind == "command.queued")
+            .expect("pending predecessor queues the targetless follower");
+        assert_eq!(
+            queued_event.data["reason"],
+            "rule_action_predecessor_pending"
+        );
+
+        store
+            .settle(
+                &first_child_id,
+                CommandState::Rejected,
+                Some(json!({"reason": "version_conflict"})),
+                now + 2,
+            )
+            .unwrap();
+
+        let recoverable = store.recover_rule_children(None, 100).unwrap();
+        assert!(
+            recoverable
+                .iter()
+                .any(|command| command.command.id == second_child_id),
+            "Store recovery must surface the targetless follower for cancellation"
+        );
+        let cancelled = store.dispatch(&second_child_id, now + 3).unwrap();
+        assert_eq!(cancelled.value.state, CommandState::Cancelled);
+        let cancelled_event = cancelled
+            .events
+            .iter()
+            .find(|event| event.kind == "command.cancelled")
+            .expect("Store gate cancels the targetless follower");
+        assert_eq!(
+            cancelled_event.data["reason"],
+            "rule_action_predecessor_terminal"
+        );
+        assert_eq!(
+            store.get_command(&second_child_id).unwrap().unwrap().state,
+            CommandState::Cancelled,
+        );
+        let recoverable_after_cancel = store.recover_rule_children(None, 100).unwrap();
+        assert!(
+            !recoverable_after_cancel
+                .iter()
+                .any(|command| command.command.id == second_child_id)
+        );
+        let follower_dispatches: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE kind = 'command.dispatched'
+                   AND json_extract(data, '$.command_id') = ?1",
+                [&second_child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(follower_dispatches, 0);
+    }
+
+    #[test]
     fn scheduled_and_manual_timer_store_paths_reject_resume_without_old_generation() {
         let mut store = store();
         let seed = Ulid::new();
@@ -7443,6 +7596,220 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn coordination_owner_and_project_children_dispatch_apply_and_replay_once() {
+        for principal in ["owner", "project:project-test"] {
+            for verb in ["mail.send", "var.set"] {
+                let mut store = store();
+                let (agent_num, agent_id) = insert_test_agent(&mut store);
+                let now = 1_800_000_000_000;
+                if principal != "owner" {
+                    store
+                        .upsert_project_registration(
+                            "owner",
+                            &ProjectRegistrationInput {
+                                id: "project-test".to_owned(),
+                                checkout: "registered-checkout".to_owned(),
+                                repo_common_dir: "registered-common".to_owned(),
+                                git: None,
+                                profiles: Vec::new(),
+                                actions: vec![verb.to_owned()],
+                                interpreters: std::collections::BTreeMap::new(),
+                                run_env: Vec::new(),
+                            },
+                            now,
+                        )
+                        .unwrap();
+                }
+                let args = if verb == "mail.send" {
+                    json!({"to": [agent_id], "text": "completed"})
+                } else {
+                    json!({"scope": "project:project-test", "key": "result", "value": "done", "expect_version": 0})
+                };
+                let mut action = args.clone();
+                action["action"] = json!(verb);
+                let value = json!({"id": "coordination", "enabled": true, "do": [action]});
+                let input = RuleDefinitionInput {
+                    id: "coordination".to_owned(),
+                    canonical_definition: serde_json::to_string(&value).unwrap(),
+                    definition_digest: core::canonical_json_sha256(&value).unwrap(),
+                    enabled: true,
+                };
+                let state = store.ensure_rule_state(principal, &input, now).unwrap();
+                let seq = insert_test_turn_completed(&mut store, agent_num, now);
+                let mut request = SubmitCommand::new("", verb);
+                request.args = args;
+                let admission = store
+                    .admit_rule_action(principal, &state, seq, request.clone(), now)
+                    .unwrap();
+                let child = admission
+                    .child
+                    .as_ref()
+                    .expect("coordination child")
+                    .command
+                    .clone();
+                let dispatched = store.dispatch(&child.id, now + 1).unwrap();
+                assert_eq!(dispatched.value.state, CommandState::Dispatched);
+                assert_eq!(dispatched.events.last().unwrap().kind, "command.dispatched");
+                let apply = |store: &mut Store| {
+                    if verb == "mail.send" {
+                        store.commit_mail_send_applied(
+                            &child.id,
+                            core::api::MailLimits::default(),
+                            now + 2,
+                        )
+                    } else {
+                        store.commit_var_set_applied(&child.id, now + 2)
+                    }
+                    .unwrap()
+                };
+                let applied = apply(&mut store);
+                assert_eq!(applied.value.state, CommandState::Applied);
+                assert!(applied.events.iter().all(|event| {
+                    event
+                        .cause
+                        .as_ref()
+                        .is_some_and(|cause| cause.command_id == child.id && cause.depth == 1)
+                }));
+                if verb == "mail.send" {
+                    let delivery =
+                        applied.value.outcome.as_ref().unwrap()["deliveries"][0]["delivery_id"]
+                            .as_str()
+                            .unwrap();
+                    let head = delivery
+                        .split_once('/')
+                        .unwrap()
+                        .0
+                        .strip_prefix("rule:")
+                        .unwrap();
+                    assert_eq!(ulid_timestamp_ms(head), Some(now));
+                    assert_eq!(
+                        store
+                            .connection
+                            .query_row("SELECT COUNT(*) FROM messages", [], |row| row
+                                .get::<_, i64>(0))
+                            .unwrap(),
+                        1
+                    );
+                } else {
+                    assert_eq!(applied.events[0].kind, "var.changed");
+                    assert_eq!(applied.events[1].kind, "command.applied");
+                    assert_eq!(applied.value.outcome.as_ref().unwrap()["version"], 1);
+                }
+                let replay = store
+                    .admit_rule_action(principal, &state, seq, request, now + 3)
+                    .unwrap();
+                assert!(!replay.is_new);
+                assert_eq!(replay.child.unwrap().command.id, child.id);
+                assert!(replay.events.is_empty());
+                let repeated = apply(&mut store);
+                assert_eq!(repeated.value, applied.value);
+                assert!(repeated.events.is_empty());
+                assert_eq!(
+                    store
+                        .connection
+                        .query_row("SELECT COUNT(*) FROM writes", [], |row| row
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coordination_var_changed_preserves_cause_through_depth_five() {
+        let mut store = store();
+        let mut state = store
+            .ensure_rule_state("owner", &definition("var-loop", true), 10)
+            .unwrap();
+        let mut seq = insert_test_event(&mut store, "var.changed", 11);
+        for depth in 1..=6 {
+            let mut request = SubmitCommand::new("", "var.set");
+            request.args = json!({"scope": "global", "key": "loop", "value": depth});
+            let admission = store
+                .admit_rule_action("owner", &state, seq, request, 12 + i64::from(depth))
+                .unwrap();
+            state = admission.state;
+            if depth == 6 {
+                assert!(admission.parent.is_none());
+                assert!(admission.child.is_none());
+                assert!(admission.events.is_empty());
+                break;
+            }
+            let child = admission.child.unwrap().command;
+            store.dispatch(&child.id, 20).unwrap();
+            let applied = store.commit_var_set_applied(&child.id, 21).unwrap();
+            let event = &applied.events[0];
+            assert_eq!(event.kind, "var.changed");
+            let cause = event.cause.as_ref().expect("verified variable producer");
+            assert_eq!(cause.command_id, child.id);
+            assert_eq!(cause.depth, depth);
+            seq = event.seq;
+        }
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT version FROM vars WHERE key = 'loop'", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn coordination_rule_mail_ack_survives_pruned_delivery() {
+        let mut store = store();
+        let (agent_num, agent_id) = insert_test_agent(&mut store);
+        let now = 1_800_000_000_000;
+        let state = store
+            .ensure_rule_state("owner", &definition("mail-result", true), now)
+            .unwrap();
+        let seq = insert_test_turn_completed(&mut store, agent_num, now);
+        let mut request = SubmitCommand::new("", "mail.send");
+        request.args = json!({"to": [agent_id], "text": "completed"});
+        let child = store
+            .admit_rule_action("owner", &state, seq, request, now)
+            .unwrap()
+            .child
+            .unwrap()
+            .command;
+        store.dispatch(&child.id, now).unwrap();
+        let applied = store
+            .commit_mail_send_applied(&child.id, core::api::MailLimits::default(), now)
+            .unwrap();
+        let delivery = applied.value.outcome.unwrap()["deliveries"][0]["delivery_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let ack = core::api::MailAckRequest {
+            id: Ulid::from_parts(now as u64, 1).to_string(),
+            agent: Some(agent_id),
+            deliveries: vec![delivery],
+        };
+        store.mail_ack("owner", &ack, now).unwrap();
+        let later = now + 31 * 24 * 60 * 60 * 1_000;
+        assert_eq!(
+            store
+                .prune_retention(None, None, Some(30), later)
+                .unwrap()
+                .mail_deleted,
+            1
+        );
+        let fresh_ack = core::api::MailAckRequest {
+            id: Ulid::from_parts(later as u64, 2).to_string(),
+            ..ack
+        };
+        assert_eq!(
+            store
+                .mail_ack("owner", &fresh_ack, later)
+                .unwrap()
+                .value
+                .acked,
+            fresh_ack.deliveries
         );
     }
 

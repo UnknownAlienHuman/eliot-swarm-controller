@@ -23,12 +23,12 @@ fn decode_resolve_request<T>(
     params: &Value,
     principal: &Principal,
     secrets: &SecretSet,
-    method: &str,
+    _method: &str,
     noun: &str,
     validate: fn(&T) -> Result<()>,
 ) -> Result<T>
 where
-    T: DeserializeOwned,
+    T: DeserializeOwned + schemars::JsonSchema,
 {
     require_owner(principal)?;
     if contains_known_secret_including_keys(params, secrets) {
@@ -37,8 +37,7 @@ where
             format!("{noun} contains a known credential"),
         ));
     }
-    let request: T = serde_json::from_value(params.clone())
-        .map_err(|_| Error::new("invalid", format!("{method} params are invalid")))?;
+    let request: T = eliot_core::api::discovery::decode_params(params.clone())?;
     validate(&request)?;
     Ok(request)
 }
@@ -350,13 +349,7 @@ mod tests {
                 .target
                 .unwrap();
             store.dispatch(&launch_id, now).unwrap();
-            crate::test_support::install_fixture_sources(
-                &mut *store,
-                &agent,
-                &launch_id,
-                1,
-                now,
-            );
+            crate::test_support::install_fixture_sources(&mut store, &agent, &launch_id, 1, now);
             store
                 .put_batch(
                     eliot_core::SourceBatch {
@@ -576,7 +569,7 @@ mod tests {
             .target
             .unwrap();
         store.dispatch(&launch_id, now).unwrap();
-        crate::test_support::install_fixture_sources(&mut *store, &agent, &launch_id, 1, now);
+        crate::test_support::install_fixture_sources(&mut store, &agent, &launch_id, 1, now);
         store
             .put_batch(
                 SourceBatch {

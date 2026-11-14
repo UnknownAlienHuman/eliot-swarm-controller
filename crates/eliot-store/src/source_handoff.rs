@@ -795,7 +795,10 @@ mod tests {
     }
 
     fn handoff_all_native_families(agent: &str) -> SourceHandoff {
-        handoff(agent, &["session", "turn", "message", "tool", "request"][..])
+        handoff(
+            agent,
+            &["session", "turn", "message", "tool", "request"][..],
+        )
     }
 
     fn with_gap(mut request: SourceHandoff) -> SourceHandoff {

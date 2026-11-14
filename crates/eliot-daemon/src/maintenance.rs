@@ -634,7 +634,7 @@ mod tests {
                 .unwrap();
             store.dispatch(&launch_id, admitted_at).unwrap();
             crate::test_support::install_fixture_sources(
-                &mut *store,
+                &mut store,
                 &agent,
                 &launch_id,
                 1,

@@ -192,6 +192,26 @@ impl GoalRoundCommitResult {
     }
 }
 
+/// One active Eliot-mode Goal that could round on its retained idle
+/// event. `idle_seq` carries the latest event seq only when that row
+/// still names an idle event of the Goal's generation; otherwise the
+/// retained evidence is pruned, superseded or never existed and the
+/// Router waits for a real event instead of inventing one.
+/// `key_consumed` names the same burn the probe and claim enforce: the
+/// committed key matches or a non-live marker already spent this
+/// generation's idle key. The Router skips consumed subjects before
+/// taking a scheduler slot, so one burned key cannot starve an
+/// eligible Goal past the concurrency cap.
+#[derive(Clone, Debug)]
+pub struct GoalReconcileCandidate {
+    pub agent: String,
+    pub generation: i64,
+    pub revision: i64,
+    pub agent_state: AgentState,
+    pub idle_seq: Option<i64>,
+    pub key_consumed: bool,
+}
+
 /// A duplicate claim returns its original reply, without another check.
 #[derive(Clone, Debug)]
 pub enum GoalRoundClaim {
@@ -461,6 +481,77 @@ impl Store {
         let agent_num = parse_agent_id(agent)?;
         Ok(load_goal_row(&self.connection, agent_num, "native")?
             .is_some_and(|row| row.state.status == GoalStatus::Active))
+    }
+
+    /// Active non-cadenced Eliot Goals bound to their Agent's current
+    /// generation. The Router applies the same enablement checks as the
+    /// event path before reserving a round on the retained idle subject.
+    pub fn goal_reconcile_candidates(&self) -> Result<Vec<GoalReconcileCandidate>> {
+        let rows: Vec<(i64, i64, i64)> = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT g.agent, g.generation, g.revision
+                     FROM goals g JOIN agents a ON a.id = g.agent
+                     WHERE g.mode = 'eliot'
+                       AND json_extract(g.state, '$.status') = 'active'
+                       AND g.generation = a.generation
+                       AND json_extract(g.definition, '$.cadence_ms') IS NULL
+                       AND a.observe_only = 0
+                     ORDER BY g.agent",
+                )
+                .map_err(sql_error)?;
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .map_err(sql_error)?
+                .collect::<rusqlite::Result<Vec<(i64, i64, i64)>>>()
+                .map_err(sql_error)?
+        };
+        let mut candidates = Vec::with_capacity(rows.len());
+        for (agent_num, generation, revision) in rows {
+            let agent_row = load_agent_by_num(&self.connection, agent_num)?
+                .ok_or_else(|| Error::new("internal", "reconcile goal lost its Agent"))?;
+            let max_seq = max_agent_seq(&self.connection, agent_num, generation)?;
+            let idle_seq = if max_seq > 0
+                && round_key_names_generation_event(
+                    &self.connection,
+                    agent_num,
+                    generation,
+                    max_seq,
+                )? {
+                Some(max_seq)
+            } else {
+                None
+            };
+            // Name the burn the probe and claim enforce, so the Router
+            // skips spent subjects before taking a scheduler slot.
+            let mut key_consumed = false;
+            if let Some(seq) = idle_seq {
+                let key = GoalRoundKey::Idle(seq);
+                if let Some(row) = load_goal_row(&self.connection, agent_num, "eliot")? {
+                    if row.last_round_key.as_deref() == Some(&key.text()) {
+                        key_consumed = true;
+                    } else {
+                        let markers = load_goal_markers(&self.connection, agent_num, "eliot")?;
+                        key_consumed = markers.iter().any(|marker| {
+                            marker.round_key == key.value()
+                                && marker.kind == key.kind()
+                                && marker.generation == generation
+                                && !marker.is_live(&self.goal_holder)
+                        });
+                    }
+                }
+            }
+            candidates.push(GoalReconcileCandidate {
+                agent: format_agent_id(agent_num),
+                generation,
+                revision,
+                agent_state: agent_row.state,
+                idle_seq,
+                key_consumed,
+            });
+        }
+        Ok(candidates)
     }
 
     /// Read round facts, pausing a generation-drifted Goal. Fails before any

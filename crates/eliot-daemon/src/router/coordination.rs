@@ -31,7 +31,7 @@ pub(super) fn decode_coordination_request<T>(
     validate: fn(&T) -> Result<()>,
 ) -> Result<T>
 where
-    T: DeserializeOwned,
+    T: DeserializeOwned + schemars::JsonSchema,
 {
     if contains_known_secret_including_keys(params, secrets) {
         return Err(Error::new(
@@ -39,8 +39,7 @@ where
             format!("{method} request contains a known credential"),
         ));
     }
-    let request: T = serde_json::from_value(params.clone())
-        .map_err(|_| Error::new("invalid", format!("{method} params are invalid")))?;
+    let request: T = eliot_core::api::discovery::decode_params(params.clone())?;
     validate(&request)?;
     Ok(request)
 }
@@ -381,7 +380,7 @@ mod tests {
             .expect("admit launch");
         let agent = admission.command.target.expect("launch target");
         store.dispatch(&launch_id, now).expect("dispatch launch");
-        crate::test_support::install_fixture_sources(&mut *store, &agent, &launch_id, 1, now);
+        crate::test_support::install_fixture_sources(&mut store, &agent, &launch_id, 1, now);
         store
             .put_batch(
                 SourceBatch {

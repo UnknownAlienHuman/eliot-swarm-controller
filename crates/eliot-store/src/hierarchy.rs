@@ -736,7 +736,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 28);
+        assert_eq!(version, 30);
         let mut columns: Vec<String> = store
             .connection
             .prepare("SELECT name FROM pragma_table_info('agents')")
@@ -1344,7 +1344,7 @@ mod tests {
         ));
         {
             let legacy_store = Store::open(&path).unwrap();
-            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 28);
+            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 30);
             drop(legacy_store);
             // Downgrade to the v22 shape with two legacy rows, then reopen so
             // the v23 block backfills them exactly as it would on upgrade.
@@ -1353,7 +1353,18 @@ mod tests {
             let legacy = rusqlite::Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
-                    "DROP INDEX agents_parent;
+                    "DROP TRIGGER native_child_activity_revision;
+                     DROP TRIGGER native_child_progress_pruned;
+                     DROP INDEX native_children_producer;
+                     DROP INDEX turns_native_activity;
+                     DROP INDEX events_native_progress_time;
+                     DROP INDEX events_git_progress_time;
+                     ALTER TABLE agents DROP COLUMN native_child_revision;
+                     DELETE FROM schema_migrations WHERE version = 30;
+                     ALTER TABLE turns DROP COLUMN outcome;
+                     ALTER TABLE turns DROP COLUMN native_status;
+                     DELETE FROM schema_migrations WHERE version = 29;
+                     DROP INDEX agents_parent;
                      DROP INDEX agents_root;
                      ALTER TABLE agents DROP COLUMN parent;
                      ALTER TABLE agents DROP COLUMN root;
@@ -1393,7 +1404,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 28);
+        assert_eq!(version, 30);
         for id in ["a1", "a2"] {
             let agent = store.get_agent(id).unwrap().expect("legacy row");
             assert_eq!(agent.root, id);

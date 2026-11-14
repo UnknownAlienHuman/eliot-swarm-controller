@@ -34,8 +34,8 @@ impl Router {
         principal: &Principal,
     ) -> Result<Value> {
         require_owner(principal)?;
-        let request: RuleCatchUpRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "rule.catch_up params are invalid"))?;
+        let request: RuleCatchUpRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let rule_principal = rule_principal(request.project.as_deref());
         if let Some(parent) = self
@@ -206,8 +206,7 @@ impl Router {
 
     pub(super) async fn timer_run(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
-        let request: TimerRunRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "timer.run params are invalid"))?;
+        let request: TimerRunRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let rule_principal = rule_principal(request.project.as_deref());
 
@@ -429,12 +428,21 @@ impl Router {
         } = prepared;
         if !matches!(
             action.verb.as_str(),
-            "stop" | "send" | "launch" | "resume" | "run" | "git.fetch" | "notify" | "emit"
+            "stop"
+                | "send"
+                | "launch"
+                | "resume"
+                | "run"
+                | "git.fetch"
+                | "notify"
+                | "emit"
+                | "mail.send"
+                | "var.set"
         ) || workspace.is_some()
         {
             return Err(Error::new(
                 "invalid",
-                "timer firing must contain one prepared stop, send, launch, resume, Run, or local event command",
+                "timer firing must contain one prepared stop, send, launch, resume, Run, mail.send, var.set, or local event command",
             ));
         }
         if action.verb == "run" {
@@ -609,11 +617,13 @@ impl Router {
                     | "answer"
                     | "notify"
                     | "emit"
+                    | "mail.send"
+                    | "var.set"
             )
         {
             return Err(Error::new(
                 "invalid",
-                "rule firing must contain a prepared stop, send, launch, resume, steer, interrupt, reply, Run, or local event action",
+                "rule firing must contain a prepared stop, send, launch, resume, steer, interrupt, reply, Run, mail.send, var.set, or local event action",
             ));
         }
         let admission = {
@@ -1103,7 +1113,13 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
                 .unwrap();
             let agent = launch.command.target.unwrap();
             store.dispatch(&launch_id, now_ms()).unwrap();
-            crate::test_support::install_fixture_sources(&mut *store, &agent, &launch_id, 1, now_ms());
+            crate::test_support::install_fixture_sources(
+                &mut store,
+                &agent,
+                &launch_id,
+                1,
+                now_ms(),
+            );
             read_fixture_event(
                 &mut store,
                 &agent,
@@ -1263,7 +1279,13 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
                 )
                 .unwrap();
             store.dispatch(&launch_id, now_ms()).unwrap();
-            crate::test_support::install_fixture_sources(&mut *store, &pending_agent, &launch_id, 1, now_ms());
+            crate::test_support::install_fixture_sources(
+                &mut store,
+                &pending_agent,
+                &launch_id,
+                1,
+                now_ms(),
+            );
             read_fixture_event(
                 &mut store,
                 &pending_agent,
@@ -1277,7 +1299,21 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
             store
                 .settle(&launch_id, CommandState::Applied, None, now_ms())
                 .unwrap();
+            crate::test_support::install_live_owned_process_source(
+                &mut store,
+                &pending_agent,
+                1,
+                now_ms(),
+            );
             read_fixture_event(&mut store, &pending_agent, "session.ended", json!({}));
+            // Prove generation-1 custody closed so the resume below admits;
+            // generation 2 still stays Creating, undispatched.
+            crate::test_support::simulate_owned_process_exit_proof(
+                &mut store,
+                &pending_agent,
+                1,
+                now_ms(),
+            );
             (pending_agent, pending_event_seq, initial_workspace)
         };
 

@@ -20,8 +20,8 @@ use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
 use eliot_plugin::{
     StderrView,
     native_transport::{
-        NativeChild, NativeLabels, NativeLaunch, NativeWriter, PendingCalls, PumpAction, PumpMode,
-        StreamState, encode_frame, spawn_pumped,
+        DEFAULT_MAX_NATIVE_FRAME_BYTES, NativeChild, NativeLabels, NativeLaunch, NativeWriter,
+        PendingCalls, PumpAction, PumpMode, StreamState, encode_frame, spawn_pumped,
     },
 };
 
@@ -35,6 +35,11 @@ const LABELS: NativeLabels = NativeLabels {
     server: "Claude",
 };
 const ID_PREFIX: &str = "claude";
+
+/// Claude speaks stream-json records keyed by `type`, never JSON-RPC
+/// `method`/`id`: no inbound method name is legitimate, so oversized-frame
+/// diagnosis omits the method and keeps only the kind and length.
+const OVERSIZED_KNOWN_METHODS: &[&str] = &[];
 
 /// One non-response stream record for the event task.
 pub(crate) enum ClaudeFrame {
@@ -66,7 +71,10 @@ impl ClaudeProcess {
             LABELS,
             ID_PREFIX,
             PumpMode::LossyOverflow,
+            DEFAULT_MAX_NATIVE_FRAME_BYTES,
+            OVERSIZED_KNOWN_METHODS,
             classify_claude_frame,
+            None,
         )
         .await?;
         let client = ClaudeClient {

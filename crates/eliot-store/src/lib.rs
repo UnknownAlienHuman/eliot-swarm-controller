@@ -35,9 +35,9 @@ use eliot_core::{
     Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage,
     GitSnapshot, InjectPoint, NativeEvent, NativeStoreBinding, PendingRequest, ProcessIdentity,
     ProcessRecord, ProcessSnapshot, ProcessState, SourceBatch, SourceGap, SourceGapAck,
-    SubmitCommand, Turn, TurnState, TurnUsage, WorkspaceCancelOutcome, WorkspaceCreationOutcome,
-    WorkspacePhase, WorkspacePreparation, WorkspacePreparationInput, WorkspaceRemovalOutcome,
-    WorkspaceSetupArg, WorkspaceSetupOutcome, parse_agent_id,
+    SubmitCommand, Turn, TurnOutcome, TurnState, TurnUsage, WorkspaceCancelOutcome,
+    WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation, WorkspacePreparationInput,
+    WorkspaceRemovalOutcome, WorkspaceSetupArg, WorkspaceSetupOutcome, parse_agent_id,
 };
 pub use eliot_core::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -113,6 +113,9 @@ mod goals;
 mod hierarchy;
 mod lifecycle;
 mod native_children;
+pub use native_children::{
+    NATIVE_CHILD_ATTENTION_PAGE_SIZE, NativeChildrenAttention, NativeChildrenAttentionPage,
+};
 mod native_events;
 mod observer;
 mod observer_live;
@@ -749,8 +752,8 @@ impl Store {
         Ok(agents)
     }
 
-    /// Page only routed Agents whose current projections can need attention.
-    /// Historical and terminal rows do not consume the page limit.
+    /// Page routed attention candidates. Registration existence is an indexed
+    /// candidate check; child activity is inspected in separate bounded pages.
     pub fn list_attention_agents(&self, after: Option<&str>, limit: usize) -> Result<Vec<Agent>> {
         validate_limit(limit)?;
         let after_num = after.map(parse_agent_id).transpose()?.unwrap_or(0);
@@ -762,7 +765,9 @@ impl Store {
                         pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
                         parent, root, depth, control
                  FROM agents
-                 WHERE id > ?1 AND observe_only = 0 AND state IN ('busy', 'waiting')
+                 WHERE id > ?1 AND observe_only = 0 AND (state IN ('busy', 'waiting')
+                   OR EXISTS(SELECT 1 FROM native_child_registrations r
+                     WHERE r.producer = agents.id AND r.producer_generation = agents.generation))
                  ORDER BY id LIMIT ?2",
             )
             .map_err(sql_error)?;
@@ -1099,17 +1104,18 @@ impl Store {
     pub fn list_turns(&self, agent: &str, generation: i64, limit: usize) -> Result<Vec<Turn>> {
         validate_limit(limit)?;
         let agent_num = parse_agent_id(agent)?;
-        if load_agent_by_num(&self.connection, agent_num)?.is_none() {
+        let Some(agent_row) = load_agent_by_num(&self.connection, agent_num)? else {
             return Err(Error::new(
                 "not_found",
                 format!("Agent {agent} was not found"),
             ));
-        }
+        };
+        let harness = agent_row.harness;
         let mut statement = self
             .connection
             .prepare(
-                "SELECT agent, generation, turn_id, state, status, final_text,
-                        started_at, completed_at, usage
+                "SELECT agent, generation, turn_id, state, status, outcome, native_status,
+                        final_text, started_at, completed_at, usage
                  FROM turns WHERE agent = ?1 AND generation = ?2
                  ORDER BY COALESCE(started_at, completed_at, 0) DESC, turn_id DESC
                  LIMIT ?3",
@@ -1123,7 +1129,7 @@ impl Store {
             .map_err(sql_error)?;
         let mut turns = Vec::new();
         for row in rows {
-            turns.push(turn_from_record(row.map_err(sql_error)?)?);
+            turns.push(turn_from_record(row.map_err(sql_error)?, &harness)?);
         }
         enforce_page_bytes(&mut turns)?;
         Ok(turns)
@@ -1739,22 +1745,31 @@ impl Store {
     /// Ownership was verified on commit; later handoff cannot erase those facts.
     pub fn last_model_progress(&self, agent: &str, generation: i64) -> Result<Option<i64>> {
         let agent_num = parse_agent_id(agent)?;
-        self.connection
+        let exists: bool = self
+            .connection
             .query_row(
-                "SELECT MAX(e.ts) FROM events e
-                 WHERE e.agent = ?1 AND e.generation = ?2
-                   AND EXISTS(SELECT 1 FROM agents a WHERE a.id = e.agent)
-                   AND ((e.source NOT IN ('os', 'daemon', 'git', 'workspace_process') AND e.native_id IS NOT NULL
-                   AND e.kind IN ('turn.started', 'turn.completed', 'message.completed',
-                                  'tool.started', 'tool.completed',
-                                  'request.opened', 'request.resolved', 'request.closed'))
-                     OR (e.source = 'git' AND e.kind = 'file.changed'))",
-                params![agent_num, generation],
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
+                [agent_num],
                 |row| row.get(0),
             )
-            .map_err(sql_error)
+            .map_err(sql_error)?;
+        if !exists {
+            return Ok(None);
+        }
+        let native = native_children::native_progress(&self.connection, agent_num, generation)?;
+        let git: Option<i64> = self
+            .connection
+            .query_row(GIT_PROGRESS_SQL, params![agent_num, generation], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(sql_error)?;
+        Ok(native.into_iter().chain(git).max())
     }
 }
+
+const GIT_PROGRESS_SQL: &str = "SELECT ts FROM events WHERE agent = ?1 AND generation = ?2
+    AND source = 'git' AND kind = 'file.changed' ORDER BY ts DESC LIMIT 1";
 
 impl Store {
     pub fn ensure_git_source(
@@ -2520,6 +2535,8 @@ struct TurnRecord {
     turn_id: String,
     state: String,
     status: Option<String>,
+    outcome: Option<String>,
+    native_status: Option<String>,
     final_text: Option<String>,
     started_at: Option<i64>,
     completed_at: Option<i64>,
@@ -2716,6 +2733,8 @@ struct TurnInsert<'a> {
     turn_id: &'a str,
     state: TurnState,
     status: Option<&'a str>,
+    outcome: Option<&'a str>,
+    native_status: Option<&'a str>,
     final_text: Option<&'a str>,
     started_at: Option<i64>,
     completed_at: Option<i64>,
@@ -2796,6 +2815,15 @@ fn agent_from_record(connection: &Connection, record: AgentRecord) -> Result<Age
             .map(|value| decode_json(&value))
             .transpose()?,
         state: parse_enum(&record.state, "Agent state")?,
+        activity: if record.origin == "native" && record.observe_only {
+            Some(native_children::activity(
+                connection,
+                record.id,
+                record.generation,
+            )?)
+        } else {
+            None
+        },
         active_turn: record.active_turn,
         pending,
         created_at: record.created_at,
@@ -3743,21 +3771,40 @@ fn turn_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord>
         turn_id: row.get(2)?,
         state: row.get(3)?,
         status: row.get(4)?,
-        final_text: row.get(5)?,
-        started_at: row.get(6)?,
-        completed_at: row.get(7)?,
-        usage: row.get(8)?,
+        outcome: row.get(5)?,
+        native_status: row.get(6)?,
+        final_text: row.get(7)?,
+        started_at: row.get(8)?,
+        completed_at: row.get(9)?,
+        usage: row.get(10)?,
     })
 }
 
-fn turn_from_record(record: TurnRecord) -> Result<Turn> {
+fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
     let usage = record.usage.as_deref().map(decode_turn_usage).transpose()?;
+    let state: TurnState = parse_enum(&record.state, "turn state")?;
+    // Rows written before canonical outcomes existed carry no stored outcome:
+    // classify them explicitly from the legacy status with the stored
+    // harness (Claude rows carry the raw terminal reason), never as success.
+    let outcome = match record.outcome.as_deref() {
+        Some(value) => Some(
+            TurnOutcome::parse(value)
+                .ok_or_else(|| Error::new("internal", "invalid stored turn outcome"))?,
+        ),
+        None if state == TurnState::Completed => Some(
+            TurnOutcome::classify_legacy_status_for_harness(harness, record.status.as_deref()),
+        ),
+        None => None,
+    };
+    let native_status = record.native_status.filter(|value| !value.is_empty());
     Ok(Turn {
         agent: format_agent_id(record.agent),
         generation: record.generation,
         turn_id: record.turn_id,
-        state: parse_enum(&record.state, "turn state")?,
+        state,
         status: record.status,
+        outcome,
+        native_status,
         final_text: record.final_text,
         started_at: record.started_at,
         completed_at: record.completed_at,
@@ -3778,28 +3825,47 @@ fn load_turn(
 ) -> Result<Option<Turn>> {
     let record = connection
         .query_row(
-            "SELECT agent, generation, turn_id, state, status, final_text,
-                    started_at, completed_at, usage
+            "SELECT agent, generation, turn_id, state, status, outcome, native_status,
+                    final_text, started_at, completed_at, usage
              FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
             params![agent, generation, turn_id],
             turn_record_from_row,
         )
         .optional()
         .map_err(sql_error)?;
-    record.map(turn_from_record).transpose()
+    record
+        .map(|record| {
+            let harness = load_harness_by_num(connection, agent)?;
+            turn_from_record(record, &harness)
+        })
+        .transpose()
+}
+
+/// Stored harness for one agent row, used to classify legacy turn rows that
+/// carry no canonical outcome. Missing agent rows classify generically.
+fn load_harness_by_num(connection: &Connection, agent: i64) -> Result<String> {
+    connection
+        .query_row("SELECT harness FROM agents WHERE id = ?1", [agent], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(sql_error)
+        .map(|harness| harness.unwrap_or_default())
 }
 
 fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
     db!(tx.execute(
-        "INSERT INTO turns(agent, generation, turn_id, state, status, final_text,
-                           started_at, completed_at, usage)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO turns(agent, generation, turn_id, state, status, outcome, native_status,
+                           final_text, started_at, completed_at, usage)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             turn.agent,
             turn.generation,
             turn.turn_id,
             turn_state_name(turn.state),
             turn.status,
+            turn.outcome,
+            turn.native_status,
             turn.final_text,
             turn.started_at,
             turn.completed_at,

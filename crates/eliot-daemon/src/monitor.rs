@@ -251,10 +251,10 @@ impl Monitoring {
         let events = store.ensure_git_source(&agent.id, agent.generation, workspace, now_ms())?;
         self.inner.bus.publish(&events);
         drop(store);
-        self.inner
-            .git_bindings
-            .lock_recover()
-            .insert((agent.id.clone(), agent.generation), workspace.to_owned());
+        // Registration and retirement take these locks in the same order. Keep
+        // the binding visible until its cache slot is installed as one operation.
+        let mut bindings = self.inner.git_bindings.lock_recover();
+        bindings.insert((agent.id.clone(), agent.generation), workspace.to_owned());
         self.inner
             .git_workspaces
             .lock_recover()
@@ -286,7 +286,15 @@ impl Monitoring {
             targets.insert(key, Arc::clone(&target));
         }
         // A failed read-only probe leaves unknown observation; it does not fail native startup.
-        let _ = self.sample_target(&target).await;
+        // Controlled startup holds its cleanup gate here. Bound this initial
+        // sample, including its Store wait, by the existing sampling cadence.
+        // The target stays registered; a timed-out blocking read has no native
+        // effect, and its dropped future cannot later commit a stale snapshot.
+        let _ = timeout_at(
+            Instant::now() + SAMPLE_INTERVAL,
+            self.sample_target(&target),
+        )
+        .await;
         Ok(())
     }
 
@@ -920,6 +928,26 @@ impl Monitoring {
         }
     }
 
+    fn retire_git_workspaces(&self) {
+        let retired = {
+            let bindings = self.inner.git_bindings.lock_recover();
+            let needed: HashSet<_> = bindings.values().collect();
+            let mut workspaces = self.inner.git_workspaces.lock_recover();
+            let mut retired = Vec::new();
+            workspaces.retain(|workspace, target| {
+                if needed.contains(workspace) {
+                    return true;
+                }
+                // Retain the last Arc until outside both maps: dropping a watcher
+                // or a completed pending registration can stop backend threads.
+                retired.push(Arc::clone(target));
+                false
+            });
+            retired
+        };
+        drop(retired);
+    }
+
     fn update_watcher(target: &GitWorkspace, workspace: &str, live: bool) -> bool {
         let (dirty, registration, retired) = {
             let mut slot = target.watch.lock_recover();
@@ -988,6 +1016,7 @@ impl Monitoring {
             Err(error) => {
                 self.release_inactive_watchers(&HashSet::new(), false);
                 self.note_git_read_error(&error.code);
+                self.retire_git_workspaces();
                 return;
             }
         };
@@ -1128,6 +1157,10 @@ impl Monitoring {
                 }
             }
         }
+        // Final bindings remain registered through hint attribution and source
+        // closure. Consult the current registry, not this sweep's input snapshot,
+        // so a concurrent new binding keeps its shared cache slot.
+        self.retire_git_workspaces();
     }
 
     async fn commit_git_pages(
@@ -1314,6 +1347,7 @@ impl Monitoring {
             }
             Err(error) => self.mark_git_unavailable(&error.code),
         }
+        self.retire_git_workspaces();
     }
 
     fn note_git_read_error(&self, code: &str) {
@@ -1760,13 +1794,15 @@ mod tests {
             .target
             .unwrap();
         store.dispatch(&command_id, 1001).unwrap();
+        // The host owns the full native set; the handoff below moves only
+        // `families`, so the stream retains the remainder.
         crate::test_support::install_fixture_source_plan(
             &mut store,
             &agent,
             &command_id,
             1,
             1001,
-            families,
+            &["message", "request", "session", "turn"],
         );
         store
             .record_source_handoff(

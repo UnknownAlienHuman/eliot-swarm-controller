@@ -168,6 +168,8 @@ mod tests {
             turn_id: id.to_owned(),
             state: TurnState::Unknown,
             status: None,
+            outcome: None,
+            native_status: None,
             final_text: None,
             started_at: Some(0),
             completed_at: None,

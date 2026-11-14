@@ -2771,7 +2771,7 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
                 .unwrap();
             store.dispatch(&seed_id, now_ms()).unwrap();
             crate::test_support::install_fixture_sources(
-                &mut *store,
+                &mut store,
                 &agent,
                 &seed_id,
                 1,

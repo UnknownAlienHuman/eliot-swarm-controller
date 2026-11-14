@@ -96,6 +96,8 @@ pub(super) fn persist_turn_fact(
         turn_id: turn_id.clone(),
         state: TurnState::Unknown,
         status: None,
+        outcome: None,
+        native_status: None,
         final_text: None,
         started_at: None,
         completed_at: None,
@@ -122,6 +124,21 @@ pub(super) fn persist_turn_fact(
         }
         "turn.completed" => {
             let status = required_string(&event.data, "status")?;
+            let outcome = match event.data.get("outcome") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(value)) => Some(TurnOutcome::parse(value).ok_or_else(|| {
+                    Error::new("invalid", "observed turn outcome is not canonical")
+                })?),
+                Some(_) => {
+                    return Err(Error::new(
+                        "invalid",
+                        "observed turn outcome must be a string or null",
+                    ));
+                }
+            };
+            let native_status = optional_text(&event.data, "native_status")?
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
             if turn.state == TurnState::Completed {
                 return Err(Error::new(
                     "source_integrity",
@@ -130,6 +147,8 @@ pub(super) fn persist_turn_fact(
             }
             turn.state = TurnState::Completed;
             turn.status = Some(status);
+            turn.outcome = outcome;
+            turn.native_status = native_status;
             if let Some(at) = optional_time(&event.data, "started_at")? {
                 if turn.started_at.is_some_and(|known| known != at) {
                     return Err(Error::new(
@@ -163,6 +182,8 @@ pub(super) fn persist_turn_fact(
                 turn_id: &turn_id,
                 state: turn.state,
                 status: turn.status.as_deref(),
+                outcome: turn.outcome.as_ref().map(TurnOutcome::as_str),
+                native_status: turn.native_status.as_deref(),
                 final_text: turn.final_text.as_deref(),
                 started_at: turn.started_at,
                 completed_at: turn.completed_at,
@@ -171,9 +192,22 @@ pub(super) fn persist_turn_fact(
         )?;
     } else {
         db!(tx.execute(
-            "UPDATE turns SET state = ?1, status = ?2, final_text = ?3, started_at = ?4, completed_at = ?5
-             WHERE agent = ?6 AND generation = ?7 AND turn_id = ?8",
-            params![turn_state_name(turn.state),turn.status,turn.final_text,turn.started_at,turn.completed_at,id,agent.generation,turn_id],
+            "UPDATE turns SET state = ?1, status = ?2, outcome = COALESCE(?3, outcome),
+                              native_status = COALESCE(?4, native_status),
+                              final_text = ?5, started_at = ?6, completed_at = ?7
+             WHERE agent = ?8 AND generation = ?9 AND turn_id = ?10",
+            params![
+                turn_state_name(turn.state),
+                turn.status,
+                turn.outcome.as_ref().map(TurnOutcome::as_str),
+                turn.native_status,
+                turn.final_text,
+                turn.started_at,
+                turn.completed_at,
+                id,
+                agent.generation,
+                turn_id
+            ],
         ));
     }
     Ok(())

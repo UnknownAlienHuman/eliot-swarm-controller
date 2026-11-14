@@ -4,11 +4,12 @@ use super::{
 };
 use eliot_core::api::{
     ProviderClearHoldRequest, ProviderCorrectiveEvidence, RuleCatchUpRequest, ScriptInterpreter,
+    TurnResolveRequest, TurnResolveStatus,
 };
 use eliot_core::{
     AgentState, CommandState, EventCause, NativeEvent, NativeStoreBinding, ProcessIdentity,
     ProcessRecord, ProcessState, ProviderHoldState, ProviderRestrictionKind, SourceBatch,
-    SourceGap, SubmitCommand, TurnState,
+    SourceGap, SubmitCommand, TurnOutcome, TurnState,
 };
 use eliot_core::{
     WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparationInput,
@@ -2828,6 +2829,21 @@ fn project_registration_migration_defaults_legacy_run_authority_to_deny() {
                        outcome TEXT,
                        updated_at INTEGER NOT NULL
                    );
+                   CREATE TABLE events(
+                       seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                       ts INTEGER NOT NULL,
+                       kind TEXT NOT NULL,
+                       family TEXT,
+                       agent INTEGER,
+                       generation INTEGER,
+                       source TEXT NOT NULL,
+                       native_id TEXT,
+                       cursor TEXT,
+                       payload_digest BLOB,
+                       data TEXT NOT NULL,
+                       subject TEXT,
+                       cause TEXT
+                   );
                    CREATE TABLE project_registrations(
                        revision INTEGER PRIMARY KEY AUTOINCREMENT,
                        id TEXT NOT NULL UNIQUE,
@@ -3515,6 +3531,416 @@ fn send_association_emits_applied_once_with_native_batch_ack() {
             .count(),
         1
     );
+}
+
+#[test]
+fn terminal_turn_persists_canonical_outcome_and_legacy_status_classifies() {
+    // Canonical outcomes decided at the plugin boundary persist next to the
+    // raw native reason; rows written without one classify explicitly from
+    // the legacy status and never as success.
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let launch_id = Ulid::new().to_string();
+    let admission = store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: launch_id.clone(),
+                target: None,
+                selector: None,
+                verb: "launch".to_owned(),
+                args: json!({"project":"outcome-turn", "workspace":"synthetic-workspace", "harness":"codex", "profile":"codex-fixture", "profile_snapshot":{}}),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit codex launch");
+    let agent = admission.command.target.expect("launch target");
+    store.dispatch(&launch_id, now).expect("dispatch launch");
+    let plan = ["session", "turn", "message", "tool", "request"]
+        .into_iter()
+        .map(|family| (family.to_owned(), "stream".to_owned()))
+        .collect();
+    store
+        .install_plugin_sources(&agent, 1, &launch_id, &plan, now)
+        .expect("install stream source owners");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "ready".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: "ready".to_owned(),
+                    data: json!({"command_id":launch_id}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit ready");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now)
+        .expect("settle start");
+
+    let complete_turn = |store: &mut Store,
+                         send_id: &str,
+                         turn_id: &str,
+                         status: &str,
+                         outcome: Option<&str>,
+                         native_status: Option<&str>,
+                         now: i64| {
+        let mut data = json!({"command_id":send_id, "turn_id":turn_id, "status":status});
+        if let Some(outcome) = outcome {
+            data["outcome"] = json!(outcome);
+        }
+        if let Some(native_status) = native_status {
+            data["native_status"] = json!(native_status);
+        }
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{turn_id}:terminal"),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "turn.completed".to_owned(),
+                        native_id: format!("{turn_id}:terminal"),
+                        data,
+                    }],
+                    cursor: None,
+                },
+                now,
+            )
+            .expect("commit terminal turn");
+    };
+    let start_turn = |store: &mut Store, send_id: &str, turn_id: &str, now: i64| {
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{turn_id}:started"),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "turn.started".to_owned(),
+                        native_id: format!("{turn_id}:started"),
+                        data: json!({"command_id":send_id, "turn_id":turn_id}),
+                    }],
+                    cursor: None,
+                },
+                now,
+            )
+            .expect("commit turn start");
+    };
+    let send_and_start = |store: &mut Store, text: &str, now: i64| -> (String, String) {
+        let send_id = Ulid::new().to_string();
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: send_id.clone(),
+                    target: Some(agent.clone()),
+                    selector: None,
+                    verb: "send".to_owned(),
+                    args: json!({"text":text}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .expect("admit send");
+        store.dispatch(&send_id, now).expect("dispatch send");
+        let turn_id = format!("turn-{send_id}");
+        start_turn(store, &send_id, &turn_id, now + 1);
+        (send_id, turn_id)
+    };
+
+    // Interrupted turn with the adapter's canonical outcome and raw reason.
+    let (send_id, turn_id) = send_and_start(&mut store, "interrupt me", now + 1);
+    complete_turn(
+        &mut store,
+        &send_id,
+        &turn_id,
+        "interrupted",
+        Some("interrupted"),
+        Some("cancelled"),
+        now + 2,
+    );
+    let turn = store
+        .get_turn(&agent, 1, &turn_id)
+        .expect("read turn")
+        .expect("turn exists");
+    assert_eq!(turn.state, TurnState::Completed);
+    assert_eq!(turn.outcome, Some(TurnOutcome::Interrupted));
+    assert_eq!(turn.native_status.as_deref(), Some("cancelled"));
+
+    // Legacy row without a stored outcome classifies from its status.
+    let (legacy_send, legacy_turn) = send_and_start(&mut store, "legacy", now + 3);
+    complete_turn(
+        &mut store,
+        &legacy_send,
+        &legacy_turn,
+        "completed",
+        None,
+        None,
+        now + 4,
+    );
+    let legacy = store
+        .get_turn(&agent, 1, &legacy_turn)
+        .expect("read legacy turn")
+        .expect("legacy turn exists");
+    assert_eq!(legacy.outcome, Some(TurnOutcome::Success));
+    assert_eq!(legacy.native_status, None);
+
+    // An unrecognized legacy status is unknown, never success.
+    let (unknown_send, unknown_turn) = send_and_start(&mut store, "unknown", now + 5);
+    complete_turn(
+        &mut store,
+        &unknown_send,
+        &unknown_turn,
+        "bogus",
+        None,
+        None,
+        now + 6,
+    );
+    let unknown = store
+        .get_turn(&agent, 1, &unknown_turn)
+        .expect("read unknown turn")
+        .expect("unknown turn exists");
+    assert_eq!(unknown.outcome, Some(TurnOutcome::Unknown));
+
+    // Owner resolution of a lost turn records its asserted outcome.
+    let (lost_send, lost_turn) = send_and_start(&mut store, "lost", now + 7);
+    let _ = lost_send;
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{lost_turn}:ended"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: format!("{lost_turn}:ended"),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now + 8,
+        )
+        .expect("commit session end");
+    let lost = store
+        .get_turn(&agent, 1, &lost_turn)
+        .expect("read lost turn")
+        .expect("lost turn exists");
+    assert_eq!(lost.state, TurnState::Unknown);
+    assert_eq!(lost.outcome, None);
+    store
+        .resolve_turn(
+            "owner",
+            &TurnResolveRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.clone(),
+                generation: 1,
+                turn_id: lost_turn.clone(),
+                status: TurnResolveStatus::Interrupted,
+                reason: "owner asserts the lost turn was interrupted".to_owned(),
+            },
+            None,
+            now + 9,
+        )
+        .expect("resolve lost turn");
+    let resolved = store
+        .get_turn(&agent, 1, &lost_turn)
+        .expect("read resolved turn")
+        .expect("resolved turn exists");
+    assert_eq!(resolved.state, TurnState::Completed);
+    assert_eq!(resolved.status.as_deref(), Some("interrupted"));
+    assert_eq!(resolved.outcome, Some(TurnOutcome::Interrupted));
+}
+
+#[test]
+fn claude_legacy_rows_classify_from_the_raw_terminal_reason() {
+    // Pre-outcome Claude rows carry the raw terminal reason in `status`
+    // (`success`, `api_error*`), not the normalized lifecycle status, so a
+    // harness-blind read reports them as unknown. Retrying the identical
+    // retained command with `--wait` must exit 0/1, not 4.
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let launch_id = Ulid::new().to_string();
+    let admission = store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: launch_id.clone(),
+                target: None,
+                selector: None,
+                verb: "launch".to_owned(),
+                args: json!({"project":"claude-legacy", "workspace":"synthetic-workspace", "harness":"claude", "profile":"claude-fixture", "profile_snapshot":{}}),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit claude launch");
+    let agent = admission.command.target.expect("launch target");
+    store.dispatch(&launch_id, now).expect("dispatch launch");
+    let plan = ["session", "turn", "message", "tool", "request"]
+        .into_iter()
+        .map(|family| (family.to_owned(), "stream".to_owned()))
+        .collect();
+    store
+        .install_plugin_sources(&agent, 1, &launch_id, &plan, now)
+        .expect("install stream source owners");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "ready".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: "ready".to_owned(),
+                    data: json!({"command_id":launch_id}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit ready");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now)
+        .expect("settle start");
+
+    let legacy_turn = |store: &mut Store, status: &str, now: i64| -> String {
+        let send_id = Ulid::new().to_string();
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: send_id.clone(),
+                    target: Some(agent.clone()),
+                    selector: None,
+                    verb: "send".to_owned(),
+                    args: json!({"text":"legacy"}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .expect("admit send");
+        store.dispatch(&send_id, now).expect("dispatch send");
+        let turn_id = format!("turn-{send_id}");
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{turn_id}:started"),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "turn.started".to_owned(),
+                        native_id: format!("{turn_id}:started"),
+                        data: json!({"command_id":send_id, "turn_id":turn_id}),
+                    }],
+                    cursor: None,
+                },
+                now + 1,
+            )
+            .expect("commit turn start");
+        // No `outcome`: a row written before canonical outcomes existed.
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{turn_id}:terminal"),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "turn.completed".to_owned(),
+                        native_id: format!("{turn_id}:terminal"),
+                        data: json!({"command_id":send_id, "turn_id":turn_id, "status":status}),
+                    }],
+                    cursor: None,
+                },
+                now + 2,
+            )
+            .expect("commit legacy terminal turn");
+        turn_id
+    };
+
+    let mut tick = 0;
+    for (status, expected) in [
+        ("success", TurnOutcome::Success),
+        ("api_error", TurnOutcome::Failure),
+        ("api_error_rate_limited", TurnOutcome::Failure),
+        ("error", TurnOutcome::Failure),
+        ("cancelled", TurnOutcome::Interrupted),
+        ("completed", TurnOutcome::Unknown),
+        ("bogus", TurnOutcome::Unknown),
+    ] {
+        tick += 10;
+        let turn_id = legacy_turn(&mut store, status, now + tick);
+        let turn = store
+            .get_turn(&agent, 1, &turn_id)
+            .expect("read legacy turn")
+            .expect("legacy turn exists");
+        assert_eq!(turn.state, TurnState::Completed, "status={status}");
+        assert_eq!(turn.outcome, Some(expected), "status={status}");
+        assert_eq!(turn.status.as_deref(), Some(status), "status={status}");
+    }
+
+    // The harness-aware read also feeds the list path, not just `get_turn`,
+    // so a retained command retried with `--wait` exits 0/1, not 4.
+    let turns = store.list_turns(&agent, 1, 50).expect("list legacy turns");
+    assert!(
+        turns
+            .iter()
+            .any(|turn| turn.status.as_deref() == Some("success")
+                && turn.outcome == Some(TurnOutcome::Success)),
+        "list_turns must classify the claude success row"
+    );
+    assert!(
+        turns
+            .iter()
+            .any(|turn| turn.status.as_deref() == Some("api_error")
+                && turn.outcome == Some(TurnOutcome::Failure)),
+        "list_turns must classify the claude api_error row"
+    );
+    // The list path agrees with the `get_turn` classification.
+    for (status, expected) in [
+        ("cancelled", TurnOutcome::Interrupted),
+        ("completed", TurnOutcome::Unknown),
+        ("bogus", TurnOutcome::Unknown),
+    ] {
+        assert!(
+            turns.iter().any(
+                |turn| turn.status.as_deref() == Some(status) && turn.outcome == Some(expected)
+            ),
+            "list_turns must classify status={status} as {expected:?}"
+        );
+    }
 }
 
 #[test]
@@ -6060,10 +6486,7 @@ fn configured_capacity_scopes_are_reserved_atomically_and_retries_are_idempotent
         .command
         .target
         .expect("named small Agent");
-    let named_small_agent = named_store
-        .get_agent(&named_small_agent)
-        .unwrap()
-        .unwrap();
+    let named_small_agent = named_store.get_agent(&named_small_agent).unwrap().unwrap();
     assert_eq!(named_small_agent.harness, "codex");
     assert_eq!(named_small_agent.profile, "fixture-small");
 
@@ -6352,10 +6775,24 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
         .dispatch(&launch_id, now + 1)
         .expect("dispatch launch");
     // Return the file to schema 16, as an older binary left it, and upgrade.
+    // Drop the v29/v30 activity artifacts first: the v30 events triggers
+    // would otherwise fire during the table rebuilds below while their
+    // native_child_registrations reads no longer resolve (#418).
     store
         .connection
         .execute_batch(
-            "DROP INDEX agents_parent; DROP INDEX agents_root;
+            "DROP TRIGGER native_child_activity_revision;
+             DROP TRIGGER native_child_progress_pruned;
+             DROP INDEX native_children_producer;
+             DROP INDEX turns_native_activity;
+             DROP INDEX events_native_progress_time;
+             DROP INDEX events_git_progress_time;
+             ALTER TABLE agents DROP COLUMN native_child_revision;
+             DELETE FROM schema_migrations WHERE version = 30;
+             ALTER TABLE turns DROP COLUMN outcome;
+             ALTER TABLE turns DROP COLUMN native_status;
+             DELETE FROM schema_migrations WHERE version = 29;
+             DROP INDEX agents_parent; DROP INDEX agents_root;
              ALTER TABLE agents DROP COLUMN parent; ALTER TABLE agents DROP COLUMN root;
              ALTER TABLE agents DROP COLUMN depth; ALTER TABLE agents DROP COLUMN control;
              ALTER TABLE commands DROP COLUMN selector;
@@ -7859,7 +8296,9 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
                  WHERE request_id IS NOT NULL;
              CREATE TABLE events(
                  agent INTEGER, generation INTEGER, family TEXT,
-                 kind TEXT, source TEXT, data TEXT
+                 kind TEXT, source TEXT, data TEXT,
+                 ts INTEGER NOT NULL DEFAULT 0,
+                 native_id TEXT
              );
              CREATE TABLE turns(
                  agent INTEGER NOT NULL REFERENCES agents(id),

@@ -560,6 +560,14 @@ impl State {
             return Ok(());
         }
         match frame {
+            AgyFrame::StreamFault(fault) => {
+                self.lose(&format!(
+                    "Antigravity stream contained an invalid frame ({})",
+                    fault.describe()
+                ))
+                .await;
+                Ok(())
+            }
             AgyFrame::Update(params) => self.update(&params).await,
             // The ordered load boundary: consumed after every history
             // update ahead of it on the wire. Publish the outcome for
@@ -796,10 +804,23 @@ impl State {
             .ok_or_else(|| Error::new("unknown", "Antigravity turn is absent"))?;
         let (command, turn) = (pending.command.clone(), pending.turn.clone());
         let failed = status == "failed";
+        // Canonical outcome decided here at the plugin boundary from the
+        // Antigravity terminal vocabulary (`completed` | `failed` |
+        // `cancelled`). The grouped normal stop reasons (`end_turn`,
+        // `max_tokens`, `max_turn_requests`) all complete normally: ordinary
+        // native termination is success with its native reason, not Goal
+        // fulfilment. The raw `stopReason` is already preserved as
+        // `native_status` next to it.
+        let outcome = match status {
+            "completed" => "success",
+            "failed" => "failure",
+            "cancelled" => "interrupted",
+            _ => "unknown",
+        };
         let text = self.policy.redact_text(&self.text_accum);
         let truncated = self.text_truncated;
         let mut data = json!({"command_id": command, "turn_id": turn,
-            "status": status, "native_status": result.stop_reason});
+            "status": status, "outcome": outcome, "native_status": result.stop_reason});
         self.policy.redact_values(&mut data);
         if !text.is_empty() && !truncated {
             self.commit(
@@ -1076,20 +1097,12 @@ pub(crate) fn spawn(
                         stream_open = false;
                     }
                     let current = *stream.borrow();
-                    let mut state = state.lock().await;
-                    match current {
-                        StreamState::Overflow => {
-                            state.lose("Antigravity native queue overflowed").await;
-                        }
-                        StreamState::Malformed(fault) => {
-                            state
-                                .lose(&format!(
-                                    "Antigravity stream contained an invalid frame ({})",
-                                    fault.label()
-                                ))
-                                .await;
-                        }
-                        _ => {}
+                    // Snapshot the fault before checking the queue. The pump
+                    // publishes its ordered marker before the watch update.
+                    // Fatal/overflow faults have no accepted suffix: drain their
+                    // retained prefix before applying this out-of-band gap.
+                    if frames.is_empty() {
+                        note_stream_fault(&state, current).await;
                     }
                     continue;
                 }
@@ -1107,24 +1120,14 @@ pub(crate) fn spawn(
                 }
                 Next::Frame(None) => break,
                 Next::Frame(Some(frame)) => {
-                    let current = *stream.borrow();
-                    let mut state = state.lock().await;
-                    match current {
-                        StreamState::Overflow => {
-                            state.lose("Antigravity native queue overflowed").await;
-                        }
-                        StreamState::Malformed(fault) => {
-                            state
-                                .lose(&format!(
-                                    "Antigravity stream contained an invalid frame ({})",
-                                    fault.label()
-                                ))
-                                .await;
-                        }
-                        _ => {}
+                    let mut state_guard = state.lock().await;
+                    if let Err(error) = state_guard.observe(frame, &client).await {
+                        state_guard.lose(&error.message).await;
                     }
-                    if let Err(error) = state.observe(frame, &client).await {
-                        state.lose(&error.message).await;
+                    drop(state_guard);
+                    let current = *stream.borrow();
+                    if frames.is_empty() {
+                        note_stream_fault(&state, current).await;
                     }
                 }
             }
@@ -1144,6 +1147,29 @@ pub(crate) fn spawn(
                 .await;
         }
     })
+}
+
+async fn note_stream_fault(state: &Shared, current: StreamState) {
+    match current {
+        StreamState::Overflow => {
+            state
+                .lock()
+                .await
+                .lose("Antigravity native queue overflowed")
+                .await
+        }
+        StreamState::Malformed(fault) => {
+            state
+                .lock()
+                .await
+                .lose(&format!(
+                    "Antigravity stream contained an invalid frame ({})",
+                    fault.describe()
+                ))
+                .await;
+        }
+        _ => {}
+    }
 }
 
 async fn handle_hook_callback(

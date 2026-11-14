@@ -25,8 +25,8 @@ use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
 use eliot_plugin::{
     StderrView,
     native_transport::{
-        NativeChild, NativeLabels, NativeLaunch, NativeWriter, PendingCalls, PendingGuard,
-        PumpAction, PumpMode, encode_frame, spawn_pumped,
+        DEFAULT_MAX_NATIVE_FRAME_BYTES, NativeChild, NativeLabels, NativeLaunch, NativeStreamFault,
+        NativeWriter, PendingCalls, PendingGuard, PumpAction, PumpMode, encode_frame, spawn_pumped,
     },
 };
 use serde::Serialize;
@@ -55,6 +55,8 @@ pub(crate) enum FencedKind {
 /// One ACP stream record for the event task, in wire order.
 #[derive(Debug)]
 pub(crate) enum AgyFrame {
+    /// Ordered record-local fault, behind every retained pre-fault frame.
+    StreamFault(NativeStreamFault),
     /// A `session/update` notification body.
     Update(Value),
     /// The terminal reply of a fenced `session/prompt` call.
@@ -127,6 +129,20 @@ pub(crate) struct AgyProcess {
     stream: watch::Receiver<StreamState>,
 }
 
+/// Inbound ACP methods the server can legitimately send: the
+/// `session/update` notification Eliot consumes (agent-to-client requests
+/// are rejected without answering, so their methods are never recorded).
+/// Oversized-frame diagnosis records only these exact names.
+const OVERSIZED_KNOWN_METHODS: &[&str] = &[
+    "initialize",
+    "session/new",
+    "session/load",
+    "session/prompt",
+    "session/update",
+    "session/cancel",
+    "session/close",
+];
+
 #[derive(Serialize)]
 struct OutboundRequest<'a> {
     jsonrpc: &'static str,
@@ -168,7 +184,10 @@ impl AgyProcess {
             LABELS,
             ID_PREFIX,
             PumpMode::LossyOverflow,
+            DEFAULT_MAX_NATIVE_FRAME_BYTES,
+            OVERSIZED_KNOWN_METHODS,
             move |value| classify_agy_frame(value, &fenced_classify),
+            Some(AgyFrame::StreamFault),
         )
         .await?;
         let client = AgyClient {

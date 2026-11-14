@@ -22,7 +22,7 @@ use eliot_plugin::{
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Map, Value, json};
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsString,
@@ -30,7 +30,10 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
-    sync::{Arc, Mutex, Weak, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -152,6 +155,8 @@ struct HostState {
     progress: watch::Sender<u64>,
     late_batch_causes: Mutex<HashMap<AgentKey, String>>,
     running: Mutex<HashMap<AgentKey, RuntimeEntry>>,
+    startup_gate: AsyncMutex<()>,
+    startup_closed: AtomicBool,
     observers: Mutex<HashMap<AgentKey, Arc<observation::ObserverEntry>>>,
     readers: Mutex<HashMap<String, discovery::Reader>>,
     discovery_closed: AtomicBool,
@@ -272,6 +277,8 @@ impl PluginHost {
                 progress,
                 late_batch_causes: Mutex::new(HashMap::new()),
                 running: Mutex::new(HashMap::new()),
+                startup_gate: AsyncMutex::new(()),
+                startup_closed: AtomicBool::new(false),
                 observers: Mutex::new(HashMap::new()),
                 readers: Mutex::new(HashMap::new()),
                 discovery_closed: AtomicBool::new(false),
@@ -386,6 +393,23 @@ impl PluginHost {
         };
         let target_environment =
             build_target_environment(&self.state.data_root, &agent, &agent_token)?;
+        // Cleanup closes admission, then waits for this gate before snapshotting
+        // running. Cover the first filesystem effect through child ownership
+        // handoff, including the awaits before registration; never hold Store.
+        let startup = self.state.startup_gate.lock().await;
+        if self.state.startup_closed.load(Ordering::SeqCst) {
+            return Err(Error::new(
+                "native_not_dispatched",
+                "controlled startup is closed",
+            ));
+        }
+        // Another startup may have registered while this one waited for the gate.
+        if self.state.running.lock_recover().contains_key(&key) {
+            return Err(Error::new(
+                "bad_state",
+                "an owned plugin already exists for this Agent generation",
+            ));
+        }
         let (instance_dir, credential) = self.create_instance_dir(&key)?;
         let source_credentials = source_secret_snapshot(
             &agent.profile_snapshot,
@@ -543,6 +567,7 @@ impl PluginHost {
             )
             .await;
         });
+        drop(startup);
 
         let result = match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, started_rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
@@ -787,7 +812,21 @@ impl PluginHost {
         self.state.snapshot_turn_calls.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn close_startup_admission(&self) {
+        self.state.startup_closed.store(true, Ordering::SeqCst);
+    }
+
     pub(crate) async fn force_all(&self) {
+        self.close_startup_admission();
+        let entries: Vec<_> = {
+            let _startup = self.state.startup_gate.lock().await;
+            self.state
+                .running
+                .lock_recover()
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.sender.clone()))
+                .collect()
+        };
         if !self.cancel_discoveries().await {
             crate::logging::record(
                 &SecretPolicy::default(),
@@ -797,13 +836,6 @@ impl PluginHost {
             );
         }
         self.cancel_observers().await;
-        let entries: Vec<_> = self
-            .state
-            .running
-            .lock_recover()
-            .iter()
-            .map(|(key, entry)| (key.clone(), entry.sender.clone()))
-            .collect();
         for (key, sender) in entries {
             let (reply, response) = oneshot::channel();
             if sender
@@ -3675,13 +3707,14 @@ mod tests {
     #[test]
     fn controlled_opencode_manifest_requires_request_stream_family() {
         let mut opencode = test_manifest("opencode", "2.0.32");
-        // Without the request family the PR2 plugin contract refuses.
-        assert_eq!(
-            manifest_source_plan(&opencode, "opencode")
-                .unwrap_err()
-                .code,
-            "unsupported"
-        );
+        // Capability validation is generic since #332: only the
+        // message/session/turn families are mandatory, request stays optional.
+        let plan = manifest_source_plan(&opencode, "opencode")
+            .expect("OpenCode manifest without request is supported");
+        assert_eq!(plan.as_object().unwrap().len(), 3);
+        for family in ["message", "session", "turn"] {
+            assert_eq!(plan[family], "stream");
+        }
         opencode
             .sources
             .get_mut("controlled")
@@ -5051,11 +5084,16 @@ mod tests {
         assert_eq!(store.get_agent(&key.id).unwrap().unwrap(), current);
         assert_eq!(store.list_source_states(&key.id, 2).unwrap(), sources);
         assert_eq!(store.get_agent_token(&key.id, 2).unwrap(), token);
+        // Reader unavailability marks only the native sources stale; the
+        // reserved OS process source stays ok and closed after the exit
+        // proof, exactly as the fixture helper records it.
         assert!(
             store
                 .list_source_states(&key.id, 1)
                 .unwrap()
                 .iter()
+                .filter(|source| !["daemon", "os", "git", "workspace_process"]
+                    .contains(&source["source"].as_str().unwrap_or("")))
                 .all(|source| source["health"] == "stale")
         );
         assert!(

@@ -134,6 +134,110 @@ pub(crate) async fn profile_store(
     .native_binding(metadata_secrets)
 }
 
+/// Enumerate the worker-visible native MCP server names for a minimal
+/// policy. A short-lived metadata reader runs initialize, one `config/read`
+/// with the worker's cwd, then closes; it never starts a thread. The
+/// worker's per-server `enabled=false` overrides are computed from these
+/// keys before the long-lived process is born. The reader is pinned to the
+/// frozen native-store binding the same way the worker launch is pinned,
+/// and the pin is verified before the enumeration `config/read` is trusted.
+pub(crate) async fn read_effective_mcp_server_names(
+    launch: &NativeLaunch,
+    binding: &NativeStoreBinding,
+    metadata_secrets: &[String],
+    diagnostic_secrets: &[String],
+    deadline: Instant,
+) -> Result<Vec<String>> {
+    let cwd = launch.cwd.clone();
+    let pinned = pinned_launch_for_binding(launch, binding)?;
+    let (mut probe, drainer) = start_reader(pinned, diagnostic_secrets, deadline).await?;
+    let probe_result: Result<Vec<String>> = async {
+        let client = probe.client();
+        let initialized = initialize_reader(&client, metadata_secrets, deadline).await?;
+        verify_initialized_store(
+            &client,
+            &initialized,
+            binding,
+            &cwd,
+            metadata_secrets,
+            deadline,
+        )
+        .await
+        .map_err(|error| {
+            contextual_error(
+                error,
+                "native_scope_unverified",
+                "Codex MCP server enumeration reader is outside the frozen native store",
+            )
+        })?;
+        let config = client
+            .call(
+                "config/read",
+                json!({"cwd": launch.cwd, "includeLayers": false}),
+                deadline,
+            )
+            .await
+            .map_err(|error| {
+                contextual_error(
+                    error,
+                    "native_readback",
+                    "Codex MCP server enumeration failed before worker spawn",
+                )
+            })?;
+        let names = mcp_server_names(&config)?;
+        reject_secrets(
+            &serde_json::to_value(&names).map_err(|_| invalid_page())?,
+            metadata_secrets,
+        )?;
+        Ok(names)
+    }
+    .await;
+    finish_reader(&mut probe, Some(drainer)).await?;
+    let probe_result = probe_result.map_err(|error| probe.client().diagnostic_error(error));
+    drop(probe);
+    probe_result
+}
+
+/// Project the effective `mcp_servers` table keys. Absent means no
+/// configured servers; anything else must be an object.
+fn mcp_server_names(config_response: &Value) -> Result<Vec<String>> {
+    const MAX_ENUMERATED_SERVERS: usize = 1024;
+    const MAX_ENUMERATED_NAME_BYTES: usize = 256;
+    let config = config_response
+        .get("config")
+        .filter(|config| config.is_object())
+        .ok_or_else(|| {
+            Error::new(
+                "native_readback",
+                "Codex MCP server enumeration failed before worker spawn",
+            )
+        })?;
+    match config.get("mcp_servers") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Object(servers)) => {
+            if servers.len() > MAX_ENUMERATED_SERVERS {
+                return Err(too_large());
+            }
+            let mut names = Vec::with_capacity(servers.len());
+            for name in servers.keys() {
+                check_text(name, MAX_ENUMERATED_NAME_BYTES, true).map_err(|_| {
+                    Error::new(
+                        "native_readback",
+                        "Codex MCP server enumeration failed before worker spawn",
+                    )
+                })?;
+                names.push(name.clone());
+            }
+            names.sort();
+            Ok(names)
+        }
+        Some(_) => Err(Error::new(
+            "native_readback",
+            "Codex MCP server enumeration failed before worker spawn",
+        )),
+    }
+}
+
 pub(crate) fn pinned_launch_for_binding(
     launch: &NativeLaunch,
     binding: &NativeStoreBinding,
@@ -933,9 +1037,10 @@ fn too_large() -> Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        CURSOR_PREFIX, Cursor, NativeLaunch, StoreContext, binding_paths, decode_cursor,
-        fingerprint, native_scope, pinned_launch, pinned_launch_for_binding, request_binding,
-        select_store, sqlite_environment, store_scope, validate_pin, validate_store,
+        CURSOR_PREFIX, Cursor, NativeLaunch, READ_TIMEOUT, StoreContext, binding_paths,
+        decode_cursor, fingerprint, mcp_server_names, native_scope, pinned_launch,
+        pinned_launch_for_binding, read_effective_mcp_server_names, request_binding, select_store,
+        sqlite_environment, store_scope, validate_pin, validate_store,
     };
     use crate::native::types::NativeDiscoveryConfigReadResponse;
     use eliot_core::{NativeStoreBinding, SecretPolicy};
@@ -1034,6 +1139,67 @@ mod tests {
         let mut relative = binding.clone();
         relative.root = "relative-store".to_owned();
         assert!(pinned_launch_for_binding(&launch, &relative).is_err());
+    }
+
+    #[tokio::test]
+    async fn minimal_enumeration_reader_is_pinned_before_any_spawn() {
+        let workspace = Path::new(if cfg!(windows) {
+            r"C:\fixture\workspace"
+        } else {
+            "/fixture/workspace"
+        });
+        let launch = NativeLaunch {
+            program: "codex-not-executed".into(),
+            args: vec![OsString::from("app-server")],
+            cwd: workspace.to_path_buf(),
+            environment: vec![(OsString::from("CODEX_HOME"), OsString::from("owner-home"))],
+        };
+        // A non-absolute frozen binding is rejected at pin time, before any
+        // metadata reader process spawns.
+        let relative: NativeStoreBinding = serde_json::from_value(json!({
+            "home": "relative-home",
+            "root": "relative-root",
+            "native_scope": "fixture-scope",
+        }))
+        .unwrap();
+        let error = read_effective_mcp_server_names(
+            &launch,
+            &relative,
+            &[],
+            &[],
+            tokio::time::Instant::now() + READ_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "native_scope_unverified");
+        // A well-formed absolute binding passes the pin, so the failure moves
+        // past it to spawning the (absent here) reader program.
+        let home = if cfg!(windows) {
+            r"C:\fixture\frozen-home"
+        } else {
+            "/fixture/frozen-home"
+        };
+        let root = if cfg!(windows) {
+            r"C:\fixture\frozen-root"
+        } else {
+            "/fixture/frozen-root"
+        };
+        let binding: NativeStoreBinding = serde_json::from_value(json!({
+            "home": home,
+            "root": root,
+            "native_scope": "fixture-scope",
+        }))
+        .unwrap();
+        let error = read_effective_mcp_server_names(
+            &launch,
+            &binding,
+            &[],
+            &[],
+            tokio::time::Instant::now() + READ_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert_ne!(error.code, "native_scope_unverified");
     }
 
     #[test]
@@ -1245,6 +1411,28 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn mcp_server_names_projects_only_the_table_keys() {
+        assert!(mcp_server_names(&json!({"config": {}})).unwrap().is_empty());
+        assert!(
+            mcp_server_names(&json!({"config": {"mcp_servers": null}}))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            mcp_server_names(&json!({"config": {"mcp_servers": {"b": {}, "a": {}}}})).unwrap(),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+        for response in [
+            json!({}),
+            json!({"config": null}),
+            json!({"config": {"mcp_servers": []}}),
+            json!({"config": {"mcp_servers": {"": {}}}}),
+        ] {
+            assert!(mcp_server_names(&response).is_err());
+        }
     }
 
     #[test]

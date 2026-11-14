@@ -6,7 +6,7 @@ pub const MAX_STDERR_BYTES: usize = 16 * 1024;
 /// Aggregate encoded JSON budget, including source/flags and JSON escaping.
 pub const MAX_STDERR_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq)]
 pub struct StderrSnapshot {
     pub text: String,
     pub truncated: bool,
@@ -74,14 +74,14 @@ impl StderrSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StderrSource {
     Plugin,
     Harness,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StderrDiagnostic {
     pub source: StderrSource,
