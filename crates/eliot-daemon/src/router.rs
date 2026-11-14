@@ -274,6 +274,8 @@ impl Router {
             "command.resolve" => self.command_resolve(&params, &principal).await,
             "agent.get" => self.agent_get(&params, &principal).await,
             "agent.discover" => self.agent_discover(&params, &principal).await,
+            "harness.list" => self.harness_list(&params, &principal).await,
+            "harness.models" => self.harness_models(&params, &principal).await,
             "agent.history" => self.agent_history(&params, &principal).await,
             "agent.list" => self.agent_list(&params, &principal).await,
             "agent.result" => self.agent_result(&params, &principal).await,
@@ -1730,6 +1732,60 @@ impl Router {
             return Ok(true);
         }
 
+        // Ad-hoc Owner launch: freeze a profile-equivalent snapshot from
+        // built-in per-harness defaults plus flags. Agent principals keep
+        // the profile and child_profiles rules; they cannot ad-hoc launch.
+        if request.args.get("harness").is_some() {
+            if !matches!(principal, Principal::Owner) {
+                return Err(Error::new(
+                    "not_allowed",
+                    "ad-hoc launch requires the Owner principal",
+                ));
+            }
+            let harness = request
+                .args
+                .get("harness")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::new("invalid", "launch harness must be a non-empty string"))?
+                .to_owned();
+            let model = request
+                .args
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let effort = request
+                .args
+                .get("effort")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let cmd = crate::adhoc::discover_cmd_for_harness(&harness)?;
+            let mut snapshot =
+                crate::adhoc::adhoc_snapshot(&harness, model.as_deref(), effort.as_deref(), cmd)?;
+            crate::config::capture_native_store_inputs(&mut snapshot, |name| {
+                std::env::var_os(name)
+            })?;
+            let harness = snapshot
+                .get("harness")
+                .and_then(Value::as_str)
+                .filter(|harness| !harness.trim().is_empty())
+                .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
+                .to_owned();
+            let profile_name = crate::adhoc::adhoc_profile_name(&harness);
+            // Keep the requested harness/model/effort beside the frozen
+            // snapshot: same-ID retries bind the exact requested payload
+            // (a changed model is id_conflict), while the frozen snapshot
+            // stays the replay-stable source for dispatch.
+            if let Some(args) = request.args.as_object_mut() {
+                args.insert("profile".to_owned(), Value::String(profile_name));
+            }
+            install_frozen_profile(request, &harness, snapshot, true)?;
+            {
+                let store = self.inner.store.lock().await;
+                hierarchy::check_agent_launch_authority(&store, principal, request)?;
+            }
+            return Ok(false);
+        }
+
         // Agent-principal child launches default to the parent profile and
         // reuse the parent's frozen snapshot verbatim (including the
         // dispatch-derived `native_store_binding` the parent gained at its
@@ -2358,6 +2414,150 @@ impl Router {
         })?;
         serde_json::to_value(page)
             .map_err(|_| Error::new("internal", "discovery page could not be encoded"))
+    }
+
+    /// Read-only harness installation facts: no model turn, no inference.
+    async fn harness_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: eliot_core::api::HarnessListRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let mut harnesses = Vec::new();
+        for harness in crate::adhoc::SUPPORTED_HARNESSES {
+            let entry = crate::adhoc::harness_installation(harness);
+            harnesses.push(eliot_core::api::HarnessEntry {
+                harness: (*harness).to_owned(),
+                installed: entry
+                    .get("installed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                cmd: entry.get("cmd").and_then(Value::as_str).map(str::to_owned),
+                version: entry
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                code: entry.get("code").and_then(Value::as_str).map(str::to_owned),
+                error: entry
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            });
+        }
+        let response = eliot_core::api::HarnessListResponse { harnesses };
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "harness list could not be encoded"))
+    }
+
+    /// Read-only native model catalogue for a harness: no model turn, no
+    /// inference. Codex/Muse/OpenCode use the harness's own read-only
+    /// method through a dedicated metadata reader; Claude reports aliases
+    /// plus the CLI default; Antigravity has no catalogue.
+    async fn harness_models(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: eliot_core::api::HarnessModelsRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let harness = request.harness.trim().to_owned();
+        if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+            return Err(Error::new(
+                "unavailable",
+                "daemon is shutting down and rejects new discovery",
+            ));
+        }
+        let response = match harness.as_str() {
+            "claude" => eliot_core::api::HarnessModelsResponse {
+                harness: harness.clone(),
+                catalogue: "aliases".to_owned(),
+                models: Vec::new(),
+                default: None,
+                note: Some(
+                    "Claude accepts model aliases and the CLI default; no live catalogue exists"
+                        .to_owned(),
+                ),
+            },
+            "antigravity" => eliot_core::api::HarnessModelsResponse {
+                harness: harness.clone(),
+                catalogue: "none".to_owned(),
+                models: Vec::new(),
+                default: None,
+                note: Some(
+                    "Antigravity exposes no model catalogue; a profile must name an explicit model"
+                        .to_owned(),
+                ),
+            },
+            "codex" | "muse" | "opencode" => {
+                let cmd = crate::adhoc::discover_cmd_for_harness(&harness)?;
+                let mut snapshot = crate::adhoc::adhoc_snapshot(&harness, None, None, cmd)?;
+                crate::config::capture_native_store_inputs(&mut snapshot, |name| {
+                    std::env::var_os(name)
+                })?;
+                let raw = self.inner.plugin_host.models(snapshot).await?;
+                let models = raw
+                    .get("models")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut entries = Vec::new();
+                for model in models {
+                    let id = model
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    if id.trim().is_empty() {
+                        continue;
+                    }
+                    entries.push(eliot_core::api::HarnessModelEntry {
+                        id,
+                        default: model
+                            .get("default")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        efforts: model
+                            .get("efforts")
+                            .and_then(|efforts| serde_json::from_value(efforts.clone()).ok()),
+                        default_effort: model
+                            .get("default_effort")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    });
+                }
+                let default = raw
+                    .get("default")
+                    .and_then(Value::as_str)
+                    .filter(|default| !default.trim().is_empty())
+                    .map(str::to_owned);
+                let note = if harness == "muse" {
+                    Some(
+                        "Muse model/list names no default marker; the server default applies at launch"
+                            .to_owned(),
+                    )
+                } else if harness == "opencode" {
+                    Some(
+                        "OpenCode lists providers from native auth; the configured model resolves at launch"
+                            .to_owned(),
+                    )
+                } else {
+                    None
+                };
+                eliot_core::api::HarnessModelsResponse {
+                    harness: harness.clone(),
+                    catalogue: "native".to_owned(),
+                    models: entries,
+                    default,
+                    note,
+                }
+            }
+            _ => {
+                return Err(Error::new(
+                    "unsupported",
+                    format!("unsupported harness {harness}"),
+                ));
+            }
+        };
+        response.validate()?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "harness models could not be encoded"))
     }
 
     async fn agent_history(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -4780,16 +4980,58 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
     // A present profile must be a nonempty string for every caller.
     // Absence is optional only for an Agent principal, whose child
     // reuses the parent's frozen snapshot; every other caller requires it.
-    if let Some(profile) = args.get("profile") {
-        let Some(name) = profile.as_str().filter(|name| !name.trim().is_empty()) else {
+    // Ad-hoc Owner launch names a harness instead of a profile, with
+    // optional model/effort; profile and harness are mutually exclusive.
+    if let Some(harness) = args.get("harness") {
+        let Some(name) = harness.as_str().filter(|name| !name.trim().is_empty()) else {
             return Err(Error::new(
                 "invalid",
-                "launch profile must be a non-empty string",
+                "launch harness must be a non-empty string",
             ));
         };
-        let _ = name;
-    } else if !matches!(principal, Principal::Agent { .. }) {
-        return Err(Error::new("invalid", "launch requires a profile name"));
+        crate::adhoc::validate_adhoc_harness(name)?;
+        if args.get("profile").is_some() {
+            return Err(Error::new(
+                "invalid",
+                "launch profile and harness are mutually exclusive",
+            ));
+        }
+        if args.get("parent").is_some() {
+            return Err(Error::new("invalid", "ad-hoc launch cannot have a parent"));
+        }
+        for field in ["model", "effort"] {
+            if let Some(value) = args.get(field)
+                && value.as_str().is_none_or(|text| text.trim().is_empty())
+            {
+                return Err(Error::new(
+                    "invalid",
+                    format!("launch {field} must be a non-empty string"),
+                ));
+            }
+        }
+    } else {
+        for field in ["model", "effort"] {
+            if args.get(field).is_some() {
+                return Err(Error::new(
+                    "invalid",
+                    format!("launch {field} requires a harness for ad-hoc launch"),
+                ));
+            }
+        }
+        if let Some(profile) = args.get("profile") {
+            let Some(name) = profile.as_str().filter(|name| !name.trim().is_empty()) else {
+                return Err(Error::new(
+                    "invalid",
+                    "launch profile must be a non-empty string",
+                ));
+            };
+            let _ = name;
+        } else if !matches!(principal, Principal::Agent { .. }) {
+            return Err(Error::new(
+                "invalid",
+                "launch requires a profile name or an ad-hoc harness",
+            ));
+        }
     }
     args.insert("workspace".to_owned(), Value::String(workspace.clone()));
     args.insert("project".to_owned(), Value::String(workspace));
@@ -5263,7 +5505,6 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
         .as_object()
         .ok_or_else(|| Error::new("invalid", "launch args must be an object"))?;
     for reserved in [
-        "harness",
         "profile_snapshot",
         "source_plan",
         "target_environment",
@@ -13248,6 +13489,34 @@ mod run_authorization_tests {
         )
         .unwrap();
         assert_eq!(response.results[0].status, "still_running");
+    }
+
+    #[tokio::test]
+    async fn agent_principal_cannot_adhoc_launch() {
+        let router = router();
+        let mut request = SubmitCommand {
+            id: ulid::Ulid::new().to_string().to_ascii_lowercase(),
+            target: None,
+            selector: None,
+            verb: "launch".to_owned(),
+            args: json!({"harness": "codex", "workspace": "/tmp"}),
+            expected_generation: None,
+            expected_turn_id: None,
+            request_id: None,
+            probe: false,
+        };
+        let principal = Principal::Agent {
+            id: "a1".to_owned(),
+            generation: 1,
+        };
+        // The ad-hoc shape itself is valid; the freeze boundary rejects the
+        // Agent principal before any discovery or snapshot work.
+        normalize_launch(&mut request, &principal).expect("ad-hoc shape is valid");
+        let error = router
+            .freeze_launch_profile(&principal, &mut request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
     }
 
     #[tokio::test]

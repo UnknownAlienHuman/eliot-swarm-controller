@@ -258,3 +258,14 @@ substitute another subscription/API route. L7 checks initialize
 ordering, session verification, prompt correlation, interrupt settlement,
 gaps, and actual permissions/model. Common wire/ack/custody behavior
 stays in the plugin spec.
+
+## Ad-hoc launch
+
+`swarm launch --harness antigravity --model M --workspace W "prompt"` is
+Owner-only and freezes a profile-equivalent snapshot from safe defaults
+(`dangerously_skip_permissions = false`, MCP `inherit`) plus flags. A model
+is required (no native default is mapped; omission is `profile_error`).
+`cmd` is the installed app at
+`%LOCALAPPDATA%\Programs\Antigravity\Antigravity.exe`, or `unsupported` when
+the harness needs a different binary. `swarm models --harness antigravity`
+reports no catalogue: name an explicit model.

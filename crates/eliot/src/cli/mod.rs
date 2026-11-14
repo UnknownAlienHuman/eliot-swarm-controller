@@ -29,6 +29,8 @@ pub(crate) async fn dispatch(
         CliCommand::Timer(args) => rules::run_timer(args, data_dir, json_output, id).await,
         CliCommand::Goal(args) => rules::run_goal(args, data_dir, json_output, id).await,
         CliCommand::Discover(args) => agents::run_discover(args, data_dir, json_output).await,
+        CliCommand::Harnesses => agents::run_harnesses(data_dir, json_output).await,
+        CliCommand::Models(args) => agents::run_models(args, data_dir, json_output).await,
         CliCommand::Attach(args) => agents::run_attach(args, data_dir, json_output, id).await,
         CliCommand::Launch(args) => agents::run_launch(args, data_dir, json_output, id).await,
         CliCommand::Send(args) => agents::run_send(args, data_dir, json_output, id).await,
