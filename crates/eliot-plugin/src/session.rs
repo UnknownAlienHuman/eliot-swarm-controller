@@ -290,7 +290,7 @@ pub fn optional_profile_text(
 }
 
 /// Split the exact provider/model profile form at its first slash. OpenCode
-/// v2.0.32 Model.Ref.parse keeps later slashes in the model id; its separate
+/// v2.2.7 Model.Ref.parse keeps later slashes in the model id; its separate
 /// `#variant` syntax is not mapped by the current Eliot profile path.
 pub fn split_provider_model(model: &str) -> Option<(&str, &str)> {
     if model

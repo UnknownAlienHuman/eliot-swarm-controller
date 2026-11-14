@@ -73,6 +73,7 @@ pub(crate) struct Counts {
     pub(crate) commands: u64,
     pub(crate) writes: u64,
     pub(crate) mail: u64,
+    pub(crate) digests: u64,
 }
 
 /// One bounded Muse view-health log record: the cumulative per-agent counters
@@ -234,6 +235,7 @@ fn encode_record(
             "commands": counts.commands,
             "writes": counts.writes,
             "mail": counts.mail,
+            "digests": counts.digests,
         });
     }
     if let Some(error) = error {

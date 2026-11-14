@@ -30,9 +30,9 @@ use crate::native::{
     ClaudeClient, ClaudeFrame,
     types::{
         CanUseToolBody, CommandLifecycle, ControlCancelRequest, HookCallbackBody,
-        HookCallbackResponse, OutboundControlResponse, OutboundControlResponseBody,
+        HookCallbackResponse, InitMcpServer, OutboundControlResponse, OutboundControlResponseBody,
         PermissionResult, ResultRecord, assistant_model, assistant_text, assistant_tool_use_ids,
-        result_session_usage, result_usage,
+        attach_mcp_readback, init_mcp_servers, result_session_usage, result_usage,
     },
 };
 
@@ -567,6 +567,11 @@ struct EventProcessor {
     pending_fault_gap: Option<String>,
     final_text: Option<String>,
     final_text_unavailable: bool,
+    /// Proven MCP surface from the owned stream's `system`/`init` record
+    /// (names plus statuses). Retained on observation and attached to the
+    /// next turn terminal so the reducer merges it into the effective set;
+    /// absent until the first post-input init arrives.
+    init_mcp_servers: Option<Vec<InitMcpServer>>,
     closed: bool,
     native: Option<ClaudeClient>,
     status_tx: watch::Sender<EventStatus>,
@@ -1062,6 +1067,7 @@ impl EventProcessor {
             pending_fault_gap: None,
             final_text: None,
             final_text_unavailable: false,
+            init_mcp_servers: None,
             closed: false,
             native: None,
             status_tx,
@@ -1445,6 +1451,7 @@ impl EventProcessor {
                     "Claude system record did not belong to the owned session",
                 ));
             }
+            self.retain_init_mcp_servers(record);
             return Ok(());
         }
         if self.status.ready {
@@ -1455,7 +1462,36 @@ impl EventProcessor {
             ));
         }
         self.status.session_id = Some(session_id.to_owned());
+        self.retain_init_mcp_servers(record);
         Ok(())
+    }
+
+    /// Retain the proven MCP surface from the owned session's
+    /// `system`/`init` record. Only an observed inventory is kept (with
+    /// secrets redacted); anything unprovable leaves the retained set
+    /// untouched so the effective servers stay unknown, never guessed.
+    fn retain_init_mcp_servers(&mut self, record: &Value) {
+        if record.get("subtype").and_then(Value::as_str) != Some("init") {
+            return;
+        }
+        let Some(servers) = init_mcp_servers(record) else {
+            return;
+        };
+        let policy = SecretPolicy::new(self.secrets.iter().cloned());
+        let redacted = servers
+            .into_iter()
+            .map(|server| InitMcpServer {
+                name: policy.redact_text(&server.name),
+                status: policy.redact_text(&server.status),
+            })
+            .collect::<Vec<_>>();
+        if redacted
+            .iter()
+            .any(|server| server.name.trim().is_empty() || server.status.trim().is_empty())
+        {
+            return;
+        }
+        self.init_mcp_servers = Some(redacted);
     }
 
     async fn observe_lifecycle(&mut self, record: &Value) -> Result<()> {
@@ -2885,6 +2921,11 @@ impl EventProcessor {
         if let Some(usage) = result_usage(record) {
             data["usage"] = serde_json::to_value(&usage).unwrap_or(Value::Null);
         }
+        // Proven MCP surface from the owned stream's `system`/`init`
+        // record: attached once observed, so the first terminal after init
+        // carries the readback into the effective set. Unobserved stays
+        // unattached and the effective set stays unknown.
+        attach_mcp_readback(&mut data, self.init_mcp_servers.as_deref());
         // Optional cumulative session cost from `total_cost_usd`, held for the
         // session fact that commits after the accepted terminal. Absent or
         // unusable cost simply commits no session fact.
