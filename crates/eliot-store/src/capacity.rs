@@ -15,7 +15,12 @@ pub struct RetainedGeneration {
     /// The generation started after this Store had a custody namespace, so
     /// its custody was created under the name derived from it.
     pub named_custody: bool,
+    /// Custody-relevant records only: processes not yet proven exited plus
+    /// the plugin leader, which carries the generation's boot identity.
     pub processes: Vec<RecordedProcess>,
+    /// More custody-relevant records existed than one bounded readback holds,
+    /// so closure cannot be proven from them and the reservation stays.
+    pub processes_truncated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,7 +88,8 @@ impl Store {
             .connection
             .prepare(
                 "SELECT host_boot_id, pid, start_time, role, state = 'exited' FROM processes
-                 WHERE owner = ?1 ORDER BY host_boot_id, pid, start_time LIMIT ?2",
+                 WHERE owner = ?1 AND (state != 'exited' OR role = 'plugin')
+                 ORDER BY host_boot_id, pid, start_time LIMIT ?2",
             )
             .map_err(sql_error)?;
         let mut retained = Vec::with_capacity(agents.len());
@@ -93,7 +99,7 @@ impl Store {
                 .map_err(sql_error)?;
             let agent = format_agent_id(agent_num);
             let owner = format!("agent:{agent}#{generation}");
-            let rows = processes
+            let mut rows = processes
                 .query_map(params![owner, MAX_PAGE_ENTRIES as i64 + 1], |row| {
                     Ok(RecordedProcess {
                         identity: ProcessIdentity {
@@ -108,17 +114,17 @@ impl Store {
                 .map_err(sql_error)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(sql_error)?;
-            if rows.len() > MAX_PAGE_ENTRIES {
-                return Err(Error::new(
-                    "frame_too_large",
-                    "retained generation process readback exceeds its bound",
-                ));
-            }
+            // Exited children (every compiler a worker ran) are already proven
+            // gone and are not read. An overflow of the remaining records keeps
+            // this one generation retained instead of failing daemon startup.
+            let processes_truncated = rows.len() > MAX_PAGE_ENTRIES;
+            rows.truncate(MAX_PAGE_ENTRIES);
             retained.push(RetainedGeneration {
                 agent,
                 generation,
                 named_custody,
                 processes: rows,
+                processes_truncated,
             });
         }
         Ok(retained)

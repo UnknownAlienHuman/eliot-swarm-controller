@@ -378,6 +378,11 @@ pub fn restart_custody(
     namespace: &str,
     generation: &eliot_store::RetainedGeneration,
 ) -> Result<RestartCustody> {
+    if generation.processes_truncated {
+        return Ok(RestartCustody::Retained {
+            missing: "process_readback_truncated",
+        });
+    }
     #[cfg(windows)]
     {
         if !generation.named_custody {
@@ -657,6 +662,7 @@ mod restart_custody_tests {
             generation: 3,
             named_custody: true,
             processes: vec![recorded(child.child.id().expect("live plugin pid"))],
+            processes_truncated: false,
         };
         assert_eq!(
             restart_custody(&namespace, &generation).expect("probe live custody"),
@@ -735,6 +741,7 @@ mod restart_custody_tests {
             generation: 3,
             named_custody: true,
             processes: vec![leader.clone()],
+            processes_truncated: false,
         };
         assert_eq!(
             restart_custody("unused", &generation).expect("probe live group"),

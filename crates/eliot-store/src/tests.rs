@@ -6600,6 +6600,82 @@ fn unknown_start_capacity_survives_recovery_and_store_reopen() {
 }
 
 #[test]
+fn restart_readback_skips_exited_children_and_bounds_live_records() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let launch = capacity_launch_request(
+        "restart-heavy",
+        "restart-heavy",
+        json!([{"scope": "profile:restart-heavy", "max_live": null}]),
+    );
+    let launch_id = launch.id.clone();
+    let agent = store
+        .submit("owner", launch, now)
+        .expect("admit launch")
+        .command
+        .target
+        .expect("launch Agent");
+    store
+        .dispatch(&launch_id, now + 1)
+        .expect("dispatch launch");
+    store
+        .settle(
+            &launch_id,
+            CommandState::Unknown,
+            Some(json!({"reason":"start_readback_unknown"})),
+            now + 2,
+        )
+        .expect("retain uncertain native start");
+    store.recover_on_restart(now + 3).expect("recover");
+    let owner = format!("agent:{agent}#1");
+    let insert = |store: &Store, pid: i64, role: &str, state: &str| {
+        store
+            .connection
+            .execute(
+                "INSERT INTO processes(host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at)
+                 VALUES ('boot-a', ?1, 1, ?2, ?3, ?4, ?5, 1)",
+                rusqlite::params![
+                    pid,
+                    owner,
+                    role,
+                    state,
+                    (state == "exited").then_some(0)
+                ],
+            )
+            .expect("record process");
+    };
+    // A worker that ran compilers leaves far more exited children than one
+    // page; none of them is custody evidence and startup must not fail.
+    insert(&store, 1, "plugin", "exited");
+    for pid in 2..=(crate::MAX_PAGE_ENTRIES as i64 + 600) {
+        insert(&store, pid, "child", "exited");
+    }
+    insert(&store, 9_000_000, "child", "running");
+    let retained = store
+        .restart_retained_generations(None)
+        .expect("read retained generations");
+    assert_eq!(retained.len(), 1);
+    assert!(!retained[0].processes_truncated);
+    let roles: Vec<_> = retained[0]
+        .processes
+        .iter()
+        .map(|process| (process.role.as_str(), process.exited))
+        .collect();
+    assert_eq!(roles, [("plugin", true), ("child", false)]);
+
+    // An overflow of records that still need a liveness check keeps only this
+    // generation retained, without failing the readback.
+    for pid in 10_000_000..(10_000_000 + crate::MAX_PAGE_ENTRIES as i64) {
+        insert(&store, pid, "child", "running");
+    }
+    let retained = store
+        .restart_retained_generations(None)
+        .expect("bounded readback never fails startup");
+    assert!(retained[0].processes_truncated);
+    assert_eq!(retained[0].processes.len(), crate::MAX_PAGE_ENTRIES);
+}
+
+#[test]
 fn verified_restart_closure_releases_only_the_retained_lost_generation() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
