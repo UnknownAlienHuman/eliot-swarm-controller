@@ -16,6 +16,7 @@ use eliot_plugin::{
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Duration;
 use tokio::{
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
@@ -35,11 +36,11 @@ use crate::native::{
     types::{
         NativeApprovalDecideResult, NativeApprovalResolvedNotification,
         NativeApprovalUpdatedNotification, NativeHistoryNoneReason, NativeItem,
-        NativeItemCompletedNotification, NativeItemStartedNotification,
-        NativeSessionClosedNotification, NativeSessionStartedNotification,
-        NativeSessionViewHealthChangedNotification, NativeTurnCompletedNotification,
-        NativeTurnError, NativeTurnStartedNotification, NativeTurnTerminal,
-        NativeUserInputAnswerResult, NativeUserInputCancelResult,
+        NativeItemCompletedNotification, NativeItemReadOutputParams, NativeItemReadOutputResult,
+        NativeItemStartedNotification, NativePatchRef, NativeSessionClosedNotification,
+        NativeSessionStartedNotification, NativeSessionViewHealthChangedNotification,
+        NativeTurnCompletedNotification, NativeTurnError, NativeTurnStartedNotification,
+        NativeTurnTerminal, NativeUserInputAnswerResult, NativeUserInputCancelResult,
         NativeUserInputSettledNotification, NativeViewHealth, NativeViewSubscribeParams,
         NativeViewSubscribeResult, NativeWorkflowChild, NativeWorkflowItemNotification,
     },
@@ -60,6 +61,16 @@ const APPLIED_VIEW_HISTORY: usize = 512;
 /// Bound on persisted native file-change hints per completion, mirroring the
 /// Codex adapter's bound exactly.
 const MAX_CHANGED_PATHS: usize = 1_000;
+/// Stored bytes fetched by the single `item/readOutput` patch read. The page
+/// carries only patch headers downstream, so 128 KiB covers a large
+/// multi-file patch while keeping the transient (never persisted) read small;
+/// anything past the first page stays covered by `changed_paths_truncated`.
+const PATCH_READ_BYTES: i64 = 128 * 1024;
+/// Deadline for that one read. The event actor processes the next item only
+/// after this read resolves, so the bound is tighter than the control-plane
+/// RPC timeout; expiry keeps today's empty-paths coverage gap instead of
+/// stalling the loop behind a hung host.
+const PATCH_READ_DEADLINE: Duration = Duration::from_secs(10);
 
 struct ViewRecovery {
     head: Option<String>,
@@ -2337,11 +2348,12 @@ impl EventProcessor {
     /// completed-file-change payload (`tool` `fileChange`, verbatim
     /// `status`, bounded `changed_paths`/`changed_paths_truncated`) that
     /// native file-change hint attribution accepts, mirroring exactly what
-    /// the Codex adapter emits for its `fileChange` items. Only the inline
-    /// target path is attached: multi-file patch bodies stay behind
-    /// `patchRef` (fetched via `item/readOutput`, which this adapter never
-    /// calls), so an edit with no inline path commits empty `changed_paths`
-    /// with the truncation flag set.
+    /// the Codex adapter emits for its `fileChange` items. The inline
+    /// target path attaches when present; otherwise one bounded
+    /// `item/readOutput` fetch resolves the stored `patchRef` and only the
+    /// file paths from the patch headers attach. An unresolvable reference
+    /// (absent, unservable, failed or timed-out read) keeps today's
+    /// behavior: empty `changed_paths` with the truncation flag set.
     async fn complete_tool(&mut self, item: &NativeItem) -> Result<()> {
         let Some(tool) = tool_label(item) else {
             if tool_item_kind(&item.kind) {
@@ -2386,7 +2398,11 @@ impl EventProcessor {
                 .len();
             let mut changed_paths = Vec::new();
             let mut truncated = false;
-            'paths: for path in edit_hint_paths(item) {
+            let admit_hint = |path: String,
+                              changed_paths: &mut Vec<String>,
+                              metadata_bytes: &mut usize,
+                              truncated: &mut bool|
+             -> Result<bool> {
                 let path_bytes = serde_json::to_vec(&path)
                     .map_err(|_| {
                         Error::new("internal", "Muse fileChange path could not be encoded")
@@ -2397,15 +2413,41 @@ impl EventProcessor {
                     || changed_paths.len() >= MAX_CHANGED_PATHS
                     || metadata_bytes.saturating_add(path_bytes) > MAX_EVENT_BYTES
                 {
-                    truncated = true;
+                    *truncated = true;
+                    return Ok(false);
+                }
+                *metadata_bytes += path_bytes;
+                changed_paths.push(path);
+                Ok(true)
+            };
+            'paths: for path in edit_hint_paths(item) {
+                if !admit_hint(
+                    path,
+                    &mut changed_paths,
+                    &mut metadata_bytes,
+                    &mut truncated,
+                )? {
                     break 'paths;
                 }
-                metadata_bytes += path_bytes;
-                changed_paths.push(path);
             }
             if changed_paths.is_empty() {
-                // No inline target: the diff, if any, lives behind `patchRef`
-                // and was not resolved here, so downstream coverage is
+                // No inline target: resolve the stored patch reference once,
+                // bounded by the single first-page fetch. Only header paths
+                // attach; the patch body itself is never persisted.
+                for path in self.read_patch_hint_paths(item).await {
+                    if !admit_hint(
+                        path,
+                        &mut changed_paths,
+                        &mut metadata_bytes,
+                        &mut truncated,
+                    )? {
+                        break;
+                    }
+                }
+            }
+            if changed_paths.is_empty() {
+                // No inline target and no resolvable patch: the diff, if
+                // any, stays behind `patchRef`, so downstream coverage is
                 // incomplete by construction.
                 truncated = true;
             }
@@ -2424,6 +2466,34 @@ impl EventProcessor {
             "tool.completed",
         )?;
         self.commit_event("tool.completed", native_id, data).await
+    }
+
+    /// One bounded `item/readOutput` fetch of the stored patch for a
+    /// completed edit-family item with no inline target. The transport
+    /// client is cloned up front and the read runs before any commit, so it
+    /// holds no actor or Store lock; the tighter read deadline (not the
+    /// control-plane timeout) bounds how long the sequential loop waits
+    /// before serving other items. Any failure or timeout returns no paths
+    /// and the caller keeps today's empty-paths coverage gap.
+    async fn read_patch_hint_paths(&self, item: &NativeItem) -> Vec<String> {
+        let Some(patch_ref) = item.patch_ref.as_ref() else {
+            return Vec::new();
+        };
+        if patch_ref.id.trim().is_empty() {
+            return Vec::new();
+        }
+        if patch_ref
+            .availability
+            .as_deref()
+            .is_some_and(|availability| availability != "available")
+        {
+            return Vec::new();
+        }
+        let Some(session_id) = self.status.session_id.clone() else {
+            return Vec::new();
+        };
+        let client = self.native.clone();
+        fetch_patch_page_paths(&client, &session_id, &item.item_id, patch_ref).await
     }
 
     /// The exact Eliot turn/command a tool item binds to, or `None` for a
@@ -3940,7 +4010,7 @@ fn completed_file_change(item: &NativeItem) -> bool {
 /// strings are returned, at most one bound over the adapter limit; `args`
 /// itself, file contents, diffs and results are never persisted. An absent,
 /// undecodable or almost-JSON `args` yields no paths here: the diff, if any,
-/// lives behind `patchRef` and stays unresolved.
+/// lives behind `patchRef`, which the caller resolves with one bounded read.
 fn edit_hint_paths(item: &NativeItem) -> Vec<String> {
     let Some(args) = item.args.as_deref() else {
         return Vec::new();
@@ -3972,6 +4042,141 @@ fn edit_hint_paths(item: &NativeItem) -> Vec<String> {
         paths.truncate(MAX_CHANGED_PATHS + 1);
     }
     paths
+}
+
+/// Single bounded page fetch behind a stored patch reference: `offset 0`,
+/// `length PATCH_READ_BYTES`, decoded per the served `encoding`. Only file
+/// paths from the patch headers return; the page body is dropped here and
+/// never persisted. Any transport, decode or shape failure returns no paths
+/// so the caller keeps today's empty-paths coverage gap.
+async fn fetch_patch_page_paths(
+    client: &NativeClient,
+    session_id: &str,
+    item_id: &str,
+    patch_ref: &NativePatchRef,
+) -> Vec<String> {
+    let Ok(params) = serde_json::to_value(NativeItemReadOutputParams {
+        session_id: session_id.to_owned(),
+        item_id: item_id.to_owned(),
+        output_ref: patch_ref.id.clone(),
+        offset_bytes: 0,
+        length_bytes: PATCH_READ_BYTES,
+    }) else {
+        return Vec::new();
+    };
+    let page = match client
+        .call(
+            "item/readOutput",
+            params,
+            Instant::now() + PATCH_READ_DEADLINE,
+        )
+        .await
+    {
+        Ok(page) => page,
+        Err(_) => return Vec::new(),
+    };
+    let Ok(page) = serde_json::from_value::<NativeItemReadOutputResult>(page) else {
+        return Vec::new();
+    };
+    patch_page_paths(&page)
+}
+
+/// File paths from one stored patch page. Only the `utf8` text encoding is
+/// consumed (the `tool_patch` media type is `application/json` text); any
+/// other encoding keeps today's gap. Paths come only from patch headers —
+/// never from bodies, contents or args — in the verbatim
+/// relative-or-absolute form the Store hint normalizer accepts (it drops
+/// paths outside the workspace, same as for inline hints).
+fn patch_page_paths(page: &NativeItemReadOutputResult) -> Vec<String> {
+    if page.encoding != "utf8" {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for text in patch_candidate_texts(&page.content) {
+        for line in text.lines() {
+            if paths.len() > MAX_CHANGED_PATHS {
+                return paths;
+            }
+            if let Some(path) = patch_header_path(line)
+                && seen.insert(path.clone())
+            {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+/// Candidate patch texts inside one stored page body. The `tool_patch`
+/// document is `application/json`: a bare patch string, or an object/array
+/// whose string leaves carry the patch text. Every string leaf scans — no
+/// field name is assumed — and a non-JSON body scans as raw patch text.
+fn patch_candidate_texts(body: &str) -> Vec<String> {
+    let Ok(document) = serde_json::from_str::<Value>(body) else {
+        return vec![body.to_owned()];
+    };
+    let mut texts = Vec::new();
+    collect_patch_texts(&document, &mut texts);
+    if texts.is_empty() {
+        vec![body.to_owned()]
+    } else {
+        texts
+    }
+}
+
+/// Every string leaf of a stored patch document, in document order.
+fn collect_patch_texts(document: &Value, texts: &mut Vec<String>) {
+    match document {
+        Value::String(text) => texts.push(text.clone()),
+        Value::Array(items) => {
+            for item in items {
+                collect_patch_texts(item, texts);
+            }
+        }
+        Value::Object(fields) => {
+            for (_, value) in fields {
+                collect_patch_texts(value, texts);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One patch header line to its file path. The installed host's `apply_patch`
+/// patch-text vocabulary (observed read-only in
+/// `muse-bin-1.4.0-R4161.1.exe`) marks files as `*** Add File: <path>`,
+/// `*** Update File: <path>` or `*** Delete File: <path>`, and unified-diff
+/// patch text marks them as `--- <path>` / `+++ <path>` with an optional
+/// `a/`/`b/` tree prefix. Hunk bodies and every other line never contribute:
+/// `/dev/null` sides and blank targets are skipped.
+fn patch_header_path(line: &str) -> Option<String> {
+    for marker in ["*** Add File:", "*** Update File:", "*** Delete File:"] {
+        if let Some(path) = line.strip_prefix(marker) {
+            let path = path.trim();
+            if path.is_empty() {
+                return None;
+            }
+            return Some(path.to_owned());
+        }
+    }
+    for marker in ["--- ", "+++ "] {
+        if let Some(rest) = line.strip_prefix(marker) {
+            let rest = rest.trim();
+            if rest.is_empty() || rest == "/dev/null" {
+                return None;
+            }
+            let path = rest
+                .strip_prefix("a/")
+                .or_else(|| rest.strip_prefix("b/"))
+                .unwrap_or(rest);
+            if path.is_empty() || path == "/dev/null" {
+                return None;
+            }
+            return Some(path.to_owned());
+        }
+    }
+    None
 }
 
 /// Terminal item revisions commit tool facts. The schema folds terminal as
@@ -4166,6 +4371,7 @@ mod tests {
             text: None,
             tool: Some("shell".to_owned()),
             args: None,
+            patch_ref: None,
             turn_id: Some("turn-1".to_owned()),
         };
         assert_eq!(tool_label(&call), Some("shell".to_owned()));
@@ -4196,6 +4402,7 @@ mod tests {
             text: None,
             tool: Some(tool.to_owned()),
             args: args.map(str::to_owned),
+            patch_ref: None,
             turn_id: Some("turn-1".to_owned()),
         }
     }
@@ -4261,6 +4468,201 @@ mod tests {
         assert!(edit_hint_paths(&blank).is_empty());
     }
 
+    fn patch_page(content: &str, encoding: &str) -> NativeItemReadOutputResult {
+        NativeItemReadOutputResult {
+            byte_len: content.len() as i64,
+            content: content.to_owned(),
+            encoding: encoding.to_owned(),
+            eof: true,
+            media_type: Some("application/json".to_owned()),
+            offset_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn patch_ref_decodes_id_and_servability_only() {
+        // Stable schema shape (`patchRef` on the `toolCall` item, fetched
+        // with `patchRef.id`): only the durable id and the servability flag
+        // are modelled, never the patch body.
+        let item: NativeItem = serde_json::from_value(json!({
+            "itemId": "item-patch",
+            "kind": "toolCall",
+            "revision": 3,
+            "status": "completed",
+            "turnId": "turn-1",
+            "tool": "apply_patch",
+            "args": "{\"patch\":\"*** Begin Patch ***\"}",
+            "patchRef": {"id": "patch-1", "availability": "available", "kind": "tool_patch", "uri": "msp:patch/patch-1", "byteLen": 42},
+            "patchSummary": {"files": 2, "added": 10, "removed": 3},
+        }))
+        .expect("toolCall with patchRef decodes");
+        let patch_ref = item.patch_ref.expect("patchRef is modelled");
+        assert_eq!(patch_ref.id, "patch-1");
+        assert_eq!(patch_ref.availability.as_deref(), Some("available"));
+        let unservable: NativeItem = serde_json::from_value(json!({
+            "itemId": "item-missing",
+            "kind": "toolCall",
+            "revision": 3,
+            "status": "completed",
+            "turnId": "turn-1",
+            "tool": "apply_patch",
+            "patchRef": {"id": "patch-2", "availability": "missing", "kind": "tool_patch", "uri": "msp:patch/patch-2"},
+        }))
+        .expect("unservable patchRef decodes");
+        assert_eq!(
+            unservable.patch_ref.expect("ref").availability.as_deref(),
+            Some("missing")
+        );
+    }
+
+    #[test]
+    fn read_output_params_use_the_schema_field_names() {
+        // `muse schema generate-json-schema` (stable, 1.4.0-R4161.1):
+        // `item/readOutput` takes the stored output's durable id (never the
+        // `uri`) plus the stored-byte range.
+        let params = NativeItemReadOutputParams {
+            session_id: "session-1".to_owned(),
+            item_id: "item-patch".to_owned(),
+            output_ref: "patch-1".to_owned(),
+            offset_bytes: 0,
+            length_bytes: PATCH_READ_BYTES,
+        };
+        assert_eq!(
+            serde_json::to_value(params).expect("params encode"),
+            json!({
+                "sessionId": "session-1",
+                "itemId": "item-patch",
+                "outputRef": "patch-1",
+                "offsetBytes": 0,
+                "lengthBytes": PATCH_READ_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn patch_headers_resolve_only_header_paths() {
+        // Synthetic `***`-format multi-file patch page: headers resolve,
+        // hunk bodies (with their secrets) never surface.
+        let page = patch_page(
+            "*** Begin Patch\n*** Update File: crates/a.rs\n@@ -1 +1 @@\n-old\n+new SECRET_MUST_NOT_PERSIST\n*** Add File: crates/b.rs\n@@ -0,0 +1 @@\n+created\n*** Delete File: crates/old.rs\n*** End Patch\n",
+            "utf8",
+        );
+        let resolved = patch_page_paths(&page);
+        assert_eq!(
+            resolved,
+            vec![
+                "crates/a.rs".to_owned(),
+                "crates/b.rs".to_owned(),
+                "crates/old.rs".to_owned()
+            ]
+        );
+        assert!(
+            !resolved
+                .iter()
+                .any(|path| path.contains("SECRET_MUST_NOT_PERSIST"))
+        );
+        // Non-text encodings keep today's gap: no paths, no decode attempt.
+        assert!(patch_page_paths(&patch_page("*** Update File: crates/a.rs", "base64")).is_empty());
+        assert!(patch_page_paths(&patch_page("*** Update File: crates/a.rs", "future")).is_empty());
+    }
+
+    #[test]
+    fn patch_headers_cover_diff_and_json_wrappers() {
+        // Unified-diff patch text: `a/`/`b/` prefixes strip, `/dev/null`
+        // sides are skipped.
+        let diff = patch_page(
+            "--- a/crates/a.rs\n+++ b/crates/a.rs\n@@ -1 +1 @@\n-old\n+new\n--- /dev/null\n+++ b/crates/new.rs\n@@ -0,0 +1 @@\n+created\n--- a/crates/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-removed\n",
+            "utf8",
+        );
+        assert_eq!(
+            patch_page_paths(&diff),
+            vec![
+                "crates/a.rs".to_owned(),
+                "crates/new.rs".to_owned(),
+                "crates/gone.rs".to_owned()
+            ]
+        );
+        // Bare JSON string body carrying the same patch text.
+        let wrapped = patch_page(
+            &serde_json::to_string("*** Update File: crates/a.rs\n@@ -1 +1 @@\n-old\n+new\n")
+                .expect("wrap patch"),
+            "utf8",
+        );
+        assert_eq!(patch_page_paths(&wrapped), vec!["crates/a.rs".to_owned()]);
+        // JSON document: every string leaf scans without assuming field
+        // names, while non-path strings and bodies contribute no paths.
+        let document = patch_page(
+            r#"{"patch":"*** Update File: crates/a.rs\n*** End Patch","summary":"2 files","meta":{"count":2,"flag":true,"empty":null}}"#,
+            "utf8",
+        );
+        assert_eq!(patch_page_paths(&document), vec!["crates/a.rs".to_owned()]);
+        // A JSON document with no strings resolves nothing rather than
+        // scanning the raw body.
+        assert!(patch_page_paths(&patch_page(r#"{"count":2}"#, "utf8")).is_empty());
+        // Raw non-JSON text still scans as patch text.
+        assert_eq!(
+            patch_page_paths(&patch_page("*** Update File: crates/a.rs", "utf8")),
+            vec!["crates/a.rs".to_owned()]
+        );
+    }
+
+    #[test]
+    fn patch_header_lines_reject_bodies_and_blanks() {
+        for line in [
+            "*** Update File: ",
+            "*** Update File:",
+            "*** Add File:   ",
+            "--- ",
+            "+++ ",
+            "--- /dev/null",
+            "+++ /dev/null",
+            "--- a/",
+            "*** Begin Patch",
+            "*** End Patch",
+            "@@ -1 +1 @@",
+            " old context",
+            "-removed",
+            "+added",
+            "crates/a.rs",
+            "",
+            "   ",
+        ] {
+            assert_eq!(patch_header_path(line), None, "line={line:?}");
+        }
+        assert_eq!(
+            patch_header_path("*** Update File: crates/a.rs"),
+            Some("crates/a.rs".to_owned())
+        );
+        assert_eq!(patch_header_path("***   Update File: crates/a.rs"), None);
+        assert_eq!(
+            patch_header_path("--- a/crates/a.rs"),
+            Some("crates/a.rs".to_owned())
+        );
+        assert_eq!(
+            patch_header_path("+++ b/crates/a.rs"),
+            Some("crates/a.rs".to_owned())
+        );
+        assert_eq!(
+            patch_header_path("--- crates/a.rs"),
+            Some("crates/a.rs".to_owned())
+        );
+    }
+
+    #[test]
+    fn patch_paths_dedupe_and_stay_bounded() {
+        let mut body = String::new();
+        for index in 0..(MAX_CHANGED_PATHS + 50) {
+            body.push_str(&format!("*** Update File: crates/f{index}.rs\n"));
+        }
+        body.push_str("*** Update File: crates/f0.rs\n");
+        let paths = patch_page_paths(&patch_page(&body, "utf8"));
+        assert_eq!(paths.len(), MAX_CHANGED_PATHS + 1);
+        let mut seen = std::collections::HashSet::new();
+        for path in &paths {
+            assert!(seen.insert(path.clone()), "duplicate {path}");
+        }
+    }
+
     #[test]
     fn tool_facts_commit_on_any_non_in_progress_status() {
         assert!(!is_terminal_item_status("inProgress"));
@@ -4280,9 +4682,10 @@ mod tests {
     fn tool_items_decode_the_schema_field_names() {
         // `muse schema generate-json-schema` (stable, 1.4.0-R4161.1): the
         // `toolCall` tool name and verbatim argument JSON, `userShell`
-        // command execution and the common identity fields. Other per-kind
-        // payloads (`commandText`, `patchRef`, `visibleOutput`, ...) stay
-        // unparsed and must not break decoding.
+        // command execution, the common identity fields and the `toolCall`
+        // stored-patch reference (id plus servability, never the body).
+        // Other per-kind payloads (`commandText`, `patchSummary`,
+        // `visibleOutput`, ...) stay unparsed and must not break decoding.
         let call: NativeItem = serde_json::from_value(json!({
             "itemId": "item-1",
             "kind": "toolCall",
