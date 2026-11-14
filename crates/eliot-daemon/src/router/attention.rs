@@ -31,6 +31,7 @@ const REPORT_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_SOURCE_FACTS: usize = 32;
 const MAX_PENDING_KINDS: usize = 16;
 const MAX_PROCESS_FACTS: usize = 16;
+const MAX_STARTUP_LOSSES: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum IncidentKind {
@@ -238,6 +239,14 @@ pub(crate) async fn run_attention(
         suspicion_window,
         &mut tasks,
     );
+    // Reconcile bounded retained loss evidence through the existing
+    // `AgentLost` handling. Recovery publishes losses before attention
+    // subscribes, and a crash between the recovery commit and this consumer
+    // leaves no live event at all; the retained `lost` rows plus their
+    // latest `agent.lost` sequence are the bounded evidence. One pass only,
+    // deduplicated per incident by the existing reservation map: not every
+    // historical lost row becomes a new incident engine.
+    queue_startup_losses(&router, &state).await;
 
     loop {
         tokio::select! {
@@ -442,6 +451,38 @@ fn request_full_reconcile(state: &Arc<Mutex<AttentionState>>) {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .reconcile_all = true;
+}
+
+/// Queue one bounded pass of retained startup losses as `AgentLost`
+/// triggers. Each entry flows through `inspect_lost_agent` (or the child
+/// cohort path when the lost manager still has unfinished children), so
+/// reporting stays deduplicated per incident by the reservation map and no
+/// second incident engine is introduced. A lost Agent whose evidence went
+/// stale before commit is classified and dropped there, never mailed.
+async fn queue_startup_losses(router: &Router, state: &Arc<Mutex<AttentionState>>) {
+    let losses = {
+        let store = router.inner.store.lock().await;
+        store.startup_lost_agents(MAX_STARTUP_LOSSES)
+    };
+    let losses = match losses {
+        Ok(losses) => losses,
+        Err(error) => {
+            crate::logging::record(
+                &eliot_core::SecretPolicy::default(),
+                "daemon.attention_startup_losses_failed",
+                &[],
+                Some(&error),
+            );
+            return;
+        }
+    };
+    for (agent, generation, event_seq) in losses {
+        queue_check(
+            state,
+            AgentKey { agent, generation },
+            Trigger::AgentLost { event_seq },
+        );
+    }
 }
 
 fn reserve_pending_checks(
@@ -1184,7 +1225,20 @@ async fn report_cleared_incidents(
                 current.recovery_delivery.get_or_insert(delivery).clone()
             }
         };
-        persist_and_notify(router, &delivery).await?;
+        if let Err(error) = persist_and_notify(router, &delivery).await {
+            if matches!(error.code.as_str(), "stale_generation" | "not_found") {
+                let mut state_guard = state.lock().unwrap_or_else(|error| error.into_inner());
+                if state_guard
+                    .active
+                    .get(&key)
+                    .is_some_and(|current| current.incident_id == incident.incident_id)
+                {
+                    state_guard.active.remove(&key);
+                }
+                continue;
+            }
+            return Err(error);
+        }
         let mut state_guard = state.lock().unwrap_or_else(|error| error.into_inner());
         if state_guard.active.get(&key).is_some_and(|current| {
             current.incident_id == incident.incident_id
@@ -1426,7 +1480,27 @@ async fn deliver_active_incident(
         return Ok(false);
     };
     if let Some(delivery) = delivery {
-        persist_and_notify(router, &delivery).await?;
+        // Stale evidence (Agent gone or generation moved between capture
+        // and commit) is classified, not retried: drop the frozen delivery
+        // so an unchanged superseded incident cannot produce further wakes.
+        if let Err(error) = persist_and_notify(router, &delivery).await {
+            if matches!(error.code.as_str(), "stale_generation" | "not_found") {
+                let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+                if state
+                    .active
+                    .get(key)
+                    .is_some_and(|incident| incident.incident_id == incident_id)
+                {
+                    state.active.remove(key);
+                }
+                state.pending_checks.remove(&AgentKey {
+                    agent: key.agent.clone(),
+                    generation: key.generation,
+                });
+                return Ok(true);
+            }
+            return Err(error);
+        }
         let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(incident) = state.active.get_mut(key)
             && incident.incident_id == incident_id
@@ -2212,16 +2286,40 @@ async fn wait_for_applied(router: &Router, command_id: &str) -> Result<()> {
                 let store = router.inner.store.lock().await;
                 store.get_command(command_id)?
             };
-            match command.map(|command| command.state) {
+            match command.as_ref().map(|command| command.state) {
                 Some(CommandState::Applied) => return Ok(()),
-                Some(CommandState::Rejected | CommandState::Failed | CommandState::Cancelled) => {
-                    return Err(Error::new("unknown", "attention event did not commit"));
-                }
-                Some(CommandState::Unknown) => {
-                    return Err(Error::new(
-                        "unknown",
-                        "attention event commit outcome is unknown",
-                    ));
+                Some(
+                    CommandState::Rejected
+                    | CommandState::Failed
+                    | CommandState::Cancelled
+                    | CommandState::Unknown,
+                ) => {
+                    // Preserve a classified commit failure (notably
+                    // `stale_generation` from the trusted attention commit)
+                    // so callers can drop superseded evidence instead of
+                    // retrying it.
+                    let code = command
+                        .as_ref()
+                        .and_then(|command| command.outcome.as_ref())
+                        .and_then(|outcome| outcome.get("code"))
+                        .and_then(Value::as_str)
+                        .filter(|code| {
+                            matches!(
+                                *code,
+                                "stale_generation" | "not_found" | "invalid" | "bad_state"
+                            )
+                        })
+                        .unwrap_or("unknown");
+                    if command
+                        .as_ref()
+                        .is_some_and(|command| command.state == CommandState::Unknown)
+                    {
+                        return Err(Error::new(
+                            code,
+                            "attention event commit outcome is unknown",
+                        ));
+                    }
+                    return Err(Error::new(code, "attention event did not commit"));
                 }
                 _ => {}
             }
@@ -2246,16 +2344,30 @@ async fn send_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
         "Eliot attention {phase_label} for Agent {} generation {}. Incident {}. {diagnosis} See the structured x.user.agent.attention event for details.",
         report.agent_id, report.generation, report.incident_id,
     );
-    let thread = Some(format!(
+    let escalation_thread = Some(format!(
         "attention-{}",
         &report.incident_id[..20.min(report.incident_id.len())]
     ));
+    // The subject's own copy is advisory: durable in its inbox for voluntary
+    // reads and acknowledgement, but never wakes it (the Store excludes the
+    // `-advisory` thread from mail wake claims and reoffer pages). A
+    // `children_unattended` report is addressed to the manager itself, so its
+    // subject copy is the actionable escalation and keeps the waking thread.
+    // At most one incident and one recovery notice are ever sent per
+    // incident, so an unchanged unread set cannot produce further wakes.
+    let affected_thread = if report.reason == "children_unattended" {
+        escalation_thread.clone()
+    } else {
+        escalation_thread
+            .as_deref()
+            .map(|thread| format!("{thread}-advisory"))
+    };
     let affected = MailSendRequest {
         id: delivery.affected_mail_id.clone(),
         to: vec![report.agent_id.clone()],
         mode: MailMode::Queue,
         text: text.clone(),
-        thread: thread.clone(),
+        thread: affected_thread,
         reply_to_delivery: None,
     };
     let mut delivery_errors = Vec::with_capacity(2);
@@ -2278,7 +2390,7 @@ async fn send_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
             to: vec![parent.clone()],
             mode: MailMode::Queue,
             text,
-            thread,
+            thread: escalation_thread,
             reply_to_delivery: None,
         };
         match serde_json::to_value(supervisor) {

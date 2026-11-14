@@ -546,11 +546,13 @@ impl Store {
     }
 
     /// Page recipient ids due a normal mail notice: current `idle`,
-    /// non-observer, generation >= 1 agents holding unread mail whose
+    /// non-observer, generation >= 1 agents holding waking unread mail whose
     /// `mail_notices` row is absent or past the normal notice cooldown.
-    /// Read-only candidate scan: the caller must still `notice_claim` each
-    /// recipient, which stays authoritative for open commands, holds and
-    /// races. Open notice commands are deliberately not consulted here.
+    /// Advisory attention mail never pages here; it stays inbox-durable
+    /// without a wake. Read-only candidate scan: the caller must still
+    /// `notice_claim` each recipient, which stays authoritative for open
+    /// commands, holds and races. Open notice commands are deliberately
+    /// not consulted here.
     pub fn due_mail_notice_recipients(
         &self,
         after: Option<&str>,
@@ -573,6 +575,7 @@ impl Store {
                    AND EXISTS (
                            SELECT 1 FROM messages m
                            WHERE m.recipient = a.id AND m.read_at IS NULL
+                             AND COALESCE(m.thread, '') NOT LIKE 'attention-%-advisory'
                        )
                  ORDER BY a.id LIMIT ?4",
             )
@@ -1403,8 +1406,11 @@ impl Store {
 }
 
 /// Resolve the pending proof inside the claim transaction: mail counts
-/// its unread rows, claims arrive with their overlap count. `None`
-/// suppresses the notice without recording anything.
+/// its waking unread rows, claims arrive with their overlap count. `None`
+/// suppresses the notice without recording anything. Advisory attention
+/// mail (thread `attention-*-advisory`) stays durable in the inbox for
+/// voluntary reads and acknowledgement but never proves a wake: it is
+/// excluded here so an unread advisory set alone cannot claim a notice.
 fn notice_pending_count_tx(
     tx: &Transaction<'_>,
     pending: NoticePending,
@@ -1414,7 +1420,8 @@ fn notice_pending_count_tx(
         NoticePending::Mail => {
             let unread: i64 = tx
                 .query_row(
-                    "SELECT COUNT(*) FROM messages WHERE recipient = ?1 AND read_at IS NULL",
+                    "SELECT COUNT(*) FROM messages WHERE recipient = ?1 AND read_at IS NULL
+                     AND COALESCE(thread, '') NOT LIKE 'attention-%-advisory'",
                     params![num],
                     |row| row.get(0),
                 )
@@ -3192,6 +3199,93 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn advisory_attention_mail_never_wakes_but_stays_durable() {
+        let mut store = store();
+        let now = now_ms();
+        let launch_id = Ulid::new().to_string();
+        let admission = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: launch_id.clone(),
+                    target: None,
+                    selector: None,
+                    verb: "launch".to_owned(),
+                    args: json!({"project":"app", "workspace":"synthetic-workspace", "harness":"codex", "profile":"test", "profile_snapshot":{}}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .expect("admit launch");
+        let a = admission.command.target.expect("launch target");
+        store.dispatch(&launch_id, now).expect("dispatch launch");
+        let plan = ["session", "turn", "message"]
+            .into_iter()
+            .map(|family| (family.to_owned(), "stream".to_owned()))
+            .collect();
+        store
+            .install_plugin_sources(&a, 1, &launch_id, &plan, now)
+            .expect("install plugin sources");
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: Ulid::new().to_string(),
+                    agent_id: a.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ready".to_owned(),
+                        native_id: Ulid::new().to_string(),
+                        data: json!({"command_id":launch_id}),
+                    }],
+                    cursor: None,
+                },
+                now,
+            )
+            .expect("commit session ready");
+        store
+            .settle(&launch_id, CommandState::Applied, None, now)
+            .expect("settle launch");
+        // An advisory attention copy is durable inbox mail ...
+        let mut advisory = send_request(vec![a.clone()], "attention report");
+        advisory.thread = Some("attention-abcdef0123456789-advisory".to_owned());
+        store
+            .mail_send("owner", &advisory, MailLimits::default(), now)
+            .expect("queue advisory mail");
+        assert_eq!(unread(&store, &a), 1);
+        // ... but proves no wake on its own, neither by claim ...
+        assert_eq!(
+            store
+                .notice_claim(&a, &Ulid::new().to_string(), NoticePending::Mail, now)
+                .unwrap(),
+            None
+        );
+        // ... nor by the reoffer page.
+        assert!(
+            store
+                .due_mail_notice_recipients(None, 100, now)
+                .unwrap()
+                .iter()
+                .all(|recipient| recipient != &a)
+        );
+        // A waking escalation copy still wakes exactly for its own content.
+        let mut escalation = send_request(vec![a.clone()], "attention escalation");
+        escalation.thread = Some("attention-abcdef0123456789".to_owned());
+        store
+            .mail_send("owner", &escalation, MailLimits::default(), now + 1)
+            .expect("queue escalation mail");
+        let claim = store
+            .notice_claim(&a, &Ulid::new().to_string(), NoticePending::Mail, now + 1)
+            .expect("claim")
+            .expect("escalation wakes");
+        assert_eq!(claim.count, 1, "only the waking copy proves the wake");
     }
 
     #[test]

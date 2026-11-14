@@ -785,6 +785,48 @@ impl Store {
         Ok(agents)
     }
 
+    /// Bounded retained loss evidence for attention startup: currently-`lost`
+    /// Agents with their latest `agent.lost` sequence, most recently updated
+    /// first. One pass only; historical lost rows beyond the bound are not
+    /// promoted to incidents. Callers deduplicate through the existing
+    /// `AgentLost` handling per incident.
+    pub fn startup_lost_agents(&self, limit: usize) -> Result<Vec<(String, i64, i64)>> {
+        validate_limit(limit)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, generation FROM agents
+                 WHERE observe_only = 0 AND state = 'lost'
+                 ORDER BY updated_at DESC LIMIT ?1",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![limit as i64], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(sql_error)?;
+        let mut agents = Vec::new();
+        for row in rows {
+            agents.push(row.map_err(sql_error)?);
+        }
+        let mut losses = Vec::with_capacity(agents.len());
+        for (num, generation) in agents {
+            let seq: Option<i64> = self
+                .connection
+                .query_row(
+                    "SELECT seq FROM events
+                     WHERE kind = 'agent.lost' AND agent = ?1 AND generation = ?2
+                     ORDER BY seq DESC LIMIT 1",
+                    params![num, generation],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            losses.push((format_agent_id(num), generation, seq.unwrap_or(0)));
+        }
+        Ok(losses)
+    }
+
     /// Return live Agent projections independently of historical-row volume.
     pub fn list_nonterminal_agents(&self, limit: usize) -> Result<Vec<Agent>> {
         validate_limit(limit)?;

@@ -762,7 +762,11 @@ impl Router {
         self.redact_native_value(&mut data);
         let committed = {
             let mut store = self.inner.store.lock().await;
-            let result = store.commit_user_event_applied(id, &kind, data, now_ms());
+            let result = if kind == "x.user.agent.attention" {
+                store.commit_attention_event_applied(id, &kind, data, now_ms())
+            } else {
+                store.commit_user_event_applied(id, &kind, data, now_ms())
+            };
             if let Ok(change) = &result
                 && !change.events.is_empty()
             {

@@ -517,12 +517,27 @@ and a progressing manager with healthy progressing children, open no child incid
 An open turn with a lost/gapped source remains unfinished; silence is never completion.
 
 These reports capture complete unfinished/lost/stalled counts and at most sixteen
-child activity samples, with explicit truncation. Reports go only to the manager's
+child activity samples, with explicit truncation. Each report is committed as a
+typed `x.user.agent.attention` event whose top-level Agent/generation binding and
+event-time subject snapshot are captured from the current generation in the same
+Store transaction as its Applied settlement; stale evidence (unknown Agent or
+generation drift) is rejected and never mailed. The wire shape stays compatible:
+kind `x.user.agent.attention` with the report at `event.data.data`. A valid
+explicit `on.event` rule can target the incident through that binding without
+weakening stale-generation checks. Child-cohort reports go only to the manager's
 existing queued mail path (which wakes an eligible idle recipient), plus the Owner
-notice even when the manager itself has a parent. A stopped manager receives queued
-mail but is not automatically resumed. No child is addressed, controlled or stopped;
-no native snapshot or model call is needed for this decision. CPU and Git are not
-progress. Sweeps include idle/stopped managers with current native registrations;
+notice even when the manager itself has a parent. Source/no-progress reports mail
+an advisory copy to the affected subject on a non-waking thread (durable in its
+inbox for voluntary reads and acknowledgement, never a wake) and an actionable
+escalation to the nearest controlled ancestor (the parent mail path, which wakes)
+plus the Owner notice; a subject with no parent gets the Owner notice instead.
+A stopped manager receives queued mail but is not automatically resumed. No child
+is addressed, controlled or stopped; no native snapshot or model call is needed
+for this decision. CPU and Git are not progress. At most one incident and one
+recovery notice are ever sent per incident, so an unchanged unread set cannot
+generate further wakes. Binding an advisory attention event never starts a Goal
+or reoffers mail; automatic idle/Goal/mail nudges ignore the attention kind.
+Sweeps include idle/stopped managers with current native registrations;
 the candidate lookup checks registration existence without traversing child turns.
 Descendant capture visits at most `NATIVE_CHILD_ATTENTION_PAGE_SIZE` registrations
 per Store lock, including finished/no-facts rows; the registration cursor advances
@@ -582,6 +597,12 @@ and ULID mutation IDs until event and notice delivery settle, so retries reuse
 the same facts and command bindings. Inbox/owner notices carry a short bounded
 diagnosis and link to the structured report. Attention does not call a model,
 replay work, or restart a harness.
+At startup attention reconciles one bounded pass of retained loss evidence
+(currently-`lost` Agents with their latest `agent.lost` sequence, most recent
+first, at most 32) through the existing `AgentLost` handling, deduplicated per
+incident; historical lost rows beyond the bound do not become new incidents.
+This covers losses published before attention subscribed as well as a crash
+between the recovery commit and consumer startup.
 
 ## Restart reconciliation
 
