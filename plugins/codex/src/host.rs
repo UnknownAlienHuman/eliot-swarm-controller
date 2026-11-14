@@ -1,8 +1,8 @@
 use crate::{
     events::{self, EventConfig, EventHandle, TurnFacts},
     mcp::{
-        McpReadback, compute_disables, merge_status_page, parse_status_page, policy_from_profile,
-        require_minimal_own_server,
+        MINIMAL_PROMPT_OVERRIDES, McpReadback, compute_disables, compute_plugin_disables,
+        merge_status_page, parse_status_page, policy_from_profile, require_minimal_own_server,
     },
     native::{
         NativeClient, NativeLaunch, NativeProcess,
@@ -845,35 +845,46 @@ impl CodexPlugin {
             .to_string()
             .to_ascii_lowercase();
         let mcp_server_name = format!("eliot_swarm_{start_command}");
-        // Minimal policy: enumerate the worker-visible native servers with a
-        // short-lived metadata reader, then suppress every non-allowed one
-        // with its own `enabled=false` override. Inherit keeps the current
-        // additive behavior with no extra process.
-        let mcp_disables = if mcp_policy == McpPolicy::Minimal {
+        // Minimal policy: enumerate the worker-visible native servers and
+        // plugins with a short-lived metadata reader, then suppress every
+        // non-allowed one with its own `enabled=false` override, and pin the
+        // prompt-surface flags (instruction/environment text, subagent
+        // delegation, contextual features, web search off). Inherit keeps
+        // the current additive behavior with no extra process.
+        let (mcp_disables, plugin_disables, prompt_overrides): (
+            Vec<String>,
+            Vec<String>,
+            &[(&str, &str)],
+        ) = if mcp_policy == McpPolicy::Minimal {
             let probe = NativeLaunch {
                 program: program.clone(),
                 args: route.args()?,
                 cwd: workspace.clone(),
                 environment: environment.clone(),
             };
-            let enumerated = crate::discovery::read_effective_mcp_server_names(
-                &probe,
-                &frozen_store,
-                &metadata_secrets,
-                &secrets,
-                Instant::now() + RPC_TIMEOUT,
-            )
-            .await
-            .map_err(|error| {
-                pre_dispatch_read_error(
-                    error,
-                    "profile_error",
-                    "Codex minimal MCP server enumeration failed before worker spawn",
+            let (enumerated_mcp, enumerated_plugins) =
+                crate::discovery::read_effective_config_tables(
+                    &probe,
+                    &frozen_store,
+                    &metadata_secrets,
+                    &secrets,
+                    Instant::now() + RPC_TIMEOUT,
                 )
-            })?;
-            compute_disables(&enumerated, &mcp_allow, &mcp_server_name)?
+                .await
+                .map_err(|error| {
+                    pre_dispatch_read_error(
+                        error,
+                        "profile_error",
+                        "Codex minimal MCP server enumeration failed before worker spawn",
+                    )
+                })?;
+            (
+                compute_disables(&enumerated_mcp, &mcp_allow, &mcp_server_name)?,
+                compute_plugin_disables(&enumerated_plugins, &mcp_allow)?,
+                MINIMAL_PROMPT_OVERRIDES,
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new(), &[] as &[(&str, &str)])
         };
         let launch = NativeLaunch {
             program,
@@ -883,6 +894,8 @@ impl CodexPlugin {
                 &data_dir,
                 &mcp_cwd,
                 &mcp_disables,
+                &plugin_disables,
+                prompt_overrides,
             )?,
             cwd: workspace.clone(),
             environment,

@@ -123,12 +123,20 @@ plus the explicitly allowed servers:
 
 - Before spawn, a short-lived metadata reader (initialize, one `config/read`
   with the worker cwd, close; no thread) enumerates the worker-visible
-  `mcp_servers` keys. The reader is pinned to the frozen native-store
-  binding the same way the worker launch is pinned, and the pin is verified
-  before the enumeration is trusted. Every enumerated server outside the
-  allow list gets its own `-c mcp_servers.<name>.enabled=false` override; a
-  name no `-c` path can address (Codex splits override paths on literal dots
-  before decoding) fails the start closed instead of silently inheriting.
+  `mcp_servers` keys and the worker-visible `plugins` keys. The reader is
+  pinned to the frozen native-store binding the same way the worker launch
+  is pinned, and the pin is verified before the enumeration is trusted.
+  Every enumerated server outside the allow list gets its own
+  `-c mcp_servers.<name>.enabled=false` override, and every enumerated
+  plugin gets its own `-c plugins.<name>.enabled=false` override (plugin
+  ids allow `@`, e.g. `browser@openai-bundled`); a name no `-c` path can
+  address (Codex splits override paths on literal dots before decoding)
+  fails the start closed instead of silently inheriting. The worker also
+  pins the prompt-surface flags (`include_apps/collaboration_mode/
+  environment[_time]/permissions_instructions=false`, `agents.enabled=false`,
+  `features.{memories,multi_agent,mentions_v2,remote_plugin,tool_suggest}
+  =false`, `web_search="disabled"`); `project_doc_max_bytes` is untouched so
+  the workspace's own AGENTS.md stays wanted context.
 - After `thread/start` (or `thread/resume`) and before any input, the
   installed `mcpServerStatus/list` inventory is read back scoped to the
   owned thread (`threadId`; names only, secret-checked) and reported as
@@ -136,11 +144,21 @@ plus the explicitly allowed servers:
   required: the installed 0.167.1 schema reports per-thread runtime state,
   and without a loaded thread every entry's status is unavailable, so a
   pre-thread read cannot prove the isolated surface. `minimal` fails closed
-  when the visible surface cannot be verified, shows an enabled non-allowed
-  server, or omits the Agent-scoped server (an empty inventory or a
-  disabled own entry proves nothing); the empty thread is retained like
-  any stopped Agent's thread and never receives input. `inherit` performs
-  no inventory readback and reports `null` / unverified.
+  when the visible surface cannot be verified, shows a serving unexpected
+  server (`connected`, or a missing/null status), shows an unexpected server
+  from the enumerated config surface in any non-disabled state, or omits
+  the Agent-scoped server (an empty inventory or a disabled own entry proves
+  nothing); the empty thread is retained like any stopped Agent's thread
+  and never receives input. `inherit` performs no inventory readback and
+  reports `null` / unverified. The only tolerance is for the four Codex
+  built-in runtime servers with no config-table lever (`codex_app`,
+  `codex_apps`, `cua_repl`, `daybreak-local`) while they are non-serving
+  (`starting`, `authenticationRequired`, `failed`; `disabled` entries are
+  absent everywhere): they are reported honestly in `effective.mcp_servers`
+  but do not fail the start. Any other unexpected server in any
+  non-disabled state fails closed — including a newly added owner server
+  that is still starting — as does any unexpected server that is serving
+  (`connected`, or a missing/null status).
 
 Requested vs observed: `requested` carries `mcp_policy` and `mcp_allow`;
 `effective` carries `mcp_policy`, `mcp_servers` (native-readback names, or
@@ -160,6 +178,53 @@ that server (probe showed `enabled: false`), and `mcpServerStatus/list`
 exists in the app-server protocol (v2 schema: `{data: [{name,
 runtimeStatus, ...}], nextCursor}`). The owner's global config is never
 edited and `auth.json` is never copied.
+
+### Minimal-context measurement (2026-11-14)
+
+Same trivial prompt (`Reply with exactly 42 and nothing else.`), model
+`gpt-6.1-sol`, effort `low`, per-turn `input_tokens` from the
+`thread/tokenUsage/updated` readback (turn expenditure = latest `total`
+minus the turn-start baseline; single-response turns report `last == total`).
+Single samples; prompt caching varied between runs (`input_tokens` counts
+cached tokens too) and the owner surface below is one machine's, so treat
+deltas as indicative, not budgets.
+
+Owner surface at the time: 106 effective config keys, 6 `mcp_servers`
+(`node_repl`, `github_oauth`, `cloudflare-api`, `eliot-research-remote`,
+`eliot_swarm`, `eliot-search`), 17 enabled `plugins`, 18 installed ChatGPT
+account apps (17 enabled), `features.multi_agent/memories` on, all
+`include_*` instruction flags on, `project_doc_max_bytes = 32768`.
+
+| Variant | `input_tokens` | Δ vs baseline |
+| --- | --- | --- |
+| (a) `inherit` via Swarm daemon | 27,050 | — baseline |
+| (a′) same prompt, raw app-server (no Eliot tool) | 26,971 | −79 (Eliot's own `swarm` tool schema) |
+| 6 MCP servers disabled only | 26,840 | −131 |
+| 17 plugins disabled only | 25,151 | −1,820 |
+| Prompt-surface flags only (5× `include_*=false`, `web_search="disabled"`) | 24,150 | −2,821 |
+| Agent/feature flags only (`agents.enabled=false`, 5× `features.*=false`) | 20,808 | −6,163 |
+| (c) all of the above combined (35 `-c` overrides) | 15,386 | −11,585 (−43%) |
+| (b) `minimal` via Swarm daemon after this change | 15,464 | −11,586 (matches (c) plus the Eliot tool) |
+
+Before this change, `minimal` could not start on this surface at all: the
+thread inventory always shows the `codex_apps` account-connector aggregator
+(568 tools, perpetually `starting`) plus the plugin-contributed `cua_repl`
+(`connected`), so verification failed closed with `plugin_outcome_unknown`
+(`profile_error`: unexpected enabled server). Asking the model for its
+`adobe.*` tools returns NONE with and without the strip, so `codex_apps`
+contributes zero model-side tokens; the remaining ~15.4k is the irreducible
+floor on this build (base prompt plus native tools). The runtime inventory
+also explains the 2.2 MB readback that sized the 8 MiB frame cap: disabled
+servers report `tools: 0`, while every listed server embeds its full tool
+catalogs, dominated by the phantom `codex_apps` entry.
+
+Live proof after this change, same private daemon (debug build of this
+branch): trivial prompt under `minimal` returns `42` with 15,464 input
+tokens and `effective.mcp_servers = ["codex_apps", "eliot_swarm_<own>"]`,
+`mcp_servers_verified = true`; a real small coding task under `minimal`
+(`Create hello.txt containing exactly hello without a newline`,
+workspace-write) succeeds with the Agent-scoped `eliot_swarm` server present
+and verified, producing exactly `hello` with no newline.
 
 Native frame budget: the inbound NDJSON frame cap for the Codex host is 8 MiB
 (`CodexStdioConfig::MAX_FRAME_BYTES`; every other adapter except Muse keeps

@@ -13,6 +13,20 @@
 //! server explicitly, then verifies the visible surface with the installed
 //! `mcpServerStatus/list` app-server method (v2 schema: `{data:
 //! [{name, runtimeStatus, ...}], nextCursor}`).
+//!
+//! Live-measured 2026-11-14 on the same build (trivial "reply 42" turn,
+//! `gpt-6.1-sol`, effort `low`): the inherited surface costs ~27.0k input
+//! tokens, and only ~0.1k of that is the six owner MCP servers. The rest is
+//! prompt-surface text (~9.0k from instruction/environment/agent/feature
+//! flags), plugin skills (~1.8k from 17 enabled owner plugins, including the
+//! `cua_repl` runtime server they contribute), and the ~15.4k irreducible
+//! floor (base prompt plus native tools). Minimal therefore also disables
+//! every enumerated `plugins` key and pins the prompt-surface flags below;
+//! the runtime `codex_apps` aggregator (568 account-connector tools,
+//! perpetually `starting`) never reaches the model (the model answers NONE
+//! when asked for its tools, with and without the strip) but still appears
+//! in the inventory, so verification tolerates the known non-serving
+//! built-ins below while failing closed on anything serving.
 
 use eliot_core::{Error, McpPolicy, Result};
 use serde_json::Value;
@@ -32,6 +46,19 @@ pub(super) fn is_addressable_override_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+/// An enumerated owner plugin name is addressable under the same rule plus
+/// `@`: plugin ids have the shape `name@marketplace` (verified 2026-11-14:
+/// all 17 owner keys, e.g. `browser@openai-bundled`, accept
+/// `-c plugins.<name>.enabled=false`). `@` contains no dot, so it cannot
+/// disturb neighbouring keys.
+pub(super) fn is_addressable_plugin_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= eliot_core::MAX_MCP_SERVER_NAME_LEN
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'@'
+        })
 }
 
 /// Names the worker must suppress: enumerated effective servers minus the
@@ -61,6 +88,87 @@ pub(super) fn compute_disables(
     }
     disables.sort();
     Ok(disables)
+}
+
+/// Plugin names the worker must suppress: every enumerated effective plugin
+/// minus the shared allow list. Sorted for deterministic argv. A non-allowed
+/// plugin name that cannot be addressed fails closed, the same way an
+/// unaddressable MCP server does. Verified 2026-11-14: the 17 owner-configured
+/// plugin keys (all without dots, e.g. `browser@openai-bundled`) each accept
+/// `-c plugins.<name>.enabled=false` (effective-config readback shows the
+/// `sessionFlags` origin), and disabling them removes the plugin-contributed
+/// runtime servers (`cua_repl`, `codex_app`) from the thread inventory.
+pub(super) fn compute_plugin_disables(
+    enumerated: &[String],
+    allow: &[String],
+) -> Result<Vec<String>> {
+    let allowed: HashSet<&str> = allow.iter().map(String::as_str).collect();
+    let mut disables: Vec<String> = Vec::new();
+    for name in enumerated {
+        if allowed.contains(name.as_str()) {
+            continue;
+        }
+        if !is_addressable_plugin_name(name) {
+            return Err(Error::new(
+                "profile_error",
+                "Codex minimal MCP cannot suppress a native plugin whose name is not a plain override segment",
+            ));
+        }
+        if !disables.iter().any(|kept| kept == name) {
+            disables.push(name.clone());
+        }
+    }
+    disables.sort();
+    Ok(disables)
+}
+
+/// Prompt-surface flags pinned for every minimal worker, as `(key, TOML
+/// value)` pairs encoded into per-run `-c` overrides (owner config
+/// untouched). Each key is a plain override path (Codex splits on literal
+/// dots, so only `features.*`/`agents.*` nest one level) and each value is a
+/// fixed TOML literal. Verified one by one 2026-11-14 against installed Codex
+/// 0.167.1 (`config/read` shows every value with the `sessionFlags` origin;
+/// a trivial turn still succeeds with all of them set):
+/// instruction/environment text off, subagent delegation off, contextual
+/// features off, web search off. `project_doc_max_bytes` is deliberately
+/// absent: the workspace's own AGENTS.md stays wanted context.
+pub(super) const MINIMAL_PROMPT_OVERRIDES: &[(&str, &str)] = &[
+    ("include_apps_instructions", "false"),
+    ("include_collaboration_mode_instructions", "false"),
+    ("include_environment_context", "false"),
+    ("include_environment_context_time", "false"),
+    ("include_permissions_instructions", "false"),
+    ("agents.enabled", "false"),
+    ("features.memories", "false"),
+    ("features.multi_agent", "false"),
+    ("features.mentions_v2", "false"),
+    ("features.remote_plugin", "false"),
+    ("features.tool_suggest", "false"),
+    ("web_search", "\"disabled\""),
+];
+
+/// Codex built-in runtime servers with no config-table lever. They appear in
+/// the thread-scoped `mcpServerStatus/list` inventory without any
+/// `mcp_servers` or `plugins` config entry (verified 2026-11-14), so no `-c`
+/// override can address them (`mcp_servers.codex_apps.enabled=false` is
+/// rejected at startup with `invalid transport`, and per-app
+/// `apps.<id>.enabled=false` lands but does not unload the aggregator).
+/// `codex_apps` (the ChatGPT-account connector aggregator, 568 tools) sits
+/// perpetually at `starting` and its tools never reach the model (the model
+/// answers NONE when asked for them, with and without the strip), so a
+/// non-serving built-in must not fail the minimal start closed. Anything
+/// actually serving (`connected`, or a missing/null status) still fails.
+pub(super) const RUNTIME_ONLY_TOLERATED_WHEN_NOT_SERVING: &[&str] =
+    &["codex_app", "codex_apps", "cua_repl", "daybreak-local"];
+
+/// Whether a non-disabled unexpected inventory entry keeps the minimal start
+/// acceptable. Serving entries never do; non-serving entries do only for the
+/// known built-ins above, which have no config lever. Every other
+/// non-disabled unexpected entry (including a newly added owner server that
+/// is still starting) fails closed.
+pub(super) fn is_tolerated_non_serving(name: &str, runtime_status: Option<&str>) -> bool {
+    !matches!(runtime_status, Some("connected") | None)
+        && RUNTIME_ONLY_TOLERATED_WHEN_NOT_SERVING.contains(&name)
 }
 
 /// Read the frozen worker MCP policy back. Legacy snapshots without `mcp`
@@ -162,6 +270,12 @@ pub(super) fn parse_status_page(
             }
         } else if runtime_status == Some("disabled") {
             continue;
+        } else if is_tolerated_non_serving(name, runtime_status) {
+            // A known Codex built-in without a config lever that is not
+            // serving tools (e.g. the perpetually `starting` `codex_apps`
+            // aggregator, whose tools never reach the model). Reported
+            // honestly in the effective set, but does not fail the start.
+            effective.push(name.to_owned());
         } else {
             acceptable = false;
             effective.push(name.to_owned());
@@ -254,6 +368,93 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn plugin_disables_cover_everything_outside_allow() {
+        let disables = compute_plugin_disables(
+            &[
+                "browser@openai-bundled".to_owned(),
+                "allowed-plugin".to_owned(),
+                "browser@openai-bundled".to_owned(),
+            ],
+            &["allowed-plugin".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(disables, vec!["browser@openai-bundled".to_owned()]);
+        // Dotted plugin names cannot be addressed and fail closed.
+        assert!(compute_plugin_disables(&["owner.search".to_owned()], &[]).is_err());
+    }
+
+    #[test]
+    fn prompt_overrides_stay_plain_override_paths() {
+        for &(key, value) in MINIMAL_PROMPT_OVERRIDES {
+            assert!(
+                !key.is_empty() && key.len() <= 128,
+                "prompt override key is not bounded: {key:?}"
+            );
+            assert!(
+                key.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'_'),
+                "prompt override key is not a plain path: {key:?}"
+            );
+            assert!(!value.is_empty(), "override {key:?} has no value");
+            assert!(
+                key != "project_doc_max_bytes",
+                "project instructions stay wanted context"
+            );
+        }
+        assert!(MINIMAL_PROMPT_OVERRIDES.len() >= 12);
+    }
+
+    #[test]
+    fn status_page_tolerates_only_non_serving_known_builtins() {
+        // The perpetually `starting` `codex_apps` aggregator is reported
+        // but acceptable; the same entry `connected` fails closed.
+        let page = parse_status_page(
+            &json!({"data": [
+                {"name": "eliot_swarm_x", "runtimeStatus": "connected"},
+                {"name": "codex_apps", "runtimeStatus": "starting"},
+                {"name": "suppressed", "runtimeStatus": "disabled"},
+            ]}),
+            &[],
+            "eliot_swarm_x",
+        )
+        .unwrap();
+        assert!(page.acceptable);
+        assert_eq!(
+            page.effective,
+            vec!["eliot_swarm_x".to_owned(), "codex_apps".to_owned()]
+        );
+
+        for (name, status) in [
+            ("codex_apps", "connected"),
+            ("owner-new-server", "starting"),
+            ("owner-new-server", "authenticationRequired"),
+            ("cua_repl", "connected"),
+        ] {
+            let page = parse_status_page(
+                &json!({"data": [
+                    {"name": "eliot_swarm_x", "runtimeStatus": "connected"},
+                    {"name": name, "runtimeStatus": status},
+                ]}),
+                &[],
+                "eliot_swarm_x",
+            )
+            .unwrap();
+            assert!(!page.acceptable, "accepted {name:?} {status:?}");
+        }
+        // A null status never counts as non-serving.
+        let page = parse_status_page(
+            &json!({"data": [
+                {"name": "eliot_swarm_x", "runtimeStatus": "connected"},
+                {"name": "codex_apps", "runtimeStatus": null},
+            ]}),
+            &[],
+            "eliot_swarm_x",
+        )
+        .unwrap();
+        assert!(!page.acceptable);
     }
 
     #[test]

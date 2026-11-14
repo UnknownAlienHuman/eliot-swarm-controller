@@ -144,25 +144,27 @@ pub(crate) async fn profile_store(
     .native_binding(metadata_secrets)
 }
 
-/// Enumerate the worker-visible native MCP server names for a minimal
-/// policy. A short-lived metadata reader runs initialize, one `config/read`
-/// with the worker's cwd, then closes; it never starts a thread. The
-/// worker's per-server `enabled=false` overrides are computed from these
-/// keys before the long-lived process is born. The reader is pinned to the
-/// frozen native-store binding the same way the worker launch is pinned,
-/// and the pin is verified before the enumeration `config/read` is trusted.
-pub(crate) async fn read_effective_mcp_server_names(
+/// Enumerate the worker-visible native MCP server and plugin names for a
+/// minimal policy. A short-lived metadata reader runs initialize, one
+/// `config/read` with the worker's cwd, then closes; it never starts a
+/// thread. The worker's per-server `enabled=false` and per-plugin
+/// `enabled=false` overrides are computed from these keys before the
+/// long-lived process is born. The reader is pinned to the frozen
+/// native-store binding the same way the worker launch is pinned, and the
+/// pin is verified before the enumeration `config/read` is trusted.
+/// Returns the `(mcp_servers, plugins)` key sets, each sorted.
+pub(crate) async fn read_effective_config_tables(
     launch: &NativeLaunch,
     binding: &NativeStoreBinding,
     metadata_secrets: &[String],
     diagnostic_secrets: &[String],
     deadline: Instant,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, Vec<String>)> {
     let cwd = launch.cwd.clone();
     let pinned = pinned_launch_for_binding(launch, binding)?;
     let (mut probe, drainer, initialized) =
         start_initialized_reader(pinned, metadata_secrets, diagnostic_secrets, deadline).await?;
-    let probe_result: Result<Vec<String>> = async {
+    let probe_result: Result<(Vec<String>, Vec<String>)> = async {
         let client = probe.client();
         verify_initialized_store(
             &client,
@@ -194,12 +196,13 @@ pub(crate) async fn read_effective_mcp_server_names(
                     "Codex MCP server enumeration failed before worker spawn",
                 )
             })?;
-        let names = mcp_server_names(&config)?;
+        let mcp = mcp_server_names(&config)?;
+        let plugins = plugin_names(&config)?;
         reject_secrets(
-            &serde_json::to_value(&names).map_err(|_| invalid_page())?,
+            &serde_json::to_value((&mcp, &plugins)).map_err(|_| invalid_page())?,
             metadata_secrets,
         )?;
-        Ok(names)
+        Ok((mcp, plugins))
     }
     .await;
     finish_reader(&mut probe, Some(drainer)).await?;
@@ -274,6 +277,16 @@ pub(crate) async fn list_models(
 /// Project the effective `mcp_servers` table keys. Absent means no
 /// configured servers; anything else must be an object.
 fn mcp_server_names(config_response: &Value) -> Result<Vec<String>> {
+    config_table_names(config_response, "mcp_servers")
+}
+
+/// Project the effective `plugins` table keys. Absent means no configured
+/// plugins; anything else must be an object.
+fn plugin_names(config_response: &Value) -> Result<Vec<String>> {
+    config_table_names(config_response, "plugins")
+}
+
+fn config_table_names(config_response: &Value, table: &str) -> Result<Vec<String>> {
     const MAX_ENUMERATED_SERVERS: usize = 1024;
     const MAX_ENUMERATED_NAME_BYTES: usize = 256;
     let config = config_response
@@ -285,7 +298,7 @@ fn mcp_server_names(config_response: &Value) -> Result<Vec<String>> {
                 "Codex MCP server enumeration failed before worker spawn",
             )
         })?;
-    match config.get("mcp_servers") {
+    match config.get(table) {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Object(servers)) => {
             if servers.len() > MAX_ENUMERATED_SERVERS {
@@ -1215,8 +1228,9 @@ mod tests {
     use super::{
         CURSOR_PREFIX, Cursor, NativeLaunch, READ_TIMEOUT, StoreContext, binding_paths,
         decode_cursor, fingerprint, mcp_server_names, native_scope, pinned_launch,
-        pinned_launch_for_binding, read_effective_mcp_server_names, request_binding, select_store,
-        sqlite_environment, start_initialized_reader, store_scope, validate_pin, validate_store,
+        pinned_launch_for_binding, plugin_names, read_effective_config_tables, request_binding,
+        select_store, sqlite_environment, start_initialized_reader, store_scope, validate_pin,
+        validate_store,
     };
     use crate::native::types::NativeDiscoveryConfigReadResponse;
     use eliot_core::{NativeStoreBinding, SecretPolicy};
@@ -1378,7 +1392,7 @@ mod tests {
             "native_scope": "fixture-scope",
         }))
         .unwrap();
-        let error = read_effective_mcp_server_names(
+        let error = read_effective_config_tables(
             &launch,
             &relative,
             &[],
@@ -1406,7 +1420,7 @@ mod tests {
             "native_scope": "fixture-scope",
         }))
         .unwrap();
-        let error = read_effective_mcp_server_names(
+        let error = read_effective_config_tables(
             &launch,
             &binding,
             &[],
@@ -1648,6 +1662,28 @@ mod tests {
             json!({"config": {"mcp_servers": {"": {}}}}),
         ] {
             assert!(mcp_server_names(&response).is_err());
+        }
+    }
+
+    #[test]
+    fn plugin_names_projects_only_the_table_keys() {
+        assert!(plugin_names(&json!({"config": {}})).unwrap().is_empty());
+        assert!(
+            plugin_names(&json!({"config": {"plugins": null}}))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            plugin_names(&json!({"config": {"plugins": {"b@x": {}, "a@y": {}}}})).unwrap(),
+            vec!["a@y".to_owned(), "b@x".to_owned()]
+        );
+        for response in [
+            json!({}),
+            json!({"config": null}),
+            json!({"config": {"plugins": []}}),
+            json!({"config": {"plugins": {"": {}}}}),
+        ] {
+            assert!(plugin_names(&response).is_err());
         }
     }
 
