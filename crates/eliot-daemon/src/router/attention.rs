@@ -31,6 +31,7 @@ const REPORT_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_SOURCE_FACTS: usize = 32;
 const MAX_PENDING_KINDS: usize = 16;
 const MAX_PROCESS_FACTS: usize = 16;
+const MAX_STARTUP_LOSSES: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum IncidentKind {
@@ -238,6 +239,15 @@ pub(crate) async fn run_attention(
         suspicion_window,
         &mut tasks,
     );
+    // Reconcile bounded retained loss evidence through the existing
+    // `AgentLost` handling. Recovery publishes losses before attention
+    // subscribes, and a crash between the recovery commit and this consumer
+    // leaves no live event at all; the retained `lost` rows plus their
+    // latest `agent.lost` sequence are the bounded evidence. Drained in
+    // bounded pages and deduplicated per incident by the existing reservation
+    // map plus the durable incident record: not every historical lost row
+    // becomes a new incident engine.
+    queue_startup_losses(&router, &state).await;
 
     loop {
         tokio::select! {
@@ -442,6 +452,56 @@ fn request_full_reconcile(state: &Arc<Mutex<AttentionState>>) {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .reconcile_all = true;
+}
+
+/// Drain retained startup losses as `AgentLost` triggers in bounded,
+/// resumable pages. Each entry flows through `inspect_lost_agent` (or the
+/// child cohort path when the lost manager still has unfinished children),
+/// so reporting stays deduplicated per incident by the reservation map and no
+/// second incident engine is introduced. Rows whose exact `agent.lost`
+/// evidence was pruned carry no sequence and are skipped here, never
+/// synthesized. A lost Agent whose evidence went stale before commit is
+/// classified and dropped there, never mailed.
+async fn queue_startup_losses(router: &Router, state: &Arc<Mutex<AttentionState>>) {
+    let mut after: Option<(i64, i64)> = None;
+    loop {
+        let page = {
+            let store = router.inner.store.lock().await;
+            store.startup_lost_agents(MAX_STARTUP_LOSSES, after)
+        };
+        let page = match page {
+            Ok(page) => page,
+            Err(error) => {
+                crate::logging::record(
+                    &eliot_core::SecretPolicy::default(),
+                    "daemon.attention_startup_losses_failed",
+                    &[],
+                    Some(&error),
+                );
+                return;
+            }
+        };
+        if page.is_empty() {
+            return;
+        }
+        after = page.last().map(|loss| (loss.updated_at, loss.agent_num));
+        for loss in &page {
+            let Some(event_seq) = loss.event_seq else {
+                continue;
+            };
+            queue_check(
+                state,
+                AgentKey {
+                    agent: loss.agent.clone(),
+                    generation: loss.generation,
+                },
+                Trigger::AgentLost { event_seq },
+            );
+        }
+        if page.len() < MAX_STARTUP_LOSSES {
+            return;
+        }
+    }
 }
 
 fn reserve_pending_checks(
@@ -1048,6 +1108,23 @@ async fn inspect_lost_agent(
     if captured.agent.observe_only || captured.agent.state == AgentState::Stopped {
         return Ok(());
     }
+    // One incident per exact loss event: the id is anchored only on the
+    // retained `agent.lost` sequence, so a post-restart re-report maps to the
+    // same incident and its deterministic mutation ids make it a no-op.
+    let incident_id = loss_incident_id(agent_id, generation, event_seq);
+    // The deterministic mutation ids below derive from this timestamp. When
+    // the evidence was pruned between the trigger and this read, there is
+    // nothing to anchor on: skip rather than synthesize an event identity.
+    let loss_ts = {
+        let store = router.inner.store.lock().await;
+        store.daemon_event_timestamp(event_seq)?
+    };
+    let Some(loss_ts) = loss_ts else {
+        return Ok(());
+    };
+    if loss_report_already_complete(router, &incident_id, &captured.agent).await? {
+        return Ok(());
+    }
     let key = IncidentKey {
         agent: agent_id.to_owned(),
         generation,
@@ -1072,20 +1149,6 @@ async fn inspect_lost_agent(
     else {
         return Ok(());
     };
-    let incident_id = if after_probe.unhealthy_source_seq.is_some() {
-        incident_id(
-            &after_probe,
-            IncidentKind::SourceUnhealthy,
-            "source_unhealthy",
-        )
-    } else {
-        digest_id(&[
-            "session_lost",
-            agent_id,
-            &generation.to_string(),
-            &event_seq.to_string(),
-        ])
-    };
     let report = build_report(
         &after_probe,
         IncidentKind::SourceUnhealthy,
@@ -1100,7 +1163,7 @@ async fn inspect_lost_agent(
             process_observation,
         },
     );
-    let frozen = freeze_report(report);
+    let frozen = freeze_loss_report(report, loss_ts);
     let incident_id = frozen.report.incident_id.clone();
     let baseline_progress_at = frozen.report.progress_basis_at;
     let baseline_model_progress_at = frozen.report.last_model_progress_at;
@@ -1114,7 +1177,100 @@ async fn inspect_lost_agent(
             recovery_delivery: None,
         },
     );
-    let _ = deliver_active_incident(router, &state, &key).await?;
+    persist_loss_report(router, &state, &key).await
+}
+
+/// Whether the retained loss incident needs no further work: its incident
+/// event is already committed and every expected notice is already
+/// delivered. Expected notices are the advisory subject copy, plus the
+/// supervisor escalation for a parented subject or the owner notice
+/// otherwise. A post-restart re-report that finds this state is a no-op.
+async fn loss_report_already_complete(
+    router: &Router,
+    incident_id: &str,
+    agent: &Agent,
+) -> Result<bool> {
+    let store = router.inner.store.lock().await;
+    if !store.attention_incident_exists(incident_id)? {
+        return Ok(false);
+    }
+    let escalation_thread = Some(format!(
+        "attention-{}",
+        &incident_id[..20.min(incident_id.len())]
+    ));
+    let advisory_thread = escalation_thread
+        .as_deref()
+        .map(|thread| format!("{thread}-advisory"));
+    let Some(advisory_thread) = advisory_thread else {
+        return Ok(false);
+    };
+    if !store.attention_thread_mailed_to(&advisory_thread, &agent.id)? {
+        return Ok(false);
+    }
+    if let Some(parent) = agent.parent.as_deref().filter(|parent| *parent != agent.id) {
+        let Some(escalation_thread) = escalation_thread.as_deref() else {
+            return Ok(false);
+        };
+        if !store.attention_thread_mailed_to(escalation_thread, parent)? {
+            return Ok(false);
+        }
+    } else if !store.attention_owner_notice_exists(incident_id)? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Deliver the frozen loss incident, then drop it from the active set.
+/// Retried reconciliation resends only missing notices: the deterministic
+/// mutation ids replay the retained emit, and per-thread presence skips mail
+/// that is already delivered, so a crash between the emit commit and notice
+/// delivery cannot duplicate the incident.
+async fn persist_loss_report(
+    router: &Router,
+    state: &Arc<Mutex<AttentionState>>,
+    key: &IncidentKey,
+) -> Result<()> {
+    let Some((incident_id, delivery)) = ({
+        let state = state.lock().unwrap_or_else(|error| error.into_inner());
+        state.active.get(key).map(|incident| {
+            (
+                incident.incident_id.clone(),
+                incident.incident_delivery.clone(),
+            )
+        })
+    }) else {
+        return Ok(());
+    };
+    if let Some(delivery) = delivery {
+        if let Err(error) = persist_loss_delivery(router, &delivery).await {
+            if matches!(error.code.as_str(), "stale_generation" | "not_found") {
+                let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+                if state
+                    .active
+                    .get(key)
+                    .is_some_and(|incident| incident.incident_id == incident_id)
+                {
+                    state.active.remove(key);
+                }
+                state.pending_checks.remove(&AgentKey {
+                    agent: key.agent.clone(),
+                    generation: key.generation,
+                });
+                return Ok(());
+            }
+            return Err(error);
+        }
+        let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(incident) = state.active.get_mut(key)
+            && incident.incident_id == incident_id
+            && incident
+                .incident_delivery
+                .as_ref()
+                .is_some_and(|current| current.emit_command_id == delivery.emit_command_id)
+        {
+            incident.incident_delivery = None;
+        }
+    }
     Ok(())
 }
 
@@ -1184,7 +1340,20 @@ async fn report_cleared_incidents(
                 current.recovery_delivery.get_or_insert(delivery).clone()
             }
         };
-        persist_and_notify(router, &delivery).await?;
+        if let Err(error) = persist_and_notify(router, &delivery).await {
+            if matches!(error.code.as_str(), "stale_generation" | "not_found") {
+                let mut state_guard = state.lock().unwrap_or_else(|error| error.into_inner());
+                if state_guard
+                    .active
+                    .get(&key)
+                    .is_some_and(|current| current.incident_id == incident.incident_id)
+                {
+                    state_guard.active.remove(&key);
+                }
+                continue;
+            }
+            return Err(error);
+        }
         let mut state_guard = state.lock().unwrap_or_else(|error| error.into_inner());
         if state_guard.active.get(&key).is_some_and(|current| {
             current.incident_id == incident.incident_id
@@ -1409,6 +1578,53 @@ fn freeze_report(report: AttentionReport) -> FrozenReport {
     }
 }
 
+/// Deterministic mutation ids for a loss-evidence report, derived from the
+/// incident id, phase and the retained loss event timestamp. A post-restart
+/// re-report of the same loss reuses these ids, so the existing
+/// command/delivery idempotency makes it a no-op instead of a duplicate
+/// incident. No second incident ledger is introduced.
+fn freeze_loss_report(report: AttentionReport, loss_event_ts_ms: i64) -> FrozenReport {
+    let phase = match report.phase {
+        ReportPhase::Incident => "incident",
+        ReportPhase::Recovery => "recovery",
+    };
+    FrozenReport {
+        emit_command_id: attention_ulid(&report.incident_id, phase, "emit", loss_event_ts_ms),
+        affected_mail_id: attention_ulid(
+            &report.incident_id,
+            phase,
+            "affected-mail",
+            loss_event_ts_ms,
+        ),
+        supervisor_mail_id: attention_ulid(
+            &report.incident_id,
+            phase,
+            "supervisor-mail",
+            loss_event_ts_ms,
+        ),
+        owner_notify_id: attention_ulid(
+            &report.incident_id,
+            phase,
+            "owner-notify",
+            loss_event_ts_ms,
+        ),
+        report,
+    }
+}
+
+fn attention_ulid(incident_id: &str, phase: &str, purpose: &str, ts_ms: i64) -> String {
+    let mut digest = Sha256::new();
+    for part in ["attention-mutation-id", incident_id, phase, purpose] {
+        digest.update((part.len() as u64).to_le_bytes());
+        digest.update(part.as_bytes());
+    }
+    let finalized = digest.finalize();
+    let mut random = [0u8; 16];
+    random.copy_from_slice(&finalized[..16]);
+    let random = u128::from_be_bytes(random) & ((1u128 << 80) - 1);
+    ulid::Ulid::from_parts(u64::try_from(ts_ms).unwrap_or(0), random).to_string()
+}
+
 async fn deliver_active_incident(
     router: &Router,
     state: &Arc<Mutex<AttentionState>>,
@@ -1426,7 +1642,27 @@ async fn deliver_active_incident(
         return Ok(false);
     };
     if let Some(delivery) = delivery {
-        persist_and_notify(router, &delivery).await?;
+        // Stale evidence (Agent gone or generation moved between capture
+        // and commit) is classified, not retried: drop the frozen delivery
+        // so an unchanged superseded incident cannot produce further wakes.
+        if let Err(error) = persist_and_notify(router, &delivery).await {
+            if matches!(error.code.as_str(), "stale_generation" | "not_found") {
+                let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+                if state
+                    .active
+                    .get(key)
+                    .is_some_and(|incident| incident.incident_id == incident_id)
+                {
+                    state.active.remove(key);
+                }
+                state.pending_checks.remove(&AgentKey {
+                    agent: key.agent.clone(),
+                    generation: key.generation,
+                });
+                return Ok(true);
+            }
+            return Err(error);
+        }
         let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(incident) = state.active.get_mut(key)
             && incident.incident_id == incident_id
@@ -1825,6 +2061,25 @@ fn source_is_unhealthy(agent_state: AgentState, states: &[SourceState]) -> bool 
 }
 
 fn incident_id(captured: &CapturedAgent, kind: IncidentKind, activity: &str) -> String {
+    let identity = incident_identity(captured, kind, activity);
+    digest_id(&[&identity, &ulid::Ulid::new().to_string()])
+}
+
+/// Deterministic incident id for loss evidence, anchored only on the exact
+/// retained `agent.lost` event (Agent, generation, sequence). The same loss
+/// re-reported after a restart maps to the same incident, anchoring the
+/// deterministic mutation ids that make the re-report a Store-level no-op.
+/// No fresh randomness or volatile capture detail is mixed in here.
+fn loss_incident_id(agent_id: &str, generation: i64, event_seq: i64) -> String {
+    digest_id(&[
+        "session_lost",
+        agent_id,
+        &generation.to_string(),
+        &event_seq.to_string(),
+    ])
+}
+
+fn incident_identity(captured: &CapturedAgent, kind: IncidentKind, activity: &str) -> String {
     let mut parts = vec![
         kind.as_str().to_owned(),
         captured.agent.id.clone(),
@@ -1860,8 +2115,7 @@ fn incident_id(captured: &CapturedAgent, kind: IncidentKind, activity: &str) -> 
         sources.sort();
         parts.extend(sources);
     }
-    let identity = digest_id(&parts.iter().map(String::as_str).collect::<Vec<_>>());
-    digest_id(&[&identity, &ulid::Ulid::new().to_string()])
+    digest_id(&parts.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
 fn digest_id(parts: &[&str]) -> String {
@@ -2192,16 +2446,75 @@ async fn persist_and_notify(router: &Router, delivery: &FrozenReport) -> Result<
         store.get_command(&delivery.emit_command_id)?.is_some()
     };
     if !already_admitted {
+        // Only the internal attention verb reaches the bound commit; a public
+        // emit naming the reserved topic is rejected at admission.
         router
-            .submit(
-                &json!({"id": delivery.emit_command_id.clone(), "verb": "emit", "args": args}),
-                &Principal::Owner,
+            .submit_attention_event(
+                &json!({"id": delivery.emit_command_id.clone(), "verb": "attention.emit", "args": args}),
             )
             .await?;
     }
     wait_for_applied(router, &delivery.emit_command_id).await?;
     send_notice(router, delivery).await?;
     Ok(())
+}
+
+/// Persist one frozen loss-evidence delivery. The deterministic mutation ids
+/// replay the retained emit when this loss was already reported (a retained
+/// command binding skips submission entirely), and per-thread presence skips
+/// mail that is already delivered, so a crash between the emit commit and
+/// notice delivery — or a restart re-report — cannot duplicate the incident.
+async fn persist_loss_delivery(router: &Router, delivery: &FrozenReport) -> Result<()> {
+    let report = &delivery.report;
+    let data = serde_json::to_value(report)
+        .map_err(|_| Error::new("internal", "attention report could not be encoded"))?;
+    let request = EmitDefinitionArgs {
+        topic: "agent.attention".to_owned(),
+        data,
+    };
+    let args = serde_json::to_value(request)
+        .map_err(|_| Error::new("internal", "attention event args could not be encoded"))?;
+    let already_admitted = {
+        let store = router.inner.store.lock().await;
+        store.get_command(&delivery.emit_command_id)?.is_some()
+    };
+    if !already_admitted
+        && let Err(error) = router
+            .submit_attention_event(
+                &json!({"id": delivery.emit_command_id.clone(), "verb": "attention.emit", "args": args}),
+            )
+            .await
+        // A retained binding without a command row is this incident's own
+        // emit (deterministic ids collide only with themselves): continue
+        // to settlement instead of duplicating it.
+        && (error.code != "id_conflict" || !is_own_loss_emit(router, delivery).await?)
+    {
+        return Err(error);
+    }
+    wait_for_applied(router, &delivery.emit_command_id).await?;
+    send_loss_notice(router, delivery).await?;
+    Ok(())
+}
+
+/// Whether the retained command under this loss delivery's deterministic emit
+/// id is this incident's own attention emit.
+async fn is_own_loss_emit(router: &Router, delivery: &FrozenReport) -> Result<bool> {
+    let store = router.inner.store.lock().await;
+    let retained = store.get_command(&delivery.emit_command_id)?;
+    let Some(command) = retained else {
+        return Ok(false);
+    };
+    if command.verb != "attention.emit" {
+        return Ok(false);
+    }
+    let ours = serde_json::from_value::<EmitDefinitionArgs>(command.args.clone())
+        .map(|definition| {
+            definition.topic == "agent.attention"
+                && definition.data.get("incident_id").and_then(Value::as_str)
+                    == Some(delivery.report.incident_id.as_str())
+        })
+        .unwrap_or(false);
+    Ok(ours)
 }
 
 async fn wait_for_applied(router: &Router, command_id: &str) -> Result<()> {
@@ -2212,16 +2525,40 @@ async fn wait_for_applied(router: &Router, command_id: &str) -> Result<()> {
                 let store = router.inner.store.lock().await;
                 store.get_command(command_id)?
             };
-            match command.map(|command| command.state) {
+            match command.as_ref().map(|command| command.state) {
                 Some(CommandState::Applied) => return Ok(()),
-                Some(CommandState::Rejected | CommandState::Failed | CommandState::Cancelled) => {
-                    return Err(Error::new("unknown", "attention event did not commit"));
-                }
-                Some(CommandState::Unknown) => {
-                    return Err(Error::new(
-                        "unknown",
-                        "attention event commit outcome is unknown",
-                    ));
+                Some(
+                    CommandState::Rejected
+                    | CommandState::Failed
+                    | CommandState::Cancelled
+                    | CommandState::Unknown,
+                ) => {
+                    // Preserve a classified commit failure (notably
+                    // `stale_generation` from the trusted attention commit)
+                    // so callers can drop superseded evidence instead of
+                    // retrying it.
+                    let code = command
+                        .as_ref()
+                        .and_then(|command| command.outcome.as_ref())
+                        .and_then(|outcome| outcome.get("code"))
+                        .and_then(Value::as_str)
+                        .filter(|code| {
+                            matches!(
+                                *code,
+                                "stale_generation" | "not_found" | "invalid" | "bad_state"
+                            )
+                        })
+                        .unwrap_or("unknown");
+                    if command
+                        .as_ref()
+                        .is_some_and(|command| command.state == CommandState::Unknown)
+                    {
+                        return Err(Error::new(
+                            code,
+                            "attention event commit outcome is unknown",
+                        ));
+                    }
+                    return Err(Error::new(code, "attention event did not commit"));
                 }
                 _ => {}
             }
@@ -2235,8 +2572,12 @@ async fn wait_for_applied(router: &Router, command_id: &str) -> Result<()> {
     .map_err(|_| Error::new("unknown", "attention event settlement deadline elapsed"))?
 }
 
-async fn send_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
-    let report = &delivery.report;
+/// Shared notice text and threads for one frozen report: the inbox text, the
+/// escalation thread (which wakes an eligible idle recipient at most once
+/// per thread), and the subject copy thread (advisory and never waking,
+/// except for a `children_unattended` report addressed to the manager
+/// itself, whose subject copy is the actionable escalation).
+fn attention_notice_parts(report: &AttentionReport) -> (String, Option<String>, Option<String>) {
     let phase_label = match report.phase {
         ReportPhase::Incident => "report",
         ReportPhase::Recovery => "recovery",
@@ -2246,16 +2587,37 @@ async fn send_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
         "Eliot attention {phase_label} for Agent {} generation {}. Incident {}. {diagnosis} See the structured x.user.agent.attention event for details.",
         report.agent_id, report.generation, report.incident_id,
     );
-    let thread = Some(format!(
+    let escalation_thread = Some(format!(
         "attention-{}",
         &report.incident_id[..20.min(report.incident_id.len())]
     ));
+    let affected_thread = if report.reason == "children_unattended" {
+        escalation_thread.clone()
+    } else {
+        escalation_thread
+            .as_deref()
+            .map(|thread| format!("{thread}-advisory"))
+    };
+    (text, escalation_thread, affected_thread)
+}
+
+async fn send_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
+    let report = &delivery.report;
+    // The subject's own copy is advisory: durable in its inbox for voluntary
+    // reads and acknowledgement, but never wakes it (the Store excludes the
+    // `-advisory` thread from mail wake claims and reoffer pages). A
+    // `children_unattended` report is addressed to the manager itself, so its
+    // subject copy is the actionable escalation and keeps the waking thread.
+    // At most one incident and one recovery notice are ever sent per
+    // incident, and the Store spends each escalation thread's wake only once,
+    // so an unchanged unread set cannot produce further wakes.
+    let (text, escalation_thread, affected_thread) = attention_notice_parts(report);
     let affected = MailSendRequest {
         id: delivery.affected_mail_id.clone(),
         to: vec![report.agent_id.clone()],
         mode: MailMode::Queue,
         text: text.clone(),
-        thread: thread.clone(),
+        thread: affected_thread,
         reply_to_delivery: None,
     };
     let mut delivery_errors = Vec::with_capacity(2);
@@ -2278,7 +2640,7 @@ async fn send_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
             to: vec![parent.clone()],
             mode: MailMode::Queue,
             text,
-            thread,
+            thread: escalation_thread,
             reply_to_delivery: None,
         };
         match serde_json::to_value(supervisor) {
@@ -2294,6 +2656,7 @@ async fn send_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
             ReportPhase::Incident => "Agent attention",
             ReportPhase::Recovery => "Agent attention recovered",
         };
+        let diagnosis = diagnosis_summary(report);
         let message = format!(
             "Agent {} generation {}: {} (incident {}). {diagnosis} See the structured x.user.agent.attention event for details.",
             report.agent_id, report.generation, report.reason, report.incident_id
@@ -2327,6 +2690,173 @@ async fn send_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
                 delivery_errors.join(", ")
             ),
         ))
+    }
+}
+
+/// Send the notices for one frozen loss-evidence delivery, resending only
+/// what is missing. Mail is skipped when its thread already reached the
+/// recipient (a retained `id_conflict` binding means the notice was already
+/// delivered, possibly acked and pruned since), and the owner notice is
+/// skipped when its command or a notice naming this incident already exists.
+/// A loss incident is never about a `children_unattended` cohort, so the
+/// subject copy is always the advisory thread here.
+async fn send_loss_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
+    let report = &delivery.report;
+    let (text, escalation_thread, affected_thread) = attention_notice_parts(report);
+    let mut delivery_errors = Vec::with_capacity(2);
+    send_loss_mail(
+        router,
+        &delivery.affected_mail_id,
+        &report.agent_id,
+        affected_thread,
+        text.clone(),
+        &mut delivery_errors,
+        "affected_mail",
+    )
+    .await;
+    if let Some(parent) = report
+        .parent_agent
+        .as_ref()
+        .filter(|parent| *parent != &report.agent_id)
+    {
+        send_loss_mail(
+            router,
+            &delivery.supervisor_mail_id,
+            parent,
+            escalation_thread,
+            text,
+            &mut delivery_errors,
+            "supervisor_mail",
+        )
+        .await;
+    } else {
+        let owner_done = {
+            let store = router.inner.store.lock().await;
+            store.get_command(&delivery.owner_notify_id)?.is_some()
+                || store.attention_owner_notice_exists(&report.incident_id)?
+        };
+        if !owner_done {
+            let title = match report.phase {
+                ReportPhase::Incident => "Agent attention",
+                ReportPhase::Recovery => "Agent attention recovered",
+            };
+            let diagnosis = diagnosis_summary(report);
+            let message = format!(
+                "Agent {} generation {}: {} (incident {}). {diagnosis} See the structured x.user.agent.attention event for details.",
+                report.agent_id, report.generation, report.reason, report.incident_id
+            );
+            let submit_owner = |id: &str| {
+                let id = id.to_owned();
+                let title = title.to_owned();
+                let message = message.clone();
+                async move {
+                    router
+                        .submit(
+                            &json!({
+                                "id": id,
+                                "verb": "notify",
+                                "args": {"title": title, "message": message}
+                            }),
+                            &Principal::Owner,
+                        )
+                        .await
+                }
+            };
+            if let Err(error) = submit_owner(&delivery.owner_notify_id).await {
+                // The retained evidence can predate the retry window: without
+                // a binding this id cannot be admitted, so fall back to a
+                // fresh owner-notice id once. The incident id stays
+                // deterministic, so the next restart still reconciles by
+                // incident record instead of duplicating.
+                if error.code == "id_expired" && {
+                    let store = router.inner.store.lock().await;
+                    store.get_command(&delivery.owner_notify_id)?.is_none()
+                } {
+                    if let Err(error) = submit_owner(&ulid::Ulid::new().to_string()).await {
+                        delivery_errors.push(format!("owner_notify:{}", error.code));
+                    }
+                } else {
+                    delivery_errors.push(format!("owner_notify:{}", error.code));
+                }
+            }
+        }
+    }
+    if delivery_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "unknown",
+            format!(
+                "attention notice delivery incomplete: {}",
+                delivery_errors.join(", ")
+            ),
+        ))
+    }
+}
+
+/// Send one loss notice unless its thread already reached the recipient. A
+/// retained `id_conflict` binding means the notice was already delivered
+/// (possibly acked and pruned since): re-check presence and skip instead of
+/// duplicating it.
+#[allow(clippy::too_many_arguments)]
+async fn send_loss_mail(
+    router: &Router,
+    mail_id: &str,
+    recipient: &str,
+    thread: Option<String>,
+    text: String,
+    delivery_errors: &mut Vec<String>,
+    label: &str,
+) {
+    let Some(thread) = thread else {
+        return;
+    };
+    let already_mailed = {
+        let store = router.inner.store.lock().await;
+        store.attention_thread_mailed_to(&thread, recipient)
+    };
+    let already_mailed = match already_mailed {
+        Ok(mailed) => mailed,
+        Err(error) => {
+            delivery_errors.push(format!("{label}:{}", error.code));
+            return;
+        }
+    };
+    if already_mailed {
+        return;
+    }
+    let request = MailSendRequest {
+        id: mail_id.to_owned(),
+        to: vec![recipient.to_owned()],
+        mode: MailMode::Queue,
+        text,
+        thread: Some(thread),
+        reply_to_delivery: None,
+    };
+    let encoded = match serde_json::to_value(request) {
+        Ok(encoded) => encoded,
+        Err(_) => {
+            delivery_errors.push(format!("{label}:encode"));
+            return;
+        }
+    };
+    if let Err(error) = router.mail_send(&encoded, &Principal::Owner).await {
+        if error.code == "id_conflict" {
+            let still_missing = {
+                let store = router.inner.store.lock().await;
+                store.attention_thread_mailed_to(
+                    encoded
+                        .get("thread")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    recipient,
+                )
+            };
+            if still_missing.is_ok_and(|missing| !missing) {
+                return;
+            }
+        }
+        delivery_errors.push(format!("{label}:{}", error.code));
     }
 }
 
@@ -2747,5 +3277,49 @@ mod child_attention_tests {
         assert_eq!(same_key, key);
         assert!(reserve_incident(&state, &same_key).is_none());
         assert!(!incident_condition_cleared(&same_key, &incident, &captured));
+    }
+}
+
+#[cfg(test)]
+mod loss_identity_tests {
+    use super::*;
+
+    #[test]
+    fn loss_incident_id_is_deterministic_per_loss_event() {
+        let first = loss_incident_id("a1", 2, 99);
+        assert_eq!(first, loss_incident_id("a1", 2, 99));
+        assert_ne!(first, loss_incident_id("a1", 2, 100));
+        assert_ne!(first, loss_incident_id("a1", 3, 99));
+        assert_ne!(first, loss_incident_id("a2", 2, 99));
+    }
+
+    #[test]
+    fn loss_mutation_ids_are_deterministic_per_incident_phase_and_purpose() {
+        let loss_ts = 1_700_000_000_000_i64;
+        let emit = attention_ulid("attention-abc", "incident", "emit", loss_ts);
+        assert_eq!(
+            emit,
+            attention_ulid("attention-abc", "incident", "emit", loss_ts)
+        );
+        assert_ne!(
+            emit,
+            attention_ulid("attention-abc", "incident", "affected-mail", loss_ts)
+        );
+        assert_ne!(
+            emit,
+            attention_ulid("attention-abc", "recovery", "emit", loss_ts)
+        );
+        assert_ne!(
+            emit,
+            attention_ulid("attention-abd", "incident", "emit", loss_ts)
+        );
+        assert_ne!(
+            emit,
+            attention_ulid("attention-abc", "incident", "emit", loss_ts + 1)
+        );
+        // Deterministic ids stay valid ULIDs carrying the loss timestamp, so
+        // admission can check their shape without a retry-window rebuke.
+        let parsed = ulid::Ulid::from_string(&emit).expect("deterministic ULID");
+        assert_eq!(parsed.timestamp_ms(), loss_ts as u64);
     }
 }

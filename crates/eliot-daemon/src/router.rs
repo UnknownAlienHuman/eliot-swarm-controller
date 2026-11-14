@@ -534,6 +534,14 @@ impl Router {
         if request.verb == "git.fetch" {
             return self.submit_git_fetch(request, principal, remote).await;
         }
+        // The internal attention verb is admitted only through
+        // `submit_attention_event`; the public path never carries it.
+        if request.verb == "attention.emit" {
+            return Err(Error::new(
+                "invalid",
+                "attention.emit is reserved for the internal attention producer",
+            ));
+        }
 
         authorize_command(principal, &mut request)?;
         self.authorize_submission_scope(&mut request, principal)
@@ -790,7 +798,9 @@ impl Router {
 
     /// Validate one targetless local `notify`/`emit` submission. Admission
     /// secret checks run in the shared preparation path; execution commits
-    /// exactly this validated DTO as one persisted `x.user.*` event.
+    /// exactly this validated DTO as one persisted `x.user.*` event. The
+    /// reserved attention topic is rejected here: only the internal
+    /// attention producer (verb `attention.emit`) may use the bound commit.
     fn validate_user_event_request(request: &SubmitCommand) -> Result<()> {
         if request.target.is_some()
             || request.expected_generation.is_some()
@@ -803,8 +813,68 @@ impl Router {
                 "notify/emit must be targetless and have no Agent or request bindings",
             ));
         }
-        user_event_kind_data(&request.verb, &request.args)?;
+        let (kind, _) = user_event_kind_data(&request.verb, &request.args)?;
+        if kind == ATTENTION_USER_EVENT_KIND {
+            return Err(Error::new(
+                "invalid",
+                "agent.attention is reserved for the internal attention producer",
+            ));
+        }
         Ok(())
+    }
+
+    /// Submit one internal attention event command (verb `attention.emit`).
+    /// Only the attention producer calls this; the public `submit` path
+    /// rejects the verb so a public emit can never acquire the bound commit.
+    pub(crate) async fn submit_attention_event(&self, params: &Value) -> Result<Value> {
+        let mut request: CommandSubmitRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        if request.verb != "attention.emit" {
+            return Err(Error::new(
+                "invalid",
+                "attention submission requires the attention.emit verb",
+            ));
+        }
+        authorize_command(&Principal::Owner, &mut request)?;
+        self.authorize_submission_scope(&mut request, &Principal::Owner)
+            .await?;
+        let prepared = self
+            .prepare_submission_after_authorization(request, &Principal::Owner, false, true)
+            .await?;
+        let submitted = {
+            let mut store = self.inner.store.lock().await;
+            let submitted = self.admit_prepared_submission(
+                &mut store,
+                &principal_name(&Principal::Owner),
+                prepared,
+                None,
+            );
+            match submitted {
+                Ok(admission) => {
+                    if !admission.events.is_empty() {
+                        self.publish_locked(&admission.events);
+                    }
+                    Ok(admission)
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let admission = submitted?;
+        if admission.command.state == CommandState::Unknown {
+            self.inner
+                .unknown_commands
+                .lock_recover()
+                .insert(admission.command.id.clone());
+        }
+        if admission.is_new && command_needs_worker(&admission.command) {
+            self.schedule_admission(&admission);
+        }
+        self.signal_progress();
+        serde_json::to_value(submit_result(
+            &admission.command,
+            admission.linked_command.as_ref(),
+        ))
+        .map_err(|_| Error::new("internal", "command admission result could not be encoded"))
     }
 
     async fn retained_git_fetch_submit(
@@ -1474,7 +1544,7 @@ impl Router {
         // keys before admission; never persist or log the offending key.
         let secret_hit = if matches!(
             request.verb.as_str(),
-            "notify" | "emit" | "mail.send" | "var.set"
+            "notify" | "emit" | "attention.emit" | "mail.send" | "var.set"
         ) {
             contains_known_secret_including_keys(&request.args, &self.inner.secrets)
         } else {
@@ -4461,9 +4531,14 @@ fn normalize_resume(request: &mut SubmitCommand) -> Result<()> {
     Ok(())
 }
 
-/// Map one validated local `notify`/`emit` DTO to its persisted event kind
-/// and bounded payload. Shared by admission and execution so both read the
-/// same DTO exactly once.
+/// Persisted kind of the internal attention event.
+pub(crate) const ATTENTION_USER_EVENT_KIND: &str = "x.user.agent.attention";
+
+/// Map one validated local `notify`/`emit`/`attention.emit` DTO to its
+/// persisted event kind and bounded payload. Shared by admission and
+/// execution so both read the same DTO exactly once. The internal
+/// `attention.emit` verb carries the same DTO as `emit`; only the producer
+/// (not the kind) differs, and admission keeps them apart.
 fn user_event_kind_data(verb: &str, args: &Value) -> Result<(String, Value)> {
     match verb {
         "notify" => {
@@ -4478,7 +4553,7 @@ fn user_event_kind_data(verb: &str, args: &Value) -> Result<(String, Value)> {
             }
             Ok(("x.user.notify".to_owned(), data))
         }
-        "emit" => {
+        "emit" | "attention.emit" => {
             let definition = eliot_core::api::discovery::decode_params_at::<EmitDefinitionArgs>(
                 args.clone(),
                 "params.args",
@@ -5124,6 +5199,77 @@ mod tests {
             Arc::new(AsyncMutex::new(store)),
             Bus::new(16),
         )
+    }
+
+    #[tokio::test]
+    async fn public_emit_cannot_acquire_the_attention_binding() {
+        let router = router();
+        // A public emit naming the reserved topic is rejected: it can never
+        // acquire the authoritative subject binding.
+        let public_id = ulid::Ulid::new().to_string();
+        let error = router
+            .handle(
+                "command.submit",
+                json!({
+                    "_auth":{"kind":"owner","credential":"owner-credential"},
+                    "_payload":{"id":public_id,"verb":"emit","args":{"topic":"agent.attention","data":{"agent_id":"a1","generation":1}}},
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "invalid");
+        assert!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .get_command(&public_id)
+                .unwrap()
+                .is_none()
+        );
+        // The public path also rejects the internal verb outright.
+        let forged_id = ulid::Ulid::new().to_string();
+        let error = router
+            .handle(
+                "command.submit",
+                json!({
+                    "_auth":{"kind":"owner","credential":"owner-credential"},
+                    "_payload":{"id":forged_id,"verb":"attention.emit","args":{"topic":"agent.attention","data":{}}},
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "invalid");
+        assert!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .get_command(&forged_id)
+                .unwrap()
+                .is_none()
+        );
+        // The internal producer path admits the same topic for the bound
+        // commit.
+        let internal_id = ulid::Ulid::new().to_string();
+        router
+            .submit_attention_event(
+                &json!({"id":internal_id,"verb":"attention.emit","args":{"topic":"agent.attention","data":{}}}),
+            )
+            .await
+            .expect("internal attention submission admits");
+        assert!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .get_command(&internal_id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

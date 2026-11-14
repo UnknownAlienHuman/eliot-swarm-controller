@@ -16,7 +16,7 @@ use super::{
     commit_transaction, decode_json, encode_json, enforce_page_bytes, has_pending_send_input,
     has_unknown_gate, history_expired, insert_daemon_event_for_command, insert_daemon_event_input,
     load_agent_by_num, load_command_record, provider_holds, sql_error, validate_id_age,
-    validate_limit, write_binding,
+    validate_limit, validate_ulid, write_binding,
 };
 use eliot_core::{
     Agent, AgentState, CommandState,
@@ -84,6 +84,30 @@ impl NoticePending {
         }
     }
 }
+
+/// Whether one unread attention-thread message row (outer alias `m`) may prove
+/// a wake. Advisory copies never wake. An escalation thread wakes its
+/// recipient at most once per (recipient, thread) — the spent wake is recorded
+/// in `attention_wakes` when the notice is claimed — and only while a bound
+/// post-fix attention incident proves the escalation target: the bound event
+/// subject must differ from the recipient, except for a
+/// `children_unattended` cohort report whose subject is the manager itself.
+/// Retained pre-fix subject copies match no bound incident event (those events
+/// carry no Agent binding) and never wake, however long they stay unread.
+const ATTENTION_WAKING_THREAD_SQL: &str = "COALESCE(m.thread, '') LIKE 'attention-%'
+    AND COALESCE(m.thread, '') NOT LIKE 'attention-%-advisory'
+    AND NOT EXISTS (
+        SELECT 1 FROM attention_wakes w
+        WHERE w.recipient = m.recipient AND w.thread = m.thread
+    )
+    AND EXISTS (
+        SELECT 1 FROM events e
+        WHERE e.kind = 'x.user.agent.attention'
+          AND e.agent IS NOT NULL
+          AND m.thread = 'attention-' || substr(json_extract(e.data, '$.data.incident_id'), 1, 20)
+          AND (e.agent != m.recipient
+               OR json_extract(e.data, '$.data.reason') = 'children_unattended')
+    )";
 
 /// A claimed notice: the pending count for the generic notice text and the
 /// recipient generation the notice command must bind.
@@ -546,11 +570,16 @@ impl Store {
     }
 
     /// Page recipient ids due a normal mail notice: current `idle`,
-    /// non-observer, generation >= 1 agents holding unread mail whose
+    /// non-observer, generation >= 1 agents holding waking unread mail whose
     /// `mail_notices` row is absent or past the normal notice cooldown.
-    /// Read-only candidate scan: the caller must still `notice_claim` each
-    /// recipient, which stays authoritative for open commands, holds and
-    /// races. Open notice commands are deliberately not consulted here.
+    /// Advisory attention mail never pages here; it stays inbox-durable
+    /// without a wake. Attention escalation threads page at most once per
+    /// (recipient, thread) and only with a bound incident proving the
+    /// escalation target, so an unchanged unread incident set cannot page
+    /// again after its wake. Read-only candidate scan: the caller must still
+    /// `notice_claim` each recipient, which stays authoritative for open
+    /// commands, holds and races. Open notice commands are deliberately
+    /// not consulted here.
     pub fn due_mail_notice_recipients(
         &self,
         after: Option<&str>,
@@ -561,7 +590,7 @@ impl Store {
         let after_num = after.map(parse_agent_id).transpose()?.unwrap_or(0);
         let mut statement = self
             .connection
-            .prepare(
+            .prepare(&format!(
                 "SELECT a.id FROM agents a
                  LEFT JOIN mail_notices mn ON mn.recipient = a.id
                  WHERE a.id > ?1
@@ -573,9 +602,11 @@ impl Store {
                    AND EXISTS (
                            SELECT 1 FROM messages m
                            WHERE m.recipient = a.id AND m.read_at IS NULL
+                             AND (COALESCE(m.thread, '') NOT LIKE 'attention-%'
+                                  OR ({ATTENTION_WAKING_THREAD_SQL}))
                        )
                  ORDER BY a.id LIMIT ?4",
-            )
+            ))
             .map_err(sql_error)?;
         let rows = statement
             .query_map(
@@ -792,7 +823,20 @@ impl Store {
                 outcome: MailSendOutcome::Retained,
             });
         }
-        validate_id_age(&request.id, now)?;
+        // Attention loss reports reuse deterministic write ids derived from
+        // the retained loss evidence (same exemption as rule-derived ids), so
+        // their age is the evidence's age. Retained bindings still replay
+        // before this check; the format rule still applies. Other mail keeps
+        // the strict retry-window rule.
+        let attention_write = request
+            .thread
+            .as_deref()
+            .is_some_and(|thread| thread.starts_with("attention-"));
+        if attention_write {
+            validate_ulid(&request.id)?;
+        } else {
+            validate_id_age(&request.id, now)?;
+        }
 
         let definition = MailDefinitionArgs {
             to: request.to.clone(),
@@ -1378,6 +1422,20 @@ impl Store {
                  open_notice_command = excluded.open_notice_command",
             params![num, notice_command],
         ));
+        // A successful mail wake spends the one wake of every unread
+        // non-advisory attention thread in this mailbox, so an unchanged
+        // unread incident set cannot wake the recipient again until new
+        // evidence arrives on a new thread.
+        if pending.kind() == NoticeKind::Mail {
+            db!(tx.execute(
+                "INSERT OR IGNORE INTO attention_wakes(recipient, thread, woken_at)
+                 SELECT DISTINCT ?1, m.thread, ?2 FROM messages m
+                 WHERE m.recipient = ?1 AND m.read_at IS NULL
+                   AND COALESCE(m.thread, '') LIKE 'attention-%'
+                   AND COALESCE(m.thread, '') NOT LIKE 'attention-%-advisory'",
+                params![num, now],
+            ));
+        }
         commit_transaction(tx, &self.write_faulted)?;
         Ok(Some(NoticeClaim {
             kind: pending.kind(),
@@ -1403,8 +1461,13 @@ impl Store {
 }
 
 /// Resolve the pending proof inside the claim transaction: mail counts
-/// its unread rows, claims arrive with their overlap count. `None`
-/// suppresses the notice without recording anything.
+/// its waking unread rows, claims arrive with their overlap count. `None`
+/// suppresses the notice without recording anything. Advisory attention
+/// mail (thread `attention-*-advisory`) stays durable in the inbox for
+/// voluntary reads and acknowledgement but never proves a wake. Attention
+/// escalation threads prove at most one wake per (recipient, thread) and
+/// only with a bound incident proving the escalation target; retained
+/// pre-fix subject copies never prove a wake.
 fn notice_pending_count_tx(
     tx: &Transaction<'_>,
     pending: NoticePending,
@@ -1414,7 +1477,11 @@ fn notice_pending_count_tx(
         NoticePending::Mail => {
             let unread: i64 = tx
                 .query_row(
-                    "SELECT COUNT(*) FROM messages WHERE recipient = ?1 AND read_at IS NULL",
+                    &format!(
+                        "SELECT COUNT(*) FROM messages m WHERE m.recipient = ?1 AND m.read_at IS NULL
+                         AND (COALESCE(m.thread, '') NOT LIKE 'attention-%'
+                              OR ({ATTENTION_WAKING_THREAD_SQL}))"
+                    ),
                     params![num],
                     |row| row.get(0),
                 )
@@ -1685,7 +1752,7 @@ mod tests {
             })
             .expect("read Store migration version");
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 31);
+        assert_eq!(version, 32);
         for table in ["messages", "vars", "mail_notices", "claims"] {
             let found: i64 = store
                 .connection
@@ -3192,6 +3259,219 @@ mod tests {
                 )
                 .unwrap(),
             None
+        );
+    }
+
+    fn commit_bound_attention(
+        store: &mut Store,
+        subject: &str,
+        generation: i64,
+        incident_id: &str,
+        reason: &str,
+        now: i64,
+    ) {
+        let emit_id = Ulid::new().to_string();
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: emit_id.clone(),
+                    target: None,
+                    selector: None,
+                    verb: "attention.emit".to_owned(),
+                    args: json!({"topic": "agent.attention", "data": {}}),
+                    expected_generation: None,
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .expect("admit internal attention emit");
+        store
+            .dispatch(&emit_id, now)
+            .expect("dispatch attention emit");
+        store
+            .commit_attention_event_applied(
+                &emit_id,
+                "x.user.agent.attention",
+                json!({"data": {"agent_id": subject, "generation": generation, "incident_id": incident_id, "reason": reason}}),
+                now,
+            )
+            .expect("bound attention commit");
+    }
+
+    #[test]
+    fn advisory_attention_mail_never_wakes_but_stays_durable() {
+        let mut store = store();
+        let now = now_ms();
+        let launch_id = Ulid::new().to_string();
+        let admission = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: launch_id.clone(),
+                    target: None,
+                    selector: None,
+                    verb: "launch".to_owned(),
+                    args: json!({"project":"app", "workspace":"synthetic-workspace", "harness":"codex", "profile":"test", "profile_snapshot":{}}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .expect("admit launch");
+        let a = admission.command.target.expect("launch target");
+        store.dispatch(&launch_id, now).expect("dispatch launch");
+        let plan = ["session", "turn", "message"]
+            .into_iter()
+            .map(|family| (family.to_owned(), "stream".to_owned()))
+            .collect();
+        store
+            .install_plugin_sources(&a, 1, &launch_id, &plan, now)
+            .expect("install plugin sources");
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: Ulid::new().to_string(),
+                    agent_id: a.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ready".to_owned(),
+                        native_id: Ulid::new().to_string(),
+                        data: json!({"command_id":launch_id}),
+                    }],
+                    cursor: None,
+                },
+                now,
+            )
+            .expect("commit session ready");
+        store
+            .settle(&launch_id, CommandState::Applied, None, now)
+            .expect("settle launch");
+        // An advisory attention copy is durable inbox mail ...
+        let mut advisory = send_request(vec![a.clone()], "attention report");
+        advisory.thread = Some("attention-abcdef0123456789-advisory".to_owned());
+        store
+            .mail_send("owner", &advisory, MailLimits::default(), now)
+            .expect("queue advisory mail");
+        assert_eq!(unread(&store, &a), 1);
+        // ... but proves no wake on its own, neither by claim ...
+        assert_eq!(
+            store
+                .notice_claim(&a, &Ulid::new().to_string(), NoticePending::Mail, now)
+                .unwrap(),
+            None
+        );
+        // ... nor by the reoffer page.
+        assert!(
+            store
+                .due_mail_notice_recipients(None, 100, now)
+                .unwrap()
+                .iter()
+                .all(|recipient| recipient != &a)
+        );
+        // A retained pre-fix subject copy (bare attention thread with no bound
+        // incident event) stays durable but never proves a wake.
+        let mut stale_subject = send_request(vec![a.clone()], "attention stale subject copy");
+        stale_subject.thread = Some("attention-0123456789abcdef".to_owned());
+        store
+            .mail_send("owner", &stale_subject, MailLimits::default(), now + 1)
+            .expect("queue stale subject mail");
+        assert_eq!(unread(&store, &a), 2);
+        assert_eq!(
+            store
+                .notice_claim(&a, &Ulid::new().to_string(), NoticePending::Mail, now + 1)
+                .unwrap(),
+            None,
+            "stale subject copies never wake"
+        );
+        assert!(
+            store
+                .due_mail_notice_recipients(None, 100, now + 1)
+                .unwrap()
+                .iter()
+                .all(|recipient| recipient != &a)
+        );
+        // A bound escalation to an idle manager wakes exactly once for its
+        // thread, even though the unread set never changes.
+        let manager = ready_agent(&mut store, "attention-manager", now + 2);
+        let incident_id = "abcdef0123456789abcd";
+        commit_bound_attention(&mut store, &a, 1, incident_id, "source_unhealthy", now + 3);
+        let mut escalation = send_request(vec![manager.clone()], "attention escalation");
+        escalation.thread = Some(format!("attention-{incident_id}"));
+        store
+            .mail_send("owner", &escalation, MailLimits::default(), now + 4)
+            .expect("queue escalation mail");
+        let notice = Ulid::new().to_string();
+        let claim = store
+            .notice_claim(&manager, &notice, NoticePending::Mail, now + 4)
+            .expect("claim")
+            .expect("escalation wakes once");
+        assert_eq!(claim.count, 1, "only the waking copy proves the wake");
+        store
+            .notice_release(&manager, &notice)
+            .expect("release open notice");
+        assert_eq!(
+            store
+                .notice_claim(
+                    &manager,
+                    &Ulid::new().to_string(),
+                    NoticePending::Mail,
+                    now + 4 + MAIL_NOTICE_COOLDOWN_MS + 1
+                )
+                .unwrap(),
+            None,
+            "an unchanged unread incident set cannot wake again"
+        );
+        assert!(
+            store
+                .due_mail_notice_recipients(None, 100, now + 4 + MAIL_NOTICE_COOLDOWN_MS + 1)
+                .unwrap()
+                .iter()
+                .all(|recipient| recipient != &manager),
+            "spent threads leave the reoffer page"
+        );
+        // A bound `children_unattended` cohort report wakes its own manager
+        // once: the subject binding matches the recipient with that reason.
+        let child_incident = "ffff0000111122223333";
+        commit_bound_attention(
+            &mut store,
+            &manager,
+            1,
+            child_incident,
+            "children_unattended",
+            now + 5,
+        );
+        let mut cohort = send_request(vec![manager.clone()], "attention cohort");
+        cohort.thread = Some(format!("attention-{child_incident}"));
+        store
+            .mail_send("owner", &cohort, MailLimits::default(), now + 6)
+            .expect("queue cohort mail");
+        let cohort_notice = Ulid::new().to_string();
+        let claim = store
+            .notice_claim(&manager, &cohort_notice, NoticePending::Mail, now + 6)
+            .expect("claim")
+            .expect("cohort escalation wakes once");
+        assert_eq!(claim.count, 1, "only the unwoken thread proves the wake");
+        store
+            .notice_release(&manager, &cohort_notice)
+            .expect("release cohort notice");
+        assert_eq!(
+            store
+                .notice_claim(
+                    &manager,
+                    &Ulid::new().to_string(),
+                    NoticePending::Mail,
+                    now + 6 + MAIL_NOTICE_COOLDOWN_MS + 1
+                )
+                .unwrap(),
+            None,
+            "the cohort thread spends its single wake too"
         );
     }
 

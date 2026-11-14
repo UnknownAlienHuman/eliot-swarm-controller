@@ -452,8 +452,10 @@ impl Router {
                             "force shutdown prevents Git fetch dispatch",
                         ))
                     }
-                    None if matches!(command.verb.as_str(), "notify" | "emit")
-                        && self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE =>
+                    None if matches!(
+                        command.verb.as_str(),
+                        "notify" | "emit" | "attention.emit"
+                    ) && self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE =>
                     {
                         Err(Error::new(
                             "bad_state",
@@ -610,6 +612,10 @@ impl Router {
             self.execute_user_event_command(&id, dispatched).await;
             return;
         }
+        if dispatched.verb == "attention.emit" {
+            self.execute_attention_event_command(&id, dispatched).await;
+            return;
+        }
         if dispatched.verb == "mail.send" {
             self.execute_mail_send_command(&id, dispatched).await;
             return;
@@ -759,10 +765,63 @@ impl Router {
                 return;
             }
         };
+        // The reserved attention topic is never bound through the public
+        // `emit` verb: admission rejects it, and a retained pre-fix command
+        // that still reaches execution is rejected here. Only the internal
+        // `attention.emit` verb below may use the bound commit.
+        if kind == super::ATTENTION_USER_EVENT_KIND {
+            self.settle(id, CommandState::Rejected, Some(json!({"code": "invalid"})))
+                .await;
+            self.signal_progress();
+            return;
+        }
         self.redact_native_value(&mut data);
         let committed = {
             let mut store = self.inner.store.lock().await;
             let result = store.commit_user_event_applied(id, &kind, data, now_ms());
+            if let Ok(change) = &result
+                && !change.events.is_empty()
+            {
+                self.publish_locked(&change.events);
+            }
+            result
+        };
+        if let Err(error) = committed {
+            self.settle(
+                id,
+                CommandState::Unknown,
+                Some(json!({"code": error.code, "cause": "user_event_commit_failed"})),
+            )
+            .await;
+        }
+        self.signal_progress();
+    }
+
+    /// Execute a dispatched internal `attention.emit` command: commit its
+    /// validated report as one bound `x.user.agent.attention` event with its
+    /// Applied settlement in a single Store transaction. The Store admits the
+    /// `attention.emit` verb only from the internal attention producer, and
+    /// the bound commit additionally requires that verb, so a public emit
+    /// can never acquire an authoritative subject binding.
+    async fn execute_attention_event_command(&self, id: &str, dispatched: Command) {
+        let (kind, mut data) = match super::user_event_kind_data(&dispatched.verb, &dispatched.args)
+        {
+            Ok(kind_data) => kind_data,
+            Err(error) => {
+                self.settle(
+                    id,
+                    CommandState::Rejected,
+                    Some(json!({"code": error.code})),
+                )
+                .await;
+                self.signal_progress();
+                return;
+            }
+        };
+        self.redact_native_value(&mut data);
+        let committed = {
+            let mut store = self.inner.store.lock().await;
+            let result = store.commit_attention_event_applied(id, &kind, data, now_ms());
             if let Ok(change) = &result
                 && !change.events.is_empty()
             {

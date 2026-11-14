@@ -6879,15 +6879,18 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
         .dispatch(&launch_id, now + 1)
         .expect("dispatch launch");
     // Return the file to schema 16, as an older binary left it, and upgrade.
-    // Drop the v29/v30 activity artifacts first: the v30 events triggers
-    // would otherwise fire during the table rebuilds below while their
-    // native_child_registrations reads no longer resolve (#418). Drop the
-    // v31 fleet indexes too, or the parent-column drop below fails and the
-    // reopen would recreate existing indexes.
+    // Drop the v32 attention-wake table first so the reopen exercises
+    // its migration block. Drop the v29/v30 activity artifacts next: the
+    // v30 events triggers would otherwise fire during the table rebuilds
+    // below while their native_child_registrations reads no longer
+    // resolve (#418). Drop the v31 fleet indexes too, or the parent-column
+    // drop below fails and the reopen would recreate existing indexes.
     store
         .connection
         .execute_batch(
-            "DROP INDEX agents_list_state;
+            "DROP TABLE attention_wakes;
+             DELETE FROM schema_migrations WHERE version = 32;
+             DROP INDEX agents_list_state;
              DROP INDEX agents_list_project;
              DROP INDEX agents_list_harness;
              DROP INDEX agents_list_parent;
@@ -11787,4 +11790,365 @@ fn projection_gap_turn_unknown_settles_once_without_resurrection() {
         .expect("read turn")
         .expect("turn row");
     assert_eq!(turn.state, TurnState::Unknown);
+}
+
+fn ready_attention_agent(store: &mut Store, project: &str, now: i64) -> String {
+    let launch_id = Ulid::new().to_string();
+    let admission = store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: launch_id.clone(),
+                target: None,
+                selector: None,
+                verb: "launch".to_owned(),
+                args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"codex", "profile":"test", "profile_snapshot":{}}),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit launch");
+    let agent = admission.command.target.expect("launch target");
+    store.dispatch(&launch_id, now).expect("dispatch launch");
+    let plan = ["session", "turn", "message"]
+        .into_iter()
+        .map(|family| (family.to_owned(), "stream".to_owned()))
+        .collect();
+    store
+        .install_plugin_sources(&agent, 1, &launch_id, &plan, now)
+        .expect("install plugin sources");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:ready"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: format!("{project}:ready"),
+                    data: json!({"command_id":launch_id}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit session ready");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now)
+        .expect("settle launch");
+    agent
+}
+
+#[test]
+fn attention_commit_binds_agent_generation_and_subject_atomically() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_attention_agent(&mut store, "attention-bind", now);
+    let generation = store.get_agent(&agent).unwrap().unwrap().generation;
+    let id = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: id.clone(),
+                target: None,
+                selector: None,
+                verb: "attention.emit".to_owned(),
+                args: json!({"topic": "agent.attention", "data": {"probe": true}}),
+                expected_generation: None,
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit attention emit");
+    store
+        .dispatch(&id, now + 1)
+        .expect("dispatch attention emit");
+    let report = json!({
+        "schema": 1,
+        "incident_id": "attention-test",
+        "phase": "incident",
+        "reason": "source_unhealthy",
+        "agent_id": agent,
+        "generation": generation,
+    });
+    let change = store
+        .commit_attention_event_applied(
+            &id,
+            "x.user.agent.attention",
+            json!({"data": report}),
+            now + 2,
+        )
+        .expect("atomic attention commit");
+    assert_eq!(change.value.state, CommandState::Applied);
+    assert_eq!(change.events.len(), 2);
+    let event = &change.events[0];
+    assert_eq!(event.kind, "x.user.agent.attention");
+    assert_eq!(event.agent.as_deref(), Some(agent.as_str()));
+    assert_eq!(event.generation, Some(generation));
+    // The wire shape stays compatible: the report rides at data.data.
+    assert_eq!(
+        event
+            .data
+            .get("data")
+            .and_then(|data| data.get("agent_id"))
+            .and_then(|id| id.as_str()),
+        Some(agent.as_str())
+    );
+    let expected_state = store.get_agent(&agent).unwrap().unwrap().state;
+    assert_eq!(
+        event
+            .subject
+            .as_ref()
+            .expect("attention carries a subject")
+            .state,
+        expected_state
+    );
+    assert_eq!(change.events[1].kind, "command.applied");
+    // An exact retry returns the recorded result without a new event.
+    let event_count: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .expect("count events after atomic commit");
+    let retry = store
+        .commit_attention_event_applied(
+            &id,
+            "x.user.agent.attention",
+            json!({"data": report}),
+            now + 3,
+        )
+        .expect("idempotent attention retry");
+    assert_eq!(retry.value.state, CommandState::Applied);
+    assert!(retry.events.is_empty());
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count events after retry"),
+        event_count
+    );
+}
+
+#[test]
+fn attention_commit_rejects_stale_evidence_without_a_binding() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_attention_agent(&mut store, "attention-stale", now);
+    let id = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: id.clone(),
+                target: None,
+                selector: None,
+                verb: "attention.emit".to_owned(),
+                args: json!({"topic": "agent.attention", "data": {"probe": true}}),
+                expected_generation: None,
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit attention emit");
+    store
+        .dispatch(&id, now + 1)
+        .expect("dispatch attention emit");
+    let event_count: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .expect("count events before stale commit");
+    let error = store
+        .commit_attention_event_applied(
+            &id,
+            "x.user.agent.attention",
+            json!({"data": {"agent_id": agent, "generation": 999}}),
+            now + 2,
+        )
+        .expect_err("stale generation is rejected");
+    assert_eq!(error.code, "stale_generation");
+    assert_eq!(
+        store.get_command(&id).unwrap().unwrap().state,
+        CommandState::Dispatched
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count events after stale commit"),
+        event_count
+    );
+}
+
+#[test]
+fn public_emit_cannot_use_the_reserved_attention_topic() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_attention_agent(&mut store, "attention-reserved", now);
+    // A public `emit` naming the reserved topic is rejected at admission, so
+    // it can never acquire an authoritative subject binding.
+    let error = store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: Ulid::new().to_string(),
+                target: None,
+                selector: None,
+                verb: "emit".to_owned(),
+                args: json!({"topic": "agent.attention", "data": {"agent_id": agent, "generation": 1}}),
+                expected_generation: None,
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect_err("reserved topic is rejected");
+    assert_eq!(error.code, "invalid");
+    // The internal verb admits only the reserved topic.
+    let error = store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: Ulid::new().to_string(),
+                target: None,
+                selector: None,
+                verb: "attention.emit".to_owned(),
+                args: json!({"topic": "agent.other", "data": {}}),
+                expected_generation: None,
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect_err("internal verb carries only the reserved topic");
+    assert_eq!(error.code, "invalid");
+    // Even a directly admitted public emit can never reach the bound commit:
+    // the bound commit requires the internal verb.
+    let id = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: id.clone(),
+                target: None,
+                selector: None,
+                verb: "emit".to_owned(),
+                args: json!({"topic": "agent.probe", "data": {}}),
+                expected_generation: None,
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit ordinary emit");
+    store.dispatch(&id, now + 1).expect("dispatch emit");
+    let error = store
+        .commit_attention_event_applied(
+            &id,
+            "x.user.agent.attention",
+            json!({"data": {"agent_id": agent, "generation": 1}}),
+            now + 2,
+        )
+        .expect_err("public emit cannot use the bound commit");
+    assert_eq!(error.code, "invalid");
+}
+
+#[test]
+fn startup_lost_agents_returns_bounded_retained_losses() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let lost = ready_attention_agent(&mut store, "attention-startup-lost", now);
+    store.mark_lost(&lost, 1, now + 1).expect("mark lost");
+    let healthy = ready_attention_agent(&mut store, "attention-startup-live", now + 2);
+    let losses = store
+        .startup_lost_agents(8, None)
+        .expect("read startup losses");
+    assert!(
+        losses.iter().any(|loss| {
+            loss.agent == lost && loss.generation == 1 && loss.event_seq.is_some_and(|seq| seq > 0)
+        }),
+        "retained loss carries its latest agent.lost sequence"
+    );
+    assert!(
+        losses.iter().all(|loss| loss.agent != healthy),
+        "live agents are not loss evidence"
+    );
+    let bounded = store
+        .startup_lost_agents(1, None)
+        .expect("bounded startup losses");
+    assert_eq!(bounded.len(), 1);
+}
+
+#[test]
+fn startup_lost_agents_pages_beyond_the_first_bound() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let mut lost_agents = Vec::new();
+    for index in 0..5 {
+        let agent =
+            ready_attention_agent(&mut store, &format!("attention-startup-page-{index}"), now);
+        store
+            .mark_lost(&agent, 1, now + 1 + index)
+            .expect("mark lost");
+        lost_agents.push(agent);
+    }
+    let mut drained = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store
+            .startup_lost_agents(2, after)
+            .expect("read startup loss page");
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().map(|loss| (loss.updated_at, loss.agent_num));
+        drained.extend(page.into_iter().map(|loss| loss.agent));
+        assert!(drained.len() <= lost_agents.len() + 2, "pages stay bounded");
+    }
+    for agent in &lost_agents {
+        assert!(
+            drained.iter().any(|drained| drained == agent),
+            "every eligible loss drains through the cursor"
+        );
+    }
+    // Rows without retained evidence are skipped by the caller, never
+    // synthesized: the query surfaces them with no sequence.
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_attention_agent(&mut store, "attention-startup-noseq", now);
+    store.mark_lost(&agent, 1, now + 1).expect("mark lost");
+    let agent_num = eliot_core::parse_agent_id(&agent).expect("valid Agent id");
+    let pruned: i64 = store
+        .connection
+        .query_row(
+            "SELECT seq FROM events WHERE kind = 'agent.lost' AND agent = ?1 AND generation = 1",
+            [agent_num],
+            |row| row.get(0),
+        )
+        .expect("loss event exists");
+    store
+        .connection
+        .execute("DELETE FROM events WHERE seq = ?1", [pruned])
+        .expect("prune loss evidence");
+    let losses = store
+        .startup_lost_agents(8, None)
+        .expect("read pruned losses");
+    assert_eq!(losses.len(), 1);
+    assert_eq!(
+        losses[0].event_seq, None,
+        "missing evidence surfaces as no sequence, never seq 0"
+    );
 }

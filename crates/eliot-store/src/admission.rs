@@ -1,5 +1,9 @@
 use super::*;
 
+/// Local topic reserved for the internal attention producer. Public `emit`
+/// commands cannot use it; only the internal `attention.emit` verb admits it.
+pub(super) const ATTENTION_RESERVED_TOPIC: &str = "agent.attention";
+
 pub(super) fn command_semantic_payload(request: &SubmitCommand, args: Value) -> Result<Value> {
     let mut payload = json!({
         "target": request.target,
@@ -325,7 +329,11 @@ pub(super) fn submit_tx(
             "native store binding is derived at launch dispatch",
         ));
     }
-    if !derived_rule {
+    // The internal attention verb carries deterministic mutation ids derived
+    // from the retained loss evidence (like rule-derived ids), so its age is
+    // the evidence's age, not a replay signal. Retained bindings still replay
+    // before this check; see `commit_attention_event_applied`.
+    if !derived_rule && request.verb != "attention.emit" {
         validate_id_age(&request.id, now)?;
     }
     if request.selector.is_some() {
@@ -432,9 +440,46 @@ pub(super) fn submit_tx(
                     .map_err(|_| Error::new("invalid", "notify definition is malformed"))?
                     .validate()?;
             } else {
+                let definition =
+                    serde_json::from_value::<core::api::EmitDefinitionArgs>(request.args.clone())
+                        .map_err(|_| Error::new("invalid", "emit definition is malformed"))?;
+                definition.validate()?;
+                if definition.topic == ATTENTION_RESERVED_TOPIC {
+                    return Err(Error::new(
+                        "invalid",
+                        "agent.attention is reserved for the internal attention producer",
+                    ));
+                }
+            }
+            events.push(admit_command(
+                tx,
+                &CommandInsert::targetless_admitted(principal, &request, &payload_digest, now),
+                json!({"command_id": request.id, "verb": request.verb}),
+            )?);
+            None
+        }
+        "attention.emit" => {
+            if request.target.is_some()
+                || request.expected_generation.is_some()
+                || request.expected_turn_id.is_some()
+                || request.request_id.is_some()
+                || request.probe
+                || preparation.is_some()
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "attention.emit is a targetless command without Agent bindings",
+                ));
+            }
+            let definition =
                 serde_json::from_value::<core::api::EmitDefinitionArgs>(request.args.clone())
-                    .map_err(|_| Error::new("invalid", "emit definition is malformed"))?
-                    .validate()?;
+                    .map_err(|_| Error::new("invalid", "attention.emit definition is malformed"))?;
+            definition.validate()?;
+            if definition.topic != ATTENTION_RESERVED_TOPIC {
+                return Err(Error::new(
+                    "invalid",
+                    "attention.emit carries only the reserved attention topic",
+                ));
             }
             events.push(admit_command(
                 tx,

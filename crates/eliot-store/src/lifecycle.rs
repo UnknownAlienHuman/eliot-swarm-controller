@@ -250,6 +250,181 @@ impl Store {
         result
     }
 
+    /// Commit one internal attention `x.user.agent.attention` event with its
+    /// exact Agent/generation binding and event-time subject, together with
+    /// its Applied settlement in a single transaction. The bound report
+    /// carries `agent_id`/`generation` at `data.data`; the persisted subject
+    /// snapshot is captured from the current generation in the same
+    /// transaction. Stale evidence (unknown Agent or generation drift)
+    /// rejects with `stale_generation` and commits nothing, so a superseded
+    /// capture can never acquire an authoritative binding. Reuses the
+    /// `commit_user_event_applied` settlement shape: idempotent Applied
+    /// retries return the recorded result without a new event, and failures
+    /// leave the command for the existing Unknown-conservative path.
+    pub fn commit_attention_event_applied(
+        &mut self,
+        command_id: &str,
+        kind: &str,
+        data: Value,
+        now: i64,
+    ) -> Result<Change<Command>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            if kind != "x.user.agent.attention" {
+                return Err(Error::new("invalid", "not an attention user-event command"));
+            }
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let record = load_command_record(&tx, command_id)?
+                .ok_or_else(|| Error::new("not_found", "user-event command was not found"))?;
+            // Only the internal attention producer admits the `attention.emit`
+            // verb, so a public `emit` can never reach this bound commit even
+            // when its topic names the reserved attention topic.
+            if record.command.verb != "attention.emit" {
+                return Err(Error::new(
+                    "invalid",
+                    "not an internal attention user-event command",
+                ));
+            }
+            if record.target.is_some() || record.command.generation.is_some() {
+                return Err(Error::new(
+                    "invalid",
+                    "user-event command must be targetless",
+                ));
+            }
+            let definition = serde_json::from_value::<core::api::EmitDefinitionArgs>(
+                record.command.args.clone(),
+            )
+            .map_err(|_| Error::new("invalid", "emit definition is malformed"))?;
+            if format!("x.user.{}", definition.topic) != kind {
+                return Err(Error::new(
+                    "invalid",
+                    "user-event kind does not match its command",
+                ));
+            }
+            if definition.topic != "agent.attention" {
+                return Err(Error::new("invalid", "not an attention user-event command"));
+            }
+            if record.state == CommandState::Applied
+                && record
+                    .command
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some(kind)
+            {
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(Change {
+                    value: record.command,
+                    events: Vec::new(),
+                });
+            }
+            if record.state != CommandState::Dispatched {
+                return Err(Error::new(
+                    "bad_state",
+                    "user-event command is not dispatched",
+                ));
+            }
+            let report = data.get("data").ok_or_else(|| {
+                Error::new("invalid", "attention event data must carry its report")
+            })?;
+            let agent_id = report
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::new("invalid", "attention report must carry its agent"))?;
+            let generation = report
+                .get("generation")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| {
+                    Error::new("invalid", "attention report must carry its generation")
+                })?;
+            let agent_num = parse_agent_id(agent_id)?;
+            let current = load_agent_by_num(&tx, agent_num)?;
+            let Some(current) = current else {
+                return Err(Error::new(
+                    "stale_generation",
+                    "attention subject Agent is no longer present",
+                ));
+            };
+            if current.generation != generation {
+                return Err(Error::new(
+                    "stale_generation",
+                    "attention evidence targets a stale generation",
+                ));
+            }
+            let mut events = Vec::new();
+            events.push(insert_daemon_event_for_command(
+                &tx,
+                command_id,
+                DaemonEventInput::new(now, kind, "user", Some(agent_num), Some(generation), data),
+            )?);
+            let outcome = json!({"kind": kind, "seq": events[0].seq});
+            validate_settle_outcome(CommandState::Applied, &Some(outcome.clone()))?;
+            check_settle_verb_guards(
+                &tx,
+                &record,
+                CommandState::Applied,
+                &Some(outcome.clone()),
+                command_id,
+            )?;
+            if !core::command_transition_allowed(record.state, CommandState::Applied) {
+                return Err(Error::new(
+                    "bad_state",
+                    "command state transition is not allowed for ordinary settlement",
+                ));
+            }
+            let target = record.target;
+            let command_generation = record.command.generation;
+            update_command_state(
+                &tx,
+                command_id,
+                CommandState::Applied,
+                Some(&outcome),
+                None,
+                now,
+            )?;
+            events.push(insert_daemon_command_event(
+                &tx,
+                now,
+                "command.applied",
+                target,
+                command_generation,
+                command_id,
+                json!({"command_id": command_id, "state": "applied", "outcome": outcome}),
+            )?);
+            release_settle_capacity(
+                &tx,
+                &record,
+                CommandState::Applied,
+                command_id,
+                false,
+                now,
+                &mut events,
+            )?;
+            apply_settle_agent_transition(
+                &tx,
+                &record,
+                CommandState::Applied,
+                command_id,
+                false,
+                now,
+                &mut events,
+            )?;
+            let record = load_command_record(&tx, command_id)?
+                .ok_or_else(|| Error::new("internal", "settled command disappeared"))?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(Change {
+                value: record.command,
+                events,
+            })
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     /// Commit one rule `mail.send` child together with its Applied settlement
     /// in a single transaction: validate the Dispatched child and its frozen
     /// definition, perform the queued-mail effect, record Applied with the
