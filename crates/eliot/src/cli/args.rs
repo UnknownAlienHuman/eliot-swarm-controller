@@ -132,6 +132,8 @@ pub(crate) enum CliCommand {
     Events(EventsArgs),
     /// Wait for a frozen set of child commands/turns with all/any semantics.
     Wait(WaitArgs),
+    /// Register a durable completion digest delivering one coalesced parent mailbox result.
+    Digest(DigestArgs),
     /// Send, read or acknowledge addressed Agent mail.
     Msg(MsgArgs),
     /// Read one page of unread mail for a mailbox.
@@ -590,6 +592,22 @@ pub(crate) struct WaitArgs {
     pub(crate) any: bool,
     #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
     pub(crate) timeout_seconds: u64,
+    /// Command ids, or `agent/generation/turn_id` for exact turn bindings.
+    #[arg(value_name = "ID")]
+    pub(crate) ids: Vec<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct DigestArgs {
+    /// Complete when every entry is terminal.
+    #[arg(long, conflicts_with = "any")]
+    pub(crate) all: bool,
+    /// Complete when any entry is terminal.
+    #[arg(long, conflicts_with = "all")]
+    pub(crate) any: bool,
+    /// Parent Agent mailbox for the one coalesced result.
+    #[arg(long, value_name = "AGENT")]
+    pub(crate) to: String,
     /// Command ids, or `agent/generation/turn_id` for exact turn bindings.
     #[arg(value_name = "ID")]
     pub(crate) ids: Vec<String>,
