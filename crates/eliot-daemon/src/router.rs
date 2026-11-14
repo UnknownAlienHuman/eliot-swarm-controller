@@ -1751,18 +1751,6 @@ impl Router {
                 .and_then(Value::as_str)
                 .ok_or_else(|| Error::new("invalid", "launch harness must be a non-empty string"))?
                 .to_owned();
-            // OpenCode start always transfers one stored auth integration
-            // into the isolated native store; auth selection stays
-            // profile-only with no ad-hoc default, so no ad-hoc OpenCode
-            // launch can pass the plugin start gate. Refuse at the freeze
-            // boundary with the typed reason instead of stranding an
-            // unknown launch after creating the Agent.
-            if harness == "opencode" {
-                return Err(Error::new(
-                    "profile_error",
-                    "ad-hoc opencode launch requires a stored profile with an explicit auth_integration selector",
-                ));
-            }
             let model = request
                 .args
                 .get("model")
@@ -1771,6 +1759,19 @@ impl Router {
             let effort = request
                 .args
                 .get("effort")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(auth) = request.args.get("auth")
+                && !auth.is_string()
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "launch auth must be an integration selector string",
+                ));
+            }
+            let auth = request
+                .args
+                .get("auth")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             if let Some(cmd) = request.args.get("cmd")
@@ -1794,8 +1795,13 @@ impl Router {
                 Some(cmd) => Some(cmd),
                 None => crate::adhoc::discover_cmd_for_harness(&harness)?,
             };
-            let mut snapshot =
-                crate::adhoc::adhoc_snapshot(&harness, model.as_deref(), effort.as_deref(), cmd)?;
+            let mut snapshot = crate::adhoc::adhoc_snapshot(
+                &harness,
+                model.as_deref(),
+                effort.as_deref(),
+                cmd,
+                auth.as_deref(),
+            )?;
             crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                 std::env::var_os(name)
             })?;
@@ -1806,10 +1812,10 @@ impl Router {
                 .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
                 .to_owned();
             let profile_name = crate::adhoc::adhoc_profile_name(&harness);
-            // Keep the requested harness/model/effort/cmd beside the frozen
-            // snapshot: same-ID retries bind the exact requested payload
-            // (a changed model is id_conflict), while the frozen snapshot
-            // stays the replay-stable source for dispatch.
+            // Keep the requested harness/model/effort/cmd/auth beside the
+            // frozen snapshot: same-ID retries bind the exact requested
+            // payload (a changed model is id_conflict), while the frozen
+            // snapshot stays the replay-stable source for dispatch.
             if let Some(args) = request.args.as_object_mut() {
                 args.insert("profile".to_owned(), Value::String(profile_name));
             }
@@ -2538,7 +2544,7 @@ impl Router {
                     Some(cmd) => Some(cmd),
                     None => crate::adhoc::discover_cmd_for_harness(&harness)?,
                 };
-                let mut snapshot = crate::adhoc::adhoc_snapshot(&harness, None, None, cmd)?;
+                let mut snapshot = crate::adhoc::adhoc_snapshot(&harness, None, None, cmd, None)?;
                 crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                     std::env::var_os(name)
                 })?;
@@ -5032,7 +5038,7 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
     // Absence is optional only for an Agent principal, whose child
     // reuses the parent's frozen snapshot; every other caller requires it.
     // Ad-hoc Owner launch names a harness instead of a profile, with
-    // optional model/effort; profile and harness are mutually exclusive.
+    // optional model/effort/auth; profile and harness are mutually exclusive.
     if let Some(harness) = args.get("harness") {
         let Some(name) = harness.as_str().filter(|name| !name.trim().is_empty()) else {
             return Err(Error::new(
@@ -5050,7 +5056,7 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
         if args.get("parent").is_some() {
             return Err(Error::new("invalid", "ad-hoc launch cannot have a parent"));
         }
-        for field in ["model", "effort"] {
+        for field in ["model", "effort", "auth"] {
             if let Some(value) = args.get(field)
                 && value.as_str().is_none_or(|text| text.trim().is_empty())
             {
@@ -5061,7 +5067,7 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
             }
         }
     } else {
-        for field in ["model", "effort"] {
+        for field in ["model", "effort", "auth"] {
             if args.get(field).is_some() {
                 return Err(Error::new(
                     "invalid",
@@ -13568,34 +13574,6 @@ mod run_authorization_tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, "not_allowed");
-    }
-
-    #[tokio::test]
-    async fn adhoc_opencode_launch_requires_stored_profile() {
-        let router = router();
-        let mut request = SubmitCommand {
-            id: ulid::Ulid::new().to_string().to_ascii_lowercase(),
-            target: None,
-            selector: None,
-            verb: "launch".to_owned(),
-            args: json!({"harness": "opencode", "model": "opencode/deepseek-v4.1-flash-free", "workspace": "/tmp"}),
-            expected_generation: None,
-            expected_turn_id: None,
-            request_id: None,
-            probe: false,
-        };
-        // The refusal sits before discovery, so it holds with or without the
-        // native executable installed; auth selection stays profile-only.
-        normalize_launch(&mut request, &Principal::Owner).expect("ad-hoc shape is valid");
-        let error = router
-            .freeze_launch_profile(&Principal::Owner, &mut request)
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, "profile_error");
-        assert_eq!(
-            error.message,
-            "ad-hoc opencode launch requires a stored profile with an explicit auth_integration selector"
-        );
     }
 
     #[tokio::test]

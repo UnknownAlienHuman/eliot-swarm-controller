@@ -248,7 +248,7 @@ pub(crate) struct LaunchArgs {
     pub(crate) profile: Option<String>,
     /// Ad-hoc Owner launch harness (codex|claude|muse|opencode|antigravity).
     /// The daemon freezes a profile-equivalent snapshot from built-in
-    /// per-harness defaults plus --model/--effort. Owner-only.
+    /// per-harness defaults plus --model/--effort/--auth. Owner-only.
     #[arg(long, value_name = "HARNESS")]
     pub(crate) harness: Option<String>,
     /// Ad-hoc model id; omitted uses the harness native default.
@@ -258,6 +258,12 @@ pub(crate) struct LaunchArgs {
     /// Only Codex and Muse map effort; other harnesses reject it.
     #[arg(long, value_name = "EFFORT")]
     pub(crate) effort: Option<String>,
+    /// Ad-hoc auth integration; OpenCode-only. An explicit selector freezes
+    /// verbatim like the profile's auth_integration; omitted defaults to
+    /// the model provider prefix when the native auth list holds exactly
+    /// that id. Requires --harness.
+    #[arg(long, value_name = "INTEGRATION")]
+    pub(crate) auth: Option<String>,
     /// Explicit native executable, overriding discovery (e.g. to pin the
     /// Muse binary version the launcher marks current). Requires --harness.
     #[arg(long, value_name = "PATH")]

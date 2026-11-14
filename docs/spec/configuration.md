@@ -72,8 +72,8 @@ pass_env = ["CODEX_HOME"]
 
 ## Ad-hoc Owner launch (no stored profile)
 
-`swarm launch --harness <codex|claude|muse|antigravity>
-[--model M] [--effort E] [--cmd PATH] --workspace W "prompt"` (and the same in
+`swarm launch --harness <codex|claude|muse|opencode|antigravity>
+[--model M] [--effort E] [--auth I] [--cmd PATH] --workspace W "prompt"` (and the same in
 `command.submit` `launch` args, where `cmd` rides beside `model`/`effort` in
 the exact retry-bound payload) is an Owner-only tool that builds and freezes
 a profile-equivalent snapshot exactly like a stored profile: built-in safe
@@ -100,11 +100,17 @@ launcher dir version the launcher marks current, Codex via the existing
 when the harness needs a different binary). `--cmd` pins one explicit native
 executable instead (e.g. a Muse binary version the launcher no longer marks
 current). A missing or ambiguous executable is a clear
-`unsupported`/`profile_error` naming what was searched. Agent principals keep
+`unsupported`/`profile_error` naming what was searched. `--auth` is
+OpenCode-only (other harnesses reject it as `unsupported`): an explicit
+selector freezes verbatim like the profile's `auth_integration`, while an
+omitted one defaults to the model provider prefix only when the native
+`opencode auth list` holds an entry with exactly that id. Anything else
+refuses before spawning with a typed `profile_error` naming `--auth` and
+listing the available integration ids; another provider's credential is never
+picked silently, and the plugin's pre-serve transfer gate is unchanged.
+Agent principals keep
 the profile and `child_profiles` rules; they cannot ad-hoc launch
-(`not_allowed`). Ad-hoc OpenCode launch is refused (`profile_error`): auth
-selection stays profile-only, so an OpenCode turn needs a stored profile
-with an explicit `auth_integration` selector.
+(`not_allowed`).
 
 The profile author supplies an exact model string. Reasoning effort is optional
 on every Codex route: when the profile omits `effort`, the plugin omits the

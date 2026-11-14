@@ -600,14 +600,17 @@ Worktree creation is opt-in on the same launch command:
 ```text
 command.submit {id, verb:"launch",
   args:{profile?:NAME, harness?:HARNESS, model?:MODEL, effort?:EFFORT, cmd?:PATH,
+        auth?:INTEGRATION,
         workspace, worktree?:BRANCH, base?:REF, parent?:AGENT, text?}}
 ```
 
 A parentless Owner launch names either a stored `profile` or an ad-hoc
-`harness` (mutually exclusive); `model`/`effort`/`cmd` are ad-hoc only and
-require `harness` (`cmd` pins the native executable, e.g. a Muse binary
-version the launcher no longer marks current). Ad-hoc launch is Owner-only
-and freezes a profile-equivalent
+`harness` (mutually exclusive); `model`/`effort`/`cmd`/`auth` are ad-hoc
+only and require `harness` (`cmd` pins the native executable, e.g. a Muse
+binary version the launcher no longer marks current; OpenCode-only `auth`
+pins the native auth integration, defaulting to the model provider prefix
+when the native auth list holds exactly that id). Ad-hoc launch is
+Owner-only and freezes a profile-equivalent
 snapshot from built-in safe defaults plus flags (see
 [configuration](configuration.md#ad-hoc-owner-launch-no-stored-profile));
 Agent principals keep the profile and `child_profiles` rules and cannot

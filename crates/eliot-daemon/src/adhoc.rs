@@ -82,16 +82,49 @@ fn validate_adhoc_effort(harness: &str, effort: &str) -> core::Result<String> {
     Ok(trimmed.to_owned())
 }
 
+/// Longest accepted ad-hoc auth selector, in bytes. Mirrors the plugin's
+/// `IntegrationSelector` rule so the frozen value always passes the
+/// profile-side check.
+const MAX_AUTH_SELECTOR_BYTES: usize = 128;
+
+/// Ad-hoc auth shape: only the OpenCode slice transfers a canonical auth
+/// integration, so only it accepts `--auth`. The syntax mirrors the
+/// profile's `auth_integration` selector.
+fn validate_adhoc_auth(harness: &str, auth: &str) -> core::Result<String> {
+    if harness != "opencode" {
+        return Err(core::Error::new(
+            "unsupported",
+            format!("the {harness} slice has no auth-integration mapping"),
+        ));
+    }
+    let trimmed = auth.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_AUTH_SELECTOR_BYTES
+        || trimmed.starts_with('-')
+        || trimmed.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(core::Error::new(
+            "profile_error",
+            "ad-hoc auth must be a non-empty selector of at most 128 characters with no leading dash or controls",
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
 /// Build and freeze an ad-hoc snapshot from per-harness safe defaults plus
-/// the requested model/effort. `cmd` is the already-discovered absolute
+/// the requested model/effort/auth. `cmd` is the already-discovered absolute
 /// native path for harnesses that require one, or `None` for Codex (which
 /// launches `codex` by name). An omitted model/effort stays absent so the
 /// plugin applies the harness native default and reports it separately.
+/// `auth` is OpenCode-only: an explicit selector freezes verbatim, an
+/// omitted one defaults to the model provider prefix when the native auth
+/// list holds exactly that id, and anything else refuses before spawning.
 pub(crate) fn adhoc_snapshot(
     harness: &str,
     model: Option<&str>,
     effort: Option<&str>,
     cmd: Option<String>,
+    auth: Option<&str>,
 ) -> core::Result<Value> {
     let harness = validate_adhoc_harness(harness)?;
     let model = model
@@ -102,16 +135,15 @@ pub(crate) fn adhoc_snapshot(
         .filter(|value| !value.trim().is_empty())
         .map(|value| validate_adhoc_effort(&harness, value))
         .transpose()?;
+    let auth = auth
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| validate_adhoc_auth(&harness, value))
+        .transpose()?;
     if harness == "antigravity" && model.is_none() {
         return Err(core::Error::new(
             "profile_error",
             "ad-hoc antigravity launch requires an explicit model",
         ));
-    }
-    if harness == "opencode" && model.is_none() {
-        // The OpenCode slice splits provider/model at the first slash; an
-        // absent model leaves the configured native default to the plugin.
-        // Auth selection stays profile-only until a default is defined.
     }
     if let Some(model) = model.as_deref()
         && harness == "opencode"
@@ -201,10 +233,28 @@ pub(crate) fn adhoc_snapshot(
                 )
             })?;
             let validated = validate_native_cmd(&profile_name, &cmd)?;
+            // An explicit selector freezes verbatim; an omitted one defaults
+            // to the model provider prefix only on an exact auth-list id
+            // match, and anything else refuses before spawning. The plugin's
+            // pre-serve transfer gate is unchanged: it still requires the
+            // frozen integration to hold exactly one canonical credential.
+            let selector = match auth {
+                Some(explicit) => explicit,
+                None => {
+                    let ids = opencode_auth_ids(&validated).ok_or_else(|| {
+                        core::Error::new(
+                            "profile_error",
+                            "ad-hoc opencode launch needs --auth <integration>; the native auth list could not be read",
+                        )
+                    })?;
+                    resolve_opencode_default(model.as_deref(), &ids)?
+                }
+            };
             snapshot.insert("cmd".to_owned(), Value::String(validated));
             if let Some(model) = model {
                 snapshot.insert("model".to_owned(), Value::String(model));
             }
+            snapshot.insert("auth_integration".to_owned(), Value::String(selector));
         }
         "antigravity" => {
             let cmd = cmd.ok_or_else(|| {
@@ -832,6 +882,108 @@ fn native_version(program: &str) -> Value {
     native_version_string(program).map_or(Value::Null, Value::String)
 }
 
+/// Bound on one `<exe> auth list` read: a hung native executable must not
+/// stall ad-hoc launch admission for every Owner.
+const AUTH_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Largest accepted `auth list` document. List output is metadata (hundreds
+/// of bytes observed); anything larger is unreadable, never truncated.
+const MAX_AUTH_LIST_BYTES: usize = 64 * 1024;
+
+/// Read-only native integration ids from `<exe> auth list --format json
+/// --standalone`: the canonical store the plugin's pre-serve transfer also
+/// reads. Only nonsecret ids leave this function; connection bodies stay
+/// unread. `None` when the helper cannot be spawned, times out, exits
+/// non-zero, or its document is unreadable.
+fn opencode_auth_ids(program: &str) -> Option<Vec<String>> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(program)
+        .args(["auth", "list", "--format", "json", "--standalone"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + AUTH_LIST_TIMEOUT;
+    let exited = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !exited {
+        return None;
+    }
+    let mut stdout = Vec::new();
+    let read_ok = child
+        .stdout
+        .take()
+        .is_some_and(|mut pipe| pipe.read_to_end(&mut stdout).is_ok());
+    if !read_ok || stdout.len() > MAX_AUTH_LIST_BYTES {
+        return None;
+    }
+    let entries: Vec<Value> = serde_json::from_slice(&stdout).ok()?;
+    Some(
+        entries
+            .iter()
+            .filter_map(|entry| entry.get("id")?.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// Human-countable integration list for refusal messages: ids only, no
+/// secrets, bounded with a remainder count.
+fn describe_integrations(ids: &[String]) -> String {
+    const SHOWN: usize = 32;
+    if ids.is_empty() {
+        return "(none)".to_owned();
+    }
+    let shown: Vec<&str> = ids.iter().take(SHOWN).map(String::as_str).collect();
+    let mut text = shown.join(", ");
+    if ids.len() > SHOWN {
+        text.push_str(&format!(" (+{} more)", ids.len() - SHOWN));
+    }
+    text
+}
+
+/// Default an omitted ad-hoc OpenCode auth selector to the model provider
+/// prefix, but only on an exact native auth-list id match. Never picks
+/// another provider's credential: a missing prefix, an absent model, or an
+/// unreadable list refuses with a typed error naming `--auth` and the
+/// available integration ids.
+fn resolve_opencode_default(model: Option<&str>, ids: &[String]) -> core::Result<String> {
+    let prefix = model
+        .and_then(split_provider_model)
+        .map(|(provider, _)| provider.to_owned());
+    match prefix {
+        Some(prefix) if ids.iter().any(|id| id == &prefix) => Ok(prefix),
+        Some(prefix) => Err(core::Error::new(
+            "profile_error",
+            format!(
+                "ad-hoc opencode launch needs --auth <integration> for provider '{prefix}'; available integrations: {}",
+                describe_integrations(ids)
+            ),
+        )),
+        None => Err(core::Error::new(
+            "profile_error",
+            format!(
+                "ad-hoc opencode launch needs --auth <integration>; available integrations: {}",
+                describe_integrations(ids)
+            ),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,7 +991,8 @@ mod tests {
 
     #[test]
     fn adhoc_snapshot_freezes_flags_plus_safe_defaults() {
-        let snapshot = adhoc_snapshot("codex", Some("gpt-6-luna"), Some("medium"), None).unwrap();
+        let snapshot =
+            adhoc_snapshot("codex", Some("gpt-6-luna"), Some("medium"), None, None).unwrap();
         assert_eq!(snapshot["harness"], json!("codex"));
         assert_eq!(snapshot["model"], json!("gpt-6-luna"));
         assert_eq!(snapshot["effort"], json!("medium"));
@@ -859,7 +1012,7 @@ mod tests {
 
     #[test]
     fn adhoc_snapshot_omits_absent_model_and_effort_for_native_default() {
-        let snapshot = adhoc_snapshot("codex", None, None, None).unwrap();
+        let snapshot = adhoc_snapshot("codex", None, None, None, None).unwrap();
         assert!(snapshot.get("model").is_none());
         assert!(snapshot.get("effort").is_none());
         let snapshot = adhoc_snapshot(
@@ -867,13 +1020,20 @@ mod tests {
             None,
             None,
             Some(r"C:\Tools\MuseCode\muse-bin-1.exe".to_owned()),
+            None,
         )
         .unwrap();
         assert!(snapshot.get("model").is_none());
         assert!(snapshot.get("effort").is_none());
         // Claude omits both so the CLI default applies.
-        let snapshot =
-            adhoc_snapshot("claude", None, None, Some(r"C:\bin\claude.exe".to_owned())).unwrap();
+        let snapshot = adhoc_snapshot(
+            "claude",
+            None,
+            None,
+            Some(r"C:\bin\claude.exe".to_owned()),
+            None,
+        )
+        .unwrap();
         assert!(snapshot.get("model").is_none());
         assert!(snapshot.get("effort").is_none());
     }
@@ -886,6 +1046,7 @@ mod tests {
                 Some("model"),
                 Some("medium"),
                 Some(r"C:\bin\native.exe".to_owned()),
+                None,
             )
             .unwrap_err();
             assert_eq!(error.code, "unsupported", "{harness}");
@@ -894,7 +1055,7 @@ mod tests {
 
     #[test]
     fn adhoc_snapshot_rejects_unknown_harness() {
-        let error = adhoc_snapshot("fake", None, None, None).unwrap_err();
+        let error = adhoc_snapshot("fake", None, None, None, None).unwrap_err();
         assert_eq!(error.code, "unsupported");
     }
 
@@ -905,6 +1066,7 @@ mod tests {
             None,
             None,
             Some(r"C:\bin\Antigravity.exe".to_owned()),
+            None,
         )
         .unwrap_err();
         assert_eq!(error.code, "profile_error");
@@ -917,9 +1079,79 @@ mod tests {
             Some("no-slash"),
             None,
             Some(r"C:\bin\opencode.exe".to_owned()),
+            None,
         )
         .unwrap_err();
         assert_eq!(error.code, "profile_error");
+    }
+
+    #[test]
+    fn adhoc_opencode_freezes_explicit_auth_verbatim() {
+        // Explicit --auth needs no native read: the frozen value passes the
+        // profile-side selector rule and the plugin transfer gates it.
+        let snapshot = adhoc_snapshot(
+            "opencode",
+            Some("opencode/deepseek-v4.1-flash-free"),
+            None,
+            Some(r"C:\bin\opencode.exe".to_owned()),
+            Some("opencode-go"),
+        )
+        .unwrap();
+        assert_eq!(snapshot["auth_integration"], json!("opencode-go"));
+        assert_eq!(
+            snapshot["model"],
+            json!("opencode/deepseek-v4.1-flash-free")
+        );
+        for bad in ["", "  ", "-flag", "has\ncontrol"] {
+            assert_eq!(
+                validate_adhoc_auth("opencode", bad).unwrap_err().code,
+                "profile_error",
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            validate_adhoc_auth("codex", "openrouter").unwrap_err().code,
+            "unsupported"
+        );
+    }
+
+    #[test]
+    fn adhoc_opencode_defaults_auth_to_provider_prefix_on_exact_id() {
+        let ids = ["opencode-go".to_owned(), "openrouter".to_owned()];
+        assert_eq!(
+            resolve_opencode_default(Some("opencode-go/model"), &ids).unwrap(),
+            "opencode-go"
+        );
+        // Nested model ids split at the first slash only.
+        assert_eq!(
+            resolve_opencode_default(Some("openrouter/stealth/crouton-alpha"), &ids).unwrap(),
+            "openrouter"
+        );
+    }
+
+    #[test]
+    fn adhoc_opencode_refuses_auth_without_exact_id_match() {
+        let ids = ["opencode-go".to_owned(), "openrouter".to_owned()];
+        // The provider prefix is absent: the refusal names --auth and lists
+        // the available integration ids, never picking another provider.
+        let error =
+            resolve_opencode_default(Some("opencode/deepseek-v4.1-flash-free"), &ids).unwrap_err();
+        assert_eq!(error.code, "profile_error");
+        assert!(error.message.contains("--auth"), "{}", error.message);
+        assert!(error.message.contains("opencode-go"), "{}", error.message);
+        assert!(error.message.contains("openrouter"), "{}", error.message);
+        assert!(
+            !error.message.contains("opencode/deepseek"),
+            "{}",
+            error.message
+        );
+        // An absent model cannot default either.
+        let error = resolve_opencode_default(None, &ids).unwrap_err();
+        assert_eq!(error.code, "profile_error");
+        assert!(error.message.contains("--auth"), "{}", error.message);
+        // An empty store lists (none) instead of naming a secret-free blank.
+        let error = resolve_opencode_default(Some("opencode/m"), &[]).unwrap_err();
+        assert!(error.message.contains("(none)"), "{}", error.message);
     }
 
     #[test]
@@ -936,8 +1168,14 @@ mod tests {
         assert!(!is_script_wrapper(
             r"C:\Tools\MuseCode\muse-bin-1.4.20-R8619.1.exe"
         ));
-        let error = adhoc_snapshot("claude", None, None, Some(r"C:\bin\claude.cmd".to_owned()))
-            .unwrap_err();
+        let error = adhoc_snapshot(
+            "claude",
+            None,
+            None,
+            Some(r"C:\bin\claude.cmd".to_owned()),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(error.code, "profile_error");
     }
 
@@ -982,13 +1220,14 @@ mod tests {
         // binary the launcher no longer marks current); discovery is
         // bypassed and the path is frozen exactly as given.
         let pinned = r"C:\Tools\MuseCode\muse-bin-1.4.0-R4161.1.exe";
-        let snapshot = adhoc_snapshot("muse", None, None, Some(pinned.to_owned())).unwrap();
+        let snapshot = adhoc_snapshot("muse", None, None, Some(pinned.to_owned()), None).unwrap();
         assert_eq!(snapshot["cmd"], json!(pinned));
         let error = adhoc_snapshot(
             "muse",
             None,
             None,
             Some(r"C:\Tools\MuseCode\muse.cmd".to_owned()),
+            None,
         )
         .unwrap_err();
         assert_eq!(error.code, "profile_error");
