@@ -30,14 +30,9 @@ slash only (see below).
 The model provider and the transferred credential are independent: the
 `opencode` provider carries its own server-side credential (it has no
 canonical `auth list` entry), so any transferable canonical credential
-satisfies the required pre-serve transfer. Verified 2026-11-14 against
-`opencode serve` v2.2.7 through the isolated per-Agent store: the
-`opencode-go` credential transfers, and `opencode/deepseek-v4.1-flash-free`
-completes a turn. The `opencode-go/*` models are refused upstream with
-`provider.auth` 403 "Workspace access denied" on every directory and store
-(including the native CLI outside Eliot), and the owner default
-`opencode/muse-spark-1.3-contributor-free` is a stale alias the server
-answers with "Model unavailable".
+satisfies the required pre-serve transfer. A provider-side refusal (for
+example `provider.auth` 403) surfaces as the turn's native failure with its
+message; the adapter never retries it on another provider or model.
 
 ## Authentication
 
