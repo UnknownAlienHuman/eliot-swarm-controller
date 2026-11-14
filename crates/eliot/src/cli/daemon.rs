@@ -137,7 +137,7 @@ pub(crate) async fn start_daemon(data_dir: &Path, json_output: bool) -> Result<u
         .map_err(|error| Failure::new(1, format!("cannot start daemon: {error}")))?;
     #[cfg(not(windows))]
     {
-        let executable = env::current_exe()
+        let executable = std::env::current_exe()
             .map_err(|error| Failure::new(1, format!("cannot locate Eliot executable: {error}")))?;
         let mut command = ProcessCommand::new(executable);
         command
