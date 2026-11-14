@@ -166,6 +166,137 @@ impl PluginHost {
             .map_err(|_| Error::new("unavailable", "profile.store reader stopped"))?
     }
 
+    /// Read-only native model catalogue for `harness.models`. A dedicated
+    /// metadata reader calls the harness's own `model.list` with no session,
+    /// no turn and no inference. The caller supplies a frozen profile
+    /// snapshot (ad-hoc or named) whose `cmd` names the native executable.
+    pub(crate) async fn models(&self, profile: Value) -> Result<Value> {
+        if !profile
+            .get("harness")
+            .and_then(Value::as_str)
+            .is_some_and(|harness| matches!(harness, "codex" | "muse" | "opencode"))
+        {
+            return Err(Error::new(
+                "unsupported",
+                "harness.models needs a codex, muse or opencode profile",
+            ));
+        }
+        let environment = Value::Object(build_process_environment(&profile)?);
+        let (id, stop_rx, done_tx) = self.register_metadata_reader()?;
+        let host = self.clone();
+        let (reply, response) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let completion = host
+                .read_model_catalogue(profile, environment, stop_rx)
+                .await;
+            host.finish_metadata_reader(&id, done_tx, completion.cleanup);
+            let _ = reply.send(completion.result);
+        });
+        response
+            .await
+            .map_err(|_| Error::new("unavailable", "model.list reader stopped"))?
+    }
+
+    async fn read_model_catalogue(
+        &self,
+        profile: Value,
+        environment: Value,
+        mut stop: watch::Receiver<Option<Instant>>,
+    ) -> MetadataRead<Value> {
+        if stop.borrow().is_some() {
+            return MetadataRead {
+                result: Err(Error::new(
+                    "cancelled",
+                    "model.list was cancelled before spawn",
+                )),
+                cleanup: ReaderCleanup::Confirmed,
+            };
+        }
+        let Some(harness) = profile["harness"].as_str() else {
+            return MetadataRead {
+                result: Err(Error::new("invalid", "missing harness")),
+                cleanup: ReaderCleanup::Confirmed,
+            };
+        };
+        let harness = harness.to_owned();
+        let opened = self
+            .open_reader_with_cleanup(
+                &AgentKey {
+                    id: "model-list".to_owned(),
+                    generation: 0,
+                },
+                &harness,
+                &profile,
+                &environment,
+                None,
+            )
+            .await;
+        let mut reader = match opened.result {
+            Ok(reader) => reader,
+            Err(error) => {
+                return failed_metadata_open(error, opened.cleanup_confirmed, "model.list");
+            }
+        };
+        let mut known: Vec<_> = self.state.secrets.lock_recover().iter().cloned().collect();
+        known.extend([self.state.owner_token.clone(), reader.credential.clone()]);
+        let metadata_secrets = metadata_secret_snapshot(&profile, &environment, known);
+        let until = Instant::now() + READER_DEADLINE;
+        let read = async {
+            let manifest = reader.initialize(&harness, until).await?;
+            require_proxy_capability(&profile, &manifest)?;
+            let request = serde_json::json!({"profile": profile});
+            let value = reader.client.call("model.list", request, until).await?;
+            if SecretPolicy::new(metadata_secrets.iter()).contains_value(&value) {
+                return Err(Error::new(
+                    "source_integrity",
+                    "model.list metadata contains reserved credentials",
+                ));
+            }
+            let mut value: Value = value;
+            if value.get("models").and_then(Value::as_array).is_none() {
+                return Err(Error::new(
+                    "source_integrity",
+                    "model.list catalogue is malformed",
+                ));
+            }
+            if let Some(models) = value.get_mut("models").and_then(Value::as_array_mut)
+                && models.len() > 1024
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "model.list catalogue exceeds 1024 entries",
+                ));
+            }
+            Ok(value)
+        };
+        let result = tokio::select! {
+            result = tokio::time::timeout_at(until, read) =>
+                result.unwrap_or_else(|_| Err(Error::new("unavailable", "model.list deadline exceeded"))),
+            _ = stop.changed() => Err(Error::new("cancelled", "model.list was cancelled")),
+        };
+        let secrets = reader.secrets.clone();
+        let close_until = metadata_reader_close_deadline(&stop);
+        let closure = reader.close_until(self, None, close_until).await;
+        let result = require_reader_cleanup(result, closure.closed, "model.list");
+        let result = result.map_err(|error| {
+            let error = redact_native_error(
+                error.with_stderr(StderrSource::Plugin, closure.stderr),
+                &secrets,
+            );
+            crate::logging::record(
+                &SecretPolicy::new(secrets.iter()),
+                &error.code,
+                &[("operation", "model.list")],
+                Some(&error),
+            );
+            error
+        });
+        MetadataRead {
+            result,
+            cleanup: cleanup_state(closure.closed),
+        }
+    }
+
     fn register_metadata_reader(
         &self,
     ) -> Result<(

@@ -180,8 +180,9 @@ turn `unknown` with the recorded gap through the shared turn-unknown path
 never as success or failure. The turn binding clears only after that terminal
 write is acknowledged; a failed write keeps the binding and retries on the
 next opportunity instead of stranding the Store turn. The plugin host stays
-alive and the Agent is not marked lost; the session remains for a later
-send/stop. Later facts for that turn gap instead of resurrecting it, and
+alive and the Agent is not marked lost; the session remains for stop/readback
+and owner resolution, while a later send queues behind the unknown-turn gate
+until that turn is explicitly resolved (core.md turn/input gates). Later facts for that turn gap instead of resurrecting it, and
 interrupt/stop afterwards behave as for any unknown turn. Subscription
 admission alone, or a timer, never proves native turn completion or
 process/session exit; a bounded durable page proving the exact terminal does.
@@ -370,3 +371,16 @@ Do not assume a generic base-URL override. Use explicit native account/billing p
 and report what the host actually exposes. L7 covers lost replies, exact request/turn
 binding, cursor/gaps, stale approval snapshots, child lifetime and long-session behavior.
 No adapter-specific journal, proof receipts or secondary workflow model is imported.
+
+## Ad-hoc launch
+
+`swarm launch --harness muse [--model M] [--effort E] --workspace W "prompt"`
+is Owner-only and freezes a profile-equivalent snapshot from safe defaults
+(`workspace-write`, `never`, MCP `inherit`) plus flags. An omitted `--model`
+defers to the server default (the catalogue names no default marker; an empty
+catalogue, e.g. Muse 1.4.20's `bundledCatalog` with zero models, fails
+honestly); the effective id is read back from the session. An unavailable
+requested model fails without substitution. `cmd` is discovered from the
+launcher dir version the launcher marks current (`muse.cmd` wrappers are never
+frozen). `swarm models --harness muse` returns the live native catalogue;
+note it carries no default marker.

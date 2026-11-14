@@ -106,7 +106,10 @@ struct StartPlan {
     config_dir: Option<String>,
     credential: String,
     session_id: String,
-    requested_model: String,
+    /// Requested model id, or `None` when the profile omitted it and the
+    /// CLI default applies (`--model` omitted; effective read back from
+    /// initialize/stream).
+    requested_model: Option<String>,
     requested_permission_mode: Option<String>,
     /// Frozen Claude Code `--effort` level (closed CLI vocabulary); absent
     /// keeps the CLI default.
@@ -638,14 +641,14 @@ impl ClaudePlugin {
                 "Claude plugin received a profile for another harness",
             ));
         }
-        let requested_model = profile
+        // An omitted model omits `--model` so the CLI default applies; the
+        // effective model is read back from initialize/stream. Requested
+        // stays absent separately from the effective readback.
+        let requested_model: Option<String> = profile
             .get("model")
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                Error::new("profile_error", "Claude profile requires an exact model id")
-            })?
-            .to_owned();
+            .map(str::to_owned);
         // The daemon freezes the closed CLI permission-mode vocabulary here;
         // unset means the CLI-default posture.
         let requested_permission_mode =
@@ -900,9 +903,14 @@ impl ClaudePlugin {
                     .await);
             }
         };
-        let model_available = readback.models.iter().any(|model| {
-            model.value.as_deref() == Some(plan.requested_model.as_str())
-                || model.resolved_model.as_deref() == Some(plan.requested_model.as_str())
+        // An omitted request accepts the CLI default: availability is
+        // proven by the idle session itself, and the effective model is
+        // read back below. An explicit request must name a catalogue member.
+        let model_available = plan.requested_model.as_deref().is_none_or(|requested| {
+            readback.models.iter().any(|model| {
+                model.value.as_deref() == Some(requested)
+                    || model.resolved_model.as_deref() == Some(requested)
+            })
         });
         if !model_available || readback.session_state.as_deref() != Some("idle") {
             return Err(self
@@ -925,7 +933,7 @@ impl ClaudePlugin {
         if plan.resume_ref.is_some() {
             match realign_resumed_settings(
                 &session.native_client,
-                &plan.requested_model,
+                plan.requested_model.as_deref(),
                 plan.requested_permission_mode.as_deref(),
                 effective_mode.clone(),
             )
@@ -2019,8 +2027,12 @@ async fn launch_session(
             argv.push(OsString::from(&plan.session_id));
         }
     }
-    argv.push(OsString::from("--model"));
-    argv.push(OsString::from(&plan.requested_model));
+    // Omit `--model` when the profile left it absent so the CLI default
+    // applies; the effective model is read back from initialize/stream.
+    if let Some(model) = plan.requested_model.as_deref() {
+        argv.push(OsString::from("--model"));
+        argv.push(OsString::from(model));
+    }
     if let Some(mode) = plan.requested_permission_mode.as_deref() {
         argv.push(OsString::from("--permission-mode"));
         argv.push(OsString::from(mode));
@@ -2091,18 +2103,22 @@ async fn launch_session(
 /// unexpected echo: the CLI applied its own mode instead.
 async fn realign_resumed_settings(
     client: &ClaudeClient,
-    requested_model: &str,
+    requested_model: Option<&str>,
     requested_mode: Option<&str>,
     current_mode: Option<String>,
 ) -> Result<Option<String>> {
-    client
-        .control(
-            "set_model",
-            json!({"model": requested_model}),
-            Instant::now() + RPC_TIMEOUT,
-        )
-        .await
-        .map_err(|error| setter_error(error, "set_model"))?;
+    // An omitted request keeps the retained server-selected model: no
+    // `set_model` realign runs, and the effective mode readback below stands.
+    if let Some(requested) = requested_model {
+        client
+            .control(
+                "set_model",
+                json!({"model": requested}),
+                Instant::now() + RPC_TIMEOUT,
+            )
+            .await
+            .map_err(|error| setter_error(error, "set_model"))?;
+    }
     let mut effective_mode = current_mode;
     if let Some(profile_mode) = requested_mode {
         let requested = native_resume_permission_mode(profile_mode);

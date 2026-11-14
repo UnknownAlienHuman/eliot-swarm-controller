@@ -599,8 +599,18 @@ Worktree creation is opt-in on the same launch command:
 
 ```text
 command.submit {id, verb:"launch",
-  args:{profile?:NAME, workspace, worktree?:BRANCH, base?:REF, parent?:AGENT, text?}}
+  args:{profile?:NAME, harness?:HARNESS, model?:MODEL, effort?:EFFORT,
+        workspace, worktree?:BRANCH, base?:REF, parent?:AGENT, text?}}
 ```
+
+A parentless Owner launch names either a stored `profile` or an ad-hoc
+`harness` (mutually exclusive); `model`/`effort` are ad-hoc only and require
+`harness`. Ad-hoc launch is Owner-only and freezes a profile-equivalent
+snapshot from built-in safe defaults plus flags (see
+[configuration](configuration.md#ad-hoc-owner-launch-no-stored-profile));
+Agent principals keep the profile and `child_profiles` rules and cannot
+ad-hoc launch. Same-ID retries bind the exact requested payload: a changed
+ad-hoc model is `id_conflict`, while the frozen snapshot stays replay-stable.
 
 Without `worktree`, `workspace` remains the existing execution directory. With it,
 `workspace` names the source repository; the daemon chooses the managed destination.
@@ -900,6 +910,13 @@ restores revoked control; unknown blocks another takeover.
 
 `agent.discover` uses `AgentDiscoverRequest`/`DiscoverPage`; `agent.history` uses
 `AgentHistoryRequest`/`ObservationPage` from the canonical native metadata DTOs.
+`harness.list` (`HarnessListRequest`/`HarnessListResponse`, no params) reports
+per-harness installation facts (installed, resolved `cmd`, `--version`);
+`harness.models` (`HarnessModelsRequest`/`HarnessModelsResponse`) returns the
+harness's own read-only catalogue (Codex/Muse native `model/list`, the OpenCode
+provider/model list; Claude reports aliases plus the CLI default, Antigravity
+reports no catalogue). Both are owner-only, read-only, and start no model turn
+and no inference (`swarm harnesses`, `swarm models --harness H`).
 `profile` and `id` are required nonempty strings. Present strings are checked for
 nonemptiness after trimming but are preserved as supplied. For `agent.discover`, optional
 `harness`, `native_scope` and `cursor` may be omitted or `null` to mean absent. For
