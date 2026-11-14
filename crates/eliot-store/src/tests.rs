@@ -6879,15 +6879,18 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
         .dispatch(&launch_id, now + 1)
         .expect("dispatch launch");
     // Return the file to schema 16, as an older binary left it, and upgrade.
-    // Drop the v29/v30 activity artifacts first: the v30 events triggers
-    // would otherwise fire during the table rebuilds below while their
-    // native_child_registrations reads no longer resolve (#418). Drop the
-    // v31 fleet indexes too, or the parent-column drop below fails and the
-    // reopen would recreate existing indexes.
+    // Drop the v32 attention-wake table first so the reopen exercises
+    // its migration block. Drop the v29/v30 activity artifacts next: the
+    // v30 events triggers would otherwise fire during the table rebuilds
+    // below while their native_child_registrations reads no longer
+    // resolve (#418). Drop the v31 fleet indexes too, or the parent-column
+    // drop below fails and the reopen would recreate existing indexes.
     store
         .connection
         .execute_batch(
-            "DROP INDEX agents_list_state;
+            "DROP TABLE attention_wakes;
+             DELETE FROM schema_migrations WHERE version = 32;
+             DROP INDEX agents_list_state;
              DROP INDEX agents_list_project;
              DROP INDEX agents_list_harness;
              DROP INDEX agents_list_parent;

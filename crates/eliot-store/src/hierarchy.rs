@@ -737,7 +737,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 31);
+        assert_eq!(version, 32);
         let mut columns: Vec<String> = store
             .connection
             .prepare("SELECT name FROM pragma_table_info('agents')")
@@ -1345,15 +1345,19 @@ mod tests {
         ));
         {
             let legacy_store = Store::open(&path).unwrap();
-            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 31);
+            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 32);
             drop(legacy_store);
             // Downgrade to the v22 shape with two legacy rows, then reopen so
             // the v23 block backfills them exactly as it would on upgrade.
             // The v24 claims table postdates the downgrade target, so it
             // goes too; the reopen migrates 22 through the current version.
+            // Drop the v32 attention-wake table first so the reopen exercises
+            // its migration block.
             let legacy = rusqlite::Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
+                    "DROP TABLE attention_wakes;
+                     DELETE FROM schema_migrations WHERE version = 32;
                      DROP INDEX agents_list_state;
                      DROP INDEX agents_list_project;
                      DROP INDEX agents_list_harness;
@@ -1411,7 +1415,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 31);
+        assert_eq!(version, 32);
         for id in ["a1", "a2"] {
             let agent = store.get_agent(id).unwrap().expect("legacy row");
             assert_eq!(agent.root, id);
