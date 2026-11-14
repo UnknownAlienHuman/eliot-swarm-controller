@@ -872,9 +872,25 @@ fn release_settle_capacity(
             events,
             false,
         )?;
-    } else if state == CommandState::Rejected
+    } else if matches!(state, CommandState::Rejected | CommandState::Failed)
         && matches!(record.command.verb.as_str(), "launch" | "resume")
     {
+        // A dispatched Rejected start never dispatched native I/O, so its
+        // slot is released immediately. A dispatched Failed start carries the
+        // plugin's authoritative proven-no-effect verdict, but its slot is
+        // released here only after the owned-exit proof path has proven the
+        // generation's processes exited; without that proof the reservation
+        // is kept and the later exit proof (or OS-source closure) releases
+        // it. Never release a Failed start on a guess.
+        if state == CommandState::Failed
+            && !capacity::has_owned_exit_and_reader_drain_tx(
+                tx,
+                target.ok_or_else(|| Error::new("internal", "start has no Agent"))?,
+                generation.ok_or_else(|| Error::new("internal", "start has no generation"))?,
+            )?
+        {
+            return Ok(());
+        }
         let agent = target.ok_or_else(|| Error::new("internal", "rejected start has no Agent"))?;
         let command_generation =
             generation.ok_or_else(|| Error::new("internal", "rejected start has no generation"))?;

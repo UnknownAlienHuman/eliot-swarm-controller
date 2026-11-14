@@ -1019,7 +1019,10 @@ impl Router {
     }
 
     /// Start a launched or resumed Agent through the owned plugin, settle
-    /// ready, and schedule the linked input if there is one.
+    /// ready, and schedule the linked input if there is one. A plugin
+    /// `"failed"` start state is an authoritative proven-no-effect verdict
+    /// (the plugin returns it instead of an error only for checks before any
+    /// native session effect), so the launch settles failed, never unknown.
     async fn execute_start_command(
         &self,
         id: &str,
@@ -1034,12 +1037,17 @@ impl Router {
             .start(agent, dispatched.clone(), resume_source_state)
             .await;
         match start {
-            Ok(_) => {
-                let _ = self
-                    .settle(id, CommandState::Applied, Some(json!({"state": "ready"})))
-                    .await;
-                if let Some(linked_id) = linked_id {
-                    self.schedule_command(linked_id, None);
+            Ok(mut value) => {
+                if classify_start_result(&value) == CommandState::Failed {
+                    self.redact_native_value(&mut value);
+                    let _ = self.settle(id, CommandState::Failed, Some(value)).await;
+                } else {
+                    let _ = self
+                        .settle(id, CommandState::Applied, Some(json!({"state": "ready"})))
+                        .await;
+                    if let Some(linked_id) = linked_id {
+                        self.schedule_command(linked_id, None);
+                    }
                 }
             }
             Err(error) => {
@@ -1832,6 +1840,42 @@ fn validate_observer_command_result(
         object.remove("reader_closed");
     }
     Ok(value)
+}
+
+/// Settlement for an authoritative plugin `agent.start` result. A `"failed"`
+/// state proves the plugin dispatched no native session effect, so the
+/// launch settles failed, never unknown. Any other shape keeps the
+/// historical ready settlement.
+fn classify_start_result(value: &Value) -> CommandState {
+    if value.get("state").and_then(Value::as_str) == Some("failed") {
+        CommandState::Failed
+    } else {
+        CommandState::Applied
+    }
+}
+
+#[cfg(test)]
+mod start_result_tests {
+    use super::classify_start_result;
+    use eliot_core::CommandState;
+    use serde_json::json;
+
+    #[test]
+    fn failed_state_settles_failed_and_everything_else_stays_ready() {
+        assert_eq!(
+            classify_start_result(&json!({"state": "failed", "reason": "x"})),
+            CommandState::Failed
+        );
+        assert_eq!(
+            classify_start_result(&json!({"state": "ready"})),
+            CommandState::Applied
+        );
+        assert_eq!(classify_start_result(&json!({})), CommandState::Applied);
+        assert_eq!(
+            classify_start_result(&json!({"state": "unknown"})),
+            CommandState::Applied
+        );
+    }
 }
 
 fn unknown_cause(error: &Error) -> String {

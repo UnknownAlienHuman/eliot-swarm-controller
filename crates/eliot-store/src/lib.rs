@@ -29,6 +29,7 @@ pub use rules::{
     TimerSlotAdmission, TimerSlotCommit,
 };
 pub use scripts::ScriptRunAdmission;
+pub use usage::ResolvedUsageScope;
 
 use eliot_core::api::AgentSummary;
 use eliot_core::{
@@ -140,6 +141,7 @@ mod retention;
 mod schema;
 mod source_batches;
 mod source_handoff;
+pub(crate) mod usage;
 mod workspace;
 
 fn sql_error(error: rusqlite::Error) -> Error {

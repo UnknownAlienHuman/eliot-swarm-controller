@@ -3381,6 +3381,214 @@ fn workspace_exceptions_stay_marker_bound_across_unknown_readback() {
 }
 
 #[test]
+fn failed_dispatched_start_keeps_reservation_until_owned_exit_then_releases() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let scopes = json!([{"scope":"profile:failed-start","max_live":1}]);
+    // First launch on the profile: dispatch it and install the fixture
+    // native plan plus the live owned-plugin observation, mirroring the
+    // daemon's manifest check and spawn before `agent.start`.
+    let launch = capacity_launch_request("failed-start-first", "failed-start", scopes.clone());
+    let launch_id = launch.id.clone();
+    {
+        let admission = store
+            .submit("owner", launch, now)
+            .expect("admit first failed-start launch");
+        let agent = admission.command.target.expect("launch target");
+        assert_eq!(capacity_generation(&store, &agent), Some(1));
+        store
+            .dispatch(&launch_id, now)
+            .expect("dispatch first launch");
+        install_fixture_sources(&mut store, &agent, &launch_id, 1, now);
+        install_live_custody_observations(&mut store, &agent, 1, now);
+        // A dispatched Failed start settles Failed with the plugin's bound
+        // failed result, but without any exit proof the reservation is kept:
+        // releasing on a guess could over-admit a still-live plugin.
+        let failed_outcome = json!({
+            "state": "failed",
+            "agent_id": agent,
+            "generation": 1,
+            "command_id": launch_id,
+            "reason": "synthetic catalogue miss",
+        });
+        let settled = store
+            .settle(
+                &launch_id,
+                CommandState::Failed,
+                Some(failed_outcome.clone()),
+                now,
+            )
+            .expect("settle failed start without exit proof");
+        assert_eq!(settled.value.state, CommandState::Failed);
+        assert_eq!(settled.value.outcome.as_ref(), Some(&failed_outcome));
+        assert_eq!(
+            store
+                .get_agent(&agent)
+                .expect("Agent")
+                .expect("owner")
+                .state,
+            AgentState::Failed
+        );
+        assert_eq!(
+            capacity_generation(&store, &agent),
+            Some(1),
+            "failed start without proven exit keeps its reservation"
+        );
+        assert_eq!(
+            store
+                .submit(
+                    "owner",
+                    capacity_launch_request("failed-start-blocked", "failed-start", scopes.clone()),
+                    now + 1,
+                )
+                .unwrap_err()
+                .code,
+            "capacity_unavailable"
+        );
+        // Replay of the failed command returns the identical Failed result
+        // with no new events and no native I/O.
+        let high_water = store.high_water().unwrap();
+        let replay = store
+            .settle(
+                &launch_id,
+                CommandState::Failed,
+                Some(failed_outcome.clone()),
+                now + 2,
+            )
+            .expect("replay failed start");
+        assert!(replay.events.is_empty());
+        assert_eq!(replay.value.state, CommandState::Failed);
+        assert_eq!(replay.value.outcome.as_ref(), Some(&failed_outcome));
+        assert_eq!(store.high_water().unwrap(), high_water);
+        assert_eq!(capacity_generation(&store, &agent), Some(1));
+        // Complete the owned-exit proof in host order after the Failed
+        // settlement: exit observation, native drain, OS-source closure, then
+        // the owned-control-exit record. The OS-source closure releases the
+        // reservation through the existing proof path.
+        store
+            .observe_processes(
+                &agent,
+                1,
+                &[ProcessRecord {
+                    identity: simulated_plugin_identity(&agent, 1),
+                    owner: format!("agent:{agent}#1"),
+                    role: "plugin".to_owned(),
+                    state: ProcessState::Exited,
+                    exit_code: Some(0),
+                    updated_at: now + 3,
+                }],
+                now + 3,
+            )
+            .expect("observe owned plugin exit");
+        store
+            .close_native_sources(&agent, 1, now + 3)
+            .expect("close drained native sources");
+        store
+            .set_process_source_status(&agent, 1, "ok", true, now + 3)
+            .expect("close OS process source after exit");
+        let released = store
+            .record_owned_control_exit(&agent, 1, now + 3)
+            .expect("record owned control exit proof");
+        assert!(
+            released
+                .iter()
+                .any(|event| event.kind == "capacity.released"),
+            "owned exit proof releases the failed generation"
+        );
+        assert_eq!(capacity_generation(&store, &agent), None);
+    }
+    // The freed profile slot admits a second launch immediately.
+    let second_agent = store
+        .submit(
+            "owner",
+            capacity_launch_request("failed-start-second", "failed-start", scopes.clone()),
+            now + 4,
+        )
+        .expect("released slot admits a second launch")
+        .command
+        .target
+        .expect("second launch target");
+    assert_eq!(capacity_generation(&store, &second_agent), Some(1));
+
+    // A dispatched Failed start whose exit is already proven releases
+    // through settlement on the same terms as Rejected.
+    let proven_scopes = json!([{"scope":"profile:failed-start-proven","max_live":1}]);
+    let proven_launch =
+        capacity_launch_request("failed-start-proven", "failed-start-proven", proven_scopes);
+    let proven_id = proven_launch.id.clone();
+    let proven_agent = store
+        .submit("owner", proven_launch, now + 5)
+        .expect("admit proven-exit launch")
+        .command
+        .target
+        .expect("proven launch target");
+    store
+        .dispatch(&proven_id, now + 5)
+        .expect("dispatch proven-exit launch");
+    install_fixture_sources(&mut store, &proven_agent, &proven_id, 1, now + 5);
+    install_live_custody_observations(&mut store, &proven_agent, 1, now + 5);
+    simulate_normal_stop_proof(&mut store, &proven_agent, 1, now + 6);
+    assert_eq!(capacity_generation(&store, &proven_agent), None);
+    let proven_outcome = json!({
+        "state": "failed",
+        "agent_id": proven_agent,
+        "generation": 1,
+        "command_id": proven_id,
+        "reason": "synthetic catalogue miss",
+    });
+    let proven_settled = store
+        .settle(
+            &proven_id,
+            CommandState::Failed,
+            Some(proven_outcome.clone()),
+            now + 7,
+        )
+        .expect("settle failed start with proven exit");
+    assert_eq!(proven_settled.value.state, CommandState::Failed);
+    assert_eq!(proven_settled.value.outcome.as_ref(), Some(&proven_outcome));
+    assert_eq!(capacity_generation(&store, &proven_agent), None);
+
+    // The existing Rejected release behavior is unchanged: a dispatched
+    // start that settles Rejected releases its slot immediately.
+    let rejected_scopes = json!([{"scope":"profile:failed-start-rejected","max_live":1}]);
+    let rejected_launch = capacity_launch_request(
+        "failed-start-rejected",
+        "failed-start-rejected",
+        rejected_scopes,
+    );
+    let rejected_id = rejected_launch.id.clone();
+    let rejected_agent = store
+        .submit("owner", rejected_launch, now + 8)
+        .expect("admit rejected launch")
+        .command
+        .target
+        .expect("rejected launch target");
+    store
+        .dispatch(&rejected_id, now + 8)
+        .expect("dispatch rejected launch");
+    store
+        .settle(
+            &rejected_id,
+            CommandState::Rejected,
+            Some(json!({"code": "native_not_dispatched"})),
+            now + 8,
+        )
+        .expect("settle rejected start");
+    assert_eq!(capacity_generation(&store, &rejected_agent), None);
+    store
+        .submit(
+            "owner",
+            capacity_launch_request(
+                "failed-start-rejected-second",
+                "failed-start-rejected",
+                json!([{"scope":"profile:failed-start-rejected","max_live":1}]),
+            ),
+            now + 9,
+        )
+        .expect("rejected release still admits a second launch");
+}
+
+#[test]
 fn send_association_emits_applied_once_with_native_batch_ack() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");

@@ -21,9 +21,10 @@ use eliot_core::{
         ProjectRegistrationView, ProviderClearHoldRequest, ProviderClearHoldResponse,
         ProviderCorrectiveEvidence, ProviderHoldsRequest, ProviderHoldsResponse,
         RuleCatchUpRequest, RuleGetRequest, RuleStateView, ShutdownMode, SwarmWaitRequest,
-        SwarmWaitResponse, TimerGetRequest, TimerRunRequest, TimerStateView, TurnGetRequest,
-        TurnResolveRequest, TurnResolveResponse, TurnResolveStatus, VarGetRequest, VarGetResponse,
-        VarSetRequest, VarSetResponse, WaitTurnRef, WhoRequest, WhoResponse,
+        SwarmWaitResponse, TimerGetRequest, TimerRunRequest, TimerStateView, TurnCounterMissing,
+        TurnGetRequest, TurnResolveRequest, TurnResolveResponse, TurnResolveStatus,
+        UsageSummaryRequest, UsageSummaryResponse, VarGetRequest, VarGetResponse, VarSetRequest,
+        VarSetResponse, WaitTurnRef, WhoRequest, WhoResponse,
     },
 };
 use serde_json::{Value, json};
@@ -142,6 +143,8 @@ enum CliCommand {
     Processes(ProcessesArgs),
     /// Read an Agent's ephemeral process statistics.
     Stats(StatsArgs),
+    /// Read bounded usage totals with explicit coverage for one Agent, project or tree.
+    Usage(UsageArgs),
     /// Read the current Git snapshot for an Agent's workspace.
     GitStatus(GitStatusArgs),
     /// Read one page of edits attributed to an Agent by native file-change hints.
@@ -460,6 +463,24 @@ struct StatsArgs {
     agent: String,
     #[command(flatten)]
     generation: ReadGenerationArgs,
+}
+
+#[derive(Args)]
+struct UsageArgs {
+    #[arg(
+        long,
+        value_name = "AGENT",
+        conflicts_with = "project",
+        conflicts_with = "root"
+    )]
+    agent: Option<String>,
+    #[command(flatten)]
+    generation: ReadGenerationArgs,
+    #[arg(long, value_name = "PROJECT", conflicts_with = "root")]
+    project: Option<String>,
+    /// Subtree-root Agent ID; covers the root and its descendants.
+    #[arg(long, value_name = "AGENT")]
+    root: Option<String>,
 }
 
 #[derive(Args)]
@@ -2054,6 +2075,35 @@ async fn dispatch(
             };
             read_and_print!("agent.stats", params, AgentStatsResponse)
         }
+        CliCommand::Usage(UsageArgs {
+            agent,
+            generation: ReadGenerationArgs { generation },
+            project,
+            root,
+        }) => {
+            let params = UsageSummaryRequest {
+                agent,
+                generation,
+                project,
+                root,
+            };
+            if json_output {
+                read_and_print!("usage.summary", params, UsageSummaryResponse)
+            } else {
+                params
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, false))?;
+                let response: UsageSummaryResponse =
+                    eliot_daemon::client_call_typed(&data_dir, "usage.summary", &params)
+                        .await
+                        .map_err(|error| Failure::from_core(error, false))?;
+                params
+                    .validate_response(&response)
+                    .map_err(|error| Failure::from_core(error, false))?;
+                print_usage_table(&response);
+                Ok(0)
+            }
+        }
         CliCommand::GitStatus(GitStatusArgs {
             agent,
             generation: ReadGenerationArgs { generation },
@@ -3591,6 +3641,136 @@ fn print_agent_table(response: &AgentListResponse, with_observations: bool) {
     );
 }
 
+/// Readable usage summary for `swarm usage`. Turn scopes never merge: each
+/// row is one native attribution scope with its own subtotals, and `--`
+/// marks a counter no counted turn supplied. Session cumulative counters
+/// carry their coverage; cost sums only within one verbatim unit. `--json`
+/// keeps printing the raw response; this table never replaces it.
+fn print_usage_table(response: &UsageSummaryResponse) {
+    let scope = if let Some(agent) = &response.scope.agent {
+        match response.scope.generation {
+            Some(generation) => format!("agent {agent}#{generation}"),
+            None => format!("agent {agent} (all generations)"),
+        }
+    } else if let Some(project) = &response.scope.project {
+        format!("project {project}")
+    } else if let Some(root) = &response.scope.root {
+        format!("tree {root}")
+    } else {
+        "-".to_owned()
+    };
+    println!(
+        "usage {scope} agents {} generations {} truncated {} history {} (pruned_through {})",
+        response.agents_included,
+        response.generations_included,
+        yes_no(response.truncated),
+        if response.history_complete {
+            "complete"
+        } else {
+            "partial"
+        },
+        response.pruned_through,
+    );
+    println!("  {}", response.history_reason);
+    println!(
+        "  turns counted {} with_usage {} without_usage {} excluded unknown {} running {}",
+        response.turns.turns_counted,
+        response.turns.turns_counted - response.turns.turns_without_usage,
+        response.turns.turns_without_usage,
+        response.turns.turns_unknown_excluded,
+        response.turns.turns_running_excluded,
+    );
+    println!(
+        "  {:<14} {:<7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "SCOPE", "COUNTED", "INPUT", "OUTPUT", "REASON", "THINK", "CACHE_R", "CACHE_W", "TOTAL"
+    );
+    for entry in &response.turns.by_scope {
+        println!(
+            "  {:<14} {:<7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            truncate_cell(&entry.scope, 14),
+            entry.turns_counted,
+            counter_cell(entry.totals.input_tokens),
+            counter_cell(entry.totals.output_tokens),
+            counter_cell(entry.totals.reasoning_tokens),
+            counter_cell(entry.totals.thinking_tokens),
+            counter_cell(entry.totals.cache_read_tokens),
+            counter_cell(entry.totals.cache_write_tokens),
+            counter_cell(entry.totals.total_tokens),
+        );
+    }
+    println!(
+        "  turns missing counters: {}",
+        missing_cell(&response.turns.turns_missing)
+    );
+    println!(
+        "  sessions snapshots {} without_snapshot {} occupancy {} capacity {}",
+        response.sessions.snapshots,
+        response.sessions.generations_without_snapshot,
+        response.sessions.context_occupancy_supplied,
+        response.sessions.context_capacity_supplied,
+    );
+    for (name, subtotal) in [
+        ("input", &response.sessions.cumulative_tokens.input_tokens),
+        ("output", &response.sessions.cumulative_tokens.output_tokens),
+        (
+            "cache_read",
+            &response.sessions.cumulative_tokens.cache_read_tokens,
+        ),
+        (
+            "cache_write",
+            &response.sessions.cumulative_tokens.cache_write_tokens,
+        ),
+    ] {
+        println!(
+            "    cumulative {name}: total {} supplied {} missing {} complete {}",
+            subtotal
+                .total
+                .map(|total| total.to_string())
+                .as_deref()
+                .unwrap_or("--"),
+            subtotal.supplied,
+            subtotal.missing,
+            yes_no(subtotal.complete),
+        );
+    }
+    if response.sessions.cost_by_unit.is_empty() {
+        println!(
+            "    cost: none (snapshots without cost {})",
+            response.sessions.snapshots_without_cost
+        );
+    } else {
+        for cost in &response.sessions.cost_by_unit {
+            println!(
+                "    cost [{}]: {} over {} snapshots",
+                cost.unit, cost.total_amount, cost.snapshots
+            );
+        }
+        println!(
+            "    snapshots without cost {}",
+            response.sessions.snapshots_without_cost
+        );
+    }
+}
+
+fn counter_cell(value: Option<i64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "--".to_owned())
+}
+
+fn missing_cell(missing: &TurnCounterMissing) -> String {
+    format!(
+        "input {} output {} reasoning {} thinking {} cache_read {} cache_write {} total {}",
+        missing.input_tokens,
+        missing.output_tokens,
+        missing.reasoning_tokens,
+        missing.thinking_tokens,
+        missing.cache_read_tokens,
+        missing.cache_write_tokens,
+        missing.total_tokens,
+    )
+}
+
 fn state_cell(state: AgentState) -> &'static str {
     match state {
         AgentState::Unknown => "unknown",
@@ -3755,6 +3935,129 @@ mod tests {
         assert!(!any);
         assert_eq!(timeout_seconds, 7);
         assert_eq!(ids, vec!["c1".to_owned()]);
+    }
+
+    #[test]
+    fn usage_cli_selects_one_scope() {
+        let cli = Cli::try_parse_from(["swarm", "usage", "--project", "p1"]).unwrap();
+        let Some(CliCommand::Usage(UsageArgs {
+            agent,
+            generation: ReadGenerationArgs { generation },
+            project,
+            root,
+        })) = cli.command
+        else {
+            panic!("usage command required");
+        };
+        assert_eq!(agent, None);
+        assert_eq!(generation, None);
+        assert_eq!(project.as_deref(), Some("p1"));
+        assert_eq!(root, None);
+        let cli =
+            Cli::try_parse_from(["swarm", "usage", "--agent", "a1", "--generation", "2"]).unwrap();
+        let Some(CliCommand::Usage(UsageArgs {
+            generation: ReadGenerationArgs { generation },
+            ..
+        })) = cli.command
+        else {
+            panic!("usage command required");
+        };
+        assert_eq!(generation, Some(2));
+        assert!(
+            Cli::try_parse_from(["swarm", "usage", "--agent", "a1", "--project", "p1"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["swarm", "usage", "--agent", "a1", "--root", "a2"]).is_err());
+        assert!(
+            Cli::try_parse_from(["swarm", "usage", "--project", "p1", "--root", "a2"]).is_err()
+        );
+    }
+
+    #[test]
+    fn usage_table_renders_a_bounded_summary() {
+        use eliot_core::api::{
+            SessionCostTotal, SessionCumulativeTotals, SessionFacts, SessionTokenSubtotal,
+            TurnCounterTotals, TurnExpenditure, TurnScopeTotals, UsageScopeView,
+        };
+
+        let subtotal = |total: Option<i64>, supplied: usize, missing: usize| SessionTokenSubtotal {
+            total,
+            supplied,
+            missing,
+            complete: missing == 0 && supplied > 0,
+        };
+        let response = UsageSummaryResponse {
+            scope: UsageScopeView {
+                agent: Some("a1".to_owned()),
+                generation: None,
+                project: None,
+                root: None,
+            },
+            agents_included: 1,
+            generations_included: 1,
+            truncated: false,
+            history_complete: true,
+            history_reason: "no event history pruned".to_owned(),
+            pruned_through: 0,
+            turns: TurnExpenditure {
+                turns_counted: 2,
+                turns_without_usage: 1,
+                turns_unknown_excluded: 1,
+                turns_running_excluded: 1,
+                turns_missing: TurnCounterMissing {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    reasoning_tokens: 2,
+                    thinking_tokens: 2,
+                    cache_read_tokens: 2,
+                    cache_write_tokens: 2,
+                    total_tokens: 2,
+                },
+                by_scope: vec![TurnScopeTotals {
+                    scope: "turn".to_owned(),
+                    turns_counted: 1,
+                    totals: TurnCounterTotals {
+                        input_tokens: Some(10),
+                        ..Default::default()
+                    },
+                    turns_missing: TurnCounterMissing {
+                        input_tokens: 0,
+                        output_tokens: 1,
+                        reasoning_tokens: 1,
+                        thinking_tokens: 1,
+                        cache_read_tokens: 1,
+                        cache_write_tokens: 1,
+                        total_tokens: 1,
+                    },
+                }],
+            },
+            sessions: SessionFacts {
+                snapshots: 1,
+                generations_without_snapshot: 0,
+                cumulative_tokens: SessionCumulativeTotals {
+                    input_tokens: subtotal(Some(100), 1, 0),
+                    output_tokens: subtotal(None, 0, 1),
+                    cache_read_tokens: subtotal(None, 0, 1),
+                    cache_write_tokens: subtotal(None, 0, 1),
+                },
+                cost_by_unit: vec![SessionCostTotal {
+                    unit: "usd_estimate".to_owned(),
+                    total_amount: 0.5,
+                    snapshots: 1,
+                }],
+                snapshots_without_cost: 0,
+                context_occupancy_supplied: 1,
+                context_capacity_supplied: 1,
+            },
+        };
+        UsageSummaryRequest {
+            agent: Some("a1".to_owned()),
+            generation: None,
+            project: None,
+            root: None,
+        }
+        .validate_response(&response)
+        .expect("table fixture binds its request");
+        print_usage_table(&response);
     }
 
     #[test]

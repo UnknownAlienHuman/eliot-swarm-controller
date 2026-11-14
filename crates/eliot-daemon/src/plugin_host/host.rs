@@ -1219,6 +1219,45 @@ async fn cleanup_startup(
     cleanup_actor(&actor.state, &actor.key, &actor.plugin_credential, false).await;
 }
 
+/// Retire one validated failed-start plugin without entering the live actor
+/// loop: the plugin's normal shutdown, then the owned-exit wait the existing
+/// stop path uses. On proven exit the owned-exit proof path releases the
+/// capacity reservation; on unproven exit the reservation is kept and the
+/// custody failure is reported like the other unconfirmed paths. The
+/// authoritative Failed outcome itself is preserved by the caller, which
+/// already holds the validated value. Never marks the generation lost: the
+/// router settles it Failed.
+async fn retire_failed_start(
+    client: &PluginClient,
+    child: &mut OwnedChild,
+    event_task: &mut tokio::task::JoinHandle<()>,
+    actor: &AgentActorConfig,
+    pending_failure: &mut Option<PendingFailure>,
+) {
+    let deadlines = StopDeadlines::new(Instant::now());
+    let (_, exited) =
+        shutdown_and_wait_child(client, child, &actor.monitoring, &actor.agent, deadlines).await;
+    let settled = settle_owned_source_exit(
+        &actor.state,
+        &actor.key,
+        Some(event_task),
+        exited,
+        "plugin_failed_start_exit",
+    )
+    .await;
+    if let Some(state) = actor.state.upgrade() {
+        fence_runtime_generation(&state, &actor.key);
+    }
+    if let Err(error) = settled {
+        pending_failure.get_or_insert(PendingFailure {
+            reply: None,
+            error,
+            command_id: actor.start_command.id.clone(),
+        });
+    }
+    cleanup_actor(&actor.state, &actor.key, &actor.plugin_credential, false).await;
+}
+
 async fn run_agent_inner(
     actor: AgentActorConfig,
     mut child: OwnedChild,
@@ -1268,6 +1307,24 @@ async fn run_agent_inner(
     };
     match start {
         Ok(value) if validate_start_result(&value, &actor.agent, &actor.start_command).is_ok() => {
+            if is_failed_start_result(&value) {
+                // The plugin's authoritative proven-no-effect verdict: never
+                // enter the live actor loop. Retire and drain this exact
+                // plugin actor and process tree first so Store sees the
+                // generation's processes exit and the owned-exit proof path
+                // releases the capacity reservation, then deliver the
+                // authoritative Failed outcome. No re-dispatch.
+                retire_failed_start(
+                    &client,
+                    &mut child,
+                    &mut event_task,
+                    &actor,
+                    pending_failure,
+                )
+                .await;
+                let _ = started.send(Ok(value));
+                return;
+            }
             let _ = started.send(Ok(value));
         }
         Ok(_) => {
@@ -2793,8 +2850,21 @@ fn validate_send_result(value: Value) -> Result<Value> {
     Ok(value)
 }
 
+/// True for a validated `agent.start` result carrying the plugin's
+/// authoritative proven-no-effect verdict. Only `validate_start_result`
+/// decides admission; this splits the admitted shapes so a failed start
+/// retires instead of entering the live actor loop.
+fn is_failed_start_result(value: &Value) -> bool {
+    value.get("state").and_then(Value::as_str) == Some("failed")
+}
+
 fn validate_start_result(value: &Value, agent: &Agent, command: &Command) -> Result<()> {
-    if value.get("state").and_then(Value::as_str) == Some("ready")
+    // Ready establishes the session; failed is the plugin's authoritative
+    // proven-no-effect verdict (returned instead of an error only for checks
+    // before any native session effect). Both require the exact
+    // agent/generation/command binding.
+    let state = value.get("state").and_then(Value::as_str);
+    if matches!(state, Some("ready") | Some("failed"))
         && value.get("agent_id").and_then(Value::as_str) == Some(agent.id.as_str())
         && value.get("generation").and_then(Value::as_i64) == Some(agent.generation)
         && value.get("command_id").and_then(Value::as_str) == Some(command.id.as_str())
@@ -5544,6 +5614,33 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&data_root);
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn validate_start_result_accepts_bound_ready_or_failed() {
+        let agent_id = "agent-start-validate";
+        let mut agent = Agent::new(agent_id, "project", "muse", "fixture", 0);
+        agent.generation = 1;
+        let command = launch_command_for(agent_id, 1);
+        let bound = |state: &str| {
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": command.id,
+                "state": state,
+                "reason": "Muse test check failed",
+            })
+        };
+        assert!(validate_start_result(&bound("ready"), &agent, &command).is_ok());
+        assert!(validate_start_result(&bound("failed"), &agent, &command).is_ok());
+        assert!(!is_failed_start_result(&bound("ready")));
+        assert!(is_failed_start_result(&bound("failed")));
+        assert!(!is_failed_start_result(&json!({"state": "unknown"})));
+        assert!(validate_start_result(&json!({"state": "ready"}), &agent, &command).is_err());
+        assert!(validate_start_result(&bound("unknown"), &agent, &command).is_err());
+        let mut wrong_command = bound("failed");
+        wrong_command["command_id"] = json!("other-command");
+        assert!(validate_start_result(&wrong_command, &agent, &command).is_err());
     }
 
     #[tokio::test]
