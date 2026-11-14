@@ -28,8 +28,9 @@ mod workspaces;
 pub use config::load_cloud_access_config;
 pub use daemon::client_call_with_remote_context;
 pub use daemon::{
-    MAX_RPC_FRAME_BYTES, client_call, client_call_typed, client_call_with_agent_identity,
-    client_call_with_owner_credential, require_agent_identity, run,
+    DaemonStartupFailure, MAX_RPC_FRAME_BYTES, client_call, client_call_typed,
+    client_call_with_agent_identity, client_call_with_owner_credential, daemon_connect_hint,
+    daemon_failure_since, last_daemon_failure, require_agent_identity, run,
 };
 
 /// Start this executable's background daemon without inheriting caller handles.

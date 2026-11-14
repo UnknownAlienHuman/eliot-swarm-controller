@@ -311,6 +311,8 @@ struct ResumeArgs {
     wait: bool,
     #[command(flatten)]
     generation: GenerationArgs,
+    #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
+    timeout_seconds: u64,
 }
 
 #[derive(Args)]
@@ -1307,8 +1309,8 @@ async fn dispatch(
                     Ok(0)
                 }
                 None => {
-                    start_daemon(&data_dir, json_output)?;
-                    Ok(0)
+                    let exit_code = start_daemon(&data_dir, json_output).await?;
+                    Ok(exit_code)
                 }
             }
         }
@@ -1352,11 +1354,27 @@ async fn dispatch(
             Ok(0)
         }
         CliCommand::Status => {
-            read_and_print!(
-                "daemon.status",
-                DaemonStatusRequest::default(),
-                DaemonStatusResponse
-            )
+            let params = DaemonStatusRequest::default();
+            params
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let response: DaemonStatusResponse =
+                eliot_daemon::client_call_typed(&data_dir, "daemon.status", &params)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            params
+                .validate_response(&response)
+                .map_err(|error| Failure::from_core(error, false))?;
+            let mut value = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "daemon.status response is invalid"))?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "data_dir".to_owned(),
+                    Value::String(data_dir.to_string_lossy().into_owned()),
+                );
+            }
+            print_value(&value, json_output);
+            Ok(0)
         }
         CliCommand::Provider(ProviderArgs { command }) => match command {
             ProviderCommand::Holds(ProviderHoldsArgs { after, limit }) => {
@@ -1758,7 +1776,7 @@ async fn dispatch(
                 let linked = submitted.linked_command.as_deref().ok_or_else(|| {
                     Failure::new(4, "launch response omitted its linked input command")
                 })?;
-                let turn = wait_for_turn(&data_dir, linked, deadline).await?;
+                let turn = wait_for_linked_turn(&data_dir, root_id, linked, deadline).await?;
                 let exit_code = turn_exit_code(&turn);
                 (turn_value(turn)?, exit_code)
             } else {
@@ -1809,10 +1827,11 @@ async fn dispatch(
             prompt,
             wait,
             generation: GenerationArgs { generation },
+            timeout_seconds,
         }) => {
             validate_text(prompt.as_deref())?;
             let deadline = if wait {
-                Some(wait_deadline(DEFAULT_WAIT_SECONDS)?)
+                Some(wait_deadline(timeout_seconds)?)
             } else {
                 None
             };
@@ -1838,7 +1857,8 @@ async fn dispatch(
                 let linked = submitted.linked_command.as_deref().ok_or_else(|| {
                     Failure::new(4, "resume response omitted its linked input command")
                 })?;
-                let turn = wait_for_turn(&data_dir, linked, deadline).await?;
+                let turn = wait_for_linked_turn(&data_dir, &submitted.command_id, linked, deadline)
+                    .await?;
                 let exit_code = turn_exit_code(&turn);
                 (turn_value(turn)?, exit_code)
             } else {
@@ -2546,7 +2566,8 @@ async fn run_claim_command(
     }
 }
 
-fn start_daemon(data_dir: &Path, json_output: bool) -> Result<(), Failure> {
+async fn start_daemon(data_dir: &Path, json_output: bool) -> Result<u8, Failure> {
+    let start_ms = daemon_now_ms();
     #[cfg(windows)]
     eliot_daemon::start_background_daemon(data_dir)
         .map_err(|error| Failure::new(1, format!("cannot start daemon: {error}")))?;
@@ -2570,15 +2591,131 @@ fn start_daemon(data_dir: &Path, json_output: bool) -> Result<(), Failure> {
             .map_err(|error| Failure::new(1, format!("cannot start daemon: {error}")))?;
     }
     let log_path = data_dir.join("logs").join("daemon.log");
+    let data_dir_value = Value::String(data_dir.to_string_lossy().into_owned());
     if json_output {
         print_value(
-            &json!({ "state": "starting", "log": log_path.to_string_lossy() }),
+            &json!({
+                "state": "starting",
+                "data_dir": data_dir_value,
+                "log": log_path.to_string_lossy(),
+            }),
             true,
         );
     } else {
-        println!("daemon starting; diagnostics: {}", log_path.display());
+        println!(
+            "daemon starting; data_dir: {}; diagnostics: {}",
+            data_dir.display(),
+            log_path.display()
+        );
     }
-    Ok(())
+    wait_for_daemon_ready(data_dir, &log_path, start_ms, json_output).await
+}
+
+fn daemon_now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0)
+}
+
+const STARTUP_WAIT: Duration = Duration::from_secs(30);
+const STARTUP_POLL: Duration = Duration::from_millis(200);
+const STARTUP_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn wait_for_daemon_ready(
+    data_dir: &Path,
+    log_path: &Path,
+    start_ms: u128,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    let deadline = Instant::now() + STARTUP_WAIT;
+    loop {
+        if let Some(failure) = eliot_daemon::daemon_failure_since(data_dir, start_ms) {
+            return Err(startup_failure(failure, data_dir, log_path));
+        }
+        let status = tokio::time::timeout(
+            STARTUP_RPC_TIMEOUT,
+            eliot_daemon::client_call_typed::<DaemonStatusRequest, DaemonStatusResponse>(
+                data_dir,
+                "daemon.status",
+                &DaemonStatusRequest::default(),
+            ),
+        )
+        .await;
+        if let Ok(Ok(_)) = status {
+            let boot_id = read_daemon_boot_id(data_dir);
+            if json_output {
+                print_value(
+                    &json!({
+                        "state": "ready",
+                        "data_dir": data_dir.to_string_lossy(),
+                        "boot_id": boot_id.unwrap_or_default(),
+                        "log": log_path.to_string_lossy(),
+                    }),
+                    true,
+                );
+            } else if let Some(boot_id) = boot_id {
+                println!(
+                    "daemon ready; data_dir: {}; boot_id: {}",
+                    data_dir.display(),
+                    boot_id
+                );
+            } else {
+                println!("daemon ready; data_dir: {}", data_dir.display());
+            }
+            return Ok(0);
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        sleep(STARTUP_POLL.min(deadline.saturating_duration_since(Instant::now()))).await;
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    if let Some(failure) = eliot_daemon::daemon_failure_since(data_dir, start_ms) {
+        return Err(startup_failure(failure, data_dir, log_path));
+    }
+    Err(Failure::new(
+        1,
+        format!(
+            "daemon did not become ready within 30s; data_dir: {}; diagnostics: {}",
+            data_dir.display(),
+            log_path.display()
+        ),
+    ))
+}
+
+fn read_daemon_boot_id(data_dir: &Path) -> Option<String> {
+    let bytes = std::fs::read(data_dir.join("daemon.json")).ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("boot_id")
+        .and_then(Value::as_str)
+        .filter(|boot_id| !boot_id.is_empty() && boot_id.len() <= 256)
+        .map(str::to_owned)
+}
+
+fn startup_failure(
+    failure: eliot_daemon::DaemonStartupFailure,
+    data_dir: &Path,
+    log_path: &Path,
+) -> Failure {
+    let mut result = Failure::new(
+        1,
+        format!(
+            "daemon failed during startup: {}; data_dir: {}; diagnostics: {}",
+            failure.error_code,
+            data_dir.display(),
+            log_path.display()
+        ),
+    );
+    result.diagnostics = failure.diagnostics;
+    eliot_core::bound_stderr_diagnostics(
+        &mut result.diagnostics,
+        eliot_core::MAX_STDERR_DIAGNOSTIC_BYTES,
+    );
+    result
 }
 
 fn goal_mode(mode: &str) -> Result<GoalMode, Failure> {
@@ -2822,6 +2959,40 @@ async fn wait_for_turn(
             TurnState::Unknown => return Err(Failure::new(4, "turn outcome is unknown")),
             TurnState::Running => sleep_before_deadline(deadline).await?,
         }
+    }
+}
+
+/// Wait for a launch/resume linked SEND turn. When the linked input is
+/// cancelled because its parent start failed, report the parent launch
+/// failure rather than only the cancellation.
+async fn wait_for_linked_turn(
+    data_dir: &Path,
+    root_id: &str,
+    linked_id: &str,
+    deadline: Instant,
+) -> Result<CoreTurn, Failure> {
+    match wait_for_turn(data_dir, linked_id, deadline).await {
+        Ok(turn) => Ok(turn),
+        Err(linked) if linked.exit_code == INTERRUPTED_EXIT_CODE => {
+            let params = CommandGetRequest::new(root_id);
+            if params.validate().is_err() {
+                return Err(linked);
+            }
+            let root: CoreCommand =
+                match eliot_daemon::client_call_typed(data_dir, "command.get", &params).await {
+                    Ok(command) => command,
+                    Err(_) => return Err(linked),
+                };
+            if params.validate_response(&root).is_err() {
+                return Err(linked);
+            }
+            match command_state_result(&root) {
+                Ok(_) => Err(linked),
+                Err(root_failure) if root_failure.exit_code == INTERRUPTED_EXIT_CODE => Err(linked),
+                Err(root_failure) => Err(root_failure),
+            }
+        }
+        Err(other) => Err(other),
     }
 }
 
