@@ -632,11 +632,11 @@ fn persist_turn_terminal(
 }
 
 /// Persist one `session.usage` snapshot as the latest for its Agent
-/// generation, in the caller's transaction. A newer snapshot replaces the
-/// retained one; an older snapshot or a byte-identical duplicate is ignored,
-/// so replays and out-of-order deliveries can never inflate or regress the
-/// readback. No history rows and no rollups: only the latest snapshot reads
-/// back.
+/// generation, in the caller's transaction. A strictly newer snapshot
+/// replaces the retained one; an older or equal-timestamp snapshot or a
+/// byte-identical duplicate is ignored, so replays and out-of-order
+/// deliveries can never inflate or regress the readback. No history rows and
+/// no rollups: only the latest snapshot reads back.
 fn persist_session_usage(scope: EffectScope<'_, '_>, usage: &SessionUsage) -> Result<()> {
     let EffectScope {
         tx,
@@ -676,7 +676,7 @@ fn persist_session_usage(scope: EffectScope<'_, '_>, usage: &SessionUsage) -> Re
             ));
         }
         Some((stored_snapshot, stored_at)) => {
-            if stored_snapshot == snapshot || observed_at < stored_at {
+            if stored_snapshot == snapshot || observed_at <= stored_at {
                 return Ok(());
             }
             db!(tx.execute(

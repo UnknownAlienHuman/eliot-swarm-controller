@@ -602,10 +602,10 @@ null usage even when session facts exist for that generation.
 `session_usage` retains only the latest serialized `SessionUsage` snapshot
 per Agent generation, committed from `session.usage` `data.usage` (`source`
 names the adapter and native signal, `observed_at` is native epoch
-milliseconds defaulted at the owning boundary). A newer snapshot replaces
-the retained one; an older snapshot or a byte-identical duplicate is
-ignored, so replays and out-of-order deliveries can never inflate or regress
-the readback. `context_used_tokens`/`context_window_tokens` carry occupancy
+milliseconds defaulted at the owning boundary). A strictly newer snapshot
+replaces the retained one; an older or equal-timestamp snapshot or a
+byte-identical duplicate is ignored, so replays and out-of-order deliveries
+can never inflate or regress the readback. `context_used_tokens`/`context_window_tokens` carry occupancy
 and capacity, `cumulative_tokens` carries only input/output/cache counters
 where supplied (never a derived total), and `cumulative_cost` carries the
 verbatim native amount with its verbatim native unit (for example

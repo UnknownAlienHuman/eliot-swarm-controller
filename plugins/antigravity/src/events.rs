@@ -147,14 +147,16 @@ pub(crate) struct State {
     /// notification write.
     pub settlement: Option<(String, String)>,
     /// Latest merged session-scoped snapshot from `usage_update`: context
-    /// occupancy/capacity and cumulative session cost. Never turn
-    /// expenditure; committed as `session.usage` alongside the terminal and
-    /// replaced wholesale on newer updates.
+    /// occupancy/capacity and cumulative session cost. Never turn expenditure;
+    /// committed as `session.usage` when accepted and replaced wholesale on
+    /// newer updates.
     session_usage: Option<SessionUsage>,
-    /// Last committed session snapshot content. The terminal commits the
-    /// retained snapshot only when it differs, so quiet turns (no usage
-    /// signals) commit no session fact.
+    /// Last committed session snapshot content. Each accepted update commits
+    /// only when it differs, so repeats commit no extra session fact.
     session_usage_committed: Option<SessionUsage>,
+    /// Monotonic counter for `session.usage` native ids so each accepted
+    /// update commits under a unique identity.
+    session_usage_seq: u64,
 }
 
 impl State {
@@ -202,6 +204,7 @@ impl State {
             settlement: None,
             session_usage: None,
             session_usage_committed: None,
+            session_usage_seq: 0,
         }
     }
 
@@ -704,19 +707,21 @@ impl State {
                 cost_amount,
                 cost_unit,
             } => {
-                // Fold into the retained session snapshot; the terminal
-                // commits it as `session.usage`. Session-scoped facts, never
-                // per-turn input/output totals.
-                if let Some(merged) = session_usage_from_update(
+                // Fold into the retained session snapshot and commit it as
+                // `session.usage` when accepted, with `observed_at` captured
+                // at acceptance. Session-scoped facts, never per-turn
+                // input/output totals.
+                let Some(merged) = session_usage_from_update(
                     used,
                     size,
                     cost_amount,
                     cost_unit,
                     self.session_usage.as_ref(),
-                ) {
-                    self.session_usage = Some(merged);
-                }
-                Ok(())
+                ) else {
+                    return Ok(());
+                };
+                self.session_usage = Some(merged.clone());
+                self.commit_session_usage_now(merged).await
             }
             AcpUpdate::ToolCall {
                 tool_call_id,
@@ -761,21 +766,29 @@ impl State {
         }
     }
 
-    /// Commit the retained session snapshot as its own `session.usage` fact
-    /// after the accepted terminal, so session scope and turn scope can never
-    /// be confused. Commits only when the retained snapshot changed since the
-    /// last session fact, so quiet turns commit nothing extra. Occupancy
-    /// changes (compaction can reduce `used`) never read as token
-    /// expenditure.
-    async fn commit_session_usage(&mut self, turn: &str) -> Result<()> {
-        if self.session_usage == self.session_usage_committed {
+    /// Commit one accepted session snapshot as its own `session.usage` fact,
+    /// so session scope and turn scope can never be confused and stream loss
+    /// before the terminal cannot lose an accepted fact. Commits only when
+    /// the snapshot differs from the last committed fact. Occupancy changes
+    /// (compaction can reduce `used`) never read as token expenditure. Uses
+    /// the pending turn when one is prepared, else the idle `session` scope.
+    async fn commit_session_usage_now(&mut self, usage: SessionUsage) -> Result<()> {
+        if self.session_usage_committed.as_ref() == Some(&usage) {
             return Ok(());
         }
-        let Some(usage) = self.session_usage.clone() else {
-            return Ok(());
-        };
-        self.commit("session.usage", turn, "session", json!({"usage": usage}))
-            .await?;
+        self.session_usage_seq = self.session_usage_seq.wrapping_add(1);
+        let turn = self
+            .pending
+            .as_ref()
+            .map(|pending| pending.turn.clone())
+            .unwrap_or_else(|| "session".to_owned());
+        self.commit(
+            "session.usage",
+            &turn,
+            &format!("session-{}", self.session_usage_seq),
+            json!({"usage": usage}),
+        )
+        .await?;
         self.session_usage_committed = Some(usage);
         Ok(())
     }
@@ -893,7 +906,8 @@ impl State {
         }
         self.commit("turn.completed", &turn, "completed", data.clone())
             .await?;
-        self.commit_session_usage(&turn).await?;
+        // Session facts already committed when each update was accepted, so
+        // the terminal carries turn scope only.
         self.reject_pending_steer(
             "Antigravity turn ended before its next PreInvocation steer point",
         );

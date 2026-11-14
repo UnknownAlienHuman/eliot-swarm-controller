@@ -209,8 +209,9 @@ optional cumulative session `cost` with its currency/unit: session-scoped
 facts, not per-turn input/output totals. The adapter ignores them for turn
 attribution, so occupancy changes (compaction can reduce `used`) can never
 read as token expenditure. The adapter folds `usage_update` into the
-retained `SessionUsage` snapshot and commits it as `session.usage` (source
-`antigravity:usage_update`): `used`/`size` replace the retained context
+retained `SessionUsage` snapshot and commits it as `session.usage` when
+accepted (source `antigravity:usage_update`), with `observed_at` captured at
+acceptance: `used`/`size` replace the retained context
 counters and a supplied cost replaces the retained cumulative cost with
 its verbatim unit. Live emission of `usage_update` by the
 installed `agy` 1.5.3 server was not exercised (no model calls in this

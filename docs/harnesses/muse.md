@@ -84,11 +84,13 @@ events (raw counters plus server-derived counted-once
 session-scoped facts: not turn expenditure, so repeated
 completions can never inflate the terminal count. The adapter folds them
 into the retained `SessionUsage` snapshot and commits it as `session.usage`
-(sources `muse:session/tokenUsage` and `muse:session/contextUsage`):
+when accepted (sources `muse:session/tokenUsage` and
+`muse:session/contextUsage`), with `observed_at` captured at acceptance:
 the `cumulative` counted-once input/output/cache counters replace the
 retained cumulative counters (no total is derived), the server-computed
-estimated `cost.usd` maps with unit `usd_estimate`, and the occupancy
-triple replaces the retained context counters. Missing counters stay
+estimated `cost.usd` maps with unit `usd_estimate`, and each context
+notification replaces both context counters (absent members become null,
+never keeping the previous window). Missing counters stay
 null. Live 2026-11-14: real turns commit `turn.completed` with no `usage`
 field at all, so these session notifications are the only usage signal for
 this harness; session facts never derive per-turn usage.

@@ -460,12 +460,13 @@ associated with its exact turn; it is not the turn's terminal result. Final text
 available, precedes the terminal turn; process exit or silence is not a turn result.
 Session-scoped usage (`session.usage` with a `SessionUsage` snapshot) replaces
 the retained snapshot for its Agent generation rather than being summed or
-rolled up: a newer `observed_at` replaces, an older or duplicate snapshot is
-ignored. Adapters fold their native session signals (Codex
-`thread/tokenUsage/updated` cumulative total plus `modelContextWindow`,
-Muse `session/tokenUsage` cumulative plus cost and `session/contextUsage`
-occupancy, Antigravity `usage_update` occupancy plus cost, Claude
-`result.total_cost_usd`) into the latest merged snapshot, bound to the exact
+rolled up: a strictly newer `observed_at` replaces, an older or
+equal-timestamp or duplicate snapshot is ignored. Adapters fold their native
+session signals (Codex `thread/tokenUsage/updated` cumulative total plus
+`modelContextWindow`, Muse `session/tokenUsage` cumulative plus cost and
+`session/contextUsage` occupancy, Antigravity `usage_update` occupancy plus
+cost, Claude `result.total_cost_usd`) into the latest merged snapshot and
+commit each changed snapshot when accepted, bound to the exact
 Agent generation with the adapter plus native signal name as `source`.
 Cumulative usage replaces
 its prior scope value rather than being summed. OpenCode attributes its final assistant

@@ -714,14 +714,17 @@ pub(crate) fn session_usage_from_token_usage(
 }
 
 /// Merge one `session/contextUsage` triple into the retained session
-/// snapshot: counted-once occupancy and the effective window size. Yields
-/// `None` when the event contributes nothing new. Absent members keep the
-/// retained values; negative values stay null.
+/// snapshot: each notification replaces both the counted-once occupancy and
+/// the effective window size. Absent or negative members become null and
+/// never keep the previous window. Yields `None` when the event contributes
+/// nothing new.
 pub(crate) fn session_usage_from_context_usage(
     notification: &NativeSessionContextUsageNotification,
     previous: Option<&SessionUsage>,
 ) -> Option<SessionUsage> {
     let counter = |value: Option<i64>| value.filter(|value| *value >= 0);
+    let used = counter(notification.used_tokens);
+    let window = counter(notification.window_tokens);
     let mut merged = previous.cloned().unwrap_or(SessionUsage {
         context_used_tokens: None,
         context_window_tokens: None,
@@ -730,22 +733,11 @@ pub(crate) fn session_usage_from_context_usage(
         source: None,
         observed_at: None,
     });
-    let mut changed = false;
-    if let Some(used) = counter(notification.used_tokens)
-        && merged.context_used_tokens != Some(used)
-    {
-        merged.context_used_tokens = Some(used);
-        changed = true;
-    }
-    if let Some(window) = counter(notification.window_tokens)
-        && merged.context_window_tokens != Some(window)
-    {
-        merged.context_window_tokens = Some(window);
-        changed = true;
-    }
-    if !changed {
+    if merged.context_used_tokens == used && merged.context_window_tokens == window {
         return None;
     }
+    merged.context_used_tokens = used;
+    merged.context_window_tokens = window;
     merged.source = Some("muse:session/contextUsage".to_owned());
     merged.observed_at = None;
     Some(merged)
@@ -1482,6 +1474,39 @@ mod tests {
         // A repeat contributes nothing new.
         assert_eq!(
             session_usage_from_context_usage(&notification, Some(&with_cumulative)),
+            None
+        );
+    }
+
+    #[test]
+    fn session_context_usage_replaces_both_fields() {
+        let full: NativeSessionContextUsageNotification = serde_json::from_value(json!({
+            "sessionId": "session-1",
+            "usedTokens": 10,
+            "windowTokens": 200000,
+        }))
+        .expect("session/contextUsage decodes");
+        let merged = session_usage_from_context_usage(&full, None).expect("occupancy maps");
+        assert_eq!(merged.context_used_tokens, Some(10));
+        assert_eq!(merged.context_window_tokens, Some(200000));
+        // A later notification without the window clears it instead of
+        // keeping the previous capacity.
+        let partial: NativeSessionContextUsageNotification = serde_json::from_value(json!({
+            "sessionId": "session-1",
+            "usedTokens": 20,
+        }))
+        .expect("window-less contextUsage decodes");
+        let replaced = session_usage_from_context_usage(&partial, Some(&merged))
+            .expect("window clears to null");
+        assert_eq!(replaced.context_used_tokens, Some(20));
+        assert_eq!(replaced.context_window_tokens, None);
+        assert_eq!(
+            replaced.source.as_deref(),
+            Some("muse:session/contextUsage")
+        );
+        // A repeat of the cleared snapshot contributes nothing new.
+        assert_eq!(
+            session_usage_from_context_usage(&partial, Some(&replaced)),
             None
         );
     }

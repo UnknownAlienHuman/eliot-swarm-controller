@@ -367,13 +367,15 @@ struct EventProcessor {
     /// Latest merged session-scoped snapshot from `session/tokenUsage`
     /// (cumulative counted-once totals plus estimated cost) and
     /// `session/contextUsage` (occupancy triple). Never turn expenditure;
-    /// committed as `session.usage` alongside the terminal and replaced
-    /// wholesale on newer updates.
+    /// committed as `session.usage` when accepted and replaced wholesale on
+    /// newer updates.
     session_usage: Option<SessionUsage>,
-    /// Last committed session snapshot content. The terminal commits the
-    /// retained snapshot only when it differs, so quiet turns (no usage
-    /// signals) commit no session fact.
+    /// Last committed session snapshot content. Each accepted update commits
+    /// only when it differs, so repeats commit no extra session fact.
     session_usage_committed: Option<SessionUsage>,
+    /// Monotonic counter for `session.usage` native ids so each accepted
+    /// update commits under a unique identity.
+    session_usage_seq: u64,
     view_recovery: Option<ViewRecovery>,
     /// Cursors already normalized on this actor. A replayed copy skips
     /// normalization; the first application did the binding and conflict
@@ -622,6 +624,7 @@ impl EventProcessor {
             last_view_cursor: None,
             session_usage: None,
             session_usage_committed: None,
+            session_usage_seq: 0,
             view_recovery: None,
             applied_view_cursors: AppliedViewCursors::default(),
             final_text: None,
@@ -2345,10 +2348,11 @@ impl EventProcessor {
     }
 
     /// Fold one `session/tokenUsage` event into the retained session snapshot
-    /// and commit it as `session.usage`: the cumulative counted-once session
-    /// totals plus the estimated session cost. Session-scoped facts, never
-    /// turn expenditure, so repeated completions can never inflate the
-    /// terminal count. Unchanged merges commit nothing.
+    /// and commit it as `session.usage` when accepted: the cumulative
+    /// counted-once session totals plus the estimated session cost, with
+    /// `observed_at` captured at acceptance. Session-scoped facts, never turn
+    /// expenditure, so repeated completions can never inflate the terminal
+    /// count. Unchanged merges commit nothing.
     async fn observe_session_token_usage(&mut self, params: Value) -> Result<()> {
         let notification: NativeSessionTokenUsageNotification = serde_json::from_value(params)
             .map_err(|_| {
@@ -2358,18 +2362,21 @@ impl EventProcessor {
                 )
             })?;
         self.check_session_signal(&notification.session_id)?;
-        if let Some(merged) =
+        let Some(merged) =
             session_usage_from_token_usage(&notification, self.session_usage.as_ref())
-        {
-            self.session_usage = Some(merged);
-        }
-        Ok(())
+        else {
+            return Ok(());
+        };
+        self.session_usage = Some(merged.clone());
+        self.commit_session_usage_now(merged).await
     }
 
     /// Fold one `session/contextUsage` event into the retained session
-    /// snapshot and commit it as `session.usage`: counted-once context
-    /// occupancy and the effective window size. Unchanged merges commit
-    /// nothing, so identical adoptions never churn the readback.
+    /// snapshot and commit it as `session.usage` when accepted: counted-once
+    /// context occupancy and the effective window size, with `observed_at`
+    /// captured at acceptance. Each notification replaces both context
+    /// fields. Unchanged merges commit nothing, so identical adoptions never
+    /// churn the readback.
     async fn observe_session_context_usage(&mut self, params: Value) -> Result<()> {
         let notification: NativeSessionContextUsageNotification = serde_json::from_value(params)
             .map_err(|_| {
@@ -2379,12 +2386,13 @@ impl EventProcessor {
                 )
             })?;
         self.check_session_signal(&notification.session_id)?;
-        if let Some(merged) =
+        let Some(merged) =
             session_usage_from_context_usage(&notification, self.session_usage.as_ref())
-        {
-            self.session_usage = Some(merged);
-        }
-        Ok(())
+        else {
+            return Ok(());
+        };
+        self.session_usage = Some(merged.clone());
+        self.commit_session_usage_now(merged).await
     }
 
     /// The notification names the owned native session; anything else is a
@@ -2399,22 +2407,28 @@ impl EventProcessor {
         Ok(())
     }
 
-    /// Commit the retained session snapshot as its own `session.usage` fact
-    /// after the accepted terminal, so session scope and turn scope can never
-    /// be confused. Commits only when the retained snapshot changed since the
-    /// last session fact, so quiet turns commit nothing extra. A terminal
-    /// whose native turn carries no usage leaves `data.usage` unset and
-    /// still commits the session snapshot: for this harness the session
-    /// notifications are the only usage signal.
-    async fn commit_session_usage(&mut self, turn_id: &str) -> Result<()> {
-        if self.session_usage == self.session_usage_committed {
+    /// Commit one accepted session snapshot as its own `session.usage` fact,
+    /// so session scope and turn scope can never be confused and stream loss
+    /// before the terminal cannot lose an accepted fact. Commits only when
+    /// the snapshot differs from the last committed fact; `observed_at` is
+    /// defaulted at the owning boundary to the commit time.
+    async fn commit_session_usage_now(&mut self, usage: SessionUsage) -> Result<()> {
+        if self.session_usage_committed.as_ref() == Some(&usage) {
             return Ok(());
         }
-        let Some(usage) = self.session_usage.clone() else {
-            return Ok(());
-        };
+        self.session_usage_seq = self.session_usage_seq.wrapping_add(1);
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
-        let native_id = event_id(session_id, turn_id, "session", "session.usage")?;
+        let turn = self
+            .status
+            .active_turn_id
+            .clone()
+            .unwrap_or_else(|| "session".to_owned());
+        let native_id = event_id(
+            session_id,
+            &turn,
+            &format!("session-{}", self.session_usage_seq),
+            "session.usage",
+        )?;
         self.commit_event("session.usage", native_id, json!({"usage": usage}))
             .await?;
         self.session_usage_committed = Some(usage);
@@ -2729,7 +2743,10 @@ impl EventProcessor {
             "turn.completed",
         )?;
         self.commit_event("turn.completed", native_id, data).await?;
-        self.commit_session_usage(&notification.turn_id).await?;
+        // Session facts already committed when each notification was
+        // accepted, so the terminal carries turn scope only. A terminal
+        // whose native turn carries no usage leaves `data.usage` unset: for
+        // this harness the session notifications are the only usage signal.
         let dead_turn_id = notification.turn_id.clone();
         self.status.last_turn = Some(TurnFacts {
             command_id,

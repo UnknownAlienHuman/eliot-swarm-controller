@@ -12282,6 +12282,27 @@ fn session_usage_keeps_only_the_latest_snapshot() {
         "older snapshot must not replace a newer one"
     );
 
+    // An equal-timestamp snapshot with different content never replaces.
+    commit(
+        &mut store,
+        "session-usage:3b",
+        "session-usage:n3b",
+        json!({
+            "context_used_tokens": 99,
+            "context_window_tokens": 1000,
+            "source": "codex:thread/tokenUsage/updated",
+            "observed_at": now + 2,
+        }),
+        now + 5,
+    );
+    assert_eq!(
+        store
+            .get_session_usage(&agent, 1)
+            .expect("read session usage"),
+        Some(second.clone()),
+        "equal timestamp must not replace the retained snapshot"
+    );
+
     // A byte-identical duplicate is ignored, even on a newer commit.
     commit(
         &mut store,
