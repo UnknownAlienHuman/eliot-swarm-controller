@@ -864,6 +864,13 @@ fn spawn_auto_round(
     pending_reconcile: &mut BTreeMap<String, PendingReconcile>,
     event: Event,
 ) {
+    // Advisory attention binds its subject snapshot for explicit `on.event`
+    // rules, but must never drive automatic behavior: neither a Goal round
+    // nor a deferred mail reoffer. An explicit rule can still target the
+    // incident; the automatic idle/Goal/mail nudges stay silent here.
+    if event.kind == "x.user.agent.attention" {
+        return;
+    }
     let Some(agent) = event.agent.clone() else {
         return;
     };
@@ -2398,6 +2405,94 @@ mod tests {
             data: json!({}),
             cause: None,
         }
+    }
+
+    #[tokio::test]
+    async fn advisory_attention_event_starts_no_goal_round_and_stores_no_follow_up() {
+        let router = router();
+        // The shared `ready_agent` fixture predates the frozen harness
+        // profile fields, so mint the agent inline with a supported harness.
+        let agent = {
+            let store_handle = Arc::clone(&router.inner.store);
+            let mut store = store_handle.lock().await;
+            let now = now_ms();
+            let launch_id = ulid::Ulid::new().to_string();
+            let admission = store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: launch_id.clone(),
+                        target: None,
+                        selector: None,
+                        verb: "launch".to_owned(),
+                        args: json!({"project":"goal-attention-quiet", "workspace":"synthetic-workspace", "harness":"codex", "profile":"test", "profile_snapshot":{}}),
+                        expected_generation: Some(0),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now,
+                )
+                .expect("admit launch");
+            let agent = admission.command.target.expect("launch target");
+            store.dispatch(&launch_id, now).expect("dispatch launch");
+            let plan = ["session", "turn", "message"]
+                .into_iter()
+                .map(|family| (family.to_owned(), "stream".to_owned()))
+                .collect();
+            store
+                .install_plugin_sources(&agent, 1, &launch_id, &plan, now)
+                .expect("install plugin sources");
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: "goal-attention-quiet:ready".to_owned(),
+                        agent_id: agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "session.ready".to_owned(),
+                            native_id: "goal-attention-quiet:ready".to_owned(),
+                            data: json!({"command_id":launch_id}),
+                        }],
+                        cursor: None,
+                    },
+                    now,
+                )
+                .expect("commit session ready");
+            store
+                .settle(&launch_id, eliot_core::CommandState::Applied, None, now)
+                .expect("settle launch");
+            agent
+        };
+        set_goal(&router, &agent, definition("keep green")).await;
+        let mut rounds: JoinSet<(String, i64)> = JoinSet::new();
+        let mut in_flight: HashMap<String, InFlightAutoRound> = HashMap::new();
+        let mut pending: HashMap<String, Event> = HashMap::new();
+        let mut pending_reconcile: BTreeMap<String, PendingReconcile> = BTreeMap::new();
+        // An idle subject snapshot on an attention event must not drive
+        // automatic behavior; explicit on.event rules stay available.
+        let mut attention = idle_event(&agent, 1, high_water(&router).await);
+        attention.kind = "x.user.agent.attention".to_owned();
+        spawn_auto_round(
+            &router,
+            passing_runner,
+            &mut rounds,
+            &mut in_flight,
+            &mut pending,
+            &mut pending_reconcile,
+            attention,
+        );
+        assert!(
+            in_flight.is_empty(),
+            "advisory attention starts no automatic round"
+        );
+        assert!(
+            pending.is_empty(),
+            "advisory attention stores no follow-up event"
+        );
+        assert!(rounds.is_empty());
     }
 
     async fn stored_goal(router: &Router, agent: &str) -> eliot_core::api::GoalView {

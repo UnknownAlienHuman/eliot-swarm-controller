@@ -65,6 +65,25 @@ Stop requires observed process exit, drained output and acknowledged `session.en
 deadline expiry or uncertain drain stays unknown. Stopping does not supply a missing
 terminal turn result or replay retained start/input outcomes.
 
+## Usage attribution
+
+Verified read-only 2026-11-13 against installed Muse 1.4.0-R4161.1
+(`muse schema generate-json-schema`, stable surface):
+`turn/completed.usage` (`TokenUsage`) is the turn's aggregate token usage,
+summed across the turn's model completions, and maps to `TurnUsage` at
+`turn` scope bound to the exact session/generation/turn. Only the explicit
+counters project (`inputTokens`, `outputTokens`, `reasoningTokens`,
+`cacheReadTokens`/`cacheWriteTokens`); `cachedTokens` is
+provider-convention-dependent (inside or beside `inputTokens`) and never
+mapped, and no total is derived. The per-completion `session/tokenUsage`
+events (raw counters plus server-derived counted-once
+`promptTokens`/`totalTokens` and the session `cumulative` block with
+`cost`), and the `session/contextUsage`
+(`usedTokens`/`windowTokens`/`pressure`) occupancy triple, are
+session-scoped facts: not turn expenditure, unmapped here, so repeated
+completions can never inflate the terminal count. Missing counters stay
+null.
+
 ## Observation and recovery
 
 Controlled MSP stream owns native lifecycle; view/page and output reads are bounded

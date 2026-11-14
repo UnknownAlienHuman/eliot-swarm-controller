@@ -46,7 +46,7 @@ pub(super) fn dispatch_tx(
     }
     if matches!(
         command.command.verb.as_str(),
-        "notify" | "emit" | "mail.send" | "var.set"
+        "notify" | "emit" | "attention.emit" | "mail.send" | "var.set"
     ) {
         if command.target.is_some()
             || command.command.generation.is_some()
