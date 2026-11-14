@@ -363,39 +363,46 @@ subjects (retained archives for archived selection) and does not claim complete 
 raw database/history-row, or capacity coverage.
 The reader never calls `thread/resume` or `thread/start` to obtain visibility.
 
-The 2026-11-14 isolated Windows probe with installed Codex 0.167.1 completed 4,168
-two-stage metadata attempts at 32 workers: 4,159 succeeded and nine selection probes
-failed before metadata, all among the first ten attempts against a fresh native home.
-All 8,327 started app-servers exited, without forced termination or cleanup errors.
-In a separate fresh home, 32 OS-lock-serialized metadata attempts all succeeded;
-all 64 native children exited successfully. These were direct app-server diagnostics,
-not qualification of the repaired Eliot/Swarm attachment path.
-This reproduces the startup symptom; it does not establish the original retained-store
-failure's cause. The underlying SQLite/OS error remains unobserved.
-At [upstream 0.167.1](https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/app-server/src/lib.rs),
-state-runtime initialization precedes installation of stderr and database tracing
-subscribers, and its error is formatted with `{err}` rather than the full error chain.
-Consequently `RUST_LOG=trace` still reported only `failed to initialize sqlite state
-runtime ... failed to initialize state runtime`, and native logs did not establish
-whether migration, journal setup or another initialization operation failed.
-Contention is a hypothesis; the mechanism below explicitly bounds startup overlap.
+On 2026-11-14, real Windows Swarm observation qualification with installed Codex
+0.167.1 rejected a global metadata-startup lock: 448 gated attempts produced 90
+unknowns, including 84 lock-wait timeouts and two SQLite-init failures. The ungated
+baseline had no unknowns in 443 attempts; a cold home separately reproduced the
+initialization failure. The gated debug build's mean cycle was 15.5 seconds versus
+4.9 seconds for the release baseline, so that timing includes a build-mode difference.
+The lock has been removed. The underlying SQLite/OS error remains unknown; contention
+is a hypothesis, and Eliot cannot coordinate other Codex processes sharing the home.
 
-Metadata readers (including observe attachment's selection probe and pinned reader)
-serialize startup across plugin processes with an OS file lock,
-`eliot-codex-state-init-v1.lock`, in the plugin's temporary directory. The probe's
-effective SQLite directory is unknown before startup, so this conservative gate
-covers all metadata stores sharing that temporary directory. It is held from before
-spawn through initialization and store verification; short-lived probes hold it
-through cleanup. A verified observer releases it before reading subject metadata
-and retaining its reader. The lock file is never removed or truncated, and process
-exit releases the OS lock. Waiting uses the existing read deadline. No failed native
-startup is retried: even metadata-only initialization can mutate native SQLite state.
-Errors and unconfirmed cleanup retain the existing uncertainty classification.
+Each metadata process may retry initialization once after a short randomized backoff
+defined by [the startup retry helper](../../plugins/codex/src/native/startup_retry.rs),
+within the existing read deadline, only when its owned process independently exited
+unsuccessfully and complete stderr matches the state-runtime initialization signature.
+The retry boundary owns spawn and initialization: only `initialize` may have been sent
+to the failed process; no successful initialization, configuration read, thread/session
+request or binding on that process may precede a retry. An earlier selection probe may
+have completed its configuration reads, but it never creates or resumes a thread.
+Native initialization can touch SQLite internals; this proof is
+about absence of session/thread effects, not absence of native database writes.
+Cleanup and output drain must be confirmed before retry. An initial failure with a missing
+signature, incomplete diagnostics, unexpected native activity or unconfirmed exit/cleanup
+retains uncertainty and does not authorize retry. After that one retry, another failed
+`initialize` RPC settles definitely only with complete diagnostics, confirmed cleanup and
+no native activity or session/thread effect; its diagnostic text may differ. A received
+successful initialization response or failed `initialized` notification never qualifies
+for retry or this exhausted-start verdict. Later configuration, store verification and
+history failures are never retried by this mechanism.
+
+An exhausted eligible retry or a pre-spawn refusal returns a bound failed attachment
+result with a short safe reason, settling the attach command definitely failed rather
+than unknown. Generic transport loss and uncertain effects retain unknown outcomes.
 The second startup and its exact home/root and `sessionFlags` proof remain required.
 
-This limits Eliot metadata-startup overlap; it does not coordinate owner-run Codex,
-controlled-session startup, other temporary directories, or background native writes.
-It is not a SQLite repair or proof that native initialization is free of failures.
+The subsequent eight-worker release Swarm sample applied 400/400 warm-home attaches,
+with all native subject/turn/item history reads and detaches succeeding. A private
+cold home copied only authentication and configuration, so its 400 attaches to refs
+from the warm store retained 400 `unknown/history_gap` outcomes and 400 applied detaches;
+these are absent-subject results, not successful attachment. Neither sample surfaced a
+SQLite-init failure. Successful internal retries are not exposed by the settled readback,
+so these observations do not prove that the retry branch ran or identify the SQLite cause.
 
 The installed stable and experimental schemas expose no passive subscription operation.
 `thread/read`, `thread/turns/list` and `thread/items/list` are separate bounded historical

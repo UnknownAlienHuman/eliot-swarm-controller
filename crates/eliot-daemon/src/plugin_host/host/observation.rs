@@ -308,6 +308,7 @@ impl PluginHost {
     ) {
         let mut transport = None;
         let mut spawn_attempted = false;
+        let mut attach_requested = false;
         let startup = async {
             let _gate = entry.gate.lock().await;
             if *entry.stop.borrow() || entry.detaching.load(Ordering::SeqCst) {
@@ -378,6 +379,9 @@ impl PluginHost {
                     "observer attach was fenced before native I/O",
                 ));
             }
+            // Mark possible delivery before polling the RPC: cancellation or
+            // transport loss from this boundary cannot prove non-admission.
+            attach_requested = true;
             let value = reader.client.call("agent.attach", json!({
                 "agent_id": entry.agent.id, "generation": entry.agent.generation,
                 "command_id": command.id, "mode": "observe",
@@ -386,6 +390,10 @@ impl PluginHost {
                 "source_plan": plan, "source_state": source_state,
             }), until).await?;
             validate_subject(&value, &entry.agent)?;
+            if value["state"] == "failed" {
+                validate_failed_attach_result(&value, &entry.agent, &command)?;
+                return safe_value(value, &reader.metadata_secrets);
+            }
             if value["state"] != "attached"
                 || value["observation_state"] != "unknown"
                 || value["command_id"].as_str() != Some(command.id.as_str())
@@ -404,6 +412,34 @@ impl PluginHost {
             _ = cancellation.changed() => Err(Error::new("cancelled", "observer attach was cancelled")),
             result = timeout_at(until, startup) => result.unwrap_or_else(|_| Err(Error::new("unknown", "observer startup deadline elapsed"))),
         };
+        let result = observer_start_result(result, attach_requested, &entry.agent, &command.id);
+        if let Ok(value) = &result
+            && value["state"] == "failed"
+        {
+            entry.detaching.store(true, Ordering::SeqCst);
+            let closed = match transport.take() {
+                Some(reader) => reader.close(self, Some(&entry.agent)).await.closed,
+                None => !spawn_attempted,
+            };
+            let reply_delivered = if closed {
+                let mut value = value.clone();
+                value["reader_closed"] = json!(true);
+                ready.send(Ok(value)).is_ok()
+            } else {
+                ready
+                    .send(Err(Error::new(
+                        "unknown",
+                        "observer failed attach cleanup is unconfirmed",
+                    )))
+                    .is_ok()
+            };
+            if !closed || !reply_delivered {
+                self.observer_unavailable(&entry.agent, "observer_start_failed", closed)
+                    .await;
+            }
+            done.send_replace(Some(closed));
+            return;
+        }
         let started = result.is_ok();
         let _ = ready.send(result.map_err(|error| {
             transport
@@ -509,7 +545,7 @@ impl PluginHost {
         }
     }
 
-    async fn observer_unavailable(&self, agent: &Agent, reason: &str, closed: bool) {
+    pub(crate) async fn observer_unavailable(&self, agent: &Agent, reason: &str, closed: bool) {
         let mut store = self.state.store.lock().await;
         if let Ok(events) =
             store.mark_observer_unavailable(&agent.id, agent.generation, reason, closed, now_ms())
@@ -518,6 +554,43 @@ impl PluginHost {
         }
         signal_progress(&self.state);
     }
+}
+
+fn observer_start_result(
+    result: Result<Value>,
+    attach_requested: bool,
+    agent: &Agent,
+    command_id: &str,
+) -> Result<Value> {
+    match result {
+        // No native attach request could have run. The caller must still
+        // confirm owned plugin cleanup before handing this result to Router.
+        Err(_) if !attach_requested => Ok(json!({
+            "agent_id": agent.id, "generation": agent.generation,
+            "command_id": command_id, "native_scope": agent.native_scope,
+            "native_ref": agent.native_ref, "state": "failed",
+            "observation_state": "unknown", "reason": "observer_preparation_failed",
+        })),
+        result => result,
+    }
+}
+
+fn validate_failed_attach_result(value: &Value, agent: &Agent, command: &Command) -> Result<()> {
+    let reason = value["reason"].as_str();
+    if value["state"] != "failed"
+        || value["observation_state"] != "unknown"
+        || value["command_id"].as_str() != Some(command.id.as_str())
+        || !matches!(
+            reason,
+            Some("observer_preparation_failed" | "native_start_failed")
+        )
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "plugin failed observer attach without its exact bound startup refusal",
+        ));
+    }
+    validate_subject(value, agent)
 }
 
 fn check_agent(store: &eliot_store::Store, expected: &Agent) -> Result<()> {
@@ -814,6 +887,31 @@ fn detach_receipt(agent: &Agent, command_id: &str, logical_only: bool) -> Value 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_failure_is_bound_but_post_attach_transport_loss_stays_uncertain() {
+        let mut agent = Agent::new("observer", "project", "codex", "profile", 1);
+        agent.generation = 3;
+        agent.native_scope = Some("scope".to_owned());
+        agent.native_ref = Some("thread".to_owned());
+        let error = Error::new("cancelled", "private preparation detail");
+        let failed = observer_start_result(Err(error.clone()), false, &agent, "attach-command")
+            .expect("pre-attach refusal has no native effect");
+        validate_subject(&failed, &agent).expect("exact subject and generation");
+        assert_eq!(failed["command_id"], "attach-command");
+        assert_eq!(failed["state"], "failed");
+        assert_eq!(failed["reason"], "observer_preparation_failed");
+        assert!(
+            failed.get("reader_closed").is_none(),
+            "cleanup is still required"
+        );
+        assert!(!failed.to_string().contains("private preparation detail"));
+        assert_eq!(
+            observer_start_result(Err(error.clone()), true, &agent, "attach-command")
+                .expect_err("possible native delivery cannot become definite"),
+            error,
+        );
+    }
 
     #[test]
     fn zero_family_predecessor_has_reader_lifetime_without_publication_plan() {

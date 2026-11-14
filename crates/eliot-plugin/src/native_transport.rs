@@ -885,7 +885,9 @@ impl NativeChild {
 
         let mut child = command.spawn().map_err(|error| {
             Error::new(
-                "native_spawn",
+                // Only Command::spawn failure proves no child was created.
+                // Later pipe/custody failures retain the conservative code.
+                "native_spawn_refused",
                 policy.redact_text(&format!(
                     "could not start the configured {}: {error}",
                     labels.server

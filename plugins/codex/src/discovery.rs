@@ -5,7 +5,10 @@ use crate::{
     host::{contextual_error, native_scope},
     native::{
         NativeClient, NativeFrame, NativeLaunch, NativeProcess,
-        startup_gate::StartupGate,
+        startup_retry::{
+            StartupFailureEvidence, exhausted_start_failure, native_start_failed, next_retry_count,
+            randomized_retry_delay,
+        },
         store_policy::ensure_store_pin_supported,
         types::{
             NativeClientInfo, NativeDiscoveryConfigReadResponse, NativeDiscoverySourceKind,
@@ -29,15 +32,20 @@ use std::{
     collections::HashSet,
     ffi::OsString,
     path::{Component, Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
     task::JoinHandle,
-    time::{Instant, timeout_at},
+    time::{Instant, sleep_until, timeout_at},
 };
 
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(25);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_EXIT_CONFIRMATION: Duration = Duration::from_millis(500);
 const MAX_PROFILE_BYTES: usize = 128 * 1024;
 const MAX_CURSOR_BYTES: usize = 16 * 1024;
 const MAX_NATIVE_CURSOR_BYTES: usize = 8 * 1024;
@@ -151,10 +159,10 @@ pub(crate) async fn read_effective_mcp_server_names(
 ) -> Result<Vec<String>> {
     let cwd = launch.cwd.clone();
     let pinned = pinned_launch_for_binding(launch, binding)?;
-    let (mut probe, drainer, _startup) = start_reader(pinned, diagnostic_secrets, deadline).await?;
+    let (mut probe, drainer, initialized) =
+        start_initialized_reader(pinned, metadata_secrets, diagnostic_secrets, deadline).await?;
     let probe_result: Result<Vec<String>> = async {
         let client = probe.client();
-        let initialized = initialize_reader(&client, metadata_secrets, deadline).await?;
         verify_initialized_store(
             &client,
             &initialized,
@@ -357,20 +365,20 @@ pub(crate) async fn probe_store(
     diagnostic_secrets: &[String],
     deadline: Instant,
 ) -> Result<StoreContext> {
-    let (mut probe, drainer, _startup) = start_reader(
+    let (mut probe, drainer, initialized) = start_initialized_reader(
         NativeLaunch {
             program: launch.program.clone(),
             args: launch.args.clone(),
             cwd: launch.cwd.clone(),
             environment: launch.environment.clone(),
         },
+        metadata_secrets,
         diagnostic_secrets,
         deadline,
     )
     .await?;
     let probe_result: Result<StoreContext> = async {
         let client = probe.client();
-        let initialized = initialize_reader(&client, metadata_secrets, deadline).await?;
         read_store(
             &client,
             environment,
@@ -398,10 +406,10 @@ pub(crate) async fn open_pinned_reader(
     // thread_store is fixed at process startup (pinned message_processor.rs:301-304).
     // A config/read reload must not relabel one store's page with another root.
     let pinned = pinned_launch(launch, store.root())?;
-    let (mut query, drainer, _startup) = start_reader(pinned, diagnostic_secrets, deadline).await?;
+    let (mut query, drainer, initialized) =
+        start_initialized_reader(pinned, metadata_secrets, diagnostic_secrets, deadline).await?;
     let result = async {
         let client = query.client();
-        let initialized = initialize_reader(&client, metadata_secrets, deadline).await?;
         let pinned_store = read_store(
             &client,
             environment,
@@ -422,24 +430,104 @@ pub(crate) async fn open_pinned_reader(
     }
 }
 
-async fn start_reader(
+/// Spawn and initialize a metadata reader before any caller can issue a
+/// configuration, thread, or session request. A startup failure is definite
+/// only after the reader is reaped and its complete output is drained.
+async fn start_initialized_reader(
     launch: NativeLaunch,
-    secrets: &[String],
+    metadata_secrets: &[String],
+    diagnostic_secrets: &[String],
     deadline: Instant,
-) -> Result<(NativeProcess, JoinHandle<()>, StartupGate)> {
-    // Every attachment has its own plugin process. Hold an OS lock, rather than
-    // a process-local mutex, from before spawn through initialization and store
-    // verification (or confirmed cleanup on failure). The unpinned probe cannot
-    // know the selected store before its effective-config readback.
-    let startup = StartupGate::acquire(deadline).await?;
-    if Instant::now() >= deadline {
-        return Err(Error::new(
-            "native_readback",
-            "Codex discovery read deadline elapsed",
-        ));
+) -> Result<(NativeProcess, JoinHandle<()>, NativeInitializeResponse)> {
+    let mut retries_used = 0;
+    loop {
+        if Instant::now() >= deadline {
+            // This refusal is before spawn; no native process or session exists.
+            return Err(native_start_failed());
+        }
+        let (mut native, drainer, native_frame_seen) =
+            spawn_reader(&launch, diagnostic_secrets, deadline).await?;
+        let client = native.client();
+        let mut initialize_response_received = false;
+        let mut initialize_request_failed = false;
+        let initialized = initialize_reader(
+            &client,
+            metadata_secrets,
+            deadline,
+            &mut initialize_response_received,
+            &mut initialize_request_failed,
+        )
+        .await;
+        let initialized = match initialized {
+            Ok(initialized) => initialized,
+            Err(initialize_error) => {
+                // Observe a natural exit before cleanup can terminate the process.
+                let natural_exit = wait_for_natural_startup_exit(&mut native, deadline).await;
+                finish_reader(&mut native, Some(drainer)).await?;
+                let stderr = client.stderr_snapshot();
+                let evidence = StartupFailureEvidence {
+                    initialize_request_failed,
+                    initialize_response_received,
+                    process_exited_unsuccessfully: natural_exit
+                        .is_some_and(|status| !status.success()),
+                    output_fully_drained: true,
+                    thread_or_session_request_sent: false,
+                    native_frame_seen: native_frame_seen.load(Ordering::Acquire),
+                    stderr: &stderr,
+                };
+                if let Some(next_retry_count) = next_retry_count(retries_used, evidence) {
+                    retries_used = next_retry_count;
+                    sleep_until((Instant::now() + randomized_retry_delay()).min(deadline)).await;
+                    continue;
+                }
+                if let Some(error) = exhausted_start_failure(retries_used, evidence, true) {
+                    return Err(client.diagnostic_error(error));
+                }
+                return Err(client.diagnostic_error(initialize_error));
+            }
+        };
+
+        // A received initialize response or initialized notification failure is
+        // never eligible for retry. No session or thread request has run yet.
+        if let Err(error) = notify_initialized(&client, deadline).await {
+            finish_reader(&mut native, Some(drainer)).await?;
+            if native_frame_seen.load(Ordering::Acquire) {
+                return Err(client.diagnostic_error(Error::new(
+                    "unknown",
+                    "Codex native startup emitted an unexpected native frame",
+                )));
+            }
+            return Err(client.diagnostic_error(error));
+        }
+        return Ok((native, drainer, initialized));
     }
-    let mut native =
-        NativeProcess::spawn(launch, SecretPolicy::new(secrets.iter().cloned())).await?;
+}
+
+async fn spawn_reader(
+    launch: &NativeLaunch,
+    diagnostic_secrets: &[String],
+    deadline: Instant,
+) -> Result<(NativeProcess, JoinHandle<()>, Arc<AtomicBool>)> {
+    if Instant::now() >= deadline {
+        return Err(native_start_failed());
+    }
+    let mut native = NativeProcess::spawn(
+        NativeLaunch {
+            program: launch.program.clone(),
+            args: launch.args.clone(),
+            cwd: launch.cwd.clone(),
+            environment: launch.environment.clone(),
+        },
+        SecretPolicy::new(diagnostic_secrets.iter().cloned()),
+    )
+    .await
+    .map_err(|error| {
+        if error.code == "native_spawn_refused" {
+            native_start_failed()
+        } else {
+            error
+        }
+    })?;
     let client = native.client();
     let mut frames = match native.take_frames() {
         Ok(frames) => frames,
@@ -448,8 +536,11 @@ async fn start_reader(
             return Err(error);
         }
     };
+    let native_frame_seen = Arc::new(AtomicBool::new(false));
+    let task_native_frame_seen = Arc::clone(&native_frame_seen);
     let drainer = tokio::spawn(async move {
         while let Some(frame) = frames.recv().await {
+            task_native_frame_seen.store(true, Ordering::Release);
             if let NativeFrame::Request { id, method, params } = frame {
                 // A reader never services auth refresh, approvals or tool requests.
                 let _ = client
@@ -458,7 +549,18 @@ async fn start_reader(
             }
         }
     });
-    Ok((native, drainer, startup))
+    Ok((native, drainer, native_frame_seen))
+}
+
+async fn wait_for_natural_startup_exit(
+    native: &mut NativeProcess,
+    deadline: Instant,
+) -> Option<std::process::ExitStatus> {
+    let exit_deadline = (Instant::now() + STARTUP_EXIT_CONFIRMATION).min(deadline);
+    match timeout_at(exit_deadline, native.transport.wait_for_process_exit()).await {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(_)) | Err(_) => None,
+    }
 }
 
 pub(crate) async fn finish_reader(
@@ -483,6 +585,8 @@ async fn initialize_reader(
     client: &NativeClient,
     secrets: &[String],
     deadline: Instant,
+    response_received: &mut bool,
+    request_failed: &mut bool,
 ) -> Result<NativeInitializeResponse> {
     let init = NativeInitializeParams {
         client_info: NativeClientInfo {
@@ -492,20 +596,19 @@ async fn initialize_reader(
         },
         capabilities: None,
     };
-    let initialized = client
-        .call(
-            "initialize",
-            serde_json::to_value(init).map_err(|_| invalid_page())?,
-            deadline,
-        )
-        .await
-        .map_err(|error| {
-            contextual_error(
+    let params = serde_json::to_value(init).map_err(|_| invalid_page())?;
+    let initialized = match client.call("initialize", params, deadline).await {
+        Ok(initialized) => initialized,
+        Err(error) => {
+            *request_failed = true;
+            return Err(contextual_error(
                 error,
                 "native_readback",
                 "Codex discovery initialize failed",
-            )
-        })?;
+            ));
+        }
+    };
+    *response_received = true;
     reject_secrets(&initialized, secrets)?;
     let initialized: NativeInitializeResponse =
         serde_json::from_value(initialized).map_err(|_| invalid_page())?;
@@ -516,6 +619,10 @@ async fn initialize_reader(
     {
         return Err(invalid_page());
     }
+    Ok(initialized)
+}
+
+async fn notify_initialized(client: &NativeClient, deadline: Instant) -> Result<()> {
     client
         .notify("initialized", None, deadline)
         .await
@@ -525,8 +632,7 @@ async fn initialize_reader(
                 "native_readback",
                 "Codex discovery initialized failed",
             )
-        })?;
-    Ok(initialized)
+        })
 }
 
 async fn read_store(
@@ -1046,32 +1152,51 @@ mod tests {
         CURSOR_PREFIX, Cursor, NativeLaunch, READ_TIMEOUT, StoreContext, binding_paths,
         decode_cursor, fingerprint, mcp_server_names, native_scope, pinned_launch,
         pinned_launch_for_binding, read_effective_mcp_server_names, request_binding, select_store,
-        sqlite_environment, start_reader, store_scope, validate_pin, validate_store,
+        sqlite_environment, start_initialized_reader, store_scope, validate_pin, validate_store,
     };
     use crate::native::types::NativeDiscoveryConfigReadResponse;
     use eliot_core::{NativeStoreBinding, SecretPolicy};
     use serde_json::json;
-    use std::{ffi::OsString, path::Path};
+    use std::{ffi::OsString, path::Path, time::Duration};
 
     #[tokio::test]
-    async fn expired_startup_deadline_never_spawns_or_claims_whole_attach_non_admission() {
+    async fn expired_startup_deadline_is_definite_before_any_native_spawn() {
         let launch = NativeLaunch {
             program: "codex-must-not-be-executed".into(),
             args: Vec::new(),
             cwd: std::env::current_dir().unwrap(),
             environment: Vec::new(),
         };
-        let error = match start_reader(launch, &[], tokio::time::Instant::now()).await {
-            Ok(_) => panic!("expired startup must not spawn a native process"),
+        let error =
+            match start_initialized_reader(launch, &[], &[], tokio::time::Instant::now()).await {
+                Ok(_) => panic!("expired startup must not spawn a native process"),
+                Err(error) => error,
+            };
+        assert_eq!(error.code, "native_start_failed");
+    }
+
+    #[tokio::test]
+    async fn nonexistent_native_executable_is_a_definite_spawn_refusal() {
+        let program =
+            std::env::temp_dir().join(format!("eliot-codex-missing-{}", ulid::Ulid::new()));
+        let launch = NativeLaunch {
+            program: program.into_os_string(),
+            args: Vec::new(),
+            cwd: std::env::current_dir().unwrap(),
+            environment: Vec::new(),
+        };
+        let error = match start_initialized_reader(
+            launch,
+            &[],
+            &[],
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        {
+            Ok(_) => panic!("a unique missing executable must not spawn"),
             Err(error) => error,
         };
-        // A spawn attempt would fail with native_spawn. Only waiting is retried;
-        // an earlier selection probe may already have initialized native state.
-        assert_eq!(error.code, "native_readback");
-        assert_eq!(
-            eliot_core::classify_dispatched_error(&error.code),
-            eliot_core::CommandState::Unknown,
-        );
+        assert_eq!(error.code, "native_start_failed");
     }
 
     #[test]

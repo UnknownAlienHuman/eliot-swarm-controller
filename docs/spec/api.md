@@ -897,6 +897,13 @@ targeted stop; only a tree `stop` expansion skips them and reports them as skipp
 `mode:"control"` is unsupported. The vendor plugin method is `agent.attach`; it is not
 a second public mutation method.
 
+A reader may return a bound `failed` attach result only when preparation refused before
+native startup or Codex reported `native_start_failed` under its proven no-effect startup
+contract. The Router verifies the exact Agent generation, command, and native subject, and
+accepts `failed` only after the owned reader is confirmed closed. Same-command retries replay
+the retained failure; a changed binding conflicts. An uncertain startup or cleanup remains
+`unknown`.
+
 `agent.history` is a separate owner-only read. `source` is required and must be
 `native` or `rollout`; `view` is required and must be `subject`, `turns` or `items`.
 Omitting either required field, supplying `null`, or using a wrong type is `invalid`;

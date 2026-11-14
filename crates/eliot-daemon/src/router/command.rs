@@ -40,6 +40,8 @@ struct ObserverCommandResult {
     coverage: Option<Value>,
     #[serde(default)]
     reader_closed: Option<bool>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 pub(super) struct RunWorkerCompletion {
@@ -993,12 +995,34 @@ impl Router {
         {
             Ok(mut value) => {
                 self.redact_native_value(&mut value);
-                match validate_observer_command_result(value, agent, &dispatched, "attached") {
+                let failed = value["state"] == "failed";
+                let failed_closed = failed && value["reader_closed"].as_bool() == Some(true);
+                let expected_state = if failed { "failed" } else { "attached" };
+                match validate_observer_command_result(value, agent, &dispatched, expected_state) {
                     Ok(snapshot) => {
-                        let _ = self.settle_observe_attach(id, snapshot.clone()).await;
+                        if failed {
+                            let reason = snapshot["reason"]
+                                .as_str()
+                                .unwrap_or("observer_start_failed");
+                            let _ = self
+                                .settle(id, CommandState::Failed, Some(json!({"reason": reason})))
+                                .await;
+                            self.inner
+                                .plugin_host
+                                .observer_unavailable(agent, "observer_start_failed", true)
+                                .await;
+                        } else {
+                            let _ = self.settle_observe_attach(id, snapshot.clone()).await;
+                        }
                     }
                     Err(error) => {
                         self.settle_plugin_error(id, &error).await;
+                        if failed_closed {
+                            self.inner
+                                .plugin_host
+                                .observer_unavailable(agent, "observer_start_failed", true)
+                                .await;
+                        }
                     }
                 }
             }
@@ -1797,6 +1821,7 @@ fn validate_observer_command_result(
         || result.state != expected_state
         || result.observation_state != "unknown"
         || result.reader_closed == Some(false)
+        || (expected_state == "failed" && result.reader_closed != Some(true))
     {
         return Err(Error::new(
             "source_integrity",
@@ -1810,6 +1835,17 @@ fn validate_observer_command_result(
         return Err(Error::new(
             "source_integrity",
             "observer attach omitted bounded metadata or coverage",
+        ));
+    }
+    if expected_state == "failed"
+        && !matches!(
+            result.reason.as_deref(),
+            Some("observer_preparation_failed" | "native_start_failed")
+        )
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "observer failure omitted its safe startup reason",
         ));
     }
     if result
@@ -1874,6 +1910,107 @@ mod start_result_tests {
         assert_eq!(
             classify_start_result(&json!({"state": "unknown"})),
             CommandState::Applied
+        );
+    }
+}
+
+#[cfg(test)]
+mod observer_attach_result_tests {
+    use super::validate_observer_command_result;
+    use eliot_core::{Agent, AgentOrigin, AgentState, Command, CommandState};
+    use serde_json::json;
+
+    fn binding() -> (Agent, Command) {
+        let mut agent = Agent::new("agent-1", "project-1", "codex", "profile-1", 1);
+        agent.generation = 2;
+        agent.origin = AgentOrigin::External;
+        agent.observe_only = true;
+        agent.native_scope = Some("scope-1".to_owned());
+        agent.native_ref = Some("thread-1".to_owned());
+        agent.state = AgentState::Unknown;
+        let command = Command {
+            id: "018f0a00-0000-7000-8000-000000000001".to_owned(),
+            principal: "owner".to_owned(),
+            method: "command.submit".to_owned(),
+            verb: "attach".to_owned(),
+            target: Some(agent.id.clone()),
+            selector: None,
+            expected_generation: Some(2),
+            generation: Some(2),
+            args: json!({}),
+            state: CommandState::Dispatched,
+            turn_id: None,
+            request_id: None,
+            outcome: None,
+            created_at: 1,
+            updated_at: 1,
+            probe: false,
+        };
+        (agent, command)
+    }
+
+    fn failed_result() -> serde_json::Value {
+        json!({
+            "agent_id":"agent-1", "generation":2,
+            "command_id":"018f0a00-0000-7000-8000-000000000001",
+            "native_scope":"scope-1", "native_ref":"thread-1",
+            "state":"failed", "observation_state":"unknown",
+            "reader_closed":true, "reason":"native_start_failed"
+        })
+    }
+
+    #[test]
+    fn failed_attach_requires_exact_subject_command_and_confirmed_reader_close() {
+        let (agent, command) = binding();
+        let value = validate_observer_command_result(failed_result(), &agent, &command, "failed")
+            .expect("exact failed attach result is admitted");
+        assert_eq!(value["state"], "failed");
+        assert_eq!(value["reason"], "native_start_failed");
+        assert!(value.get("reader_closed").is_none());
+
+        let mut changed = failed_result();
+        changed["command_id"] = json!("018f0a00-0000-7000-8000-000000000002");
+        assert_eq!(
+            validate_observer_command_result(changed, &agent, &command, "failed")
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
+        let mut changed = failed_result();
+        changed["native_ref"] = json!("another-thread");
+        assert_eq!(
+            validate_observer_command_result(changed, &agent, &command, "failed")
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
+        let mut changed = failed_result();
+        changed["reader_closed"] = json!(false);
+        assert_eq!(
+            validate_observer_command_result(changed, &agent, &command, "failed")
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
+        let mut changed = failed_result();
+        changed["reason"] = json!("unknown");
+        assert_eq!(
+            validate_observer_command_result(changed, &agent, &command, "failed")
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
+        assert_eq!(
+            validate_observer_command_result(
+                json!({"state":"unknown"}),
+                &agent,
+                &command,
+                "attached",
+            )
+            .unwrap_err()
+            .code,
+            "source_integrity",
+            "uncertain attach results stay outside the definite Failed path"
         );
     }
 }
