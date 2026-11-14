@@ -67,6 +67,12 @@ pub(crate) enum CliCommand {
     Goal(GoalArgs),
     /// Discover one page of native sessions through an explicit profile.
     Discover(DiscoverArgs),
+    /// List installed harness executables with versions. Starts no model
+    /// turn and performs no inference.
+    Harnesses,
+    /// Read a harness native model catalogue through its own read-only
+    /// method. Starts no model turn and performs no inference.
+    Models(ModelsArgs),
     /// Attach to an exact native subject without taking control of it.
     Attach(AttachArgs),
     /// Start an Agent using the named profile.
@@ -126,6 +132,8 @@ pub(crate) enum CliCommand {
     Events(EventsArgs),
     /// Wait for a frozen set of child commands/turns with all/any semantics.
     Wait(WaitArgs),
+    /// Register a durable completion digest delivering one coalesced parent mailbox result.
+    Digest(DigestArgs),
     /// Send, read or acknowledge addressed Agent mail.
     Msg(MsgArgs),
     /// Read one page of unread mail for a mailbox.
@@ -207,6 +215,13 @@ pub(crate) struct DiscoverArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct ModelsArgs {
+    /// Harness code: codex|claude|muse|opencode|antigravity.
+    #[arg(long, value_name = "HARNESS")]
+    pub(crate) harness: String,
+}
+
+#[derive(Args)]
 pub(crate) struct AttachArgs {
     #[arg(long, value_name = "PROFILE")]
     pub(crate) profile: String,
@@ -222,10 +237,23 @@ pub(crate) struct AttachArgs {
 
 #[derive(Args)]
 pub(crate) struct LaunchArgs {
-    /// Named profile. Required for a parentless launch. An Agent child
-    /// reuses its parent's frozen profile; the Owner may supply one.
-    #[arg(long, value_name = "PROFILE")]
+    /// Named profile. Required for a parentless launch unless --harness is
+    /// given for an Owner ad-hoc launch. An Agent child reuses its parent's
+    /// frozen profile; the Owner may supply one.
+    #[arg(long, value_name = "PROFILE", conflicts_with = "harness")]
     pub(crate) profile: Option<String>,
+    /// Ad-hoc Owner launch harness (codex|claude|muse|opencode|antigravity).
+    /// The daemon freezes a profile-equivalent snapshot from built-in
+    /// per-harness defaults plus --model/--effort. Owner-only.
+    #[arg(long, value_name = "HARNESS")]
+    pub(crate) harness: Option<String>,
+    /// Ad-hoc model id; omitted uses the harness native default.
+    #[arg(long, value_name = "MODEL")]
+    pub(crate) model: Option<String>,
+    /// Ad-hoc reasoning effort; omitted uses the harness native default.
+    /// Only Codex and Muse map effort; other harnesses reject it.
+    #[arg(long, value_name = "EFFORT")]
+    pub(crate) effort: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub(crate) workspace: PathBuf,
     #[arg(long, value_name = "BRANCH")]
@@ -564,6 +592,22 @@ pub(crate) struct WaitArgs {
     pub(crate) any: bool,
     #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
     pub(crate) timeout_seconds: u64,
+    /// Command ids, or `agent/generation/turn_id` for exact turn bindings.
+    #[arg(value_name = "ID")]
+    pub(crate) ids: Vec<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct DigestArgs {
+    /// Complete when every entry is terminal.
+    #[arg(long, conflicts_with = "any")]
+    pub(crate) all: bool,
+    /// Complete when any entry is terminal.
+    #[arg(long, conflicts_with = "all")]
+    pub(crate) any: bool,
+    /// Parent Agent mailbox for the one coalesced result.
+    #[arg(long, value_name = "AGENT")]
+    pub(crate) to: String,
     /// Command ids, or `agent/generation/turn_id` for exact turn bindings.
     #[arg(value_name = "ID")]
     pub(crate) ids: Vec<String>,

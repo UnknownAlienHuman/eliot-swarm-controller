@@ -123,8 +123,12 @@ stages one named group (`eliot-system-context`) in a dedicated hook-only
 directory (`<instance>-hooks/.agents/hooks.json`, a sibling of the private
 instance directory holding nothing else: no tokens, logs, state, or sockets)
 and passes that directory as the only `--add-dir` root, for both fresh starts
-and resumed sessions; hook delivery itself is unchanged. The real workspace
-remains the ACP cwd, and the private instance directory is never a native
+and resumed sessions; hook delivery itself is unchanged. The root is a
+plain absolute path: agy 1.5.3 builds `file://` URLs from its workspace
+roots and rejects the escaped `?` of a Windows verbatim (`\\?\`) path,
+dropping the whole root and its hooks without firing, so the staged root
+is stored without that prefix (it names the identical directory). The real
+workspace remains the ACP cwd, and the private instance directory is never a native
 root. The adapter does not write global or user-project hook files, copy
 authentication, or change login/native-store paths. The staged config, its
 `.agents` directory, and the discovery root are removed when the generation
@@ -258,3 +262,14 @@ substitute another subscription/API route. L7 checks initialize
 ordering, session verification, prompt correlation, interrupt settlement,
 gaps, and actual permissions/model. Common wire/ack/custody behavior
 stays in the plugin spec.
+
+## Ad-hoc launch
+
+`swarm launch --harness antigravity --model M --workspace W "prompt"` is
+Owner-only and freezes a profile-equivalent snapshot from safe defaults
+(`dangerously_skip_permissions = false`, MCP `inherit`) plus flags. A model
+is required (no native default is mapped; omission is `profile_error`).
+`cmd` is the installed app at
+`%LOCALAPPDATA%\Programs\Antigravity\Antigravity.exe`, or `unsupported` when
+the harness needs a different binary. `swarm models --harness antigravity`
+reports no catalogue: name an explicit model.

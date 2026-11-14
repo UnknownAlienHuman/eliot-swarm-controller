@@ -142,6 +142,7 @@ fn encode_record(
                 | "validation"
                 | "boot_id"
                 | "pid"
+                | "method"
         ) {
             context.insert(
                 key.to_owned(),
@@ -382,6 +383,37 @@ mod tests {
             "untouched"
         );
         assert!(!directory.join("daemon.log.1").exists());
+    }
+
+    #[test]
+    fn rpc_error_records_keep_the_calling_method() {
+        let policy = SecretPolicy::default();
+        let error = Error::new(
+            "stale_generation",
+            "Agent generation has no live plugin owner",
+        );
+        let bytes = encode_record(
+            &policy,
+            "rpc.error",
+            &[("method", "daemon.status")],
+            None,
+            Some(&error),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["ids"]["method"], json!("daemon.status"));
+        assert_eq!(value["error_code"], json!("stale_generation"));
+        // Unknown id keys are still dropped.
+        let bytes = encode_record(
+            &policy,
+            "rpc.error",
+            &[("request", "must-not-appear")],
+            None,
+            Some(&error),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value.get("ids").is_none());
     }
 
     #[test]

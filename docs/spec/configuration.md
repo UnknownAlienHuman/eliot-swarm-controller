@@ -25,7 +25,11 @@ symlink/reparse roots or unsafe ownership.
 ```
 
 The ordinary CLI reads `owner.token` automatically, only outside managed Agent/rule
-environments. A missing managed token rejects, never becomes owner. This is attribution
+environments. A missing managed token rejects, never becomes owner. An inherited Agent
+identity applies only to the daemon that issued it (see
+[Environment and secrets](#environment-and-secrets)): calls naming another data directory
+(`--data-dir`, else `ELIOT_HOME`, else default) connect as that directory's local Owner
+instead of sending the foreign token. This is attribution
 within one OS user, not hostile-same-user isolation. Tokens never appear in semantic
 payloads, recordings or logs.
 
@@ -43,9 +47,12 @@ change command settlement, source acknowledgement or process cleanup.
 The current product has five native adapters: Codex, Claude, OpenCode, Muse
 and Antigravity. Each profile selects one `harness` explicitly and an exact
 `model`. Only Codex may omit `cmd`, in which case it launches `codex` by name;
-the other four adapters require an explicit native executable in `cmd`.
-There is no default profile, no builtin fake profile, and no automatic
-harness/model/route/account fallback. The harness pages
+the other four adapters require an explicit native executable in `cmd` in a
+stored profile. There is no default profile, no builtin fake profile, and no
+automatic harness/model/route/account fallback. Profiles stay the durable
+explicit record: ad-hoc Owner launch (`swarm launch --harness ...`) freezes an
+equivalent snapshot from built-in per-harness safe defaults plus flags (see
+below). The harness pages
 ([Codex](../harnesses/codex.md), [Claude](../harnesses/claude-code.md),
 [OpenCode](../harnesses/opencode.md), [Muse](../harnesses/muse.md),
 [Antigravity](../harnesses/antigravity.md)) own their native mappings.
@@ -62,6 +69,33 @@ model = "gpt-6-luna"
 permissions = "workspace-write"
 pass_env = ["CODEX_HOME"]
 ```
+
+## Ad-hoc Owner launch (no stored profile)
+
+`swarm launch --harness <codex|claude|muse|opencode|antigravity>
+[--model M] [--effort E] --workspace W "prompt"` (and the same in
+`command.submit` `launch` args) is an Owner-only tool that builds and freezes
+a profile-equivalent snapshot exactly like a stored profile: built-in safe
+defaults for that harness plus the supplied flags, reproducible and
+replay-safe. Requested `model`/`effort` may be omitted; the freeze records the
+requested value as absent separately from the effective value the harness
+resolves at start (Codex `model/list` default entry and its default effort,
+Muse server default (after proving the `model/list` catalogue is non-empty; Muse names no default marker), Claude CLI default with `--model`/`--effort`
+omitted and effective read back, OpenCode configured default model), never a
+silent substitution: an unavailable requested model fails honestly. Authority
+fields default to the safe posture (Codex `workspace-write` + `never`,
+Claude CLI-default permission mode, Muse and OpenCode current conservative
+defaults); broader authority stays profile-only, owner-written choice. When
+`cmd` is not given, the daemon resolves the installed native executable
+deterministically and freezes the absolute path: Claude `claude.exe` on `PATH`
+or the standard user install location (refusing `.cmd`/`.bat`/`.ps1`
+wrappers), OpenCode by following the npm shim to the native `opencode.exe`,
+Muse via the launcher dir version the launcher marks current, Codex via the
+existing `codex` resolution, Antigravity via the installed app path (or
+`unsupported` when the harness needs a different binary). A missing or
+ambiguous executable is a clear `unsupported`/`profile_error` naming what was
+searched. Agent principals keep the profile and `child_profiles` rules; they
+cannot ad-hoc launch (`not_allowed`).
 
 The profile author supplies an exact model string. Reasoning effort is optional
 on every Codex route: when the profile omits `effort`, the plugin omits the
@@ -657,7 +691,13 @@ literal nonsecret `env`, named secrets resolved in memory, then Eliot identity/G
 `secret_env` is a subset of `pass_env`; those values are never persisted. Missing named
 required values fail clearly. Windows keys compare case-insensitively.
 The managed Agent target environment sets `ELIOT_HOME` to the owned data directory,
-overriding ambient/profile, alongside `ELIOT_AGENT_ID`/`ELIOT_AGENT_GENERATION`/`ELIOT_AGENT_TOKEN`.
+overriding ambient/profile, alongside `ELIOT_AGENT_ID`/`ELIOT_AGENT_GENERATION`/`ELIOT_AGENT_TOKEN`
+and the normalized issuing data directory `ELIOT_AGENT_DATA_DIR`. The CLI uses the
+inherited Agent identity only when the resolved target data directory (`--data-dir`, else
+`ELIOT_HOME`, else default) equals `ELIOT_AGENT_DATA_DIR` (lexically normalized, compared
+case-insensitively on Windows); otherwise it connects as the local Owner of the target
+data directory and never sends the foreign token. An incomplete Agent identity for the
+same data directory still rejects and never falls back to Owner authority.
 It prepends the active controller executable's parent directory to `PATH`, preserving the
 native baseline entries, so bare `swarm` resolves to the current controller before ambient/legacy bins.
 A controller directory containing the OS `PATH` separator (`;` on Windows, `:` elsewhere)

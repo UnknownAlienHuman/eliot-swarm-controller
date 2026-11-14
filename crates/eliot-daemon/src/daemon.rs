@@ -168,6 +168,13 @@ async fn run_owned(
             crate::router::run_mail_reoffer(mail_router, mail_shutdown).await
         });
     }
+    {
+        let digest_router = router.clone();
+        let digest_shutdown = attention_stop.subscribe();
+        attention_tasks.spawn(async move {
+            crate::router::run_completion_digest(digest_router, digest_shutdown).await
+        });
+    }
     let mut recovery = JoinSet::new();
     let recovery_router = router.clone();
     recovery.spawn(async move { ("workspace", recovery_router.recover_workspaces().await) });
@@ -529,31 +536,36 @@ async fn run_owned(
 /// private root; reads never initialize credentials, a database, or a daemon.
 pub async fn client_call(path: &Path, method: &str, params: Value) -> Result<Value> {
     validate_client_call(method, &params)?;
-    let identity = caller_identity()?;
+    let identity = caller_identity_for_target(path)?;
     client_call_with_identity(path, method, params, identity).await
 }
 
-/// Require the inherited identity to be a complete Agent identity. This
-/// validates only local role context and never opens the data directory or
-/// reads the Owner token; the Router remains authoritative for generation.
-pub fn require_agent_identity() -> Result<()> {
-    required_agent_identity().map(|_| ())
+/// Require the inherited identity to be a complete Agent identity scoped to
+/// `target`. This validates only local role context and never opens the data
+/// directory or reads the Owner token; the Router remains authoritative for
+/// generation. An Agent identity issued by another data directory is rejected
+/// here instead of falling back to Owner authority.
+pub fn require_agent_identity(target: &Path) -> Result<()> {
+    required_agent_identity_for(target).map(|_| ())
 }
 
-/// Make one local JSON-RPC call using only a complete inherited Agent identity.
-/// Owner and Run contexts are rejected before any Owner credential lookup.
+/// Make one local JSON-RPC call using only a complete inherited Agent identity
+/// scoped to `path`. Owner and Run contexts are rejected before any Owner
+/// credential lookup, as is an Agent identity issued by another data
+/// directory: this path never sends a foreign token and never falls back to
+/// Owner authority.
 pub async fn client_call_with_agent_identity(
     path: &Path,
     method: &str,
     params: Value,
 ) -> Result<Value> {
     validate_client_call(method, &params)?;
-    let identity = required_agent_identity()?;
+    let identity = required_agent_identity_for(path)?;
     client_call_with_identity(path, method, params, identity).await
 }
 
-fn required_agent_identity() -> Result<ClientIdentity> {
-    match caller_identity()? {
+fn required_agent_identity_for(target: &Path) -> Result<ClientIdentity> {
+    match caller_identity_for_target(target)? {
         identity @ ClientIdentity::Agent { .. } => Ok(identity),
         ClientIdentity::Owner | ClientIdentity::Run { .. } => Err(Error::new(
             "not_allowed",
@@ -834,7 +846,16 @@ async fn serve_connection_with_write_timeout(
                             }
                         }
                         Err(error) => {
-                            logging::record(&policy, "rpc.error", &[], Some(&error));
+                            // The method names the calling convention behind a
+                            // rejection burst (for example a readiness wait
+                            // polling the wrong identity), so a flood stays
+                            // attributable without hiding the error itself.
+                            logging::record(
+                                &policy,
+                                "rpc.error",
+                                &[("method", request.method.as_str())],
+                                Some(&error),
+                            );
                             RpcResponse {
                                 jsonrpc: "2.0".to_owned(),
                                 id: request.id,
@@ -1026,6 +1047,9 @@ const AGENT_IDENTITY_ENV: [&str; 3] = [
     "ELIOT_AGENT_GENERATION",
     "ELIOT_AGENT_TOKEN",
 ];
+/// Issuing data directory of the inherited Agent identity, normalized by the
+/// spawning daemon (see [`normalize_identity_data_dir`]).
+pub(crate) const AGENT_DATA_DIR_ENV: &str = "ELIOT_AGENT_DATA_DIR";
 const RUN_IDENTITY_ENV: [&str; 2] = ["ELIOT_RUN_COMMAND_ID", "ELIOT_RUN_TOKEN"];
 const OWNER_IDENTITY_ENV: [&str; 3] = [
     "ELIOT_OWNER_ID",
@@ -1033,20 +1057,89 @@ const OWNER_IDENTITY_ENV: [&str; 3] = [
     "ELIOT_OWNER_CREDENTIAL",
 ];
 
-fn caller_identity() -> Result<ClientIdentity> {
+/// Lexically normalize a data directory for identity-scope comparison. This
+/// performs no filesystem I/O: a relative path resolves against the current
+/// directory, `.` segments and redundant separators drop out, and `..`
+/// segments pop the previous normal segment. A `..` that cannot pop stays in
+/// place so the comparison safely misses instead of escaping the root.
+pub(crate) fn normalize_identity_data_dir(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+/// Compare two data directories after [`normalize_identity_data_dir`].
+/// Directory paths compare case-insensitively on Windows and exactly
+/// elsewhere, matching environment-name handling on each platform.
+pub(crate) fn identity_data_dirs_equal(left: &Path, right: &Path) -> bool {
+    let left = normalize_identity_data_dir(left);
+    let right = normalize_identity_data_dir(right);
+    #[cfg(windows)]
+    {
+        left.as_os_str()
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(right.as_os_str().as_encoded_bytes())
+    }
+    #[cfg(not(windows))]
+    {
+        left.as_os_str() == right.as_os_str()
+    }
+}
+
+fn caller_identity_for_target(target: &Path) -> Result<ClientIdentity> {
     caller_identity_from(
+        target,
         AGENT_IDENTITY_ENV.map(std::env::var_os),
+        std::env::var_os(AGENT_DATA_DIR_ENV),
         RUN_IDENTITY_ENV.map(std::env::var_os),
         OWNER_IDENTITY_ENV.map(std::env::var_os),
     )
 }
 
 fn caller_identity_from(
+    target: &Path,
     agent_values: [Option<std::ffi::OsString>; 3],
+    agent_data_dir: Option<std::ffi::OsString>,
     run_values: [Option<std::ffi::OsString>; 2],
     owner_values: [Option<std::ffi::OsString>; 3],
 ) -> Result<ClientIdentity> {
-    let has_agent = agent_values.iter().any(Option::is_some);
+    // An inherited Agent identity applies only to the daemon that issued it.
+    // When the target data directory differs from the issuing directory, the
+    // Agent credentials are ignored entirely so the call connects as the local
+    // Owner of the target instead of sending a foreign token. Spawns that
+    // predate the issuing-directory marker keep the previous behavior.
+    let raw_has_agent = agent_values.iter().any(Option::is_some);
+    let agent_in_scope = match agent_data_dir
+        .as_ref()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+    {
+        None => true,
+        Some(issuing) => identity_data_dirs_equal(target, Path::new(issuing)),
+    };
+    let has_agent = raw_has_agent && agent_in_scope;
     let has_run = run_values.iter().any(Option::is_some);
     let has_owner = owner_values.iter().any(Option::is_some);
     if has_owner || (has_agent && has_run) {
@@ -1177,9 +1270,21 @@ pub fn daemon_failure_since(data_dir: &Path, since_ms: u128) -> Option<DaemonSta
         .rfind(|failure| failure.ts_ms >= since_ms)
 }
 
-fn read_log_failures(data_dir: &Path) -> Vec<DaemonStartupFailure> {
-    // Only the resolved private data dir is ever read. An unvalidated or
-    // missing root yields no records rather than an error with paths.
+/// Newest `daemon.*` startup phase marker in the bounded log tail, if any. A
+/// readiness timeout names the phase that stalled; a phase of `daemon.ready`
+/// with failing probes means the daemon is up but rejecting the caller.
+pub fn last_daemon_phase(data_dir: &Path) -> Option<String> {
+    read_log_tail(data_dir).into_iter().rev().find_map(|value| {
+        let code = value.get("code")?.as_str()?;
+        code.starts_with("daemon.")
+            .then(|| code.chars().take(64).collect())
+    })
+}
+
+/// Bounded parsed records from the private daemon log tail, oldest first.
+/// Only the resolved private data dir is ever read. An unvalidated or
+/// missing root yields no records rather than an error with paths.
+fn read_log_tail(data_dir: &Path) -> Vec<Value> {
     if DataDir::open_existing(data_dir).is_err() {
         return Vec::new();
     }
@@ -1209,17 +1314,23 @@ fn read_log_failures(data_dir: &Path) -> Vec<DaemonStartupFailure> {
     } else {
         0
     };
-    let mut failures = Vec::new();
     let tail: Vec<&str> = text[start..].lines().rev().take(LOG_TAIL_RECORDS).collect();
+    let mut records = Vec::new();
     for line in tail.into_iter().rev() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let value: Value = match serde_json::from_str(line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            records.push(value);
+        }
+    }
+    records
+}
+
+fn read_log_failures(data_dir: &Path) -> Vec<DaemonStartupFailure> {
+    let mut failures = Vec::new();
+    for value in read_log_tail(data_dir) {
         if value.get("code").and_then(Value::as_str) != Some("daemon.failed") {
             continue;
         }
@@ -1486,12 +1597,15 @@ mod tests {
 
     #[test]
     fn run_identity_requires_exact_pair_and_never_falls_back_to_owner() {
+        let target = Path::new("test-target-data-dir");
         let owner_values = envs([None, None, None]);
         let run_token = "a".repeat(64);
         let run_values = envs([Some("run-1"), Some(run_token.as_str())]);
         assert!(matches!(
             caller_identity_from(
+                target,
                 envs([None, None, None]),
+                None,
                 run_values.clone(),
                 owner_values.clone()
             ),
@@ -1499,7 +1613,9 @@ mod tests {
         ));
         assert!(
             caller_identity_from(
+                target,
                 envs([None, None, None]),
+                None,
                 envs([Some("run-1"), None]),
                 owner_values.clone()
             )
@@ -1507,24 +1623,35 @@ mod tests {
         );
         assert!(
             caller_identity_from(
+                target,
                 envs([None, None, None]),
+                None,
                 envs([None, Some(run_token.as_str())]),
                 owner_values.clone()
             )
             .is_err()
         );
         assert!(matches!(
-            caller_identity_from(envs([None, None, None]), envs([None, None]), owner_values),
+            caller_identity_from(
+                target,
+                envs([None, None, None]),
+                None,
+                envs([None, None]),
+                owner_values
+            ),
             Ok(ClientIdentity::Owner)
         ));
     }
 
     #[test]
     fn role_environment_conflicts_fail_closed_and_agent_identity_stays_supported() {
+        let target = Path::new("test-target-data-dir");
         let run_token = "a".repeat(64);
         assert!(
             caller_identity_from(
+                target,
                 envs([Some("a1"), Some("1"), Some("agent-token")]),
+                None,
                 envs([Some("run-1"), Some(run_token.as_str())]),
                 envs([None, None, None])
             )
@@ -1532,7 +1659,9 @@ mod tests {
         );
         assert!(
             caller_identity_from(
+                target,
                 envs([Some("a1"), None, None]),
+                None,
                 envs([None, None]),
                 envs([None, None, None])
             )
@@ -1540,7 +1669,9 @@ mod tests {
         );
         assert!(
             caller_identity_from(
+                target,
                 envs([None, None, None]),
+                None,
                 envs([None, None]),
                 envs([None, Some("owner-token"), None])
             )
@@ -1548,7 +1679,9 @@ mod tests {
         );
 
         match caller_identity_from(
+            target,
             envs([Some("a1"), Some("7"), Some("agent-token")]),
+            None,
             envs([None, None]),
             envs([None, None, None]),
         )
@@ -1565,6 +1698,180 @@ mod tests {
             }
             _ => panic!("expected Agent identity"),
         }
+    }
+
+    fn scoped_envs(
+        target: &Path,
+        agent: [Option<&str>; 3],
+        issuing: Option<&str>,
+        run: [Option<&str>; 2],
+    ) -> Result<ClientIdentity> {
+        caller_identity_from(
+            target,
+            envs(agent),
+            issuing.map(std::ffi::OsString::from),
+            envs(run),
+            envs([None, None, None]),
+        )
+    }
+
+    #[test]
+    fn agent_identity_applies_only_to_its_issuing_data_dir() {
+        let same = Path::new(&format!(
+            "test-issuing-data-dir{}",
+            std::path::MAIN_SEPARATOR
+        ))
+        .to_path_buf();
+        let other = Path::new("test-other-data-dir");
+        let complete = [Some("a1"), Some("7"), Some("agent-token")];
+        let none: [Option<&str>; 2] = [None, None];
+
+        match scoped_envs(&same, complete, Some("test-issuing-data-dir"), none)
+            .expect("same-dir Agent identity applies")
+        {
+            ClientIdentity::Agent {
+                id,
+                generation,
+                token,
+            } => {
+                assert_eq!(id, "a1");
+                assert_eq!(generation, 7);
+                assert_eq!(token, "agent-token");
+            }
+            _ => panic!("expected Agent identity for the issuing directory"),
+        }
+
+        assert!(matches!(
+            scoped_envs(other, complete, Some("test-issuing-data-dir"), none)
+                .expect("foreign Agent identity is ignored"),
+            ClientIdentity::Owner
+        ));
+
+        assert!(
+            scoped_envs(
+                &same,
+                [Some("a1"), None, None],
+                Some("test-issuing-data-dir"),
+                none
+            )
+            .is_err(),
+            "incomplete same-dir identity must not fall back to Owner"
+        );
+
+        assert!(matches!(
+            scoped_envs(
+                other,
+                [Some("a1"), None, None],
+                Some("test-issuing-data-dir"),
+                none
+            )
+            .expect("incomplete foreign identity is ignored"),
+            ClientIdentity::Owner
+        ));
+
+        assert!(matches!(
+            scoped_envs(&same, complete, None, none).expect("legacy spawns keep working"),
+            ClientIdentity::Agent { .. }
+        ));
+        assert!(
+            scoped_envs(&same, [Some("a1"), None, None], None, none).is_err(),
+            "legacy incomplete identity still fails closed"
+        );
+        assert!(matches!(
+            scoped_envs(&same, complete, Some(""), none).expect("empty marker is legacy"),
+            ClientIdentity::Agent { .. }
+        ));
+
+        let run_token = "b".repeat(64);
+        assert!(matches!(
+            scoped_envs(
+                other,
+                complete,
+                Some("test-issuing-data-dir"),
+                [Some("run-1"), Some(run_token.as_str())],
+            )
+            .expect("foreign Agent does not conflict with Run"),
+            ClientIdentity::Run { .. }
+        ));
+    }
+
+    #[test]
+    fn agent_scope_comparison_ignores_spelling_variants() {
+        let complete = [Some("a1"), Some("7"), Some("agent-token")];
+        let none: [Option<&str>; 2] = [None, None];
+        let base = std::env::temp_dir().join("eliot-q20-scope-test");
+        let issuing = base.to_str().expect("temp dir is UTF-8").to_owned();
+
+        let mut varied = base.clone();
+        varied.push(".");
+        assert!(matches!(
+            scoped_envs(&varied, complete, Some(issuing.as_str()), none)
+                .expect("dot segment matches"),
+            ClientIdentity::Agent { .. }
+        ));
+
+        let trailing = format!("{}{}", issuing, std::path::MAIN_SEPARATOR);
+        assert!(matches!(
+            scoped_envs(Path::new(&trailing), complete, Some(issuing.as_str()), none)
+                .expect("trailing separator matches"),
+            ClientIdentity::Agent { .. }
+        ));
+
+        #[cfg(windows)]
+        {
+            assert!(matches!(
+                scoped_envs(
+                    Path::new(&issuing.to_ascii_uppercase()),
+                    complete,
+                    Some(issuing.as_str()),
+                    none,
+                )
+                .expect("case differs only"),
+                ClientIdentity::Agent { .. }
+            ));
+        }
+
+        assert!(matches!(
+            scoped_envs(
+                &base.join("sibling"),
+                complete,
+                Some(issuing.as_str()),
+                none,
+            )
+            .expect("sibling directory is foreign"),
+            ClientIdentity::Owner
+        ));
+    }
+
+    #[test]
+    fn scope_normalization_is_lexical_and_never_escapes() {
+        let cwd = std::env::current_dir().expect("current dir");
+        assert_eq!(
+            normalize_identity_data_dir(Path::new("relative-scope-dir")),
+            cwd.join("relative-scope-dir")
+        );
+        assert_eq!(
+            normalize_identity_data_dir(&cwd.join(".").join("child")),
+            cwd.join("child")
+        );
+        assert_eq!(
+            normalize_identity_data_dir(&cwd.join("child").join("..").join("other")),
+            cwd.join("other")
+        );
+        let rooted_escape = normalize_identity_data_dir(Path::new("/../outside"));
+        let keeps_parent = rooted_escape
+            .as_os_str()
+            .as_encoded_bytes()
+            .split(|byte| *byte == b'/' || *byte == b'\\')
+            .any(|segment| segment == b"..");
+        assert!(
+            keeps_parent,
+            "an un-poppable parent segment stays literal: {rooted_escape:?}"
+        );
+        assert!(!identity_data_dirs_equal(
+            Path::new("/../outside"),
+            Path::new("/outside")
+        ));
     }
 
     fn test_router() -> Router {
@@ -1714,5 +2021,39 @@ mod tests {
         }))
         .expect("failure JSON");
         assert!(!serialized.contains(secret));
+    }
+
+    #[test]
+    fn last_daemon_phase_names_the_newest_startup_marker() {
+        let root = std::env::temp_dir().join(format!("eliot daemon phase {}", Ulid::new()));
+        std::fs::create_dir_all(&root).expect("test root");
+        struct Guard(std::path::PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(root.clone());
+        assert!(
+            last_daemon_phase(&root).is_none(),
+            "no log tail before initialization"
+        );
+        let data = DataDir::open(&root).expect("private test data dir");
+        let logs = data.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        std::fs::write(
+            logs.join("daemon.log"),
+            "{\"ts\": 1, \"code\": \"daemon.starting\"}\n{\"ts\": 2, \"code\": \"daemon.recovered\"}\n{\"ts\": 3, \"code\": \"rpc.error\", \"error_code\": \"stale_generation\"}\n",
+        )
+        .expect("write test log");
+        assert_eq!(
+            last_daemon_phase(data.path()).as_deref(),
+            Some("daemon.recovered"),
+            "non-daemon codes never mask the phase"
+        );
+        assert!(
+            last_daemon_phase(&root.join("missing")).is_none(),
+            "missing roots yield no phase"
+        );
     }
 }

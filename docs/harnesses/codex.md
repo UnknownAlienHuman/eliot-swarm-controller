@@ -504,3 +504,14 @@ typed error, never an invented default reply.
 L7 exercises lost-start/input replies, stale generation/turn/request, final-output vs
 exit ordering, requested/effective route, paginated recovery and child limitations.
 Do not make that complete campaign a prerequisite to the first useful file edit.
+
+## Ad-hoc launch
+
+`swarm launch --harness codex [--model M] [--effort E] --workspace W "prompt"`
+is Owner-only and freezes a profile-equivalent snapshot from safe defaults
+(`workspace-write`, `never`, MCP `inherit`, empty `pass_env`, default scratch,
+no child allow-list) plus flags. An omitted `--model` selects the native
+`model/list` default entry (`isDefault`); an omitted `--effort` preserves the
+native default and reports the effective readback. An unavailable requested
+model fails without substitution. `cmd` resolves via the existing `codex`
+lookup. `swarm models --harness codex` returns the live native catalogue.
