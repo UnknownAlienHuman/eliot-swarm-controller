@@ -25,7 +25,13 @@ use eliot_store::{
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     process::Command as TokioCommand,
     sync::{broadcast, watch},
@@ -180,6 +186,22 @@ fn failed_check_message(reason: ProcessFailure) -> &'static str {
 }
 
 impl Router {
+    /// Wake the goal driver to sweep retained idle subjects. Called by
+    /// `goal.set`/`goal.resume` once the Goal is active and idle-keyed,
+    /// so an already-idle Agent rounds without a new bus event. Reads,
+    /// pauses and clears never call it; the Store single-flight marker
+    /// keeps every sweep to at most one round per subject.
+    pub(crate) fn notify_goal_reconcile(&self) {
+        let current = *self.inner.goal_reconcile.borrow();
+        self.inner
+            .goal_reconcile
+            .send_replace(current.wrapping_add(1));
+    }
+
+    pub(crate) fn subscribe_goal_reconcile(&self) -> watch::Receiver<u64> {
+        self.inner.goal_reconcile.subscribe()
+    }
+
     pub(super) async fn goal_set(&self, params: &Value, principal: &Principal) -> Result<Value> {
         let request: GoalSetRequest = decode_goal_request(
             params,
@@ -197,6 +219,9 @@ impl Router {
             &request.definition,
             now_ms(),
         )?;
+        if view.definition.cadence_ms.is_none() {
+            self.notify_goal_reconcile();
+        }
         request.validate_response(&view)?;
         serde_json::to_value(view)
             .map_err(|_| Error::new("internal", "goal state could not be encoded"))
@@ -282,6 +307,9 @@ impl Router {
             &super::principal_name(principal),
             now_ms(),
         )?;
+        if view.definition.cadence_ms.is_none() {
+            self.notify_goal_reconcile();
+        }
         request.validate_response(&view)?;
         serde_json::to_value(view)
             .map_err(|_| Error::new("internal", "goal state could not be encoded"))
@@ -668,17 +696,32 @@ struct InFlightAutoRound {
     task: tokio::task::Id,
 }
 
+/// A retained idle subject waiting for its Goal's live round to resolve
+/// or for a free concurrency slot. Bound to the Goal revision seen at
+/// sweep time: a newer revision overwrites an older wait, never the
+/// reverse, so a re-armed subject is never dropped as a duplicate.
+#[derive(Clone, Debug)]
+struct PendingReconcile {
+    generation: i64,
+    revision: i64,
+    seq: i64,
+}
+
 /// Drive active Eliot-mode Goals when their generation commits an idle
 /// event. Each round runs in its own task — at most one per Goal — through
 /// the same `goal_round` path as an explicit owner call: same probe, gates,
 /// check custody and conditional commit, with a fresh owner mutation id.
 /// A newer event for a Goal with a round in flight is remembered and
 /// driven as a follow-up when that round resolves, so the fresh key is
-/// never silently dropped. Bus lag, cap drops and stale rounds are logged;
-/// other lost races stay silent. Shutdown cancels every in-flight check
-/// through its custody cancellation and waits only for the rounds to
-/// resolve their markers (`unknown`, never rerun), never for a check to
-/// finish on its own.
+/// never silently dropped. A `goal.set`/`goal.resume` notification sweeps
+/// the retained idle subjects through the same reservation without
+/// re-offering mail; a retained subject that finds its Goal busy or the
+/// cap full waits in revision-bound order and is revalidated when a round
+/// resolves. Bus lag, bus-event cap drops, queued waits and stale rounds
+/// are logged; other lost races stay silent. Shutdown cancels every
+/// in-flight check through its custody cancellation and waits only for the
+/// rounds to resolve their markers (`unknown`, never rerun), never for a
+/// check to finish on its own.
 pub(crate) async fn run_goal_driver(
     router: Router,
     run_check: GoalCheckRunner,
@@ -686,12 +729,17 @@ pub(crate) async fn run_goal_driver(
 ) -> Result<()> {
     router.note_automation_task_running("goal_driver");
     let mut events = router.subscribe_rule_events();
+    let mut goal_changes = router.subscribe_goal_reconcile();
     let mut rounds: JoinSet<(String, i64)> = JoinSet::new();
     let mut in_flight: HashMap<String, InFlightAutoRound> = HashMap::new();
     // Newest event per Goal with a round in flight, driven as a follow-up
     // when that round resolves. Never filled past shutdown: the drain
     // below starts no new rounds.
     let mut pending: HashMap<String, Event> = HashMap::new();
+    // Retained subjects waiting for their Goal's live round to resolve or
+    // for a free cap slot, in Agent order. Revalidated and drained when a
+    // round resolves; never filled past shutdown.
+    let mut pending_reconcile: BTreeMap<String, PendingReconcile> = BTreeMap::new();
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -711,6 +759,7 @@ pub(crate) async fn run_goal_driver(
                         &mut rounds,
                         &mut in_flight,
                         &mut pending,
+                        &mut pending_reconcile,
                         event,
                     );
                 }
@@ -727,6 +776,20 @@ pub(crate) async fn run_goal_driver(
                     return Err(Error::new("unavailable", "event bus is closed"));
                 }
             },
+            changed = goal_changes.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                reconcile_idle_goals(
+                    &router,
+                    run_check,
+                    &mut rounds,
+                    &mut in_flight,
+                    &mut pending,
+                    &mut pending_reconcile,
+                )
+                .await;
+            }
             Some(joined) = rounds.join_next(), if !rounds.is_empty() => {
                 let agent = match joined {
                     Ok((agent, _)) => Some(agent),
@@ -755,13 +818,38 @@ pub(crate) async fn run_goal_driver(
                             &mut rounds,
                             &mut in_flight,
                             &mut pending,
+                            &mut pending_reconcile,
                             follow,
                         );
                     }
+                    drain_pending_reconcile(
+                        &router,
+                        run_check,
+                        &mut rounds,
+                        &mut in_flight,
+                        &mut pending,
+                        &mut pending_reconcile,
+                        &agent,
+                    )
+                    .await;
                 }
             }
         }
     }
+}
+
+/// What an automatic round runs on: a fresh bus event, or the retained
+/// exact-generation idle subject a `goal.set`/`goal.resume` reconciles.
+/// Bus events can wait as follow-ups; a retained subject that loses the
+/// race waits in revision-bound order instead of going silent.
+enum IdleSubject {
+    Event(Box<Event>),
+    Retained {
+        agent: String,
+        generation: i64,
+        revision: i64,
+        seq: i64,
+    },
 }
 
 /// Start one automatic round for an idle event unless its Goal already
@@ -773,6 +861,7 @@ fn spawn_auto_round(
     rounds: &mut JoinSet<(String, i64)>,
     in_flight: &mut HashMap<String, InFlightAutoRound>,
     pending: &mut HashMap<String, Event>,
+    pending_reconcile: &mut BTreeMap<String, PendingReconcile>,
     event: Event,
 ) {
     let Some(agent) = event.agent.clone() else {
@@ -792,66 +881,179 @@ fn spawn_auto_round(
             mail_router.reoffer_mail_notice(&mail_agent).await;
         });
     }
+    reserve_idle_round(
+        router,
+        run_check,
+        rounds,
+        in_flight,
+        pending,
+        pending_reconcile,
+        IdleSubject::Event(Box::new(event)),
+    );
+}
+
+/// Goal set/resume reconcile entry into the same reservation: the
+/// retained exact-generation idle subject rounds without a new bus
+/// event, and never re-offers mail.
+fn spawn_reconcile_round(
+    router: &Router,
+    run_check: GoalCheckRunner,
+    rounds: &mut JoinSet<(String, i64)>,
+    in_flight: &mut HashMap<String, InFlightAutoRound>,
+    pending: &mut HashMap<String, Event>,
+    pending_reconcile: &mut BTreeMap<String, PendingReconcile>,
+    subject: IdleSubject,
+) {
+    reserve_idle_round(
+        router,
+        run_check,
+        rounds,
+        in_flight,
+        pending,
+        pending_reconcile,
+        subject,
+    );
+}
+
+/// Keep the newest wait for one Agent: a newer revision overwrites an
+/// older one, and a repeat sweep at the same revision never shrinks the
+/// waited-on key.
+fn remember_reconcile_wait(
+    pending_reconcile: &mut BTreeMap<String, PendingReconcile>,
+    agent: String,
+    waiting: PendingReconcile,
+) {
+    let newer = pending_reconcile
+        .get(&agent)
+        .is_none_or(|prior| (waiting.revision, waiting.seq) >= (prior.revision, prior.seq));
+    if newer {
+        pending_reconcile.insert(agent, waiting);
+    }
+}
+
+/// Shared reservation for automatic rounds: at most one per Goal and
+/// four Goals at once, through the same round path. A newer event for a
+/// Goal with a round in flight is remembered for a follow-up; a retained
+/// subject that loses its race waits in revision-bound order instead of
+/// going silent. A retained subject past the cap waits for a free slot
+/// instead of dropping — only bus events are dropped at the cap — and
+/// the Store single-flight marker covers explicit rounds.
+fn reserve_idle_round(
+    router: &Router,
+    run_check: GoalCheckRunner,
+    rounds: &mut JoinSet<(String, i64)>,
+    in_flight: &mut HashMap<String, InFlightAutoRound>,
+    pending: &mut HashMap<String, Event>,
+    pending_reconcile: &mut BTreeMap<String, PendingReconcile>,
+    subject: IdleSubject,
+) {
+    let (agent, generation, seq, follow, waiting) = match subject {
+        IdleSubject::Event(event) => {
+            let Some(agent) = event.agent.clone() else {
+                return;
+            };
+            let generation = event.generation;
+            let seq = event.seq;
+            (agent, generation, seq, Some(*event), None)
+        }
+        IdleSubject::Retained {
+            agent,
+            generation,
+            revision,
+            seq,
+        } => (
+            agent,
+            Some(generation),
+            seq,
+            None,
+            Some(PendingReconcile {
+                generation,
+                revision,
+                seq,
+            }),
+        ),
+    };
     if let Some(running) = in_flight.get(&agent) {
-        let newer = event.seq > running.seq
-            && pending
-                .get(&agent)
-                .is_none_or(|prior| event.seq > prior.seq);
-        if newer {
-            pending.insert(agent, event);
+        if let Some(event) = follow {
+            let newer = event.seq > running.seq
+                && pending
+                    .get(&agent)
+                    .is_none_or(|prior| event.seq > prior.seq);
+            if newer {
+                pending.insert(agent, event);
+            }
+        } else if let Some(waiting) = waiting {
+            remember_reconcile_wait(pending_reconcile, agent, waiting);
         }
         return;
     }
-    if event.generation.is_none()
-        || !event
+    let Some(generation) = generation else {
+        return;
+    };
+    if follow.as_ref().is_some_and(|event| {
+        !event
             .subject
             .as_ref()
             .is_some_and(|subject| subject.state == AgentState::Idle)
-    {
+    }) {
         return;
     }
     if in_flight.len() >= MAX_CONCURRENT_AUTO_ROUNDS {
-        let policy = router.secret_policy_snapshot();
-        crate::logging::record(
-            &policy,
-            "daemon.goal_auto_round_dropped",
-            &[("agent", &agent)],
-            None,
-        );
+        if let Some(waiting) = waiting {
+            remember_reconcile_wait(pending_reconcile, agent.clone(), waiting);
+            let policy = router.secret_policy_snapshot();
+            crate::logging::record(
+                &policy,
+                "daemon.goal_auto_round_queued",
+                &[("agent", &agent)],
+                None,
+            );
+        } else {
+            let policy = router.secret_policy_snapshot();
+            crate::logging::record(
+                &policy,
+                "daemon.goal_auto_round_dropped",
+                &[("agent", &agent)],
+                None,
+            );
+        }
         return;
     }
     let (cancel, cancellation) = watch::channel(false);
-    let seq = event.seq;
     let task_router = router.clone();
     let task_agent = agent.clone();
+    let drive_agent = agent.clone();
     let task = rounds
         .spawn(async move {
-            drive_goal_for_event(&task_router, run_check, event, cancellation).await;
+            drive_goal_at_idle(
+                &task_router,
+                run_check,
+                &drive_agent,
+                generation,
+                seq,
+                cancellation,
+            )
+            .await;
             (task_agent, seq)
         })
         .id();
     in_flight.insert(agent, InFlightAutoRound { cancel, seq, task });
 }
 
-async fn drive_goal_for_event(
+/// Shared automatic-round driver for one exact-generation idle subject:
+/// the same scope, enablement and single-flight checks whether the
+/// subject arrived on the bus or was retained from `goal.set`/`resume`.
+/// A busy Agent, a drifted generation or a consumed key stays silent and
+/// waits for the next real event; only the round path itself may pause a
+/// drifted Goal, so this returns before any probe when generations differ.
+async fn drive_goal_at_idle(
     router: &Router,
     run_check: GoalCheckRunner,
-    event: Event,
+    agent: &str,
+    generation: i64,
+    idle_seq: i64,
     cancellation: watch::Receiver<bool>,
 ) {
-    let Some(agent) = event.agent.as_deref() else {
-        return;
-    };
-    let Some(generation) = event.generation else {
-        return;
-    };
-    if !event
-        .subject
-        .as_ref()
-        .is_some_and(|subject| subject.state == AgentState::Idle)
-    {
-        return;
-    }
     if !router.rule_firings_open() {
         return;
     }
@@ -881,7 +1083,7 @@ async fn drive_goal_for_event(
         "id": ulid::Ulid::new().to_string(),
         "agent": agent,
         "mode": "eliot",
-        "idle_seq": event.seq,
+        "idle_seq": idle_seq,
     });
     match router
         .goal_round_with_cancellation(&params, &Principal::Owner, run_check, cancellation)
@@ -914,6 +1116,184 @@ async fn drive_goal_for_event(
                 Some(&error),
             );
         }
+    }
+}
+
+/// Sweep the retained idle subjects after `goal.set`/`goal.resume`.
+/// Each still-eligible subject enters the same reservation as a bus
+/// event, without re-offering mail. A non-idle Agent stays silent; a
+/// missing subject (pruned, superseded or never retained) is logged and
+/// waits for a real event instead of inventing one. A spent subject is
+/// skipped before taking a scheduler slot, so burned keys cannot starve
+/// eligible Goals past the cap. A subject that finds its Goal busy or the
+/// cap full waits in revision-bound order for the next join. The readback
+/// shows the outcome: a scheduled round appears as the Goal's round marker
+/// and counters, an ineligible subject leaves them untouched. Drifted
+/// generations are skipped without pausing: a set/resume never resumes a
+/// lost Agent, and only the round path itself may pause a drifted Goal.
+/// A consumed subject rearms only through a new Goal revision (a
+/// definition change clears the committed key); unknown-burned keys never
+/// rerun within the generation, so repeated set/retry, reads and daemon
+/// restart cannot create another round.
+async fn reconcile_idle_goals(
+    router: &Router,
+    run_check: GoalCheckRunner,
+    rounds: &mut JoinSet<(String, i64)>,
+    in_flight: &mut HashMap<String, InFlightAutoRound>,
+    pending: &mut HashMap<String, Event>,
+    pending_reconcile: &mut BTreeMap<String, PendingReconcile>,
+) {
+    if !router.rule_firings_open() {
+        return;
+    }
+    let candidates = {
+        let store = router.inner.store.lock().await;
+        match store.goal_reconcile_candidates() {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                let policy = router.secret_policy_snapshot();
+                crate::logging::record(&policy, "daemon.goal_reconcile_failed", &[], Some(&error));
+                return;
+            }
+        }
+    };
+    for candidate in candidates {
+        if candidate.agent_state != AgentState::Idle {
+            continue;
+        }
+        let Some(seq) = candidate.idle_seq else {
+            let policy = router.secret_policy_snapshot();
+            crate::logging::record(
+                &policy,
+                "daemon.goal_reconcile_no_idle_event",
+                &[("agent", &candidate.agent)],
+                None,
+            );
+            continue;
+        };
+        if candidate.key_consumed {
+            // Already spent within this generation: never rerun, and never
+            // take a scheduler slot another Goal could use.
+            let policy = router.secret_policy_snapshot();
+            crate::logging::record(
+                &policy,
+                "daemon.goal_auto_round_stale",
+                &[("agent", &candidate.agent)],
+                None,
+            );
+            continue;
+        }
+        spawn_reconcile_round(
+            router,
+            run_check,
+            rounds,
+            in_flight,
+            pending,
+            pending_reconcile,
+            IdleSubject::Retained {
+                agent: candidate.agent,
+                generation: candidate.generation,
+                revision: candidate.revision,
+                seq,
+            },
+        );
+    }
+}
+
+/// Drive waiting retained subjects when a round resolves: the joined
+/// Goal's own revision-bound follow-up first, then the oldest queued
+/// subject in Agent order while a scheduler slot is free. Each subject
+/// is revalidated against the Store — same generation and revision, same
+/// unconsumed idle key — so a subject spent while it waited stays silent
+/// without taking the freed slot.
+async fn drain_pending_reconcile(
+    router: &Router,
+    run_check: GoalCheckRunner,
+    rounds: &mut JoinSet<(String, i64)>,
+    in_flight: &mut HashMap<String, InFlightAutoRound>,
+    pending: &mut HashMap<String, Event>,
+    pending_reconcile: &mut BTreeMap<String, PendingReconcile>,
+    joined: &str,
+) {
+    while in_flight.len() < MAX_CONCURRENT_AUTO_ROUNDS {
+        let next = pending_reconcile
+            .remove(joined)
+            .map(|waiting| {
+                (
+                    joined.to_owned(),
+                    waiting.generation,
+                    waiting.revision,
+                    waiting.seq,
+                )
+            })
+            .or_else(|| {
+                let agent = pending_reconcile
+                    .keys()
+                    .find(|agent| !in_flight.contains_key(*agent))
+                    .cloned()?;
+                pending_reconcile
+                    .remove(&agent)
+                    .map(|waiting| (agent, waiting.generation, waiting.revision, waiting.seq))
+            });
+        let Some((agent, generation, revision, seq)) = next else {
+            break;
+        };
+        let eligible = {
+            let store = router.inner.store.lock().await;
+            match store.goal_reconcile_candidates() {
+                Ok(candidates) => candidates
+                    .into_iter()
+                    .find(|candidate| candidate.agent == agent)
+                    .is_some_and(|candidate| {
+                        candidate.generation == generation
+                            && candidate.revision == revision
+                            && candidate.idle_seq == Some(seq)
+                            && !candidate.key_consumed
+                    }),
+                Err(error) => {
+                    let policy = router.secret_policy_snapshot();
+                    crate::logging::record(
+                        &policy,
+                        "daemon.goal_reconcile_failed",
+                        &[],
+                        Some(&error),
+                    );
+                    pending_reconcile.insert(
+                        agent,
+                        PendingReconcile {
+                            generation,
+                            revision,
+                            seq,
+                        },
+                    );
+                    break;
+                }
+            }
+        };
+        if !eligible {
+            let policy = router.secret_policy_snapshot();
+            crate::logging::record(
+                &policy,
+                "daemon.goal_auto_round_stale",
+                &[("agent", &agent)],
+                None,
+            );
+            continue;
+        }
+        spawn_reconcile_round(
+            router,
+            run_check,
+            rounds,
+            in_flight,
+            pending,
+            pending_reconcile,
+            IdleSubject::Retained {
+                agent,
+                generation,
+                revision,
+                seq,
+            },
+        );
     }
 }
 
@@ -2000,7 +2380,28 @@ mod tests {
 
     async fn drive_event(router: &Router, run_check: GoalCheckRunner, event: Event) {
         let (_cancel, cancellation) = watch::channel(false);
-        drive_goal_for_event(router, run_check, event, cancellation).await;
+        let Some(agent) = event.agent.clone() else {
+            return;
+        };
+        let Some(generation) = event.generation else {
+            return;
+        };
+        if !event
+            .subject
+            .as_ref()
+            .is_some_and(|subject| subject.state == AgentState::Idle)
+        {
+            return;
+        }
+        drive_goal_at_idle(
+            router,
+            run_check,
+            &agent,
+            generation,
+            event.seq,
+            cancellation,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -2612,5 +3013,381 @@ mod tests {
         assert_eq!(second["outcome"], "blocked");
         assert_eq!(second["reason"], "no_progress");
         assert_eq!(second["view"]["status"], "blocked");
+    }
+
+    #[tokio::test]
+    async fn goal_set_reconciles_an_idle_agent_without_a_bus_event() {
+        let router = router();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let driver = tokio::spawn(run_goal_driver(router.clone(), failing_runner, shutdown_rx));
+        let agent = ready_agent(&router, "goal-reconcile-set").await;
+        let key = high_water(&router).await;
+        // Set once up front so the Goal exists before the loop reads it
+        // back, then retry the identical set until the driver subscribes:
+        // every retry re-notifies, but the single-flight marker keeps it
+        // to one round.
+        set_goal(&router, &agent, definition("keep green")).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if stored_goal(&router, &agent).await.counters.rounds == 1 {
+                    break;
+                }
+                set_goal(&router, &agent, definition("keep green")).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("set reconciles an idle agent");
+        // Repeated identical sets cannot schedule another round on the
+        // consumed subject: the revision is unchanged and the key stays
+        // burned, so the sweep keeps waiting for a real event.
+        set_goal(&router, &agent, definition("keep green")).await;
+        set_goal(&router, &agent, definition("keep green")).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let view = stored_goal(&router, &agent).await;
+        assert_eq!(view.status, eliot_core::api::GoalStatus::Active);
+        assert_eq!(view.counters.rounds, 1);
+        assert_eq!(view.last_round_key, Some(format!("idle:{key}")));
+        assert!(view.round_marker.is_none());
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), driver)
+            .await
+            .expect("driver joins")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn goal_resume_reconciles_a_paused_goal_without_a_bus_event() {
+        let router = router();
+        let agent = ready_agent(&router, "goal-reconcile-resume").await;
+        set_goal(&router, &agent, definition("keep green")).await;
+        router
+            .goal_pause(
+                &json!({"id": ulid::Ulid::new().to_string(), "agent":agent, "mode":"eliot", "reason":"waiting"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        let key = high_water(&router).await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let driver = tokio::spawn(run_goal_driver(router.clone(), passing_runner, shutdown_rx));
+        // Retry the resume until the driver subscribes; the first resume
+        // activates the Goal and every retry re-notifies idempotently.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if stored_goal(&router, &agent).await.counters.rounds == 1 {
+                    break;
+                }
+                router
+                    .goal_resume(
+                        &json!({"id": ulid::Ulid::new().to_string(), "agent":agent, "mode":"eliot"}),
+                        &Principal::Owner,
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("resume reconciles a paused goal");
+        let view = stored_goal(&router, &agent).await;
+        assert_eq!(view.status, eliot_core::api::GoalStatus::Completed);
+        assert_eq!(view.counters.rounds, 1);
+        assert_eq!(view.last_round_key, Some(format!("idle:{key}")));
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), driver)
+            .await
+            .expect("driver joins")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn goal_reconcile_and_bus_event_schedule_exactly_one_round() {
+        let router = router();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let driver = tokio::spawn(run_goal_driver(router.clone(), passing_runner, shutdown_rx));
+        let agent = ready_agent(&router, "goal-reconcile-race").await;
+        let key = high_water(&router).await;
+        // Set once up front so the Goal exists before the loop reads it
+        // back, then retry set plus event until one path wins the race.
+        set_goal(&router, &agent, definition("keep green")).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if stored_goal(&router, &agent).await.counters.rounds == 1 {
+                    break;
+                }
+                set_goal(&router, &agent, definition("keep green")).await;
+                router.inner.bus.publish(&[idle_event(&agent, 1, key)]);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("one round wins the set/event race");
+        // Settle: further sweeps and redelivered events must not schedule
+        // another round on the consumed subject.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let view = stored_goal(&router, &agent).await;
+        assert_eq!(view.counters.rounds, 1);
+        assert_eq!(view.last_round_key, Some(format!("idle:{key}")));
+        assert!(view.round_marker.is_none());
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), driver)
+            .await
+            .expect("driver joins")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn goal_reconcile_skips_spent_keys_and_queues_past_the_cap() {
+        let router = router();
+        let mut agents = Vec::new();
+        for index in 0..MAX_CONCURRENT_AUTO_ROUNDS + 5 {
+            let agent = ready_agent(&router, &format!("goal-reconcile-cap-{index}")).await;
+            set_goal(&router, &agent, definition("keep green")).await;
+            agents.push((agent, high_water(&router).await));
+        }
+        // Burn the first four keys without admitting a continuation: an
+        // unknown round spends its key through the marker, stays active
+        // and appends no Agent events, so the sweep must skip the still
+        // current consumed keys before the cap.
+        for (agent, key) in &agents[..MAX_CONCURRENT_AUTO_ROUNDS] {
+            drive_event(&router, unknown_runner, idle_event(agent, 1, *key)).await;
+            let view = stored_goal(&router, agent).await;
+            assert_eq!(view.counters.rounds, 0);
+            assert_eq!(view.last_round_key, None);
+            let marker = view.round_marker.expect("burned key stays visible");
+            assert_eq!(marker.round_key, format!("idle:{key}"));
+            assert_eq!(marker.state, eliot_core::api::GoalMarkerState::Unknown);
+        }
+        let mut rounds: JoinSet<(String, i64)> = JoinSet::new();
+        let mut in_flight: HashMap<String, InFlightAutoRound> = HashMap::new();
+        let mut pending: HashMap<String, Event> = HashMap::new();
+        let mut pending_reconcile: BTreeMap<String, PendingReconcile> = BTreeMap::new();
+        reconcile_idle_goals(
+            &router,
+            passing_runner,
+            &mut rounds,
+            &mut in_flight,
+            &mut pending,
+            &mut pending_reconcile,
+        )
+        .await;
+        // Four eligible Goals fill the cap; the fifth waits instead of
+        // dropping, and no spent key takes a slot.
+        assert_eq!(in_flight.len(), MAX_CONCURRENT_AUTO_ROUNDS);
+        for (agent, _) in &agents[..MAX_CONCURRENT_AUTO_ROUNDS] {
+            assert!(!in_flight.contains_key(agent));
+        }
+        for (agent, _) in &agents[MAX_CONCURRENT_AUTO_ROUNDS..MAX_CONCURRENT_AUTO_ROUNDS + 4] {
+            assert!(in_flight.contains_key(agent));
+        }
+        assert_eq!(pending_reconcile.len(), 1);
+        let queued = agents[MAX_CONCURRENT_AUTO_ROUNDS + 4].0.clone();
+        assert!(pending_reconcile.contains_key(&queued));
+        // Freeing one slot drives the queued subject.
+        let (joined, _) = tokio::time::timeout(Duration::from_secs(10), rounds.join_next())
+            .await
+            .expect("a round resolves")
+            .expect("round task joins")
+            .expect("round task succeeds");
+        in_flight.remove(&joined);
+        drain_pending_reconcile(
+            &router,
+            passing_runner,
+            &mut rounds,
+            &mut in_flight,
+            &mut pending,
+            &mut pending_reconcile,
+            &joined,
+        )
+        .await;
+        assert!(pending_reconcile.is_empty());
+        assert!(in_flight.contains_key(&queued));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while rounds.join_next().await.is_some() {}
+        })
+        .await
+        .expect("queued round resolves");
+        for (agent, key) in &agents[MAX_CONCURRENT_AUTO_ROUNDS..] {
+            let view = stored_goal(&router, agent).await;
+            assert_eq!(view.counters.rounds, 1);
+            assert_eq!(view.last_round_key, Some(format!("idle:{key}")));
+        }
+        // The spent Goals never rounded.
+        for (agent, _) in &agents[..MAX_CONCURRENT_AUTO_ROUNDS] {
+            assert_eq!(stored_goal(&router, agent).await.counters.rounds, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_reconcile_follow_up_rounds_the_new_revision_after_join() {
+        let router = router();
+        let agent = ready_agent(&router, "goal-reconcile-revision").await;
+        let revision = set_goal(&router, &agent, definition("keep green")).await["revision"]
+            .as_i64()
+            .expect("set returns a revision");
+        let key = high_water(&router).await;
+        let mut rounds: JoinSet<(String, i64)> = JoinSet::new();
+        let mut in_flight: HashMap<String, InFlightAutoRound> = HashMap::new();
+        let mut pending: HashMap<String, Event> = HashMap::new();
+        let mut pending_reconcile: BTreeMap<String, PendingReconcile> = BTreeMap::new();
+        // The live round starts on the first revision and commits before
+        // its join is processed.
+        reserve_idle_round(
+            &router,
+            passing_runner,
+            &mut rounds,
+            &mut in_flight,
+            &mut pending,
+            &mut pending_reconcile,
+            IdleSubject::Retained {
+                agent: agent.clone(),
+                generation: 1,
+                revision,
+                seq: key,
+            },
+        );
+        assert_eq!(in_flight.len(), 1);
+        let (joined, _) = tokio::time::timeout(Duration::from_secs(10), rounds.join_next())
+            .await
+            .expect("live round resolves")
+            .expect("round task joins")
+            .expect("round task succeeds");
+        assert_eq!(joined, agent);
+        // A changed definition rearms the same subject while the join is
+        // still unprocessed: the sweep must wait for the join, not drop
+        // the new revision.
+        set_goal(&router, &agent, definition("greener")).await;
+        reconcile_idle_goals(
+            &router,
+            passing_runner,
+            &mut rounds,
+            &mut in_flight,
+            &mut pending,
+            &mut pending_reconcile,
+        )
+        .await;
+        assert_eq!(in_flight.len(), 1);
+        assert!(pending_reconcile.contains_key(&agent));
+        // Processing the old join drives the waited-on revision.
+        in_flight.remove(&agent);
+        drain_pending_reconcile(
+            &router,
+            passing_runner,
+            &mut rounds,
+            &mut in_flight,
+            &mut pending,
+            &mut pending_reconcile,
+            &agent,
+        )
+        .await;
+        assert!(pending_reconcile.is_empty());
+        assert_eq!(in_flight.len(), 1);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while rounds.join_next().await.is_some() {}
+        })
+        .await
+        .expect("follow-up round resolves");
+        let view = stored_goal(&router, &agent).await;
+        // The definition replacement resets the counters, so the
+        // revision-bound follow-up is the first counted round.
+        assert_eq!(view.counters.rounds, 1);
+        assert_eq!(view.last_round_key, Some(format!("idle:{key}")));
+    }
+
+    static DRAIN_STARTED: AtomicUsize = AtomicUsize::new(0);
+    static DRAIN_RELEASE: OnceLock<Notify> = OnceLock::new();
+
+    fn drain_runner(
+        _: TokioCommand,
+        _: Vec<u8>,
+        _: Duration,
+        _: Arc<SecretPolicy>,
+        _: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>> {
+        Box::pin(async {
+            DRAIN_STARTED.fetch_add(1, Ordering::SeqCst);
+            DRAIN_RELEASE.get_or_init(Notify::new).notified().await;
+            completed_outcome(0, b"all green", true)
+        })
+    }
+
+    #[tokio::test]
+    async fn goal_driver_drains_queued_reconcile_after_a_follow_up_join() {
+        DRAIN_STARTED.store(0, Ordering::SeqCst);
+        let router = router();
+        let mut agents = Vec::new();
+        for index in 0..MAX_CONCURRENT_AUTO_ROUNDS + 1 {
+            let agent = ready_agent(&router, &format!("goal-drain-follow-up-{index}")).await;
+            set_goal(&router, &agent, definition("keep green")).await;
+            agents.push((agent, high_water(&router).await));
+        }
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let driver = tokio::spawn(run_goal_driver(router.clone(), drain_runner, shutdown_rx));
+        // Fill the cap with four slow rounds.
+        publish_until(&router, &agents[0].0, 1, agents[0].1, &DRAIN_STARTED).await;
+        for (agent, key) in &agents[1..MAX_CONCURRENT_AUTO_ROUNDS] {
+            router.inner.bus.publish(&[idle_event(agent, 1, *key)]);
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while DRAIN_STARTED.load(Ordering::SeqCst) < MAX_CONCURRENT_AUTO_ROUNDS {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cap fills with running checks");
+        // Queue the fifth goal past the cap through a reconcile sweep.
+        set_goal(
+            &router,
+            &agents[MAX_CONCURRENT_AUTO_ROUNDS].0,
+            definition("keep green"),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Newer non-idle events for the running goals: follow-ups that
+        // must not spawn, but must not suppress the drain either.
+        for (agent, key) in &agents[..MAX_CONCURRENT_AUTO_ROUNDS] {
+            router
+                .inner
+                .bus
+                .publish(&[busy_event(agent, 1, *key + 1, AgentState::Waiting)]);
+        }
+        // Release the slow checks; every join carries a follow-up, so the
+        // queued fifth goal rounds only if the join drains after it.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                DRAIN_RELEASE.get_or_init(Notify::new).notify_waiters();
+                if stored_goal(&router, &agents[MAX_CONCURRENT_AUTO_ROUNDS].0)
+                    .await
+                    .counters
+                    .rounds
+                    == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("queued goal rounds after follow-up joins");
+        let queued = &agents[MAX_CONCURRENT_AUTO_ROUNDS].0;
+        let view = stored_goal(&router, queued).await;
+        assert_eq!(
+            view.last_round_key,
+            Some(format!("idle:{}", agents[MAX_CONCURRENT_AUTO_ROUNDS].1))
+        );
+        // The follow-ups never spawned extra rounds.
+        for (agent, _) in &agents[..MAX_CONCURRENT_AUTO_ROUNDS] {
+            assert_eq!(stored_goal(&router, agent).await.counters.rounds, 1);
+        }
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), driver)
+            .await
+            .expect("driver joins")
+            .unwrap()
+            .unwrap();
     }
 }

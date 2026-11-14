@@ -111,6 +111,11 @@ struct RouterInner {
     progress: watch::Sender<u64>,
     run_cancellation: watch::Sender<bool>,
     run_workers: Mutex<HashMap<String, RunWorkerHandle>>,
+    /// Bumped by `goal.set`/`goal.resume` when the Goal ends up active and
+    /// idle-keyed. The goal driver sweeps the retained idle subjects on
+    /// every change; reads never bump it. Startup performs no sweep: the
+    /// restart marks every owned session lost, so nothing is eligible.
+    goal_reconcile: watch::Sender<u64>,
 }
 
 struct RunWorkerHandle {
@@ -179,6 +184,7 @@ impl Router {
         let unknown_commands: UnknownCommands = Arc::new(Mutex::new(Default::default()));
         let (progress, _) = watch::channel(0_u64);
         let (run_cancellation, _) = watch::channel(false);
+        let (goal_reconcile, _) = watch::channel(0_u64);
         let monitoring = Monitoring::new(Arc::clone(&store), bus.clone(), Arc::clone(&secrets));
         let workspaces = WorkspaceManager::new(
             data_root.clone(),
@@ -224,6 +230,7 @@ impl Router {
                 progress,
                 run_cancellation,
                 run_workers: Mutex::new(HashMap::new()),
+                goal_reconcile,
             }),
         }
     }
