@@ -1060,7 +1060,10 @@ CLI `watch [AGENT]` reads these bounds once and starts at `hi`, delivering new e
 `watch [AGENT] --after SEQ` instead uses that exact exclusive replay cursor. A lost
 cursor, including explicit `--after 0` after pruning, returns `history_gap`; it is
 never clamped or replaced by a new tip. MCP notification bootstrap also uses bounds
-instead of replay from zero. A later retention gap still fails explicitly.
+instead of replay from zero. A later retention gap still fails explicitly. A transient
+transport timeout never ends the stream: the client re-issues `events.subscribe` from
+its last cursor with bounded backoff. Only a typed rejection ends it; on `history_gap`
+the client resolves the retained resume cursor from fresh bounds and reports it.
 
 Before printing events or advancing a cursor, validate each response page against the
 effective request cursor: `0 <= after <= next <= high_water`. Event `seq` values must be

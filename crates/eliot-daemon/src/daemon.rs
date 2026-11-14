@@ -1226,7 +1226,12 @@ fn call_timeout(method: &str, params: &Value) -> Duration {
             .and_then(Value::as_u64)
             .unwrap_or(0)
             .min(30_000);
-        Duration::from_millis(wait_ms).saturating_add(Duration::from_secs(5))
+        // One long-poll legitimately spans the server wait window plus store
+        // contention under sustained multi-hundred-events/s load. Bound the
+        // processing/connect slack by the standard RPC timeout instead of a
+        // fixed few seconds, so a transient stall delays one page instead of
+        // killing the stream with an absolute deadline.
+        Duration::from_millis(wait_ms).saturating_add(DEFAULT_CALL_TIMEOUT)
     } else {
         DEFAULT_CALL_TIMEOUT
     }
@@ -1534,6 +1539,37 @@ mod tests {
         )
         .expect("object subscribe result");
         assert!(subscribe.events.is_empty());
+    }
+
+    #[test]
+    fn subscribe_timeout_covers_the_wait_window_plus_the_standard_slack() {
+        let timeout =
+            |wait_ms: u64| call_timeout("events.subscribe", &json!({ "wait_ms": wait_ms }));
+        assert_eq!(
+            timeout(1_000),
+            Duration::from_millis(1_000) + DEFAULT_CALL_TIMEOUT
+        );
+        assert_eq!(
+            timeout(60_000),
+            Duration::from_millis(30_000) + DEFAULT_CALL_TIMEOUT
+        );
+        assert_eq!(timeout(0), DEFAULT_CALL_TIMEOUT);
+    }
+
+    #[test]
+    fn ordinary_rpc_timeouts_are_unchanged() {
+        assert_eq!(
+            call_timeout("daemon.status", &json!({})),
+            DEFAULT_CALL_TIMEOUT
+        );
+        assert_eq!(
+            call_timeout("events.read", &json!({})),
+            DEFAULT_CALL_TIMEOUT
+        );
+        assert_eq!(
+            call_timeout("agent.discover", &json!({})),
+            Duration::from_secs(45)
+        );
     }
 
     #[test]
