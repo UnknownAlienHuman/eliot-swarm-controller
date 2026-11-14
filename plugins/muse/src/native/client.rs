@@ -45,11 +45,12 @@ impl NativeStdioConfig for MuseStdioConfig {
     const SHORT: &'static str = "Muse";
     const ID_PREFIX: &'static str = "muse";
     // The 8 MiB cap covers `view/page` readback (Eliot requests
-    // `limit: 1000`) plus envelope overhead; the installed schema's text
-    // budget is otherwise unpublished, so a live item notification beyond
-    // it stays an explicit oversized gap. Eliot makes no `item/readOutput`
-    // calls, so that surface (6 MiB stored bytes per page, exactly 8 MiB
-    // of base64 before envelope overhead) does not size this cap.
+    // `limit: 1000`), the single bounded `item/readOutput` patch page (128
+    // KiB) plus envelope overhead; the installed schema's text budget is
+    // otherwise unpublished, so a live item notification beyond it stays an
+    // explicit oversized gap. The full `item/readOutput` surface (6 MiB
+    // stored bytes per page, exactly 8 MiB of base64 before envelope
+    // overhead) is never fetched, so it still does not size this cap.
     const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
     /// Inbound methods the Muse host can legitimately send: the
