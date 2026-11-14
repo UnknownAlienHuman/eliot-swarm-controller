@@ -2462,8 +2462,14 @@ impl EventProcessor {
             if changed_paths.is_empty() {
                 // No inline target: resolve the stored patch reference once,
                 // bounded by the single first-page fetch. Only header paths
-                // attach; the patch body itself is never persisted.
-                for path in self.read_patch_hint_paths(item).await {
+                // attach; the patch body itself is never persisted. A page
+                // that stops short of the stored patch still contributes the
+                // paths it covered, with the truncation flag set.
+                let (patch_paths, patch_complete) = self.read_patch_hint_paths(item).await;
+                if !patch_complete {
+                    truncated = true;
+                }
+                for path in patch_paths {
                     if !admit_hint(
                         path,
                         &mut changed_paths,
@@ -2503,23 +2509,25 @@ impl EventProcessor {
     /// holds no actor or Store lock; the tighter read deadline (not the
     /// control-plane timeout) bounds how long the sequential loop waits
     /// before serving other items. Any failure or timeout returns no paths
-    /// and the caller keeps today's empty-paths coverage gap.
-    async fn read_patch_hint_paths(&self, item: &NativeItem) -> Vec<String> {
+    /// with the page marked incomplete, and the caller keeps today's
+    /// empty-paths coverage gap.
+    async fn read_patch_hint_paths(&self, item: &NativeItem) -> (Vec<String>, bool) {
+        let incomplete: (Vec<String>, bool) = (Vec::new(), false);
         let Some(patch_ref) = item.patch_ref.as_ref() else {
-            return Vec::new();
+            return incomplete;
         };
         if patch_ref.id.trim().is_empty() {
-            return Vec::new();
+            return incomplete;
         }
         if patch_ref
             .availability
             .as_deref()
             .is_some_and(|availability| availability != "available")
         {
-            return Vec::new();
+            return incomplete;
         }
         let Some(session_id) = self.status.session_id.clone() else {
-            return Vec::new();
+            return incomplete;
         };
         let client = self.native.clone();
         fetch_patch_page_paths(&client, &session_id, &item.item_id, patch_ref).await
@@ -4082,15 +4090,18 @@ fn edit_hint_paths(item: &NativeItem) -> Vec<String> {
 
 /// Single bounded page fetch behind a stored patch reference: `offset 0`,
 /// `length PATCH_READ_BYTES`, decoded per the served `encoding`. Only file
-/// paths from the patch headers return; the page body is dropped here and
-/// never persisted. Any transport, decode or shape failure returns no paths
-/// so the caller keeps today's empty-paths coverage gap.
+/// paths from the patch headers return alongside whether the page covered
+/// the whole stored patch; the page body is dropped here and never
+/// persisted. Any transport, decode or shape failure returns no paths with
+/// the page marked incomplete so the caller keeps today's empty-paths
+/// coverage gap.
 async fn fetch_patch_page_paths(
     client: &NativeClient,
     session_id: &str,
     item_id: &str,
     patch_ref: &NativePatchRef,
-) -> Vec<String> {
+) -> (Vec<String>, bool) {
+    let incomplete: (Vec<String>, bool) = (Vec::new(), false);
     let Ok(params) = serde_json::to_value(NativeItemReadOutputParams {
         session_id: session_id.to_owned(),
         item_id: item_id.to_owned(),
@@ -4098,7 +4109,7 @@ async fn fetch_patch_page_paths(
         offset_bytes: 0,
         length_bytes: PATCH_READ_BYTES,
     }) else {
-        return Vec::new();
+        return incomplete;
     };
     let page = match client
         .call(
@@ -4109,37 +4120,110 @@ async fn fetch_patch_page_paths(
         .await
     {
         Ok(page) => page,
-        Err(_) => return Vec::new(),
+        Err(_) => return incomplete,
     };
     let Ok(page) = serde_json::from_value::<NativeItemReadOutputResult>(page) else {
-        return Vec::new();
+        return incomplete;
     };
     patch_page_paths(&page)
 }
 
-/// File paths from one stored patch page. Only the `utf8` text encoding is
-/// consumed (the `tool_patch` media type is `application/json` text); any
-/// other encoding keeps today's gap. Paths come only from patch headers —
-/// never from bodies, contents or args — in the verbatim
+/// File paths from one stored patch page, plus whether the page covered
+/// the whole stored patch. Only the `utf8` text encoding is consumed (the
+/// `tool_patch` media type is `application/json` text); any other encoding
+/// keeps today's gap and counts as incomplete. Paths come only from patch
+/// headers — never from bodies, contents or args — in the verbatim
 /// relative-or-absolute form the Store hint normalizer accepts (it drops
-/// paths outside the workspace, same as for inline hints).
-fn patch_page_paths(page: &NativeItemReadOutputResult) -> Vec<String> {
+/// paths outside the workspace, same as for inline hints). A page that stops
+/// short of the stored patch still contributes the paths it covered; the
+/// caller marks the truncation.
+fn patch_page_paths(page: &NativeItemReadOutputResult) -> (Vec<String>, bool) {
+    let complete = patch_page_complete(page);
     if page.encoding != "utf8" {
-        return Vec::new();
+        return (Vec::new(), complete);
     }
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
     for text in patch_candidate_texts(&page.content) {
-        for line in text.lines() {
+        for path in patch_text_paths(&text) {
             if paths.len() > MAX_CHANGED_PATHS {
-                return paths;
+                return (paths, complete);
             }
-            if let Some(path) = patch_header_path(line)
-                && seen.insert(path.clone())
-            {
+            if seen.insert(path.clone()) {
                 paths.push(path);
             }
         }
+    }
+    (paths, complete)
+}
+
+/// Whether one stored patch page covered the whole stored patch. The host
+/// reports `eof` once the page reaches the stored end; a nonzero page offset
+/// or a stored length running past the fetched bytes also marks the page
+/// partial where that shape is present, so downstream attribution never
+/// treats a cut-off read as full coverage.
+fn patch_page_complete(page: &NativeItemReadOutputResult) -> bool {
+    if page.encoding != "utf8" {
+        return false;
+    }
+    if !page.eof {
+        return false;
+    }
+    if page.offset_bytes != 0 {
+        return false;
+    }
+    // `content` is the decoded `utf8` text, so its byte length matches the
+    // stored bytes it carries; a stored length past the fetched bytes means
+    // the page was cut short even when `eof` claims otherwise.
+    if page.byte_len > 0 && (page.content.len() as i64) < page.byte_len {
+        return false;
+    }
+    true
+}
+
+/// File paths from the lines of one patch text, in order. The installed
+/// host's `apply_patch` patch-text vocabulary (observed read-only in
+/// `muse-bin-1.4.0-R4161.1.exe`) marks files as `*** Add File: <path>`,
+/// `*** Update File: <path>`, `*** Delete File: <path>` or `*** Move to:
+/// <path>` (rename destination). Inside such a `*** ... File:` section every
+/// `---`/`+++` line is hunk content (a removed `-- comment` reads
+/// `--- comment`, an added `++ x` reads `+++ x`) and never a header.
+/// Outside those sections, unified-diff headers count only as an adjacent
+/// `--- <path>` / `+++ <path>` pair; both sides are taken and a lone
+/// `---`/`+++` line never contributes.
+fn patch_text_paths(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut index = 0;
+    let mut in_host_section = false;
+    while index < lines.len() {
+        let line = lines[index];
+        if let Some(path) = host_patch_header_path(line) {
+            in_host_section = true;
+            paths.push(path);
+            index += 1;
+            continue;
+        }
+        if line.starts_with("***") {
+            in_host_section = false;
+            index += 1;
+            continue;
+        }
+        if !in_host_section
+            && let Some(rest) = line.strip_prefix("--- ")
+            && let Some(next) = lines.get(index + 1)
+            && let Some(plus) = next.strip_prefix("+++ ")
+        {
+            if let Some(path) = diff_side_path(rest) {
+                paths.push(path);
+            }
+            if let Some(path) = diff_side_path(plus) {
+                paths.push(path);
+            }
+            index += 2;
+            continue;
+        }
+        index += 1;
     }
     paths
 }
@@ -4179,15 +4263,17 @@ fn collect_patch_texts(document: &Value, texts: &mut Vec<String>) {
     }
 }
 
-/// One patch header line to its file path. The installed host's `apply_patch`
-/// patch-text vocabulary (observed read-only in
-/// `muse-bin-1.4.0-R4161.1.exe`) marks files as `*** Add File: <path>`,
-/// `*** Update File: <path>` or `*** Delete File: <path>`, and unified-diff
-/// patch text marks them as `--- <path>` / `+++ <path>` with an optional
-/// `a/`/`b/` tree prefix. Hunk bodies and every other line never contribute:
-/// `/dev/null` sides and blank targets are skipped.
-fn patch_header_path(line: &str) -> Option<String> {
-    for marker in ["*** Add File:", "*** Update File:", "*** Delete File:"] {
+/// One host patch header line to its file path: `*** Add File:`,
+/// `*** Update File:`, `*** Delete File:` or `*** Move to:` (rename
+/// destination). Unified-diff `---`/`+++` sides never count here; they are
+/// paired up in `patch_text_paths`, where hunk position decides.
+fn host_patch_header_path(line: &str) -> Option<String> {
+    for marker in [
+        "*** Add File:",
+        "*** Update File:",
+        "*** Delete File:",
+        "*** Move to:",
+    ] {
         if let Some(path) = line.strip_prefix(marker) {
             let path = path.trim();
             if path.is_empty() {
@@ -4196,23 +4282,24 @@ fn patch_header_path(line: &str) -> Option<String> {
             return Some(path.to_owned());
         }
     }
-    for marker in ["--- ", "+++ "] {
-        if let Some(rest) = line.strip_prefix(marker) {
-            let rest = rest.trim();
-            if rest.is_empty() || rest == "/dev/null" {
-                return None;
-            }
-            let path = rest
-                .strip_prefix("a/")
-                .or_else(|| rest.strip_prefix("b/"))
-                .unwrap_or(rest);
-            if path.is_empty() || path == "/dev/null" {
-                return None;
-            }
-            return Some(path.to_owned());
-        }
-    }
     None
+}
+
+/// One unified-diff `---`/`+++` side to its file path, with an optional
+/// `a/`/`b/` tree prefix. `/dev/null` sides and blank targets are skipped.
+fn diff_side_path(rest: &str) -> Option<String> {
+    let rest = rest.trim();
+    if rest.is_empty() || rest == "/dev/null" {
+        return None;
+    }
+    let path = rest
+        .strip_prefix("a/")
+        .or_else(|| rest.strip_prefix("b/"))
+        .unwrap_or(rest);
+    if path.is_empty() || path == "/dev/null" {
+        return None;
+    }
+    Some(path.to_owned())
 }
 
 /// Terminal item revisions commit tool facts. The schema folds terminal as
@@ -4583,7 +4670,8 @@ mod tests {
             "*** Begin Patch\n*** Update File: crates/a.rs\n@@ -1 +1 @@\n-old\n+new SECRET_MUST_NOT_PERSIST\n*** Add File: crates/b.rs\n@@ -0,0 +1 @@\n+created\n*** Delete File: crates/old.rs\n*** End Patch\n",
             "utf8",
         );
-        let resolved = patch_page_paths(&page);
+        let (resolved, complete) = patch_page_paths(&page);
+        assert!(complete);
         assert_eq!(
             resolved,
             vec![
@@ -4597,21 +4685,30 @@ mod tests {
                 .iter()
                 .any(|path| path.contains("SECRET_MUST_NOT_PERSIST"))
         );
-        // Non-text encodings keep today's gap: no paths, no decode attempt.
-        assert!(patch_page_paths(&patch_page("*** Update File: crates/a.rs", "base64")).is_empty());
-        assert!(patch_page_paths(&patch_page("*** Update File: crates/a.rs", "future")).is_empty());
+        // Non-text encodings keep today's gap: no paths, no decode attempt,
+        // and the page never counts as complete coverage.
+        let (base64_paths, base64_complete) =
+            patch_page_paths(&patch_page("*** Update File: crates/a.rs", "base64"));
+        assert!(base64_paths.is_empty());
+        assert!(!base64_complete);
+        let (future_paths, future_complete) =
+            patch_page_paths(&patch_page("*** Update File: crates/a.rs", "future"));
+        assert!(future_paths.is_empty());
+        assert!(!future_complete);
     }
 
     #[test]
     fn patch_headers_cover_diff_and_json_wrappers() {
-        // Unified-diff patch text: `a/`/`b/` prefixes strip, `/dev/null`
-        // sides are skipped.
+        // Unified-diff patch text: adjacent `---`/`+++` pairs resolve with
+        // `a/`/`b/` prefixes stripped and `/dev/null` sides skipped.
         let diff = patch_page(
             "--- a/crates/a.rs\n+++ b/crates/a.rs\n@@ -1 +1 @@\n-old\n+new\n--- /dev/null\n+++ b/crates/new.rs\n@@ -0,0 +1 @@\n+created\n--- a/crates/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-removed\n",
             "utf8",
         );
+        let (paths, complete) = patch_page_paths(&diff);
+        assert!(complete);
         assert_eq!(
-            patch_page_paths(&diff),
+            paths,
             vec![
                 "crates/a.rs".to_owned(),
                 "crates/new.rs".to_owned(),
@@ -4624,64 +4721,135 @@ mod tests {
                 .expect("wrap patch"),
             "utf8",
         );
-        assert_eq!(patch_page_paths(&wrapped), vec!["crates/a.rs".to_owned()]);
+        let (paths, complete) = patch_page_paths(&wrapped);
+        assert!(complete);
+        assert_eq!(paths, vec!["crates/a.rs".to_owned()]);
         // JSON document: every string leaf scans without assuming field
         // names, while non-path strings and bodies contribute no paths.
         let document = patch_page(
             r#"{"patch":"*** Update File: crates/a.rs\n*** End Patch","summary":"2 files","meta":{"count":2,"flag":true,"empty":null}}"#,
             "utf8",
         );
-        assert_eq!(patch_page_paths(&document), vec!["crates/a.rs".to_owned()]);
+        let (paths, complete) = patch_page_paths(&document);
+        assert!(complete);
+        assert_eq!(paths, vec!["crates/a.rs".to_owned()]);
         // A JSON document with no strings resolves nothing rather than
         // scanning the raw body.
-        assert!(patch_page_paths(&patch_page(r#"{"count":2}"#, "utf8")).is_empty());
+        let (paths, _) = patch_page_paths(&patch_page(r#"{"count":2}"#, "utf8"));
+        assert!(paths.is_empty());
         // Raw non-JSON text still scans as patch text.
-        assert_eq!(
-            patch_page_paths(&patch_page("*** Update File: crates/a.rs", "utf8")),
-            vec!["crates/a.rs".to_owned()]
-        );
+        let (paths, complete) =
+            patch_page_paths(&patch_page("*** Update File: crates/a.rs", "utf8"));
+        assert!(complete);
+        assert_eq!(paths, vec!["crates/a.rs".to_owned()]);
     }
 
     #[test]
     fn patch_header_lines_reject_bodies_and_blanks() {
+        // Host `***` markers resolve only with an exact single-space marker
+        // and a non-blank target. Unified-diff sides never count here; they
+        // resolve only as adjacent pairs in `patch_text_paths`.
         for line in [
             "*** Update File: ",
             "*** Update File:",
             "*** Add File:   ",
-            "--- ",
-            "+++ ",
-            "--- /dev/null",
-            "+++ /dev/null",
-            "--- a/",
+            "*** Move to: ",
+            "*** Move to:",
             "*** Begin Patch",
             "*** End Patch",
+            "***   Update File: crates/a.rs",
             "@@ -1 +1 @@",
             " old context",
             "-removed",
             "+added",
+            "--- a/crates/a.rs",
+            "+++ b/crates/a.rs",
+            "--- crates/a.rs",
             "crates/a.rs",
             "",
             "   ",
         ] {
-            assert_eq!(patch_header_path(line), None, "line={line:?}");
+            assert_eq!(host_patch_header_path(line), None, "line={line:?}");
         }
         assert_eq!(
-            patch_header_path("*** Update File: crates/a.rs"),
-            Some("crates/a.rs".to_owned())
-        );
-        assert_eq!(patch_header_path("***   Update File: crates/a.rs"), None);
-        assert_eq!(
-            patch_header_path("--- a/crates/a.rs"),
+            host_patch_header_path("*** Update File: crates/a.rs"),
             Some("crates/a.rs".to_owned())
         );
         assert_eq!(
-            patch_header_path("+++ b/crates/a.rs"),
-            Some("crates/a.rs".to_owned())
+            host_patch_header_path("*** Move to: crates/b.rs"),
+            Some("crates/b.rs".to_owned())
         );
         assert_eq!(
-            patch_header_path("--- crates/a.rs"),
-            Some("crates/a.rs".to_owned())
+            host_patch_header_path("***   Update File: crates/a.rs"),
+            None
         );
+        // A lone `---`/`+++` line yields nothing, even with a path shape.
+        assert!(patch_text_paths("--- a/crates/a.rs").is_empty());
+        assert!(patch_text_paths("+++ b/crates/a.rs").is_empty());
+        assert!(patch_text_paths("+++ x").is_empty());
+        // An adjacent pair resolves both sides.
+        let (paths, _) =
+            patch_page_paths(&patch_page("--- a/crates/a.rs\n+++ b/crates/a.rs", "utf8"));
+        assert_eq!(paths, vec!["crates/a.rs".to_owned()]);
+    }
+
+    #[test]
+    fn patch_hunk_content_never_counts_as_headers() {
+        // A removed `-- comment` line (SQL, Lua, Haskell) reads
+        // `--- comment` inside a `*** Update File:` hunk, and an added
+        // `++ x` line reads `+++ x`: both are hunk content, never headers.
+        let (paths, _) = patch_page_paths(&patch_page(
+            "*** Begin Patch\n*** Update File: crates/a.sql\n@@ -1,2 +1,2 @@\n--- comment\n+-- comment\n+++ x\n++ x\n*** End Patch\n",
+            "utf8",
+        ));
+        assert_eq!(paths, vec!["crates/a.sql".to_owned()]);
+        // The same byte shapes inside a unified-diff hunk resolve only the
+        // header pair above them.
+        let (paths, _) = patch_page_paths(&patch_page(
+            "--- a/crates/a.sql\n+++ b/crates/a.sql\n@@ -1,2 +1,2 @@\n--- comment\n+-- comment\n",
+            "utf8",
+        ));
+        assert_eq!(paths, vec!["crates/a.sql".to_owned()]);
+    }
+
+    #[test]
+    fn patch_move_to_resolves_rename_destination() {
+        let (paths, complete) = patch_page_paths(&patch_page(
+            "*** Begin Patch\n*** Update File: crates/old.rs\n*** Move to: crates/new.rs\n@@ -1 +1 @@\n-old\n+new\n*** End Patch\n",
+            "utf8",
+        ));
+        assert!(complete);
+        assert_eq!(
+            paths,
+            vec!["crates/old.rs".to_owned(), "crates/new.rs".to_owned()]
+        );
+    }
+
+    #[test]
+    fn partial_patch_page_keeps_paths_and_marks_truncation() {
+        // A stored patch longer than the bounded read stops short of `eof`:
+        // the covered paths still resolve, but the page never counts as
+        // complete, so `complete_tool` keeps `changed_paths_truncated` set.
+        let mut short = patch_page("*** Update File: crates/a.rs\n*** End Patch\n", "utf8");
+        short.eof = false;
+        assert!(!patch_page_complete(&short));
+        let (paths, complete) = patch_page_paths(&short);
+        assert_eq!(paths, vec!["crates/a.rs".to_owned()]);
+        assert!(!complete);
+        // The same holds when the stored length runs past the fetched bytes
+        // or the page starts past zero, even with `eof` set.
+        let mut long = patch_page("*** Update File: crates/a.rs\n", "utf8");
+        long.byte_len = long.content.len() as i64 + 1;
+        assert!(!patch_page_complete(&long));
+        let mut offset = patch_page("*** Update File: crates/a.rs\n", "utf8");
+        offset.offset_bytes = 1;
+        assert!(!patch_page_complete(&offset));
+        // A whole stored patch on one page counts as complete coverage.
+        let whole = patch_page("*** Update File: crates/a.rs\n", "utf8");
+        assert!(patch_page_complete(&whole));
+        let (paths, complete) = patch_page_paths(&whole);
+        assert_eq!(paths, vec!["crates/a.rs".to_owned()]);
+        assert!(complete);
     }
 
     #[test]
@@ -4691,7 +4859,7 @@ mod tests {
             body.push_str(&format!("*** Update File: crates/f{index}.rs\n"));
         }
         body.push_str("*** Update File: crates/f0.rs\n");
-        let paths = patch_page_paths(&patch_page(&body, "utf8"));
+        let (paths, _) = patch_page_paths(&patch_page(&body, "utf8"));
         assert_eq!(paths.len(), MAX_CHANGED_PATHS + 1);
         let mut seen = std::collections::HashSet::new();
         for path in &paths {

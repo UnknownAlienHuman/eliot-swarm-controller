@@ -244,13 +244,16 @@ attributes Muse edits. When the item carries no inline target, the adapter
 makes exactly one bounded `item/readOutput` fetch of the stored `patchRef`
 (offset 0, 128 KiB page, 10 s deadline, before any commit and holding no
 Store lock) and attaches only the file paths from the patch headers
-(`*** Add/Update/Delete File:` markers and unified-diff `---`/`+++` lines
-with the `a/`/`b/` prefix stripped) in the verbatim relative-or-absolute
-form the Store hint normalizer accepts. The patch body, contents and args
-are never persisted. Limit: when the reference is absent, unservable, or the
-bounded read fails or times out, the completed edit commits empty
-`changed_paths` with `changed_paths_truncated` set, recording the coverage
-gap instead of presenting Git state as authorship.
+(`*** Add/Update/Delete File:` and `*** Move to:` markers, plus unified-diff
+`---`/`+++` lines only as adjacent pairs with the `a/`/`b/` prefix stripped
+and never inside a `*** ... File:` section) in the verbatim
+relative-or-absolute form the Store hint normalizer accepts. The patch body,
+contents and args are never persisted. Limit: when the reference is absent,
+unservable, or the bounded read fails or times out, the completed edit
+commits empty `changed_paths` with `changed_paths_truncated` set; when the
+stored patch runs past the first page, the covered paths attach with
+`changed_paths_truncated` set, recording the coverage gap instead of
+presenting Git state as authorship.
 
 ## Host permissions
 
