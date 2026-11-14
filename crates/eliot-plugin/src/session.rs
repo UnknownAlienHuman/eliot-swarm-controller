@@ -917,15 +917,35 @@ impl StreamSource<'_> {
         reason: &str,
         retained: &mut Option<SourceGap>,
     ) -> Result<()> {
-        self.record_gap_inner_until(reason, retained, Instant::now() + EVENT_DEADLINE)
-            .await
+        self.record_gap_inner_until(
+            reason,
+            retained,
+            None,
+            None,
+            Instant::now() + EVENT_DEADLINE,
+        )
+        .await
     }
 
     /// Use a caller-owned absolute deadline when a loss must also settle a
     /// separate bounded source-health update.
     pub async fn record_gap_until(&mut self, reason: &str, deadline: Instant) -> Result<()> {
         let mut ignored = None;
-        self.record_gap_inner_until(reason, &mut ignored, deadline)
+        self.record_gap_inner_until(reason, &mut ignored, None, None, deadline)
+            .await
+    }
+
+    /// Record the observed opaque cursor bounds without inferring positions
+    /// inside them. An unavailable upper bound stays absent.
+    pub async fn record_gap_range_until(
+        &mut self,
+        reason: &str,
+        from: Option<String>,
+        to: Option<String>,
+        deadline: Instant,
+    ) -> Result<()> {
+        let mut ignored = None;
+        self.record_gap_inner_until(reason, &mut ignored, from, to, deadline)
             .await
     }
 
@@ -933,6 +953,8 @@ impl StreamSource<'_> {
         &mut self,
         reason: &str,
         retained: &mut Option<SourceGap>,
+        from: Option<String>,
+        to: Option<String>,
         deadline: Instant,
     ) -> Result<()> {
         let had_retained = retained.is_some();
@@ -987,8 +1009,8 @@ impl StreamSource<'_> {
                 .map(|family| (*family).to_owned())
                 .collect(),
             reason: reason.to_owned(),
-            from: None,
-            to: None,
+            from,
+            to,
         };
         let result = self.send_gap_until(&gap, deadline).await;
         match result {

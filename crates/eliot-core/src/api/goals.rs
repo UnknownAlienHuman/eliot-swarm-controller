@@ -845,11 +845,15 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<GoalSetRequest>(invalid).is_err());
         }
-        let blank: GoalSetRequest =
-            serde_json::from_value(json!({"agent":" ","definition":definition()})).unwrap();
+        let blank: GoalSetRequest = serde_json::from_value(
+            json!({"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","agent":" ","definition":definition()}),
+        )
+        .unwrap();
         assert!(blank.validate().is_err());
-        let defaulted: GoalSetRequest =
-            serde_json::from_value(json!({"agent":"a1","definition":definition()})).unwrap();
+        let defaulted: GoalSetRequest = serde_json::from_value(
+            json!({"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","agent":"a1","definition":definition()}),
+        )
+        .unwrap();
         assert_eq!(defaulted.mode, GoalMode::Eliot);
     }
 

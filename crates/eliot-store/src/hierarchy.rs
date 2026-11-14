@@ -13,9 +13,10 @@ use super::*;
 use eliot_core::api::{HierarchyLimits, parse_tree_selector, selector_child_id};
 
 pub(super) const SELECTOR_LINK_KIND: &str = "selector";
-/// Bound on parent-chain walks; creation depth is fanout-limited, so this is
-/// only defense against legacy rows, never a reachable depth.
-const ANCESTOR_WALK_CAP: i64 = 4096;
+/// Bound on parent-chain walks and tree-scope listing; creation depth is
+/// fanout-limited, so this is only defense against legacy rows, never a
+/// reachable depth. Listing, totals and direct reads share this bound.
+pub(crate) const ANCESTOR_WALK_CAP: i64 = 4096;
 
 pub(super) enum Caller {
     Owner,
@@ -580,7 +581,7 @@ mod tests {
     }
 
     fn launch_request(project: &str, parent: Option<&str>) -> SubmitCommand {
-        let mut args = json!({"project":project, "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}});
+        let mut args = json!({"project":project, "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":{}});
         if let Some(parent) = parent {
             args["parent"] = json!(parent);
         }
@@ -622,7 +623,7 @@ mod tests {
                     target: None,
                     selector: None,
                     verb: "launch".to_owned(),
-                    args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}}),
+                    args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":{}}),
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
@@ -633,6 +634,7 @@ mod tests {
             .expect("admit launch");
         let agent = admission.command.target.expect("launch target");
         store.dispatch(&launch_id, now).expect("dispatch launch");
+        crate::tests::install_fixture_sources(store, &agent, &launch_id, 1, now);
         store
             .put_batch(
                 SourceBatch {
@@ -701,6 +703,7 @@ mod tests {
             )
             .unwrap();
         store.dispatch(&launch_id, now).expect("dispatch launch");
+        crate::tests::install_fixture_sources(store, agent, &launch_id, 1, now);
         store
             .put_batch(
                 SourceBatch {
@@ -734,7 +737,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 26);
+        assert_eq!(version, 31);
         let mut columns: Vec<String> = store
             .connection
             .prepare("SELECT name FROM pragma_table_info('agents')")
@@ -1342,7 +1345,7 @@ mod tests {
         ));
         {
             let legacy_store = Store::open(&path).unwrap();
-            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 26);
+            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 31);
             drop(legacy_store);
             // Downgrade to the v22 shape with two legacy rows, then reopen so
             // the v23 block backfills them exactly as it would on upgrade.
@@ -1351,7 +1354,24 @@ mod tests {
             let legacy = rusqlite::Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
-                    "DROP INDEX agents_parent;
+                     DROP INDEX agents_list_state;
+                     DROP INDEX agents_list_project;
+                     DROP INDEX agents_list_harness;
+                     DROP INDEX agents_list_parent;
+                     DROP INDEX agents_list_root;
+                     DELETE FROM schema_migrations WHERE version = 31;
+                     DROP TRIGGER native_child_activity_revision;
+                     DROP TRIGGER native_child_progress_pruned;
+                     DROP INDEX native_children_producer;
+                     DROP INDEX turns_native_activity;
+                     DROP INDEX events_native_progress_time;
+                     DROP INDEX events_git_progress_time;
+                     ALTER TABLE agents DROP COLUMN native_child_revision;
+                     DELETE FROM schema_migrations WHERE version = 30;
+                     ALTER TABLE turns DROP COLUMN outcome;
+                     ALTER TABLE turns DROP COLUMN native_status;
+                     DELETE FROM schema_migrations WHERE version = 29;
+                     DROP INDEX agents_parent;
                      DROP INDEX agents_root;
                      ALTER TABLE agents DROP COLUMN parent;
                      ALTER TABLE agents DROP COLUMN root;
@@ -1365,6 +1385,10 @@ mod tests {
                      DELETE FROM schema_migrations WHERE version = 25;
                      DROP TABLE native_child_registrations;
                      DELETE FROM schema_migrations WHERE version = 26;
+                     ALTER TABLE turns DROP COLUMN usage;
+                     DELETE FROM schema_migrations WHERE version = 27;
+                     DROP INDEX commands_context_pending;
+                     DELETE FROM schema_migrations WHERE version = 28;
                      INSERT INTO agents(generation, project, harness, profile,
                                         workspace, state, created_at, updated_at)
                      VALUES (1, 'legacy', 'fake', 'fake',
@@ -1387,7 +1411,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 26);
+        assert_eq!(version, 31);
         for id in ["a1", "a2"] {
             let agent = store.get_agent(id).unwrap().expect("legacy row");
             assert_eq!(agent.root, id);

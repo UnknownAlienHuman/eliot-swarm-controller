@@ -191,7 +191,7 @@ fn owner_and_project_event_and_timer_actions_admit_the_same_targetless_command()
     launch.args = json!({
         "project": repository,
         "workspace": registered.checkout.clone(),
-        "harness": "fake",
+        "harness": "codex",
         "profile": "fake",
         "profile_snapshot": {},
     });

@@ -7,9 +7,9 @@ use eliot_core::api::{
     TurnResolveRequest, TurnResolveStatus,
 };
 use eliot_core::{
-    AgentState, CommandState, EventCause, NativeEvent, NativeStoreBinding, ProcessIdentity,
-    ProcessRecord, ProcessState, ProviderHoldState, ProviderRestrictionKind, SourceBatch,
-    SourceGap, SubmitCommand, TurnOutcome, TurnState,
+    AgentControl, AgentState, CommandState, EventCause, NativeEvent, NativeStoreBinding,
+    ProcessIdentity, ProcessRecord, ProcessState, ProviderHoldState, ProviderRestrictionKind,
+    SourceBatch, SourceGap, SubmitCommand, TurnOutcome, TurnState,
 };
 use eliot_core::{
     WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparationInput,
@@ -33,7 +33,7 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
                 target: None,
                 selector: None,
                 verb: "launch".to_owned(),
-                args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}}),
+                args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":{}}),
                 expected_generation: Some(0),
                 expected_turn_id: None,
                 request_id: None,
@@ -44,6 +44,7 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
         .expect("admit launch");
     let agent = admission.command.target.expect("launch target");
     store.dispatch(&launch_id, now).expect("dispatch launch");
+    install_fixture_sources(store, &agent, &launch_id, 1, now);
     store
         .put_batch(
             SourceBatch {
@@ -135,6 +136,7 @@ fn ready_managed_codex_agent(
     store
         .dispatch(&start_id, now + 2)
         .expect("dispatch managed L3 launch");
+    install_fixture_sources(store, &agent, &start_id, 1, now + 2);
     store
         .put_batch(
             SourceBatch {
@@ -299,7 +301,7 @@ fn targetless_rule_launch_request(
     let mut request = SubmitCommand::new(Ulid::new().to_string(), "launch");
     request.args = json!({
         "project": project,
-        "harness": "fake",
+        "harness": "codex",
         "profile": "fake",
         "profile_snapshot": {},
         "workspace": workspace,
@@ -440,6 +442,7 @@ fn ready_capacity_agent(store: &mut Store, project: &str, now: i64) -> (String, 
     store
         .dispatch(&launch_id, now)
         .expect("dispatch capacity launch");
+    install_fixture_sources(store, &agent, &launch_id, 1, now);
     store
         .put_batch(
             SourceBatch {
@@ -478,6 +481,28 @@ fn simulated_plugin_identity(agent: &str, generation: i64) -> ProcessIdentity {
         pid: 81001,
         start_time: u64::try_from(generation).expect("positive fixture generation"),
     }
+}
+
+/// Install the fixture native source plan after dispatch, before any native
+/// batch. Fixture counterpart of the PluginHost manifest validation
+/// (`install_plugin_sources` after manifest check, before `agent.start`);
+/// the ownership gate refuses every native family until this plan commits.
+/// Uses the common five-family stream plan so every native kind used in
+/// fixtures has an owner.
+pub(crate) fn install_fixture_sources(
+    store: &mut Store,
+    agent: &str,
+    start_command_id: &str,
+    generation: i64,
+    now: i64,
+) {
+    let plan: BTreeMap<String, String> = ["session", "turn", "message", "tool", "request"]
+        .into_iter()
+        .map(|family| (family.to_owned(), "stream".to_owned()))
+        .collect();
+    store
+        .install_plugin_sources(agent, generation, start_command_id, &plan, now)
+        .expect("install fixture source plan");
 }
 
 /// Install OS process ownership and the running owned-plugin observation
@@ -684,7 +709,7 @@ fn project_stop_rejects_setup_ready_next_generation() {
                     "project": checkout,
                     "workspace": checkout,
                     "worktree": branch,
-                    "harness": "fake",
+                    "harness": "codex",
                     "profile": "fake",
                     "profile_snapshot": {}
                 }),
@@ -839,6 +864,7 @@ fn project_stop_cannot_cancel_a_new_workspace_generation_after_dispatch_admissio
     store
         .dispatch(&launch_id, now + 2)
         .expect("dispatch launch");
+    install_fixture_sources(&mut store, &agent, &launch_id, 1, now + 2);
     store
         .put_batch(
             SourceBatch {
@@ -1254,6 +1280,7 @@ fn history_project_rule_send_rejects_rebinding_old_event_to_current_generation()
     store
         .dispatch(&resume_id, now + 13)
         .expect("dispatch generation-2 resume");
+    install_fixture_sources(&mut store, &agent, &resume_id, 2, now + 13);
     store
         .put_batch(
             SourceBatch {
@@ -1502,6 +1529,7 @@ fn project_resume_rules_use_retained_binding_for_live_and_history_and_require_se
     store
         .dispatch(&live_resume_id, now + 28)
         .expect("dispatch live Project resume");
+    install_fixture_sources(&mut store, &live_agent, &live_resume_id, 2, now + 28);
     let live_scope = format!("{checkout}:{live_agent}:scope");
     let live_ref = format!("{checkout}:{live_agent}:thread");
     store
@@ -1877,7 +1905,7 @@ fn fake_interrupt_rejects_stale_bindings_and_dispatches_exact_request_replies() 
     assert_eq!(sources[0]["source"], "stream");
     assert_eq!(
         sources[0]["families"],
-        json!(["message", "request", "session", "turn"])
+        json!(["message", "request", "session", "tool", "turn"])
     );
     let turn_id = start_fake_turn(&mut store, &agent, now + 1);
 
@@ -2272,6 +2300,7 @@ fn project_event_launch_requires_both_grants_and_only_linked_send_uses_next_gene
     store
         .dispatch(&launch_id, now + 11)
         .expect("dispatch project launch");
+    install_fixture_sources(&mut store, &target, &launch_id, 1, now + 11);
     store
         .put_batch(
             SourceBatch {
@@ -2759,6 +2788,17 @@ fn project_registration_migration_defaults_legacy_run_authority_to_deny() {
                        WHERE request_id IS NOT NULL;
                    CREATE INDEX commands_rule_action_window ON commands(created_at)
                        WHERE link_kind = 'rule_action';
+                   CREATE TABLE turns(
+                       agent INTEGER NOT NULL REFERENCES agents(id),
+                       generation INTEGER NOT NULL,
+                       turn_id TEXT NOT NULL,
+                       state TEXT NOT NULL,
+                       status TEXT,
+                       final_text TEXT,
+                       started_at INTEGER,
+                       completed_at INTEGER,
+                       PRIMARY KEY(agent, generation, turn_id)
+                   );
                    CREATE TABLE processes (
                        host_boot_id TEXT NOT NULL CHECK(length(host_boot_id) > 0),
                        pid INTEGER NOT NULL CHECK(pid > 0 AND pid <= 4294967295),
@@ -2788,6 +2828,21 @@ fn project_registration_migration_defaults_legacy_run_authority_to_deny() {
                        setup_index INTEGER NOT NULL DEFAULT 0 CHECK(setup_index >= 0),
                        outcome TEXT,
                        updated_at INTEGER NOT NULL
+                   );
+                   CREATE TABLE events(
+                       seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                       ts INTEGER NOT NULL,
+                       kind TEXT NOT NULL,
+                       family TEXT,
+                       agent INTEGER,
+                       generation INTEGER,
+                       source TEXT NOT NULL,
+                       native_id TEXT,
+                       cursor TEXT,
+                       payload_digest BLOB,
+                       data TEXT NOT NULL,
+                       subject TEXT,
+                       cause TEXT
                    );
                    CREATE TABLE project_registrations(
                        revision INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3155,7 +3210,7 @@ fn workspace_exceptions_stay_marker_bound_across_unknown_readback() {
     let start = store.submit_with_workspace("owner", SubmitCommand {
         id: start_id.clone(), target: None, selector: None, verb: "launch".to_owned(),
         args: json!({"project":input.project,"workspace":input.repo_path,"worktree":input.requested_branch,
-            "harness":"fake","profile":"fake",
+            "harness":"codex","profile":"fake",
             "profile_snapshot":{"capacity_scopes":[{"scope":"profile:fake","max_live":1}]}}),
         expected_generation: Some(0), expected_turn_id: None, request_id: None, probe: false,
     }, input.clone(), now).expect("admit prepared launch");
@@ -3338,7 +3393,7 @@ fn send_association_emits_applied_once_with_native_batch_ack() {
                 target: None,
                 selector: None,
                 verb: "launch".to_owned(),
-                args: json!({"project":"send-event", "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}}),
+                args: json!({"project":"send-event", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":{}}),
                 expected_generation: Some(0),
                 expected_turn_id: None,
                 request_id: None,
@@ -3346,9 +3401,10 @@ fn send_association_emits_applied_once_with_native_batch_ack() {
             },
             now,
         )
-        .expect("admit fake launch");
+        .expect("admit launch");
     let agent = admission.command.target.expect("launch target");
     store.dispatch(&launch_id, now).expect("dispatch launch");
+    install_fixture_sources(&mut store, &agent, &launch_id, 1, now);
     store
         .put_batch(
             SourceBatch {
@@ -3939,6 +3995,7 @@ fn secret_question_answer_is_rejected_before_command_persistence() {
         .command
         .target
         .expect("launch admission returns its Agent");
+    install_fixture_sources(&mut store, &agent_id, &launch_id, 1, now);
     assert_eq!(started.value.generation, Some(1));
     store
         .put_batch(
@@ -4474,6 +4531,7 @@ fn owner_event_launch_links_one_send_counts_once_and_replays_unknown() {
     store
         .dispatch(&launch_id, now + 7)
         .expect("dispatch admitted launch");
+    install_fixture_sources(&mut store, &launch_target, &launch_id, 1, now + 7);
     store
         .put_batch(
             SourceBatch {
@@ -4757,7 +4815,11 @@ fn event_rule_replies_bind_open_request_turn_and_replay_without_competing_reply(
     let reply = |verb: &str, request_id: &str, text: Option<&str>| {
         let mut request = SubmitCommand::new(String::new(), verb);
         request.target = Some(agent_id.clone());
-        request.args = text.map_or_else(|| json!({}), |text| json!({"text":text}));
+        // Rule-driven answers carry the structured #327 answer form.
+        request.args = match (verb, text) {
+            ("answer", Some(text)) => json!({"answers": {"q1": {"answers": [text]}}}),
+            (_, text) => text.map_or_else(|| json!({}), |text| json!({"text":text})),
+        };
         request.expected_generation = Some(1);
         request.expected_turn_id = Some(turn_id.clone());
         request.request_id = Some(request_id.to_owned());
@@ -4899,7 +4961,7 @@ fn event_rule_replies_bind_open_request_turn_and_replay_without_competing_reply(
     );
     assert_eq!(
         answered.child.as_ref().unwrap().command.args,
-        json!({"text":"ordinary answer"})
+        json!({"answers": {"q1": {"answers": ["ordinary answer"]}}})
     );
 }
 
@@ -5090,6 +5152,7 @@ fn native_request_cleanup_does_not_acknowledge_reply() {
         .target
         .expect("launch returns an Agent");
     store.dispatch(&launch_id, now).expect("dispatch launch");
+    install_fixture_sources(&mut store, &agent_id, &launch_id, 1, now);
     let batch = |kind: &str, data| SourceBatch {
         batch_id: Ulid::new().to_string(),
         agent_id: agent_id.clone(),
@@ -5432,6 +5495,7 @@ fn ready_steer_agent(store: &mut Store, project: &str, now: i64) -> String {
     store
         .dispatch(&launch_id, now)
         .expect("dispatch Codex steer test Agent");
+    install_fixture_sources(store, &agent, &launch_id, 1, now);
     store
         .put_batch(
             SourceBatch {
@@ -5559,7 +5623,7 @@ fn provider_probe_claim_survives_reopen_and_exact_success_clears_hold() {
         let count_before_launch = store.agent_count().unwrap();
         let launch_id = Ulid::new().to_string();
         let mut launch = SubmitCommand::new(launch_id, "launch");
-        launch.args = json!({"project":"provider-held-launch", "workspace":"synthetic-held-launch", "harness":"fake", "profile":"fake", "profile_snapshot":{}});
+        launch.args = json!({"project":"provider-held-launch", "workspace":"synthetic-held-launch", "harness":"codex", "profile":"fake", "profile_snapshot":{}});
         launch.expected_generation = Some(0);
         assert_eq!(
             store.submit("owner", launch, now + 9).unwrap_err().code,
@@ -5998,6 +6062,7 @@ fn native_store_binding_commits_without_changing_admitted_input_or_retry_binding
     let dispatched = store
         .dispatch_with_native_store_binding(&request.id, now + 1, &expected, &binding)
         .unwrap();
+    install_fixture_sources(&mut store, id, &request.id, 1, now + 1);
     assert_eq!(dispatched.value.state, CommandState::Dispatched);
     assert_eq!(dispatched.value.args, admitted.command.args);
     let agent = store.get_agent(id).unwrap().unwrap();
@@ -6409,22 +6474,21 @@ fn configured_capacity_scopes_are_reserved_atomically_and_retries_are_idempotent
             .is_none()
     );
 
-    let mut fake_store = Store::open(Path::new(":memory:")).expect("open Store");
-    let mut named_fake = capacity_launch_request(
-        "capacity-named-fake",
-        "fake-small",
-        json!([{"scope":"profile:fake-small","max_live":1}]),
+    let mut named_store = Store::open(Path::new(":memory:")).expect("open Store");
+    let named_small = capacity_launch_request(
+        "capacity-named-small",
+        "fixture-small",
+        json!([{"scope":"profile:fixture-small","max_live":1}]),
     );
-    named_fake.args["harness"] = json!("fake");
-    let named_fake_agent = fake_store
-        .submit("owner", named_fake, now)
-        .expect("Store admits a configured named fake profile")
+    let named_small_agent = named_store
+        .submit("owner", named_small, now)
+        .expect("Store admits a configured named small profile")
         .command
         .target
-        .expect("named fake Agent");
-    let named_fake_agent = fake_store.get_agent(&named_fake_agent).unwrap().unwrap();
-    assert_eq!(named_fake_agent.harness, "fake");
-    assert_eq!(named_fake_agent.profile, "fake-small");
+        .expect("named small Agent");
+    let named_small_agent = named_store.get_agent(&named_small_agent).unwrap().unwrap();
+    assert_eq!(named_small_agent.harness, "codex");
+    assert_eq!(named_small_agent.profile, "fixture-small");
 
     let mut proxy_store = Store::open(Path::new(":memory:")).expect("open Store");
     proxy_store
@@ -6600,6 +6664,110 @@ fn unknown_start_capacity_survives_recovery_and_store_reopen() {
 }
 
 #[test]
+fn restart_readback_skips_exited_children_and_bounds_live_records() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let launch = capacity_launch_request(
+        "restart-heavy",
+        "restart-heavy",
+        json!([{"scope": "profile:restart-heavy", "max_live": null}]),
+    );
+    let launch_id = launch.id.clone();
+    let agent = store
+        .submit("owner", launch, now)
+        .expect("admit launch")
+        .command
+        .target
+        .expect("launch Agent");
+    store
+        .dispatch(&launch_id, now + 1)
+        .expect("dispatch launch");
+    store
+        .settle(
+            &launch_id,
+            CommandState::Unknown,
+            Some(json!({"reason":"start_readback_unknown"})),
+            now + 2,
+        )
+        .expect("retain uncertain native start");
+    store.recover_on_restart(now + 3).expect("recover");
+    let owner = format!("agent:{agent}#1");
+    let insert_on = |store: &Store, boot: &str, pid: i64, role: &str, state: &str| {
+        store
+            .connection
+            .execute(
+                "INSERT INTO processes(host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at)
+                 VALUES (?6, ?1, 1, ?2, ?3, ?4, ?5, 1)",
+                rusqlite::params![
+                    pid,
+                    owner,
+                    role,
+                    state,
+                    (state == "exited").then_some(0),
+                    boot
+                ],
+            )
+            .expect("record process");
+    };
+    let insert = |store: &Store, pid: i64, role: &str, state: &str| {
+        insert_on(store, "boot-a", pid, role, state)
+    };
+    // A worker that ran compilers leaves far more exited children than one
+    // page; only one exited witness per boot is custody evidence and startup
+    // must not fail.
+    insert(&store, 1, "plugin", "exited");
+    for pid in 2..=(crate::MAX_PAGE_ENTRIES as i64 + 600) {
+        insert(&store, pid, "child", "exited");
+    }
+    insert(&store, 9_000_000, "child", "running");
+    let retained = store
+        .restart_retained_generations(None)
+        .expect("read retained generations");
+    assert_eq!(retained.len(), 1);
+    assert!(!retained[0].processes_truncated);
+    let roles: Vec<_> = retained[0]
+        .processes
+        .iter()
+        .map(|process| (process.role.as_str(), process.exited))
+        .collect();
+    assert_eq!(roles, [("plugin", true), ("child", true), ("child", false)]);
+    assert_eq!(retained[0].processes[1].identity.pid, 2);
+
+    // Boot presence survives: an exited child on another boot still yields one
+    // witness for that boot, so Linux custody sees the same boots as before.
+    insert_on(&store, "boot-b", 5, "child", "exited");
+    insert_on(&store, "boot-b", 6, "child", "exited");
+    let retained = store
+        .restart_retained_generations(None)
+        .expect("read retained generations");
+    let boots: Vec<_> = retained[0]
+        .processes
+        .iter()
+        .map(|process| (process.identity.host_boot_id.as_str(), process.identity.pid))
+        .collect();
+    assert_eq!(
+        boots,
+        [
+            ("boot-a", 1),
+            ("boot-a", 2),
+            ("boot-a", 9_000_000),
+            ("boot-b", 5)
+        ]
+    );
+
+    // An overflow of records that still need a liveness check keeps only this
+    // generation retained, without failing the readback.
+    for pid in 10_000_000..(10_000_000 + crate::MAX_PAGE_ENTRIES as i64) {
+        insert(&store, pid, "child", "running");
+    }
+    let retained = store
+        .restart_retained_generations(None)
+        .expect("bounded readback never fails startup");
+    assert!(retained[0].processes_truncated);
+    assert_eq!(retained[0].processes.len(), crate::MAX_PAGE_ENTRIES);
+}
+
+#[test]
 fn verified_restart_closure_releases_only_the_retained_lost_generation() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
@@ -6711,10 +6879,32 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
         .dispatch(&launch_id, now + 1)
         .expect("dispatch launch");
     // Return the file to schema 16, as an older binary left it, and upgrade.
+    // Drop the v29/v30 activity artifacts first: the v30 events triggers
+    // would otherwise fire during the table rebuilds below while their
+    // native_child_registrations reads no longer resolve (#418). Drop the
+    // v31 fleet indexes too, or the parent-column drop below fails and the
+    // reopen would recreate existing indexes.
     store
         .connection
         .execute_batch(
-            "DROP INDEX agents_parent; DROP INDEX agents_root;
+            "DROP INDEX agents_list_state;
+             DROP INDEX agents_list_project;
+             DROP INDEX agents_list_harness;
+             DROP INDEX agents_list_parent;
+             DROP INDEX agents_list_root;
+             DELETE FROM schema_migrations WHERE version = 31;
+             DROP TRIGGER native_child_activity_revision;
+             DROP TRIGGER native_child_progress_pruned;
+             DROP INDEX native_children_producer;
+             DROP INDEX turns_native_activity;
+             DROP INDEX events_native_progress_time;
+             DROP INDEX events_git_progress_time;
+             ALTER TABLE agents DROP COLUMN native_child_revision;
+             DELETE FROM schema_migrations WHERE version = 30;
+             ALTER TABLE turns DROP COLUMN outcome;
+             ALTER TABLE turns DROP COLUMN native_status;
+             DELETE FROM schema_migrations WHERE version = 29;
+             DROP INDEX agents_parent; DROP INDEX agents_root;
              ALTER TABLE agents DROP COLUMN parent; ALTER TABLE agents DROP COLUMN root;
              ALTER TABLE agents DROP COLUMN depth; ALTER TABLE agents DROP COLUMN control;
              ALTER TABLE commands DROP COLUMN selector;
@@ -6737,11 +6927,15 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
              DROP TABLE owned_exits;
              DELETE FROM schema_migrations WHERE version = 25;
              DROP TABLE native_child_registrations;
-             DELETE FROM schema_migrations WHERE version = 26;",
+             DELETE FROM schema_migrations WHERE version = 26;
+             ALTER TABLE turns DROP COLUMN usage;
+             DELETE FROM schema_migrations WHERE version = 27;
+             DROP INDEX commands_context_pending;
+             DELETE FROM schema_migrations WHERE version = 28;",
         )
         .expect("roll back to schema 16");
     drop(store);
-    let mut store = Store::open(&path).expect("migrate 16 to 25");
+    let mut store = Store::open(&path).expect("migrate 16 to latest");
     store.recover_on_restart(now + 2).expect("recover");
     let retained = store
         .restart_retained_generations(None)
@@ -8189,7 +8383,8 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
              CREATE TABLE agents(
                  id INTEGER PRIMARY KEY, generation INTEGER NOT NULL,
                  observe_only INTEGER NOT NULL, profile TEXT NOT NULL,
-                 profile_snapshot TEXT NOT NULL
+                 profile_snapshot TEXT NOT NULL,
+                 state TEXT NOT NULL, project TEXT NOT NULL, harness TEXT NOT NULL
              );
              CREATE TABLE commands(
                  id TEXT PRIMARY KEY, principal TEXT NOT NULL, method TEXT NOT NULL,
@@ -8214,7 +8409,20 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
                  WHERE request_id IS NOT NULL;
              CREATE TABLE events(
                  agent INTEGER, generation INTEGER, family TEXT,
-                 kind TEXT, source TEXT, data TEXT
+                 kind TEXT, source TEXT, data TEXT,
+                 ts INTEGER NOT NULL DEFAULT 0,
+                 native_id TEXT
+             );
+             CREATE TABLE turns(
+                 agent INTEGER NOT NULL REFERENCES agents(id),
+                 generation INTEGER NOT NULL,
+                 turn_id TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 status TEXT,
+                 final_text TEXT,
+                 started_at INTEGER,
+                 completed_at INTEGER,
+                 PRIMARY KEY(agent, generation, turn_id)
              );
              CREATE TABLE source_state(
                  agent INTEGER, generation INTEGER, source TEXT, state TEXT
@@ -8258,8 +8466,9 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
             (10, 1, "pending-resume", pending_resume_snapshot),
         ] {
             old.execute(
-                "INSERT INTO agents(id, generation, observe_only, profile, profile_snapshot)
-                 VALUES (?1, ?2, 0, ?3, ?4)",
+                "INSERT INTO agents(id, generation, observe_only, profile, profile_snapshot,
+                                    state, project, harness)
+                 VALUES (?1, ?2, 0, ?3, ?4, 'idle', 'capacity-test', 'test-harness')",
                 rusqlite::params![id, generation, profile, snapshot],
             )
             .expect("insert v8 Agent");
@@ -8768,7 +8977,7 @@ fn event_subject_is_persisted_at_write_time_without_changing_native_data_digest(
     let project = "event-subject-snapshot";
     let launch_id = Ulid::new().to_string();
     let mut request = SubmitCommand::new(launch_id.clone(), "launch");
-    request.args = json!({"project":project, "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}});
+    request.args = json!({"project":project, "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":{}});
     request.expected_generation = Some(0);
     let admission = store.submit("owner", request, now).unwrap();
     let agent = admission.command.target.clone().unwrap();
@@ -8779,10 +8988,11 @@ fn event_subject_is_persisted_at_write_time_without_changing_native_data_digest(
         .unwrap();
     let created_subject = created.subject.as_ref().unwrap();
     assert_eq!(created_subject.project, project);
-    assert_eq!(created_subject.harness, "fake");
+    assert_eq!(created_subject.harness, "codex");
     assert_eq!(created_subject.state, AgentState::Created);
 
     let dispatched = store.dispatch(&launch_id, now + 1).unwrap();
+    install_fixture_sources(&mut store, &agent, &launch_id, 1, now + 1);
     let starting = dispatched
         .events
         .iter()
@@ -9459,6 +9669,7 @@ fn opencode_launch_passes_admission_and_dispatch_gates() {
     store
         .dispatch(&launch_id, now + 1)
         .expect("dispatch opencode launch");
+    install_fixture_sources(&mut store, &agent, &launch_id, 1, now + 1);
     store
         .put_batch(
             SourceBatch {
@@ -9522,6 +9733,22 @@ fn ready_muse_agent(
     store
         .dispatch(&launch_id, now + 1)
         .expect("dispatch muse launch");
+    install_fixture_sources(store, &agent, &launch_id, 1, now + 1);
+    store
+        .install_plugin_sources(
+            &agent,
+            1,
+            &launch_id,
+            &BTreeMap::from([
+                ("session".to_owned(), "stream".to_owned()),
+                ("turn".to_owned(), "stream".to_owned()),
+                ("message".to_owned(), "stream".to_owned()),
+                ("tool".to_owned(), "stream".to_owned()),
+                ("request".to_owned(), "stream".to_owned()),
+            ]),
+            now + 1,
+        )
+        .expect("install muse stream source plan");
     store
         .put_batch(
             SourceBatch {
@@ -9648,6 +9875,7 @@ fn muse_resume_passes_admission_and_dispatch_gates_with_exact_linked_input() {
             .state,
         CommandState::Dispatched
     );
+    install_fixture_sources(&mut store, &agent, &resume_id, 2, now + 8);
     let starting = store.get_agent(&agent).unwrap().unwrap();
     assert_eq!(starting.generation, 2);
     assert_eq!(starting.state, AgentState::Starting);
@@ -9805,7 +10033,7 @@ fn muse_project_resume_passes_the_projects_gate_with_linked_input() {
     end_muse_session(&mut store, &agent, project, now + 6);
 
     // The project principal's linked SEND passes the projects resume binding
-    // gate (`projects.rs`), which admits the `muse` harness like Codex/Fake.
+    // gate (`projects.rs`), which admits the `muse` harness like the other real harnesses.
     let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
     resume.target = Some(agent.clone());
     resume.expected_generation = Some(1);
@@ -9824,6 +10052,7 @@ fn muse_project_resume_passes_the_projects_gate_with_linked_input() {
     store
         .dispatch(&resume_id, now + 8)
         .expect("dispatch project muse resume");
+    install_fixture_sources(&mut store, &agent, &resume_id, 2, now + 8);
     store
         .put_batch(
             SourceBatch {
@@ -9885,7 +10114,7 @@ fn muse_resume_gates_refuse_an_unlisted_harness() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
 
-    // Admission refuses resume for a harness outside codex/fake/muse/claude
+    // Admission refuses resume for a harness outside codex/muse/claude/opencode/antigravity
     // even when the old generation is terminal with a retained native subject.
     let (agent, _, _, _) = ready_muse_agent(
         &mut store,
@@ -9913,8 +10142,10 @@ fn muse_resume_gates_refuse_an_unlisted_harness() {
         "unsupported"
     );
 
-    // Dispatch rechecks the same gate: a resume admitted for `muse` cannot
-    // dispatch once the Agent no longer names a supported harness.
+    // Dispatch deliberately rechecks only generation, state, and pending
+    // work: harness support was proven at admission and the harness is
+    // frozen, so a resume admitted for `muse` dispatches on that proof
+    // (#309 removed the redundant dispatch-time harness recheck).
     let (second, _, _, _) = ready_muse_agent(
         &mut store,
         "muse-harness-refusal-dispatch",
@@ -9934,24 +10165,14 @@ fn muse_resume_gates_refuse_an_unlisted_harness() {
     let second_id = second_resume.id.clone();
     store
         .submit("owner", second_resume, now + 16)
-        .expect("admit the muse resume before the harness change");
-    store
-        .connection
-        .execute(
-            "UPDATE agents SET harness = 'other' WHERE id = ?1",
-            [eliot_core::parse_agent_id(&second).expect("valid Agent id")],
-        )
-        .expect("retarget the second Agent at an unlisted harness");
+        .expect("admit the muse resume before the harness proof");
     assert_eq!(
         store
             .dispatch(&second_id, now + 17)
-            .expect_err("unlisted harness refuses resume at dispatch")
-            .code,
-        "unsupported"
-    );
-    assert_eq!(
-        store.get_command(&second_id).unwrap().unwrap().state,
-        CommandState::Accepted
+            .expect("admitted muse resume dispatches on its admission proof")
+            .value
+            .state,
+        CommandState::Dispatched
     );
 }
 
@@ -10157,6 +10378,9 @@ fn muse_replies_and_turn_controls_pass_admission_and_dispatch() {
         reply.expected_generation = Some(1);
         reply.expected_turn_id = Some(turn_id.clone());
         reply.request_id = Some(request_id.to_owned());
+        if verb == "answer" {
+            reply.args = json!({"answers": {"q1": {"answers": ["proceed"]}}});
+        }
         let reply_id = reply.id.clone();
         let admission = store
             .submit("owner", reply, now + 9)
@@ -10227,6 +10451,7 @@ fn ready_opencode_agent(
     store
         .dispatch(&launch_id, now + 1)
         .expect("dispatch opencode launch");
+    install_fixture_sources(store, &agent, &launch_id, 1, now + 1);
     store
         .put_batch(
             SourceBatch {
@@ -10409,6 +10634,9 @@ fn opencode_replies_and_interrupt_pass_admission_and_dispatch() {
         reply.expected_generation = Some(1);
         reply.expected_turn_id = Some(turn_id.clone());
         reply.request_id = Some(request_id.to_owned());
+        if verb == "answer" {
+            reply.args = json!({"answers": {"q1": {"answers": ["proceed"]}}});
+        }
         let reply_id = reply.id.clone();
         let admission = store
             .submit("owner", reply, now + 9)
@@ -10446,18 +10674,30 @@ fn opencode_replies_and_interrupt_pass_admission_and_dispatch() {
         CommandState::Dispatched
     );
 
-    // Steer has no installed OpenCode method and stays unsupported.
+    // Steer admits and dispatches at the Store level like the other
+    // harnesses; control-verb capability is enforced by the PluginHost
+    // manifest, not the Store (#332).
     let mut steer = SubmitCommand::new(Ulid::new().to_string(), "steer");
     steer.target = Some(agent.clone());
     steer.expected_generation = Some(1);
     steer.expected_turn_id = Some(turn_id.clone());
     steer.args = json!({"text": "follow-up"});
+    let steer_id = steer.id.clone();
     assert_eq!(
         store
             .submit("owner", steer, now + 13)
-            .expect_err("opencode steer is unsupported")
-            .code,
-        "unsupported"
+            .expect("admit opencode steer")
+            .command
+            .state,
+        CommandState::Accepted
+    );
+    assert_eq!(
+        store
+            .dispatch(&steer_id, now + 14)
+            .expect("dispatch opencode steer")
+            .value
+            .state,
+        CommandState::Dispatched
     );
 }
 
@@ -10493,6 +10733,7 @@ fn ready_claude_agent(
     store
         .dispatch(&launch_id, now + 1)
         .expect("dispatch claude launch");
+    install_fixture_sources(store, &agent, &launch_id, 1, now + 1);
     store
         .put_batch(
             SourceBatch {
@@ -10622,6 +10863,7 @@ fn claude_replies_and_interrupt_pass_admission_and_dispatch() {
                 events: vec![
                     open_request("claude-reply-approve", "claude-request-approve"),
                     open_request("claude-reply-deny", "claude-request-deny"),
+                    open_request("claude-reply-answer", "claude-request-answer"),
                 ],
                 cursor: None,
             },
@@ -10629,17 +10871,23 @@ fn claude_replies_and_interrupt_pass_admission_and_dispatch() {
         )
         .expect("commit claude pending permission requests");
 
-    // PR2 connects approve/deny for `claude`: each admits against its
+    // PR2 connects approve/deny/answer for `claude`: each admits against its
     // exact pending request and dispatches to the plugin's agent.command.
+    // Control-verb capability moved to the PluginHost manifest (#332), so the
+    // Store admits every known control verb, including steer.
     for (verb, request_id) in [
         ("approve", "claude-request-approve"),
         ("deny", "claude-request-deny"),
+        ("answer", "claude-request-answer"),
     ] {
         let mut reply = SubmitCommand::new(Ulid::new().to_string(), verb);
         reply.target = Some(agent.clone());
         reply.expected_generation = Some(1);
         reply.expected_turn_id = Some(turn_id.clone());
         reply.request_id = Some(request_id.to_owned());
+        if verb == "answer" {
+            reply.args = json!({"answers": {"q1": {"answers": ["proceed"]}}});
+        }
         let reply_id = reply.id.clone();
         let admission = store
             .submit("owner", reply, now + 9)
@@ -10655,20 +10903,30 @@ fn claude_replies_and_interrupt_pass_admission_and_dispatch() {
         );
     }
 
-    // Steer and answer stay unconnected: no exact native mechanism.
-    for verb in ["steer", "answer"] {
-        let mut control = SubmitCommand::new(Ulid::new().to_string(), verb);
-        control.target = Some(agent.clone());
-        control.expected_generation = Some(1);
-        control.expected_turn_id = Some(turn_id.clone());
-        if verb == "steer" {
-            control.args = json!({"text": "follow-up"});
-        } else {
-            control.request_id = Some("claude-request-approve".to_owned());
-        }
-        let error = store.submit("owner", control, now + 11).unwrap_err();
-        assert_eq!(error.code, "unsupported", "claude {verb} must refuse");
-    }
+    // Steer admits and dispatches at the Store level like the other
+    // harnesses; the native hook delivery is a daemon concern (#342).
+    let mut steer = SubmitCommand::new(Ulid::new().to_string(), "steer");
+    steer.target = Some(agent.clone());
+    steer.expected_generation = Some(1);
+    steer.expected_turn_id = Some(turn_id.clone());
+    steer.args = json!({"text": "follow-up"});
+    let steer_id = steer.id.clone();
+    assert_eq!(
+        store
+            .submit("owner", steer, now + 11)
+            .expect("admit claude steer")
+            .command
+            .state,
+        CommandState::Accepted
+    );
+    assert_eq!(
+        store
+            .dispatch(&steer_id, now + 12)
+            .expect("dispatch claude steer")
+            .value
+            .state,
+        CommandState::Dispatched
+    );
 }
 
 #[test]
@@ -10734,6 +10992,7 @@ fn claude_resume_passes_admission_and_dispatch_gates_with_exact_linked_input() {
             .state,
         CommandState::Dispatched
     );
+    install_fixture_sources(&mut store, &agent, &resume_id, 2, now + 8);
     let starting = store.get_agent(&agent).unwrap().unwrap();
     assert_eq!(starting.generation, 2);
     assert_eq!(starting.state, AgentState::Starting);
@@ -10974,6 +11233,7 @@ fn claude_project_resume_passes_the_projects_gate_with_linked_input() {
     store
         .dispatch(&resume_id, now + 8)
         .expect("dispatch project claude resume");
+    install_fixture_sources(&mut store, &agent, &resume_id, 2, now + 8);
     store
         .put_batch(
             SourceBatch {
@@ -11165,6 +11425,368 @@ fn local_user_event_atomic_commit_rejects_mismatch_and_leaves_unknown() {
     let command = store.get_command(&legacy).unwrap().unwrap();
     assert_eq!(command.state, CommandState::Unknown);
     assert_eq!(command.outcome, Some(json!({"reason": "daemon_restart"})));
+}
+
+#[test]
+fn agent_list_filters_use_indexes_and_pages_stay_ordered() {
+    use super::{AgentListFilter, agent_list_select};
+
+    fn fleet_agent(store: &mut Store, project: &str, now: i64) -> String {
+        let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+        launch.expected_generation = Some(0);
+        launch.args = json!({"harness": "codex", "profile": "codex-test",
+            "profile_snapshot": {}, "project": project, "workspace": "synthetic-workspace"});
+        let command = launch.id.clone();
+        let id = store
+            .submit("owner", launch, now)
+            .expect("admit fleet launch")
+            .command
+            .target
+            .expect("launch target");
+        store
+            .dispatch(&command, now)
+            .expect("dispatch fleet launch");
+        id
+    }
+
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let first = fleet_agent(&mut store, "fleet-a", now);
+    let second = fleet_agent(&mut store, "fleet-a", now + 1);
+    let third = fleet_agent(&mut store, "fleet-b", now + 2);
+    // Shape one child link so subtree filters have a descendant to find.
+    let first_num = eliot_core::parse_agent_id(&first).expect("parse fleet root");
+    let second_num = eliot_core::parse_agent_id(&second).expect("parse fleet child");
+    store
+        .connection
+        .execute(
+            "UPDATE agents SET parent = ?1, root = ?1, depth = 1 WHERE id = ?2",
+            [first_num, second_num],
+        )
+        .expect("link fleet child");
+
+    // Every new filter rides its composite index.
+    for (filter, index) in [
+        (
+            AgentListFilter {
+                state: Some(AgentState::Idle),
+                ..Default::default()
+            },
+            "agents_list_state",
+        ),
+        (
+            AgentListFilter {
+                project: Some("fleet-a".to_owned()),
+                ..Default::default()
+            },
+            "agents_list_project",
+        ),
+        (
+            AgentListFilter {
+                harness: Some("codex".to_owned()),
+                ..Default::default()
+            },
+            "agents_list_harness",
+        ),
+        (
+            AgentListFilter {
+                parent: Some(first.clone()),
+                ..Default::default()
+            },
+            "agents_list_parent",
+        ),
+        (
+            AgentListFilter {
+                root: Some(first.clone()),
+                ..Default::default()
+            },
+            "agents_list_root",
+        ),
+    ] {
+        let select =
+            agent_list_select(&filter, None, Some(0), Some(2), false).expect("build fleet query");
+        let mut statement = store
+            .connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", select.sql))
+            .expect("explain fleet query");
+        let plan = statement
+            .query_map(rusqlite::params_from_iter(select.params.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("read fleet plan")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect fleet plan")
+            .join(" | ");
+        assert!(
+            plan.contains(&format!("USING INDEX {index}")),
+            "filter must use {index}: {plan}"
+        );
+    }
+
+    // Ordered continuation across pages with honest counts.
+    let filter = AgentListFilter::default();
+    let mut after = None;
+    let mut seen = Vec::new();
+    for last in [false, false, true] {
+        let page = store
+            .list_agent_summaries(&filter, after.as_deref(), 1, now + 9)
+            .expect("page the fleet");
+        assert_eq!(page.total, 3);
+        assert_eq!(page.truncated, !last);
+        assert_eq!(page.summaries.len(), 1);
+        assert_eq!(page.next.as_deref(), Some(page.summaries[0].id.as_str()));
+        assert!(seen.iter().all(|id| id != &page.summaries[0].id));
+        if last {
+            assert!(page.summaries[0].id == third);
+        }
+        after = page.next;
+        seen.push(page.summaries.into_iter().next().unwrap().id);
+    }
+    assert!(seen.windows(2).all(|pair| pair[0] < pair[1]));
+    let drained = store
+        .list_agent_summaries(&filter, after.as_deref(), 1, now + 9)
+        .expect("drain the fleet");
+    assert!(drained.summaries.is_empty());
+    assert_eq!(drained.total, 3);
+    assert!(!drained.truncated);
+
+    // Filtered totals ignore the cursor.
+    let project = store
+        .list_agent_summaries(
+            &AgentListFilter {
+                project: Some("fleet-a".to_owned()),
+                ..Default::default()
+            },
+            Some(seen[1].as_str()),
+            10,
+            now + 9,
+        )
+        .expect("filter the fleet by project");
+    assert_eq!(project.total, 2);
+    assert!(!project.truncated);
+    let root = store
+        .list_agent_summaries(
+            &AgentListFilter {
+                root: Some(first.clone()),
+                ..Default::default()
+            },
+            None,
+            10,
+            now + 9,
+        )
+        .expect("filter the fleet by root");
+    assert_eq!(root.total, 2);
+    let parent = store
+        .list_agent_summaries(
+            &AgentListFilter {
+                parent: Some(first.clone()),
+                ..Default::default()
+            },
+            None,
+            10,
+            now + 9,
+        )
+        .expect("filter the fleet by parent");
+    assert_eq!(parent.total, 1);
+    assert_eq!(parent.summaries[0].id, second);
+    assert_eq!(parent.summaries[0].root, first);
+
+    // Compact rows carry freshness without fabricating outcomes.
+    let probe = &root.summaries[0];
+    assert_eq!(probe.last_outcome, None);
+    assert_eq!(probe.last_turn_id, None);
+    assert_eq!(probe.last_progress_at, None);
+    assert_eq!(probe.progress_age_ms, None);
+    assert!(probe.updated_at >= now);
+
+    // Scopes: self sees one row, tree sees the subtree, project the label.
+    let agent = store
+        .get_agent(&first)
+        .expect("read fleet root")
+        .expect("fleet root");
+    let mut tree = agent.clone();
+    tree.control = AgentControl::Tree;
+    let scoped = store
+        .list_agent_summaries_scoped(&tree, &AgentListFilter::default(), None, 10, now + 9)
+        .expect("list the fleet subtree");
+    assert_eq!(scoped.total, 2);
+    let mut project_caller = agent.clone();
+    project_caller.control = AgentControl::Project;
+    let scoped = store
+        .list_agent_summaries_scoped(
+            &project_caller,
+            &AgentListFilter::default(),
+            None,
+            10,
+            now + 9,
+        )
+        .expect("list the fleet project");
+    assert_eq!(scoped.total, 2);
+    let scoped = store
+        .list_agent_summaries_scoped(&agent, &AgentListFilter::default(), None, 10, now + 9)
+        .expect("list the fleet self row");
+    assert_eq!(scoped.total, 1);
+    assert_eq!(scoped.summaries[0].id, first);
+}
+
+#[test]
+fn tree_scope_listing_shares_bounded_depth_with_direct_reads() {
+    use super::hierarchy::ANCESTOR_WALK_CAP;
+    use super::{AgentListFilter, agent_list_select};
+
+    // Listing, totals and direct reads share one bounded scope rule: the
+    // tree CTE carries the same walk cap that gates parent-chain direct
+    // reads, so a tree caller cannot list or count an Agent its `agent.get`
+    // would deny.
+    let mut caller = eliot_core::Agent::new("a1", "p", "codex", "fixture", 7);
+    caller.control = eliot_core::AgentControl::Tree;
+    let filter = AgentListFilter::default();
+    for count in [false, true] {
+        let select = agent_list_select(&filter, Some(&caller), None, Some(2), count)
+            .expect("build tree scope query");
+        assert!(
+            select.sql.contains(&ANCESTOR_WALK_CAP.to_string()),
+            "tree scope must bound depth with the shared cap: {}",
+            select.sql
+        );
+        assert!(
+            select.sql.contains("subtree(id, depth)"),
+            "tree scope must track CTE depth: {}",
+            select.sql
+        );
+    }
+    // The selective structural index wins over state when both are present,
+    // so `state=idle,parent=a42` totals do not scan all idle Agents.
+    let combined = AgentListFilter {
+        state: Some(eliot_core::AgentState::Idle),
+        parent: Some("a42".to_owned()),
+        ..Default::default()
+    };
+    let select = agent_list_select(&combined, None, Some(0), Some(2), false)
+        .expect("build combined filter query");
+    assert!(
+        select.sql.contains("INDEXED BY agents_list_parent"),
+        "combined filters must prefer the parent index: {}",
+        select.sql
+    );
+    assert!(
+        !select.sql.contains("INDEXED BY agents_list_state"),
+        "combined filters must not force the state index: {}",
+        select.sql
+    );
+}
+
+#[test]
+fn projection_gap_turn_unknown_settles_once_without_resurrection() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let (agent, _, _, _) = ready_muse_agent(
+        &mut store,
+        "projection-gap",
+        "muse-test",
+        "synthetic-projection-gap",
+        now,
+    );
+    let send = send_request(&agent, 1, "projection gap turn");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now + 4).expect("admit send");
+    store.dispatch(&send_id, now + 5).expect("dispatch send");
+    let turn_id = format!("fake-turn-{send_id}");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("projection-gap-{send_id}-started"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: format!("projection-gap-{send_id}:started"),
+                    data: json!({"command_id": send_id, "turn_id": turn_id.clone()}),
+                }],
+                cursor: None,
+            },
+            now + 6,
+        )
+        .expect("commit turn started");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("projection-gap-{send_id}-unknown"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.unknown".to_owned(),
+                    native_id: format!("projection-gap-{send_id}:turn.unknown"),
+                    data: json!({
+                        "command_id": send_id,
+                        "turn_id": turn_id.clone(),
+                        "reason": "Muse native view recovery did not prove live delivery after the recorded gap (projectionUnavailable)",
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 7,
+        )
+        .expect("commit turn unknown");
+    let agent_row = store
+        .get_agent(&agent)
+        .expect("read agent")
+        .expect("agent row");
+    assert_eq!(agent_row.state, AgentState::Idle);
+    assert_eq!(agent_row.active_turn, None);
+    assert!(!agent_row.is_terminal());
+    let turn = store
+        .get_turn(&agent, 1, &turn_id)
+        .expect("read turn")
+        .expect("turn row");
+    assert_eq!(turn.state, TurnState::Unknown);
+    assert_eq!(turn.outcome, Some(TurnOutcome::Unknown));
+    let late = store.put_batch(
+        SourceBatch {
+            batch_id: format!("projection-gap-{send_id}-late"),
+            agent_id: agent.clone(),
+            generation: 1,
+            source: "stream".to_owned(),
+            events: vec![NativeEvent {
+                ts: None,
+                kind: "turn.completed".to_owned(),
+                native_id: format!("projection-gap-{send_id}:late-completed"),
+                data: json!({"command_id": send_id, "turn_id": turn_id.clone(), "status": "completed"}),
+            }],
+            cursor: None,
+        },
+        now + 8,
+    );
+    assert!(
+        late.is_err(),
+        "late terminal must not resurrect the unknown turn"
+    );
+    let duplicate = store.put_batch(
+        SourceBatch {
+            batch_id: format!("projection-gap-{send_id}-unknown-again"),
+            agent_id: agent.clone(),
+            generation: 1,
+            source: "stream".to_owned(),
+            events: vec![NativeEvent {
+                ts: None,
+                kind: "turn.unknown".to_owned(),
+                native_id: format!("projection-gap-{send_id}:turn.unknown-again"),
+                data: json!({"command_id": send_id, "turn_id": turn_id.clone(), "reason": "retry"}),
+            }],
+            cursor: None,
+        },
+        now + 9,
+    );
+    assert!(duplicate.is_err(), "turn unknown settles exactly once");
+    let turn = store
+        .get_turn(&agent, 1, &turn_id)
+        .expect("read turn")
+        .expect("turn row");
+    assert_eq!(turn.state, TurnState::Unknown);
 }
 
 fn ready_attention_agent(store: &mut Store, project: &str, now: i64) -> String {

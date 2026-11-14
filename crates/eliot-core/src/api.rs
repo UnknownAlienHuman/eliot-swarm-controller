@@ -24,8 +24,8 @@ mod timers;
 pub use agent_views::{
     AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse, AgentGitRequest,
     AgentGitResponse, AgentListRequest, AgentListResponse, AgentListRow, AgentProcessesRequest,
-    AgentProcessesResponse, AgentStatsRequest, AgentStatsResponse, CloudMcpCustody, CloudMcpHealth,
-    CloudMcpStatus, DaemonStatusRequest, DaemonStatusResponse, GitCredentialHelper,
+    AgentProcessesResponse, AgentStatsRequest, AgentStatsResponse, AgentSummary, CloudMcpCustody,
+    CloudMcpHealth, CloudMcpStatus, DaemonStatusRequest, DaemonStatusResponse, GitCredentialHelper,
     PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectGitView, ProjectRegistrationView,
     SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary, WorkerTaskHealth,
     WorkerTaskStatus, WorkspaceCustodyView,

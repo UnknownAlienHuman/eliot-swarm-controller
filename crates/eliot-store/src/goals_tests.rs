@@ -36,7 +36,7 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
                 target: None,
                 selector: None,
                 verb: "launch".to_owned(),
-                args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}}),
+                args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":{}}),
                 expected_generation: Some(0),
                 expected_turn_id: None,
                 request_id: None,
@@ -47,6 +47,7 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
         .expect("admit launch");
     let agent = admission.command.target.expect("launch target");
     store.dispatch(&launch_id, now).expect("dispatch launch");
+    crate::tests::install_fixture_sources(store, &agent, &launch_id, 1, now);
     store
         .put_batch(
             SourceBatch {
@@ -135,12 +136,13 @@ fn commit_for(
     agent: &str,
     revision: i64,
     round_key: i64,
+    id: &str,
     check: Option<GoalCheckResult>,
     blocked_reason: Option<&str>,
-    continuation: Option<GoalContinuation>,
+    continuation: Option<String>,
 ) -> GoalRoundCommit {
     GoalRoundCommit {
-        id: Ulid::new().to_string(),
+        id: id.to_owned(),
         principal: "owner".to_owned(),
         agent: agent.to_owned(),
         mode: "eliot".to_owned(),
@@ -151,7 +153,10 @@ fn commit_for(
         claim_seq: round_key,
         check,
         blocked_reason: blocked_reason.map(ToOwned::to_owned),
-        continuation,
+        continuation: continuation.map(|command_id| GoalContinuation {
+            id: command_id,
+            text: "keep going".to_owned(),
+        }),
     }
 }
 
@@ -250,7 +255,7 @@ fn goal_migration_installs_v20_round_key_kind() {
         })
         .expect("read Store migration version");
     assert_eq!(version, super::schema::CURRENT_SCHEMA_VERSION);
-    assert_eq!(version, 26);
+    assert_eq!(version, 31);
     let found: i64 = store
         .connection
         .query_row(
@@ -471,7 +476,15 @@ fn goal_native_mode_is_unsupported_everywhere() {
     );
     let commit = GoalRoundCommit {
         mode: "native".to_owned(),
-        ..commit_for(&agent, 1, 0, Some(passed_check()), None, None)
+        ..commit_for(
+            &agent,
+            1,
+            0,
+            &Ulid::new().to_string(),
+            Some(passed_check()),
+            None,
+            None,
+        )
     };
     assert_eq!(
         store.goal_commit_round(&commit, now).unwrap_err().code,
@@ -773,8 +786,16 @@ fn goal_probe_refuses_consumed_and_terminal_rounds() {
         )
         .unwrap();
     let key = store.high_water().unwrap();
-    let commit = commit_for(&agent, view.revision, key, Some(passed_check()), None, None);
-    claim(&mut store, &agent, view.revision, key, now + 1);
+    let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 1);
+    let commit = commit_for(
+        &agent,
+        view.revision,
+        key,
+        &round,
+        Some(passed_check()),
+        None,
+        None,
+    );
     store.goal_commit_round(&commit, now + 1).unwrap();
     assert_eq!(
         store
@@ -874,10 +895,18 @@ fn goal_commit_completes_on_exit_zero() {
         )
         .unwrap();
     let key = store.high_water().unwrap();
-    claim(&mut store, &agent, view.revision, key, now + 1);
+    let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 1);
     let result = store
         .goal_commit_round(
-            &commit_for(&agent, view.revision, key, Some(passed_check()), None, None),
+            &commit_for(
+                &agent,
+                view.revision,
+                key,
+                &round,
+                Some(passed_check()),
+                None,
+                None,
+            ),
             now + 1,
         )
         .unwrap();
@@ -909,20 +938,17 @@ fn goal_commit_admits_one_ordinary_send_continuation() {
         )
         .unwrap();
     let key = store.high_water().unwrap();
-    let send_id = Ulid::new().to_string();
-    claim(&mut store, &agent, view.revision, key, now + 1);
+    let (round, _, send_id) = claim(&mut store, &agent, view.revision, key, now + 1);
     let result = store
         .goal_commit_round(
             &commit_for(
                 &agent,
                 view.revision,
                 key,
+                &round,
                 Some(failed_check("digest-a")),
                 None,
-                Some(GoalContinuation {
-                    id: send_id.clone(),
-                    text: "keep going".to_owned(),
-                }),
+                Some(send_id.clone()),
             ),
             now + 1,
         )
@@ -962,13 +988,23 @@ fn goal_commit_refuses_a_consumed_round_key() {
         )
         .unwrap();
     let key = store.high_water().unwrap();
-    let commit = commit_for(&agent, view.revision, key, Some(passed_check()), None, None);
-    claim(&mut store, &agent, view.revision, key, now + 1);
+    let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 1);
+    let commit = commit_for(
+        &agent,
+        view.revision,
+        key,
+        &round,
+        Some(passed_check()),
+        None,
+        None,
+    );
     store.goal_commit_round(&commit, now + 1).unwrap();
-    let replay = store.goal_commit_round(&commit, now + 2).unwrap_err();
-    assert_eq!(replay.code, "bad_state");
-    // A continued round stays active but its key is consumed: the same key
-    // can never commit twice.
+    // Id-bound round requests (#353): replaying the same committed mutation
+    // resolves to the retained response instead of consuming the key twice.
+    let replay = store.goal_commit_round(&commit, now + 2).unwrap();
+    assert_eq!(replay.outcome, super::GoalCommitOutcome::Completed);
+    // A continued round stays active but its key is consumed: a different
+    // mutation for the same key can never commit twice.
     store
         .goal_set(
             &agent,
@@ -981,36 +1017,34 @@ fn goal_commit_refuses_a_consumed_round_key() {
         .unwrap();
     let current = store.goal_get(&agent, "eliot").unwrap().unwrap();
     let fresh_key = store.high_water().unwrap();
+    let (round_continued, _, cont_continued) =
+        claim(&mut store, &agent, current.revision, fresh_key, now + 4);
     let continued = commit_for(
         &agent,
         current.revision,
         fresh_key,
+        &round_continued,
         Some(failed_check("digest-a")),
         None,
-        Some(GoalContinuation {
-            id: Ulid::new().to_string(),
-            text: "keep going".to_owned(),
-        }),
+        Some(cont_continued.clone()),
     );
-    claim(&mut store, &agent, current.revision, fresh_key, now + 4);
     let first = store.goal_commit_round(&continued, now + 4).unwrap();
     assert_eq!(first.view.status, GoalStatus::Active);
+    // The same mutation id replays the retained round instead of committing
+    // the consumed key twice (id-bound requests, #353): the replay returns
+    // the original outcome and admits no second send.
     let repeat = commit_for(
         &agent,
         first.view.revision,
         fresh_key,
+        &round_continued,
         Some(failed_check("digest-a")),
         None,
-        Some(GoalContinuation {
-            id: Ulid::new().to_string(),
-            text: "keep going".to_owned(),
-        }),
+        Some(cont_continued.clone()),
     );
-    assert_eq!(
-        store.goal_commit_round(&repeat, now + 5).unwrap_err().code,
-        "stale_round"
-    );
-    // The refused replay admitted no second send.
+    let replayed = store.goal_commit_round(&repeat, now + 5).unwrap();
+    assert_eq!(replayed.outcome, first.outcome);
+    // The replay admitted no second send.
     assert_eq!(
         store
             .list_unsettled_commands(100)
@@ -1038,7 +1072,7 @@ fn goal_commit_refuses_revision_and_event_drift() {
         )
         .unwrap();
     let key = store.high_water().unwrap();
-    claim(&mut store, &agent, view.revision, key, now + 1);
+    let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 1);
     store
         .goal_pause(
             &agent,
@@ -1052,7 +1086,15 @@ fn goal_commit_refuses_revision_and_event_drift() {
     store
         .goal_resume(&agent, "eliot", &Ulid::new().to_string(), "owner", now + 2)
         .unwrap();
-    let drifted = commit_for(&agent, view.revision, key, Some(passed_check()), None, None);
+    let drifted = commit_for(
+        &agent,
+        view.revision,
+        key,
+        &round,
+        Some(passed_check()),
+        None,
+        None,
+    );
     assert_eq!(
         store.goal_commit_round(&drifted, now + 3).unwrap_err().code,
         "stale_round"
@@ -1061,7 +1103,7 @@ fn goal_commit_refuses_revision_and_event_drift() {
         .goal_abandon_round(
             "owner",
             &eliot_core::api::GoalRoundRequest {
-                id: Ulid::new().to_string(),
+                id: round.clone(),
                 agent: agent.to_owned(),
                 mode: GoalMode::parse("eliot").unwrap(),
                 idle_seq: match GoalRoundKey::Idle(key) {
@@ -1118,7 +1160,7 @@ fn goal_commit_refuses_revision_and_event_drift() {
     complete_send(&mut store, &agent, &fresh_id, "turn-drift-0", now + 4);
     let fresh = store.high_water().unwrap();
     assert!(fresh > key);
-    claim(&mut store, &agent, current.revision, fresh, now + 5);
+    let (round_drift, _, _) = claim(&mut store, &agent, current.revision, fresh, now + 5);
     let late = send_request(&agent, "late input");
     let late_id = late.id.clone();
     store
@@ -1143,6 +1185,7 @@ fn goal_commit_refuses_revision_and_event_drift() {
         &agent,
         current.revision,
         fresh,
+        &round_drift,
         Some(passed_check()),
         None,
         None,
@@ -1172,10 +1215,18 @@ fn goal_commit_blocks_without_a_check_for_an_exhausted_budget() {
         )
         .unwrap();
     let key = store.high_water().unwrap();
-    claim(&mut store, &agent, view.revision, key, now + 1);
+    let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 1);
     let result = store
         .goal_commit_round(
-            &commit_for(&agent, view.revision, key, None, Some("round_budget"), None),
+            &commit_for(
+                &agent,
+                view.revision,
+                key,
+                &round,
+                None,
+                Some("round_budget"),
+                None,
+            ),
             now + 1,
         )
         .unwrap();
@@ -1208,21 +1259,18 @@ fn goal_commit_blocks_a_failed_check_against_frozen_limits() {
             now,
         )
         .unwrap();
-    let send_id = Ulid::new().to_string();
     let key = store.high_water().unwrap();
-    claim(&mut store, &agent, view.revision, key, now + 1);
+    let (round, _, send_id) = claim(&mut store, &agent, view.revision, key, now + 1);
     let blocked = store
         .goal_commit_round(
             &commit_for(
                 &agent,
                 view.revision,
                 key,
+                &round,
                 Some(failed_check("digest-a")),
                 None,
-                Some(GoalContinuation {
-                    id: send_id.clone(),
-                    text: "keep going".to_owned(),
-                }),
+                Some(send_id.clone()),
             ),
             now + 1,
         )
@@ -1288,19 +1336,17 @@ fn goal_commit_blocks_on_turn_limit_and_no_progress_streaks() {
         .expect("settle send");
     let current = store.goal_get(&agent, "eliot").unwrap().unwrap();
     let key = store.high_water().unwrap();
-    claim(&mut store, &agent, current.revision, key, now + 4);
+    let (round, _, cont) = claim(&mut store, &agent, current.revision, key, now + 4);
     let blocked = store
         .goal_commit_round(
             &commit_for(
                 &agent,
                 current.revision,
                 key,
+                &round,
                 Some(failed_check("digest-a")),
                 None,
-                Some(GoalContinuation {
-                    id: Ulid::new().to_string(),
-                    text: "keep going".to_owned(),
-                }),
+                Some(cont.clone()),
             ),
             now + 4,
         )
@@ -1329,19 +1375,17 @@ fn goal_commit_blocks_on_turn_limit_and_no_progress_streaks() {
         )
         .unwrap();
     let key = store.high_water().unwrap();
-    claim(&mut store, &agent, view.revision, key, now + 6);
+    let (round_first, _, cont_first) = claim(&mut store, &agent, view.revision, key, now + 6);
     let first = store
         .goal_commit_round(
             &commit_for(
                 &agent,
                 view.revision,
                 key,
+                &round_first,
                 Some(failed_check("digest-a")),
                 None,
-                Some(GoalContinuation {
-                    id: Ulid::new().to_string(),
-                    text: "keep going".to_owned(),
-                }),
+                Some(cont_first.clone()),
             ),
             now + 6,
         )
@@ -1351,19 +1395,18 @@ fn goal_commit_blocks_on_turn_limit_and_no_progress_streaks() {
     };
     complete_send(&mut store, &agent, command_id, "turn-np-1", now + 6);
     let key = store.high_water().unwrap();
-    claim(&mut store, &agent, first.view.revision, key, now + 7);
+    let (round_second, _, cont_second) =
+        claim(&mut store, &agent, first.view.revision, key, now + 7);
     let second = store
         .goal_commit_round(
             &commit_for(
                 &agent,
                 first.view.revision,
                 key,
+                &round_second,
                 Some(failed_check("digest-a")),
                 None,
-                Some(GoalContinuation {
-                    id: Ulid::new().to_string(),
-                    text: "keep going".to_owned(),
-                }),
+                Some(cont_second.clone()),
             ),
             now + 7,
         )
@@ -1395,10 +1438,18 @@ fn goal_commit_completes_despite_a_spent_budget() {
         )
         .unwrap();
     let key = store.high_water().unwrap();
-    claim(&mut store, &agent, view.revision, key, now + 1);
+    let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 1);
     let completed = store
         .goal_commit_round(
-            &commit_for(&agent, view.revision, key, Some(passed_check()), None, None),
+            &commit_for(
+                &agent,
+                view.revision,
+                key,
+                &round,
+                Some(passed_check()),
+                None,
+                None,
+            ),
             now + 1,
         )
         .unwrap();
@@ -1422,20 +1473,10 @@ fn goal_no_progress_counter_skips_incomplete_output() {
         .unwrap();
     let continued =
         |store: &mut Store, revision: i64, key: i64, check: GoalCheckResult, now: i64| {
-            claim(store, &agent, revision, key, now);
+            let (round, _, cont) = claim(store, &agent, revision, key, now);
             let result = store
                 .goal_commit_round(
-                    &commit_for(
-                        &agent,
-                        revision,
-                        key,
-                        Some(check),
-                        None,
-                        Some(GoalContinuation {
-                            id: Ulid::new().to_string(),
-                            text: "keep going".to_owned(),
-                        }),
-                    ),
+                    &commit_for(&agent, revision, key, &round, Some(check), None, Some(cont)),
                     now,
                 )
                 .unwrap();
@@ -1517,7 +1558,7 @@ fn goal_claim_refuses_a_second_round_while_one_is_in_flight() {
         )
         .unwrap();
     let key = store.high_water().unwrap();
-    claim(&mut store, &agent, view.revision, key, now + 1);
+    let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 1);
     for other in [key, key + 1] {
         assert_eq!(
             store
@@ -1561,7 +1602,7 @@ fn goal_claim_refuses_a_second_round_while_one_is_in_flight() {
         .goal_abandon_round(
             "owner",
             &eliot_core::api::GoalRoundRequest {
-                id: Ulid::new().to_string(),
+                id: round.clone(),
                 agent: agent.to_owned(),
                 mode: GoalMode::parse("eliot").unwrap(),
                 idle_seq: match GoalRoundKey::Idle(key) {
@@ -1581,7 +1622,7 @@ fn goal_claim_refuses_a_second_round_while_one_is_in_flight() {
         .goal_abandon_round(
             "owner",
             &eliot_core::api::GoalRoundRequest {
-                id: Ulid::new().to_string(),
+                id: round.clone(),
                 agent: agent.to_owned(),
                 mode: GoalMode::parse("eliot").unwrap(),
                 idle_seq: match GoalRoundKey::Idle(key) {
@@ -1662,19 +1703,19 @@ fn goal_commit_requires_its_claimed_marker() {
         &agent,
         view.revision,
         key,
+        &Ulid::new().to_string(),
         Some(failed_check("digest-a")),
         None,
-        Some(GoalContinuation {
-            id: round_id.clone(),
-            text: "keep going".to_owned(),
-        }),
+        Some(round_id.clone()),
     );
+    // Id-bound round requests (#353): without a claim there is no retained
+    // reservation for the commit id, so the key checks never run.
     assert_eq!(
         store
             .goal_commit_round(&unclaimed, now + 1)
             .unwrap_err()
             .code,
-        "stale_round"
+        "unknown"
     );
     assert!(store.get_command(&round_id).unwrap().is_none());
     // A claim for a fresh key does not authorize the old commit.
@@ -1684,24 +1725,22 @@ fn goal_commit_requires_its_claimed_marker() {
     complete_send(&mut store, &agent, &send_id, "turn-marker-1", now + 2);
     let fresh = store.high_water().unwrap();
     assert!(fresh > key);
-    claim(&mut store, &agent, view.revision, fresh, now + 3);
+    let (round_fresh, _, cont_fresh) = claim(&mut store, &agent, view.revision, fresh, now + 3);
     assert_eq!(
         store
             .goal_commit_round(&unclaimed, now + 3)
             .unwrap_err()
             .code,
-        "stale_round"
+        "unknown"
     );
     let continued = commit_for(
         &agent,
         view.revision,
         fresh,
+        &round_fresh,
         Some(failed_check("digest-a")),
         None,
-        Some(GoalContinuation {
-            id: Ulid::new().to_string(),
-            text: "keep going".to_owned(),
-        }),
+        Some(cont_fresh.clone()),
     );
     store.goal_commit_round(&continued, now + 3).unwrap();
     let markers: i64 = store
@@ -1774,7 +1813,7 @@ fn goal_crash_leaves_an_unknown_marker_and_burns_its_key() {
     store
         .goal_round_probe(&agent, "eliot", GoalRoundKey::Idle(fresh), now + 3)
         .expect("probe the fresh key");
-    claim(&mut store, &agent, current.revision, fresh, now + 3);
+    let (round, _, _) = claim(&mut store, &agent, current.revision, fresh, now + 3);
     let state: String = store
         .connection
         .query_row(
@@ -1790,6 +1829,7 @@ fn goal_crash_leaves_an_unknown_marker_and_burns_its_key() {
                 &agent,
                 current.revision,
                 fresh,
+                &round,
                 Some(passed_check()),
                 None,
                 None,
@@ -1818,20 +1858,17 @@ fn goal_commit_refuses_activity_admitted_during_the_check() {
         )
         .unwrap();
     let key = store.high_water().unwrap();
-    claim(&mut store, &agent, view.revision, key, now + 1);
+    let (round, _, round_id) = claim(&mut store, &agent, view.revision, key, now + 1);
     let send = send_request(&agent, "owner input during the check");
     store.submit("owner", send, now + 1).expect("admit send");
-    let round_id = Ulid::new().to_string();
     let raced = commit_for(
         &agent,
         view.revision,
         key,
+        &round,
         Some(failed_check("digest-a")),
         None,
-        Some(GoalContinuation {
-            id: round_id.clone(),
-            text: "keep going".to_owned(),
-        }),
+        Some(round_id.clone()),
     );
     assert_eq!(
         store.goal_commit_round(&raced, now + 2).unwrap_err().code,
@@ -1846,7 +1883,7 @@ fn goal_commit_refuses_activity_admitted_during_the_check() {
         .goal_abandon_round(
             "owner",
             &eliot_core::api::GoalRoundRequest {
-                id: Ulid::new().to_string(),
+                id: round.clone(),
                 agent: agent.to_owned(),
                 mode: GoalMode::parse("eliot").unwrap(),
                 idle_seq: match GoalRoundKey::Idle(key) {
@@ -1880,7 +1917,7 @@ fn goal_commit_refuses_activity_admitted_during_the_check() {
         )
         .unwrap();
     let key = store.high_water().unwrap();
-    claim(&mut store, &agent, view.revision, key, now + 4);
+    let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 4);
     let send = send_request(&agent, "drive a turn");
     let send_id = send.id.clone();
     store.submit("owner", send, now + 4).expect("admit send");
@@ -1896,7 +1933,15 @@ fn goal_commit_refuses_activity_admitted_during_the_check() {
             now + 4,
         )
         .expect("start turn");
-    let raced = commit_for(&agent, view.revision, key, Some(passed_check()), None, None);
+    let raced = commit_for(
+        &agent,
+        view.revision,
+        key,
+        &round,
+        Some(passed_check()),
+        None,
+        None,
+    );
     assert_eq!(
         store.goal_commit_round(&raced, now + 5).unwrap_err().code,
         "stale_round"
@@ -1914,7 +1959,7 @@ fn goal_commit_refuses_activity_admitted_during_the_check() {
         )
         .unwrap();
     let key = store.high_water().unwrap();
-    claim(&mut store, &agent, view.revision, key, now + 7);
+    let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 7);
     let send = send_request(&agent, "needs approval");
     let send_id = send.id.clone();
     store.submit("owner", send, now + 7).expect("admit send");
@@ -1942,7 +1987,15 @@ fn goal_commit_refuses_activity_admitted_during_the_check() {
             now + 7,
         )
         .expect("open request");
-    let raced = commit_for(&agent, view.revision, key, Some(passed_check()), None, None);
+    let raced = commit_for(
+        &agent,
+        view.revision,
+        key,
+        &round,
+        Some(passed_check()),
+        None,
+        None,
+    );
     assert_eq!(
         store.goal_commit_round(&raced, now + 8).unwrap_err().code,
         "stale_round"
@@ -2073,7 +2126,7 @@ fn goal_commit_refuses_a_check_without_an_exit_code() {
         )
         .unwrap();
     let key = store.high_water().unwrap();
-    claim(&mut store, &agent, view.revision, key, now + 1);
+    let (round, _, cont) = claim(&mut store, &agent, view.revision, key, now + 1);
     let codeless = GoalCheckResult {
         exit_code: None,
         output_complete: true,
@@ -2085,12 +2138,10 @@ fn goal_commit_refuses_a_check_without_an_exit_code() {
         &agent,
         view.revision,
         key,
+        &round,
         Some(codeless),
         None,
-        Some(GoalContinuation {
-            id: round_id.clone(),
-            text: "keep going".to_owned(),
-        }),
+        Some(cont.clone()),
     );
     assert_eq!(
         store.goal_commit_round(&commit, now + 2).unwrap_err().code,
@@ -2263,17 +2314,21 @@ fn cadenced_definition(text: &str) -> GoalDefinition {
     }
 }
 
+/// Test-only constructor mirroring the commit fields; the arity matches the
+/// struct it builds.
+#[allow(clippy::too_many_arguments)]
 fn slot_commit_for(
     agent: &str,
     revision: i64,
     slot: i64,
     claim_seq: i64,
+    id: &str,
     check: Option<GoalCheckResult>,
     blocked_reason: Option<&str>,
-    continuation: Option<GoalContinuation>,
+    continuation: Option<String>,
 ) -> GoalRoundCommit {
     GoalRoundCommit {
-        id: Ulid::new().to_string(),
+        id: id.to_owned(),
         principal: "owner".to_owned(),
         agent: agent.to_owned(),
         mode: "eliot".to_owned(),
@@ -2283,14 +2338,10 @@ fn slot_commit_for(
         claim_seq,
         check,
         blocked_reason: blocked_reason.map(ToOwned::to_owned),
-        continuation,
-    }
-}
-
-fn continued_send(text: &str) -> GoalContinuation {
-    GoalContinuation {
-        id: Ulid::new().to_string(),
-        text: text.to_owned(),
+        continuation: continuation.map(|command_id| GoalContinuation {
+            id: command_id,
+            text: "keep going".to_owned(),
+        }),
     }
 }
 
@@ -2386,11 +2437,12 @@ fn goal_slot_round_trip_continues_then_completes() {
     let probe = store
         .goal_round_probe(&agent, "eliot", GoalRoundKey::Slot(1), first_due)
         .expect("first slot probes when due");
-    let claim_seq = store
+    let round_first = Ulid::new().to_string();
+    let (claim_seq, cont_first) = store
         .goal_claim_round(
             "owner",
             &eliot_core::api::GoalRoundRequest {
-                id: Ulid::new().to_string(),
+                id: round_first.clone(),
                 agent: agent.to_owned(),
                 mode: GoalMode::parse("eliot").unwrap(),
                 idle_seq: match GoalRoundKey::Slot(1) {
@@ -2407,7 +2459,10 @@ fn goal_slot_round_trip_continues_then_completes() {
             first_due,
         )
         .map(|claim| match claim {
-            super::GoalRoundClaim::Claimed { seq, .. } => seq,
+            super::GoalRoundClaim::Claimed {
+                seq,
+                continuation_id,
+            } => (seq, continuation_id),
             super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
         })
         .expect("claim first slot");
@@ -2419,9 +2474,10 @@ fn goal_slot_round_trip_continues_then_completes() {
                 set.revision,
                 1,
                 claim_seq,
+                &round_first,
                 Some(failed_check("digest-a")),
                 None,
-                Some(continued_send("keep going")),
+                Some(cont_first),
             ),
             first_due,
         )
@@ -2441,11 +2497,12 @@ fn goal_slot_round_trip_continues_then_completes() {
     let probe = store
         .goal_round_probe(&agent, "eliot", GoalRoundKey::Slot(2), second_due)
         .expect("second slot probes when due");
+    let round_second = Ulid::new().to_string();
     let claim_seq = store
         .goal_claim_round(
             "owner",
             &eliot_core::api::GoalRoundRequest {
-                id: Ulid::new().to_string(),
+                id: round_second.clone(),
                 agent: agent.to_owned(),
                 mode: GoalMode::parse("eliot").unwrap(),
                 idle_seq: match GoalRoundKey::Slot(2) {
@@ -2473,6 +2530,7 @@ fn goal_slot_round_trip_continues_then_completes() {
                 first.view.revision,
                 2,
                 claim_seq,
+                &round_second,
                 Some(passed_check()),
                 None,
                 None,
@@ -2654,11 +2712,12 @@ fn goal_slot_burn_ignores_revision_but_separates_forms() {
         )
         .unwrap();
     let key = store.high_water().unwrap();
+    let round = Ulid::new().to_string();
     let claim_seq = store
         .goal_claim_round(
             "owner",
             &eliot_core::api::GoalRoundRequest {
-                id: Ulid::new().to_string(),
+                id: round.clone(),
                 agent: agent.to_owned(),
                 mode: GoalMode::parse("eliot").unwrap(),
                 idle_seq: match GoalRoundKey::Idle(key) {
@@ -2684,7 +2743,7 @@ fn goal_slot_burn_ignores_revision_but_separates_forms() {
         .goal_abandon_round(
             "owner",
             &eliot_core::api::GoalRoundRequest {
-                id: Ulid::new().to_string(),
+                id: round.clone(),
                 agent: agent.to_owned(),
                 mode: GoalMode::parse("eliot").unwrap(),
                 idle_seq: match GoalRoundKey::Idle(key) {
@@ -2717,11 +2776,12 @@ fn goal_slot_burn_ignores_revision_but_separates_forms() {
     let probe = store
         .goal_round_probe(&agent, "eliot", GoalRoundKey::Slot(key), due)
         .expect("same number as a slot is not burned");
+    let round_slot = Ulid::new().to_string();
     store
         .goal_claim_round(
             "owner",
             &eliot_core::api::GoalRoundRequest {
-                id: Ulid::new().to_string(),
+                id: round_slot.clone(),
                 agent: agent.to_owned(),
                 mode: GoalMode::parse("eliot").unwrap(),
                 idle_seq: match GoalRoundKey::Slot(key) {
@@ -2746,7 +2806,7 @@ fn goal_slot_burn_ignores_revision_but_separates_forms() {
         .goal_abandon_round(
             "owner",
             &eliot_core::api::GoalRoundRequest {
-                id: Ulid::new().to_string(),
+                id: round_slot.clone(),
                 agent: agent.to_owned(),
                 mode: GoalMode::parse("eliot").unwrap(),
                 idle_seq: match GoalRoundKey::Slot(key) {
@@ -2835,11 +2895,12 @@ fn goal_slot_commit_refuses_events_during_the_check() {
         )
         .unwrap();
     let due = base + MIN_GOAL_CADENCE_MS;
+    let round = Ulid::new().to_string();
     let claim_seq = store
         .goal_claim_round(
             "owner",
             &eliot_core::api::GoalRoundRequest {
-                id: Ulid::new().to_string(),
+                id: round.clone(),
                 agent: agent.to_owned(),
                 mode: GoalMode::parse("eliot").unwrap(),
                 idle_seq: match GoalRoundKey::Slot(1) {
@@ -2871,6 +2932,7 @@ fn goal_slot_commit_refuses_events_during_the_check() {
         set.revision,
         1,
         claim_seq,
+        &round,
         Some(passed_check()),
         None,
         None,
@@ -2922,16 +2984,17 @@ fn failing_round(
     store
         .goal_round_probe(agent, "eliot", GoalRoundKey::Idle(key), now)
         .expect("probe idle round");
-    claim(store, agent, revision, key, now);
+    let (round, _, cont) = claim(store, agent, revision, key, now);
     store
         .goal_commit_round(
             &commit_for(
                 agent,
                 revision,
                 key,
+                &round,
                 Some(failed_check(digest)),
                 None,
-                Some(continued_send("keep going")),
+                Some(cont),
             ),
             now,
         )
@@ -3395,11 +3458,12 @@ fn goal_committed_slots_are_monotonic() {
     let probe = store
         .goal_round_probe(&agent, "eliot", GoalRoundKey::Slot(9), ninth_due)
         .expect("slot 9 probes when due");
-    let claim_seq = store
+    let round_nine = Ulid::new().to_string();
+    let (claim_seq, cont_nine) = store
         .goal_claim_round(
             "owner",
             &eliot_core::api::GoalRoundRequest {
-                id: Ulid::new().to_string(),
+                id: round_nine.clone(),
                 agent: agent.to_owned(),
                 mode: GoalMode::parse("eliot").unwrap(),
                 idle_seq: match GoalRoundKey::Slot(9) {
@@ -3416,7 +3480,10 @@ fn goal_committed_slots_are_monotonic() {
             ninth_due,
         )
         .map(|claim| match claim {
-            super::GoalRoundClaim::Claimed { seq, .. } => seq,
+            super::GoalRoundClaim::Claimed {
+                seq,
+                continuation_id,
+            } => (seq, continuation_id),
             super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
         })
         .expect("claim slot 9");
@@ -3427,9 +3494,10 @@ fn goal_committed_slots_are_monotonic() {
                 set.revision,
                 9,
                 claim_seq,
+                &round_nine,
                 Some(failed_check("digest-9")),
                 None,
-                Some(continued_send("keep going")),
+                Some(cont_nine),
             ),
             ninth_due,
         )
@@ -3829,8 +3897,15 @@ fn goal_reconcile_candidate_rearms_after_definition_change() {
     // sweep sees no candidate. The commit reuses the claim's request id
     // and observed sequence.
     let (request_id, seq, _) = claim(&mut store, &agent, view.revision, key, now + 1);
-    let mut commit = commit_for(&agent, view.revision, key, Some(passed_check()), None, None);
-    commit.id = request_id;
+    let mut commit = commit_for(
+        &agent,
+        view.revision,
+        key,
+        &request_id,
+        Some(passed_check()),
+        None,
+        None,
+    );
     commit.claim_seq = seq;
     let committed = store.goal_commit_round(&commit, now + 1).unwrap();
     assert_eq!(committed.view.status, GoalStatus::Completed);

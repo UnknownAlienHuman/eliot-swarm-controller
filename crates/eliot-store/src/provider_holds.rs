@@ -304,6 +304,11 @@ pub(super) fn terminal_tx(
     else {
         return Ok(Vec::new());
     };
+    // A live-host projection gap settles the turn unknown with no provider
+    // signal: no restriction is recorded and no probe claim resolves.
+    if native_event.kind == "turn.unknown" {
+        return Ok(Vec::new());
+    }
     let agent_num = parse_agent_id(&agent.id)?;
     let generation = agent.generation;
     if native_event.kind != "turn.completed"

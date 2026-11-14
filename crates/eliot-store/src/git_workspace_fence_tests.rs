@@ -82,7 +82,7 @@ fn admit_workspace(
         "project": input.project,
         "workspace": input.repo_path,
         "worktree": input.requested_branch,
-        "harness": "fake",
+        "harness": "codex",
         "profile": "fake",
         "profile_snapshot": {},
     });
@@ -159,7 +159,14 @@ fn ready_workspace(
     verified_creation(store, &fixture, 1, now + 2);
     store
         .dispatch(&fixture.start_command_id, now + 3)
-        .expect("dispatch Fake launch after worktree readback");
+        .expect("dispatch fixture launch after worktree readback");
+    crate::tests::install_fixture_sources(
+        store,
+        &fixture.agent,
+        &fixture.start_command_id,
+        1,
+        now + 3,
+    );
     let batch_id = Ulid::new().to_string();
     let native_scope = format!("timer-resume-{}-scope", fixture.agent);
     let native_ref = format!("timer-resume-{}-subject", fixture.agent);
@@ -184,7 +191,7 @@ fn ready_workspace(
             },
             now + 4,
         )
-        .expect("commit Fake session readiness");
+        .expect("commit fixture session readiness");
     store
         .settle(
             &fixture.start_command_id,
@@ -192,7 +199,7 @@ fn ready_workspace(
             None,
             now + 5,
         )
-        .expect("settle Fake launch");
+        .expect("settle fixture launch");
     assert_eq!(workspace(store, &fixture).phase, WorkspacePhase::Ready);
     fixture
 }
@@ -216,7 +223,7 @@ fn end_session(store: &mut Store, fixture: &WorkspaceFixture, now: i64) {
             },
             now,
         )
-        .expect("commit retained Fake session end");
+        .expect("commit retained fixture session end");
     assert_eq!(
         store.get_agent(&fixture.agent).unwrap().unwrap().state,
         AgentState::Stopped

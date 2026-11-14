@@ -681,13 +681,7 @@ mod tests {
             .expect("admit launch");
         let agent = admission.command.target.expect("launch target");
         store.dispatch(&launch_id, now).expect("dispatch launch");
-        let plan = ["session", "turn", "message"]
-            .into_iter()
-            .map(|family| (family.to_owned(), "stream".to_owned()))
-            .collect();
-        store
-            .install_plugin_sources(&agent, 1, &launch_id, &plan, now)
-            .expect("install plugin sources");
+        crate::tests::install_fixture_sources(store, &agent, &launch_id, 1, now);
         store
             .put_batch(
                 SourceBatch {
@@ -790,6 +784,7 @@ mod tests {
             )
             .expect("admit resume");
         store.dispatch(&resume_id, now).expect("dispatch resume");
+        crate::tests::install_fixture_sources(store, agent, &resume_id, 2, now);
         let current = store
             .get_agent(agent)
             .expect("read resumed Agent")

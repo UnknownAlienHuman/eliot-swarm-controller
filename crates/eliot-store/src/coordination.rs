@@ -1663,13 +1663,7 @@ mod tests {
             .expect("admit launch");
         let agent = admission.command.target.expect("launch target");
         store.dispatch(&launch_id, now).expect("dispatch launch");
-        let plan = ["session", "turn", "message"]
-            .into_iter()
-            .map(|family| (family.to_owned(), "stream".to_owned()))
-            .collect();
-        store
-            .install_plugin_sources(&agent, 1, &launch_id, &plan, now)
-            .expect("install plugin sources");
+        crate::tests::install_fixture_sources(store, &agent, &launch_id, 1, now);
         store
             .put_batch(
                 SourceBatch {
@@ -1758,7 +1752,7 @@ mod tests {
             })
             .expect("read Store migration version");
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 26);
+        assert_eq!(version, 31);
         for table in ["messages", "vars", "mail_notices", "claims"] {
             let found: i64 = store
                 .connection

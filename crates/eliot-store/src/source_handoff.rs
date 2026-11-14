@@ -795,7 +795,10 @@ mod tests {
     }
 
     fn handoff_all_native_families(agent: &str) -> SourceHandoff {
-        handoff(agent, &["session", "turn", "message", "request"][..])
+        handoff(
+            agent,
+            &["session", "turn", "message", "tool", "request"][..],
+        )
     }
 
     fn with_gap(mut request: SourceHandoff) -> SourceHandoff {
@@ -994,9 +997,8 @@ mod tests {
         let mut bad = original.clone();
         bad.families = vec!["message".to_owned(), "message".to_owned()];
         requests.push(bad);
-        let mut bad = original.clone();
-        bad.families = vec!["tool".to_owned()];
-        requests.push(bad);
+        // "tool" is a native family since #332, so a tool-only handoff is
+        // well-formed and no longer belongs in this rejection list.
         let mut bad = original.clone();
         bad.families.clear();
         requests.push(bad);
@@ -1200,7 +1202,7 @@ mod tests {
     fn native_exit_gaps_group_current_owners_and_never_gap_a_zero_family_predecessor() {
         for families in [
             vec!["message"],
-            vec!["session", "turn", "message", "request"],
+            vec!["session", "turn", "message", "tool", "request"],
         ] {
             let (mut store, agent, now) = fixture("muse");
             store
@@ -1227,7 +1229,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(
                     predecessor_gap.data["families"],
-                    json!(["request", "session", "turn"])
+                    json!(["request", "session", "tool", "turn"])
                 );
             } else {
                 assert!(store.read_source_state(&agent, 1, "stream").unwrap()["gap_id"].is_null());
@@ -1332,11 +1334,12 @@ mod tests {
     #[test]
     fn unimplemented_and_daemon_families_keep_distinct_admission_errors() {
         let (mut store, agent, now) = fixture("muse");
+        // "tool" is a native family since #332, so it is no longer rejected
+        // here; native families transfer through handoffs instead.
         for (family, code) in [
             ("child", "unsupported"),
             ("goal", "unsupported"),
             ("usage", "unsupported"),
-            ("tool", "unsupported"),
             ("process", "not_allowed"),
             ("file", "not_allowed"),
             ("git", "not_allowed"),
