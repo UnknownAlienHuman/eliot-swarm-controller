@@ -3492,6 +3492,7 @@ fn command_from_raw(raw: CommandRecordRaw) -> Result<CommandRecord> {
             created_at: raw.created_at,
             updated_at: raw.updated_at,
             probe: raw.probe,
+            config_revision: raw.config_revision,
         },
         state,
         target,
@@ -4442,6 +4443,9 @@ impl Store {
 /// values from one `configure` command plus the effective values the next
 /// native turn carries. The original profile snapshot is never rewritten;
 /// it stays on the Agent row while these rows accumulate per generation.
+/// A `resume` starts its new generation by inheriting the previous
+/// generation's latest overlay as revision 1 with `provenance` set to
+/// `inherited_from`; directly configured rows carry `configure`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentConfig {
     pub agent: String,
@@ -4452,6 +4456,7 @@ pub struct AgentConfig {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub application: String,
+    pub provenance: String,
     pub command_id: String,
     pub created_at: i64,
 }
@@ -4498,8 +4503,9 @@ fn agent_config_from_row(
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         application: row.get(3)?,
-        command_id: row.get(4)?,
-        created_at: row.get(5)?,
+        provenance: row.get(4)?,
+        command_id: row.get(5)?,
+        created_at: row.get(6)?,
     })
 }
 
@@ -4521,7 +4527,7 @@ fn get_agent_config_tx(
     revision: i64,
 ) -> Result<Option<AgentConfig>> {
     tx.query_row(
-        "SELECT revision, requested, effective, application, command_id, created_at
+        "SELECT revision, requested, effective, application, provenance, command_id, created_at
          FROM agent_config WHERE agent = ?1 AND generation = ?2 AND revision = ?3",
         params![agent, generation, revision],
         |row| agent_config_from_row(agent, generation, row),
@@ -4547,7 +4553,7 @@ impl Store {
         let agent_num = parse_agent_id(agent)?;
         self.connection
             .query_row(
-                "SELECT revision, requested, effective, application, command_id, created_at
+                "SELECT revision, requested, effective, application, provenance, command_id, created_at
                  FROM agent_config WHERE agent = ?1 AND generation = ?2 AND revision = ?3",
                 params![agent_num, generation, revision],
                 |row| agent_config_from_row(agent_num, generation, row),
@@ -4596,31 +4602,61 @@ impl Store {
     /// Effective model/effort for one send command's retained revision, or
     /// `None` when the send runs under the frozen snapshot. Used by the
     /// plugin host before native turn construction and by settlement when
-    /// it records what the native request carried.
+    /// it records what the native request carried. Reads only the retained
+    /// revision stamped at dispatch, so a later config-file reload can never
+    /// rewrite a pending or unknown command's meaning.
     pub fn send_effective_config(&self, command_id: &str) -> Result<Option<AgentConfig>> {
+        self.command_effective_config(command_id, &["send"])
+    }
+
+    /// Effective configuration for one retained command's stamped revision,
+    /// or `None` when it runs under the frozen snapshot (revision 0). The
+    /// revision is read from the retained command row and resolved against
+    /// the retained `agent_config` rows only: config-file reloads never
+    /// rewrite a retained generation, a pending command, or an
+    /// unknown-outcome resolution. `allowed` lists the verbs that may carry
+    /// a native configuration (launch, resume, send, configure).
+    pub fn command_effective_config(
+        &self,
+        command_id: &str,
+        allowed: &[&str],
+    ) -> Result<Option<AgentConfig>> {
         let record = load_command_record(&self.connection, command_id)?.ok_or_else(|| {
             Error::new("not_found", format!("command {command_id} was not found"))
         })?;
-        if record.command.verb != "send" {
+        if !allowed.contains(&record.command.verb.as_str()) {
             return Err(Error::new(
                 "invalid",
-                "effective configuration resolves only for send commands",
+                "effective configuration resolves only for native commands",
             ));
         }
         let Some(target) = record.target else {
             return Err(Error::new(
                 "source_integrity",
-                "send command has no retained Agent target",
+                "command has no retained Agent target",
             ));
         };
-        let generation = record.command.generation.ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "send command has no retained generation",
-            )
-        })?;
+        let generation = record
+            .command
+            .generation
+            .ok_or_else(|| Error::new("source_integrity", "command has no retained generation"))?;
         let agent = format_agent_id(target);
         self.get_agent_config(&agent, generation, record.config_revision)
+    }
+
+    /// Effective configuration for one retained turn's stamped revision, or
+    /// `None` when the turn ran under the frozen snapshot. Reads only
+    /// retained rows, so reloads never rewrite a retained turn's meaning.
+    pub fn turn_effective_config(
+        &self,
+        agent: &str,
+        generation: i64,
+        turn_id: &str,
+    ) -> Result<Option<AgentConfig>> {
+        let turn = self
+            .get_turn(agent, generation, turn_id)?
+            .ok_or_else(|| Error::new("not_found", format!("turn {turn_id} was not found")))?;
+        self.get_agent_config(agent, generation, turn.config_revision)
     }
 
     /// Commit one dispatched `configure` command's overlay and stamp the
@@ -4723,8 +4759,8 @@ impl Store {
         let requested_json = encode_json(&requested)?;
         let effective_json = encode_json(&effective)?;
         db!(tx.execute(
-            "INSERT INTO agent_config(agent, generation, revision, requested, effective, application, command_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO agent_config(agent, generation, revision, requested, effective, application, provenance, command_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'configure', ?7, ?8)",
             params![
                 agent_num,
                 generation,

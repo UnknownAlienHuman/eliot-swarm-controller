@@ -7098,6 +7098,7 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
         .connection
         .execute_batch(
             "DROP TABLE agent_config;
+             DELETE FROM schema_migrations WHERE version = 35;
              DELETE FROM schema_migrations WHERE version = 34;
              ALTER TABLE commands DROP COLUMN config_revision;
              ALTER TABLE turns DROP COLUMN config_revision;
@@ -13352,5 +13353,352 @@ fn turn_and_generation_readback_show_resolved_native_effort() {
         effective.effort.as_deref(),
         Some("low"),
         "recorded effort carries to the next input"
+    );
+}
+
+#[test]
+fn resume_inherits_latest_overlay_as_revision_one_with_provenance() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let snapshot = json!({"model": "m0", "effort": "low"});
+    let agent = ready_configure_agent(
+        &mut store,
+        "configure-resume-inherit",
+        "codex",
+        snapshot.clone(),
+        now,
+    );
+    let configure = configure_request(&agent, 1, json!({"model": "m1"}));
+    let configure_id = configure.id.clone();
+    store
+        .submit("owner", configure, now + 1)
+        .expect("admit configure");
+    store
+        .dispatch(&configure_id, now + 2)
+        .expect("dispatch configure");
+    let applied = store
+        .apply_agent_config(&configure_id, now + 3)
+        .expect("apply configure");
+    assert_eq!(applied.revision, 1);
+    assert_eq!(applied.provenance, "configure");
+    store
+        .settle(&configure_id, CommandState::Applied, None, now + 3)
+        .expect("settle configure");
+
+    // Retain a native subject, then retire generation 1 through the honest
+    // terminal fact so `resume` admits.
+    let agent_num = eliot_core::parse_agent_id(&agent).expect("Agent id");
+    store
+        .connection
+        .execute(
+            "UPDATE agents SET native_scope = ?1, native_ref = ?2 WHERE id = ?3",
+            rusqlite::params![
+                "configure-resume-inherit:scope",
+                "configure-resume-inherit:thread",
+                agent_num
+            ],
+        )
+        .expect("retain a native subject for resume");
+    install_live_custody_observations(&mut store, &agent, 1, now + 4);
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "configure-resume-inherit:ended".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "configure-resume-inherit:ended".to_owned(),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now + 5,
+        )
+        .expect("commit terminal session fact");
+    simulate_normal_stop_proof(&mut store, &agent, 1, now + 5);
+
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    let resume_id = resume.id.clone();
+    store
+        .submit("owner", resume, now + 6)
+        .expect("admit resume");
+    store
+        .dispatch(&resume_id, now + 6)
+        .expect("dispatch resume");
+    assert_eq!(
+        store
+            .get_agent(&agent)
+            .expect("load agent")
+            .expect("agent exists")
+            .generation,
+        2,
+        "resume starts the next generation"
+    );
+
+    // The new generation explicitly inherits the previous overlay as its
+    // own revision 1 with `inherited_from` provenance; the frozen snapshot
+    // itself is unchanged.
+    let inherited = store
+        .get_agent_config_current(&agent, 2)
+        .expect("read inherited overlay")
+        .expect("resume inherits an overlay");
+    assert_eq!(inherited.revision, 1);
+    assert_eq!(inherited.provenance, "inherited_from");
+    assert_eq!(inherited.requested_model.as_deref(), Some("m1"));
+    assert_eq!(inherited.model.as_deref(), Some("m1"));
+    assert_eq!(inherited.effort.as_deref(), Some("low"));
+    assert_eq!(inherited.command_id, resume_id);
+    let stored = store
+        .get_agent(&agent)
+        .expect("load agent")
+        .expect("agent exists");
+    assert_eq!(
+        stored.profile_snapshot, snapshot,
+        "snapshot never rewritten"
+    );
+    let resume_command = store
+        .get_command(&resume_id)
+        .expect("load resume")
+        .expect("resume exists");
+    assert_eq!(resume_command.generation, Some(2));
+    assert_eq!(
+        resume_command.config_revision, 1,
+        "resume runs under its inherited revision"
+    );
+
+    // The previous generation's overlay is untouched.
+    let previous = store
+        .get_agent_config(&agent, 1, 1)
+        .expect("read previous overlay")
+        .expect("previous overlay retained");
+    assert_eq!(previous.provenance, "configure");
+    assert_eq!(previous.command_id, configure_id);
+
+    // Complete the resume lifecycle so the new generation can take input.
+    install_fixture_sources(&mut store, &agent, &resume_id, 2, now + 6);
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "configure-resume-inherit:ready".to_owned(),
+                agent_id: agent.clone(),
+                generation: 2,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: "configure-resume-inherit:ready".to_owned(),
+                    data: json!({"command_id": resume_id,
+                        "native_scope": "configure-resume-inherit:scope",
+                        "native_ref": "configure-resume-inherit:thread"}),
+                }],
+                cursor: None,
+            },
+            now + 6,
+        )
+        .expect("commit resumed session ready");
+    store
+        .settle(&resume_id, CommandState::Applied, None, now + 6)
+        .expect("settle resume");
+
+    // The next send in the new generation runs under the inherited overlay.
+    let send = send_request(&agent, 2, "after resume");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now + 7).expect("admit send");
+    store.dispatch(&send_id, now + 8).expect("dispatch send");
+    let effective = store
+        .send_effective_config(&send_id)
+        .expect("resolve send")
+        .expect("inherited overlay applies");
+    assert_eq!(effective.revision, 1);
+    assert_eq!(effective.model.as_deref(), Some("m1"));
+}
+
+#[test]
+fn retained_config_survives_config_file_reload_for_pending_and_unknown() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let snapshot = json!({"model": "m0", "effort": "low"});
+    let agent = ready_configure_agent(
+        &mut store,
+        "configure-reload-proof",
+        "codex",
+        snapshot.clone(),
+        now,
+    );
+    let configure = configure_request(&agent, 1, json!({"model": "m1", "effort": "high"}));
+    let configure_id = configure.id.clone();
+    store
+        .submit("owner", configure, now + 1)
+        .expect("admit configure");
+    store
+        .dispatch(&configure_id, now + 2)
+        .expect("dispatch configure");
+    store
+        .apply_agent_config(&configure_id, now + 3)
+        .expect("apply configure");
+    store
+        .settle(&configure_id, CommandState::Applied, None, now + 3)
+        .expect("settle configure");
+
+    // A first send dispatched under the overlay, plus a pending send admitted
+    // while its turn is still unassociated.
+    let first = send_request(&agent, 1, "first");
+    let first_id = first.id.clone();
+    store.submit("owner", first, now + 4).expect("admit first");
+    store.dispatch(&first_id, now + 5).expect("dispatch first");
+    let pending = send_request(&agent, 1, "pending");
+    let pending_id = pending.id.clone();
+    store
+        .submit("owner", pending, now + 6)
+        .expect("admit pending");
+
+    // A config-file reload edits the profile: a new launch resolves the
+    // edited snapshot, while the retained generation keeps its frozen one.
+    let reloaded_snapshot = json!({"model": "m-edited", "effort": "low"});
+    let launch_id = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: launch_id.clone(),
+                target: None,
+                selector: None,
+                verb: "launch".to_owned(),
+                args: json!({"project":"configure-reload-proof-new", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":reloaded_snapshot.clone()}),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now + 7,
+        )
+        .expect("admit reloaded launch");
+    let reloaded_target = store
+        .get_command(&launch_id)
+        .expect("load reloaded launch")
+        .expect("launch exists")
+        .target
+        .expect("launch target");
+    let reloaded_row = store
+        .get_agent(&reloaded_target)
+        .expect("load reloaded agent")
+        .expect("agent exists");
+    assert_eq!(
+        reloaded_row.profile_snapshot, reloaded_snapshot,
+        "new launches resolve the reloaded profile"
+    );
+
+    let retained = store
+        .get_agent(&agent)
+        .expect("load retained agent")
+        .expect("agent exists");
+    assert_eq!(
+        retained.profile_snapshot, snapshot,
+        "reload never rewrites a retained generation"
+    );
+    assert_eq!(
+        store
+            .send_effective_config(&first_id)
+            .expect("resolve first")
+            .expect("overlay applies")
+            .model
+            .as_deref(),
+        Some("m1"),
+        "dispatched send keeps its original configuration"
+    );
+
+    // The pending send dispatches after the reload and still runs under the
+    // retained overlay, not the reloaded profile. Complete the first turn
+    // first so the send lane frees; the lane holds a configure-pending send
+    // on its unassociated input.
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "configure-reload-proof:turn".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![
+                    NativeEvent {
+                        ts: None,
+                        kind: "turn.started".to_owned(),
+                        native_id: "configure-reload-proof:turn:started".to_owned(),
+                        data: json!({"command_id": first_id, "turn_id": "reload-turn"}),
+                    },
+                    NativeEvent {
+                        ts: None,
+                        kind: "message.completed".to_owned(),
+                        native_id: "configure-reload-proof:turn:message".to_owned(),
+                        data: json!({"command_id": first_id, "turn_id": "reload-turn", "text": "first reply"}),
+                    },
+                    NativeEvent {
+                        ts: None,
+                        kind: "turn.completed".to_owned(),
+                        native_id: "configure-reload-proof:turn:completed".to_owned(),
+                        data: json!({"command_id": first_id, "turn_id": "reload-turn", "status": "completed"}),
+                    },
+                ],
+                cursor: None,
+            },
+            now + 8,
+        )
+        .expect("complete first turn");
+    store
+        .dispatch(&pending_id, now + 9)
+        .expect("dispatch pending");
+    let pending_command = store
+        .get_command(&pending_id)
+        .expect("load pending")
+        .expect("send exists");
+    assert_eq!(
+        pending_command.config_revision, 1,
+        "pending send dispatched under its retained revision"
+    );
+    assert_eq!(
+        store
+            .command_effective_config(&pending_id, &["send"])
+            .expect("resolve pending")
+            .expect("overlay applies")
+            .model
+            .as_deref(),
+        Some("m1"),
+        "pending command still reads back its original configuration"
+    );
+
+    // An unknown outcome still resolves to the retained configuration: the
+    // revision stamped at dispatch is read back, never the reloaded file.
+    store
+        .recover_on_restart(now + 10)
+        .expect("fence dispatched send as unknown");
+    let unknown = store
+        .get_command(&pending_id)
+        .expect("load unknown")
+        .expect("send exists");
+    assert_eq!(unknown.state, CommandState::Unknown);
+    assert_eq!(unknown.config_revision, 1);
+    assert_eq!(
+        store
+            .command_effective_config(&pending_id, &["send"])
+            .expect("resolve unknown")
+            .expect("overlay applies")
+            .model
+            .as_deref(),
+        Some("m1"),
+        "unknown-outcome resolution keeps the original configuration"
+    );
+    assert_eq!(
+        store
+            .turn_effective_config(&agent, 1, "reload-turn")
+            .expect("resolve turn")
+            .expect("turn overlay retained")
+            .model
+            .as_deref(),
+        Some("m1"),
+        "retained turn keeps its original configuration"
     );
 }

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 34;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 35;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -828,6 +828,19 @@ impl Store {
                  ALTER TABLE turns ADD COLUMN config_revision INTEGER NOT NULL DEFAULT 0
                      CHECK(typeof(config_revision) = 'integer' AND config_revision >= 0);
                  INSERT INTO schema_migrations(version) VALUES (34);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 35 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE agent_config ADD COLUMN provenance TEXT NOT NULL DEFAULT 'configure'
+                     CHECK(provenance IN ('configure', 'inherited_from'));
+                 INSERT INTO schema_migrations(version) VALUES (35);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

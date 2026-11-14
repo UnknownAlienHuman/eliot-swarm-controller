@@ -526,6 +526,12 @@ pub struct Command {
     pub updated_at: i64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub probe: bool,
+    /// Configuration revision the command was admitted or dispatched under:
+    /// 0 runs under the frozen profile snapshot, otherwise the exact
+    /// `agent_config` revision for its retained generation. Trailing field;
+    /// absent on old wire payloads.
+    #[serde(default)]
+    pub config_revision: i64,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

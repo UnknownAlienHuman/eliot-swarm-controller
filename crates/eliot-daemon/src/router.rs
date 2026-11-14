@@ -2539,29 +2539,42 @@ impl Router {
         };
         // Current model/effort overlay for `swarm show`: the latest
         // retained revision with its effective values plus the original
-        // frozen profile values. Absent when no `configure` applied.
+        // frozen profile values and provenance. `profile` repeats the
+        // retained requested name, `profile_inherited` reports a verbatim
+        // parent-snapshot reuse, and `provenance` distinguishes a direct
+        // `configure` from a `resume` generation's `inherited_from` row.
+        // Absent when no overlay ever applied to this generation.
         let config = {
             let store = self.inner.store.lock().await;
-            store
-                .get_agent_config_current(&agent.id, agent.generation)?
-                .map(|overlay| AgentConfigView {
-                    revision: overlay.revision,
-                    application: overlay.application.clone(),
-                    requested_model: overlay.requested_model.clone(),
-                    requested_effort: overlay.requested_effort.clone(),
-                    model: overlay.model.clone(),
-                    effort: overlay.effort.clone(),
-                    original_model: agent
-                        .profile_snapshot
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                    original_effort: agent
-                        .profile_snapshot
-                        .get("effort")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                })
+            let overlay = store.get_agent_config_current(&agent.id, agent.generation)?;
+            let profile_inherited = match agent.parent.as_deref() {
+                Some(parent_id) => store.get_agent(parent_id)?.is_some_and(|parent| {
+                    parent.profile == agent.profile
+                        && parent.profile_snapshot == agent.profile_snapshot
+                }),
+                None => false,
+            };
+            overlay.map(|overlay| AgentConfigView {
+                revision: overlay.revision,
+                application: overlay.application.clone(),
+                provenance: overlay.provenance.clone(),
+                profile: agent.profile.clone(),
+                profile_inherited,
+                requested_model: overlay.requested_model.clone(),
+                requested_effort: overlay.requested_effort.clone(),
+                model: overlay.model.clone(),
+                effort: overlay.effort.clone(),
+                original_model: agent
+                    .profile_snapshot
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                original_effort: agent
+                    .profile_snapshot
+                    .get("effort")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+            })
         };
         serde_json::to_value(AgentGetResponse {
             agent,
@@ -5880,6 +5893,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             probe: false,
+            config_revision: 0,
         }
     }
 
@@ -10809,6 +10823,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             created_at: 0,
             updated_at: 0,
             probe: false,
+            config_revision: 0,
         };
         validate_project_rule_launch_command(&registration, &command)
             .expect("the frozen existing-checkout launch is permitted");
@@ -12824,6 +12839,7 @@ mod run_authorization_tests {
             created_at: 0,
             updated_at: 0,
             probe: false,
+            config_revision: 0,
         }
     }
 

@@ -745,7 +745,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 34);
+        assert_eq!(version, 35);
         let mut columns: Vec<String> = store
             .connection
             .prepare("SELECT name FROM pragma_table_info('agents')")
@@ -1400,7 +1400,7 @@ mod tests {
         ));
         {
             let legacy_store = Store::open(&path).unwrap();
-            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 34);
+            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 35);
             drop(legacy_store);
             // Downgrade to the v22 shape with two legacy rows, then reopen so
             // the v23 block backfills them exactly as it would on upgrade.
@@ -1412,6 +1412,7 @@ mod tests {
             legacy
                 .execute_batch(
                     "DROP TABLE agent_config;
+                     DELETE FROM schema_migrations WHERE version = 35;
                      DELETE FROM schema_migrations WHERE version = 34;
                      ALTER TABLE commands DROP COLUMN config_revision;
                      ALTER TABLE turns DROP COLUMN config_revision;
@@ -1476,7 +1477,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 34);
+        assert_eq!(version, 35);
         for id in ["a1", "a2"] {
             let agent = store.get_agent(id).unwrap().expect("legacy row");
             assert_eq!(agent.root, id);

@@ -506,20 +506,33 @@ change needs a new native session and returns `unsupported`
 per-turn mechanism (Claude, OpenCode, Antigravity). The Router stores the
 overlay after dispatch, then settles `applied` with the requested and
 effective values, the monotonically increasing `config_revision` for the
-generation, and `application:\"next_turn\"`. Each send keeps the revision
-current at its own dispatch, each turn records the revision it ran under, and
-the first overlay turn's readback repeats the effective values; a send
-committed before an overlay never runs under newer configuration. The lane is
-ordered by shared admission order: a configure does not apply while an
-earlier-admitted send is still queued or undispatched, an earlier queued send
-passes a later configure, and a later input waits for an earlier configure.
-When the native turn request carries a resolved effort the overlay left absent
-(for example a model-only configure on a profile with omitted effort), the
-turn association records it on the overlay, so the turn and the generation
-readback show the effort actually sent; the requested values stay exactly what
-the owner asked. Retention keeps every command a retained overlay references:
-pruning never deletes a command named by `agent_config`, so configuration
-provenance survives expiry.
+generation, `application:\"next_turn\"`, and provenance `\"configure\"`.
+Each admitted native command (`launch`, `resume`, `send`) records the
+configuration it runs under as the retained profile-snapshot identity plus
+its stamped `config_revision` (exposed on the command readback; `launch`
+without an overlay stays at 0, `send` freezes the revision current at its own
+dispatch, `resume` carries its inherited revision); each turn records the
+revision it ran under, and the first overlay turn's readback repeats the
+effective values. A send committed before an overlay never runs under newer
+configuration, and a config-file reload never rewrites a retained generation,
+a pending command, or an unknown-outcome resolution: readback resolves only
+from retained rows. A `resume` explicitly inherits the previous generation's
+latest overlay as its new generation's revision 1 with provenance
+`\"inherited_from\"` (the frozen snapshot is unchanged; generations without
+an overlay start at 0). The lane is ordered by shared admission order: a
+configure does not apply while an earlier-admitted send is still queued or
+undispatched, an earlier queued send passes a later configure, and a later
+input waits for an earlier configure. When the native turn request carries a
+resolved effort the overlay left absent (for example a model-only configure on
+a profile with omitted effort), the turn association records it on the
+overlay, so the turn and the generation readback show the effort actually
+sent; the requested values stay exactly what the owner asked. Retention keeps
+every command a retained overlay references, including inherited revisions
+and their source configures: pruning never deletes a command named by
+`agent_config`, so configuration provenance survives expiry. `agent.get`
+distinguishes the original request (profile name and requested overrides,
+plus whether the profile snapshot was inherited from a parent launch) from
+the resolved configuration (effective values, provenance, and revision).
 
 Resolve the target and validate principal/capability/state before persisting the command
 binding and events. Each verb checks `expected_generation` at its defined admission or

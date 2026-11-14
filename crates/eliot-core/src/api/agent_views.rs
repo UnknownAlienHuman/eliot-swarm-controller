@@ -41,6 +41,8 @@ impl AgentGetRequest {
             || reply.config.as_ref().is_some_and(|config| {
                 config.revision < 1
                     || config.application != "next_turn"
+                    || !matches!(config.provenance.as_str(), "configure" | "inherited_from")
+                    || config.profile.trim().is_empty()
                     || config
                         .requested_model
                         .as_ref()
@@ -648,7 +650,11 @@ pub struct AgentGetResponse {
 /// Retained model/effort overlay readback for one Agent generation. The
 /// original profile snapshot is never rewritten: `original_model` and
 /// `original_effort` repeat the frozen values while `model`/`effort` carry
-/// the effective values the next native turn request uses.
+/// the effective values the next native turn request uses. `profile` is the
+/// retained requested profile name, `profile_inherited` reports whether the
+/// Agent's snapshot was inherited from its parent launch, and `provenance`
+/// is `configure` for a directly configured overlay or `inherited_from` for
+/// a `resume` generation that explicitly inherited the previous generation.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentConfigView {
     /// Monotonically increasing revision within the Agent generation; 0 is
@@ -657,6 +663,12 @@ pub struct AgentConfigView {
     /// Where the change applies: `next_turn`. A change needing a new
     /// native session is refused as `unsupported`, never stored.
     pub application: String,
+    /// How this revision arose: `configure` or `inherited_from`.
+    pub provenance: String,
+    /// Retained requested profile name (the original launch request).
+    pub profile: String,
+    /// Whether the Agent snapshot was inherited from a parent launch.
+    pub profile_inherited: bool,
     /// Exactly what the owner requested (each `None` when not requested).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_model: Option<String>,
