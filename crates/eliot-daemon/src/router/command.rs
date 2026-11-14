@@ -1945,6 +1945,8 @@ mod observer_attach_result_tests {
             created_at: 1,
             updated_at: 1,
             probe: false,
+            config_revision: 0,
+            config: None,
         };
         (agent, command)
     }
