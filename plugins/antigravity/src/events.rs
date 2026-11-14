@@ -4,7 +4,8 @@ use std::{
 };
 
 use eliot_core::{
-    ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy, SourceHealthUpdate,
+    ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy, SessionUsage,
+    SourceHealthUpdate,
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, MAX_FRAME_BYTES, PeerClient,
@@ -26,7 +27,10 @@ use crate::{
         HookCallback, HookInput, HookOutput, HookServer, HookStep, IpcQueryResponse,
         MAX_HOOK_FRAME_BYTES,
     },
-    native::{AcpUpdate, AgyClient, AgyFrame, FencedGuard, PromptResult, classify_update},
+    native::{
+        AcpUpdate, AgyClient, AgyFrame, FencedGuard, PromptResult, classify_update,
+        session_usage_from_update,
+    },
 };
 use ulid::Ulid;
 
@@ -142,6 +146,17 @@ pub(crate) struct State {
     /// `"unknown"`. Interrupt waits on this instead of trusting its own
     /// notification write.
     pub settlement: Option<(String, String)>,
+    /// Latest merged session-scoped snapshot from `usage_update`: context
+    /// occupancy/capacity and cumulative session cost. Never turn expenditure;
+    /// committed as `session.usage` when accepted and replaced wholesale on
+    /// newer updates.
+    session_usage: Option<SessionUsage>,
+    /// Last committed session snapshot content. Each accepted update commits
+    /// only when it differs, so repeats commit no extra session fact.
+    session_usage_committed: Option<SessionUsage>,
+    /// Monotonic counter for `session.usage` native ids so each accepted
+    /// update commits under a unique identity.
+    session_usage_seq: u64,
 }
 
 impl State {
@@ -187,6 +202,9 @@ impl State {
             stopped: false,
             last_turn: None,
             settlement: None,
+            session_usage: None,
+            session_usage_committed: None,
+            session_usage_seq: 0,
         }
     }
 
@@ -683,6 +701,28 @@ impl State {
             }
             // Bookkeeping: neither input acknowledgement nor assistant output.
             AcpUpdate::ThoughtChunk | AcpUpdate::UserChunk | AcpUpdate::Ignored => Ok(()),
+            AcpUpdate::SessionUsage {
+                used,
+                size,
+                cost_amount,
+                cost_unit,
+            } => {
+                // Fold into the retained session snapshot and commit it as
+                // `session.usage` when accepted, with `observed_at` captured
+                // at acceptance. Session-scoped facts, never per-turn
+                // input/output totals.
+                let Some(merged) = session_usage_from_update(
+                    used,
+                    size,
+                    cost_amount,
+                    cost_unit,
+                    self.session_usage.as_ref(),
+                ) else {
+                    return Ok(());
+                };
+                self.session_usage = Some(merged.clone());
+                self.commit_session_usage_now(merged).await
+            }
             AcpUpdate::ToolCall {
                 tool_call_id,
                 title,
@@ -724,6 +764,33 @@ impl State {
                 format!("Antigravity session update is unconnected: {kind}"),
             )),
         }
+    }
+
+    /// Commit one accepted session snapshot as its own `session.usage` fact,
+    /// so session scope and turn scope can never be confused and stream loss
+    /// before the terminal cannot lose an accepted fact. Commits only when
+    /// the snapshot differs from the last committed fact. Occupancy changes
+    /// (compaction can reduce `used`) never read as token expenditure. Uses
+    /// the pending turn when one is prepared, else the idle `session` scope.
+    async fn commit_session_usage_now(&mut self, usage: SessionUsage) -> Result<()> {
+        if self.session_usage_committed.as_ref() == Some(&usage) {
+            return Ok(());
+        }
+        self.session_usage_seq = self.session_usage_seq.wrapping_add(1);
+        let turn = self
+            .pending
+            .as_ref()
+            .map(|pending| pending.turn.clone())
+            .unwrap_or_else(|| "session".to_owned());
+        self.commit(
+            "session.usage",
+            &turn,
+            &format!("session-{}", self.session_usage_seq),
+            json!({"usage": usage}),
+        )
+        .await?;
+        self.session_usage_committed = Some(usage);
+        Ok(())
     }
 
     /// Merge one partial tool-call delta into the known per-id state.
@@ -839,6 +906,8 @@ impl State {
         }
         self.commit("turn.completed", &turn, "completed", data.clone())
             .await?;
+        // Session facts already committed when each update was accepted, so
+        // the terminal carries turn scope only.
         self.reject_pending_steer(
             "Antigravity turn ended before its next PreInvocation steer point",
         );

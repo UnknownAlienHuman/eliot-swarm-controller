@@ -18,7 +18,10 @@
 //!
 //! No SDK code is copied here; these structs are written from the schema.
 
-use eliot_core::{ProviderRestriction, ProviderRestrictionKind, TurnUsage};
+use eliot_core::{
+    ProviderRestriction, ProviderRestrictionKind, SessionCost, SessionTokenTotals, SessionUsage,
+    TurnUsage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -597,6 +600,162 @@ pub struct NativeTurnUsage {
     pub cache_read_tokens: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<i64>,
+}
+
+/// `session/tokenUsage` params (installed 1.4.0 schema subset): one event
+/// per model completion that reports usage, carrying the raw counters
+/// verbatim plus the server-derived counted-once `promptTokens`/`totalTokens`
+/// and the session `cumulative` block (running counted-once session totals
+/// with the server-computed estimated `cost`). Subagent/workflow-child usage
+/// is never folded in. Only the session-owned fields below are modelled;
+/// every other member stays unparsed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSessionTokenUsageNotification {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative: Option<NativeCumulativeTokenUsage>,
+}
+
+/// Session running totals of counted-once usage (installed 1.4.0 schema
+/// subset): the cache splits join the counters, and the server-computed
+/// `cost` is the documented estimated exception. All members are optional
+/// locally so partial native data stays decodable; unavailable members
+/// project as null, never zero.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeCumulativeTokenUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<NativeCumulativeCost>,
+}
+
+/// Server-computed session cost member (installed 1.4.0 schema subset):
+/// the estimated USD total. `partial` marks legs without price data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeCumulativeCost {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<bool>,
+}
+
+/// `session/contextUsage` params (installed 1.4.0 schema subset): the
+/// counted-once context-window occupancy at the latest provider-reported
+/// durable fact, joined with the host's pressure basis. `windowTokens` is
+/// absent when the basis has no limit and is never invented.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSessionContextUsageNotification {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_cursor: Option<String>,
+}
+
+/// Merge one `session/tokenUsage` cumulative block into the retained session
+/// snapshot. `promptTokens` is the counted-once input total, so it projects
+/// to `input_tokens`; `outputTokens` and the cache splits project directly.
+/// No total is derived (`totalTokens` is the server's per-completion honesty
+/// sum, not a session counter). The server-computed `cost.usd` is an
+/// estimated USD total and maps to `cumulative_cost` with unit
+/// `usd_estimate`, never converted. Yields `None` when the event contributes
+/// nothing new. Negative counters and non-finite costs stay null.
+pub(crate) fn session_usage_from_token_usage(
+    notification: &NativeSessionTokenUsageNotification,
+    previous: Option<&SessionUsage>,
+) -> Option<SessionUsage> {
+    let counter = |value: Option<i64>| value.filter(|value| *value >= 0);
+    let mut merged = previous.cloned().unwrap_or(SessionUsage {
+        context_used_tokens: None,
+        context_window_tokens: None,
+        cumulative_tokens: None,
+        cumulative_cost: None,
+        source: None,
+        observed_at: None,
+    });
+    let mut changed = false;
+    if let Some(cumulative) = &notification.cumulative {
+        let totals = SessionTokenTotals {
+            input_tokens: counter(cumulative.prompt_tokens),
+            output_tokens: counter(cumulative.output_tokens),
+            cache_read_tokens: counter(cumulative.cache_read_tokens),
+            cache_write_tokens: counter(cumulative.cache_write_tokens),
+        };
+        if (totals.input_tokens.is_some()
+            || totals.output_tokens.is_some()
+            || totals.cache_read_tokens.is_some()
+            || totals.cache_write_tokens.is_some())
+            && merged.cumulative_tokens.as_ref() != Some(&totals)
+        {
+            merged.cumulative_tokens = Some(totals);
+            changed = true;
+        }
+        if let Some(usd) = cumulative.cost.as_ref().and_then(|cost| cost.usd)
+            && usd.is_finite()
+            && usd >= 0.0
+        {
+            let cost = SessionCost {
+                amount: Some(usd),
+                unit: Some("usd_estimate".to_owned()),
+            };
+            if merged.cumulative_cost.as_ref() != Some(&cost) {
+                merged.cumulative_cost = Some(cost);
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    merged.source = Some("muse:session/tokenUsage".to_owned());
+    merged.observed_at = None;
+    Some(merged)
+}
+
+/// Merge one `session/contextUsage` triple into the retained session
+/// snapshot: each notification replaces both the counted-once occupancy and
+/// the effective window size. Absent or negative members become null and
+/// never keep the previous window. Yields `None` when the event contributes
+/// nothing new.
+pub(crate) fn session_usage_from_context_usage(
+    notification: &NativeSessionContextUsageNotification,
+    previous: Option<&SessionUsage>,
+) -> Option<SessionUsage> {
+    let counter = |value: Option<i64>| value.filter(|value| *value >= 0);
+    let used = counter(notification.used_tokens);
+    let window = counter(notification.window_tokens);
+    let mut merged = previous.cloned().unwrap_or(SessionUsage {
+        context_used_tokens: None,
+        context_window_tokens: None,
+        cumulative_tokens: None,
+        cumulative_cost: None,
+        source: None,
+        observed_at: None,
+    });
+    if merged.context_used_tokens == used && merged.context_window_tokens == window {
+        return None;
+    }
+    merged.context_used_tokens = used;
+    merged.context_window_tokens = window;
+    merged.source = Some("muse:session/contextUsage".to_owned());
+    merged.observed_at = None;
+    Some(merged)
 }
 
 /// Map one terminal `turn/completed` usage block to turn expenditure at
@@ -1243,6 +1402,130 @@ mod tests {
         assert_eq!(turn_usage(&empty), None);
         let negative = completed_with_usage(json!({"inputTokens": -5}));
         assert_eq!(turn_usage(&negative), None);
+    }
+
+    fn token_usage_notification(cumulative: Value) -> NativeSessionTokenUsageNotification {
+        serde_json::from_value(json!({
+            "sessionId": "session-1",
+            "turnId": "turn-1",
+            "viewCursor": "cursor-1",
+            "cumulative": cumulative,
+        }))
+        .expect("session/tokenUsage decodes")
+    }
+
+    #[test]
+    fn session_token_usage_maps_cumulative_and_estimated_cost() {
+        let notification = token_usage_notification(json!({
+            "promptTokens": 120,
+            "outputTokens": 30,
+            "totalTokens": 150,
+            "cacheReadTokens": 40,
+            "cacheWriteTokens": 5,
+            "cost": {"usd": 0.25, "partial": false},
+        }));
+        let merged = session_usage_from_token_usage(&notification, None).expect("cumulative maps");
+        let totals = merged
+            .cumulative_tokens
+            .as_ref()
+            .expect("cumulative counters");
+        // `promptTokens` is the counted-once input total; `totalTokens`
+        // never lands in the snapshot.
+        assert_eq!(totals.input_tokens, Some(120));
+        assert_eq!(totals.output_tokens, Some(30));
+        assert_eq!(totals.cache_read_tokens, Some(40));
+        assert_eq!(totals.cache_write_tokens, Some(5));
+        let cost = merged.cumulative_cost.as_ref().expect("estimated cost");
+        assert_eq!(cost.amount, Some(0.25));
+        assert_eq!(cost.unit.as_deref(), Some("usd_estimate"));
+        assert_eq!(merged.context_used_tokens, None);
+        assert_eq!(merged.source.as_deref(), Some("muse:session/tokenUsage"));
+        // A repeat contributes nothing new, so it commits nothing.
+        assert_eq!(
+            session_usage_from_token_usage(&notification, Some(&merged)),
+            None
+        );
+    }
+
+    #[test]
+    fn session_token_usage_without_usable_cumulative_stays_null() {
+        let missing_cumulative: NativeSessionTokenUsageNotification =
+            serde_json::from_value(json!({"sessionId": "session-1"}))
+                .expect("session/tokenUsage without cumulative decodes");
+        assert_eq!(
+            session_usage_from_token_usage(&missing_cumulative, None),
+            None
+        );
+        let negative = token_usage_notification(json!({"promptTokens": -3}));
+        assert_eq!(session_usage_from_token_usage(&negative, None), None);
+    }
+
+    #[test]
+    fn session_context_usage_maps_occupancy_triple() {
+        let notification: NativeSessionContextUsageNotification = serde_json::from_value(json!({
+            "sessionId": "session-1",
+            "usedTokens": 4096,
+            "windowTokens": 200000,
+            "viewCursor": "cursor-2",
+        }))
+        .expect("session/contextUsage decodes");
+        let merged = session_usage_from_context_usage(&notification, None).expect("occupancy maps");
+        assert_eq!(merged.context_used_tokens, Some(4096));
+        assert_eq!(merged.context_window_tokens, Some(200000));
+        assert_eq!(merged.cumulative_tokens, None);
+        assert_eq!(merged.source.as_deref(), Some("muse:session/contextUsage"));
+        // Occupancy merges preserve retained cumulative counters and cost.
+        let with_cumulative = session_usage_from_token_usage(
+            &token_usage_notification(json!({"promptTokens": 7})),
+            Some(&merged),
+        )
+        .expect("cumulative merges");
+        assert_eq!(with_cumulative.context_used_tokens, Some(4096));
+        assert_eq!(
+            with_cumulative
+                .cumulative_tokens
+                .as_ref()
+                .and_then(|totals| totals.input_tokens),
+            Some(7)
+        );
+        // A repeat contributes nothing new.
+        assert_eq!(
+            session_usage_from_context_usage(&notification, Some(&with_cumulative)),
+            None
+        );
+    }
+
+    #[test]
+    fn session_context_usage_replaces_both_fields() {
+        let full: NativeSessionContextUsageNotification = serde_json::from_value(json!({
+            "sessionId": "session-1",
+            "usedTokens": 10,
+            "windowTokens": 200000,
+        }))
+        .expect("session/contextUsage decodes");
+        let merged = session_usage_from_context_usage(&full, None).expect("occupancy maps");
+        assert_eq!(merged.context_used_tokens, Some(10));
+        assert_eq!(merged.context_window_tokens, Some(200000));
+        // A later notification without the window clears it instead of
+        // keeping the previous capacity.
+        let partial: NativeSessionContextUsageNotification = serde_json::from_value(json!({
+            "sessionId": "session-1",
+            "usedTokens": 20,
+        }))
+        .expect("window-less contextUsage decodes");
+        let replaced = session_usage_from_context_usage(&partial, Some(&merged))
+            .expect("window clears to null");
+        assert_eq!(replaced.context_used_tokens, Some(20));
+        assert_eq!(replaced.context_window_tokens, None);
+        assert_eq!(
+            replaced.source.as_deref(),
+            Some("muse:session/contextUsage")
+        );
+        // A repeat of the cleared snapshot contributes nothing new.
+        assert_eq!(
+            session_usage_from_context_usage(&partial, Some(&replaced)),
+            None
+        );
     }
 
     #[test]
