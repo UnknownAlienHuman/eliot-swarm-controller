@@ -54,8 +54,7 @@ Muse view-health needs no extra state: the same committed journal signals
 count unavailable-view episodes and their outcomes per agent. Count
 `source.gap` events whose reason starts with the shared unavailable prefix,
 `turn.unknown` events whose reason starts with the shared unknown prefix, and
-`turn.completed` events carrying the fixed `view_recovery: "readback"` marker
-(`classify_view_health_event` encodes the match).
+`turn.completed` events carrying the fixed `view_recovery: "readback"` marker.
 
 ## Process identity and custody
 

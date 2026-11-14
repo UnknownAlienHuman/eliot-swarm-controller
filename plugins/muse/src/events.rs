@@ -5456,11 +5456,6 @@ mod tests {
             json!({"command_id": "command", "turn_id": "turn", "status": "completed"});
         expected[VIEW_RECOVERY_MARKER_FIELD] = Value::from(VIEW_RECOVERY_READBACK);
         assert_eq!(data, expected);
-        // The daemon classifies exactly this marker through the shared consts.
-        assert_eq!(
-            eliot_core::classify_view_health_event("turn.completed", &data),
-            Some(eliot_core::ViewHealthOutcome::ReadbackRecovered)
-        );
     }
 
     #[test]

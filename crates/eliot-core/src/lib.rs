@@ -1002,8 +1002,8 @@ pub struct SourceGapAck {
 
 /// Bounded machine signal for Muse native view-health episodes. The Muse
 /// plugin authors these exact reason strings and the readback marker; the
-/// three outcomes are exactly countable from the journal through
-/// [`classify_view_health_event`]. Prefixes (not full reasons) are matched
+/// three outcomes are exactly countable from the journal (see the Muse
+/// harness page). Prefixes (not full reasons) are matched
 /// so cursor-bearing suffixes stay free to evolve without breaking the count.
 pub const MUSE_VIEW_UNAVAILABLE_REASON_PREFIX: &str = "Muse native view is unavailable";
 pub const MUSE_VIEW_UNKNOWN_REASON_PREFIX: &str =
@@ -1012,41 +1012,6 @@ pub const MUSE_VIEW_UNKNOWN_REASON_PREFIX: &str =
 /// `turn.completed`; its only legal value is [`VIEW_RECOVERY_READBACK`].
 pub const VIEW_RECOVERY_MARKER_FIELD: &str = "view_recovery";
 pub const VIEW_RECOVERY_READBACK: &str = "readback";
-
-/// One Muse view-health transition countable from the journal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ViewHealthOutcome {
-    Unavailable,
-    ReadbackRecovered,
-    SettledUnknown,
-}
-
-/// Classify one committed journal event into a view-health outcome, if any.
-/// Pure data match on the exact signals the Muse plugin commits; every other
-/// harness or kind yields `None`.
-pub fn classify_view_health_event(
-    kind: &str,
-    data: &serde_json::Value,
-) -> Option<ViewHealthOutcome> {
-    match kind {
-        "source.gap" => data
-            .get("reason")
-            .and_then(serde_json::Value::as_str)
-            .filter(|reason| reason.starts_with(MUSE_VIEW_UNAVAILABLE_REASON_PREFIX))
-            .map(|_| ViewHealthOutcome::Unavailable),
-        "turn.unknown" => data
-            .get("reason")
-            .and_then(serde_json::Value::as_str)
-            .filter(|reason| reason.starts_with(MUSE_VIEW_UNKNOWN_REASON_PREFIX))
-            .map(|_| ViewHealthOutcome::SettledUnknown),
-        "turn.completed" => data
-            .get(VIEW_RECOVERY_MARKER_FIELD)
-            .and_then(serde_json::Value::as_str)
-            .filter(|marker| *marker == VIEW_RECOVERY_READBACK)
-            .map(|_| ViewHealthOutcome::ReadbackRecovered),
-        _ => None,
-    }
-}
 
 /// Store-facing facts derived by the reducer; callers persist them atomically with
 /// the event and next Agent projection.
@@ -2360,78 +2325,6 @@ mod live_wire_tests {
             SourceHealthUpdate::new("a1", 1, " ", "ok")
                 .validate()
                 .is_err()
-        );
-    }
-}
-
-#[cfg(test)]
-mod view_health_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn classifier_matches_only_the_committed_muse_signals() {
-        assert_eq!(
-            classify_view_health_event(
-                "source.gap",
-                &json!({"reason": "Muse native view is unavailable (projectionUnavailable)"}),
-            ),
-            Some(ViewHealthOutcome::Unavailable)
-        );
-        assert_eq!(
-            classify_view_health_event(
-                "turn.unknown",
-                &json!({"reason": "Muse native view recovery did not prove live delivery after the recorded gap (projectionUnavailable)"}),
-            ),
-            Some(ViewHealthOutcome::SettledUnknown)
-        );
-        assert_eq!(
-            classify_view_health_event(
-                "turn.completed",
-                &json!({"command_id": "c1", "view_recovery": "readback"}),
-            ),
-            Some(ViewHealthOutcome::ReadbackRecovered)
-        );
-        // The bare prefix still classifies: only the plugin's exact signal
-        // carries a label suffix, and matching the prefix keeps the count
-        // stable if that suffix ever changes shape.
-        assert_eq!(
-            classify_view_health_event(
-                "source.gap",
-                &json!({"reason": "Muse native view is unavailable"}),
-            ),
-            Some(ViewHealthOutcome::Unavailable)
-        );
-        for (kind, data) in [
-            ("source.gap", json!({"reason": "reader lost"})),
-            (
-                "turn.unknown",
-                json!({"reason": "Muse terminal turn outcome is unknown"}),
-            ),
-            (
-                "turn.completed",
-                json!({"command_id": "c1", "view_recovery": "live"}),
-            ),
-            ("turn.completed", json!({"command_id": "c1"})),
-            (
-                "message.completed",
-                json!({"reason": "Muse native view is unavailable (x)"}),
-            ),
-            ("source.gap", json!({})),
-        ] {
-            assert_eq!(classify_view_health_event(kind, &data), None, "{kind}");
-        }
-    }
-
-    #[test]
-    fn prefix_constants_match_the_plugin_committed_reasons() {
-        assert!(
-            format!("{MUSE_VIEW_UNAVAILABLE_REASON_PREFIX} (projectionUnavailable)")
-                .starts_with(MUSE_VIEW_UNAVAILABLE_REASON_PREFIX)
-        );
-        assert!(
-            format!("{MUSE_VIEW_UNKNOWN_REASON_PREFIX} (projectionUnavailable)")
-                .starts_with(MUSE_VIEW_UNKNOWN_REASON_PREFIX)
         );
     }
 }
