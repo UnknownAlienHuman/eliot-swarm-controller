@@ -198,6 +198,18 @@ pub struct AgentCommandParams {
     /// FIFO `next_input` items claimed for this send. Empty (omitted) when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<ContextItem>,
+    /// Effective model for this `send`, resolved by the daemon from the
+    /// command's retained configuration revision. `None` when no
+    /// `configure` overlay applies; the plugin then uses its session values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
+    /// Effective effort for this `send`, resolved like `model_override`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_override: Option<String>,
+    /// Configuration revision the send runs under. Present exactly when the
+    /// overrides above apply, so the plugin can echo it in its response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_revision: Option<i64>,
 }
 
 /// Plugin-initiated system-context callback on the authenticated instance channel.

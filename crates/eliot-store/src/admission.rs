@@ -132,6 +132,150 @@ fn submit_selector_tx(
     hierarchy::admit_selector_expansion(tx, principal, &request, payload_digest, limits, now)
 }
 
+/// Shape bounds for `configure` values, mirroring the profile freeze
+/// (`MAX_MODEL_LEN`, `MAX_EFFORT_LEN` in the daemon config): nonempty,
+/// bounded, no control characters. Native catalog support is enforced at
+/// the next turn, never here, and catalog failures never select another
+/// model or account.
+const MAX_CONFIGURE_MODEL_LEN: usize = 256;
+const MAX_CONFIGURE_EFFORT_LEN: usize = 128;
+
+/// Authority-adjacent profile fields a `configure` must never touch.
+/// Named here they are rejected outright (`not_allowed`); any other
+/// unknown field is `unsupported`.
+fn is_configure_authority_field(key: &str) -> bool {
+    matches!(
+        key,
+        "permissions"
+            | "approval"
+            | "mcp"
+            | "mcp_allow"
+            | "env"
+            | "literal_env"
+            | "pass_env"
+            | "inherit_env"
+            | "secret_env_names"
+            | "route"
+            | "route_binding"
+            | "account"
+            | "provider"
+            | "proxy"
+            | "billing"
+            | "catalog"
+            | "quota"
+            | "capacity"
+            | "capacity_scopes"
+            | "workspace"
+            | "worktree"
+            | "base"
+            | "harness"
+            | "profile"
+            | "control"
+            | "project"
+            | "credential"
+            | "token"
+    )
+}
+
+fn configure_value(
+    args: &Map<String, Value>,
+    field: &str,
+    max_len: usize,
+) -> Result<Option<String>> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            if value.trim().is_empty()
+                || value.len() > max_len
+                || value.chars().any(char::is_control)
+            {
+                return Err(Error::new(
+                    "invalid",
+                    format!("configure {field} must be a nonempty string within its bound"),
+                ));
+            }
+            Ok(Some(value.clone()))
+        }
+        Some(_) => Err(Error::new(
+            "invalid",
+            format!("configure {field} must be a string"),
+        )),
+    }
+}
+
+/// Resolve one `configure` request against a frozen profile snapshot into
+/// the retained requested values, the effective values the next native
+/// turn carries, and the application point. Only `model` and `effort` are
+/// supported; authority fields are rejected outright and anything else is
+/// unsupported. Codex carries both as per-turn `turn/start` overrides;
+/// Muse carries effort per turn while a model change needs a new native
+/// session (`restart_required`, refused with `unsupported`, never
+/// restarted silently); adapters without a verified mechanism refuse the
+/// whole command. Shared by admission and by the Router-side apply so
+/// both agree on what was requested and what takes effect.
+pub(super) fn resolve_configure(
+    args: &Value,
+    harness: &str,
+    snapshot: &Value,
+) -> Result<(Value, Value, &'static str)> {
+    let args = args
+        .as_object()
+        .ok_or_else(|| Error::new("invalid", "configure args must be a JSON object"))?;
+    for key in args.keys() {
+        if is_configure_authority_field(key) {
+            return Err(Error::new(
+                "not_allowed",
+                format!("configure cannot change {key}; authority fields are rejected outright"),
+            ));
+        }
+        if !matches!(key.as_str(), "model" | "effort") {
+            return Err(Error::new(
+                "unsupported",
+                format!("configure does not support {key}"),
+            ));
+        }
+    }
+    let model = configure_value(args, "model", MAX_CONFIGURE_MODEL_LEN)?;
+    let effort = configure_value(args, "effort", MAX_CONFIGURE_EFFORT_LEN)?;
+    if model.is_none() && effort.is_none() {
+        return Err(Error::new(
+            "invalid",
+            "configure requires at least one of model or effort",
+        ));
+    }
+    match harness {
+        "codex" => {}
+        "muse" => {
+            if model.is_some() {
+                return Err(Error::new(
+                    "unsupported",
+                    "Muse model changes require a new native session (restart_required)",
+                ));
+            }
+        }
+        _ => {
+            return Err(Error::new(
+                "unsupported",
+                format!("configure is not supported for the {harness} harness"),
+            ));
+        }
+    }
+    let original_model = snapshot
+        .get("model")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let original_effort = snapshot
+        .get("effort")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let requested = json!({"model": model, "effort": effort});
+    let effective = json!({
+        "model": model.clone().or(original_model),
+        "effort": effort.clone().or(original_effort),
+    });
+    Ok((requested, effective, "next_turn"))
+}
+
 /// Admit one `send` to its exact target, shared by the single-target path
 /// and selector members (linked to their expansion parent afterwards).
 pub(super) fn admit_send_member(
@@ -952,6 +1096,70 @@ pub(super) fn submit_tx(
             } else {
                 None
             }
+        }
+        "configure" => {
+            if request.selector.is_some()
+                || request.expected_turn_id.is_some()
+                || request.request_id.is_some()
+                || request.probe
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "configure takes only a target and an optional generation binding",
+                ));
+            }
+            let target = request
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("invalid", "configure requires an Agent target"))?;
+            let agent_num = parse_agent_id(target)?;
+            let agent = load_agent_by_num(tx, agent_num)?
+                .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
+            if let Some(expected) = request.expected_generation
+                && expected != agent.generation
+            {
+                return Err(Error::new(
+                    "stale_generation",
+                    format!(
+                        "expected generation {expected}, current is {}",
+                        agent.generation
+                    ),
+                ));
+            }
+            if principal != "owner" {
+                return Err(Error::new(
+                    "not_allowed",
+                    "configure requires the Owner principal",
+                ));
+            }
+            if agent.generation < 1
+                || agent.is_terminal()
+                || !matches!(
+                    agent.state,
+                    AgentState::Idle | AgentState::Busy | AgentState::Waiting
+                )
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "configure requires a live Agent generation with a native session",
+                ));
+            }
+            // Validate the requested fields and harness support now; the
+            // overlay itself is stored by the Router after dispatch, which
+            // settles the command applied only once the values are stored.
+            let _ = resolve_configure(&request.args, &agent.harness, &agent.profile_snapshot)?;
+            events.push(admit_command(
+                tx,
+                &CommandInsert::admitted(
+                    principal,
+                    &request,
+                    &payload_digest,
+                    (agent_num, agent.generation),
+                    now,
+                ),
+                json!({"command_id": request.id, "verb": "configure"}),
+            )?);
+            None
         }
         "steer" | "interrupt" | "approve" | "deny" | "answer" => {
             let target = request

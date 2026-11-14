@@ -931,6 +931,24 @@ impl MusePlugin {
         }
     }
 
+    /// Build one native `turn/start` request from the effective reasoning
+    /// effort: the retained `configure` overlay or the frozen session
+    /// value. The installed 1.4 schema carries effort per turn, while the
+    /// model rides the session and can only change with a new one.
+    fn turn_start_params(
+        command_id: String,
+        session_id: String,
+        input: Vec<NativeTurnInputPart>,
+        reasoning_effort: Option<String>,
+    ) -> NativeTurnStartParams {
+        NativeTurnStartParams {
+            command_id,
+            session_id,
+            input,
+            reasoning_effort,
+        }
+    }
+
     async fn send_command(&mut self, params: AgentCommandParams) -> Result<Value> {
         let session = self
             .session
@@ -1001,18 +1019,27 @@ impl MusePlugin {
         // confirms it. A lost reply leaves the outcome unknown; the input is
         // never written a second time under another id.
         let native_command_id = new_command_id();
-        let turn_params = NativeTurnStartParams {
-            command_id: native_command_id.clone(),
-            session_id: session
+        // A retained `configure` effort overlay rides the per-turn field
+        // the installed schema accepts; without one the frozen session
+        // value applies unchanged. A model override never reaches this
+        // path: Muse model changes need a new native session and are
+        // refused as `unsupported` at admission.
+        let effort = params
+            .effort_override
+            .clone()
+            .or_else(|| session.selected_effort.clone());
+        let turn_params = Self::turn_start_params(
+            native_command_id.clone(),
+            session
                 .session_id
                 .clone()
                 .ok_or_else(|| Error::new("unknown", "Muse session identity is unresolved"))?,
-            input: vec![NativeTurnInputPart {
+            vec![NativeTurnInputPart {
                 part_type: "text".to_owned(),
                 text: Some(combined),
             }],
-            reasoning_effort: session.selected_effort.clone(),
-        };
+            effort.clone(),
+        );
         let encoded = serde_json::to_value(turn_params)
             .map_err(|_| Error::new("internal", "Muse turn/start params could not be encoded"))?;
         let response = session
@@ -1102,7 +1129,15 @@ impl MusePlugin {
                 "Muse turn was accepted but turn.started was not acknowledged",
             ));
         }
-        Ok(json!({"state": "applied", "turn_id": turn_id}))
+        // Echo what the native request carried when a `configure` overlay
+        // applied, so the settled outcome reads back the effective values
+        // alongside the native turn association. Unchanged without one.
+        let mut result = json!({"state": "applied", "turn_id": turn_id});
+        if let Some(revision) = params.config_revision {
+            result["config_revision"] = json!(revision);
+            result["effort"] = json!(effort);
+        }
+        Ok(result)
     }
 
     async fn steer_command(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -2731,5 +2766,48 @@ mod tests {
             Some("agent-1")
         );
         assert_eq!(value.get("generation").and_then(Value::as_i64), Some(1));
+    }
+
+    #[test]
+    fn turn_start_carries_configured_effort() {
+        use crate::native::types::NativeTurnInputPart;
+
+        let params = MusePlugin::turn_start_params(
+            "cmd-1".to_owned(),
+            "session-1".to_owned(),
+            vec![NativeTurnInputPart {
+                part_type: "text".to_owned(),
+                text: Some("hi".to_owned()),
+            }],
+            Some("high".to_owned()),
+        );
+        assert_eq!(params.reasoning_effort.as_deref(), Some("high"));
+        let wire = serde_json::to_value(&params).expect("encode turn/start");
+        assert_eq!(
+            wire["reasoningEffort"],
+            json!("high"),
+            "effort rides the per-turn wire field"
+        );
+    }
+
+    #[test]
+    fn turn_start_omits_absent_effort() {
+        use crate::native::types::NativeTurnInputPart;
+
+        let params = MusePlugin::turn_start_params(
+            "cmd-1".to_owned(),
+            "session-1".to_owned(),
+            vec![NativeTurnInputPart {
+                part_type: "text".to_owned(),
+                text: Some("hi".to_owned()),
+            }],
+            None,
+        );
+        assert_eq!(params.reasoning_effort, None);
+        let wire = serde_json::to_value(&params).expect("encode turn/start");
+        assert!(
+            wire.get("reasoningEffort").is_none(),
+            "absent effort omits the wire field"
+        );
     }
 }

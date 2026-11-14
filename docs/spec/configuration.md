@@ -544,6 +544,40 @@ URLs/key name; managed proxy also freezes launch argv and referenced files. Serv
 matching `(name,config_digest)` and exact endpoint/custody. Config reload never mutates
 or kills a service still used by old snapshots; conflicting endpoint reuse fails clearly.
 
+### Mid-run model/effort overlay (`configure`)
+
+The frozen snapshot above never changes for a generation. `command.submit`
+`verb:\"configure\"` records a separate overlay instead: the requested values,
+the effective values the next native turn carries (each requested value, or
+the frozen original when not requested), a monotonically increasing
+`config_revision` for the Agent generation, and `application:\"next_turn\"`.
+Only `model` and `effort` are supported; authority-adjacent fields are
+rejected outright and anything else is `unsupported`. Only the Owner may
+submit it.
+
+Codex carries both values as per-turn `turn/start` overrides
+(`TurnStartParams.model`/`effort`); Muse carries effort through per-turn
+`reasoningEffort`, while a Muse `model` change needs a new native session
+and is refused as `unsupported`, storing nothing. Claude, OpenCode and
+Antigravity have no verified per-turn mechanism and refuse the command. A
+catalog or quota failure at the next turn fails that turn honestly; it never
+selects another model or account.
+
+Each send keeps the revision current at its own dispatch; a send committed
+before an overlay never runs under newer configuration, and a send admitted
+after it dispatches under it. Each turn records the revision it ran under.
+The settings lane is ordered by shared admission order: a configure does not
+apply while an earlier-admitted send is still queued or undispatched, an
+earlier queued send passes a later configure, and a later input waits for an
+earlier configure; the Router redispatches on lane release. When the native
+turn request carries a resolved effort the overlay left absent, the turn
+association records it on the overlay's effective values while the requested
+values stay exactly what the owner asked. Retention keeps every command a
+retained overlay references: pruning never deletes a command named by the
+overlay, so configuration provenance survives expiry. `swarm show` (the
+`agent.get` view) reports the current effective values, the revision, and the
+original frozen values together.
+
 ## Frozen files
 
 Resolve explicit notes/setup/scripts/entry files under allowed roots, reject escapes,

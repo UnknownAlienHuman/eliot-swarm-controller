@@ -1346,6 +1346,7 @@ fn mark_lost_turn_unknown_tx(
                     started_at: None,
                     completed_at: Some(now),
                     usage: None,
+                    config_revision: current_config_revision_tx(tx, agent_num, generation)?,
                 },
             )?;
         }

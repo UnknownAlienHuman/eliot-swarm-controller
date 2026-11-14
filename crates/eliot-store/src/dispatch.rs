@@ -360,7 +360,15 @@ impl Store {
                 }
                 let ready = send_gate_open(&tx, agent_num, agent.generation)?;
                 let earliest = earliest_pending_send(&tx, agent_num, agent.generation)?;
-                if !ready || earliest.as_deref().is_some_and(|first| first != id) {
+                // Shared admission order: only a configure admitted no later
+                // than this send holds the settings lane. A later configure
+                // never blocks an earlier send, so a send dispatched now
+                // always carries the revision current at its own dispatch.
+                let own_key = command_admission_key(&tx, id)?;
+                let settings_held =
+                    earliest_pending_configure_key(&tx, agent_num, agent.generation)?
+                        .is_some_and(|(_, created_at, rowid)| (created_at, rowid) <= own_key);
+                if !ready || settings_held || earliest.as_deref().is_some_and(|first| first != id) {
                     if command.state == CommandState::Accepted {
                         update_command_state(&tx, id, CommandState::Queued, None, None, now)?;
                         events.push(insert_daemon_command_event(
@@ -393,6 +401,15 @@ impl Store {
                 } else {
                     Vec::new()
                 };
+                // Freeze the revision this send runs under: the latest
+                // retained revision at its own dispatch. A retry or
+                // reassociation keeps this stamp, so a send committed
+                // before an overlay never runs under newer configuration.
+                let revision = current_config_revision_tx(&tx, agent_num, agent.generation)?;
+                db!(tx.execute(
+                    "UPDATE commands SET config_revision = ?1 WHERE id = ?2",
+                    params![revision, id],
+                ));
                 let send_args = context::send_args(&command.command.args, &claimed_items)?;
                 check_rpc_frame(
                     "agent.command",
@@ -456,6 +473,85 @@ impl Store {
                     Some(agent.generation),
                     id,
                     json!({"command_id": id, "verb": "stop"}),
+                )?);
+            }
+            "configure" => {
+                if command_generation != agent.generation
+                    || command
+                        .command
+                        .expected_generation
+                        .is_some_and(|expected| expected != agent.generation)
+                {
+                    return Err(Error::new(
+                        "stale_generation",
+                        format!(
+                            "configure targets generation {command_generation}, current is {}",
+                            agent.generation
+                        ),
+                    ));
+                }
+                if agent.is_terminal()
+                    || !matches!(
+                        agent.state,
+                        AgentState::Idle | AgentState::Busy | AgentState::Waiting
+                    )
+                {
+                    return Err(Error::new(
+                        "bad_state",
+                        "configure requires a live Agent generation with a native session",
+                    ));
+                }
+                // Shared admission order: an earlier configure still pending
+                // holds the lane, and earlier send input that has not frozen
+                // its revision or association holds it too. The Router waits
+                // for the lane release and redispatches; a queued configure
+                // keeps its admission and assigns its revision only when it
+                // actually applies.
+                let own_key = command_admission_key(&tx, id)?;
+                let earliest = earliest_pending_configure_key(&tx, agent_num, agent.generation)?;
+                let earlier_configure = earliest.as_ref().is_some_and(|(first, _, _)| first != id);
+                let earlier_send = earliest_unresolved_send_key(&tx, agent_num, agent.generation)?
+                    .is_some_and(|(_, created_at, rowid)| (created_at, rowid) < own_key);
+                if earlier_configure || earlier_send {
+                    if command.state == CommandState::Accepted {
+                        update_command_state(&tx, id, CommandState::Queued, None, None, now)?;
+                        events.push(insert_daemon_command_event(
+                            &tx,
+                            now,
+                            "command.queued",
+                            Some(agent_num),
+                            Some(agent.generation),
+                            id,
+                            json!({"command_id": id, "verb": "configure"}),
+                        )?);
+                    }
+                    command = load_command_record(&tx, id)?
+                        .ok_or_else(|| Error::new("internal", "queued command disappeared"))?;
+                    commit_transaction(tx, &self.write_faulted)?;
+                    return Ok(Change {
+                        value: command.command,
+                        events,
+                    });
+                }
+                check_rpc_frame(
+                    "agent.command",
+                    &json!({
+                        "agent_id": agent.id,
+                        "generation": agent.generation,
+                        "command_id": id,
+                        "verb": "configure",
+                        "args": command.command.args,
+                    }),
+                )?;
+                update_command_state(&tx, id, CommandState::Dispatched, None, None, now)?;
+                events.push(insert_daemon_command_event(
+                    &tx,
+                    now,
+                    "command.dispatched",
+                    Some(agent_num),
+                    Some(agent.generation),
+                    id,
+                    json!({"command_id": id, "verb": "configure"}),
                 )?);
             }
             "inject" => {

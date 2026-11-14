@@ -174,6 +174,7 @@ mod tests {
             started_at: Some(0),
             completed_at: None,
             usage: None,
+            config_revision: 0,
         }
     }
 

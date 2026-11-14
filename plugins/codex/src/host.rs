@@ -1491,6 +1491,41 @@ impl CodexPlugin {
         }
     }
 
+    /// Build one native `turn/start` request from the effective model and
+    /// effort. Omitted effort omits the wire field (schema: effort
+    /// optional, anyOf ReasoningEffort|null), preserving the native
+    /// default. Native replaces the full collaboration settings when the
+    /// mode is present, so a null effort there would clear the
+    /// native-configured selection: carry the actual native readback
+    /// instead; no arbitrary reasoning is forced, the requested effort
+    /// stays absent and the normal turn `effort` field above stays omitted.
+    fn turn_start_params(
+        thread_id: String,
+        input: Vec<NativeUserInput>,
+        model: String,
+        effort: Option<String>,
+        collaboration_mode: Option<NativeCollaborationModeKind>,
+        native_effort: Option<String>,
+    ) -> NativeTurnStartParams {
+        NativeTurnStartParams {
+            thread_id,
+            input,
+            cwd: None,
+            model: Some(model.clone()),
+            effort: effort.clone(),
+            collaboration_mode: collaboration_mode.map(|mode| NativeCollaborationMode {
+                mode,
+                settings: NativeCollaborationSettings {
+                    model,
+                    reasoning_effort: effort.or(native_effort),
+                    developer_instructions: None,
+                },
+            }),
+            sandbox_policy: None,
+            client_user_message_id: None,
+        }
+    }
+
     async fn send_command(&mut self, params: AgentCommandParams) -> Result<Value> {
         let session = self
             .session
@@ -1556,40 +1591,38 @@ impl CodexPlugin {
         session
             .command_inputs
             .insert(command_id.clone(), text.to_owned());
-        let turn_params = NativeTurnStartParams {
-            thread_id: session
+        // A retained `configure` overlay rides the per-turn fields the
+        // installed schema accepts; without one the frozen session values
+        // apply unchanged.
+        let model = params
+            .model_override
+            .clone()
+            .unwrap_or_else(|| session.requested_model.clone());
+        let effort = params
+            .effort_override
+            .clone()
+            .or_else(|| session.selected_effort.clone());
+        // What the native turn request actually carries: the requested
+        // override, or the native readback when the profile (and the
+        // overlay) left effort absent. Reported through the turn association
+        // only under a `configure` overlay; plain sends keep their exact
+        // event shape.
+        let sent_effort = params
+            .config_revision
+            .is_some()
+            .then(|| effort.clone().or_else(|| session.native_effort.clone()))
+            .flatten();
+        let turn_params = Self::turn_start_params(
+            session
                 .thread_id
                 .clone()
                 .ok_or_else(|| Error::new("unknown", "Codex thread identity is unresolved"))?,
-            input: vec![NativeUserInput::Text(NativeTextUserInput::text(combined))],
-            cwd: None,
-            model: Some(session.requested_model.clone()),
-            // Omitted effort omits the wire field (schema: effort optional,
-            // anyOf ReasoningEffort|null), preserving the native default.
-            effort: session.selected_effort.clone(),
-            collaboration_mode: session
-                .collaboration_mode
-                .map(|mode| NativeCollaborationMode {
-                    mode,
-                    settings: NativeCollaborationSettings {
-                        model: session.requested_model.clone(),
-                        // Native replaces the full collaboration settings
-                        // when the mode is present, so a null effort here
-                        // would clear the native-configured selection and
-                        // fall back to the model default. Carry the actual
-                        // native readback instead; no arbitrary reasoning
-                        // is forced, the requested effort stays absent and
-                        // the normal turn `effort` field above stays omitted.
-                        reasoning_effort: session
-                            .selected_effort
-                            .clone()
-                            .or_else(|| session.native_effort.clone()),
-                        developer_instructions: None,
-                    },
-                }),
-            sandbox_policy: None,
-            client_user_message_id: None,
-        };
+            vec![NativeUserInput::Text(NativeTextUserInput::text(combined))],
+            model.clone(),
+            effort.clone(),
+            session.collaboration_mode,
+            session.native_effort.clone(),
+        );
         let encoded = serde_json::to_value(turn_params)
             .map_err(|_| Error::new("internal", "Codex turn/start params could not be encoded"))?;
         let response = session
@@ -1643,7 +1676,12 @@ impl CodexPlugin {
             .insert(command_id.clone(), turn_id.clone());
         if session
             .events
-            .associate_turn(command_id.clone(), turn_id.clone(), params.context.clone())
+            .associate_turn(
+                command_id.clone(),
+                turn_id.clone(),
+                params.context.clone(),
+                sent_effort.clone(),
+            )
             .await
             .is_err()
         {
@@ -1654,7 +1692,16 @@ impl CodexPlugin {
                 "Codex turn was accepted but turn.started was not acknowledged",
             ));
         }
-        Ok(json!({"state": "applied", "turn_id": turn_id}))
+        // Echo what the native request carried when a `configure` overlay
+        // applied, so the settled outcome reads back the effective values
+        // alongside the native turn association. Unchanged without one.
+        let mut result = json!({"state": "applied", "turn_id": turn_id});
+        if let Some(revision) = params.config_revision {
+            result["config_revision"] = json!(revision);
+            result["model"] = json!(model);
+            result["effort"] = json!(sent_effort);
+        }
+        Ok(result)
     }
 
     async fn steer(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -3319,5 +3366,72 @@ mod tests {
             "controller still retained after replay"
         );
         assert!(plugin.failed_start.is_none());
+    }
+
+    #[test]
+    fn turn_start_carries_configured_model_and_effort() {
+        use crate::native::types::{
+            NativeCollaborationModeKind, NativeTextUserInput, NativeUserInput,
+        };
+
+        let params = CodexPlugin::turn_start_params(
+            "thread-1".to_owned(),
+            vec![NativeUserInput::Text(NativeTextUserInput::text("hi"))],
+            "m1".to_owned(),
+            Some("high".to_owned()),
+            Some(NativeCollaborationModeKind::Plan),
+            Some("low".to_owned()),
+        );
+        assert_eq!(params.model.as_deref(), Some("m1"));
+        assert_eq!(params.effort.as_deref(), Some("high"));
+        let collaboration = params
+            .collaboration_mode
+            .as_ref()
+            .expect("mode carries settings");
+        assert_eq!(collaboration.mode, NativeCollaborationModeKind::Plan);
+        assert_eq!(collaboration.settings.model, "m1");
+        assert_eq!(
+            collaboration.settings.reasoning_effort.as_deref(),
+            Some("high")
+        );
+        let wire = serde_json::to_value(&params).expect("encode turn/start");
+        assert_eq!(
+            wire["model"],
+            json!("m1"),
+            "model rides the per-turn wire field"
+        );
+        assert_eq!(
+            wire["effort"],
+            json!("high"),
+            "effort rides the per-turn wire field"
+        );
+    }
+
+    #[test]
+    fn turn_start_omits_absent_effort_but_keeps_native_collaboration_readback() {
+        use crate::native::types::{
+            NativeCollaborationModeKind, NativeTextUserInput, NativeUserInput,
+        };
+
+        let params = CodexPlugin::turn_start_params(
+            "thread-1".to_owned(),
+            vec![NativeUserInput::Text(NativeTextUserInput::text("hi"))],
+            "m0".to_owned(),
+            None,
+            Some(NativeCollaborationModeKind::Default),
+            Some("low".to_owned()),
+        );
+        assert_eq!(params.effort, None, "absent effort omits the wire field");
+        let wire = serde_json::to_value(&params).expect("encode turn/start");
+        assert!(wire.get("effort").is_none(), "native default preserved");
+        let collaboration = params
+            .collaboration_mode
+            .as_ref()
+            .expect("mode carries settings");
+        assert_eq!(
+            collaboration.settings.reasoning_effort.as_deref(),
+            Some("low"),
+            "full collaboration settings keep the native readback, never a null clear"
+        );
     }
 }

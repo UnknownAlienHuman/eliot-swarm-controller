@@ -38,6 +38,18 @@ impl AgentGetRequest {
                 .session_usage
                 .as_ref()
                 .is_some_and(|usage| usage.validate().is_err())
+            || reply.config.as_ref().is_some_and(|config| {
+                config.revision < 1
+                    || config.application != "next_turn"
+                    || config
+                        .requested_model
+                        .as_ref()
+                        .is_some_and(|value| value.trim().is_empty())
+                    || config
+                        .requested_effort
+                        .as_ref()
+                        .is_some_and(|value| value.trim().is_empty())
+            })
             || reply.source_states.iter().any(|source| {
                 source.agent_id != self.id
                     || source.generation < 0
@@ -621,6 +633,46 @@ pub struct AgentGetResponse {
     /// committed. Never a turn total and never billing.
     #[serde(default, deserialize_with = "optional_object")]
     pub session_usage: Option<SessionUsage>,
+    /// Current model/effort overlay for the Agent generation: the latest
+    /// retained `configure` revision with the effective values the next
+    /// native turn carries plus the original profile values. `None` when no
+    /// `configure` command ever applied to this generation.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_object"
+    )]
+    pub config: Option<AgentConfigView>,
+}
+
+/// Retained model/effort overlay readback for one Agent generation. The
+/// original profile snapshot is never rewritten: `original_model` and
+/// `original_effort` repeat the frozen values while `model`/`effort` carry
+/// the effective values the next native turn request uses.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentConfigView {
+    /// Monotonically increasing revision within the Agent generation; 0 is
+    /// never stored and means no overlay exists.
+    pub revision: i64,
+    /// Where the change applies: `next_turn`. A change needing a new
+    /// native session is refused as `unsupported`, never stored.
+    pub application: String,
+    /// Exactly what the owner requested (each `None` when not requested).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_effort: Option<String>,
+    /// Effective values the next native turn carries (requested value or
+    /// the frozen original when not requested).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Frozen profile-snapshot values the overlay leaves unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_effort: Option<String>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1804,6 +1856,7 @@ mod tests {
             observation: observation(),
             source_states: vec![],
             session_usage: None,
+            config: None,
         };
         let wire = serde_json::to_value(&reply).unwrap();
         assert_eq!(wire["id"], "a1");
@@ -2243,6 +2296,7 @@ mod tests {
             observation: observation(),
             source_states: vec![source],
             session_usage: None,
+            config: None,
         };
         AgentGetRequest::new("a1")
             .validate_response(&reply)

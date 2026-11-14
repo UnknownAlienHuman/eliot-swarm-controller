@@ -53,7 +53,7 @@ Use supported typed APIs, not an inferred method list from a different host vers
 | inject | exact supported steer or explicit next-send prepend, mechanism reported; active_turn uses the actual turn/steer mechanism with the exact expected turn (`muse.turn/steer`), other points unsupported here |
 | stop/resume | clear/pause native Goal as necessary and close owned host; resume exact session without old input |
 | approve/deny/answer | exact session/child request id and offered choice/requirement; public details are the shared ApprovalRequest/QuestionRequest, answers are the universal answers map |
-| configure | model/reasoning/approval setters followed by effective readback |
+| configure | effort rides per-turn `reasoningEffort` in `turn/start`, resolved from the retained revision at send dispatch; a model change needs a new native session and is refused as `unsupported` (the frozen snapshot never changes) |
 | goal | native set/edit/pause/resume/clear where installed schema supports them |
 | compact/fork/background | native-only, advertised after implementation |
 

@@ -628,7 +628,7 @@ fn load_catch_up_children(connection: &Connection, parent_id: &str) -> Result<Ve
         .prepare(
             "SELECT id, principal, method, target, expected_generation, generation,
                     expected_turn_id, turn_id, request_id, verb, args, state, outcome,
-                    created_at, updated_at, probe, selector
+                    created_at, updated_at, probe, selector, config_revision
              FROM commands
              WHERE parent_command = ?1 AND link_kind = 'rule_action' AND ordinal IS NOT NULL
              ORDER BY ordinal",

@@ -7097,7 +7097,11 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "DROP TABLE session_usage;
+            "DROP TABLE agent_config;
+             DELETE FROM schema_migrations WHERE version = 34;
+             ALTER TABLE commands DROP COLUMN config_revision;
+             ALTER TABLE turns DROP COLUMN config_revision;
+             DROP TABLE session_usage;
              DELETE FROM schema_migrations WHERE version = 33;
              DROP TABLE attention_wakes;
              DELETE FROM schema_migrations WHERE version = 32;
@@ -12525,5 +12529,828 @@ fn session_usage_keeps_only_the_latest_snapshot() {
             .expect("read session usage"),
         Some(second),
         "duplicate snapshot must not replace the retained one"
+    );
+}
+
+/// Idle first-generation Agent with an explicit frozen profile snapshot,
+/// ready for `configure` without a native harness.
+fn ready_configure_agent(
+    store: &mut Store,
+    project: &str,
+    harness: &str,
+    snapshot: serde_json::Value,
+    now: i64,
+) -> String {
+    let launch_id = Ulid::new().to_string();
+    let admission = store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: launch_id.clone(),
+                target: None,
+                selector: None,
+                verb: "launch".to_owned(),
+                args: json!({"project":project, "workspace":"synthetic-workspace", "harness":harness, "profile":"fake", "profile_snapshot":snapshot}),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit launch");
+    let agent = admission.command.target.expect("launch target");
+    store.dispatch(&launch_id, now).expect("dispatch launch");
+    install_fixture_sources(store, &agent, &launch_id, 1, now);
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:ready"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: format!("{project}:ready"),
+                    data: json!({"command_id":launch_id}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit session ready");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now)
+        .expect("settle launch");
+    agent
+}
+
+fn configure_request(agent: &str, generation: i64, args: serde_json::Value) -> SubmitCommand {
+    let mut request = SubmitCommand::new(Ulid::new().to_string(), "configure");
+    request.target = Some(agent.to_owned());
+    request.args = args;
+    request.expected_generation = Some(generation);
+    request
+}
+
+#[test]
+fn configure_applies_overlay_and_stamps_monotonic_revisions() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let snapshot = json!({"model": "m0", "effort": "low"});
+    let agent = ready_configure_agent(
+        &mut store,
+        "configure-basic",
+        "codex",
+        snapshot.clone(),
+        now,
+    );
+
+    let first = configure_request(&agent, 1, json!({"model": "m1"}));
+    let first_id = first.id.clone();
+    store
+        .submit("owner", first, now + 1)
+        .expect("admit configure");
+    store
+        .dispatch(&first_id, now + 2)
+        .expect("dispatch configure");
+    let applied = store
+        .apply_agent_config(&first_id, now + 3)
+        .expect("apply configure");
+    assert_eq!(applied.revision, 1, "first overlay is revision 1");
+    assert_eq!(applied.requested_model.as_deref(), Some("m1"));
+    assert_eq!(applied.requested_effort, None);
+    assert_eq!(applied.model.as_deref(), Some("m1"), "requested model wins");
+    assert_eq!(
+        applied.effort.as_deref(),
+        Some("low"),
+        "unrequested effort falls back to the snapshot"
+    );
+    assert_eq!(applied.application, "next_turn");
+    store
+        .settle(&first_id, CommandState::Applied, None, now + 4)
+        .expect("settle configure");
+
+    let second = configure_request(&agent, 1, json!({"effort": "high"}));
+    let second_id = second.id.clone();
+    store
+        .submit("owner", second, now + 5)
+        .expect("admit second configure");
+    store
+        .dispatch(&second_id, now + 6)
+        .expect("dispatch second configure");
+    let reapplied = store
+        .apply_agent_config(&second_id, now + 7)
+        .expect("apply second configure");
+    assert_eq!(reapplied.revision, 2, "revisions increase monotonically");
+    assert_eq!(reapplied.requested_effort.as_deref(), Some("high"));
+    assert_eq!(
+        reapplied.model.as_deref(),
+        Some("m0"),
+        "unrequested model falls back to the snapshot"
+    );
+
+    // Reapplying the same command is idempotent, never a new revision.
+    let replayed = store
+        .apply_agent_config(&second_id, now + 8)
+        .expect("reapply configure");
+    assert_eq!(
+        replayed.revision, 2,
+        "reapply returns the retained revision"
+    );
+    let current = store
+        .get_agent_config_current(&agent, 1)
+        .expect("read current overlay")
+        .expect("overlay exists");
+    assert_eq!(current.revision, 2);
+
+    // The frozen profile snapshot is unchanged by both overlays.
+    let stored: eliot_core::Agent = store
+        .get_agent(&agent)
+        .expect("load agent")
+        .expect("agent exists");
+    assert_eq!(
+        stored.profile_snapshot, snapshot,
+        "snapshot is never rewritten"
+    );
+}
+
+#[test]
+fn configure_rejects_authority_unknown_and_malformed_fields() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_configure_agent(
+        &mut store,
+        "configure-rejections",
+        "codex",
+        json!({"model": "m0"}),
+        now,
+    );
+    for (args, code) in [
+        (json!({"permissions": {"scope": "all"}}), "not_allowed"),
+        (json!({"approval": "auto"}), "not_allowed"),
+        (json!({"mcp": {}}), "not_allowed"),
+        (json!({"env": {}}), "not_allowed"),
+        (json!({"route_binding": "x"}), "not_allowed"),
+        (json!({"account": "other"}), "not_allowed"),
+        (json!({"bogus": "x"}), "unsupported"),
+        (json!({"model": "m1", "bogus": "x"}), "unsupported"),
+        (json!({}), "invalid"),
+        (json!({"model": 1}), "invalid"),
+        (json!({"model": ""}), "invalid"),
+        (json!({"model": "   "}), "invalid"),
+        (json!({"model": null}), "invalid"),
+    ] {
+        let error = store
+            .submit("owner", configure_request(&agent, 1, args), now + 1)
+            .unwrap_err();
+        assert_eq!(error.code, code, "configure args must be refused honestly");
+    }
+    // Explicit JSON nulls are absent fields, not values.
+    store
+        .submit(
+            "owner",
+            configure_request(&agent, 1, json!({"effort": "low", "model": null})),
+            now + 2,
+        )
+        .expect("null model with a real effort configures effort");
+    assert_eq!(
+        store
+            .get_agent_config_current(&agent, 1)
+            .expect("read overlay"),
+        None,
+        "refused configures store nothing"
+    );
+}
+
+#[test]
+fn configure_gates_harness_generation_state_and_principal() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let codex = ready_configure_agent(
+        &mut store,
+        "configure-gates",
+        "codex",
+        json!({"model": "m0"}),
+        now,
+    );
+    let muse = ready_configure_agent(
+        &mut store,
+        "configure-gates-muse",
+        "muse",
+        json!({"model": "m0", "effort": "low"}),
+        now + 1,
+    );
+    let claude = ready_configure_agent(
+        &mut store,
+        "configure-gates-claude",
+        "claude",
+        json!({"model": "m0"}),
+        now + 2,
+    );
+    let opencode = ready_configure_agent(
+        &mut store,
+        "configure-gates-opencode",
+        "opencode",
+        json!({"model": "m0"}),
+        now + 3,
+    );
+    let antigravity = ready_configure_agent(
+        &mut store,
+        "configure-gates-antigravity",
+        "antigravity",
+        json!({"model": "m0"}),
+        now + 4,
+    );
+
+    // Muse effort is a per-turn override; a Muse model change needs a new
+    // native session, so it is refused as unsupported and stores nothing.
+    store
+        .submit(
+            "owner",
+            configure_request(&muse, 1, json!({"effort": "high"})),
+            now + 10,
+        )
+        .expect("admit Muse effort configure");
+    assert_eq!(
+        store
+            .submit(
+                "owner",
+                configure_request(&muse, 1, json!({"model": "m9"})),
+                now + 11
+            )
+            .unwrap_err()
+            .code,
+        "unsupported",
+        "Muse model needs a new native session"
+    );
+    assert_eq!(
+        store
+            .submit(
+                "owner",
+                configure_request(&muse, 1, json!({"model": "m9", "effort": "high"})),
+                now + 12
+            )
+            .unwrap_err()
+            .code,
+        "unsupported",
+        "mixed Muse configure is atomic: nothing applies"
+    );
+    for harness_agent in [&claude, &opencode, &antigravity] {
+        assert_eq!(
+            store
+                .submit(
+                    "owner",
+                    configure_request(harness_agent, 1, json!({"effort": "high"})),
+                    now + 13
+                )
+                .unwrap_err()
+                .code,
+            "unsupported",
+            "adapters without a verified mechanism refuse configure"
+        );
+    }
+    assert_eq!(
+        store
+            .get_agent_config_current(&muse, 1)
+            .expect("read Muse overlay"),
+        None,
+        "refused Muse model configure stores nothing"
+    );
+
+    // Stale bindings, non-Owner principals and dead sessions are rejected.
+    assert_eq!(
+        store
+            .submit(
+                "owner",
+                configure_request(&codex, 99, json!({"effort": "high"})),
+                now + 14
+            )
+            .unwrap_err()
+            .code,
+        "stale_generation"
+    );
+    assert_eq!(
+        store
+            .submit(
+                "agent:a9#1",
+                configure_request(&codex, 1, json!({"effort": "high"})),
+                now + 15
+            )
+            .unwrap_err()
+            .code,
+        "not_allowed",
+        "configure requires the Owner principal"
+    );
+    store
+        .connection
+        .execute(
+            "UPDATE agents SET state = 'stopped' WHERE id = ?1",
+            [eliot_core::parse_agent_id(&codex).expect("parse agent")],
+        )
+        .expect("stop Agent");
+    assert_eq!(
+        store
+            .submit(
+                "owner",
+                configure_request(&codex, 1, json!({"effort": "high"})),
+                now + 16
+            )
+            .unwrap_err()
+            .code,
+        "bad_state",
+        "configure requires a live Agent generation"
+    );
+}
+
+#[test]
+fn sends_run_under_their_dispatch_revision_and_turns_inherit_it() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_configure_agent(
+        &mut store,
+        "configure-freeze",
+        "codex",
+        json!({"model": "m0", "effort": "low"}),
+        now,
+    );
+
+    // First send dispatched under the frozen snapshot, before any overlay.
+    let send_one = send_request(&agent, 1, "first input");
+    let send_one_id = send_one.id.clone();
+    store
+        .submit("owner", send_one, now + 1)
+        .expect("admit first send");
+    store
+        .dispatch(&send_one_id, now + 2)
+        .expect("dispatch first send");
+
+    // The overlay is admitted while the first send is still unassociated:
+    // dispatch queues it on the held settings lane instead of applying.
+    let configure = configure_request(&agent, 1, json!({"model": "m1", "effort": "high"}));
+    let configure_id = configure.id.clone();
+    store
+        .submit("owner", configure, now + 3)
+        .expect("admit configure");
+    store
+        .dispatch(&configure_id, now + 4)
+        .expect("queue configure");
+    assert_eq!(
+        store
+            .get_command(&configure_id)
+            .expect("load configure")
+            .expect("configure exists")
+            .state,
+        CommandState::Queued,
+        "unassociated send input holds the settings lane"
+    );
+
+    // A later send is admitted while the overlay is still pending.
+    let send_two = send_request(&agent, 1, "second input");
+    let send_two_id = send_two.id.clone();
+    store
+        .submit("owner", send_two, now + 6)
+        .expect("admit second send");
+
+    // Complete the first turn so both lanes free, then let the queued
+    // configure apply before the second send dispatches.
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "configure-freeze:frozen".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![
+                    NativeEvent {
+                        ts: None,
+                        kind: "turn.started".to_owned(),
+                        native_id: "configure-freeze:frozen-turn:started".to_owned(),
+                        data: json!({"command_id": send_one_id, "turn_id": "frozen-turn"}),
+                    },
+                    NativeEvent {
+                        ts: None,
+                        kind: "message.completed".to_owned(),
+                        native_id: "configure-freeze:frozen-turn:message".to_owned(),
+                        data: json!({"command_id": send_one_id, "turn_id": "frozen-turn", "text": "first reply"}),
+                    },
+                    NativeEvent {
+                        ts: None,
+                        kind: "turn.completed".to_owned(),
+                        native_id: "configure-freeze:frozen-turn:completed".to_owned(),
+                        data: json!({"command_id": send_one_id, "turn_id": "frozen-turn", "status": "completed"}),
+                    },
+                ],
+                cursor: None,
+            },
+            now + 7,
+        )
+        .expect("complete frozen turn");
+    store
+        .dispatch(&configure_id, now + 8)
+        .expect("dispatch queued configure");
+    let applied = store
+        .apply_agent_config(&configure_id, now + 9)
+        .expect("apply configure");
+    assert_eq!(applied.revision, 1);
+    // The Router settles applied right after the Store commit; only then
+    // does the lane release for later input.
+    store
+        .settle(&configure_id, CommandState::Applied, None, now + 9)
+        .expect("settle configure");
+
+    // Association for the first send still binds the snapshot even though
+    // the association lands after the overlay: a send committed before an
+    // overlay never runs under newer configuration.
+    assert_eq!(
+        store
+            .send_effective_config(&send_one_id)
+            .expect("resolve first send"),
+        None,
+        "pre-overlay send runs under the frozen snapshot"
+    );
+    // The second send stamps its revision at its own dispatch, after the
+    // overlay applied.
+    store
+        .dispatch(&send_two_id, now + 10)
+        .expect("dispatch second send");
+    let effective = store
+        .send_effective_config(&send_two_id)
+        .expect("resolve second send")
+        .expect("overlay applies");
+    assert_eq!(effective.revision, 1);
+    assert_eq!(effective.model.as_deref(), Some("m1"));
+    assert_eq!(effective.effort.as_deref(), Some("high"));
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "configure-freeze:overlay".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: "configure-freeze:overlay-turn:started".to_owned(),
+                    data: json!({"command_id": send_two_id, "turn_id": "overlay-turn"}),
+                }],
+                cursor: None,
+            },
+            now + 9,
+        )
+        .expect("associate overlay turn");
+    let frozen = store
+        .get_turn(&agent, 1, "frozen-turn")
+        .expect("load frozen turn")
+        .expect("turn exists");
+    assert_eq!(
+        frozen.config_revision, 0,
+        "turn records the snapshot revision"
+    );
+    let overlay = store
+        .get_turn(&agent, 1, "overlay-turn")
+        .expect("load overlay turn")
+        .expect("turn exists");
+    assert_eq!(
+        overlay.config_revision, 1,
+        "turn records the revision it ran under"
+    );
+    let overlay_outcome = store
+        .get_command(&send_two_id)
+        .expect("load second send")
+        .expect("send exists")
+        .outcome
+        .expect("send has an outcome");
+    assert_eq!(overlay_outcome["config_revision"], json!(1));
+    assert_eq!(
+        overlay_outcome["model"],
+        json!("m1"),
+        "first overlay turn shows its effective model"
+    );
+    assert_eq!(overlay_outcome["effort"], json!("high"));
+    let frozen_outcome = store
+        .get_command(&send_one_id)
+        .expect("load first send")
+        .expect("send exists")
+        .outcome
+        .expect("send has an outcome");
+    assert!(
+        frozen_outcome.get("config_revision").is_none(),
+        "snapshot sends keep their exact outcome shape"
+    );
+}
+
+#[test]
+fn configure_and_send_share_one_admission_order() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_configure_agent(
+        &mut store,
+        "configure-lane",
+        "codex",
+        json!({"model": "m0", "effort": "low"}),
+        now,
+    );
+    let state_of = |store: &Store, id: &str| {
+        store
+            .get_command(id)
+            .expect("load command")
+            .expect("command exists")
+            .state
+    };
+    let batch =
+        |batch_id: &str, kind: &str, native_id: &str, data: serde_json::Value| SourceBatch {
+            batch_id: batch_id.to_owned(),
+            agent_id: agent.clone(),
+            generation: 1,
+            source: "stream".to_owned(),
+            events: vec![NativeEvent {
+                ts: None,
+                kind: kind.to_owned(),
+                native_id: native_id.to_owned(),
+                data,
+            }],
+            cursor: None,
+        };
+
+    // Occupy the Agent with an associated active turn.
+    let active = send_request(&agent, 1, "occupying turn");
+    let active_id = active.id.clone();
+    store
+        .submit("owner", active, now + 1)
+        .expect("admit occupying send");
+    store
+        .dispatch(&active_id, now + 2)
+        .expect("dispatch occupying send");
+    store
+        .put_batch(
+            batch(
+                "configure-lane:occupying",
+                "turn.started",
+                "configure-lane:occupying:started",
+                json!({"command_id": active_id, "turn_id": "lane-turn-0"}),
+            ),
+            now + 3,
+        )
+        .expect("associate occupying turn");
+
+    // Admit SEND S, then configure C, on the busy Agent.
+    let send = send_request(&agent, 1, "queued input");
+    let send_id = send.id.clone();
+    store
+        .submit("owner", send, now + 4)
+        .expect("admit queued send");
+    let configure = configure_request(&agent, 1, json!({"model": "m1"}));
+    let configure_id = configure.id.clone();
+    store
+        .submit("owner", configure, now + 5)
+        .expect("admit configure");
+
+    // A configure never overtakes an earlier-admitted send: C queues behind
+    // the still-queued S instead of applying immediately.
+    store
+        .dispatch(&configure_id, now + 6)
+        .expect("queue configure");
+    assert_eq!(
+        state_of(&store, &configure_id),
+        CommandState::Queued,
+        "configure waits for the earlier queued send"
+    );
+
+    // Free the Agent; the earlier send dispatches first and freezes the
+    // snapshot revision even though a configure is pending.
+    store
+        .put_batch(
+            batch(
+                "configure-lane:free",
+                "turn.completed",
+                "configure-lane:free:completed",
+                json!({"command_id": active_id, "turn_id": "lane-turn-0", "status": "completed"}),
+            ),
+            now + 7,
+        )
+        .expect("complete occupying turn");
+    store
+        .dispatch(&send_id, now + 8)
+        .expect("dispatch earlier send");
+    assert_eq!(
+        state_of(&store, &send_id),
+        CommandState::Dispatched,
+        "earlier send passes the later configure"
+    );
+    assert!(
+        store
+            .send_effective_config(&send_id)
+            .expect("resolve earlier send")
+            .is_none(),
+        "earlier send runs under the frozen snapshot"
+    );
+
+    // C still waits for S's turn association, then applies as revision 1.
+    store
+        .dispatch(&configure_id, now + 9)
+        .expect("redispatch configure");
+    assert_eq!(
+        state_of(&store, &configure_id),
+        CommandState::Queued,
+        "configure waits for the earlier unassociated send"
+    );
+    store
+        .put_batch(
+            batch(
+                "configure-lane:associated",
+                "turn.started",
+                "configure-lane:associated:started",
+                json!({"command_id": send_id, "turn_id": "lane-turn-1"}),
+            ),
+            now + 10,
+        )
+        .expect("associate earlier send");
+    store
+        .dispatch(&configure_id, now + 11)
+        .expect("dispatch configure");
+    let applied = store
+        .apply_agent_config(&configure_id, now + 12)
+        .expect("apply configure");
+    assert_eq!(applied.revision, 1);
+    store
+        .settle(&configure_id, CommandState::Applied, None, now + 12)
+        .expect("settle configure");
+
+    // A later input waits for the earlier configure while otherwise ready,
+    // then runs under it.
+    store
+        .put_batch(
+            batch(
+                "configure-lane:done",
+                "turn.completed",
+                "configure-lane:done:completed",
+                json!({"command_id": send_id, "turn_id": "lane-turn-1", "status": "completed"}),
+            ),
+            now + 13,
+        )
+        .expect("complete earlier turn");
+    let configure_two = configure_request(&agent, 1, json!({"effort": "high"}));
+    let configure_two_id = configure_two.id.clone();
+    store
+        .submit("owner", configure_two, now + 14)
+        .expect("admit second configure");
+    store
+        .dispatch(&configure_two_id, now + 15)
+        .expect("dispatch second configure");
+    let later = send_request(&agent, 1, "later input");
+    let later_id = later.id.clone();
+    store
+        .submit("owner", later, now + 16)
+        .expect("admit later send");
+    store
+        .dispatch(&later_id, now + 17)
+        .expect("queue later send");
+    assert_eq!(
+        state_of(&store, &later_id),
+        CommandState::Queued,
+        "later input waits for the earlier configure"
+    );
+    let applied_two = store
+        .apply_agent_config(&configure_two_id, now + 18)
+        .expect("apply second configure");
+    assert_eq!(applied_two.revision, 2);
+    store
+        .settle(&configure_two_id, CommandState::Applied, None, now + 18)
+        .expect("settle second configure");
+    store
+        .dispatch(&later_id, now + 19)
+        .expect("dispatch later send");
+    assert_eq!(state_of(&store, &later_id), CommandState::Dispatched);
+    let effective = store
+        .send_effective_config(&later_id)
+        .expect("resolve later send")
+        .expect("overlay applies");
+    assert_eq!(effective.revision, 2, "next input runs under C");
+}
+
+#[test]
+fn turn_and_generation_readback_show_resolved_native_effort() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    // The profile omits effort while native startup resolves it (e.g. low).
+    let agent = ready_configure_agent(
+        &mut store,
+        "configure-effort",
+        "codex",
+        json!({"model": "m0"}),
+        now,
+    );
+
+    // A model-only configure stores no effective effort of its own.
+    let configure = configure_request(&agent, 1, json!({"model": "m1"}));
+    let configure_id = configure.id.clone();
+    store
+        .submit("owner", configure, now + 1)
+        .expect("admit configure");
+    store
+        .dispatch(&configure_id, now + 2)
+        .expect("dispatch configure");
+    let applied = store
+        .apply_agent_config(&configure_id, now + 3)
+        .expect("apply configure");
+    assert_eq!(applied.revision, 1);
+    assert_eq!(applied.effort, None, "no effort was requested or retained");
+    assert_eq!(applied.requested_effort, None);
+    store
+        .settle(&configure_id, CommandState::Applied, None, now + 3)
+        .expect("settle configure");
+
+    // The next send runs under the overlay; the native request carries the
+    // resolved effort, which the plugin reports on the turn association.
+    let send = send_request(&agent, 1, "first turn");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now + 4).expect("admit send");
+    store.dispatch(&send_id, now + 5).expect("dispatch send");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "configure-effort:turn".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: "configure-effort:turn:started".to_owned(),
+                    data: json!({"command_id": send_id, "turn_id": "effort-turn", "effort": "low"}),
+                }],
+                cursor: None,
+            },
+            now + 6,
+        )
+        .expect("associate turn");
+    let outcome = store
+        .get_command(&send_id)
+        .expect("load send")
+        .expect("send exists")
+        .outcome
+        .expect("send has an outcome");
+    assert_eq!(
+        outcome["effort"],
+        json!("low"),
+        "turn shows the effort actually sent"
+    );
+    assert_eq!(outcome["model"], json!("m1"));
+    let current = store
+        .get_agent_config_current(&agent, 1)
+        .expect("read overlay")
+        .expect("overlay exists");
+    assert_eq!(
+        current.effort.as_deref(),
+        Some("low"),
+        "generation readback shows the resolved effort"
+    );
+    assert_eq!(
+        current.requested_effort, None,
+        "requested override stays absent"
+    );
+    let turn = store
+        .get_turn(&agent, 1, "effort-turn")
+        .expect("load turn")
+        .expect("turn exists");
+    assert_eq!(turn.config_revision, 1);
+
+    // A later send under the same revision reads back the recorded effort.
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "configure-effort:done".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.completed".to_owned(),
+                    native_id: "configure-effort:done:completed".to_owned(),
+                    data: json!({"command_id": send_id, "turn_id": "effort-turn", "status": "completed"}),
+                }],
+                cursor: None,
+            },
+            now + 7,
+        )
+        .expect("complete turn");
+    let second = send_request(&agent, 1, "second turn");
+    let second_id = second.id.clone();
+    store
+        .submit("owner", second, now + 8)
+        .expect("admit second send");
+    store
+        .dispatch(&second_id, now + 9)
+        .expect("dispatch second send");
+    let effective = store
+        .send_effective_config(&second_id)
+        .expect("resolve second send")
+        .expect("overlay applies");
+    assert_eq!(
+        effective.effort.as_deref(),
+        Some("low"),
+        "recorded effort carries to the next input"
     );
 }

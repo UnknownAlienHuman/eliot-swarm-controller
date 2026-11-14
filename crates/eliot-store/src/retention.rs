@@ -44,6 +44,7 @@ struct SubtreeMember {
     workspace_ref: bool,
     probe_ref: bool,
     goal_ref: bool,
+    config_ref: bool,
 }
 
 impl Store {
@@ -247,6 +248,9 @@ impl Store {
                               AND json_extract(g.state, '$.status') IN ('active', 'paused')
                               AND json_extract(g.state, '$.last_continuation_command_id') = m.id
                         )
+                        OR EXISTS (
+                            SELECT 1 FROM agent_config a WHERE a.command_id = m.id
+                        )
                  ),
                  oversize(root) AS (
                      SELECT s.root FROM old_sets s
@@ -290,6 +294,7 @@ impl Store {
                     || member.workspace_ref
                     || member.probe_ref
                     || member.goal_ref
+                    || member.config_ref
             }) {
                 continue;
             }
@@ -521,7 +526,8 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
                           AND g.generation = c.generation
                           AND json_extract(g.state, '$.status') IN ('active', 'paused')
                           AND json_extract(g.state, '$.last_continuation_command_id') = c.id
-                    )
+                    ),
+                    EXISTS(SELECT 1 FROM agent_config a WHERE a.command_id = c.id)
              FROM subtree s JOIN commands c ON c.id = s.id
              LIMIT ?3",
         )
@@ -539,6 +545,7 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
                     workspace_ref: row.get(5)?,
                     probe_ref: row.get(6)?,
                     goal_ref: row.get(7)?,
+                    config_ref: row.get(8)?,
                 })
             },
         )
@@ -1266,6 +1273,53 @@ mod tests {
         // The workspace start stays pinned while its preparation row exists.
         assert_eq!(command_count(&store), 1);
         assert!(store.get_command(&launch).unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_commands_keeps_agent_config_references() {
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        let agent = insert_agent(&mut store, 1);
+        let configure = Ulid::new().to_string();
+        insert_command(
+            &mut store,
+            CommandSeed {
+                target: Some(agent),
+                generation: Some(1),
+                verb: "configure".to_owned(),
+                state: "applied".to_owned(),
+                ..command_seed(configure.clone(), old)
+            },
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_config(agent, generation, revision, requested, effective, application, command_id, created_at)
+                 VALUES (?1, 1, 1, '{\"model\":\"m1\",\"effort\":null}', '{\"model\":\"m1\",\"effort\":null}', 'next_turn', ?2, ?3)",
+                params![agent, configure, old],
+            )
+            .unwrap();
+        let stale = Ulid::new().to_string();
+        insert_command(
+            &mut store,
+            CommandSeed {
+                state: "rejected".to_owned(),
+                ..command_seed(stale, old)
+            },
+        );
+        // The referenced configure survives expiry without faulting the
+        // Store; the unreferenced command is still pruned.
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
+        assert_eq!(report.commands_deleted, 1);
+        assert!(store.get_command(&configure).unwrap().is_some());
+        let overlay = store
+            .get_agent_config_current(&format!("a{agent}"), 1)
+            .expect("read retained overlay")
+            .expect("overlay exists");
+        assert_eq!(overlay.command_id, configure);
+        assert_eq!(overlay.model.as_deref(), Some("m1"));
     }
 
     #[test]
