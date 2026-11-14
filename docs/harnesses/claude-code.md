@@ -120,7 +120,10 @@ separate verb above with its own exact-turn queue and mechanism. Neither is
 Terminal `result.usage` covers only the current user turn's main loop
 (subagents excluded) and maps to `TurnUsage` at `main_loop_turn` scope with
 `message_id` null; `result.modelUsage` and `total_cost_usd` are
-cumulative/estimated and are never read. Only genuinely supplied
+cumulative/estimated and are never turn expenditure. `total_cost_usd`
+maps to the retained `SessionUsage` snapshot committed as `session.usage`
+(source `claude:result`) with unit `usd_estimate`, never converted;
+`result.modelUsage` stays unmapped. Only genuinely supplied
 nonnegative counters project (`input_tokens`, `output_tokens`,
 `cache_read_input_tokens`, `cache_creation_input_tokens`); missing or
 wholly malformed usage stays null so completion proceeds.
@@ -148,8 +151,9 @@ A terminal `result` record's `usage` is mapped, when genuinely supplied as
 nonnegative counters, into `turn.completed` `data.usage` at `main_loop_turn`
 scope with `message_id` null: with persistent streaming input it covers only
 the current user turn's main loop (subagents excluded). Cumulative/estimated
-`modelUsage` and `total_cost_usd` are never turn totals and are not persisted
-as usage or billing; unavailable/malformed individual counters stay null
+`modelUsage` is never a turn total and is not persisted; `total_cost_usd`
+is persisted only as the session-scoped `cumulative_cost` in `session.usage`,
+never as usage or billing; unavailable/malformed individual counters stay null
 (other valid counters are retained), and no valid native counters means
 `data.usage` is omitted — never blocks or gaps the terminal.
 Callbacks own missing permission/question decisions; hooks never mirror the same

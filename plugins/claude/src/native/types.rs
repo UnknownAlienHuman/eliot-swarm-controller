@@ -7,7 +7,7 @@
 //! stay open: unknown fields are ignored, required fields are checked by the
 //! caller that consumes them.
 
-use eliot_core::TurnUsage;
+use eliot_core::{SessionCost, SessionUsage, TurnUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -241,6 +241,31 @@ pub(crate) fn result_usage(record: &Value) -> Option<TurnUsage> {
     })
 }
 
+/// Extract the cumulative session cost from a terminal `result` record's
+/// `total_cost_usd`. With persistent streaming input the cost is cumulative
+/// for the session (resumed cost included) and estimated, so it maps to a
+/// session-scoped `cumulative_cost` with unit `usd_estimate`, never to turn
+/// expenditure and never converted. `result.modelUsage` is likewise
+/// cumulative and stays unmapped. Only a finite nonnegative number maps;
+/// anything else yields no session fact so completion proceeds.
+pub(crate) fn result_session_usage(record: &Value) -> Option<SessionUsage> {
+    let amount = record.get("total_cost_usd").and_then(Value::as_f64)?;
+    if !(amount.is_finite() && amount >= 0.0) {
+        return None;
+    }
+    Some(SessionUsage {
+        context_used_tokens: None,
+        context_window_tokens: None,
+        cumulative_tokens: None,
+        cumulative_cost: Some(SessionCost {
+            amount: Some(amount),
+            unit: Some("usd_estimate".to_owned()),
+        }),
+        source: Some("claude:result".to_owned()),
+        observed_at: None,
+    })
+}
+
 /// Extract the model reported by an `assistant` record's message.
 /// Only a non-empty string scalar is observed; missing/null is unobserved.
 pub(crate) fn assistant_model(record: &Value) -> Option<String> {
@@ -368,6 +393,27 @@ mod tests {
         assert_eq!(body.tool_name, "Bash");
         assert_eq!(body.tool_use_id.as_deref(), Some("tool-1"));
         assert_eq!(body.input, Some(json!({"command": "ls"})));
+    }
+
+    #[test]
+    fn session_cost_maps_total_cost_as_usd_estimate() {
+        let usage =
+            result_session_usage(&json!({"total_cost_usd": 1.25})).expect("cumulative cost maps");
+        assert_eq!(usage.context_used_tokens, None);
+        assert_eq!(usage.context_window_tokens, None);
+        assert_eq!(usage.cumulative_tokens, None);
+        let cost = usage.cumulative_cost.expect("cost");
+        assert_eq!(cost.amount, Some(1.25));
+        assert_eq!(cost.unit.as_deref(), Some("usd_estimate"));
+        assert_eq!(usage.source.as_deref(), Some("claude:result"));
+        // Absent, wrong-typed and negative costs yield no session fact, so
+        // completion proceeds without one.
+        assert_eq!(result_session_usage(&json!({})), None);
+        assert_eq!(
+            result_session_usage(&json!({"total_cost_usd": "1.25"})),
+            None
+        );
+        assert_eq!(result_session_usage(&json!({"total_cost_usd": -0.5})), None);
     }
 
     #[test]

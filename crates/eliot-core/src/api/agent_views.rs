@@ -4,7 +4,7 @@
 use super::{GitView, ObservationView, ScriptInterpreter};
 use crate::{
     Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity, ProcessIdentity,
-    ProcessRecord, Result, TurnOutcome, TurnUsage,
+    ProcessRecord, Result, SessionUsage, TurnOutcome, TurnUsage,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -34,6 +34,10 @@ impl AgentGetRequest {
         if self.validate().is_err()
             || reply.agent.id != self.id
             || !valid_agent(&reply.agent)
+            || reply
+                .session_usage
+                .as_ref()
+                .is_some_and(|usage| usage.validate().is_err())
             || reply.source_states.iter().any(|source| {
                 source.agent_id != self.id
                     || source.generation < 0
@@ -437,6 +441,10 @@ impl AgentStatsRequest {
     pub fn validate_response(&self, reply: &AgentStatsResponse) -> Result<()> {
         if self.validate().is_err()
             || !binding(&self.id, self.generation, &reply.agent, reply.generation)
+            || reply
+                .session_usage
+                .as_ref()
+                .is_some_and(|usage| usage.validate().is_err())
         {
             return Err(invalid_response());
         }
@@ -608,6 +616,11 @@ pub struct AgentGetResponse {
     pub observation: ObservationView,
     #[serde(deserialize_with = "objects")]
     pub source_states: Vec<SourceState>,
+    /// Latest retained `session.usage` snapshot for the Agent generation, in
+    /// its own session-scope section; `None` when no session fact was ever
+    /// committed. Never a turn total and never billing.
+    #[serde(default, deserialize_with = "optional_object")]
+    pub session_usage: Option<SessionUsage>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -663,6 +676,11 @@ pub struct AgentStatsResponse {
     pub generation: i64,
     #[serde(flatten, deserialize_with = "object")]
     pub observation: ObservationView,
+    /// Latest retained `session.usage` snapshot for the Agent generation, in
+    /// its own session-scope section; `None` when no session fact was ever
+    /// committed. Never a turn total and never billing.
+    #[serde(default, deserialize_with = "optional_object")]
+    pub session_usage: Option<SessionUsage>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1785,6 +1803,7 @@ mod tests {
             agent: agent.clone(),
             observation: observation(),
             source_states: vec![],
+            session_usage: None,
         };
         let wire = serde_json::to_value(&reply).unwrap();
         assert_eq!(wire["id"], "a1");
@@ -2067,6 +2086,7 @@ mod tests {
             agent: "a1".to_owned(),
             generation: 4,
             observation: observation(),
+            session_usage: None,
         };
         let wire = serde_json::to_value(&reply).unwrap();
         assert_eq!(wire["available"], false);
@@ -2222,6 +2242,7 @@ mod tests {
             agent: Agent::new("a1", "p", "fake", "fake", 0),
             observation: observation(),
             source_states: vec![source],
+            session_usage: None,
         };
         AgentGetRequest::new("a1")
             .validate_response(&reply)

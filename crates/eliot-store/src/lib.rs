@@ -35,8 +35,8 @@ use eliot_core::{
     self as core, Agent, AgentControl, AgentEdit, AgentState, BatchAck, Command, CommandState,
     Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage,
     GitSnapshot, InjectPoint, NativeEvent, NativeStoreBinding, PendingRequest, ProcessIdentity,
-    ProcessRecord, ProcessSnapshot, ProcessState, SourceBatch, SourceGap, SourceGapAck,
-    SubmitCommand, Turn, TurnOutcome, TurnState, TurnUsage, WorkspaceCancelOutcome,
+    ProcessRecord, ProcessSnapshot, ProcessState, SessionUsage, SourceBatch, SourceGap,
+    SourceGapAck, SubmitCommand, Turn, TurnOutcome, TurnState, TurnUsage, WorkspaceCancelOutcome,
     WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation, WorkspacePreparationInput,
     WorkspaceRemovalOutcome, WorkspaceSetupArg, WorkspaceSetupOutcome, parse_agent_id,
 };
@@ -4384,6 +4384,32 @@ fn decode_turn_usage(value: &str) -> Result<TurnUsage> {
         .map_err(|error| Error::new("internal", format!("invalid stored turn usage: {error}")))
 }
 
+fn decode_session_usage(value: &str) -> Result<SessionUsage> {
+    serde_json::from_str(value)
+        .map_err(|error| Error::new("internal", format!("invalid stored session usage: {error}")))
+}
+
+impl Store {
+    /// Latest retained `session.usage` snapshot for one Agent generation, or
+    /// `None` when no session fact was ever committed. Only the latest
+    /// snapshot is retained: older and duplicate snapshots never replace it.
+    pub fn get_session_usage(&self, agent: &str, generation: i64) -> Result<Option<SessionUsage>> {
+        let agent_num = parse_agent_id(agent)?;
+        let snapshot: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT snapshot FROM session_usage WHERE agent = ?1 AND generation = ?2",
+                params![agent_num, generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        snapshot
+            .map(|value| decode_session_usage(&value))
+            .transpose()
+    }
+}
+
 fn load_turn(
     connection: &Connection,
     agent: i64,
@@ -4692,7 +4718,7 @@ fn install_stream_source_plan(
 
 fn family_for_kind(kind: &str) -> Result<&'static str> {
     match kind {
-        "session.ready" | "session.ended" => Ok("session"),
+        "session.ready" | "session.ended" | "session.usage" => Ok("session"),
         "turn.started" | "turn.completed" | "turn.unknown" => Ok("turn"),
         "message.completed" => Ok("message"),
         "tool.started" | "tool.completed" | "hook.before_tool" => Ok("tool"),

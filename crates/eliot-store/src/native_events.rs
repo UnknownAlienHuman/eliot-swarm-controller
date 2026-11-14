@@ -118,6 +118,9 @@ pub(super) fn persist_effects(
                     )?);
                 }
             }
+            Effect::SessionUsageUpdated { usage } => {
+                persist_session_usage(scope, usage)?;
+            }
         }
     }
     Ok((command_events, provider_events))
@@ -628,6 +631,64 @@ fn persist_turn_terminal(
     context::cancel_turn_safe_point_tx(tx, agent_num, generation, turn_id, now)
 }
 
+/// Persist one `session.usage` snapshot as the latest for its Agent
+/// generation, in the caller's transaction. A strictly newer snapshot
+/// replaces the retained one; an older or equal-timestamp snapshot or a
+/// byte-identical duplicate is ignored, so replays and out-of-order
+/// deliveries can never inflate or regress the readback. No history rows and
+/// no rollups: only the latest snapshot reads back.
+fn persist_session_usage(scope: EffectScope<'_, '_>, usage: &SessionUsage) -> Result<()> {
+    let EffectScope {
+        tx,
+        agent_num,
+        generation,
+        now,
+        ..
+    } = scope;
+    let snapshot = encode_json(usage)?;
+    if snapshot.len() > MAX_EVENT_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "session usage snapshot exceeds 64 KiB",
+        ));
+    }
+    let observed_at = usage.observed_at.unwrap_or(now);
+    if observed_at < 0 {
+        return Err(Error::new(
+            "invalid",
+            "session usage observed_at must be nonnegative",
+        ));
+    }
+    let stored: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT snapshot, observed_at FROM session_usage WHERE agent = ?1 AND generation = ?2",
+            params![agent_num, generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    match stored {
+        None => {
+            db!(tx.execute(
+                "INSERT INTO session_usage(agent, generation, snapshot, observed_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![agent_num, generation, snapshot, observed_at],
+            ));
+        }
+        Some((stored_snapshot, stored_at)) => {
+            if stored_snapshot == snapshot || observed_at <= stored_at {
+                return Ok(());
+            }
+            db!(tx.execute(
+                "UPDATE session_usage SET snapshot = ?1, observed_at = ?2
+                 WHERE agent = ?3 AND generation = ?4",
+                params![snapshot, observed_at, agent_num, generation],
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn verified_native_event_cause_tx(
     tx: &Transaction<'_>,
     previous_agent: &Agent,
@@ -768,6 +829,7 @@ fn effect_cause_tx(
         | Effect::TurnTerminal { turn_id, .. } => {
             command_cause_for_turn_tx(tx, agent_num, generation, turn_id)
         }
+        Effect::SessionUsageUpdated { .. } => Ok(None),
     }
 }
 

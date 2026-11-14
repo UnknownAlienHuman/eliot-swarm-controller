@@ -330,12 +330,19 @@ the first update in the turn), computed per counter and mapped to
 `last` values are never summed, so a repeated notification holds the
 difference instead of double counting; a counter present in only one
 snapshot (or a backward snapshot) stays null, and a late/stale update for
-another turn is dropped so the terminal keeps null usage rather than
-foreign counters. `tokenUsage.total` is a cumulative per-thread
+another turn leaves the turn baseline alone so the terminal keeps null
+usage rather than foreign counters; the session snapshot still merges after
+exact thread validation. `tokenUsage.total` is a cumulative per-thread
 snapshot and `modelContextWindow` is capacity: session-scoped facts, never
-turn expenditure, and never mapped to `TurnUsage`. Account-level
-cost/credits (`GetAccountTokenUsage`) are account scope. Missing per-turn
-counters stay null.
+turn expenditure, and never mapped to `TurnUsage`. The adapter folds them
+into the retained `SessionUsage` snapshot and commits it as `session.usage`
+when accepted (source `codex:thread/tokenUsage/updated`), with `observed_at`
+captured at acceptance: the cumulative `total` replaces
+the retained input/output/cache counters (never a derived total) and
+`modelContextWindow` replaces the retained capacity; account-level
+cost/credits (`GetAccountTokenUsage`) stay account scope. Missing per-turn
+counters stay null. Idle updates merge and commit without waiting for a
+terminal.
 
 ## Recovery and later capabilities
 
