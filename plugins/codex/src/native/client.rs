@@ -25,8 +25,15 @@ impl NativeStdioConfig for CodexStdioConfig {
     const SERVER: &'static str = "Codex app-server";
     const SHORT: &'static str = "Codex";
     const ID_PREFIX: &'static str = "codex";
-    // No evidence of larger Codex frames: keep the 1 MiB default.
-    const MAX_FRAME_BYTES: usize = eliot_plugin::native_transport::DEFAULT_MAX_NATIVE_FRAME_BYTES;
+    // Live-observed 2026-11-14: a minimal-policy `mcpServerStatus/list`
+    // (`detail: toolsAndAuthOnly`) response reached 1,990,613 bytes against
+    // the 1 MiB default and ended the stream. The installed 0.167.1 schema
+    // offers no names-only detail (`full` | `toolsAndAuthOnly`, both embed
+    // every server's full tool catalogs with input/output schemas), and the
+    // inventory read needs the whole list to prove no unexpected enabled
+    // server, so the 8 MiB cap covers the readback plus owner variance and
+    // envelope overhead. Anything larger stays an explicit oversized gap.
+    const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
     /// Inbound methods the Codex host can legitimately send: the
     /// notifications the event task consumes plus the three server-request
@@ -161,5 +168,17 @@ mod tests {
         assert!(!encoded.contains("xy"));
         let restored: Error = serde_json::from_str(&encoded).expect("decode error diagnostics");
         assert_eq!(restored, error);
+    }
+
+    #[test]
+    fn frame_cap_covers_observed_minimal_inventory() {
+        // Live-observed 2026-11-14: a minimal-policy `mcpServerStatus/list`
+        // response reached 1,990,613 bytes against the old 1 MiB default and
+        // ended the stream. The cap must keep covering that readback while
+        // staying inside the shared pump bound.
+        let cap = CodexStdioConfig::MAX_FRAME_BYTES;
+        let pump_max = eliot_plugin::native_transport::MAX_SUPPORTED_NATIVE_FRAME_BYTES;
+        assert!(cap >= 1_990_613);
+        assert!(cap <= pump_max);
     }
 }
