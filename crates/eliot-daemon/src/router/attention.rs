@@ -36,6 +36,7 @@ const MAX_PROCESS_FACTS: usize = 16;
 enum IncidentKind {
     SourceUnhealthy,
     NoProgress,
+    ChildrenUnattended,
 }
 
 impl IncidentKind {
@@ -43,6 +44,7 @@ impl IncidentKind {
         match self {
             Self::SourceUnhealthy => "source_unhealthy",
             Self::NoProgress => "no_progress",
+            Self::ChildrenUnattended => "children_unattended",
         }
     }
 }
@@ -120,6 +122,9 @@ struct CapturedAgent {
     tool_coverage: eliot_store::ActiveToolCoverage,
     pending_kinds: Vec<String>,
     pending_kinds_truncated: bool,
+    children: eliot_store::NativeChildrenAttention,
+    children_revision: Option<i64>,
+    manager_progress_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -140,6 +145,7 @@ struct AttentionReport {
     progress_age_ms: Option<i64>,
     source_health: Option<bool>,
     activity: String,
+    children: eliot_store::NativeChildrenAttention,
     pending_kinds: Vec<String>,
     pending_kinds_truncated: bool,
     tool_coverage: String,
@@ -312,7 +318,7 @@ pub(crate) async fn run_attention(
 }
 
 fn attention_transition_event(kind: &str) -> bool {
-    kind == "source.health"
+    matches!(kind, "source.health" | "source.gap" | "source.closed")
         || matches!(
             kind,
             "turn.started"
@@ -927,20 +933,30 @@ async fn inspect_agent(
     suspicion_window: Duration,
     trigger: Trigger,
 ) -> Result<()> {
-    if let Trigger::AgentLost { event_seq } = trigger {
-        return inspect_lost_agent(router, state, agent_id, generation, event_seq).await;
-    }
-
     let trigger_event_seq = match trigger {
         Trigger::SourceEvent { event_seq } => Some(event_seq),
         Trigger::Sweep | Trigger::AgentLost { .. } => None,
     };
 
-    let Some(captured) = capture_agent(router, agent_id, generation).await? else {
+    let Some(captured) = capture_agent(router, agent_id, generation, suspicion_window).await?
+    else {
         return Ok(());
     };
     if captured.agent.observe_only {
         return Ok(());
+    }
+    if let Trigger::AgentLost { event_seq } = trigger
+        && child_attention_activity(&captured, suspicion_window).is_none()
+    {
+        return inspect_lost_agent(
+            router,
+            state,
+            agent_id,
+            generation,
+            event_seq,
+            suspicion_window,
+        )
+        .await;
     }
     let desired = desired_incident(&captured, suspicion_window);
     report_cleared_incidents(router, &state, &captured, suspicion_window).await?;
@@ -955,8 +971,13 @@ async fn inspect_agent(
         return Ok(());
     };
     let process_observation = process_observation(router, &captured.agent).await;
-    let native_status = probe_native_status(router, &captured).await;
-    let Some(after_probe) = revalidate_probe(router, &captured, key.kind).await? else {
+    let native_status = if key.kind == IncidentKind::ChildrenUnattended {
+        NativeStatus::not_requested()
+    } else {
+        probe_native_status(router, &captured).await
+    };
+    let Some(after_probe) = revalidate_probe(router, &captured, key.kind, suspicion_window).await?
+    else {
         return Ok(());
     };
     let Some((still_key, still_activity)) = desired_incident(&after_probe, suspicion_window) else {
@@ -973,7 +994,11 @@ async fn inspect_agent(
             incident_id: incident_id(&after_probe, key.kind, still_activity.as_str()),
             activity: still_activity,
             observed_at: now_ms(),
-            suspicion_window: (key.kind == IncidentKind::NoProgress).then_some(suspicion_window),
+            suspicion_window: matches!(
+                key.kind,
+                IncidentKind::NoProgress | IncidentKind::ChildrenUnattended
+            )
+            .then_some(suspicion_window),
             trigger_event_seq,
             native_status,
             process_observation,
@@ -983,6 +1008,16 @@ async fn inspect_agent(
     let incident_id = frozen.report.incident_id.clone();
     let baseline_progress_at = frozen.report.progress_basis_at;
     let baseline_model_progress_at = frozen.report.last_model_progress_at;
+    let child_guard = if key.kind == IncidentKind::ChildrenUnattended {
+        Some(router.inner.store.lock().await)
+    } else {
+        None
+    };
+    if let Some(store) = child_guard.as_deref()
+        && !child_capture_is_current(store, &after_probe)?
+    {
+        return Ok(());
+    }
     reservation.commit(
         key.clone(),
         ActiveIncident {
@@ -993,6 +1028,7 @@ async fn inspect_agent(
             recovery_delivery: None,
         },
     );
+    drop(child_guard);
     let _ = deliver_active_incident(router, &state, &key).await?;
     Ok(())
 }
@@ -1003,8 +1039,10 @@ async fn inspect_lost_agent(
     agent_id: &str,
     generation: i64,
     event_seq: i64,
+    suspicion_window: Duration,
 ) -> Result<()> {
-    let Some(captured) = capture_agent(router, agent_id, generation).await? else {
+    let Some(captured) = capture_agent(router, agent_id, generation, suspicion_window).await?
+    else {
         return Ok(());
     };
     if captured.agent.observe_only || captured.agent.state == AgentState::Stopped {
@@ -1024,8 +1062,13 @@ async fn inspect_lost_agent(
     };
     let process_observation = process_observation(router, &captured.agent).await;
     let native_status = probe_native_status(router, &captured).await;
-    let Some(after_probe) =
-        revalidate_probe(router, &captured, IncidentKind::SourceUnhealthy).await?
+    let Some(after_probe) = revalidate_probe(
+        router,
+        &captured,
+        IncidentKind::SourceUnhealthy,
+        suspicion_window,
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -1082,6 +1125,9 @@ async fn report_cleared_incidents(
     suspicion_window: Duration,
 ) -> Result<()> {
     retire_stopped_source_incidents(router, state, captured).await;
+    // Mail wakes an idle manager and starts/completes a new parent turn. That
+    // must not rearm this incident. Only a fully finished child cohort clears it.
+    retire_finished_child_cohort(router, state, captured).await?;
     let mut candidates = recovery_candidates(state, captured);
     if candidates.is_empty() {
         return Ok(());
@@ -1153,6 +1199,68 @@ async fn report_cleared_incidents(
     Ok(())
 }
 
+fn child_capture_is_current(store: &eliot_store::Store, captured: &CapturedAgent) -> Result<bool> {
+    let Some(revision) = captured.children_revision else {
+        return Ok(false);
+    };
+    if store.native_children_revision(&captured.agent.id, captured.agent.generation)?
+        != Some(revision)
+    {
+        return Ok(false);
+    }
+    Ok(store.get_agent(&captured.agent.id)?.is_some_and(|agent| {
+        agent.generation == captured.agent.generation
+            && agent.active_turn == captured.agent.active_turn
+    }))
+}
+
+async fn retire_finished_child_cohort(
+    router: &Router,
+    state: &Arc<Mutex<AttentionState>>,
+    captured: &CapturedAgent,
+) -> Result<()> {
+    if captured.children.unfinished != 0 {
+        return Ok(());
+    }
+    let key = IncidentKey {
+        agent: captured.agent.id.clone(),
+        generation: captured.agent.generation,
+        kind: IncidentKind::ChildrenUnattended,
+        turn_id: None,
+    };
+    if !state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .active
+        .contains_key(&key)
+    {
+        return Ok(());
+    }
+    // Settle only the already-frozen delivery, using its retained IDs.
+    deliver_active_incident(router, state, &key).await?;
+    let store = router.inner.store.lock().await;
+    retire_child_incident_if_current(&store, state, &key, captured)
+}
+
+fn retire_child_incident_if_current(
+    store: &eliot_store::Store,
+    state: &Arc<Mutex<AttentionState>>,
+    key: &IncidentKey,
+    captured: &CapturedAgent,
+) -> Result<()> {
+    if captured.children.unfinished == 0 && child_capture_is_current(store, captured)? {
+        let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+        if state
+            .active
+            .get(key)
+            .is_some_and(|incident| incident.incident_delivery.is_none())
+        {
+            state.active.remove(key);
+        }
+    }
+    Ok(())
+}
+
 fn recovery_candidates(
     state: &Arc<Mutex<AttentionState>>,
     captured: &CapturedAgent,
@@ -1177,6 +1285,7 @@ fn incident_condition_cleared(
     captured: &CapturedAgent,
 ) -> bool {
     match key.kind {
+        IncidentKind::ChildrenUnattended => false,
         IncidentKind::SourceUnhealthy => {
             captured.source_healthy == Some(true)
                 && !source_is_unhealthy(captured.agent.state, &captured.source_states)
@@ -1266,14 +1375,22 @@ async fn revalidate_probe(
     router: &Router,
     captured: &CapturedAgent,
     kind: IncidentKind,
+    suspicion_window: Duration,
 ) -> Result<Option<CapturedAgent>> {
-    let Some(current) =
-        capture_agent(router, &captured.agent.id, captured.agent.generation).await?
+    let Some(current) = capture_agent(
+        router,
+        &captured.agent.id,
+        captured.agent.generation,
+        suspicion_window,
+    )
+    .await?
     else {
         return Ok(None);
     };
     if current.agent.generation != captured.agent.generation
         || current.agent.active_turn != captured.agent.active_turn
+        || (kind == IncidentKind::ChildrenUnattended
+            && current.children_revision != captured.children_revision)
         || (kind == IncidentKind::NoProgress
             && current.progress_basis_at != captured.progress_basis_at)
     {
@@ -1328,7 +1445,23 @@ async fn capture_agent(
     router: &Router,
     agent_id: &str,
     generation: i64,
+    suspicion_window: Duration,
 ) -> Result<Option<CapturedAgent>> {
+    let binding = {
+        let store = router.inner.store.lock().await;
+        let Some(agent) = store.get_agent(agent_id)? else {
+            return Ok(None);
+        };
+        if agent.generation != generation {
+            return Ok(None);
+        }
+        agent
+    };
+    let Some((children, children_revision)) =
+        capture_child_activity(&router.inner.store, &binding, suspicion_window).await?
+    else {
+        return Ok(None);
+    };
     let (
         agent,
         source_states,
@@ -1338,12 +1471,17 @@ async fn capture_agent(
         turn,
         turn_command_id,
         tool_coverage,
+        manager_progress_at,
     ) = {
         let store = router.inner.store.lock().await;
         let Some(agent) = store.get_agent(agent_id)? else {
             return Ok(None);
         };
-        if agent.generation != generation {
+        if agent.generation != generation
+            || agent.active_turn != binding.active_turn
+            || (children_revision.is_some()
+                && store.native_children_revision(agent_id, generation)? != children_revision)
+        {
             return Ok(None);
         }
         let source_states = store
@@ -1359,6 +1497,11 @@ async fn capture_agent(
             .map(|turn_id| store.get_turn(agent_id, generation, turn_id))
             .transpose()?
             .flatten();
+        let manager_progress_at = store
+            .native_model_progress(agent_id, generation)?
+            .into_iter()
+            .chain(turn.as_ref().and_then(|turn| turn.started_at))
+            .max();
         let turn_command_id = match agent.active_turn.as_deref() {
             Some(turn_id) => store.turn_command_id(agent_id, generation, turn_id)?,
             None => None,
@@ -1395,6 +1538,7 @@ async fn capture_agent(
             turn,
             turn_command_id,
             tool_coverage,
+            manager_progress_at,
         )
     };
     let turn_started_at = turn.and_then(|turn| turn.started_at);
@@ -1429,13 +1573,96 @@ async fn capture_agent(
         tool_coverage,
         pending_kinds,
         pending_kinds_truncated,
+        children,
+        children_revision,
+        manager_progress_at,
     }))
+}
+
+async fn capture_child_activity(
+    store: &super::StoreHandle,
+    manager: &Agent,
+    suspicion_window: Duration,
+) -> Result<Option<(eliot_store::NativeChildrenAttention, Option<i64>)>> {
+    let mut children = eliot_store::NativeChildrenAttention::default();
+    if manager.observe_only {
+        return Ok(Some((children, None)));
+    }
+    let (through, revision) = {
+        let store = store.lock().await;
+        let Some(current) = store.get_agent(&manager.id)? else {
+            return Ok(None);
+        };
+        if current.generation != manager.generation || current.active_turn != manager.active_turn {
+            return Ok(None);
+        }
+        let Some(revision) = store.native_children_revision(&manager.id, manager.generation)?
+        else {
+            return Ok(None);
+        };
+        (
+            store.native_children_attention_end(&manager.id, manager.generation)?,
+            revision,
+        )
+    };
+    let Some(through) = through else {
+        return Ok(Some((children, Some(revision))));
+    };
+    let observed_at = now_ms();
+    let suspicion_ms = i64::try_from(suspicion_window.as_millis()).unwrap_or(i64::MAX);
+    let mut after = None;
+    loop {
+        let page = {
+            let store = store.lock().await;
+            let page = store.native_children_attention_page(
+                &manager.id,
+                manager.generation,
+                after.as_deref(),
+                &through,
+                observed_at,
+                suspicion_ms,
+            )?;
+            // Check every page against the original cohort revision as well as
+            // the manager generation/turn; no mixed-time counts may escape.
+            let Some(current) = store.get_agent(&manager.id)? else {
+                return Ok(None);
+            };
+            if current.generation != manager.generation
+                || current.active_turn != manager.active_turn
+                || store.native_children_revision(&manager.id, manager.generation)?
+                    != Some(revision)
+            {
+                return Ok(None);
+            }
+            page
+        };
+        children.append(page.summary);
+        let Some(next) = page.next else {
+            break;
+        };
+        after = Some(next);
+        // Give admission and native ingestion an opportunity between bounded
+        // pages, even when the next mutex acquisition could otherwise be ready.
+        tokio::task::yield_now().await;
+    }
+    Ok(Some((children, Some(revision))))
 }
 
 fn desired_incident(
     captured: &CapturedAgent,
     suspicion_window: Duration,
 ) -> Option<(IncidentKey, String)> {
+    if let Some(activity) = child_attention_activity(captured, suspicion_window) {
+        return Some((
+            IncidentKey {
+                agent: captured.agent.id.clone(),
+                generation: captured.agent.generation,
+                kind: IncidentKind::ChildrenUnattended,
+                turn_id: None,
+            },
+            activity.to_owned(),
+        ));
+    }
     if captured.agent.state != AgentState::Stopped
         && source_is_unhealthy(captured.agent.state, &captured.source_states)
     {
@@ -1470,6 +1697,29 @@ fn desired_incident(
         },
         activity_classification(captured, suspicion_window),
     ))
+}
+
+fn child_attention_activity(
+    captured: &CapturedAgent,
+    suspicion_window: Duration,
+) -> Option<&'static str> {
+    if captured.children.unfinished == 0 {
+        return None;
+    }
+    let threshold = i64::try_from(suspicion_window.as_millis()).unwrap_or(i64::MAX);
+    let manager_silent = captured
+        .manager_progress_at
+        .and_then(|at| now_ms().checked_sub(at))
+        .is_some_and(|age| age >= threshold);
+    if matches!(captured.agent.state, AgentState::Idle | AgentState::Stopped) || manager_silent {
+        Some("manager_inactive_with_unfinished_children")
+    } else if captured.agent.state == AgentState::Busy
+        && (captured.children.lost > 0 || captured.children.stalled > 0)
+    {
+        Some("child_progress_needs_manager")
+    } else {
+        None
+    }
 }
 
 fn activity_classification(captured: &CapturedAgent, suspicion_window: Duration) -> String {
@@ -1682,6 +1932,22 @@ fn build_report(
         eliot_store::ActiveToolCoverage::Clear => ("clear".to_owned(), Some(0)),
         eliot_store::ActiveToolCoverage::Active { count } => ("active".to_owned(), Some(count)),
     };
+    let (last_model_progress_at, progress_basis_at, progress_age_ms) =
+        if kind == IncidentKind::ChildrenUnattended {
+            let at = captured.manager_progress_at;
+            (
+                at,
+                at,
+                at.and_then(|at| observed_at.checked_sub(at))
+                    .filter(|age| *age >= 0),
+            )
+        } else {
+            (
+                captured.last_model_progress_at,
+                captured.progress_basis_at,
+                captured.progress_age_ms,
+            )
+        };
     AttentionReport {
         schema: 1,
         incident_id,
@@ -1695,11 +1961,12 @@ fn build_report(
         observed_at,
         suspicion_window_ms: suspicion_window
             .and_then(|window| i64::try_from(window.as_millis()).ok()),
-        last_model_progress_at: captured.last_model_progress_at,
-        progress_basis_at: captured.progress_basis_at,
-        progress_age_ms: captured.progress_age_ms,
+        last_model_progress_at,
+        progress_basis_at,
+        progress_age_ms,
         source_health: captured.source_healthy,
         activity,
+        children: captured.children.clone(),
         pending_kinds: captured.pending_kinds.clone(),
         pending_kinds_truncated: captured.pending_kinds_truncated,
         tool_coverage,
@@ -2004,7 +2271,7 @@ async fn send_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
     if let Some(parent) = report
         .parent_agent
         .as_ref()
-        .filter(|parent| *parent != &report.agent_id)
+        .filter(|parent| *parent != &report.agent_id && report.reason != "children_unattended")
     {
         let supervisor = MailSendRequest {
             id: delivery.supervisor_mail_id.clone(),
@@ -2043,6 +2310,11 @@ async fn send_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
             .await
         {
             delivery_errors.push(format!("owner_notify:{}", error.code));
+        }
+        if report.reason == "children_unattended"
+            && let Err(error) = wait_for_applied(router, &delivery.owner_notify_id).await
+        {
+            delivery_errors.push(format!("owner_notify_settlement:{}", error.code));
         }
     }
     if delivery_errors.is_empty() {
@@ -2086,9 +2358,12 @@ fn diagnosis_summary(report: &AttentionReport) -> String {
         .map(|exited| exited.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
     format!(
-        "Diagnosis: reason={}, activity={}, source_health={}, progress_age_ms={}, native_probe_requested={}, native_state={}, native_error={}, native_basis={}, native_freshness={}, native_binding_matches={}, process_coverage={}, process_sample_age_ms={}, process_complete={}, process_exited={}",
+        "Diagnosis: reason={}, activity={}, children_unfinished={}, children_lost={}, children_stalled={}, source_health={}, progress_age_ms={}, native_probe_requested={}, native_state={}, native_error={}, native_basis={}, native_freshness={}, native_binding_matches={}, process_coverage={}, process_sample_age_ms={}, process_complete={}, process_exited={}",
         report.reason,
         report.activity,
+        report.children.unfinished,
+        report.children.lost,
+        report.children.stalled,
         source_health,
         progress_age,
         report.native_status.probe_requested,
@@ -2115,5 +2390,362 @@ fn state_name(state: AgentState) -> &'static str {
         AgentState::Failed => "failed",
         AgentState::Lost => "lost",
         AgentState::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod child_attention_tests {
+    use super::*;
+
+    fn store_with_children(child_count: usize) -> (eliot_store::Store, Agent, Vec<String>) {
+        use eliot_core::{ChildRegistration, NativeEvent, SourceBatch, SubmitCommand};
+        let now = now_ms();
+        let mut store = eliot_store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        let mut launch = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        launch.expected_generation = Some(0);
+        launch.args = json!({"harness":"codex", "profile":"page-test", "profile_snapshot":{},
+            "project":"page-test", "workspace":"page-test"});
+        let command = launch.id.clone();
+        let manager_id = store
+            .submit("owner", launch, now)
+            .unwrap()
+            .command
+            .target
+            .unwrap();
+        store.dispatch(&command, now).unwrap();
+        let plan = ["session", "turn", "message"]
+            .into_iter()
+            .map(|family| (family.to_owned(), "stream".to_owned()))
+            .collect();
+        store
+            .install_plugin_sources(&manager_id, 1, &command, &plan, now)
+            .unwrap();
+        store.put_batch(SourceBatch {
+            batch_id: "ready".to_owned(), agent_id: manager_id.clone(), generation: 1,
+            source: "stream".to_owned(), cursor: None,
+            events: vec![NativeEvent { kind: "session.ready".to_owned(), native_id: "ready".to_owned(),
+                ts: Some(now), data: json!({"command_id":command,"native_scope":"page-test","native_ref":"manager"}) }],
+        }, now).unwrap();
+        store
+            .settle(&command, CommandState::Applied, None, now)
+            .unwrap();
+        let mut children = Vec::new();
+        for index in 0..child_count {
+            children.push(
+                store
+                    .register_native_child(
+                        &manager_id,
+                        1,
+                        ChildRegistration {
+                            registration_id: format!("child-{index}"),
+                            parent_id: manager_id.clone(),
+                            parent_generation: 1,
+                            parent_native_ref: "manager".to_owned(),
+                            native_scope: "page-test".to_owned(),
+                            native_ref: format!("child-{index}"),
+                        },
+                        now,
+                    )
+                    .unwrap()
+                    .value
+                    .agent
+                    .id,
+            );
+        }
+        let manager = store.get_agent(&manager_id).unwrap().unwrap();
+        (store, manager, children)
+    }
+
+    #[tokio::test]
+    async fn pages_release_store_and_reject_a_replaced_manager_generation() {
+        use eliot_core::SubmitCommand;
+        let now = now_ms();
+        let (store, manager, _) =
+            store_with_children(eliot_store::NATIVE_CHILD_ATTENTION_PAGE_SIZE + 1);
+        let manager_id = manager.id.clone();
+        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let capture = capture_child_activity(&store, &manager, Duration::from_secs(900));
+        tokio::pin!(capture);
+        // The first pending point is the explicit handoff after one complete page.
+        assert!(futures_util::poll!(&mut capture).is_pending());
+        {
+            let mut writer = store
+                .try_lock()
+                .expect("capture retained Store across a page handoff");
+            writer.mark_lost(&manager_id, 1, now + 1).unwrap();
+            // Store-only fixture: no process or native reader was launched.
+            writer
+                .close_native_sources(&manager_id, 1, now + 1)
+                .unwrap();
+            writer
+                .release_restart_closed_generation(
+                    &manager_id,
+                    1,
+                    "store_only_fixture",
+                    false,
+                    now + 1,
+                )
+                .unwrap();
+            let mut resume = SubmitCommand::new(ulid::Ulid::new().to_string(), "resume");
+            resume.target = Some(manager_id.clone());
+            resume.expected_generation = Some(1);
+            let resume_id = resume.id.clone();
+            writer.submit("owner", resume, now + 2).unwrap();
+            writer.dispatch(&resume_id, now + 2).unwrap();
+            assert_eq!(
+                writer.get_agent(&manager_id).unwrap().unwrap().generation,
+                2
+            );
+        }
+        assert!(capture.await.unwrap().is_none());
+    }
+
+    fn child_turn_fact(
+        store: &mut eliot_store::Store,
+        manager: &Agent,
+        child: &str,
+        turn: &str,
+        kind: &str,
+    ) {
+        let id = ulid::Ulid::new().to_string();
+        let data = if kind == "turn.completed" {
+            json!({"turn_id":turn, "status":"completed"})
+        } else {
+            json!({"turn_id":turn})
+        };
+        store
+            .put_native_child_batch(
+                &manager.id,
+                manager.generation,
+                eliot_core::SourceBatch {
+                    batch_id: id.clone(),
+                    agent_id: child.to_owned(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    cursor: Some(id.clone()),
+                    events: vec![eliot_core::NativeEvent {
+                        kind: kind.to_owned(),
+                        native_id: id,
+                        ts: Some(now_ms()),
+                        data,
+                    }],
+                },
+                now_ms(),
+            )
+            .unwrap();
+    }
+
+    async fn assert_overlap_invalidates_capture(existing_child: bool) {
+        let (mut store, manager, children) =
+            store_with_children(eliot_store::NATIVE_CHILD_ATTENTION_PAGE_SIZE + 1);
+        for child in &children[..eliot_store::NATIVE_CHILD_ATTENTION_PAGE_SIZE] {
+            child_turn_fact(&mut store, &manager, child, "finished", "turn.completed");
+        }
+        let a = children.last().unwrap();
+        child_turn_fact(&mut store, &manager, a, "A", "turn.started");
+        let through = store
+            .native_children_attention_end(&manager.id, manager.generation)
+            .unwrap();
+        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let capture = capture_child_activity(&store, &manager, Duration::from_secs(900));
+        tokio::pin!(capture);
+        assert!(futures_util::poll!(&mut capture).is_pending());
+        {
+            let mut writer = store.try_lock().unwrap();
+            let b = if existing_child {
+                children[0].clone()
+            } else {
+                writer
+                    .register_native_child(
+                        &manager.id,
+                        manager.generation,
+                        eliot_core::ChildRegistration {
+                            registration_id: "overlapping-B".to_owned(),
+                            parent_id: manager.id.clone(),
+                            parent_generation: manager.generation,
+                            parent_native_ref: "manager".to_owned(),
+                            native_scope: "page-test".to_owned(),
+                            native_ref: "overlapping-B".to_owned(),
+                        },
+                        now_ms(),
+                    )
+                    .unwrap()
+                    .value
+                    .agent
+                    .id
+            };
+            child_turn_fact(&mut writer, &manager, &b, "B", "turn.started");
+            child_turn_fact(&mut writer, &manager, a, "A", "turn.completed");
+            if existing_child {
+                assert_eq!(
+                    writer
+                        .native_children_attention_end(&manager.id, manager.generation)
+                        .unwrap(),
+                    through
+                );
+            }
+            let current = writer.get_agent(&manager.id).unwrap().unwrap();
+            assert_eq!(
+                (current.generation, current.active_turn),
+                (manager.generation, manager.active_turn.clone())
+            );
+        }
+        // The old mixed-time read would return zero and retire the incident.
+        assert!(capture.await.unwrap().is_none());
+        let (stable, _) = capture_child_activity(&store, &manager, Duration::from_secs(900))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stable.unfinished, 1);
+    }
+
+    #[tokio::test]
+    async fn overlapping_new_child_invalidates_the_whole_capture() {
+        assert_overlap_invalidates_capture(false).await;
+    }
+
+    #[tokio::test]
+    async fn existing_child_new_turn_invalidates_without_registration_change() {
+        assert_overlap_invalidates_capture(true).await;
+    }
+
+    #[tokio::test]
+    async fn stale_empty_capture_cannot_retire_or_rearm_an_existing_incident() {
+        let (store, owner, children) = store_with_children(1);
+        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let (summary, revision) = capture_child_activity(&store, &owner, Duration::from_secs(900))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut captured = manager();
+        captured.agent = owner.clone();
+        captured.children = summary;
+        captured.children_revision = revision;
+        let key = IncidentKey {
+            agent: owner.id.clone(),
+            generation: owner.generation,
+            kind: IncidentKind::ChildrenUnattended,
+            turn_id: None,
+        };
+        let state = Arc::new(Mutex::new(AttentionState::default()));
+        reserve_incident(&state, &key).unwrap().commit(
+            key.clone(),
+            ActiveIncident {
+                incident_id: "already-delivered".to_owned(),
+                baseline_progress_at: None,
+                baseline_model_progress_at: None,
+                incident_delivery: None,
+                recovery_delivery: None,
+            },
+        );
+        {
+            let mut writer = store.lock().await;
+            child_turn_fact(&mut writer, &owner, &children[0], "late", "turn.started");
+            assert!(!child_capture_is_current(&writer, &captured).unwrap());
+            retire_child_incident_if_current(&writer, &state, &key, &captured).unwrap();
+            assert!(state.lock().unwrap().active.contains_key(&key));
+            assert!(reserve_incident(&state, &key).is_none());
+            child_turn_fact(&mut writer, &owner, &children[0], "late", "turn.completed");
+        }
+        let (summary, revision) = capture_child_activity(&store, &owner, Duration::from_secs(900))
+            .await
+            .unwrap()
+            .unwrap();
+        captured.children = summary;
+        captured.children_revision = revision;
+        let writer = store.lock().await;
+        retire_child_incident_if_current(&writer, &state, &key, &captured).unwrap();
+        assert!(!state.lock().unwrap().active.contains_key(&key));
+    }
+
+    fn manager() -> CapturedAgent {
+        let now = now_ms();
+        let mut agent = Agent::new("a1", "project", "codex", "profile", now);
+        agent.generation = 1;
+        agent.state = AgentState::Busy;
+        agent.active_turn = Some("parent-turn".to_owned());
+        CapturedAgent {
+            agent,
+            source_states: Vec::new(),
+            source_healthy: Some(true),
+            unhealthy_source_seq: None,
+            last_model_progress_at: Some(now),
+            progress_basis_at: Some(now),
+            progress_age_ms: Some(0),
+            turn_command_id: None,
+            tool_coverage: eliot_store::ActiveToolCoverage::Clear,
+            pending_kinds: Vec::new(),
+            pending_kinds_truncated: false,
+            children: eliot_store::NativeChildrenAttention {
+                unfinished: 1,
+                ..Default::default()
+            },
+            children_revision: None,
+            manager_progress_at: Some(now),
+        }
+    }
+
+    #[test]
+    fn decision_requires_unfinished_children_and_manager_or_child_suspicion() {
+        let window = Duration::from_secs(900);
+        let mut captured = manager();
+        assert!(child_attention_activity(&captured, window).is_none());
+        for state in [AgentState::Idle, AgentState::Stopped] {
+            captured.agent.state = state;
+            assert_eq!(
+                child_attention_activity(&captured, window),
+                Some("manager_inactive_with_unfinished_children")
+            );
+        }
+        captured.agent.state = AgentState::Busy;
+        captured.children.stalled = 1;
+        assert_eq!(
+            child_attention_activity(&captured, window),
+            Some("child_progress_needs_manager")
+        );
+        captured.children.stalled = 0;
+        captured.children.lost = 1;
+        assert_eq!(
+            child_attention_activity(&captured, window),
+            Some("child_progress_needs_manager")
+        );
+        captured.agent.state = AgentState::Waiting;
+        assert!(child_attention_activity(&captured, window).is_none());
+        captured.agent.state = AgentState::Busy;
+        captured.children.lost = 0;
+        captured.manager_progress_at = Some(now_ms() - 900_001);
+        assert_eq!(
+            child_attention_activity(&captured, window),
+            Some("manager_inactive_with_unfinished_children")
+        );
+        captured.children.unfinished = 0;
+        captured.agent.state = AgentState::Idle;
+        assert!(child_attention_activity(&captured, window).is_none());
+    }
+
+    #[test]
+    fn mail_wake_and_parent_turn_changes_do_not_rearm_child_cohort() {
+        let window = Duration::from_secs(900);
+        let mut captured = manager();
+        captured.agent.state = AgentState::Idle;
+        let (key, _) = desired_incident(&captured, window).unwrap();
+        let state = Arc::new(Mutex::new(AttentionState::default()));
+        let incident = ActiveIncident {
+            incident_id: "frozen-child-incident".to_owned(),
+            baseline_progress_at: captured.progress_basis_at,
+            baseline_model_progress_at: captured.last_model_progress_at,
+            incident_delivery: None,
+            recovery_delivery: None,
+        };
+        reserve_incident(&state, &key)
+            .unwrap()
+            .commit(key.clone(), incident.clone());
+        captured.agent.active_turn = Some("mail-wake-turn".to_owned());
+        captured.manager_progress_at = Some(now_ms());
+        captured.children.unfinished = 100;
+        let (same_key, _) = desired_incident(&captured, window).unwrap();
+        assert_eq!(same_key, key);
+        assert!(reserve_incident(&state, &same_key).is_none());
+        assert!(!incident_condition_cleared(&same_key, &incident, &captured));
     }
 }

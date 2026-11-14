@@ -32,9 +32,14 @@ Message {
 }
 ```
 
-All implemented recipient deliveries use `<write-id>/<recipient-agent>` identifiers and
-create atomic concrete recipient rows from the frozen recipient list in one bounded
-transaction. The frozen list is not reevaluated later. One admission names 1–100
+Standalone recipient deliveries use `<write-id>/<recipient-agent>` identifiers.
+Admitted [`mail.send` rule children](automation.md#actions-are-commands) use
+`rule:<ULID>/<recipient-agent>`: the ULID combines the child's persisted admission
+timestamp with deterministic child-identity entropy, outside the public write ID
+namespace. Both forms retain the timestamp needed to classify pruned deliveries
+for reads and idempotent acknowledgements. Each creates atomic concrete recipient
+rows from the frozen recipient list in one bounded transaction.
+The frozen list is not reevaluated later. One admission names 1–100
 concrete recipients. Same id with different identity/mode/body rejects; unknown
 recipient never creates an Agent. Text is at most 32 KiB, known secrets rejected.
 Only `queue` mode is connected; `send`, `steer` and `inject` presentation

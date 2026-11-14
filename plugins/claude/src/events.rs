@@ -48,6 +48,7 @@ const DENY_CHOICE_ID: &str = "deny";
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventStatus {
+    pub native_drained: bool,
     pub ready: bool,
     pub session_id: Option<String>,
     pub active_command_id: Option<String>,
@@ -192,6 +193,41 @@ struct PendingNativeRequest {
     input: Value,
     reply_command_id: Option<String>,
     reply_state: NativeReplyState,
+}
+
+/// Canonical outcome for one Claude terminal reason, decided here at the
+/// plugin boundary; the verbatim reason is preserved as `native_status`
+/// next to it. `success` is the only recognized success. `cancelled` and
+/// `interrupted` are interrupts; supported native failures (`error`,
+/// `failed`, `failure` and the `api_error...` family) fail. Anything else
+/// is unknown: an unrecognized reason never defaults to success.
+fn claude_outcome(reason: &str) -> &'static str {
+    match reason.trim() {
+        "success" => "success",
+        "cancelled" | "interrupted" => "interrupted",
+        "error" | "failed" | "failure" => "failure",
+        reason => {
+            let lower = reason.to_lowercase();
+            if lower.starts_with("api_error")
+                || lower.starts_with("error")
+                || lower.starts_with("failed")
+                || lower.starts_with("failure")
+            {
+                "failure"
+            } else {
+                "unknown"
+            }
+        }
+    }
+}
+
+/// Classify the original terminal reason first, then redact for persistence:
+/// a configured secret inside the reason must not change its outcome (a
+/// secret `error` redacts `api_error` into `api_[REDACTED]`, i.e. unknown).
+/// Returns the canonical outcome and the sanitized reason.
+fn terminal_outcome_and_status(reason: &str, secrets: &SecretPolicy) -> (&'static str, String) {
+    let outcome = claude_outcome(reason);
+    (outcome, secrets.redact_text(reason))
 }
 
 /// Compose a decision-relevant plain-text summary of a `can_use_tool` ask:
@@ -570,6 +606,11 @@ impl EventHandle {
         let _ = timeout_at(Instant::now() + EVENT_DEADLINE, reply_rx).await;
     }
 
+    pub async fn drain_native(&self) -> Result<()> {
+        eliot_plugin::native_lifecycle::wait_for_native_tail(&self.status, |s| s.native_drained)
+            .await
+    }
+
     pub fn status(&self) -> EventStatus {
         self.status.borrow().clone()
     }
@@ -650,7 +691,9 @@ async fn run(
 }
 
 fn publish(processor: &EventProcessor, status: &watch::Sender<EventStatus>) {
-    let _ = status.send_replace(processor.status.clone());
+    let mut current = processor.status.clone();
+    current.native_drained = processor.frames_drained;
+    let _ = status.send_replace(current);
 }
 
 /// Serve one control behind any queued frame. True ends the run loop.
@@ -2616,11 +2659,14 @@ impl EventProcessor {
             return Ok(());
         }
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
-        let terminal_reason = secrets.redact_text(&parsed.terminal_reason);
+        let (outcome, terminal_reason) =
+            terminal_outcome_and_status(&parsed.terminal_reason, &secrets);
         let mut data = json!({
             "command_id": command_id.clone(),
             "turn_id": turn_id.clone(),
             "status": terminal_reason.clone(),
+            "outcome": outcome,
+            "native_status": terminal_reason.clone(),
         });
         // Optional native main-loop turn usage: absent/malformed usage never
         // blocks or gaps this terminal; it simply leaves `data.usage` unset.
@@ -2764,7 +2810,7 @@ impl EventProcessor {
                 // drain in case this immediate record is blocked.
                 let reason = format!(
                     "Claude stream contained an invalid frame ({})",
-                    fault.label()
+                    fault.describe()
                 );
                 if self.pending_fault_gap.is_none() {
                     self.pending_fault_gap = Some(reason.clone());
@@ -2948,6 +2994,42 @@ mod tests {
         processor.status.ready = true;
         processor.status.session_id = Some("test-session".to_owned());
         processor
+    }
+
+    #[test]
+    fn terminal_reasons_classify_without_defaulting_to_success() {
+        assert_eq!(claude_outcome("success"), "success");
+        assert_eq!(claude_outcome("cancelled"), "interrupted");
+        assert_eq!(claude_outcome("interrupted"), "interrupted");
+        for reason in [
+            "api_error",
+            "api_error_rate_limited",
+            "error",
+            "failed",
+            "failure",
+        ] {
+            assert_eq!(claude_outcome(reason), "failure", "reason={reason}");
+        }
+        for reason in ["", "completed", "end_turn", "inProgress", "bogus"] {
+            assert_eq!(claude_outcome(reason), "unknown", "reason={reason}");
+        }
+    }
+
+    #[test]
+    fn terminal_outcome_uses_the_pre_redaction_reason() {
+        // A configured secret inside the reason must not change its outcome:
+        // a secret `error` redacts `api_error` into `api_[REDACTED]` (unknown
+        // on its own), but the persisted outcome stays `failure` while only
+        // sanitized text is stored.
+        let secrets = SecretPolicy::new(["error"]);
+        let (outcome, status) = terminal_outcome_and_status("api_error", &secrets);
+        assert_eq!(outcome, "failure");
+        assert_eq!(status, "api_[REDACTED]");
+        assert_eq!(claude_outcome(&status), "unknown");
+        let plain = SecretPolicy::new(Vec::<String>::new());
+        let (outcome, status) = terminal_outcome_and_status("api_error", &plain);
+        assert_eq!(outcome, "failure");
+        assert_eq!(status, "api_error");
     }
 
     #[tokio::test]

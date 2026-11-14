@@ -140,7 +140,7 @@ fn decode_goal_request<T>(
     validate: fn(&T) -> Result<()>,
 ) -> Result<T>
 where
-    T: DeserializeOwned,
+    T: DeserializeOwned + schemars::JsonSchema,
 {
     require_owner(principal)?;
     decode_coordination_request(params, secrets, method, validate)

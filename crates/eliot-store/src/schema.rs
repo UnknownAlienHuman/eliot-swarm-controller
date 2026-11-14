@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 28;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 30;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -687,6 +687,70 @@ impl Store {
                  INSERT INTO schema_migrations(version) VALUES (28);",
             )
             .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 29 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE turns ADD COLUMN outcome TEXT
+                     CHECK(outcome IS NULL OR outcome IN ('success','failure','interrupted','unknown'));
+                 ALTER TABLE turns ADD COLUMN native_status TEXT
+                     CHECK(native_status IS NULL OR length(native_status) > 0);
+                 INSERT INTO schema_migrations(version) VALUES (29);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 30 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX native_children_producer ON native_child_registrations(producer, producer_generation, child);
+                 CREATE INDEX turns_native_activity ON turns(agent, generation, state, COALESCE(completed_at, started_at, 0));
+                 CREATE INDEX events_native_progress_time ON events(agent, generation, ts DESC)
+                     WHERE native_id IS NOT NULL AND source NOT IN ('daemon', 'os', 'git', 'workspace_process')
+                     AND kind IN ('turn.started', 'turn.completed', 'message.completed',
+                                  'tool.started', 'tool.completed', 'request.opened', 'request.resolved', 'request.closed');
+                 CREATE INDEX events_git_progress_time ON events(agent, generation, ts DESC)
+                     WHERE source = 'git' AND kind = 'file.changed';
+                 ALTER TABLE agents ADD COLUMN native_child_revision INTEGER NOT NULL DEFAULT 0
+                     CHECK(typeof(native_child_revision) = 'integer' AND native_child_revision >= 0);
+                 CREATE TRIGGER native_child_activity_revision AFTER INSERT ON events
+                 WHEN NEW.agent IS NOT NULL AND NEW.generation IS NOT NULL AND (
+                     NEW.kind IN ('agent.created', 'turn.started', 'turn.completed', 'turn.unknown', 'turn.resolved',
+                                  'message.completed', 'tool.started', 'tool.completed',
+                                  'request.opened', 'request.resolved', 'request.closed', 'agent.lost')
+                     OR NEW.kind GLOB 'session.*'
+                     OR (NEW.kind GLOB 'source.*'
+                         AND COALESCE(json_extract(NEW.data, '$.source'), '') NOT IN ('daemon', 'os', 'git', 'workspace_process')))
+                 BEGIN
+                     UPDATE agents SET native_child_revision = native_child_revision + 1
+                     WHERE id = (SELECT producer FROM native_child_registrations WHERE child = NEW.agent)
+                       AND generation = (SELECT producer_generation FROM native_child_registrations WHERE child = NEW.agent)
+                       AND EXISTS(SELECT 1 FROM agents c WHERE c.id = NEW.agent AND c.generation = NEW.generation);
+                     UPDATE agents SET native_child_revision = native_child_revision + 1
+                     WHERE id = NEW.agent AND generation = NEW.generation
+                       AND (NEW.kind GLOB 'source.*' OR NEW.kind GLOB 'session.*' OR NEW.kind = 'agent.lost')
+                       AND EXISTS(SELECT 1 FROM native_child_registrations r
+                           WHERE r.producer = NEW.agent AND r.producer_generation = NEW.generation);
+                 END;
+                 CREATE TRIGGER native_child_progress_pruned AFTER DELETE ON events
+                 WHEN OLD.native_id IS NOT NULL AND OLD.source NOT IN ('daemon', 'os', 'git', 'workspace_process')
+                     AND OLD.kind IN ('turn.started', 'turn.completed', 'message.completed',
+                                      'tool.started', 'tool.completed', 'request.opened', 'request.resolved', 'request.closed')
+                 BEGIN
+                     UPDATE agents SET native_child_revision = native_child_revision + 1
+                     WHERE id = (SELECT producer FROM native_child_registrations WHERE child = OLD.agent)
+                       AND generation = (SELECT producer_generation FROM native_child_registrations WHERE child = OLD.agent)
+                       AND EXISTS(SELECT 1 FROM agents c WHERE c.id = OLD.agent AND c.generation = OLD.generation);
+                 END;
+                 INSERT INTO schema_migrations(version) VALUES (30);",
+            ).map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
         Ok(())

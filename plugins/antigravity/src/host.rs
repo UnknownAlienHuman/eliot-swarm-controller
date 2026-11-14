@@ -58,10 +58,13 @@ pub(crate) async fn run() -> Result<()> {
     let mut deferred_count = 0_usize;
     let mut shutdown_requested = false;
     let mut shutdown = false;
+    let mut native_endpoint_retired = false;
+    let mut native_retirement = Ok(());
     let mut transport_closed = false;
     let mut pending_request = None;
     while !shutdown_requested || deferred_count > 0 {
         enum Next {
+            NativeExit,
             Request(Option<RpcRequest>),
             Deferred(Option<DeferredCompletion>),
         }
@@ -69,11 +72,25 @@ pub(crate) async fn run() -> Result<()> {
             Next::Request(Some(request))
         } else {
             tokio::select! {
+                biased;
+                () = async {
+                    match plugin.session.as_mut() {
+                        Some(session) => session.wait_for_native_exit().await,
+                        None => std::future::pending().await,
+                    }
+                }, if !shutdown_requested => Next::NativeExit,
                 request = requests.recv(), if !shutdown_requested => Next::Request(request),
                 completed = deferred_rx.recv(), if deferred_count > 0 => Next::Deferred(completed),
             }
         };
         match next {
+            Next::NativeExit => {
+                if let Some(session) = plugin.session.as_mut() {
+                    native_retirement = session.retire_native_exit().await;
+                }
+                native_endpoint_retired = true;
+                shutdown_requested = true;
+            }
             Next::Request(Some(request)) => {
                 let stopping = request.method == "shutdown";
                 let dispatch = if request.method == "agent.snapshot" {
@@ -191,12 +208,14 @@ pub(crate) async fn run() -> Result<()> {
             }
         }
     }
-    if let Some(session) = &mut plugin.session {
+    if !native_endpoint_retired && let Some(session) = &mut plugin.session {
         let _ = session.terminate(true).await;
     }
     reader.abort();
     let _ = reader.await;
-    if shutdown && !transport_closed {
+    if native_endpoint_retired && !transport_closed {
+        native_retirement
+    } else if shutdown && !transport_closed {
         Ok(())
     } else {
         Err(Error::new(
@@ -406,7 +425,19 @@ impl Plugin {
             return outcome.clone();
         }
         let hooks = HookServer::bind().await?;
-        let plan = crate::profile::Plan::new(&params, &credential, hooks.token(), &instance_dir)?;
+        // Stage the dedicated hook-discovery root before planning: it is the
+        // only `--add-dir` native root, and the private instance directory
+        // is never exposed to the native CLI.
+        let helper = crate::session::hook_helper_path()?;
+        let workspace_path = params
+            .workspace
+            .as_deref()
+            .map_or_else(PathBuf::new, PathBuf::from);
+        let hook_config =
+            crate::session::stage_hook_config(&instance_dir, &workspace_path, &helper)
+                .map_err(|error| error.with_code("native_not_dispatched"))?;
+        let plan =
+            crate::profile::Plan::new(&params, &credential, hooks.token(), hook_config.root())?;
         // Latch before creating a native conversation. Any failure after spawn
         // is retained; this generation never starts a second process on retry.
         self.start = Some((
@@ -417,7 +448,7 @@ impl Plugin {
             )),
         ));
         let result =
-            match Session::spawn(&params, &plan, peer, &credential, &instance_dir, hooks).await {
+            match Session::spawn(&params, &plan, peer, &credential, hook_config, hooks).await {
                 Ok(session) => {
                     self.session = Some(session);
                     let session = self

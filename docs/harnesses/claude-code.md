@@ -59,10 +59,29 @@ file in the Eliot-created Agent instance directory. It registers the standard
 `swarm` tool through an `eliot-swarm` stdio server using the current Eliot executable and explicit
 `--data-dir <ELIOT_HOME> mcp --require-agent` arguments. The config contains no
 identity values; the server inherits the Agent id, generation, and token from
-the native process environment, and `--require-agent` fails closed. Eliot does
-not pass `--strict-mcp-config` or write Claude's user configuration, so other
-native MCP sources keep Claude Code's normal behavior. The file remains with
+the native process environment, and `--require-agent` fails closed. The file remains with
 the owned CLI and is removed after confirmed stop and drain.
+
+### Worker MCP policy
+
+The additive per-run config above is the `inherit` policy (the default):
+other native MCP sources keep Claude Code's normal behavior. Profiles may
+select `mcp = "minimal"`, frozen in the profile snapshot; a non-empty
+`mcp_allow` is rejected as `unsupported` at config load because Claude has
+no selective-inclusion mechanism. `minimal` adds the installed
+`--strict-mcp-config` flag ahead of `--mcp-config`, so only the per-run
+file applies. Verified
+read-only against installed Claude Code 2.1.278 (`claude --help`):
+`--strict-mcp-config` means "Only use MCP servers from `--mcp-config`,
+ignoring all other MCP configurations". Eliot never writes Claude's user
+configuration in either policy.
+
+Requested vs observed: `requested` carries `mcp_policy` and `mcp_allow`;
+`effective` carries `mcp_policy` and the server set as unknown (`null` /
+unverified). The installed stream-json protocol exposes no MCP inventory
+record, so the effective set is not read back and the requested set is never
+echoed as observed; the applied `--strict-mcp-config` argv is the qualified
+startup difference for `minimal`.
 
 Resolve Windows executables explicitly; never insert an unrequested shell wrapper.
 Avoid modes that disable required hooks/instructions.

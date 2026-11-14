@@ -24,6 +24,7 @@ pub(crate) struct Plan {
     pub model: String,
     pub scope: String,
     pub resume: Option<String>,
+    pub hook_discovery: PathBuf,
     mode: Option<String>,
     skip_permissions: bool,
 }
@@ -72,7 +73,7 @@ impl Plan {
         params: &AgentStartParams,
         credential: &str,
         hook_token: &str,
-        instance_dir: &Path,
+        hook_discovery_dir: &Path,
     ) -> Result<Self> {
         if params.initial.is_some() {
             return Err(Error::new(
@@ -175,12 +176,18 @@ impl Plan {
             ));
         }
         let resume = resume.map(|subject| subject.native_ref);
+        if !hook_discovery_dir.is_absolute() || !hook_discovery_dir.is_dir() {
+            return Err(Error::new(
+                "invalid",
+                "Antigravity hook discovery directory is unavailable",
+            ));
+        }
         let args = native_args(
             &model,
             mode.as_deref(),
             skip_permissions,
             resume.as_deref(),
-            instance_dir,
+            hook_discovery_dir,
         );
         Ok(Self {
             launch: NativeLaunch {
@@ -193,6 +200,7 @@ impl Plan {
             model,
             scope,
             resume,
+            hook_discovery: hook_discovery_dir.to_owned(),
             mode,
             skip_permissions,
         })
@@ -272,6 +280,7 @@ impl Plan {
             "thought_level": thought_level,
             "permission_mode": self.skip_permissions,
             "cwd": self.launch.cwd,
+            "native_roots": self.native_roots(),
             "session_id": session.session_id,
             "mode": session.modes.as_ref().map(|modes| modes.current_mode_id.clone()),
         }))
@@ -299,7 +308,15 @@ impl Plan {
 
     pub fn requested(&self) -> Value {
         json!({"model": self.model, "cwd": self.launch.cwd, "mode": self.mode,
-            "dangerously_skip_permissions": self.skip_permissions, "transport": "acp"})
+            "dangerously_skip_permissions": self.skip_permissions, "transport": "acp",
+            "native_roots": self.native_roots()})
+    }
+
+    /// Effective native roots with their purpose: the real workspace (the
+    /// ACP session cwd) versus the hook-discovery root (the only `--add-dir`
+    /// directory, holding nothing but `.agents/hooks.json`).
+    fn native_roots(&self) -> Value {
+        json!({"workspace": self.launch.cwd, "hook_discovery": self.hook_discovery})
     }
 }
 
@@ -373,12 +390,15 @@ fn native_args(
     _mode: Option<&str>,
     skip_permissions: bool,
     _resume: Option<&str>,
-    instance_dir: &Path,
+    hook_discovery_dir: &Path,
 ) -> Vec<OsString> {
     // One ACP stdio server per generation. Model, thought level, session
     // mode and resume are ACP session facts now (set_config_option /
     // set_mode / session load), not CLI flags. Permission posture and the
-    // private hook-discovery directory are process launch flags.
+    // hook-discovery directory are process launch flags. The only
+    // `--add-dir` root is the dedicated hook-only directory: it holds
+    // nothing but `.agents/hooks.json`, so the private instance directory
+    // (tokens, logs, state, sockets) is never a writable native work root.
     let mut args = [
         OsString::from("acp"),
         OsString::from("--stdio"),
@@ -386,6 +406,115 @@ fn native_args(
     ]
     .to_vec();
     args.push(OsString::from("--add-dir"));
-    args.push(instance_dir.as_os_str().to_owned());
+    args.push(hook_discovery_dir.as_os_str().to_owned());
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn test_dirs(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("eliot-agy-{tag}-{}", ulid::Ulid::new()));
+        let workspace = base.join("workspace");
+        let hook_root = base.join("hooks");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&hook_root).unwrap();
+        (base, workspace, hook_root)
+    }
+
+    fn start_params(workspace: &Path) -> AgentStartParams {
+        let mut params = AgentStartParams::new("agent-1", 1, "cmd-1");
+        params.workspace = Some(workspace.to_string_lossy().into_owned());
+        params.profile = Some(json!({
+            "harness": "antigravity",
+            "model": "gemini-3.8-flash-high",
+            "cmd": "agy",
+        }));
+        params.source_plan = Some(json!({
+            "session": "stream",
+            "turn": "stream",
+            "message": "stream",
+            "tool": "stream",
+        }));
+        params
+    }
+
+    #[test]
+    fn add_dir_carries_only_the_hook_discovery_root() {
+        let (base, workspace, hook_root) = test_dirs("plan");
+        let instance_dir = base.join("instance-1");
+        fs::create_dir_all(&instance_dir).unwrap();
+        let plan = Plan::new(&start_params(&workspace), "cred", "hook-token", &hook_root).unwrap();
+        let add_dir = plan
+            .launch
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "--add-dir")
+            .map(|pair| pair[1].clone());
+        assert_eq!(add_dir, Some(hook_root.as_os_str().to_owned()));
+        assert!(
+            !plan
+                .launch
+                .args
+                .iter()
+                .any(|arg| arg == instance_dir.as_os_str()),
+            "private instance directory must never be a native root",
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn requested_and_effective_carry_native_roots() {
+        let (base, workspace, hook_root) = test_dirs("roots");
+        let plan = Plan::new(&start_params(&workspace), "cred", "hook-token", &hook_root).unwrap();
+        for facts in [
+            plan.requested(),
+            plan.check_session(
+                &serde_json::from_value(json!({
+                    "protocolVersion": 1,
+                    "agentCapabilities": {"loadSession": false},
+                }))
+                .unwrap(),
+                &serde_json::from_value(json!({
+                    "sessionId": "sess-1",
+                    "modes": null,
+                    "configOptions": [
+                        {"id": "model", "category": "model", "type": "select",
+                         "currentValue": "x",
+                         "options": [{"value": "gemini-3.8-flash", "name": "Flash"}]},
+                        {"id": "thought_level", "category": "thought_level",
+                         "type": "select", "currentValue": "x",
+                         "options": [{"value": "high", "name": "High"}]},
+                    ],
+                }))
+                .unwrap(),
+            )
+            .unwrap(),
+        ] {
+            let roots = &facts["native_roots"];
+            assert_eq!(
+                roots["workspace"].as_str(),
+                Some(workspace.to_string_lossy().as_ref()),
+            );
+            assert_eq!(
+                roots["hook_discovery"].as_str(),
+                Some(hook_root.to_string_lossy().as_ref()),
+            );
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn plan_rejects_a_missing_hook_discovery_dir() {
+        let (base, workspace, _) = test_dirs("missing");
+        let missing = base.join("no-such-hooks-root");
+        let error = match Plan::new(&start_params(&workspace), "cred", "hook-token", &missing) {
+            Ok(_) => panic!("expected an unavailable hook discovery directory"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "invalid");
+        let _ = fs::remove_dir_all(&base);
+    }
 }

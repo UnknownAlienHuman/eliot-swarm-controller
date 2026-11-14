@@ -443,6 +443,69 @@ pub(super) fn submit_tx(
             )?);
             None
         }
+        "mail.send" | "var.set" => {
+            if !derived_rule {
+                return Err(Error::new(
+                    "not_allowed",
+                    "mail.send/var.set commands must be admitted by an event-rule firing",
+                ));
+            }
+            if request.target.is_some()
+                || request.expected_generation.is_some()
+                || request.expected_turn_id.is_some()
+                || request.request_id.is_some()
+                || request.probe
+                || preparation.is_some()
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "mail.send/var.set are targetless commands without Agent bindings",
+                ));
+            }
+            if request.verb == "mail.send" {
+                let definition =
+                    serde_json::from_value::<core::api::MailDefinitionArgs>(request.args.clone())
+                        .map_err(|_| Error::new("invalid", "mail.send definition is malformed"))?;
+                definition.validate().map_err(|error| {
+                    Error::new(
+                        error.code.clone(),
+                        format!("mail.send definition invalid: {}", error.message),
+                    )
+                })?;
+                Store::validate_rule_mail_definition_tx(tx, principal, &definition).map_err(
+                    |error| {
+                        Error::new(
+                            error.code.clone(),
+                            format!("mail.send {}: {}", error.code, error.message),
+                        )
+                    },
+                )?;
+            } else {
+                let definition =
+                    serde_json::from_value::<core::api::VarDefinitionArgs>(request.args.clone())
+                        .map_err(|_| Error::new("invalid", "var.set definition is malformed"))?;
+                definition.validate().map_err(|error| {
+                    Error::new(
+                        error.code.clone(),
+                        format!("var.set definition invalid: {}", error.message),
+                    )
+                })?;
+                Store::validate_rule_var_definition_tx(principal, &definition).map_err(
+                    |error| {
+                        Error::new(
+                            error.code.clone(),
+                            format!("var.set {}: {}", error.code, error.message),
+                        )
+                    },
+                )?;
+            }
+            events.push(admit_command(
+                tx,
+                &CommandInsert::targetless_admitted(principal, &request, &payload_digest, now),
+                json!({"command_id": request.id, "verb": request.verb}),
+            )?);
+            None
+        }
         "inject" => {
             events.push(context::admit_tx(
                 tx,

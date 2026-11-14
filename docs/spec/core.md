@@ -95,6 +95,7 @@ not duplicated Agent columns. No managed row means these projections are absent.
 | observe attach dispatch and exact identity readback | target generation, unknown until current native state is proven |
 | lost start reply without proven endpoint and owner cleanup | starting, start command unknown |
 | proven native endpoint exit plus completed owner cleanup | lost, start command remains unknown |
+| proven native endpoint exit while controlled, after bounded native tail and plugin owner cleanup | lost unless already terminal; preserve terminal turn evidence, otherwise unresolved turn unknown |
 | exact turn start | busy with captured active turn |
 | first request / last resolved request | waiting / busy |
 | exact active turn terminal result | idle, clear that turn's pending requests |
@@ -116,6 +117,21 @@ whether the reader is attached: successful identity attachment can leave native 
 unknown, and a detached row retains that status. Reader-local `notLoaded` is not native
 idle or stopped evidence. Observation failure and restart retain unknown/stale coverage;
 they do not take the controlled-generation `agent.lost` transition.
+
+Native observe-only children also expose the read-only `Agent.activity` projection
+(`NativeChildActivity`): `running` when a committed child turn is open; `lost` when
+that turn remains open but its child, immediate parent or exact producer source is
+closed, gapped, unhealthy or superseded; `idle` after the latest terminal turn, or
+`interrupted` for an interrupted/cancelled terminal turn; `unknown` without sufficient
+turn facts. Partial message facts without a terminal receipt also leave an observed
+turn open; source loss/restart and event retention do not silently clear that work.
+Open turns take precedence over terminal history. `has_open_turn` is a bounded
+existence fact, never a count of unresolved turns. Progress comes only
+from committed native turn/message/tool/request facts, never CPU, Git or mail.
+The projection is derived from existing turns, events and source/registration rows,
+with no new activity table. Retention can leave the progress timestamp unknown.
+`ls`, `show`, `top` and MCP reads expose this field next to unchanged lifecycle
+`state=unknown`; activity grants neither a principal nor child control verbs.
 
 Observe attachment records `origin=external`, `observe_only=true`, `own_identity=false`
 and no token. The generation/source fence commits before reader I/O. Owner-issued native
@@ -532,10 +548,25 @@ CREATE UNIQUE INDEX commands_children ON commands(parent_command,ordinal)
   WHERE parent_command IS NOT NULL;
 CREATE TABLE turns (
   agent INTEGER NOT NULL, generation INTEGER NOT NULL, turn_id TEXT NOT NULL,
-  state TEXT NOT NULL, status TEXT, resolution_source TEXT,
+  state TEXT NOT NULL, status TEXT, outcome TEXT, native_status TEXT,
+  resolution_source TEXT,
   final_text TEXT, usage TEXT, started_at INTEGER, completed_at INTEGER,
   PRIMARY KEY(agent,generation,turn_id)
 );
+
+`turns.outcome` is the canonical task outcome (`success` | `failure` |
+`interrupted` | `unknown`) decided at the plugin boundary from the adapter's
+native terminal vocabulary; `turns.native_status` preserves the raw native
+reason next to it. Lifecycle (`state`) and outcome stay separate facts. Rows
+written before canonical outcomes existed carry no stored outcome and read
+back through explicit harness-aware legacy classification: Claude rows carry
+the raw terminal reason (`success` to success, `cancelled`/`interrupted` to
+interrupted, `error`/`failed`/`failure` and the `api_error*` family to
+failure, anything else to unknown); every other harness carries the
+normalized lifecycle status (`completed` to success, `failed`/`error` to
+failure, `interrupted`/`cancelled` to interrupted, anything else to unknown),
+never defaulting to success. No stored outcome is backfilled: NULL-outcome
+rows keep classifying at read time.
 CREATE TABLE pending_requests (
   agent INTEGER NOT NULL REFERENCES agents(id), generation INTEGER NOT NULL,
   request_id TEXT NOT NULL, turn_id TEXT NOT NULL, kind TEXT NOT NULL,

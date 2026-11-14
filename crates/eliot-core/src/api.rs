@@ -3,6 +3,7 @@
 
 mod agent_views;
 mod coordination;
+pub mod discovery;
 mod git;
 mod goals;
 mod hierarchy;
@@ -37,11 +38,11 @@ pub use coordination::{
     MAX_CLAIMS_PER_AGENT, MAX_MAIL_ACK_IDS, MAX_MAIL_INBOX_ROWS, MAX_MAIL_RECIPIENTS,
     MAX_MAIL_TEXT_BYTES, MAX_MAIL_THREAD_BYTES, MAX_VAR_KEY_BYTES, MAX_VAR_NOTE_BYTES,
     MAX_VAR_SCOPE_BYTES, MAX_VAR_VALUE_BYTES, MAX_WHO_PATHS, MAX_WHO_WORKERS, MailAckRequest,
-    MailAckResponse, MailDelivery, MailDeliverySummary, MailInboxRequest, MailInboxResponse,
-    MailLimits, MailMode, MailReadRequest, MailSendRequest, MailSendResponse, VarGetRequest,
-    VarGetResponse, VarScope, VarSetRequest, VarSetResponse, WhoRequest, WhoResponse,
-    WhoSharedWorkspace, WhoWorker, claim_glob_matches, claim_globs_overlap,
-    claim_globs_overlap_normalized, normalize_claim_glob, parse_var_scope,
+    MailAckResponse, MailDefinitionArgs, MailDelivery, MailDeliverySummary, MailInboxRequest,
+    MailInboxResponse, MailLimits, MailMode, MailReadRequest, MailSendRequest, MailSendResponse,
+    VarDefinitionArgs, VarGetRequest, VarGetResponse, VarScope, VarSetRequest, VarSetResponse,
+    WhoRequest, WhoResponse, WhoSharedWorkspace, WhoWorker, claim_glob_matches,
+    claim_globs_overlap, claim_globs_overlap_normalized, normalize_claim_glob, parse_var_scope,
 };
 pub use git::{
     DEFAULT_GIT_FETCH_TIMEOUT_MS, FrozenGitFetch, GitFetchDefinitionArgs, GitFetchOutcome,
@@ -96,20 +97,31 @@ pub use timers::{CatchUp, TimerGetRequest, TimerRunRequest, TimerSchedule, Timer
 
 use crate::{Error, Event, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1_000;
 const MAX_WAIT_MS: u64 = 30_000;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventsFilter {
     #[serde(default, deserialize_with = "filter_values")]
+    #[schemars(
+        length(max = 1000),
+        description = "At most 1000 nonempty strings, without trimming; duplicates count toward the bound."
+    )]
     pub agents: Vec<String>,
     #[serde(default, deserialize_with = "filter_values")]
+    #[schemars(
+        length(max = 1000),
+        description = "At most 1000 nonempty strings, without trimming; duplicates count toward the bound."
+    )]
     pub kinds: Vec<String>,
     #[serde(default, deserialize_with = "filter_values")]
+    #[schemars(
+        length(max = 1000),
+        description = "At most 1000 nonempty strings, without trimming; duplicates count toward the bound."
+    )]
     pub sources: Vec<String>,
 }
 
@@ -122,7 +134,7 @@ impl EventsFilter {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventsBoundsRequest {
     #[serde(default, deserialize_with = "object_filter")]
@@ -135,7 +147,7 @@ impl EventsBoundsRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventsBoundsResponse {
     pub pruned_through: i64,
     pub hi: i64,
@@ -150,12 +162,14 @@ impl EventsBoundsResponse {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventsReadRequest {
     #[serde(default, deserialize_with = "event_after")]
+    #[schemars(range(min = 0))]
     pub after: i64,
     #[serde(default = "default_limit", deserialize_with = "event_limit")]
+    #[schemars(range(min = 1, max = 1000))]
     pub limit: usize,
     #[serde(default, deserialize_with = "object_filter")]
     pub filter: EventsFilter,
@@ -177,16 +191,22 @@ impl EventsReadRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventsSubscribeRequest {
     #[serde(default, deserialize_with = "event_after")]
+    #[schemars(range(min = 0))]
     pub after: i64,
     #[serde(default = "default_limit", deserialize_with = "event_limit")]
+    #[schemars(range(min = 1, max = 1000))]
     pub limit: usize,
     #[serde(default, deserialize_with = "object_filter")]
     pub filter: EventsFilter,
     #[serde(default, deserialize_with = "event_wait_ms")]
+    #[schemars(
+        range(min = 0),
+        description = "Unsigned milliseconds; values above 30000 are accepted and clamped to 30000."
+    )]
     pub wait_ms: u64,
 }
 
@@ -208,7 +228,7 @@ impl EventsSubscribeRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EventsReadResponse {
     pub events: Vec<Event>,
     pub next: i64,
@@ -222,7 +242,7 @@ impl EventsReadResponse {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EventsSubscribeResponse {
     pub events: Vec<Event>,
     pub next: i64,
@@ -308,10 +328,22 @@ fn filter_values<'de, D: serde::Deserializer<'de>>(
 fn object_filter<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<EventsFilter, D::Error> {
-    // A named struct alone accepts positional sequences. Actual nested filters
-    // require an object, then reuse the single published DTO's field validation.
-    let object = Map::<String, Value>::deserialize(deserializer)?;
-    serde_json::from_value(Value::Object(object)).map_err(serde::de::Error::custom)
+    // Require a map while retaining the original deserializer's nested field
+    // path. Materializing a Value and decoding again loses that path.
+    struct FilterObject;
+    impl<'de> serde::de::Visitor<'de> for FilterObject {
+        type Value = EventsFilter;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an event filter object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            EventsFilter::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+    deserializer.deserialize_map(FilterObject)
 }
 
 fn event_wait_ms<'de, D: serde::Deserializer<'de>>(

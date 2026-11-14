@@ -341,9 +341,12 @@ of the predecessor's `last_store_seq`. For a gap-backed handoff, `0 < gap_seq < 
 
 `source` is the expected predecessor. `families` is a unique nonempty set; order is not
 significant, and Store sorts it before hashing the canonical operation and forming the
-ACK. Store rechecks the selected harness subset: Codex supports `session`,
+ACK. Store rechecks the selected harness subset: Codex and Muse support `session`,
 `turn`, `message`, `tool` and `request`; each other native adapter advertises
-only the families its implemented handlers support. Handoff transfer for
+only the families its implemented handlers support. Muse `tool` facts are the
+normalized `toolCall`/turn-bound `userShell` item revisions; the 1.4 item
+carries no inline workspace paths, so Muse `tool.completed` events attach no
+`changed_paths`. Handoff transfer for
 `child`, `goal` and `usage` stays `unsupported`. Native-child observation is
 implemented separately through the shared
 [`ChildParams`](../../crates/eliot-plugin/src/protocol.rs) /
@@ -440,11 +443,16 @@ when the vendor emitted no intermediate start notification; it is not a syntheti
 completion inferred from silence. Persist the durable `command.applied` association
 event in the same transaction as the source batch that proves it. An exact duplicate
 batch/readback does not publish another `command.applied`. The event means the input was
-associated with its exact turn; it is not the turn's terminal result. Final text precedes
-the terminal turn; process exit or silence is not a turn result. Cumulative usage replaces
+associated with its exact turn; it is not the turn's terminal result. Final text, when
+available, precedes the terminal turn; process exit or silence is not a turn result.
+Cumulative usage replaces
 its prior scope value rather than being summed. OpenCode attributes its final assistant
 message's native token usage to the bound turn's terminal event at message scope; a
 repeated message id replaces, and the value is never presented as a turn or session total.
+An exactly associated OpenCode SSE execution terminal proves its status even when
+HTTP transcript enrichment is unavailable, including after the native server exits.
+Commit that status without final text or usage; unavailable enrichment is not a
+contradictory transcript, and neither permits inferring a missing terminal event.
 
 On a failed terminal event, preserve its exact command/turn binding, status and structured
 provider restriction before optional final text. The following final-text budget rule
@@ -493,6 +501,29 @@ confirms owned plugin-tree cleanup before marking the Agent `lost`. The signal d
 resolve the native effect or permit replay. Without all three native-exit facts, the
 ordinary unknown-start behavior remains in force.
 
+For every controlled session, including an unknown start/resume, the plugin
+subscribes to its existing owned native-process waiter. A confirmed exit retires
+that exact per-generation plugin after bounded native-reader and event-queue
+drain, including commit acknowledgements and pending RPC settlement. A stream
+gap, EOF or failed wait alone does not prove process death. Buffered terminal
+turn evidence is committed before retirement; retirement never manufactures
+`session.ended` or changes an already-applied command. The daemon independently
+confirms its owned plugin exit and drains the plugin reader before its existing
+generation-fenced loss settlement. Without a committed terminal turn, the running
+turn becomes `unknown`; completed turns remain completed. Retiring or duplicate
+exit observations cannot settle a newer generation and never authorize replay.
+An event owner closing before the tail barrier or a drain deadline expiring is
+an explicit unknown retirement error, never successful tail settlement. Retirement
+still ends the unusable plugin; the daemon records missing native evidence as gaps
+and preserves unknown outcomes after its separate custody and reader settlement.
+Every plugin command runs through the shared `native_lifecycle::run_plugin_entry`
+runtime owner. After adapter drains and replies finish, it flushes stdout with a
+one-second deadline and bounds runtime shutdown to one second. An open daemon
+stdin cannot keep an uncancellable Tokio blocking read alive indefinitely at
+runtime teardown. This bound is not proof of native or plugin custody exit.
+Failed-start native-exit evidence remains bound to the exact Agent generation
+and start command until retirement, independently of start-response delivery.
+
 Public requests and answers are universal: `request.opened` details and kinds use the
 shared [`eliot_core::requests`](../../crates/eliot-core/src/requests.rs) shapes
 (`QuestionRequest`/`ApprovalRequest`), and `answer` args use `AnswerArgs`. Only the
@@ -530,6 +561,11 @@ NDJSON line whose JSON or envelope is invalid is record-local: the typed
 The recorded fault is sticky: EOF, exit-drain, and stop handling never
 overwrite it with a healthy-looking closure, so a busy consumer cannot miss
 it. Frame/codec/UTF-8/IO errors never continue without a proven line boundary.
+Antigravity's fenced load/prompt replies and record-local fault markers share
+one ordered queue. Consume the retained pre-fault prefix before applying the
+fault; frames after the marker cannot settle a turn. A full fault-marker queue
+latches overflow and suppresses subsequent emitted frames. Fatal/overflow watch
+faults apply after their retained prefix drains, preserving any committed terminal.
 Owner drop/cancel fences writer and response router before aborting either
 task (no await in `Drop`, no lock held over IO): already-written calls
 resolve `unknown`, fresh writes are refused `native_not_dispatched`.
@@ -554,8 +590,9 @@ only after a verified v1 binding. An owned longpoll claims through the same auth
 confirmed `applied`/`empty` may emit a receipt.
 
 The Antigravity `PreInvocation` hook (`before_model`) is the third consumer. The adapter
-installs a private generation-scoped hook group in `.agents/hooks.json` invoking an authenticated
-helper command. When the vendor runner executes the hook, the helper connects to the session-owned
+stages a private generation-scoped hook group in a dedicated hook-only directory's
+`.agents/hooks.json` (the only `--add-dir` native root; the private instance directory
+is never exposed) invoking an authenticated helper command. When the vendor runner executes the hook, the helper connects to the session-owned
 loopback listener and proves its kernel birth identity. The plugin claims FIFO `turn_safe_point`
 context through the existing authenticated `hook.event` channel, combines it with any pending
 exact-turn steer retained inside the plugin, and packages both into one `HookOutput` with native

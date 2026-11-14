@@ -52,6 +52,7 @@ const CHILD_GAP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventStatus {
+    pub native_drained: bool,
     pub ready: bool,
     pub thread_id: Option<String>,
     pub active_command_id: Option<String>,
@@ -558,6 +559,11 @@ impl EventHandle {
         }
     }
 
+    pub async fn drain_native(&self) -> Result<()> {
+        eliot_plugin::native_lifecycle::wait_for_native_tail(&self.status, |s| s.native_drained)
+            .await
+    }
+
     pub fn status(&self) -> EventStatus {
         self.status.borrow().clone()
     }
@@ -706,7 +712,7 @@ impl EventProcessor {
             StreamState::Malformed(fault) => {
                 self.defer_gap(format!(
                     "Codex app-server stream contained an invalid frame ({})",
-                    fault.label()
+                    fault.describe()
                 ));
                 self.transport_loss = true;
             }
@@ -1755,6 +1761,8 @@ impl EventProcessor {
             "command_id": command_id.clone(),
             "turn_id": notification.turn.id,
             "status": status_text,
+            "outcome": turn_outcome(&notification.turn.status),
+            "native_status": turn_status(&notification.turn.status),
         });
         // The semantic hold signal gets first claim on the bounded terminal data.
         if let Some(restriction) = provider_restriction {
@@ -2814,6 +2822,7 @@ async fn run(
                 processor.apply_gap_attempt(&attempt.child_thread, &attempt.gap, &result);
             }
         }
+        processor.status.native_drained = processor.frames_drained;
         let _ = status_tx.send(processor.status.clone());
     }
 }
@@ -2999,6 +3008,19 @@ fn turn_status(status: &NativeTurnStatus) -> String {
         NativeTurnStatus::Interrupted => "interrupted".to_owned(),
         NativeTurnStatus::Failed => "failed".to_owned(),
         NativeTurnStatus::InProgress => "inProgress".to_owned(),
+    }
+}
+
+/// Canonical outcome for the Codex terminal vocabulary
+/// (`completed` | `failed` | `interrupted`): decided here at the plugin
+/// boundary, with the raw wire status preserved as `native_status`.
+fn turn_outcome(status: &NativeTurnStatus) -> &'static str {
+    match status {
+        NativeTurnStatus::Completed => "success",
+        NativeTurnStatus::Failed => "failure",
+        NativeTurnStatus::Interrupted => "interrupted",
+        // Unreachable: a nonterminal `inProgress` status gaps before settling.
+        NativeTurnStatus::InProgress => "unknown",
     }
 }
 

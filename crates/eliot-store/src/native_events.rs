@@ -90,6 +90,8 @@ pub(super) fn persist_effects(
                 turn_id,
                 state,
                 status,
+                outcome,
+                native_status,
                 final_text,
                 usage,
                 completed_at,
@@ -100,6 +102,8 @@ pub(super) fn persist_effects(
                     turn_id,
                     *state,
                     status.as_deref(),
+                    *outcome,
+                    native_status.as_deref(),
                     final_text.as_deref(),
                     usage.as_ref(),
                     *completed_at,
@@ -168,6 +172,8 @@ fn persist_turn_associated(
             turn_id,
             state: TurnState::Running,
             status: None,
+            outcome: None,
+            native_status: None,
             final_text: None,
             started_at: Some(now),
             completed_at: None,
@@ -536,6 +542,8 @@ fn persist_turn_terminal(
     turn_id: &str,
     state: TurnState,
     status: Option<&str>,
+    outcome: Option<TurnOutcome>,
+    native_status: Option<&str>,
     final_text: Option<&str>,
     usage: Option<&TurnUsage>,
     completed_at: i64,
@@ -572,15 +580,20 @@ fn persist_turn_terminal(
         }
     }
     let usage = usage.map(encode_json).transpose()?;
+    let outcome = outcome.map(|outcome| outcome.as_str());
     let changed = tx
         .execute(
             "UPDATE turns SET state = ?1, status = COALESCE(?2, status),
-                              final_text = COALESCE(?3, final_text), completed_at = ?4,
-                              usage = COALESCE(?5, usage)
-             WHERE agent = ?6 AND generation = ?7 AND turn_id = ?8",
+                              outcome = COALESCE(?3, outcome),
+                              native_status = COALESCE(?4, native_status),
+                              final_text = COALESCE(?5, final_text), completed_at = ?6,
+                              usage = COALESCE(?7, usage)
+             WHERE agent = ?8 AND generation = ?9 AND turn_id = ?10",
             params![
                 turn_state_name(state),
                 status,
+                outcome,
+                native_status,
                 final_text,
                 completed_at,
                 usage,
