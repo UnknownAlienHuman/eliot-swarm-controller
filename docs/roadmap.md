@@ -354,7 +354,7 @@ of the explicitly selected release scope.
       and deduplicated, and two native bar sparklines are drawn. Stop, Force stop
       and Interrupt are bound at click time to the Agent, generation and turn
       shown, and are not offered for observe-only Agents. (Refs #407)
-- [x] **D4 Launch picker, Profiles and Automation screens.** The launch picker
+- [ ] **D4 Launch picker, Profiles and Automation screens.** The launch picker
       lists the daemon's sanitized `profile.list` summaries (requested settings,
       with native defaults named when a field is unset) and an Owner ad-hoc
       harness mode that shows the harness catalogue defaults. The Agent detail
