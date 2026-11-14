@@ -39,6 +39,7 @@ impl NativeStdioConfig for CodexStdioConfig {
         "item/completed",
         "serverRequest/resolved",
         "thread/started",
+        "thread/tokenUsage/updated",
         "error",
         "item/commandExecution/requestApproval",
         "item/fileChange/requestApproval",
@@ -65,6 +66,7 @@ impl NativeStdioConfig for CodexStdioConfig {
                 | "item/completed"
                 | "serverRequest/resolved"
                 | "thread/started"
+                | "thread/tokenUsage/updated"
                 | "error"
         )
     }

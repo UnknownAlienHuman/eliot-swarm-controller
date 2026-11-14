@@ -694,7 +694,12 @@ pub struct Turn {
 /// Native token usage attributed to one terminal turn. Every member is
 /// nullable: absent native data stays null, never zero. `scope` names the
 /// native attribution (`message` for the final assistant message of the
-/// bound turn); unknown fields are ignored so harnesses decode forward.
+/// bound turn, `main_loop_turn` for one turn's main-loop-only usage,
+/// `turn` for one turn's aggregate or per-turn-delta usage); unknown fields
+/// are ignored so harnesses decode forward. Context occupancy/capacity and
+/// cumulative session cost are session-scoped facts, never turn expenditure:
+/// they are not represented here, and `total_tokens` is set only when the
+/// native signal supplies a turn-scoped total, never derived.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TurnUsage {
     #[serde(default)]
