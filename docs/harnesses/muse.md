@@ -114,8 +114,13 @@ read/resume also retain `history.noneReason`. `projectionUnavailable` degrades
 observation and requires explicit degraded health on the unavailable view even when
 the push is lost; `excluded` alone is normal history omission. Missing or unknown
 reasons remain uncertain.
-Private readback cannot clear a live-source gap, replay history or acknowledge a
-terminal effect. A later healthy read does not establish live-edge recovery.
+Private readback cannot clear a live-source gap or replay history. It can,
+however, commit the exact active turn's durable terminal: when a bounded
+`view/page` scan proves the native view durably holds that turn's
+`turn/completed` (plus its final `agentMessage` when present), the adapter
+commits `message.completed` and `turn.completed` with the real final message
+rather than settling unknown. A later healthy read does not establish
+live-edge recovery.
 
 Verified 2026-11-13 using the installed host's offline stable and experimental
 JSON/TypeScript exports: Muse Code `1.4.0-R4161.1`, executable SHA-256
@@ -162,17 +167,26 @@ gap stays visible. An actual replayed terminal can complete the exact turn while
 source health remains stale. An interrupt refused during the gap names the
 unavailable-view reason explicitly.
 When the recovery window expires without live proof (or recovery cannot be
-attempted), the adapter settles the active turn `unknown` with the recorded gap
-through the shared turn-unknown path (`turn.unknown` with the exact
-command/turn binding and the gap reason), never as success or failure. The turn
-binding clears only after that terminal write is acknowledged; a failed write
-keeps the binding and retries on the next opportunity instead of stranding the
-Store turn. The plugin host stays alive and the Agent is not marked lost; the
-session remains for a later send/stop. Later facts for that turn gap instead of
-resurrecting it, and interrupt/stop afterwards behave as for any unknown turn.
-Subscription admission alone, a private page, or a timer never proves native turn
-completion or process/session exit. Live recovery after projection failure remains
-unqualified until exercised through Swarm by the controller.
+attempted), the adapter first pages the retained view backward (at most four
+`view/page` reads of up to 1000 events, newest first) for the exact active
+turn's durable terminal and final `agentMessage`. A proven terminal commits
+through the exact live shapes (`message.completed` with the real final
+message, then `turn.completed`), marks those records applied so a later live
+replay of the same revision skips instead of recommitting, retires the
+recovery deadline, and keeps the recorded gap and stale health latched. Only
+when no bounded page proves the terminal does the adapter settle the active
+turn `unknown` with the recorded gap through the shared turn-unknown path
+(`turn.unknown` with the exact command/turn binding and the gap reason),
+never as success or failure. The turn binding clears only after that terminal
+write is acknowledged; a failed write keeps the binding and retries on the
+next opportunity instead of stranding the Store turn. The plugin host stays
+alive and the Agent is not marked lost; the session remains for a later
+send/stop. Later facts for that turn gap instead of resurrecting it, and
+interrupt/stop afterwards behave as for any unknown turn. Subscription
+admission alone, or a timer, never proves native turn completion or
+process/session exit; a bounded durable page proving the exact terminal does.
+Live recovery after projection failure remains unqualified until exercised
+through Swarm by the controller.
 PR #422's shared native-exit lifecycle helper still applies only after actual
 endpoint exit; projection unavailability alone cannot invoke that exit path.
 The projection path reuses the turn-unknown settlement without retiring the
