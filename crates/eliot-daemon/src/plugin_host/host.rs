@@ -3707,13 +3707,14 @@ mod tests {
     #[test]
     fn controlled_opencode_manifest_requires_request_stream_family() {
         let mut opencode = test_manifest("opencode", "2.0.32");
-        // Without the request family the PR2 plugin contract refuses.
-        assert_eq!(
-            manifest_source_plan(&opencode, "opencode")
-                .unwrap_err()
-                .code,
-            "unsupported"
-        );
+        // Capability validation is generic since #332: only the
+        // message/session/turn families are mandatory, request stays optional.
+        let plan = manifest_source_plan(&opencode, "opencode")
+            .expect("OpenCode manifest without request is supported");
+        assert_eq!(plan.as_object().unwrap().len(), 3);
+        for family in ["message", "session", "turn"] {
+            assert_eq!(plan[family], "stream");
+        }
         opencode
             .sources
             .get_mut("controlled")
@@ -3981,7 +3982,7 @@ mod tests {
                     target: None,
                     selector: None,
                     verb: "launch".to_owned(),
-                    args: json!({"project":"payload-guard", "workspace":"synthetic-workspace"}),
+                    args: json!({"project":"payload-guard", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fixture", "profile_snapshot":{}}),
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
@@ -3992,6 +3993,7 @@ mod tests {
             .unwrap();
         let agent_id = admission.command.target.unwrap();
         store.dispatch(&command_id, now).unwrap();
+        crate::test_support::install_fixture_sources(&mut store, &agent_id, &command_id, 1, now);
         let before_events = store.read_events(0, 1000, None).unwrap();
         let before_source = store.read_source_state(&agent_id, 1, "stream").unwrap();
         let store = Arc::new(AsyncMutex::new(store));
@@ -4114,7 +4116,7 @@ mod tests {
                     target: None,
                     selector: None,
                     verb: "launch".to_owned(),
-                    args: json!({"project":"handoff-boundary", "workspace":"synthetic-workspace"}),
+                    args: json!({"project":"handoff-boundary", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fixture", "profile_snapshot":{}}),
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
@@ -4127,6 +4129,14 @@ mod tests {
             .target
             .unwrap();
         store.dispatch(&command_id, now_ms()).unwrap();
+        crate::test_support::install_fixture_source_plan(
+            &mut store,
+            &agent_id,
+            &command_id,
+            1,
+            now_ms(),
+            &["message", "request", "session", "turn"],
+        );
         store
             .put_batch(
                 SourceBatch {
@@ -4821,6 +4831,7 @@ mod tests {
             .target
             .unwrap();
         store.dispatch(&start_id, now_ms()).unwrap();
+        crate::test_support::install_fixture_sources(&mut store, &agent, &start_id, 1, now_ms());
         let store = Arc::new(AsyncMutex::new(store));
         let bus = Bus::new(32);
         let secrets = Arc::new(Mutex::new(HashSet::new()));
@@ -5073,11 +5084,16 @@ mod tests {
         assert_eq!(store.get_agent(&key.id).unwrap().unwrap(), current);
         assert_eq!(store.list_source_states(&key.id, 2).unwrap(), sources);
         assert_eq!(store.get_agent_token(&key.id, 2).unwrap(), token);
+        // Reader unavailability marks only the native sources stale; the
+        // reserved OS process source stays ok and closed after the exit
+        // proof, exactly as the fixture helper records it.
         assert!(
             store
                 .list_source_states(&key.id, 1)
                 .unwrap()
                 .iter()
+                .filter(|source| !["daemon", "os", "git", "workspace_process"]
+                    .contains(&source["source"].as_str().unwrap_or("")))
                 .all(|source| source["health"] == "stale")
         );
         assert!(
@@ -5395,6 +5411,11 @@ mod tests {
         let mut agent = Agent::new(&agent_id, "prespawn", "codex", "fixture", 0);
         agent.generation = 1;
         agent.workspace = Some(workspace.clone());
+        agent.profile_snapshot = json!({
+            "harness":"codex",
+            "pass_env":[],
+            "pass_env_values":{"CODEX_HOME":null, "CODEX_SQLITE_HOME":null},
+        });
 
         let error = host
             .start(agent, launch_command_for(&agent_id, 1), None)

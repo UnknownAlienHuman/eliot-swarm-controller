@@ -1113,6 +1113,13 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
                 .unwrap();
             let agent = launch.command.target.unwrap();
             store.dispatch(&launch_id, now_ms()).unwrap();
+            crate::test_support::install_fixture_sources(
+                &mut store,
+                &agent,
+                &launch_id,
+                1,
+                now_ms(),
+            );
             read_fixture_event(
                 &mut store,
                 &agent,
@@ -1147,6 +1154,13 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
             resume.expected_generation = Some(1);
             store.submit("owner", resume, now_ms()).unwrap();
             store.dispatch(&resume_id, now_ms()).unwrap();
+            crate::test_support::install_fixture_sources(
+                &mut store,
+                &agent,
+                &resume_id,
+                2,
+                now_ms(),
+            );
 
             let batch_id = ulid::Ulid::new().to_string();
             store
@@ -1265,6 +1279,13 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
                 )
                 .unwrap();
             store.dispatch(&launch_id, now_ms()).unwrap();
+            crate::test_support::install_fixture_sources(
+                &mut store,
+                &pending_agent,
+                &launch_id,
+                1,
+                now_ms(),
+            );
             read_fixture_event(
                 &mut store,
                 &pending_agent,
@@ -1278,7 +1299,21 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
             store
                 .settle(&launch_id, CommandState::Applied, None, now_ms())
                 .unwrap();
+            crate::test_support::install_live_owned_process_source(
+                &mut store,
+                &pending_agent,
+                1,
+                now_ms(),
+            );
             read_fixture_event(&mut store, &pending_agent, "session.ended", json!({}));
+            // Prove generation-1 custody closed so the resume below admits;
+            // generation 2 still stays Creating, undispatched.
+            crate::test_support::simulate_owned_process_exit_proof(
+                &mut store,
+                &pending_agent,
+                1,
+                now_ms(),
+            );
             (pending_agent, pending_event_seq, initial_workspace)
         };
 

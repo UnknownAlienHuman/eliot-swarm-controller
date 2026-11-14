@@ -1585,7 +1585,7 @@ mod tests {
                     target: None,
                     selector: None,
                     verb: "launch".to_owned(),
-                    args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}}),
+                    args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":{}}),
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
@@ -1596,6 +1596,7 @@ mod tests {
             .expect("admit launch");
         let agent = admission.command.target.expect("launch target");
         store.dispatch(&launch_id, now).expect("dispatch launch");
+        crate::tests::install_fixture_sources(store, &agent, &launch_id, 1, now);
         store
             .put_batch(
                 SourceBatch {
@@ -1684,7 +1685,7 @@ mod tests {
             })
             .expect("read Store migration version");
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 26);
+        assert_eq!(version, 30);
         for table in ["messages", "vars", "mail_notices", "claims"] {
             let found: i64 = store
                 .connection

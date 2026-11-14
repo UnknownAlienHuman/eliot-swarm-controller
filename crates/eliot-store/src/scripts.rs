@@ -449,7 +449,7 @@ mod tests {
                     target: None,
                     selector: None,
                     verb: "launch".to_owned(),
-                    args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}}),
+                    args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":{}}),
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
@@ -462,6 +462,7 @@ mod tests {
         store
             .dispatch(&launch_id, now + 1)
             .expect("dispatch launch");
+        crate::tests::install_fixture_sources(store, &agent_id, &launch_id, 1, now + 1);
         store
             .put_batch(
                 SourceBatch {

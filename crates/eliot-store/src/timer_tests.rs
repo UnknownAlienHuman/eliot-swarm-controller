@@ -306,7 +306,7 @@ fn ready_agent_with_workspace(
     let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
     launch.args = json!({
         "project": project,
-        "harness": "fake",
+        "harness": "codex",
         "profile": profile,
         "workspace": workspace,
         "profile_snapshot": {},
@@ -318,6 +318,7 @@ fn ready_agent_with_workspace(
     let native_ref = format!("timer-resume-{agent}-subject");
     let ready_id = format!("{project}:{agent}:ready");
     store.dispatch(&launch_id, now).unwrap();
+    crate::tests::install_fixture_sources(store, &agent, &launch_id, 1, now);
     store
         .put_batch(
             SourceBatch {
@@ -388,6 +389,7 @@ fn apply_timer_resume(
         .expect("retained timer Agent has a native subject");
     let generation = old_generation + 1;
     store.dispatch(resume_id, now).unwrap();
+    crate::tests::install_fixture_sources(store, agent, resume_id, generation, now);
     store
         .put_batch(
             SourceBatch {
@@ -420,6 +422,9 @@ fn timer_launch_action(project: &str, text: Option<&str>) -> SubmitCommand {
     action.args = json!({
         "project": project,
         "workspace": format!("synthetic-timer-{project}"),
+        "harness": "codex",
+        "profile": "fake",
+        "profile_snapshot": {},
     });
     if let Some(text) = text {
         action.args["text"] = json!(text);
@@ -454,6 +459,7 @@ fn commit_scheduled_timer_launch(
 
 fn ready_timer_launch(store: &mut Store, launch_id: &str, agent_id: &str, now: i64) {
     store.dispatch(launch_id, now).unwrap();
+    crate::tests::install_fixture_sources(store, agent_id, launch_id, 1, now);
     store
         .put_batch(
             SourceBatch {
@@ -2223,7 +2229,7 @@ fn scheduled_project_timer_launch_replay_precedes_current_profile_gate() {
         let mut action = SubmitCommand::new(Ulid::new().to_string(), "launch");
         action.args = json!({
             "project": project,
-            "harness": "fake",
+            "harness": "codex",
             "profile": "fake",
             "profile_snapshot": {},
             "workspace": checkout.as_str(),

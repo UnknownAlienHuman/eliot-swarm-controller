@@ -34,7 +34,7 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
                 target: None,
                 selector: None,
                 verb: "launch".to_owned(),
-                args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}}),
+                args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":{}}),
                 expected_generation: Some(0),
                 expected_turn_id: None,
                 request_id: None,
@@ -45,6 +45,7 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
         .expect("admit launch");
     let agent = admission.command.target.expect("launch target");
     store.dispatch(&launch_id, now).expect("dispatch launch");
+    crate::tests::install_fixture_sources(store, &agent, &launch_id, 1, now);
     store
         .put_batch(
             SourceBatch {
@@ -435,7 +436,7 @@ fn resolve_unknown_launch_leaves_agent_and_capacity_untouched() {
                 target: None,
                 selector: None,
                 verb: "launch".to_owned(),
-                args: json!({"project":"resolve-launch", "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}}),
+                args: json!({"project":"resolve-launch", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":{}}),
                 expected_generation: Some(0),
                 expected_turn_id: None,
                 request_id: None,
@@ -1621,7 +1622,7 @@ fn resolve_command_allows_launch_and_resume_only_as_failed() {
                 target: None,
                 selector: None,
                 verb: "launch".to_owned(),
-                args: json!({"project":"resolve-start-rule", "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}}),
+                args: json!({"project":"resolve-start-rule", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":{}}),
                 expected_generation: Some(0),
                 expected_turn_id: None,
                 request_id: None,
