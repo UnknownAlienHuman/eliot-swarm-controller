@@ -304,8 +304,9 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
 - [ ] Core/Store/API/reducer and event replay, including retention and non-reused ids.
 - [x] CLI E2E on the real harness, exact generations/turns/requests, queue ordering and unknown outcomes.
       Qualified 2026-11-14 on Codex and Muse; the unknown-turn send fence it exposed was fixed (#468).
-- [ ] Crash at admission, native effect, event commit, reply and source-drain boundaries;
+- [x] Crash at admission, native effect, event commit, reply and source-drain boundaries;
       verify no repeated prompt/setup/script/push and no false terminal result.
+      Qualified 2026-11-14, including 3 in-window kills between terminal commit and reply.
 - [ ] Live runs for the
       selected harnesses/routes. Verify effective model/account/permissions.
 - [x] Rules/timers/hot reload, Goal limits, mail/ack, CAS, hierarchy and Git recovery.
