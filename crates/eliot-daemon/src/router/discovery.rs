@@ -102,6 +102,7 @@ const METHODS: &[Method] = &[
     method!("events.read", EventsReadRequest, EventsReadResponse, false, false, "Read a bounded event page; history gaps remain explicit.", {"after":0,"limit":20}),
     method!("events.subscribe", EventsSubscribeRequest, EventsSubscribeResponse, false, false, "Long-poll a bounded event page, at most 30 seconds.", {"after":0,"limit":20,"wait_ms":1000}),
     method!("swarm.wait", SwarmWaitRequest, SwarmWaitResponse, false, false, "Wait up to 30 seconds for a frozen set of child commands/turns with all/any semantics.", {"commands":[EXAMPLE_ID],"turns":[],"mode":"all","wait_ms":1000}),
+    method!("swarm.digest", SwarmDigestRequest, SwarmDigestResponse, false, true, "Register a durable completion digest delivering one coalesced parent mailbox result with the standard mail wake.", {"id":EXAMPLE_ID,"to":"a1","mode":"all","commands":[EXAMPLE_ID],"turns":[]}),
     method!("project.get", ProjectGetRequest, ProjectRegistrationView, true, false, "Read one approved project registration.", {"id":"project-1"}),
     method!(
         "project.list",
@@ -246,6 +247,7 @@ impl Router {
             "var.set" => &["swarm var set"],
             "var.get" => &["swarm var get"],
             "swarm.wait" => &["swarm wait"],
+            "swarm.digest" => &["swarm digest"],
             _ => &[],
         };
         let mut unsupported = vec!["A method listing grants no additional authority. Unsupported native verbs reject; inspect agent.get for the exact target generation's capabilities.".to_owned()];
@@ -286,7 +288,7 @@ impl Router {
             cli_aliases:aliases.iter().map(|s| (*s).to_owned()).collect(),
             request_schema:(method.input)(), response_schema:(method.output)(),
             example:json!({"method":method.name,"params":example}),
-            mutation_id:if method.mutation { "Supply a fresh caller-retained ULID in id before the first write. Retry only with that same id, principal, method and identical semantic payload. Never mint another id after an uncertain outcome; read back the retained result. The example id is illustrative; replace it for a new write." } else { "Read-only; no mutation id is required." }.to_owned(),
+            mutation_id:if method.mutation { "id is optional on MCP: omit it and the server mints a ULID and returns it in the reply; retry with that same id. Otherwise supply a fresh caller-retained ULID in id before the first write. Retry only with that same id, principal, method and identical semantic payload. Never mint another id after an uncertain outcome; read back the retained result. The example id is illustrative; replace it for a new write." } else { "Read-only; no mutation id is required." }.to_owned(),
             scopes, limits:format!("{} Responses retain their DTO pagination and daemon 4 MiB frame bounds; one help result is at most 256 KiB. Examples for existing resources require their actual retained ids/profile/source/view.", method_limits(method.name)), unsupported,
         })
     }
@@ -459,6 +461,31 @@ mod tests {
             assert!((method.output)().is_object());
         }
         assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn audit_390_mutation_help_states_the_mcp_omission_rule() {
+        let router = super::super::tests::router();
+        for method in METHODS.iter().filter(|m| m.mutation) {
+            let help = router
+                .method_help(&json!({"method": method.name}), &Principal::Owner)
+                .await
+                .unwrap();
+            let text = help["mutation_id"].as_str().expect("mutation help text");
+            assert!(
+                text.contains("omit") && text.contains("retry with that same id"),
+                "{} must state the MCP omission and retry rule",
+                method.name
+            );
+        }
+        let help = router
+            .method_help(&json!({"method": "var.get"}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            help["mutation_id"],
+            json!("Read-only; no mutation id is required.")
+        );
     }
 
     #[test]

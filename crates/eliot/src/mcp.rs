@@ -15,8 +15,11 @@
 //! credential, token, or raw environment value is echoed to tool output or
 //! logs. The tool is intentionally generic: `{ method, params }` maps 1:1 to
 //! the existing management client; discovery and DTO schemas come from the daemon.
-//! Mutations keep their existing caller-known durable id — this frontend
-//! never auto-retries, never pretends rollback on cancel, and never replays.
+//! A mutation call may omit `params.id`: this frontend mints one fresh ULID
+//! for that call, forwards it, and returns it as top-level `id` so the caller
+//! retains it for exact retry. An explicit id is forwarded untouched and
+//! still validated by the daemon. This frontend never auto-retries a call,
+//! never pretends rollback on cancel, and never replays.
 //! Incoming stdio frames are bounded by the SDK's own transport limit; the
 //! peer-facing `params` size reuses the daemon 4 MiB frame limit.
 //! stdout is MCP protocol only, diagnostics go to stderr. The optional
@@ -58,8 +61,8 @@ use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
 
 const TOOL_NAME: &str = "swarm";
-const TOOL_DESCRIPTION: &str = "Generic Eliot management call. Start with api.identity and params:{} for your identity/scopes; api.methods and params:{query:\"mail\",limit:20} lists callable methods; api.help and params:{method:\"mail.send\"} returns the actual DTO schema, runnable example and limits. Use canonical mail.send and var.set. Authentication is inherited; never supply credentials. { method, params } -> authenticated daemon RPC result";
-const REQUIRE_AGENT_INSTRUCTIONS: &str = "Use this server's swarm tool for Eliot controller and coordination operations instead of shell commands. Discover your actual identity/scopes with api.identity params:{}, list/search methods with api.methods params:{query:\"mail\",limit:20}, then read api.help params:{method:\"mail.send\"} (or var.set) for DTO fields, examples and mutation-id rules. Authentication is inherited from this Agent session; never put credentials or tokens in tool arguments.";
+const TOOL_DESCRIPTION: &str = "Generic Eliot management call. Start with api.identity and params:{} for your identity/scopes; api.methods and params:{query:\"mail\",limit:20} lists callable methods; api.help and params:{method:\"mail.send\"} returns the actual DTO schema, runnable example and limits. Use canonical mail.send and var.set. Mutations accept params without id: the server mints a ULID and returns it as top-level id; retry with that same id. Authentication is inherited; never supply credentials. { method, params } -> authenticated daemon RPC result";
+const REQUIRE_AGENT_INSTRUCTIONS: &str = "Use this server's swarm tool for Eliot controller and coordination operations instead of shell commands. Discover your actual identity/scopes with api.identity params:{}, list/search methods with api.methods params:{query:\"mail\",limit:20}, then read api.help params:{method:\"mail.send\"} (or var.set) for DTO fields, examples and mutation-id rules. Mutations accept params without id: the server mints a ULID and returns it as top-level id; retry with that same id, never mint a new one after an uncertain outcome. Authentication is inherited from this Agent session; never put credentials or tokens in tool arguments.";
 
 const INVALID_ARGS_MESSAGE: &str = "tool arguments must be an object with method and params";
 
@@ -74,7 +77,7 @@ struct ToolArgs {
 /// `ELIOT_HOME` resolution in `main.rs`; no daemon is started here.
 pub async fn run_stdio(data_dir: PathBuf, require_agent: bool) -> Result<(), String> {
     if require_agent {
-        eliot_daemon::require_agent_identity()
+        eliot_daemon::require_agent_identity(&data_dir)
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
     }
     #[allow(deprecated)] // SEP-2577: LoggingLevel default is deprecated but functional in rmcp 3.9.
@@ -239,7 +242,9 @@ impl ServerHandler for EliotMcpHandler {
             if parsed.method.trim().is_empty() {
                 return Err(McpError::invalid_params(INVALID_ARGS_MESSAGE, None));
             }
-            let params = Value::Object(parsed.params);
+            let mut params_map = parsed.params;
+            let minted_id = mint_missing_mutation_id(&parsed.method, &mut params_map);
+            let params = Value::Object(params_map);
             if let Ok(encoded) = serde_json::to_string(&params)
                 && encoded.len().saturating_add(1) > eliot_daemon::MAX_RPC_FRAME_BYTES
             {
@@ -272,11 +277,7 @@ impl ServerHandler for EliotMcpHandler {
             };
             match result {
                 Ok(value) => {
-                    let output = if http {
-                        json!({"method": parsed.method, "result": value["result"], "remote_call": value["remote_call"]})
-                    } else {
-                        json!({"method": parsed.method, "result": value})
-                    };
+                    let output = success_output(&parsed.method, &value, minted_id.as_deref(), http);
                     Ok(CallToolResult::structured(output).into())
                 }
                 Err(error) => Ok(CallToolResult::structured_error(mcp_error_value(
@@ -287,6 +288,61 @@ impl ServerHandler for EliotMcpHandler {
             }
         }
     }
+}
+
+/// Mutation methods whose DTO carries a caller-retained `id`. Mirrors the
+/// daemon discovery `mutation` flags; keep the two lists in sync.
+const MUTATION_ID_METHODS: &[&str] = &[
+    "daemon.shutdown",
+    "command.submit",
+    "command.resolve",
+    "turn.resolve",
+    "rule.catch_up",
+    "timer.run",
+    "provider.clear_hold",
+    "goal.set",
+    "goal.pause",
+    "goal.clear",
+    "goal.resume",
+    "goal.round",
+    "mail.send",
+    "mail.ack",
+    "var.set",
+    "claim.set",
+    "claim.release",
+];
+
+/// Mint one fresh ULID into `params` when a mutation call omits `id`
+/// (absent or null). Returns the minted id so the caller can retain it for
+/// exact retry. An explicit id is never touched; non-mutation methods and
+/// unknown methods pass through unchanged.
+fn mint_missing_mutation_id(method: &str, params: &mut Map<String, Value>) -> Option<String> {
+    if !MUTATION_ID_METHODS.contains(&method) {
+        return None;
+    }
+    if !matches!(params.get("id"), None | Some(Value::Null)) {
+        return None;
+    }
+    let id = ulid::Ulid::new().to_string();
+    params.insert("id".to_owned(), Value::String(id.clone()));
+    Some(id)
+}
+
+/// Build the success `structuredContent` envelope. A minted mutation id is
+/// returned as top-level `id` so the caller retains it for exact retry;
+/// explicit ids need no echo because the caller already holds them.
+fn success_output(method: &str, value: &Value, minted_id: Option<&str>, http: bool) -> Value {
+    let mut output = if http {
+        json!({"method": method, "result": value["result"], "remote_call": value["remote_call"]})
+    } else {
+        json!({"method": method, "result": value})
+    };
+    if let Some(id) = minted_id
+        && let Some(map) = output.as_object_mut()
+    {
+        map.insert("id".to_owned(), Value::String(id.to_owned()));
+    }
+    output
 }
 
 /// Serialize a daemon [`eliot_core::Error`] for MCP `structuredContent`.
@@ -814,5 +870,56 @@ mod tests {
         assert!(tail_len < 8 * 1024);
         let result = CallToolResult::structured_error(value);
         assert_eq!(result.is_error, Some(true));
+    }
+
+    #[test]
+    fn mutation_id_is_minted_only_when_a_mutation_omits_it() {
+        for method in ["mail.send", "var.set", "command.submit"] {
+            let mut params = Map::new();
+            let minted = mint_missing_mutation_id(method, &mut params);
+            let id = minted.expect("omitted id is minted");
+            assert_eq!(params.get("id").and_then(Value::as_str), Some(id.as_str()));
+            assert!(ulid::Ulid::from_string(&id).is_ok());
+        }
+        let mut null_id = Map::from_iter([("id".to_owned(), Value::Null)]);
+        assert!(mint_missing_mutation_id("mail.send", &mut null_id).is_some());
+        assert!(null_id.get("id").and_then(Value::as_str).is_some());
+        let mut explicit = Map::from_iter([("id".to_owned(), json!("01ARZ3NDEKTSV4RRFFQ69G5FAV"))]);
+        assert_eq!(mint_missing_mutation_id("var.set", &mut explicit), None);
+        assert_eq!(
+            explicit.get("id").and_then(Value::as_str),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+        for method in ["var.get", "mail.read", "api.help", "unknown.method"] {
+            let mut params = Map::new();
+            assert_eq!(mint_missing_mutation_id(method, &mut params), None);
+            assert!(!params.contains_key("id"));
+        }
+    }
+
+    #[test]
+    fn success_output_returns_the_minted_id_for_retry() {
+        let value = json!({"deliveries": []});
+        let output = success_output(
+            "mail.send",
+            &value,
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            false,
+        );
+        assert_eq!(output["method"], json!("mail.send"));
+        assert_eq!(output["result"], value);
+        assert_eq!(output["id"], json!("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        let unminted = success_output("mail.send", &value, None, false);
+        assert!(unminted.get("id").is_none());
+        let http_value = json!({"result": value, "remote_call": {"kind": "x"}});
+        let http = success_output(
+            "var.set",
+            &http_value,
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            true,
+        );
+        assert_eq!(http["result"], value);
+        assert_eq!(http["remote_call"], json!({"kind": "x"}));
+        assert_eq!(http["id"], json!("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
     }
 }

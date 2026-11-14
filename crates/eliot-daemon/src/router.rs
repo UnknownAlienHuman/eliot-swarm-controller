@@ -5,6 +5,7 @@ mod catalog;
 mod command;
 mod context;
 mod coordination;
+mod digests;
 mod discovery;
 mod goals;
 mod hierarchy;
@@ -14,6 +15,7 @@ mod rules;
 pub(crate) use attention::run_attention;
 use auth::{authorize_command, authorize_rpc_method};
 pub(crate) use coordination::run_mail_reoffer;
+pub(crate) use digests::run_completion_digest;
 pub(crate) use goals::{real_goal_check, run_goal_driver};
 
 use crate::{
@@ -294,6 +296,7 @@ impl Router {
             "events.read" => self.events_read(&params, &principal).await,
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
             "swarm.wait" => self.swarm_wait(&params, &principal).await,
+            "swarm.digest" => self.swarm_digest(&params, &principal).await,
             "project.get" => self.project_get(&params, &principal).await,
             "project.list" => self.project_list(&params, &principal).await,
             "rule.get" => self.rule_get(&params, &principal).await,

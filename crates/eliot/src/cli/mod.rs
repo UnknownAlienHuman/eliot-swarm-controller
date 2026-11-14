@@ -61,6 +61,7 @@ pub(crate) async fn dispatch(
         CliCommand::Turn(args) => coord::run_turn(args, data_dir, json_output, id).await,
         CliCommand::Events(args) => reads::run_events(args, data_dir, json_output).await,
         CliCommand::Wait(args) => agents::run_wait(args, data_dir, json_output).await,
+        CliCommand::Digest(args) => agents::run_digest(args, data_dir, json_output, id).await,
         CliCommand::Msg(args) => coord::run_msg(args, data_dir, json_output, id).await,
         CliCommand::Inbox(args) => coord::run_inbox(args, data_dir, json_output).await,
         CliCommand::Var(args) => coord::run_var(args, data_dir, json_output, id).await,

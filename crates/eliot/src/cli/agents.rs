@@ -1,21 +1,22 @@
 //! Agent lifecycle and coordination writes.
 use super::args::{
-    AnswerArgs, ApproveArgs, AttachArgs, ConfigureArgs, DenyArgs, DetachArgs, DiscoverArgs,
-    GenerationArgs, InjectCliArgs, InterruptArgs, LaunchArgs, ModelsArgs, PageArgs, QuotaArgs,
-    ReadGenerationArgs, ResumeArgs, SendArgs, SteerArgs, StopArgs, WaitArgs, WorktreeArgs,
-    WorktreeCommand, WorktreeRemoveArgs,
+    AnswerArgs, ApproveArgs, AttachArgs, ConfigureArgs, DenyArgs, DetachArgs, DigestArgs,
+    DiscoverArgs, GenerationArgs, InjectCliArgs, InterruptArgs, LaunchArgs, ModelsArgs, PageArgs,
+    QuotaArgs, ReadGenerationArgs, ResumeArgs, SendArgs, SteerArgs, StopArgs, WaitArgs,
+    WorktreeArgs, WorktreeCommand, WorktreeRemoveArgs,
 };
 use super::support::read_and_print;
 use super::support::{
     DEFAULT_WAIT_SECONDS, Failure, INTERRUPTED_EXIT_CODE, MAX_ANSWERS_FILE_BYTES, MAX_TEXT_BYTES,
-    command_value, print_value, response_exit_code, submit_and_print, submit_command,
+    command_value, mutation_id, print_value, response_exit_code, submit_and_print, submit_command,
     submit_request, submit_value, turn_exit_code, turn_value, validate_limit, wait_deadline,
     wait_for_command, wait_for_linked_turn, wait_for_turn,
 };
 use eliot_core::api::{
     AgentDiscoverRequest, AgentGetRequest, AgentGetResponse, DiscoverPage, HarnessListRequest,
     HarnessListResponse, HarnessModelsRequest, HarnessModelsResponse, HarnessQuotaRequest,
-    HarnessQuotaResponse, MAX_SWARM_WAIT_TARGETS, SwarmWaitRequest, SwarmWaitResponse, WaitTurnRef,
+    HarnessQuotaResponse, MAX_SWARM_WAIT_TARGETS, SwarmDigestRequest, SwarmDigestResponse,
+    SwarmWaitRequest, SwarmWaitResponse, WaitTurnRef,
 };
 use eliot_core::{InjectArgs, InjectPoint, SubmitCommand};
 use serde_json::Value;
@@ -586,6 +587,15 @@ pub(crate) async fn run_wait(
     swarm_wait(&data_dir, all, any, timeout_seconds, ids, json_output).await
 }
 
+pub(crate) async fn run_digest(
+    DigestArgs { all, any, to, ids }: DigestArgs,
+    data_dir: PathBuf,
+    json_output: bool,
+    id: Option<String>,
+) -> Result<u8, Failure> {
+    swarm_digest(&data_dir, all, any, to, ids, json_output, id).await
+}
+
 pub(crate) fn approval_reply_args(choice: Option<String>, feedback: Option<String>) -> Value {
     let mut args = serde_json::Map::new();
     if let Some(choice) = choice {
@@ -822,6 +832,74 @@ pub(crate) async fn swarm_wait(
         .map_err(|_| Failure::new(4, "swarm.wait response is invalid"))?;
     print_value(&value, json_output);
     Ok(swarm_wait_exit_code(&response))
+}
+
+/// Durable completion digest over a frozen set of child commands/turns.
+/// Registers one parent mailbox recipient; the daemon delivers exactly one
+/// coalesced mail when the set satisfies `all`/`any` and wakes through the
+/// standard mail notice. Reusing `--id` replays the same digest without a
+/// second mail. Exit 0 when the digest is accepted (pending or delivered).
+pub(crate) async fn swarm_digest(
+    data_dir: &Path,
+    all: bool,
+    any: bool,
+    to: String,
+    ids: Vec<String>,
+    json_output: bool,
+    id: Option<String>,
+) -> Result<u8, Failure> {
+    if all == any {
+        return Err(Failure::new(
+            2,
+            "swarm digest requires exactly one of --all or --any",
+        ));
+    }
+    if to.trim().is_empty() {
+        return Err(Failure::new(2, "swarm digest requires --to AGENT"));
+    }
+    if ids.is_empty() || ids.len() > MAX_SWARM_WAIT_TARGETS {
+        return Err(Failure::new(
+            2,
+            "swarm digest requires 1..=256 captured ids",
+        ));
+    }
+    let mode = if all { "all" } else { "any" };
+    let mut commands = Vec::new();
+    let mut turns = Vec::new();
+    for id in ids {
+        if id.contains('/') {
+            turns.push(parse_wait_turn_ref(&id)?);
+        } else {
+            if id.trim().is_empty() {
+                return Err(Failure::new(
+                    2,
+                    "swarm digest ids must be non-empty strings",
+                ));
+            }
+            commands.push(id);
+        }
+    }
+    if commands.is_empty() && turns.is_empty() {
+        return Err(Failure::new(
+            2,
+            "swarm digest requires 1..=256 captured ids",
+        ));
+    }
+    let params = SwarmDigestRequest::new(mutation_id(id)?, to, mode, commands, turns);
+    params
+        .validate()
+        .map_err(|error| Failure::from_core(error, true))?;
+    let response: SwarmDigestResponse =
+        eliot_daemon::client_call_typed(data_dir, "swarm.digest", &params)
+            .await
+            .map_err(|error| Failure::from_core(error, true))?;
+    params
+        .validate_response(&response)
+        .map_err(|_| Failure::new(4, "swarm.digest response is invalid"))?;
+    let value = serde_json::to_value(&response)
+        .map_err(|_| Failure::new(4, "swarm.digest response is invalid"))?;
+    print_value(&value, json_output);
+    Ok(0)
 }
 
 pub(crate) fn parse_wait_turn_ref(id: &str) -> Result<WaitTurnRef, Failure> {

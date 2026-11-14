@@ -25,7 +25,11 @@ symlink/reparse roots or unsafe ownership.
 ```
 
 The ordinary CLI reads `owner.token` automatically, only outside managed Agent/rule
-environments. A missing managed token rejects, never becomes owner. This is attribution
+environments. A missing managed token rejects, never becomes owner. An inherited Agent
+identity applies only to the daemon that issued it (see
+[Environment and secrets](#environment-and-secrets)): calls naming another data directory
+(`--data-dir`, else `ELIOT_HOME`, else default) connect as that directory's local Owner
+instead of sending the foreign token. This is attribution
 within one OS user, not hostile-same-user isolation. Tokens never appear in semantic
 payloads, recordings or logs.
 
@@ -691,7 +695,13 @@ literal nonsecret `env`, named secrets resolved in memory, then Eliot identity/G
 `secret_env` is a subset of `pass_env`; those values are never persisted. Missing named
 required values fail clearly. Windows keys compare case-insensitively.
 The managed Agent target environment sets `ELIOT_HOME` to the owned data directory,
-overriding ambient/profile, alongside `ELIOT_AGENT_ID`/`ELIOT_AGENT_GENERATION`/`ELIOT_AGENT_TOKEN`.
+overriding ambient/profile, alongside `ELIOT_AGENT_ID`/`ELIOT_AGENT_GENERATION`/`ELIOT_AGENT_TOKEN`
+and the normalized issuing data directory `ELIOT_AGENT_DATA_DIR`. The CLI uses the
+inherited Agent identity only when the resolved target data directory (`--data-dir`, else
+`ELIOT_HOME`, else default) equals `ELIOT_AGENT_DATA_DIR` (lexically normalized, compared
+case-insensitively on Windows); otherwise it connects as the local Owner of the target
+data directory and never sends the foreign token. An incomplete Agent identity for the
+same data directory still rejects and never falls back to Owner authority.
 It prepends the active controller executable's parent directory to `PATH`, preserving the
 native baseline entries, so bare `swarm` resolves to the current controller before ambient/legacy bins.
 A controller directory containing the OS `PATH` separator (`;` on Windows, `:` elsewhere)
