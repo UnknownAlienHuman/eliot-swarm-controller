@@ -10825,7 +10825,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 "profile":"fake",
                 "workspace":checkout,
                 "project":checkout,
-                "profile_snapshot":{"harness":"fake", "setup":[]},
+                "profile_snapshot":{"harness":"codex", "setup":[]},
                 "text":"review this result",
             }),
             state: CommandState::Accepted,
@@ -10868,7 +10868,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             "profile":"fake",
             "workspace":workspace,
             "project":workspace,
-            "profile_snapshot":{"harness":"fake", "setup":[]},
+            "profile_snapshot":{"harness":"codex", "setup":[]},
         });
         let mut prepared = PreparedSubmission {
             request,
