@@ -964,6 +964,50 @@ impl EventProcessor {
         }
     }
 
+    /// v2 child announcement: a `subAgentActivity` item with
+    /// `kind: "started"` on the producer thread confirms `agentThreadId` as
+    /// a native child of that producer, equivalent to a completed spawn's
+    /// receiver. The producer is the owned thread or a confirmed child;
+    /// activity from any other thread is buffered upstream and never reaches
+    /// here unconfirmed, so anything else is ignored without a gap. Any
+    /// other `kind` (`interacted` | `interrupted` | `completed`) is a
+    /// lifecycle fact with no state-machine transition: never a gap, never a
+    /// confirmation, never a fabricated terminal. Like the spawn path,
+    /// confirmation registers through `ensure_child_registered`, which flushes
+    /// the thread's buffered early frames once the ACK validates.
+    async fn observe_sub_agent_activity(&mut self, producer: &str, item: &Value) -> Result<()> {
+        let Some((agent_thread, kind)) = sub_agent_activity(item) else {
+            return Ok(());
+        };
+        if kind != "started" {
+            return Ok(());
+        }
+        let owned = self
+            .status
+            .thread_id
+            .as_deref()
+            .unwrap_or(producer)
+            .to_owned();
+        if producer != owned
+            && !self.children.is_parent(&owned, producer)
+            && !self.child_states.contains_key(producer)
+        {
+            return Ok(());
+        }
+        if let Err(reason) = self.children.confirm(&owned, agent_thread) {
+            return self.record_child_spawn_gap(producer, reason).await;
+        }
+        self.children
+            .parents
+            .insert(agent_thread.to_owned(), producer.to_owned());
+        self.collect_orphan_child_state();
+        // Boxed: this helper runs on both the owned and the child frame
+        // path, and registration flushes buffered child frames back through
+        // the child path, so the future needs the same indirection the
+        // nested spawn path uses.
+        Box::pin(self.ensure_child_registered(agent_thread)).await
+    }
+
     async fn ensure_receivers_registered(&mut self, receivers: &[String]) -> Result<()> {
         let mut first_error = None;
         for receiver in receivers {
@@ -1533,6 +1577,13 @@ impl EventProcessor {
                         .await;
                 }
                 self.observe_spawn(&notification.item, false).await?;
+                // v2 child announcement: `kind: "started"` confirms the named
+                // thread; any other kind is a no-op lifecycle fact.
+                self.observe_sub_agent_activity(
+                    notification.thread_id.as_str(),
+                    &notification.item,
+                )
+                .await?;
                 let item_type = notification
                     .item
                     .get("type")
@@ -1586,6 +1637,10 @@ impl EventProcessor {
                 }
                 let raw_item = params.get("item").cloned().unwrap_or(Value::Null);
                 self.observe_spawn(&raw_item, true).await?;
+                // v2 child announcement, idempotent with the `item/started`
+                // side: `kind: "started"` confirms, anything else is a no-op.
+                self.observe_sub_agent_activity(notification.thread_id.as_str(), &raw_item)
+                    .await?;
                 let item_type = raw_item
                     .get("type")
                     .and_then(Value::as_str)
@@ -2601,10 +2656,16 @@ impl EventProcessor {
                 let raw_item = params.get("item").cloned().unwrap_or(Value::Null);
                 self.observe_child_spawn(child_thread, &raw_item, false)
                     .await?;
+                // Depth-2 v2 announcement from a confirmed child: same
+                // confirmation as the owned thread's, idempotent on repeat.
+                self.observe_sub_agent_activity(child_thread, &raw_item)
+                    .await?;
             }
             "item/completed" => {
                 let raw_item = params.get("item").cloned().unwrap_or(Value::Null);
                 self.observe_child_spawn(child_thread, &raw_item, true)
+                    .await?;
+                self.observe_sub_agent_activity(child_thread, &raw_item)
                     .await?;
                 let item_type = raw_item
                     .get("type")
@@ -2942,6 +3003,25 @@ fn spawn_call(item: &Value) -> Option<(String, Vec<String>)> {
         .map(str::to_owned)
         .collect();
     Some((item_id.to_owned(), receivers))
+}
+
+/// A v2 `subAgentActivity` thread item: the announced child thread and its
+/// lifecycle kind. Only `kind: "started"` confirms; every other kind is a
+/// fact with no transition. Malformed items (wrong type, missing thread or
+/// kind) are not activity at all and stay ignored without a gap.
+fn sub_agent_activity(item: &Value) -> Option<(&str, &str)> {
+    if item.get("type").and_then(Value::as_str) != Some("subAgentActivity") {
+        return None;
+    }
+    let agent_thread = item
+        .get("agentThreadId")
+        .and_then(Value::as_str)
+        .filter(|thread| !thread.trim().is_empty())?;
+    let kind = item
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.trim().is_empty())?;
+    Some((agent_thread, kind))
 }
 
 /// Encoded size of one buffered child frame, shared by buffering,
@@ -5749,8 +5829,8 @@ mod tests {
         processor.status.ready = true;
         processor.status.active_turn_id = Some("turn-1".to_owned());
         processor.status.active_command_id = Some("cmd-1".to_owned());
-        // The new 0.167.1 `subAgentActivity` item type is ignored like any
-        // other unsupported item: no tool family fits, so nothing commits
+        // A `subAgentActivity` item with an unknown kind stays ignored like
+        // any other unsupported item: no tool family fits, so nothing commits
         // and nothing gaps, on either side of the item lifecycle.
         for method in ["item/started", "item/completed"] {
             let mut params = json!({
@@ -5825,5 +5905,335 @@ mod tests {
         assert!(!state.source_unknown);
         assert!(state.pending_gap.is_none());
         assert!(!processor.gap_reported);
+    }
+
+    #[test]
+    fn sub_agent_activity_reads_only_well_formed_items() {
+        assert_eq!(
+            sub_agent_activity(&json!({
+                "type": "subAgentActivity", "id": "sa-1",
+                "agentThreadId": "child-1", "agentPath": "agents/child",
+                "kind": "started",
+            })),
+            Some(("child-1", "started"))
+        );
+        for item in [
+            json!({"type": "commandExecution", "id": "c", "agentThreadId": "x", "kind": "started"}),
+            json!({"type": "subAgentActivity", "id": "sa", "kind": "started"}),
+            json!({"type": "subAgentActivity", "id": "sa", "agentThreadId": " ", "kind": "started"}),
+            json!({"type": "subAgentActivity", "id": "sa", "agentThreadId": "x"}),
+            json!({"type": "subAgentActivity", "id": "sa", "agentThreadId": "x", "kind": " "}),
+        ] {
+            assert_eq!(sub_agent_activity(&item), None, "{item}");
+        }
+    }
+
+    fn sub_agent_activity_params(method: &str, kind: &str, agent_thread: &str) -> Value {
+        let mut params = json!({
+            "threadId": "owned",
+            "turnId": "turn-1",
+            "item": {
+                "type": "subAgentActivity", "id": "sa-1",
+                "agentThreadId": agent_thread, "agentPath": "agents/child",
+                "kind": kind,
+            },
+        });
+        if method == "item/completed" {
+            params["completedAtMs"] = json!(1);
+        }
+        params
+    }
+
+    /// Drives the v2 announcement order for one child: either the child's
+    /// `turn/started` arrives first and buffers while the thread is
+    /// unconfirmed, or the parent's `subAgentActivity` `started` confirms the
+    /// thread before any child frame. The announcement rides `method`, then
+    /// the other side of the item lifecycle repeats it idempotently. Either
+    /// way the child registers, its buffered frames flush, and no gap is
+    /// recorded.
+    async fn drive_sub_agent_activity_order(method: &str, activity_first: bool) {
+        use eliot_plugin::RpcRequest;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+
+        let (_native, mut processor, host_io, peer_task) = connected_child_processor("a1").await;
+        processor.status.ready = true;
+        processor.status.thread_id = Some("owned".to_owned());
+        processor.status.active_turn_id = Some("turn-1".to_owned());
+        processor.status.active_command_id = Some("cmd-1".to_owned());
+
+        let turn_started = json!({"threadId": "child-1", "turn": {"id": "turn-c1"}});
+        let other = if method == "item/started" {
+            "item/completed"
+        } else {
+            "item/started"
+        };
+
+        let fake_host = async {
+            let (host_read, mut host_write) = split(host_io);
+            let mut host_reader = BufReader::new(host_read);
+            let mut requests = Vec::new();
+            let mut last_seq = HashMap::<String, i64>::new();
+            // One child registration plus two event batches (child
+            // session.ready, then the flushed or direct child turn.started);
+            // the idempotent repeat commits nothing, and no gap ever fires.
+            for _ in 0..3 {
+                let mut line = String::new();
+                host_reader
+                    .read_line(&mut line)
+                    .await
+                    .expect("read fake-host request");
+                let request: RpcRequest = serde_json::from_str(&line).expect("decode request");
+                requests.push((request.method.clone(), request.params.clone()));
+                let result = match request.method.as_str() {
+                    "child" => {
+                        let registration: eliot_core::ChildRegistration =
+                            serde_json::from_value(request.params["registration"].clone())
+                                .expect("decode child registration");
+                        assert_eq!(registration.native_ref, "child-1");
+                        serde_json::to_value(crate::native_child::tests::test_ack(&registration))
+                            .expect("encode child ACK")
+                    }
+                    "events.put" => {
+                        let agent_id = request.params["agent_id"]
+                            .as_str()
+                            .expect("agent id")
+                            .to_owned();
+                        let count = request.params["events"]
+                            .as_array()
+                            .expect("event batch")
+                            .len() as i64;
+                        let sequence = last_seq.entry(agent_id).or_default();
+                        let first_seq = *sequence + 1;
+                        *sequence = first_seq + count - 1;
+                        json!({
+                            "first_seq": first_seq,
+                            "last_seq": *sequence,
+                            "cursor": Value::Null,
+                        })
+                    }
+                    method => panic!("unexpected fake-host request: {method}"),
+                };
+                let response = json!({"jsonrpc": "2.0", "id": request.id, "result": result});
+                host_write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .expect("send ACK");
+            }
+            requests
+        };
+        let driver = async {
+            if !activity_first {
+                // v2 order: the child's `turn/started` precedes any
+                // announcement, so it buffers while the thread is
+                // unconfirmed and never touches the owned path.
+                assert!(
+                    processor.take_child_frame(&turn_started),
+                    "{method} last: child turn/started must route to the child path"
+                );
+                processor
+                    .handle_frame(Some(NativeFrame::Notification {
+                        method: "turn/started".to_owned(),
+                        params: turn_started.clone(),
+                    }))
+                    .await;
+                assert!(processor.children.is_unconfirmed("child-1"));
+                assert_eq!(
+                    processor
+                        .child_buffers
+                        .get("child-1")
+                        .map(|queue| queue.len()),
+                    Some(1)
+                );
+            }
+            // The announcement rides `method`, then the other side of the
+            // item lifecycle repeats it idempotently.
+            for (position, announce) in [method, other].iter().enumerate() {
+                processor
+                    .handle_frame(Some(NativeFrame::Notification {
+                        method: (*announce).to_owned(),
+                        params: sub_agent_activity_params(announce, "started", "child-1"),
+                    }))
+                    .await;
+                assert!(
+                    processor.children.is_bound("child-1"),
+                    "{method} announce {position}: activity must confirm the child"
+                );
+                assert!(
+                    processor.child_states.contains_key("child-1"),
+                    "{method} announce {position}: activity must register the child"
+                );
+            }
+            if activity_first {
+                processor
+                    .handle_frame(Some(NativeFrame::Notification {
+                        method: "turn/started".to_owned(),
+                        params: turn_started.clone(),
+                    }))
+                    .await;
+            }
+            assert!(
+                !processor.gap_reported,
+                "{method} activity_first={activity_first}: no parent gap expected"
+            );
+            assert!(
+                processor.loss_reason.is_none(),
+                "{method} activity_first={activity_first}: no deferred loss expected"
+            );
+            assert!(
+                processor.status.failure.is_none(),
+                "{method} activity_first={activity_first}: no owned failure expected"
+            );
+            assert!(
+                !processor.status.source_unknown,
+                "{method} activity_first={activity_first}: owned source stays known"
+            );
+            assert!(
+                processor.children.is_bound("child-1"),
+                "{method} activity_first={activity_first}: child must confirm"
+            );
+            let state = processor.child_states.get("child-1").unwrap_or_else(|| {
+                panic!("{method} activity_first={activity_first}: child must register")
+            });
+            assert_eq!(
+                state.active_turn_id.as_deref(),
+                Some("turn-c1"),
+                "{method} activity_first={activity_first}: child turn must open"
+            );
+            assert!(
+                processor
+                    .child_buffers
+                    .get("child-1")
+                    .is_none_or(|queue| queue.is_empty()),
+                "{method} activity_first={activity_first}: buffered frames must flush"
+            );
+        };
+        let (requests, ()) = tokio::join!(fake_host, driver);
+        peer_task.abort();
+
+        assert!(
+            requests.iter().all(|(method, _)| method != "source.gap"),
+            "{method} activity_first={activity_first}: no gap RPC expected, saw {requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(method, params)| method == "events.put"
+                    && params["agent_id"] == "a2"
+                    && params["events"].as_array().is_some_and(|events| events
+                        .iter()
+                        .any(|event| event["kind"] == "turn.started"
+                            && event["data"]["turn_id"] == "turn-c1"))),
+            "{method} activity_first={activity_first}: child turn.started must commit, saw {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_agent_activity_started_confirms_child_in_either_order() {
+        for method in ["item/started", "item/completed"] {
+            drive_sub_agent_activity_order(method, false).await;
+            drive_sub_agent_activity_order(method, true).await;
+        }
+    }
+
+    /// `completed` (and the other non-`started` kinds) for a known child is
+    /// a lifecycle fact with no state-machine transition: no gap, no
+    /// terminal, and the child's open turn is untouched.
+    #[tokio::test]
+    async fn sub_agent_activity_completed_for_known_child_is_ignored() {
+        use tokio::io::{AsyncBufReadExt, BufReader, split};
+
+        let (_native, mut processor, host_io, peer_task) = connected_child_processor("a1").await;
+        processor.status.ready = true;
+        processor.status.thread_id = Some("owned".to_owned());
+        processor.status.active_turn_id = Some("turn-1".to_owned());
+        processor.status.active_command_id = Some("cmd-1".to_owned());
+        processor.children.confirm("owned", "child-1").unwrap();
+        processor
+            .children
+            .parents
+            .insert("child-1".to_owned(), "owned".to_owned());
+        let registration = build_registration("call-1", "a1", 1, "owned", "codex:test", "child-1");
+        let mut state = ChildState::new(ChildBinding {
+            registration,
+            agent_id: "a2".to_owned(),
+            agent_generation: 1,
+            native_ref: "child-1".to_owned(),
+        });
+        state.ready_committed = true;
+        state.active_turn_id = Some("turn-c1".to_owned());
+        processor.child_states.insert("child-1".to_owned(), state);
+
+        // No host RPC is expected at all: nothing registers, nothing commits,
+        // nothing gaps. A stray request fails the timeout read below.
+        let (host_read, _host_write) = split(host_io);
+        let mut host_reader = BufReader::new(host_read);
+        for method in ["item/started", "item/completed"] {
+            for kind in ["interacted", "interrupted", "completed"] {
+                processor
+                    .handle_frame(Some(NativeFrame::Notification {
+                        method: method.to_owned(),
+                        params: sub_agent_activity_params(method, kind, "child-1"),
+                    }))
+                    .await;
+            }
+        }
+        let state = processor.child_states.get("child-1").expect("child stays");
+        assert_eq!(state.active_turn_id.as_deref(), Some("turn-c1"));
+        assert!(state.final_text.is_none());
+        assert!(!state.source_unknown);
+        assert!(state.pending_gap.is_none());
+        assert!(!processor.gap_reported);
+        assert!(processor.loss_reason.is_none());
+        assert!(processor.status.failure.is_none());
+
+        let mut line = String::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), host_reader.read_line(&mut line))
+                .await
+                .is_err(),
+            "lifecycle facts must send no host RPC, saw {line:?}"
+        );
+        peer_task.abort();
+    }
+
+    /// Activity naming a foreign thread with a kind other than `started` is
+    /// not a confirmation: nothing registers and nothing gaps.
+    #[tokio::test]
+    async fn sub_agent_activity_completed_for_unknown_thread_never_confirms() {
+        use tokio::io::{AsyncBufReadExt, BufReader, split};
+
+        let (_native, mut processor, host_io, peer_task) = connected_child_processor("a1").await;
+        processor.status.ready = true;
+        processor.status.thread_id = Some("owned".to_owned());
+        processor.status.active_turn_id = Some("turn-1".to_owned());
+        processor.status.active_command_id = Some("cmd-1".to_owned());
+
+        let (host_read, _host_write) = split(host_io);
+        let mut host_reader = BufReader::new(host_read);
+        for method in ["item/started", "item/completed"] {
+            processor
+                .handle_frame(Some(NativeFrame::Notification {
+                    method: method.to_owned(),
+                    params: sub_agent_activity_params(method, "completed", "foreign-9"),
+                }))
+                .await;
+        }
+        assert!(!processor.children.is_bound("foreign-9"));
+        assert!(!processor.child_states.contains_key("foreign-9"));
+        assert!(!processor.child_pending.contains_key("foreign-9"));
+        assert!(!processor.children.is_unconfirmed("foreign-9"));
+        assert!(!processor.gap_reported);
+        assert!(processor.loss_reason.is_none());
+        assert!(processor.status.failure.is_none());
+        assert!(!processor.status.source_unknown);
+
+        let mut line = String::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), host_reader.read_line(&mut line))
+                .await
+                .is_err(),
+            "foreign lifecycle facts must send no host RPC, saw {line:?}"
+        );
+        peer_task.abort();
     }
 }

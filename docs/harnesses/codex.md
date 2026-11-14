@@ -251,9 +251,11 @@ the same stream, verified against installed Codex 0.167.1
 (`codex app-server generate-json-schema`). A thread is a child when its
 `thread/started` names the owned thread (or a confirmed child) in
 `source.subAgent.thread_spawn.parent_thread_id` **or** in the new top-level
-`thread.parentThreadId` (set only for subagent threads), or when the
+`thread.parentThreadId` (set only for subagent threads), when the
 owned thread's `item/completed` for a `collabAgentToolCall` `spawnAgent` lists it in
-`receiverThreadIds`. A 0.167.1 child's first frames can precede both the spawn
+`receiverThreadIds` (v1), or when a `subAgentActivity` item with
+`kind: "started"` on the owned thread (or a confirmed child, for depth 2) names it
+in `agentThreadId` (v2). A 0.167.1 child's first frames can precede both the spawn
 announcement and its own `thread/started`, so any frame naming a present non-owned
 thread routes to the child path and is held as unconfirmed in the bounded early
 buffer; a non-owned thread's frame is never validated as owned, and overflow drops
@@ -265,11 +267,14 @@ child facts publish until its
 registered child is tokenless and observe-only, with no independent Eliot principal and
 no child control verbs. Child server requests stay unsupported and are rejected, never
 forwarded to control. When the last spawn completes, the turn ends or the stream
-closes, a still-unconfirmed thread is a source gap. The new `subAgentActivity` item
-type is ignored like any other unsupported item (no gap, no family fits), and the new
+closes, a still-unconfirmed thread is a source gap. A `subAgentActivity` item with
+any other `kind` (`interacted` | `interrupted` | `completed`) is a lifecycle fact
+with no matching transition: it is ignored (no gap, no fabricated terminal), and it
+never confirms an unknown thread. The new
 `CollabAgentTool` values (`sendMessage`, `followupTask`, `interruptAgent`,
 `listAgents`) ride the existing `collabAgentToolCall` tool family; only `spawnAgent`
-opens a spawn window. `world_state` is a rollout-history record only, not a stream
+opens a spawn window, and `wait` items carry no receivers and never confirm.
+`world_state` is a rollout-history record only, not a stream
 notification, and needs no handling.
 
 Start owns one live stream. It publishes the implemented lifecycle families only; do not
