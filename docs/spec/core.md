@@ -622,7 +622,9 @@ expenditure sums each `TurnUsage` counter over retained terminal turns that
 supply it, grouped by native scope (`turn`, `main_loop_turn`, `message`,
 `unknown`): scopes never merge into a cross-scope total. The response carries
 `turns_counted`, `turns_without_usage`, and per-counter `turns_missing`
-gaps. Session facts sum cumulative counters only where every included
+gaps, plus the retained non-terminal turns the sums skip
+(`turns_unknown_excluded`, `turns_running_excluded`): an unknown turn may
+have spent tokens the readback cannot see. Session facts sum cumulative counters only where every included
 snapshot supplies them (otherwise the subtotal and its gap read back), group
 cost by verbatim unit without converting, and never sum context occupancy.
 `history_complete` is false with its reason when the retained-event

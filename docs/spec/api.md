@@ -643,7 +643,8 @@ echoes the scope, reports the included Agent/generation counts with explicit
 `truncated`, states `history_complete` with its reason and the
 `pruned_through` watermark, groups turn expenditure by native scope with
 `turns_counted`/`turns_without_usage`/per-counter `turns_missing` (no
-cross-scope totals), and carries session subtotals with their supply gaps
+cross-scope totals) plus the excluded unknown/running turns the sums skip,
+and carries session subtotals with their supply gaps
 and per-unit costs. `swarm usage` renders this response as a compact table;
 `--json` keeps printing the raw response.
 

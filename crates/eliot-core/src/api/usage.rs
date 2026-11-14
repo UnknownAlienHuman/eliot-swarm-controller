@@ -161,12 +161,20 @@ pub struct TurnScopeTotals {
 
 /// Turn expenditure over the retained terminal turns in scope, grouped by
 /// native scope. `turns_counted` is every retained terminal turn examined;
-/// `turns_without_usage` had no usage row at all.
+/// `turns_without_usage` had no usage row at all. The excluded counts name
+/// the retained non-terminal turns the sums skip: unknown turns may have
+/// spent tokens this readback cannot see.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TurnExpenditure {
     pub turns_counted: usize,
     pub turns_without_usage: usize,
+    /// Retained turns left out of the sums because they are not terminal:
+    /// `unknown` turns may have spent tokens the readback cannot see, and
+    /// `running` turns have not terminalized. Scopeless counts: a
+    /// non-terminal turn carries no attributed usage scope.
+    pub turns_unknown_excluded: usize,
+    pub turns_running_excluded: usize,
     pub turns_missing: TurnCounterMissing,
     pub by_scope: Vec<TurnScopeTotals>,
 }
@@ -401,6 +409,10 @@ mod tests {
         let request: UsageSummaryRequest = serde_json::from_value(json!({"agent": "a1"})).unwrap();
         let mut reply = empty_response(&request);
         request.validate_response(&reply).unwrap();
+        // Excluded non-terminal turns validate as ordinary coverage counts.
+        reply.turns.turns_unknown_excluded = 1;
+        reply.turns.turns_running_excluded = 2;
+        request.validate_response(&reply).unwrap();
         reply.scope.agent = Some("a2".to_owned());
         assert!(request.validate_response(&reply).is_err());
     }
@@ -422,6 +434,8 @@ mod tests {
             turns: TurnExpenditure {
                 turns_counted: 0,
                 turns_without_usage: 0,
+                turns_unknown_excluded: 0,
+                turns_running_excluded: 0,
                 turns_missing: TurnCounterMissing::default(),
                 by_scope: Vec::new(),
             },

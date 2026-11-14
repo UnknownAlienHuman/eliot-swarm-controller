@@ -3633,10 +3633,12 @@ fn print_usage_table(response: &UsageSummaryResponse) {
     );
     println!("  {}", response.history_reason);
     println!(
-        "  turns counted {} with_usage {} without_usage {}",
+        "  turns counted {} with_usage {} without_usage {} excluded unknown {} running {}",
         response.turns.turns_counted,
         response.turns.turns_counted - response.turns.turns_without_usage,
         response.turns.turns_without_usage,
+        response.turns.turns_unknown_excluded,
+        response.turns.turns_running_excluded,
     );
     println!(
         "  {:<14} {:<7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
@@ -3959,6 +3961,8 @@ mod tests {
             turns: TurnExpenditure {
                 turns_counted: 2,
                 turns_without_usage: 1,
+                turns_unknown_excluded: 1,
+                turns_running_excluded: 1,
                 turns_missing: TurnCounterMissing {
                     input_tokens: 1,
                     output_tokens: 2,

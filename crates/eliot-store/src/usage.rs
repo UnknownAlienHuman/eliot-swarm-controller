@@ -250,6 +250,8 @@ impl Store {
         let wanted: std::collections::HashSet<(i64, i64)> = pairs.iter().copied().collect();
         let mut turns_counted = 0_usize;
         let mut turns_without_usage = 0_usize;
+        let mut turns_unknown_excluded = 0_usize;
+        let mut turns_running_excluded = 0_usize;
         let mut overall_supplied = [0_usize; TURN_COUNTERS];
         let mut overall_sums = [0_i128; TURN_COUNTERS];
         let mut scopes: BTreeMap<String, ScopeAccum> = BTreeMap::new();
@@ -258,8 +260,7 @@ impl Store {
             let nums: Vec<i64> = nums.into_iter().collect();
             let placeholders = nums.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
-                "SELECT agent, generation, usage FROM turns \
-                 WHERE state = 'completed' AND agent IN ({placeholders})"
+                "SELECT agent, generation, state, usage FROM turns WHERE agent IN ({placeholders})"
             );
             let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
             let rows = statement
@@ -267,13 +268,26 @@ impl Store {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
-                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 })
                 .map_err(sql_error)?;
             for row in rows {
-                let (agent, generation, usage) = row.map_err(sql_error)?;
+                let (agent, generation, state, usage) = row.map_err(sql_error)?;
                 if !wanted.contains(&(agent, generation)) {
+                    continue;
+                }
+                if state != "completed" {
+                    // Sums stay over completed turns only, but the skipped
+                    // turns stay visible: an unknown turn may have spent
+                    // tokens this readback cannot see. Any other
+                    // non-terminal state reads as unknown rather than
+                    // vanishing from coverage.
+                    match state.as_str() {
+                        "running" => turns_running_excluded += 1,
+                        _ => turns_unknown_excluded += 1,
+                    }
                     continue;
                 }
                 turns_counted += 1;
@@ -317,6 +331,8 @@ impl Store {
             turns: TurnExpenditure {
                 turns_counted,
                 turns_without_usage,
+                turns_unknown_excluded,
+                turns_running_excluded,
                 turns_missing: counter_missing(turns_counted, &overall_supplied),
                 by_scope,
             },
@@ -525,14 +541,25 @@ mod tests {
         turn_id: &str,
         usage: Option<serde_json::Value>,
     ) {
+        insert_turn_state(store, agent, generation, turn_id, "completed", usage);
+    }
+
+    fn insert_turn_state(
+        store: &Store,
+        agent: &str,
+        generation: i64,
+        turn_id: &str,
+        state: &str,
+        usage: Option<serde_json::Value>,
+    ) {
         let num = parse_agent_id(agent).expect("valid agent id");
         let usage = usage.map(|usage| serde_json::to_string(&usage).expect("encode usage"));
         store
             .connection
             .execute(
                 "INSERT INTO turns(agent, generation, turn_id, state, status, outcome, usage, started_at)
-                 VALUES (?1, ?2, ?3, 'completed', 'completed', 'success', ?4, 1)",
-                params![num, generation, turn_id, usage],
+                 VALUES (?1, ?2, ?3, ?4, 'completed', 'success', ?5, 1)",
+                params![num, generation, turn_id, state, usage],
             )
             .expect("insert turn");
     }
@@ -611,10 +638,16 @@ mod tests {
             Some(json!({"scope": "message", "input_tokens": 3, "total_tokens": 9})),
         );
         insert_turn(&store, &agent, 1, "t4", None);
+        // Non-terminal turns stay out of the sums but stay visible: the
+        // unknown turn may have spent tokens this readback cannot see.
+        insert_turn_state(&store, &agent, 1, "t5", "unknown", None);
+        insert_turn_state(&store, &agent, 1, "t6", "running", None);
 
         let response = summarize(&store, &agent_scope(&agent));
         assert_eq!(response.turns.turns_counted, 4);
         assert_eq!(response.turns.turns_without_usage, 1);
+        assert_eq!(response.turns.turns_unknown_excluded, 1);
+        assert_eq!(response.turns.turns_running_excluded, 1);
         assert_eq!(response.turns.turns_missing.input_tokens, 1);
         assert_eq!(response.turns.turns_missing.output_tokens, 3);
         assert_eq!(response.turns.turns_missing.total_tokens, 3);
