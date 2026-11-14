@@ -634,6 +634,19 @@ reports it; null attribution means the native scope is unknown. Message scope is
 a turn or session total, and a populated native total must not be assumed a per-turn or
 per-call total when scope is unknown.
 
+`usage.summary` reads bounded usage totals with explicit coverage over
+exactly one of `agent` (with an optional `generation`; omitted covers all
+retained generations), `project`, or `root` (the root Agent and its
+descendants). The same read authorization as the other Agent reads applies:
+an Agent principal sees only what its frozen scope allows. The response
+echoes the scope, reports the included Agent/generation counts with explicit
+`truncated`, states `history_complete` with its reason and the
+`pruned_through` watermark, groups turn expenditure by native scope with
+`turns_counted`/`turns_without_usage`/per-counter `turns_missing` (no
+cross-scope totals), and carries session subtotals with their supply gaps
+and per-unit costs. `swarm usage` renders this response as a compact table;
+`--json` keeps printing the raw response.
+
 Required IDs must be strings whose trimmed value is nonempty. Validation does not trim,
 normalize or impose a new length limit on them. `turn.get` requires a nonnegative integer
 generation. For `agent.result`, omitted `generation` selects the current generation;

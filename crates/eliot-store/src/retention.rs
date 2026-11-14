@@ -481,7 +481,7 @@ fn event_prune_end_tx(
 
 /// Current `rule_history_coverage.pruned_through` for reports when the events
 /// side is disabled.
-pub(super) fn coverage_pruned_through(connection: &Connection) -> Result<i64> {
+pub(crate) fn coverage_pruned_through(connection: &Connection) -> Result<i64> {
     connection
         .query_row(
             "SELECT pruned_through FROM rule_history_coverage WHERE singleton = 1",

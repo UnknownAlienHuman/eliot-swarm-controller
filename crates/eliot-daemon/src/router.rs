@@ -44,8 +44,8 @@ use eliot_core::{
         ProcessPageCursor, ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest,
         RuleGetRequest, RuleStateView, RunningTurnSummary, ShutdownMode, SourceState,
         StatusBlocker, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView,
-        TurnGetRequest, UnsettledCommandSummary, WaitEntryResult, WorkerTaskHealth,
-        WorkerTaskStatus, WorkspaceCustodyView,
+        TurnGetRequest, UnsettledCommandSummary, UsageScopeView, UsageSummaryRequest,
+        WaitEntryResult, WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -278,6 +278,7 @@ impl Router {
             "agent.result" => self.agent_result(&params, &principal).await,
             "agent.processes" => self.agent_processes(&params, &principal).await,
             "agent.stats" => self.agent_stats(&params, &principal).await,
+            "usage.summary" => self.usage_summary(&params, &principal).await,
             "agent.git" => self.agent_git(&params, &principal).await,
             "agent.edits" => self.agent_edits(&params, &principal).await,
             "turn.get" => self.turn_get(&params, &principal).await,
@@ -2736,6 +2737,81 @@ impl Router {
             session_usage,
         })
         .map_err(|_| Error::new("internal", "stats view could not be encoded"))
+    }
+
+    /// Bounded usage totals with explicit coverage over one Agent, project
+    /// or tree scope. The Owner reads every retained generation in scope;
+    /// an Agent principal reads only the pairs its frozen control scope
+    /// allows, exactly like the other Agent reads. Scope expansion reuses
+    /// the Store hierarchy bound; truncation and retention coverage stay
+    /// explicit so a partial subtotal never presents as complete.
+    async fn usage_summary(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        let request: UsageSummaryRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let response = {
+            let store = self.inner.store.lock().await;
+            let resolved = store.resolve_usage_scope(&request)?;
+            let (pairs, agents_included) = match principal {
+                Principal::Owner => (resolved.pairs, resolved.agents_included),
+                Principal::Agent { id, .. } => {
+                    if let Some(target) = request.agent.as_deref() {
+                        hierarchy::authorize_agent_read(
+                            &store,
+                            principal,
+                            target,
+                            request.generation,
+                        )?;
+                        (resolved.pairs, resolved.agents_included)
+                    } else {
+                        if request.root.is_some() {
+                            hierarchy::authorize_agent_read(
+                                &store,
+                                principal,
+                                request.root.as_deref().expect("root scope present"),
+                                None,
+                            )?;
+                        }
+                        let caller = store.get_agent(id)?.ok_or_else(|| {
+                            Error::new("not_found", format!("Agent {id} was not found"))
+                        })?;
+                        let mut pairs = Vec::new();
+                        let mut agents = HashSet::new();
+                        for (num, generation) in &resolved.pairs {
+                            let target = format!("a{num}");
+                            if target == *id || store.agent_in_scope(&caller, &target)? {
+                                agents.insert(*num);
+                                pairs.push((*num, *generation));
+                            }
+                        }
+                        (pairs, agents.len())
+                    }
+                }
+                Principal::Run { .. } | Principal::ProjectRule { .. } => {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "usage summary needs the owner or an Agent principal",
+                    ));
+                }
+            };
+            let truncated = resolved.truncated;
+            store.summarize_usage(
+                UsageScopeView {
+                    agent: request.agent.clone(),
+                    generation: request.generation,
+                    project: request.project.clone(),
+                    root: request.root.clone(),
+                },
+                &pairs,
+                agents_included,
+                truncated,
+            )?
+        };
+        request
+            .validate_response(&response)
+            .map_err(|_| Error::new("internal", "usage summary is invalid"))?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "usage summary could not be encoded"))
     }
 
     async fn agent_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -11806,6 +11882,124 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .unwrap_err();
             assert_eq!(error.code, "invalid", "exact-turn limit: {limit}");
         }
+    }
+
+    #[tokio::test]
+    async fn usage_summary_scopes_owner_and_agent_reads() {
+        use eliot_core::api::UsageSummaryResponse;
+
+        let router = router();
+        let (parent, child, other) = {
+            let mut store = router.inner.store.lock().await;
+            let now = now_ms();
+            let launch =
+                |store: &mut eliot_store::Store, project: &str, parent: Option<&str>| -> String {
+                    let id = ulid::Ulid::new().to_string();
+                    let mut args = json!({
+                        "project": project,
+                        "workspace": "synthetic-workspace",
+                        "harness": "codex",
+                        "profile": "synthetic",
+                        "profile_snapshot": {"control": "tree"},
+                    });
+                    if let Some(parent) = parent {
+                        args["parent"] = json!(parent);
+                    }
+                    let agent = store
+                        .submit(
+                            "owner",
+                            SubmitCommand {
+                                id: id.clone(),
+                                target: None,
+                                selector: None,
+                                verb: "launch".to_owned(),
+                                args,
+                                expected_generation: Some(0),
+                                expected_turn_id: None,
+                                request_id: None,
+                                probe: false,
+                            },
+                            now,
+                        )
+                        .unwrap()
+                        .command
+                        .target
+                        .unwrap();
+                    store.dispatch(&id, now).unwrap();
+                    agent
+                };
+            let parent = launch(&mut store, "usage-scope", None);
+            let child = launch(&mut store, "usage-scope", Some(&parent));
+            let other = launch(&mut store, "usage-other", None);
+            (parent, child, other)
+        };
+        let generation = |agent: &str| {
+            let agent = agent.to_owned();
+            let router = &router;
+            async move {
+                router
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .get_agent(&agent)
+                    .unwrap()
+                    .unwrap()
+                    .generation
+            }
+        };
+
+        // The Owner sees the whole project scope.
+        let response: UsageSummaryResponse = serde_json::from_value(
+            router
+                .usage_summary(&json!({"project": "usage-scope"}), &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response.agents_included, 2);
+        assert_eq!(response.generations_included, 2);
+        assert!(!response.truncated);
+        assert!(response.history_complete);
+
+        // A tree-control parent reads its whole subtree through the root.
+        let parent_principal = Principal::Agent {
+            id: parent.clone(),
+            generation: generation(&parent).await,
+        };
+        let response: UsageSummaryResponse = serde_json::from_value(
+            router
+                .usage_summary(&json!({"root": parent}), &parent_principal)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response.agents_included, 2);
+
+        // The child cannot read through the parent root, sees only itself
+        // in the shared project, and cannot reach the outsider at all.
+        let child_principal = Principal::Agent {
+            id: child.clone(),
+            generation: generation(&child).await,
+        };
+        let error = router
+            .usage_summary(&json!({"root": parent}), &child_principal)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
+        let response: UsageSummaryResponse = serde_json::from_value(
+            router
+                .usage_summary(&json!({"project": "usage-scope"}), &child_principal)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response.agents_included, 1);
+        let error = router
+            .usage_summary(&json!({"agent": other}), &child_principal)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
     }
 
     fn launch_fixture(

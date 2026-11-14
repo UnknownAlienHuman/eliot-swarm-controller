@@ -20,6 +20,7 @@ mod resolutions;
 mod rules;
 mod scripts;
 mod timers;
+mod usage;
 mod waits;
 
 pub use agent_views::{
@@ -96,6 +97,11 @@ pub use scripts::{
     ScriptTimerContext, ScriptTimerInvocation, bound_script_outcome_stderr,
 };
 pub use timers::{CatchUp, TimerGetRequest, TimerRunRequest, TimerSchedule, TimerStateView};
+pub use usage::{
+    SessionCostTotal, SessionCumulativeTotals, SessionFacts, SessionTokenSubtotal,
+    TurnCounterMissing, TurnCounterTotals, TurnExpenditure, TurnScopeTotals, UsageScopeView,
+    UsageSummaryRequest, UsageSummaryResponse,
+};
 pub use waits::{
     MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, SwarmWaitRequest, SwarmWaitResponse,
     WaitEntryResult, WaitTurnRef,
