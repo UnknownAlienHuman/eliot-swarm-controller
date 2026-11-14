@@ -4,7 +4,7 @@
 //! custody: the plugin process runs inside the generation's Windows Job, so
 //! the server child (spawned directly, never through a `.cmd` wrapper) and
 //! anything it spawns die with the generation. The server never sees the
-//! owner's global config or data (verified on the installed v2.0.32
+//! owner's global config or data (verified on the installed v2.2.7
 //! server). Authentication is a generated per-generation `OPENCODE_PASSWORD`;
 //! a preset password also suppresses the `server password` stdout line.
 //! The child inherits the daemon-allowlisted plugin environment plus the

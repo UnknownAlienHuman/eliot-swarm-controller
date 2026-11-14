@@ -1,12 +1,13 @@
 //! OpenCode wire DTOs, hand-typed from the installed server.
 //!
-//! Source: `GET /openapi.json` of `opencode serve` v2.0.32 (OpenAPI 3.1.0,
+//! Source: `GET /openapi.json` of `opencode serve` v2.2.7 (OpenAPI 3.1.0,
 //! `opencode HttpApi version=0.0.1`, all routes under `/api/...`) plus the
 //! `session-event.ts` / `permission.ts` / `form.ts` event definitions at tag
-//! `v2.0.32` of `anomalyco/opencode`, verified against a locally started
-//! server with no model call. Unknown JSON fields are ignored on deserialize
-//! for forward compatibility. DTOs only: no I/O, no process spawning, no
-//! config access.
+//! `v2.2.7` of `anomalyco/opencode`, verified against a locally started
+//! server with a live model call (session create, prompt, message readback)
+//! through the isolated per-Agent store. Unknown JSON fields are ignored on
+//! deserialize for forward compatibility. DTOs only: no I/O, no process
+//! spawning, no config access.
 
 use serde::{Deserialize, Serialize};
 
@@ -776,6 +777,67 @@ mod tests {
     }
 
     #[test]
+    fn provider_auth_denial_decodes_with_its_message() {
+        // Exact failure observed live on `opencode serve` v2.2.7 when the
+        // upstream provider refuses: the idle outcome is `failed` with a
+        // `provider.auth` error carrying extra `status`/`response` members
+        // beside `type`/`message`. The extras must stay decodable (ignored)
+        // and the denial message must survive for the turn's native error.
+        let page: MessagePage = serde_json::from_value(serde_json::json!({
+            "data": [
+                {"id": "msg_idle_403", "time": {"created": 1794688470327i64,
+                                                "streamed": 1794688907453i64,
+                                                "completed": 1794688907514i64},
+                 "type": "idle", "outcome": "failed",
+                 "error": {"type": "provider.auth",
+                           "message": "Workspace access denied",
+                           "status": 403,
+                           "response": {"body": "{\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"Workspace access denied\"}}"}}},
+                {"id": "msg_asst_403", "time": {"created": 1794688469854i64},
+                 "type": "assistant", "agent": "build",
+                 "model": {"id": "muse-spark-1.3-contributor",
+                           "providerID": "opencode-go", "variant": "default"},
+                 "content": [], "finish": "error",
+                 "error": {"type": "provider.auth",
+                           "message": "Workspace access denied", "status": 403}},
+            ],
+            "cursor": {"previous": null, "next": null},
+        }))
+        .expect("installed denial page decodes");
+        match &page.data[0] {
+            Message::Idle(idle) => {
+                assert_eq!(idle.outcome, "failed");
+                let error = idle.error.as_ref().expect("denial carries an error");
+                assert_eq!(error.error_type, "provider.auth");
+                assert_eq!(error.message, "Workspace access denied");
+            }
+            other => panic!("expected idle, got {other:?}"),
+        }
+        match &page.data[1] {
+            Message::Assistant(assistant) => {
+                assert_eq!(assistant.finish.as_deref(), Some("error"));
+                assert!(assistant.content.is_empty());
+            }
+            other => panic!("expected assistant, got {other:?}"),
+        }
+        let failed: SseEnvelope = serde_json::from_value(serde_json::json!({
+            "id": "evt_denied",
+            "type": "session.execution.failed",
+            "data": {
+                "sessionID": "ses_denied",
+                "error": {"type": "provider.auth",
+                          "message": "Workspace access denied", "status": 403},
+            },
+        }))
+        .expect("installed failed-event shape decodes");
+        let data: ExecutionEventData =
+            serde_json::from_value(failed.data).expect("failed data decodes");
+        let error = data.error.expect("failed carries an error");
+        assert_eq!(error.error_type, "provider.auth");
+        assert_eq!(error.message, "Workspace access denied");
+    }
+
+    #[test]
     fn unknown_message_and_content_types_decode_as_other() {
         let page: MessagePage = serde_json::from_value(serde_json::json!({
             "data": [
@@ -798,7 +860,7 @@ mod tests {
 
     #[test]
     fn interrupt_response_is_unwrapped_and_idle_is_false() {
-        // Installed `POST .../interrupt` on an idle session (v2.0.32).
+        // Installed `POST .../interrupt` on an idle session (v2.2.7).
         let idle: InterruptResponse = serde_json::from_value(serde_json::json!({
             "interrupted": false,
         }))
