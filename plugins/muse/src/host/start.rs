@@ -11,7 +11,6 @@ use crate::{
     native::{
         NativeClient, NativeLaunch, NativeProcess,
         types::{
-            NativeClientCapabilities, NativeClientInfo, NativeInitializeParams,
             NativeInitializeResult, NativeModelEffortVariants, NativeModelSelection, NativeSession,
             NativeSessionSetApprovalModeParams, NativeSessionSetApprovalModeResult,
             NativeSessionSetModelParams, NativeSessionSetModelResult,
@@ -237,19 +236,7 @@ impl MusePlugin {
         requested_model: Option<&str>,
         requested_effort: Option<&str>,
     ) -> Result<InitializedNative> {
-        let init_params = NativeInitializeParams {
-            client_info: NativeClientInfo {
-                name: "eliot".to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                title: Some("Eliot".to_owned()),
-            },
-            // A1 answers `userInput/request` through Eliot's answer/deny
-            // verbs; `true` (the D-047 capable posture) has the host serve
-            // prompts toward this client.
-            capabilities: Some(NativeClientCapabilities {
-                user_input_dialogs: Some(true),
-            }),
-        };
+        let init_params = super::native_initialize_params();
         let init_value = serde_json::to_value(init_params)
             .map_err(|_| Error::new("internal", "Muse initialize params could not be encoded"))?;
         let initialized: NativeInitializeResult = serde_json::from_value(

@@ -374,13 +374,15 @@ No adapter-specific journal, proof receipts or secondary workflow model is impor
 
 ## Ad-hoc launch
 
-`swarm launch --harness muse [--model M] [--effort E] --workspace W "prompt"`
-is Owner-only and freezes a profile-equivalent snapshot from safe defaults
-(`workspace-write`, `never`, MCP `inherit`) plus flags. An omitted `--model`
-defers to the server default (the catalogue names no default marker; an empty
-catalogue, e.g. Muse 1.4.20's `bundledCatalog` with zero models, fails
-honestly); the effective id is read back from the session. An unavailable
-requested model fails without substitution. `cmd` is discovered from the
-launcher dir version the launcher marks current (`muse.cmd` wrappers are never
-frozen). `swarm models --harness muse` returns the live native catalogue;
-note it carries no default marker.
+`swarm launch --harness muse [--model M] [--effort E] [--cmd PATH]
+--workspace W "prompt"` is Owner-only and freezes a profile-equivalent
+snapshot from safe defaults (`workspace-write`, `never`, MCP `inherit`) plus
+flags. An omitted `--model` defers to the server default (the catalogue names
+no default marker; an empty catalogue, e.g. Muse 1.4.20's `bundledCatalog`
+with zero models, fails honestly); the effective id is read back from the
+session. An unavailable requested model fails without substitution. `cmd` is
+discovered from the launcher dir version the launcher marks current
+(`muse.cmd` wrappers are never frozen); `--cmd` pins one explicit binary
+version instead (e.g. the 1.4.0 binary while the launcher marks 1.4.20).
+`swarm models --harness muse` returns the live native catalogue; note it
+carries no default marker.

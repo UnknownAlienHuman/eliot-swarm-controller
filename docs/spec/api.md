@@ -599,13 +599,15 @@ Worktree creation is opt-in on the same launch command:
 
 ```text
 command.submit {id, verb:"launch",
-  args:{profile?:NAME, harness?:HARNESS, model?:MODEL, effort?:EFFORT,
+  args:{profile?:NAME, harness?:HARNESS, model?:MODEL, effort?:EFFORT, cmd?:PATH,
         workspace, worktree?:BRANCH, base?:REF, parent?:AGENT, text?}}
 ```
 
 A parentless Owner launch names either a stored `profile` or an ad-hoc
-`harness` (mutually exclusive); `model`/`effort` are ad-hoc only and require
-`harness`. Ad-hoc launch is Owner-only and freezes a profile-equivalent
+`harness` (mutually exclusive); `model`/`effort`/`cmd` are ad-hoc only and
+require `harness` (`cmd` pins the native executable, e.g. a Muse binary
+version the launcher no longer marks current). Ad-hoc launch is Owner-only
+and freezes a profile-equivalent
 snapshot from built-in safe defaults plus flags (see
 [configuration](configuration.md#ad-hoc-owner-launch-no-stored-profile));
 Agent principals keep the profile and `child_profiles` rules and cannot
@@ -911,12 +913,15 @@ restores revoked control; unknown blocks another takeover.
 `agent.discover` uses `AgentDiscoverRequest`/`DiscoverPage`; `agent.history` uses
 `AgentHistoryRequest`/`ObservationPage` from the canonical native metadata DTOs.
 `harness.list` (`HarnessListRequest`/`HarnessListResponse`, no params) reports
-per-harness installation facts (installed, resolved `cmd`, `--version`);
+per-harness installation facts (installed, resolved `cmd`, `--version`; Claude
+additionally reports every discovered install newest first in `candidates`);
 `harness.models` (`HarnessModelsRequest`/`HarnessModelsResponse`) returns the
 harness's own read-only catalogue (Codex/Muse native `model/list`, the OpenCode
 provider/model list; Claude reports aliases plus the CLI default, Antigravity
-reports no catalogue). Both are owner-only, read-only, and start no model turn
-and no inference (`swarm harnesses`, `swarm models --harness H`).
+reports no catalogue). `harness.models` accepts an optional `cmd` overriding
+discovery for the catalogue harnesses (codex|muse|opencode). Both are
+owner-only, read-only, and start no model turn and no inference
+(`swarm harnesses`, `swarm models --harness H [--cmd PATH]`).
 `profile` and `id` are required nonempty strings. Present strings are checked for
 nonemptiness after trimming but are preserved as supplied. For `agent.discover`, optional
 `harness`, `native_scope` and `cursor` may be omitted or `null` to mean absent. For

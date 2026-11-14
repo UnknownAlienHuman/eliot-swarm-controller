@@ -64,8 +64,8 @@ pub use goals::{
     MIN_GOAL_CADENCE_MS,
 };
 pub use harness::{
-    HarnessEntry, HarnessListRequest, HarnessListResponse, HarnessModelEntry, HarnessModelsRequest,
-    HarnessModelsResponse,
+    HarnessCandidate, HarnessEntry, HarnessListRequest, HarnessListResponse, HarnessModelEntry,
+    HarnessModelsRequest, HarnessModelsResponse,
 };
 pub use hierarchy::{
     DEFAULT_MAX_CHILDREN_PER_AGENT, DEFAULT_MAX_DEPTH, DEFAULT_MAX_SELECTOR_TARGETS,

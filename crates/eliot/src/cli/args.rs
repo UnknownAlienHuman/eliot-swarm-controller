@@ -219,6 +219,10 @@ pub(crate) struct ModelsArgs {
     /// Harness code: codex|claude|muse|opencode|antigravity.
     #[arg(long, value_name = "HARNESS")]
     pub(crate) harness: String,
+    /// Explicit native executable, overriding discovery. Only meaningful
+    /// for codex|muse|opencode, which read a live catalogue.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) cmd: Option<String>,
 }
 
 #[derive(Args)]
@@ -254,6 +258,10 @@ pub(crate) struct LaunchArgs {
     /// Only Codex and Muse map effort; other harnesses reject it.
     #[arg(long, value_name = "EFFORT")]
     pub(crate) effort: Option<String>,
+    /// Explicit native executable, overriding discovery (e.g. to pin the
+    /// Muse binary version the launcher marks current). Requires --harness.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) cmd: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub(crate) workspace: PathBuf,
     #[arg(long, value_name = "BRANCH")]

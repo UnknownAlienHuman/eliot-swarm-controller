@@ -65,6 +65,21 @@ pub struct HarnessEntry {
     /// Human-readable searched-locations detail when not installed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Every discovered native install, newest first (currently Claude
+    /// only: PATH, standard locations and desktop-app bundles, each with
+    /// its own `--version`). Absent for other harnesses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<HarnessCandidate>>,
+}
+
+/// One discovered native install for a harness.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessCandidate {
+    /// Absolute native executable path.
+    pub cmd: String,
+    /// Bounded `<exe> --version` first line, or null when unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// Response for `harness.list`.
@@ -79,7 +94,15 @@ pub struct HarnessListResponse {
 pub struct HarnessModelsRequest {
     /// Harness code: codex|claude|muse|opencode|antigravity.
     pub harness: String,
+    /// Explicit native executable, overriding discovery. Only meaningful
+    /// for the catalogue harnesses (codex|muse|opencode); other harnesses
+    /// reject it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<String>,
 }
+
+/// Maximum explicit native command length.
+pub const MAX_HARNESS_CMD_BYTES: usize = 1024;
 
 impl HarnessModelsRequest {
     pub fn validate(&self) -> Result<()> {
@@ -98,6 +121,23 @@ impl HarnessModelsRequest {
                 "unsupported",
                 format!("unsupported harness {}", self.harness),
             ));
+        }
+        if let Some(cmd) = self.cmd.as_deref() {
+            if cmd.trim().is_empty()
+                || cmd.len() > MAX_HARNESS_CMD_BYTES
+                || cmd.chars().any(char::is_control)
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "cmd must be a non-empty executable path of at most 1024 characters",
+                ));
+            }
+            if !matches!(trimmed, "codex" | "muse" | "opencode") {
+                return Err(Error::new(
+                    "invalid",
+                    "cmd applies only to the codex, muse and opencode catalogues",
+                ));
+            }
         }
         Ok(())
     }
@@ -176,17 +216,45 @@ mod tests {
     fn models_request_validates_harness() {
         HarnessModelsRequest {
             harness: "codex".to_owned(),
+            cmd: None,
         }
         .validate()
         .unwrap();
         let error = HarnessModelsRequest {
             harness: "fake".to_owned(),
+            cmd: None,
         }
         .validate()
         .unwrap_err();
         assert_eq!(error.code, "unsupported");
         let error = HarnessModelsRequest {
             harness: String::new(),
+            cmd: None,
+        }
+        .validate()
+        .unwrap_err();
+        assert_eq!(error.code, "invalid");
+    }
+
+    #[test]
+    fn models_request_validates_explicit_cmd() {
+        HarnessModelsRequest {
+            harness: "muse".to_owned(),
+            cmd: Some(r"C:\Tools\MuseCode\muse-bin-1.4.0-R4161.1.exe".to_owned()),
+        }
+        .validate()
+        .unwrap();
+        // An explicit cmd is meaningless where no live catalogue exists.
+        let error = HarnessModelsRequest {
+            harness: "claude".to_owned(),
+            cmd: Some(r"C:\bin\claude.exe".to_owned()),
+        }
+        .validate()
+        .unwrap_err();
+        assert_eq!(error.code, "invalid");
+        let error = HarnessModelsRequest {
+            harness: "muse".to_owned(),
+            cmd: Some(String::new()),
         }
         .validate()
         .unwrap_err();

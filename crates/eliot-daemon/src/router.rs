@@ -1761,7 +1761,27 @@ impl Router {
                 .get("effort")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let cmd = crate::adhoc::discover_cmd_for_harness(&harness)?;
+            if let Some(cmd) = request.args.get("cmd")
+                && !cmd.is_string()
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "launch cmd must be an executable path string",
+                ));
+            }
+            let explicit_cmd = request
+                .args
+                .get("cmd")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            // An explicit `--cmd` pins the native executable (e.g. a Muse
+            // binary version the launcher no longer marks current);
+            // otherwise the installed executable is discovered. Shape is
+            // validated with the frozen snapshot below.
+            let cmd = match explicit_cmd {
+                Some(cmd) => Some(cmd),
+                None => crate::adhoc::discover_cmd_for_harness(&harness)?,
+            };
             let mut snapshot =
                 crate::adhoc::adhoc_snapshot(&harness, model.as_deref(), effort.as_deref(), cmd)?;
             crate::config::capture_native_store_inputs(&mut snapshot, |name| {
@@ -1774,7 +1794,7 @@ impl Router {
                 .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
                 .to_owned();
             let profile_name = crate::adhoc::adhoc_profile_name(&harness);
-            // Keep the requested harness/model/effort beside the frozen
+            // Keep the requested harness/model/effort/cmd beside the frozen
             // snapshot: same-ID retries bind the exact requested payload
             // (a changed model is id_conflict), while the frozen snapshot
             // stays the replay-stable source for dispatch.
@@ -2428,6 +2448,15 @@ impl Router {
         let mut harnesses = Vec::new();
         for harness in crate::adhoc::SUPPORTED_HARNESSES {
             let entry = crate::adhoc::harness_installation(harness);
+            // Claude keeps several native installs (PATH, user locations,
+            // desktop-app bundles): report every candidate newest first so
+            // the controller can see which install was preferred and why.
+            let candidates = if *harness == "claude" {
+                let candidates = crate::adhoc::discover_claude_candidates();
+                (!candidates.is_empty()).then_some(candidates)
+            } else {
+                None
+            };
             harnesses.push(eliot_core::api::HarnessEntry {
                 harness: (*harness).to_owned(),
                 installed: entry
@@ -2444,6 +2473,7 @@ impl Router {
                     .get("error")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                candidates,
             });
         }
         let response = eliot_core::api::HarnessListResponse { harnesses };
@@ -2489,7 +2519,13 @@ impl Router {
                 ),
             },
             "codex" | "muse" | "opencode" => {
-                let cmd = crate::adhoc::discover_cmd_for_harness(&harness)?;
+                // An explicit `cmd` pins the native executable (e.g. a Muse
+                // binary version the launcher no longer marks current);
+                // otherwise the installed executable is discovered.
+                let cmd = match request.cmd.clone() {
+                    Some(cmd) => Some(cmd),
+                    None => crate::adhoc::discover_cmd_for_harness(&harness)?,
+                };
                 let mut snapshot = crate::adhoc::adhoc_snapshot(&harness, None, None, cmd)?;
                 crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                     std::env::var_os(name)

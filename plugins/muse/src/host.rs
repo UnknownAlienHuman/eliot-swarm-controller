@@ -7,6 +7,7 @@ use crate::{
         requests::describe_request,
         types::{
             NativeApprovalListPendingParams, NativeApprovalListPendingResult,
+            NativeClientCapabilities, NativeClientInfo, NativeInitializeParams,
             NativeItemCompletedNotification, NativeModelCatalogEntry, NativeModelListParams,
             NativeModelListResult, NativeSession, NativeSessionReadParams, NativeSessionReadResult,
             NativeSessionReasoningEffortChangedNotification, NativeSessionResumeParams,
@@ -42,6 +43,29 @@ use tokio::{
 };
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Native `initialize` client identifier. The installed host requires a
+/// machine identifier (`^[a-z0-9_]+$`); the launch path and the read-only
+/// model.list reader send the same value through [`native_initialize_params`].
+pub(super) const NATIVE_CLIENT_INFO_NAME: &str = "eliot";
+
+/// Shared native `initialize` params for the launch path and the read-only
+/// model.list reader: identical client identity on both paths.
+pub(super) fn native_initialize_params() -> NativeInitializeParams {
+    NativeInitializeParams {
+        client_info: NativeClientInfo {
+            name: NATIVE_CLIENT_INFO_NAME.to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            title: Some("Eliot".to_owned()),
+        },
+        // Eliot answers `userInput/request` through its answer/deny verbs;
+        // `true` (the D-047 capable posture) has the host serve prompts
+        // toward this client.
+        capabilities: Some(NativeClientCapabilities {
+            user_input_dialogs: Some(true),
+        }),
+    }
+}
 const STOP_SETTLEMENT_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
 const STOP_RESPONSE_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
 pub(crate) const VIEW_PAGE_SIZE: i64 = 1000;
@@ -1861,20 +1885,8 @@ impl MusePlugin {
         .await?;
         let client = native.client();
         let result: Result<Value> = async {
-            use crate::native::types::{
-                NativeClientCapabilities, NativeClientInfo, NativeInitializeParams,
-                NativeInitializeResult,
-            };
-            let init = NativeInitializeParams {
-                client_info: NativeClientInfo {
-                    name: "eliot-models".to_owned(),
-                    version: env!("CARGO_PKG_VERSION").to_owned(),
-                    title: Some("Eliot models".to_owned()),
-                },
-                capabilities: Some(NativeClientCapabilities {
-                    user_input_dialogs: Some(true),
-                }),
-            };
+            use crate::native::types::NativeInitializeResult;
+            let init = native_initialize_params();
             let init_value = serde_json::to_value(init).map_err(|_| {
                 Error::new(
                     "internal",
@@ -2652,8 +2664,8 @@ fn muse_serve_args(permissions: &str) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MusePlugin, muse_manifest, muse_scope, muse_serve_args, new_command_id,
-        select_launch_model, validate_resume_preflight,
+        MusePlugin, NATIVE_CLIENT_INFO_NAME, muse_manifest, muse_scope, muse_serve_args,
+        native_initialize_params, new_command_id, select_launch_model, validate_resume_preflight,
     };
     use crate::native::types::{NativeModelListResult, NativeSession};
     use eliot_plugin::{AgentStartParams, Peer, session::validate_source_plan};
@@ -2699,6 +2711,26 @@ mod tests {
             );
         }
         assert_ne!(new_command_id(), new_command_id());
+    }
+
+    #[test]
+    fn initialize_client_info_name_is_a_machine_identifier() {
+        // The installed host rejects `initialize` unless `clientInfo.name`
+        // matches `^[a-z0-9_]+$`; the launch path and the read-only
+        // model.list reader share one constructor so they cannot drift.
+        assert!(!NATIVE_CLIENT_INFO_NAME.is_empty());
+        assert!(
+            NATIVE_CLIENT_INFO_NAME
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+            "clientInfo.name must be a machine identifier: {NATIVE_CLIENT_INFO_NAME}"
+        );
+        let value =
+            serde_json::to_value(native_initialize_params()).expect("initialize params serialize");
+        assert_eq!(
+            value.get("clientInfo").and_then(|info| info.get("name")),
+            Some(&json!(NATIVE_CLIENT_INFO_NAME))
+        );
     }
 
     #[test]

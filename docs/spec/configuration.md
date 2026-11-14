@@ -73,8 +73,9 @@ pass_env = ["CODEX_HOME"]
 ## Ad-hoc Owner launch (no stored profile)
 
 `swarm launch --harness <codex|claude|muse|opencode|antigravity>
-[--model M] [--effort E] --workspace W "prompt"` (and the same in
-`command.submit` `launch` args) is an Owner-only tool that builds and freezes
+[--model M] [--effort E] [--cmd PATH] --workspace W "prompt"` (and the same in
+`command.submit` `launch` args, where `cmd` rides beside `model`/`effort` in
+the exact retry-bound payload) is an Owner-only tool that builds and freezes
 a profile-equivalent snapshot exactly like a stored profile: built-in safe
 defaults for that harness plus the supplied flags, reproducible and
 replay-safe. Requested `model`/`effort` may be omitted; the freeze records the
@@ -86,16 +87,22 @@ silent substitution: an unavailable requested model fails honestly. Authority
 fields default to the safe posture (Codex `workspace-write` + `never`,
 Claude CLI-default permission mode, Muse and OpenCode current conservative
 defaults); broader authority stays profile-only, owner-written choice. When
-`cmd` is not given, the daemon resolves the installed native executable
-deterministically and freezes the absolute path: Claude `claude.exe` on `PATH`
-or the standard user install location (refusing `.cmd`/`.bat`/`.ps1`
-wrappers), OpenCode by following the npm shim to the native `opencode.exe`,
-Muse via the launcher dir version the launcher marks current, Codex via the
-existing `codex` resolution, Antigravity via the installed app path (or
-`unsupported` when the harness needs a different binary). A missing or
-ambiguous executable is a clear `unsupported`/`profile_error` naming what was
-searched. Agent principals keep the profile and `child_profiles` rules; they
-cannot ad-hoc launch (`not_allowed`).
+`--cmd` is not given, the daemon resolves the installed native executable
+deterministically and freezes the absolute path: Claude prefers the newest
+install by `--version` (`claude.exe` on `PATH`, the standard user install
+locations, and the desktop-app bundles under
+`%APPDATA%\Claude\claude-code\<version>\<hash>`, refusing
+`.cmd`/`.bat`/`.ps1` wrappers), OpenCode by following the npm shim to the
+native `opencode.exe` inside the package (consulting the
+`USERPROFILE`-derived roaming root when `APPDATA` is stripped), Muse via the
+launcher dir version the launcher marks current, Codex via the existing
+`codex` resolution, Antigravity via the installed app path (or `unsupported`
+when the harness needs a different binary). `--cmd` pins one explicit native
+executable instead (e.g. a Muse binary version the launcher no longer marks
+current). A missing or ambiguous executable is a clear
+`unsupported`/`profile_error` naming what was searched. Agent principals keep
+the profile and `child_profiles` rules; they cannot ad-hoc launch
+(`not_allowed`).
 
 The profile author supplies an exact model string. Reasoning effort is optional
 on every Codex route: when the profile omits `effort`, the plugin omits the

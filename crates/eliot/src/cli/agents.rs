@@ -67,18 +67,23 @@ pub(crate) async fn run_harnesses(data_dir: PathBuf, json_output: bool) -> Resul
 }
 
 pub(crate) async fn run_models(
-    ModelsArgs { harness }: ModelsArgs,
+    ModelsArgs { harness, cmd }: ModelsArgs,
     data_dir: PathBuf,
     json_output: bool,
 ) -> Result<u8, Failure> {
     if harness.trim().is_empty() {
         return Err(Failure::new(2, "--harness must not be empty"));
     }
+    if let Some(cmd) = &cmd
+        && cmd.trim().is_empty()
+    {
+        return Err(Failure::new(2, "--cmd must not be empty"));
+    }
     read_and_print!(
         &data_dir,
         json_output,
         "harness.models",
-        HarnessModelsRequest { harness },
+        HarnessModelsRequest { harness, cmd },
         HarnessModelsResponse
     )
 }
@@ -115,6 +120,7 @@ pub(crate) async fn run_launch(
         harness,
         model,
         effort,
+        cmd,
         workspace,
         worktree,
         base,
@@ -141,8 +147,8 @@ pub(crate) async fn run_launch(
         return Err(Failure::new(2, "ad-hoc launch cannot have a parent"));
     }
     if harness.is_none() {
-        if model.is_some() || effort.is_some() {
-            return Err(Failure::new(2, "--model/--effort require --harness"));
+        if model.is_some() || effort.is_some() || cmd.is_some() {
+            return Err(Failure::new(2, "--model/--effort/--cmd require --harness"));
         }
     } else if let Some(name) = &model
         && name.trim().is_empty()
@@ -152,6 +158,10 @@ pub(crate) async fn run_launch(
         && name.trim().is_empty()
     {
         return Err(Failure::new(2, "--effort must not be empty"));
+    } else if let Some(name) = &cmd
+        && name.trim().is_empty()
+    {
+        return Err(Failure::new(2, "--cmd must not be empty"));
     }
     if profile.is_none() && harness.is_none() && parent.is_none() {
         return Err(Failure::new(
@@ -175,6 +185,9 @@ pub(crate) async fn run_launch(
     }
     if let Some(effort) = effort {
         args["effort"] = Value::String(effort);
+    }
+    if let Some(cmd) = cmd {
+        args["cmd"] = Value::String(cmd);
     }
     if let Some(worktree) = worktree {
         args["worktree"] = Value::String(worktree);
