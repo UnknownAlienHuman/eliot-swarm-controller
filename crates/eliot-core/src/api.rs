@@ -59,8 +59,10 @@ pub use goals::{
     MIN_GOAL_CADENCE_MS,
 };
 pub use harness::{
+    HARNESS_QUOTA_SUPPORTED, HARNESS_QUOTA_UNKNOWN, HARNESS_QUOTA_UNSUPPORTED, HARNESS_READ_TTL_MS,
     HarnessEntry, HarnessListRequest, HarnessListResponse, HarnessModelEntry, HarnessModelsRequest,
-    HarnessModelsResponse,
+    HarnessModelsResponse, HarnessQuotaRequest, HarnessQuotaResponse, MAX_HARNESS_CREDENTIAL_BYTES,
+    MAX_HARNESS_PROFILE_BYTES, MAX_HARNESS_QUOTA_NOTE_BYTES, MAX_HARNESS_SCOPE_BYTES,
 };
 pub use hierarchy::{
     DEFAULT_MAX_CHILDREN_PER_AGENT, DEFAULT_MAX_DEPTH, DEFAULT_MAX_SELECTOR_TARGETS,

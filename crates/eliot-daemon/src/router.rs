@@ -1,6 +1,7 @@
 mod attention;
 mod attribution;
 mod auth;
+mod catalog;
 mod command;
 mod context;
 mod coordination;
@@ -105,6 +106,7 @@ struct RouterInner {
     unknown_commands: UnknownCommands,
     unknown_causes: Mutex<HashMap<String, String>>,
     rule_definitions: Mutex<HashMap<(String, String), (i64, RuleDefinition)>>,
+    catalog_cache: Mutex<catalog::CatalogCache>,
     plugin_host: PluginHost,
     monitoring: Monitoring,
     workspaces: WorkspaceManager,
@@ -221,6 +223,7 @@ impl Router {
                 unknown_commands,
                 unknown_causes: Mutex::new(HashMap::new()),
                 rule_definitions: Mutex::new(HashMap::new()),
+                catalog_cache: Mutex::new(catalog::CatalogCache::default()),
                 plugin_host,
                 monitoring,
                 workspaces,
@@ -276,6 +279,7 @@ impl Router {
             "agent.discover" => self.agent_discover(&params, &principal).await,
             "harness.list" => self.harness_list(&params, &principal).await,
             "harness.models" => self.harness_models(&params, &principal).await,
+            "harness.quota" => self.harness_quota(&params, &principal).await,
             "agent.history" => self.agent_history(&params, &principal).await,
             "agent.list" => self.agent_list(&params, &principal).await,
             "agent.result" => self.agent_result(&params, &principal).await,
@@ -2448,10 +2452,45 @@ impl Router {
             .map_err(|_| Error::new("internal", "harness list could not be encoded"))
     }
 
+    /// Resolve the frozen snapshot for a catalogue/quota read. A named
+    /// profile must exist and its frozen harness must match; otherwise the
+    /// daemon defaults cover live harnesses (Codex/Muse/OpenCode) while
+    /// static harnesses (Claude, Antigravity) need no snapshot at all.
+    fn resolve_catalog_snapshot(
+        &self,
+        harness: &str,
+        profile: Option<&str>,
+    ) -> Result<(Option<Value>, String)> {
+        if let Some(name) = profile {
+            let mut snapshot = crate::config::resolve_profile(&self.inner.data_root, name)?;
+            crate::config::capture_native_store_inputs(&mut snapshot, |name| {
+                std::env::var_os(name)
+            })?;
+            if snapshot.get("harness").and_then(Value::as_str) != Some(harness) {
+                return Err(Error::new(
+                    "invalid",
+                    "harness does not match the selected profile",
+                ));
+            }
+            return Ok((Some(snapshot), name.to_owned()));
+        }
+        if matches!(harness, "codex" | "muse" | "opencode") {
+            let cmd = crate::adhoc::discover_cmd_for_harness(harness)?;
+            let mut snapshot = crate::adhoc::adhoc_snapshot(harness, None, None, cmd)?;
+            crate::config::capture_native_store_inputs(&mut snapshot, |name| {
+                std::env::var_os(name)
+            })?;
+            return Ok((Some(snapshot), "adhoc".to_owned()));
+        }
+        Ok((None, "adhoc".to_owned()))
+    }
+
     /// Read-only native model catalogue for a harness: no model turn, no
     /// inference. Codex/Muse/OpenCode use the harness's own read-only
-    /// method through a dedicated metadata reader; Claude reports aliases
-    /// plus the CLI default; Antigravity has no catalogue.
+    /// method through a dedicated metadata reader, cached per native
+    /// route/account with freshness and credential identity; Claude reports
+    /// aliases plus the CLI default; Antigravity has no catalogue. Native
+    /// model ids are retained verbatim: no fallback model is ever selected.
     async fn harness_models(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
         let request: eliot_core::api::HarnessModelsRequest =
@@ -2464,6 +2503,20 @@ impl Router {
                 "daemon is shutting down and rejects new discovery",
             ));
         }
+        let profile = request.profile.as_deref().map(str::trim);
+        let (snapshot, label) = self.resolve_catalog_snapshot(&harness, profile)?;
+        let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
+        let now = now_ms();
+        if let Some(hit) = self
+            .inner
+            .catalog_cache
+            .lock_recover()
+            .get_models(&scope, now)
+        {
+            request.validate_response(&hit)?;
+            return serde_json::to_value(hit)
+                .map_err(|_| Error::new("internal", "harness models could not be encoded"));
+        }
         let response = match harness.as_str() {
             "claude" => eliot_core::api::HarnessModelsResponse {
                 harness: harness.clone(),
@@ -2474,6 +2527,10 @@ impl Router {
                     "Claude accepts model aliases and the CLI default; no live catalogue exists"
                         .to_owned(),
                 ),
+                scope: scope.clone(),
+                fetched_at_ms: now_ms(),
+                ttl_ms: catalog::CATALOG_TTL_MS,
+                credential: credential.clone(),
             },
             "antigravity" => eliot_core::api::HarnessModelsResponse {
                 harness: harness.clone(),
@@ -2484,13 +2541,18 @@ impl Router {
                     "Antigravity exposes no model catalogue; a profile must name an explicit model"
                         .to_owned(),
                 ),
+                scope: scope.clone(),
+                fetched_at_ms: now_ms(),
+                ttl_ms: catalog::CATALOG_TTL_MS,
+                credential: credential.clone(),
             },
             "codex" | "muse" | "opencode" => {
-                let cmd = crate::adhoc::discover_cmd_for_harness(&harness)?;
-                let mut snapshot = crate::adhoc::adhoc_snapshot(&harness, None, None, cmd)?;
-                crate::config::capture_native_store_inputs(&mut snapshot, |name| {
-                    std::env::var_os(name)
-                })?;
+                let Some(snapshot) = snapshot else {
+                    return Err(Error::new(
+                        "internal",
+                        "live harness catalogue requires a frozen snapshot",
+                    ));
+                };
                 let raw = self.inner.plugin_host.models(snapshot).await?;
                 let models = raw
                     .get("models")
@@ -2546,6 +2608,10 @@ impl Router {
                     models: entries,
                     default,
                     note,
+                    scope: scope.clone(),
+                    fetched_at_ms: now_ms(),
+                    ttl_ms: catalog::CATALOG_TTL_MS,
+                    credential: credential.clone(),
                 }
             }
             _ => {
@@ -2555,9 +2621,95 @@ impl Router {
                 ));
             }
         };
-        response.validate()?;
+        request.validate_response(&response)?;
+        self.inner
+            .catalog_cache
+            .lock_recover()
+            .insert_models(response.clone());
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "harness models could not be encoded"))
+    }
+
+    /// Provider-supported account quota readback: timestamp, scope and an
+    /// explicit supported/unsupported/unknown status, cached per account.
+    /// Starts no model turn, performs no inference and never polls per
+    /// Agent. The installed Codex/Muse/OpenCode schemas expose no read-only
+    /// quota surface (their model/list and auth-list inventories carry no
+    /// quota), so those report `unsupported` naming the checked surface; a
+    /// future provider-owned read-only endpoint plugs into the match below.
+    /// A quota failure never selects another model or account.
+    async fn harness_quota(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: eliot_core::api::HarnessQuotaRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let harness = request.harness.trim().to_owned();
+        if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+            return Err(Error::new(
+                "unavailable",
+                "daemon is shutting down and rejects new discovery",
+            ));
+        }
+        let profile = request.profile.as_deref().map(str::trim);
+        let (snapshot, label) = self.resolve_catalog_snapshot(&harness, profile)?;
+        let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
+        let now = now_ms();
+        if let Some(hit) = self
+            .inner
+            .catalog_cache
+            .lock_recover()
+            .get_quota(&scope, now)
+        {
+            request.validate_response(&hit)?;
+            return serde_json::to_value(hit)
+                .map_err(|_| Error::new("internal", "harness quota could not be encoded"));
+        }
+        let note = match harness.as_str() {
+            "codex" => Some(
+                "Codex app-server exposes no read-only account rate-limit/usage endpoint \
+                 in the installed schema; model/list carries models only"
+                    .to_owned(),
+            ),
+            "muse" => Some(
+                "Muse exposes no read-only account quota endpoint in the installed schema; \
+                 model/list carries the provider catalogue only and session/read is per-session"
+                    .to_owned(),
+            ),
+            "opencode" => Some(
+                "OpenCode exposes no read-only account quota endpoint; auth list carries \
+                 providers and model inventory carries limits only"
+                    .to_owned(),
+            ),
+            "claude" => Some(
+                "Claude accepts model aliases and the CLI default; no live quota surface exists"
+                    .to_owned(),
+            ),
+            "antigravity" => {
+                Some("Antigravity exposes no model catalogue or quota surface".to_owned())
+            }
+            _ => {
+                return Err(Error::new(
+                    "unsupported",
+                    format!("unsupported harness {harness}"),
+                ));
+            }
+        };
+        let response = eliot_core::api::HarnessQuotaResponse {
+            harness: harness.clone(),
+            scope: scope.clone(),
+            fetched_at_ms: now_ms(),
+            ttl_ms: catalog::CATALOG_TTL_MS,
+            credential: credential.clone(),
+            status: eliot_core::api::HARNESS_QUOTA_UNSUPPORTED.to_owned(),
+            note,
+        };
+        request.validate_response(&response)?;
+        self.inner
+            .catalog_cache
+            .lock_recover()
+            .insert_quota(response.clone());
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "harness quota could not be encoded"))
     }
 
     async fn agent_history(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -13514,6 +13666,74 @@ mod run_authorization_tests {
         normalize_launch(&mut request, &principal).expect("ad-hoc shape is valid");
         let error = router
             .freeze_launch_profile(&principal, &mut request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
+    }
+
+    #[tokio::test]
+    async fn catalog_models_caches_static_harness_per_scope() {
+        let router = router();
+        // Claude needs no native installation: the aliases read never spawns
+        // a reader, so this also proves the static path performs no I/O.
+        let first = router
+            .harness_models(&json!({"harness": "claude"}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(first["catalogue"], json!("aliases"));
+        assert_eq!(first["scope"], json!("profile:adhoc harness:claude"));
+        assert_eq!(first["credential"], json!("none"));
+        assert!(first["fetched_at_ms"].as_i64().unwrap_or(-1) >= 0);
+        let second = router
+            .harness_models(&json!({"harness": "claude"}), &Principal::Owner)
+            .await
+            .unwrap();
+        // Served from the per-scope cache: the freshness timestamp is kept.
+        assert_eq!(first["fetched_at_ms"], second["fetched_at_ms"]);
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn catalog_quota_reports_unsupported_with_scope_and_caches() {
+        let router = router();
+        // Antigravity exposes no catalogue surface: quota reports unsupported
+        // with scope and freshness, without spawning any native reader.
+        let first = router
+            .harness_quota(&json!({"harness": "antigravity"}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(first["status"], json!("unsupported"));
+        assert_eq!(first["scope"], json!("profile:adhoc harness:antigravity"));
+        assert_eq!(first["credential"], json!("none"));
+        assert!(first["fetched_at_ms"].as_i64().unwrap_or(-1) >= 0);
+        assert!(first["note"].as_str().is_some_and(|note| !note.is_empty()));
+        let second = router
+            .harness_quota(&json!({"harness": "antigravity"}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(first["fetched_at_ms"], second["fetched_at_ms"]);
+        assert_eq!(first, second);
+        // Unknown profiles fail before any native work, and Agent callers
+        // are rejected at the owner-only gate.
+        let error = router
+            .harness_quota(
+                &json!({"harness": "codex", "profile": "missing"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.code.is_empty());
+        let agent = Principal::Agent {
+            id: "a1".to_owned(),
+            generation: 0,
+        };
+        let error = router
+            .harness_quota(&json!({"harness": "codex"}), &agent)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
+        let error = router
+            .harness_models(&json!({"harness": "codex"}), &agent)
             .await
             .unwrap_err();
         assert_eq!(error.code, "not_allowed");
