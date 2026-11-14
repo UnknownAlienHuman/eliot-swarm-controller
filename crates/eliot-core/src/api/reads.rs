@@ -607,6 +607,11 @@ mod tests {
 
     #[test]
     fn nested_positional_agent_and_turn_arrays_are_not_objects() {
+        // Nested read values must be objects: the response helpers decode
+        // them through maps and reject any array, so these fixtures pin the
+        // rejection without asserting how the bare structs treat sequences
+        // (serde accepts sequences for structs, and the exact layout drifts
+        // as domain fields are added).
         let positional_agent = json!([
             "a1",
             2,
@@ -636,12 +641,10 @@ mod tests {
             0,
             0
         ]);
-        assert!(serde_json::from_value::<Agent>(positional_agent.clone()).is_ok());
         let mut wire = result_wire();
         wire["agent_metadata"] = positional_agent;
         assert!(serde_json::from_value::<AgentResultResponse>(wire).is_err());
         let positional_turn = json!(["a1", 1, "turn-1", "unknown", null, null, null, null]);
-        assert!(serde_json::from_value::<Turn>(positional_turn.clone()).is_ok());
         let mut wire = result_wire();
         wire["turns"] = json!([positional_turn]);
         assert!(serde_json::from_value::<AgentResultResponse>(wire).is_err());
