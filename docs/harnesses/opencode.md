@@ -1,6 +1,6 @@
 # OpenCode
 
-L6 adapter for the installed OpenCode 2.0.32. Select one installed HTTP/SSE API
+L6 adapter for the installed OpenCode 2.2.7. Select one installed HTTP/SSE API
 generation from its OpenAPI document (`GET /doc` where supported); do not mix
 generations after a 404. Source:
 [anomalyco/opencode](https://github.com/anomalyco/opencode).
@@ -11,14 +11,14 @@ session routing, adopted service ownership and reconnect by readback. No GPL cod
 
 ## Working profile
 
-The working Eliot Swarm profile for the installed OpenCode 2.0.32 is:
+The working Eliot Swarm profile for the installed OpenCode 2.2.7 is:
 
 ```toml
-[profiles.opencode-openrouter]
+[profiles.opencode-free]
 harness = "opencode"
 cmd = "<explicit native opencode executable>"
-model = "openrouter/stealth/crouton-alpha"
-auth_integration = "openrouter"
+model = "opencode/deepseek-v4.1-flash-free"
+auth_integration = "opencode-go"
 ```
 
 `auth_integration` is required by the plugin at start, not optional: it is the
@@ -26,6 +26,13 @@ frozen nonsecret selector naming the one native integration whose canonical
 credential is prepared before `serve`. `cmd` is the explicit native executable
 (no script wrapper, no PATH default). The model string is split at its first
 slash only (see below).
+
+The model provider and the transferred credential are independent: the
+`opencode` provider carries its own server-side credential (it has no
+canonical `auth list` entry), so any transferable canonical credential
+satisfies the required pre-serve transfer. A provider-side refusal (for
+example `provider.auth` 403) surfaces as the turn's native failure with its
+message; the adapter never retries it on another provider or model.
 
 ## Authentication
 
@@ -82,7 +89,7 @@ Catalogue preflight may retry only before any session/input may have been admitt
 | --- | --- |
 | launch | installed `POST /api/session` with the workspace directory, no input; per-Agent `serve` on loopback with a generated `OPENCODE_PASSWORD` and per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`; before `serve`, the frozen nonsecret `auth_integration` selector's canonical credential transfers opaquely into the isolated store as described under [Authentication](#authentication), with no modification of owner global auth; exact session/model/directory echo required before Eliot `session.ready` |
 | send | installed `POST /api/session/{id}/prompt`; the 200 inbox id is intermediate, applied needs the exact input-to-execution association on SSE (`session.inbox.enqueued`/`delivered` plus `session.execution.started`; turn id is the exact `started` event id) |
-| steer | exact-turn `POST /api/session/{id}/prompt` with explicit `delivery: steer` (v2.0.32 `Session.Inbox.Delivery`); the exact-turn gate refuses a finished turn as stale without a write, applied needs the input delivered on SSE while the exact turn stays active (native joins it at a step boundary, never a new turn here); terminal-first, cancelled, unwatched, or timed-out consumption is unknown with an exact `DELETE .../inbox/{inboxID}` whose removal must then be proven by inbox-list absence plus a stream-observed cancel — anything unproven latches the session unknown so no later send/Goal dispatches behind the unresolved input (the native 204 also covers the no-op, so it proves nothing alone) |
+| steer | exact-turn `POST /api/session/{id}/prompt` with explicit `delivery: steer` (v2.2.7 `Session.Inbox.Delivery`); the exact-turn gate refuses a finished turn as stale without a write, applied needs the input delivered on SSE while the exact turn stays active (native joins it at a step boundary, never a new turn here); terminal-first, cancelled, unwatched, or timed-out consumption is unknown with an exact `DELETE .../inbox/{inboxID}` whose removal must then be proven by inbox-list absence plus a stream-observed cancel — anything unproven latches the session unknown so no later send/Goal dispatches behind the unresolved input (the native 204 also covers the no-op, so it proves nothing alone) |
 | inject | `next_input` prepends inside the next `POST /api/session/{id}/prompt`; `turn_safe_point` claims through the authenticated `hook.event` channel (`hook=before_model`) and resolves to the vendor-native `context` hook (RPC `eliot-context` v1 `bind`/`next`/`resolve` over the existing authenticated HTTP transport) only after a verified v1 session binding; a hook never binds by copying its last-user message id without proving actual inbox delivery to the current turn, and only a confirmed `applied`/`empty` resolve emits a `hook.before_model` receipt |
 | interrupt | installed `POST /api/session/{id}/interrupt` (`{"interrupted": bool}`); the exact-turn gate refuses a finished turn as stale without a write, `interrupted:true` applies and the terminal pair settles the turn |
 | stop | ordinary (non-force) Stop: installed interrupt-quiesce (`POST .../interrupt`) plus `GET /api/session/{id}` readback proving the session is retained for resume (proven retained applies; proven absent or ambiguous readback is unknown), then the owned per-Agent server ends through the generation's process custody; a failed quiesce/readback still proceeds to that bounded owned-server cleanup and settles as unknown. Force Stop skips that quiesce and retention readback and ends only the owned per-Agent server without proving retention, never touching another Agent; either way stop ends the directly spawned `serve` child while the generation Job owns any descendants it spawned; ordinary stop never DELETEs the session; abort-plus-detach is **not** stop |
@@ -137,9 +144,9 @@ Page all native history/child lists and retain exact parent ids. Parent idle doe
 finish children. Native database discovery, if needed, is read-only and not a parallel
 publisher. Generate per-Agent/server provider config; never edit owner global settings.
 The profile model is the exact catalog string `provider/model-id`. Split only its first
-slash: `openrouter/stealth/crouton-alpha` selects provider `openrouter` and model id
-`stealth/crouton-alpha`, without shortening or substituting it. This follows
-[v2.0.32 `Model.Ref.parse`](https://github.com/anomalyco/opencode/blob/v2.0.32/packages/schema/src/model.ts#L27).
+slash: `opencode/deepseek-v4.1-flash-free` selects provider `opencode` and model id
+`deepseek-v4.1-flash-free`, without shortening or substituting it. This follows
+[v2.2.7 `Model.Ref.parse`](https://github.com/anomalyco/opencode/blob/v2.2.7/packages/schema/src/model.ts#L27).
 Empty slash segments, backslash separators, whitespace and control characters reject.
 The native `#variant` suffix is not mapped by this slice and rejects; requests retain
 `variant=None` and the existing exact requested/effective model comparison.
@@ -172,7 +179,7 @@ for `eliot-local`, and only the `{env:NAME}` reference — or no `apiKey` key
 at all — is rendered. An unresolved `{env:NAME}` would become an empty
 string and select `Auth.none` server-side, so Eliot rejects it first.
 
-The per-Agent document renders the installed native schema (2.0.32) into
+The per-Agent document renders the installed native schema (2.2.7) into
 the existing isolated Agent root: `providers` (plural; the legacy singular
 `provider` stays migrated by the server), `package`
 `@opencode/ai/providers/openai-compatible`, `settings.baseURL` (plus
@@ -188,7 +195,7 @@ Effective settings are read back, not assumed. The isolated XDG file is not
 the final authority (project config loads after global config), so before
 inference the plugin checks the exact provider through bounded native
 `GET /api/provider/:providerID`, selects the exact API model id locally from
-`GET /api/model` (the endpoint answers an array), and reads the backend's
+`GET /api/model` (the endpoint answers an object with a `data` array), and reads the backend's
 own passive `GET {base_url}/models` inventory — which never generates text,
 never sends `?reload=1` (that can unload running llama.cpp models), and
 never touches load/switch selectors. This verification runs before

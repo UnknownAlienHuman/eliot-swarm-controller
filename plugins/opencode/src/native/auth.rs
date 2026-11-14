@@ -1,6 +1,6 @@
 //! Canonical-to-isolated credential transfer for one selected integration.
 //!
-//! Installed boundary (opencode v2.0.32 `auth --help`): `auth export
+//! Installed boundary (opencode v2.2.7 `auth --help`): `auth export
 //! [<target>] --standalone` prints stored credentials, including secrets, as
 //! JSON to stdout (`<target>` is an integration ID or name; omitting it
 //! exports every integration, which this module never does — there is no
