@@ -857,8 +857,10 @@ impl RunningTurnSummary {
 
 /// Where a live owned process comes from. `plugin` is a controlled native
 /// child for the named Agent generation; `workspace` is an owned workspace
-/// setup/removal child for that generation. Both are owned custody the
-/// daemon must drop before exit; neither proves task success.
+/// setup/removal child for that generation. Both are custody the daemon
+/// observes as not yet exited in the Store; neither proves task success. A
+/// held workspace operation lock alone (no observed child) is never listed
+/// here.
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnedProcessKind {
@@ -890,9 +892,11 @@ impl OwnedProcessSummary {
 /// Bounded drain report reusing the existing shutdown blockers. Every
 /// category carries a count, a bounded list and a truncation flag: the count
 /// is the number returned in this snapshot (or the exact in-memory total for
-/// unknown commands); `truncated` means more may exist beyond the bound.
-/// Unknown stays unknown: an empty report never proves no native effect
-/// occurred, and the daemon never auto-resolves unknown to finish drain.
+/// unknown commands); `truncated` is true whenever any qualifying record was
+/// omitted for any reason (the list bound or the Store byte bound trimming
+/// the page). Unknown stays unknown: an empty report never proves no native
+/// effect occurred, and the daemon never auto-resolves unknown to finish
+/// drain.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DrainReport {
@@ -911,9 +915,6 @@ pub struct DrainReport {
     #[serde(deserialize_with = "objects")]
     pub owned_processes: Vec<OwnedProcessSummary>,
     pub owned_processes_truncated: bool,
-    pub stopped_idle_count: usize,
-    pub stopped_idle_commands: Vec<String>,
-    pub stopped_idle_truncated: bool,
 }
 
 impl DrainReport {
@@ -931,9 +932,6 @@ impl DrainReport {
             owned_processes_count: 0,
             owned_processes: Vec::new(),
             owned_processes_truncated: false,
-            stopped_idle_count: 0,
-            stopped_idle_commands: Vec::new(),
-            stopped_idle_truncated: false,
         }
     }
 
@@ -962,12 +960,6 @@ impl DrainReport {
         {
             return Err(invalid_response());
         }
-        if self.stopped_idle_count < self.stopped_idle_commands.len()
-            || (!self.stopped_idle_truncated
-                && self.stopped_idle_count != self.stopped_idle_commands.len())
-        {
-            return Err(invalid_response());
-        }
         if self
             .running_turns
             .iter()
@@ -981,10 +973,6 @@ impl DrainReport {
                 .owned_processes
                 .iter()
                 .any(|process| process.validate().is_err())
-            || self
-                .stopped_idle_commands
-                .iter()
-                .any(|id| text(id).is_err())
         {
             return Err(invalid_response());
         }
@@ -2186,8 +2174,7 @@ mod tests {
             "unknown_commands_count":1,"unknown_commands":["c1"],"unknown_commands_truncated":false,
             "owned_processes_count":1,
             "owned_processes":[{"agent":"a1","generation":0,"kind":"plugin"}],
-            "owned_processes_truncated":false,
-            "stopped_idle_count":1,"stopped_idle_commands":["c3"],"stopped_idle_truncated":false
+            "owned_processes_truncated":false
         });
         let reply: DaemonStatusResponse = serde_json::from_value(with_drain.clone()).unwrap();
         request.validate_response(&reply).unwrap();

@@ -641,11 +641,6 @@ struct ShutdownArgs {
     drain: bool,
     #[arg(long, conflicts_with = "drain")]
     force: bool,
-    /// Drain-only opt-in: submit ordinary stop commands for idle controlled
-    /// Agents before capturing the drain report. Unknown stays unknown;
-    /// never auto-resolves and never forces.
-    #[arg(long = "stop-idle", requires = "drain")]
-    stop_idle: bool,
 }
 
 #[derive(Subcommand)]
@@ -1297,16 +1292,12 @@ async fn dispatch(
                             "--foreground is only valid when starting the daemon",
                         ));
                     }
-                    if args.stop_idle && !args.drain {
-                        return Err(Failure::new(2, "--stop-idle requires --drain"));
-                    }
                     let mode = if args.drain {
                         ShutdownMode::Drain
                     } else {
                         ShutdownMode::Force
                     };
-                    let mut request = DaemonShutdownRequest::new(mutation_id(id)?, mode);
-                    request.stop_idle = args.stop_idle;
+                    let request = DaemonShutdownRequest::new(mutation_id(id)?, mode);
                     let result = shutdown_daemon(&data_dir, &request).await?;
                     let value = serde_json::to_value(&result)
                         .map_err(|_| Failure::new(4, "daemon.shutdown response is invalid"))?;

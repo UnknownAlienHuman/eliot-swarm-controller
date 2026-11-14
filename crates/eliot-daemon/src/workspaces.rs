@@ -999,27 +999,6 @@ impl WorkspaceManager {
             .any(|slot| slot.active.lock_recover().is_some() || slot.operation.try_lock().is_err())
     }
 
-    /// Bounded workspace owners with a live owned child or an in-flight
-    /// operation, sorted for drain reporting. An absent entry never proves
-    /// no native effect occurred.
-    pub(crate) fn owned_process_owners(&self, limit: usize) -> Vec<(String, i64)> {
-        let slots = self.inner.slots.lock_recover();
-        let mut owners = Vec::new();
-        for (key, slot) in slots.iter() {
-            if owners.len() >= limit {
-                break;
-            }
-            let active = slot.active.lock_recover().is_some();
-            let in_flight = slot.operation.try_lock().is_err();
-            if active || in_flight {
-                owners.push((key.agent.clone(), key.target_generation));
-            }
-        }
-        owners.sort();
-        owners.truncate(limit);
-        owners
-    }
-
     pub(crate) fn close_startup_admission(&self) {
         self.inner.startup_closed.store(true, Ordering::SeqCst);
     }

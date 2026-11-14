@@ -123,11 +123,6 @@ pub struct DaemonShutdownRequest {
     #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
     pub mode: ShutdownMode,
-    #[serde(default, skip_serializing_if = "is_false")]
-    #[schemars(
-        description = "Drain-only opt-in: submit ordinary stop commands for idle controlled Agents before capturing the drain report."
-    )]
-    pub stop_idle: bool,
 }
 
 impl DaemonShutdownRequest {
@@ -135,19 +130,11 @@ impl DaemonShutdownRequest {
         Self {
             id: id.into(),
             mode,
-            stop_idle: false,
         }
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_shutdown_id(&self.id)?;
-        if self.stop_idle && self.mode != ShutdownMode::Drain {
-            return Err(Error::new(
-                "invalid",
-                "stop_idle is only valid with drain mode",
-            ));
-        }
-        Ok(())
+        validate_shutdown_id(&self.id)
     }
 }
 
@@ -182,10 +169,6 @@ fn validate_shutdown_id(id: &str) -> Result<()> {
         return Err(Error::new("invalid", "id must be a non-empty string"));
     }
     Ok(())
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 fn shutdown_id<'de, D: serde::Deserializer<'de>>(
@@ -450,18 +433,6 @@ mod tests {
             );
             assert_eq!(ShutdownMode::parse(mode.as_str()).unwrap(), mode);
         }
-        let mut stop_idle = DaemonShutdownRequest::new("id", ShutdownMode::Drain);
-        stop_idle.stop_idle = true;
-        stop_idle.validate().unwrap();
-        let wire = json!({"id":"id","mode":"drain","stop_idle":true});
-        assert_eq!(serde_json::to_value(&stop_idle).unwrap(), wire);
-        assert_eq!(
-            serde_json::from_value::<DaemonShutdownRequest>(wire).unwrap(),
-            stop_idle
-        );
-        let mut bad = DaemonShutdownRequest::new("id", ShutdownMode::Force);
-        bad.stop_idle = true;
-        assert_eq!(bad.validate().unwrap_err().code, "invalid");
         for bad in ["", "Drain", "draining", "forcing", " force ", "other"] {
             assert_eq!(ShutdownMode::parse(bad).unwrap_err().code, "invalid");
             assert!(
@@ -474,6 +445,7 @@ mod tests {
             json!({"mode":"force"}),
             json!({"id":"id"}),
             json!({"id":"id","mode":"force","extra":0}),
+            json!({"id":"id","mode":"drain","stop_idle":true}),
         ] {
             assert!(serde_json::from_value::<DaemonShutdownRequest>(request).is_err());
         }
@@ -574,8 +546,7 @@ mod tests {
             "running_turns_count":0,"running_turns":[],"running_turns_truncated":false,
             "unsettled_commands_count":0,"unsettled_commands":[],"unsettled_commands_truncated":false,
             "unknown_commands_count":0,"unknown_commands":[],"unknown_commands_truncated":false,
-            "owned_processes_count":0,"owned_processes":[],"owned_processes_truncated":false,
-            "stopped_idle_count":0,"stopped_idle_commands":[],"stopped_idle_truncated":false
+            "owned_processes_count":0,"owned_processes":[],"owned_processes_truncated":false
         });
         for wire in [
             json!({"state":"applied","mode":"drain","blockers":[]}),

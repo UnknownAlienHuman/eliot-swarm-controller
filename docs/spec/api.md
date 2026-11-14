@@ -1067,21 +1067,27 @@ See [coordination](coordination.md#who-works-on-this) and
 `daemon.shutdown` uses the canonical `DaemonShutdownRequest`/`DaemonShutdownResponse`.
 
 This owner-only request requires exactly an `id` and the `ShutdownMode` value `drain` or
-`force`, with an optional drain-only `stop_idle` flag (default false); unknown fields,
-missing fields, wrong types and nulls are `invalid`, and `stop_idle` with `force` is
-`invalid`. Its first reply is retained under the literal mutation ID. An exact retry
-returns that same reply, including the original drain blocker snapshot; use owner-only
-`daemon.status` for current state. Reusing the ID with another mode (or a different
-`stop_idle` binding) returns `id_conflict`.
+`force`; unknown fields, missing fields, wrong types and nulls are `invalid`. Its
+first reply is retained under the literal mutation ID. An exact retry returns that
+same reply, including the original drain blocker snapshot; use owner-only
+`daemon.status` for current state. Reusing the ID with another mode returns
+`id_conflict`. A retained reply written before the drain report existed carries no
+`drain` field and still validates; a present report always validates.
 Force admission is monotonic; a later, in-flight, or replayed drain cannot downgrade it.
 
-Drain returns `state:"applied"` with an empty typed blocker list when no blockers were
-observed, otherwise `state:"dispatched"` with the captured `StatusBlocker` list. Drain
-also returns a bounded `drain` report reusing the existing blocker sources instead of
+Drain is a pure read-side report: no effects run before the shutdown-ID claim, and
+the pre-change effect behavior is unchanged. Drain returns `state:"applied"` with an
+empty typed blocker list when no blockers were observed, otherwise
+`state:"dispatched"` with the captured `StatusBlocker` list. Drain also returns a
+bounded `drain` report reusing the existing blocker sources instead of
 a new registry: running turns (Agents with a recorded `active_turn`), unsettled
-commands, unknown commands and live owned processes (controlled plugin runtimes and
-owned workspace children). Every category carries a count, a bounded list and a
-truncation flag; the bound is 64 entries per list. `AgentLive` blockers carry the
+commands, unknown commands and live owned processes. Live owned processes come from
+the Store custody snapshot (process records not yet `exited`), never from routing
+eligibility or workspace operation locks: a held workspace operation lock alone is
+not a live child and never appears. Every category carries a count, a bounded list
+and a truncation flag; the bound is 64 entries per list, and the flag is true
+whenever any qualifying record was omitted for any reason (the list bound or the
+Store page byte bound trimming the page). `AgentLive` blockers carry the
 observed `active_turn` when present. An empty report never proves that no native
 effect occurred: an unknown native effect remains unknown until evidence or an
 explicit owner resolution, and neither "session never ready" nor an empty stderr
@@ -1092,18 +1098,11 @@ reply, the fallback still dispatches force and returns `store_write_faulted:true
 the dispatched state; that fallback is not a retained write result. When present,
 `store_write_faulted` is true.
 
-`swarm daemon stop --drain --stop-idle` opts in to stopping idle controlled Agents.
-It submits ordinary `stop` commands through the Router with the Agent's current
-generation, so the existing stop custody, generation binding and unknown handling
-apply. The dispatched stop command ids are reported in the bounded
-`drain.stopped_idle_commands` list with its count and truncation flag. A retry with
-the same shutdown mutation id returns the retained reply without submitting
-duplicate stops. `daemon.status` carries the same bounded `drain` report (with an
-empty stopped list); while draining it is the current blockers snapshot, while
-open it reflects the current fleet. `swarm daemon stop --drain` prints the retained
-`DaemonShutdownResponse` including `blockers` and `drain`; `swarm status` prints the
-typed `DaemonStatusResponse` including `blockers`, `unsettled_commands`,
-`unknown_commands` and `drain`.
+`daemon.status` carries the same bounded `drain` report; while draining it is the
+current blockers snapshot, while open it reflects the current fleet.
+`swarm daemon stop --drain` prints the retained `DaemonShutdownResponse` including
+`blockers` and `drain`; `swarm status` prints the typed `DaemonStatusResponse`
+including `blockers`, `unsettled_commands`, `unknown_commands` and `drain`.
 
 Drain rejects new turn-producing work and new automation, while continuing pre-admitted
 work and allowing exact stop/interrupt/request replies/cancel/detach/readback. Unknown
@@ -1131,7 +1130,7 @@ The synopsis is target grammar; later-layer forms are not an inventory of curren
 
 ```text
 swarm daemon [--foreground]
-swarm daemon stop [--drain [--stop-idle]|--force]
+swarm daemon stop [--drain|--force]
 swarm status
 swarm launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [PROMPT] [--wait] [--timeout-seconds N]
 swarm worktree remove AGENT [--generation N]

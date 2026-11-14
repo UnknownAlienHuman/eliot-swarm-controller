@@ -3258,21 +3258,23 @@ impl Router {
 
     async fn status(&self) -> Result<Value> {
         let blockers = self.status_blockers().await?;
-        let drain = self.drain_report(Vec::new(), false).await?;
+        let drain = self.drain_report().await?;
         let mode = self.mode_name();
-        let (agent_count, write_faulted, unsettled_commands) = {
+        let (agent_count, write_faulted, unsettled_commands, unsettled_total) = {
             let store = self.inner.store.lock().await;
             (
                 store.agent_count()?,
                 store.is_write_faulted(),
                 store.list_unsettled_commands(STATUS_BLOCKER_MAX)?,
+                store.count_unsettled_commands()?,
             )
         };
         let mut unknown_commands = self.unknown_ids();
         let unknown_commands_count = unknown_commands.len();
         let unknown_commands_truncated = unknown_commands.len() > STATUS_BLOCKER_MAX;
         unknown_commands.truncate(STATUS_BLOCKER_MAX);
-        let unsettled_commands_truncated = unsettled_commands.len() == STATUS_BLOCKER_MAX;
+        let unsettled_total = usize::try_from(unsettled_total.max(0)).unwrap_or(usize::MAX);
+        let unsettled_commands_truncated = unsettled_commands.len() < unsettled_total;
         let unsettled_command_details = unsettled_commands
             .iter()
             .map(|command| UnsettledCommandSummary {
@@ -3321,26 +3323,34 @@ impl Router {
         .map_err(|_| Error::new("internal", "daemon status could not be encoded"))
     }
 
-    /// Bounded drain report reusing the existing shutdown blockers' sources.
-    /// Running turns come from nonterminal Agents with a recorded active turn;
-    /// unsettled/unknown reuse the status projections; owned processes combine
-    /// live controlled runtimes and owned workspace children. Every category
-    /// carries a count, a bounded list and a truncation flag. Unknown stays
-    /// unknown: an empty report never proves no native effect occurred.
-    async fn drain_report(
-        &self,
-        stopped_idle_commands: Vec<String>,
-        stopped_idle_truncated: bool,
-    ) -> Result<DrainReport> {
+    /// Bounded read-side drain report reusing the existing shutdown blockers'
+    /// sources. Running turns come from nonterminal Agents with a recorded
+    /// active turn; unsettled/unknown reuse the status projections; owned
+    /// processes come from the Store custody snapshot (process records not
+    /// yet exited), never from routing eligibility or workspace operation
+    /// locks. Every category carries a count, a bounded list and a truncation
+    /// flag that is true whenever any qualifying record was omitted for any
+    /// reason: the list bound or the Store page byte bound trimming the page.
+    /// Unknown stays unknown: an empty report never proves no native effect
+    /// occurred.
+    async fn drain_report(&self) -> Result<DrainReport> {
         self.clear_terminal_unknown_cache().await;
-        let (agents, unsettled_commands) = {
+        let (agents, agents_total, unsettled_commands, unsettled_total, custody) = {
             let store = self.inner.store.lock().await;
             (
                 store.list_nonterminal_agents(STATUS_BLOCKER_MAX)?,
+                store.count_nonterminal_agents()?,
                 store.list_unsettled_commands(STATUS_BLOCKER_MAX)?,
+                store.count_unsettled_commands()?,
+                store.live_process_owners(STATUS_BLOCKER_MAX)?,
             )
         };
-        let agents_truncated = agents.len() == STATUS_BLOCKER_MAX;
+        let (live_owners, live_total) = custody;
+        let agents_total = usize::try_from(agents_total.max(0)).unwrap_or(usize::MAX);
+        let unsettled_total = usize::try_from(unsettled_total.max(0)).unwrap_or(usize::MAX);
+        // Running turns derive solely from the Agent page: any omitted Agent
+        // may hide a turn, so the Agent omission decides this flag.
+        let running_turns_truncated = agents.len() < agents_total;
         let mut running_turns = agents
             .iter()
             .filter_map(|agent| {
@@ -3361,10 +3371,9 @@ impl Router {
                 &right.turn_id,
             ))
         });
-        let running_turns_truncated = agents_truncated;
         running_turns.truncate(STATUS_BLOCKER_MAX);
         let running_turns_count = running_turns.len();
-        let unsettled_commands_truncated = unsettled_commands.len() == STATUS_BLOCKER_MAX;
+        let unsettled_commands_truncated = unsettled_commands.len() < unsettled_total;
         let unsettled_commands_count = unsettled_commands.len();
         let unsettled_details = unsettled_commands
             .iter()
@@ -3380,29 +3389,18 @@ impl Router {
         let unknown_commands_count = unknown_commands.len();
         let unknown_commands_truncated = unknown_commands.len() > STATUS_BLOCKER_MAX;
         unknown_commands.truncate(STATUS_BLOCKER_MAX);
-        let plugin_owners = self.inner.plugin_host.live_owners(STATUS_BLOCKER_MAX);
-        let plugin_truncated = plugin_owners.len() == STATUS_BLOCKER_MAX;
-        let workspace_owners = self
-            .inner
-            .workspaces
-            .owned_process_owners(STATUS_BLOCKER_MAX);
-        let workspace_truncated = workspace_owners.len() == STATUS_BLOCKER_MAX;
-        let mut owned_processes =
-            plugin_owners
-                .into_iter()
-                .map(|(agent, generation)| OwnedProcessSummary {
-                    agent,
-                    generation,
-                    kind: OwnedProcessKind::Plugin,
-                })
-                .chain(workspace_owners.into_iter().map(|(agent, generation)| {
-                    OwnedProcessSummary {
-                        agent,
-                        generation,
-                        kind: OwnedProcessKind::Workspace,
-                    }
-                }))
-                .collect::<Vec<_>>();
+        let mut owned_processes = live_owners
+            .into_iter()
+            .map(|owner| OwnedProcessSummary {
+                agent: owner.agent,
+                generation: owner.generation,
+                kind: if owner.workspace {
+                    OwnedProcessKind::Workspace
+                } else {
+                    OwnedProcessKind::Plugin
+                },
+            })
+            .collect::<Vec<_>>();
         owned_processes.sort_by(|left, right| {
             (&left.agent, left.generation, left.kind as u8).cmp(&(
                 &right.agent,
@@ -3410,11 +3408,9 @@ impl Router {
                 right.kind as u8,
             ))
         });
-        let owned_processes_truncated =
-            plugin_truncated || workspace_truncated || owned_processes.len() > STATUS_BLOCKER_MAX;
+        let owned_processes_truncated = owned_processes.len() < live_total;
         owned_processes.truncate(STATUS_BLOCKER_MAX);
         let owned_processes_count = owned_processes.len();
-        let stopped_idle_count = stopped_idle_commands.len();
         Ok(DrainReport {
             running_turns_count,
             running_turns,
@@ -3428,74 +3424,7 @@ impl Router {
             owned_processes_count,
             owned_processes,
             owned_processes_truncated,
-            stopped_idle_count,
-            stopped_idle_commands,
-            stopped_idle_truncated,
         })
-    }
-
-    /// Opt-in idle cleanup for drain: submit ordinary `stop` commands for idle
-    /// controlled Agents through the Router so existing custody and unknown
-    /// handling apply. Returns the dispatched stop command ids (bounded) and
-    /// whether more idle candidates existed beyond the bound. Never
-    /// auto-resolves unknown and never forces.
-    async fn stop_idle_agents(&self) -> Result<(Vec<String>, bool)> {
-        let (agents, unsettled_stops) = {
-            let store = self.inner.store.lock().await;
-            let agents = store.list_nonterminal_agents(STATUS_BLOCKER_MAX)?;
-            let unsettled = store.list_unsettled_commands(STATUS_BLOCKER_MAX)?;
-            let mut stops = std::collections::HashSet::new();
-            for command in unsettled {
-                if command.verb == "stop"
-                    && let (Some(target), Some(generation)) =
-                        (command.target.as_deref(), command.generation)
-                {
-                    stops.insert((target.to_owned(), generation));
-                }
-            }
-            (agents, stops)
-        };
-        let agents_truncated = agents.len() == STATUS_BLOCKER_MAX;
-        let mut candidates = Vec::new();
-        for agent in agents {
-            if agent.observe_only || agent.state != AgentState::Idle {
-                continue;
-            }
-            if !self
-                .inner
-                .plugin_host
-                .controls_generation(&agent.id, agent.generation)
-            {
-                continue;
-            }
-            if unsettled_stops.contains(&(agent.id.clone(), agent.generation)) {
-                continue;
-            }
-            candidates.push((agent.id, agent.generation));
-            if candidates.len() >= STATUS_BLOCKER_MAX {
-                break;
-            }
-        }
-        let mut stopped = Vec::new();
-        for (agent, generation) in candidates {
-            let stop_id = ulid::Ulid::new().to_string();
-            let params = json!({
-                "id": stop_id,
-                "target": agent,
-                "verb": "stop",
-                "args": {},
-                "expected_generation": generation,
-            });
-            match self.submit(&params, &Principal::Owner).await {
-                Ok(_) => stopped.push(stop_id),
-                Err(error) if error.code == "unknown" => stopped.push(stop_id),
-                Err(_) => continue,
-            }
-            if stopped.len() >= STATUS_BLOCKER_MAX {
-                break;
-            }
-        }
-        Ok((stopped, agents_truncated))
     }
 
     async fn status_blockers(&self) -> Result<Vec<StatusBlocker>> {
@@ -3585,20 +3514,9 @@ impl Router {
         request.validate()?;
         let mode = request.mode;
         let id = request.id.to_owned();
-        let stop_idle = request.stop_idle;
-        // A retry with the same mutation id must not submit duplicate stops:
-        // peek first, and let the retained write decide id_conflict. Only an
-        // unseen id proceeds to opt-in stop submission.
-        let already_retained = {
-            let store = self.inner.store.lock().await;
-            store.peek_write_result(&id)?.is_some()
-        };
-        let (stopped_idle_commands, stopped_idle_truncated) =
-            if mode == ShutdownMode::Drain && stop_idle && !already_retained {
-                self.stop_idle_agents().await?
-            } else {
-                (Vec::new(), false)
-            };
+        // Drain is a pure read-side report: no effects run before the
+        // shutdown-ID claim, so an exact retry replays the retained reply
+        // with no duplicate effects to guard.
         let result = if mode == ShutdownMode::Force {
             DaemonShutdownResponse {
                 state: CommandState::Dispatched,
@@ -3609,9 +3527,7 @@ impl Router {
             }
         } else {
             let blockers = self.status_blockers().await?;
-            let drain = self
-                .drain_report(stopped_idle_commands, stopped_idle_truncated)
-                .await?;
+            let drain = self.drain_report().await?;
             DaemonShutdownResponse {
                 state: if blockers.is_empty() {
                     CommandState::Applied
@@ -3628,15 +3544,7 @@ impl Router {
             .map_err(|_| Error::new("internal", "shutdown result could not be encoded"))?;
         let write = {
             let mut store = self.inner.store.lock().await;
-            // The retained binding includes stop_idle when set so a retry
-            // with a different flag conflicts instead of silently changing
-            // the effect. Unset stays compatible with the previous drain
-            // binding.
-            let payload = if stop_idle {
-                json!({"mode": mode.as_str(), "stop_idle": true})
-            } else {
-                json!({"mode": mode.as_str()})
-            };
+            let payload = json!({"mode": mode.as_str()});
             let write = match store.record_write(
                 &id,
                 &principal_name(principal),
@@ -7448,12 +7356,10 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             "unsettled_commands",
             "unknown_commands",
             "owned_processes",
-            "stopped_idle_commands",
         ] {
             assert_eq!(drain[category], json!([]));
         }
         assert_eq!(drain["running_turns_count"], json!(0));
-        assert_eq!(drain["stopped_idle_count"], json!(0));
         {
             let mut store = router.inner.store.lock().await;
             admit(&mut store);
@@ -7563,7 +7469,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(drain["owned_processes"], json!([]));
         assert_eq!(drain["owned_processes_count"], json!(0));
         assert_eq!(drain["owned_processes_truncated"], json!(false));
-        assert_eq!(drain["stopped_idle_commands"], json!([]));
         // Unknown stays unknown: drain never auto-resolves to failed. The
         // Store stays Dispatched (unsettled) while the in-memory unknown set
         // keeps the evidence-based unknown outcome.
@@ -7576,10 +7481,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
     }
 
     #[tokio::test]
-    async fn drain_stop_idle_submits_ordinary_stops_without_dupes() {
+    async fn drain_report_uses_store_custody_not_routing_or_operation_locks() {
         let router = router();
-        let agent = {
-            let mut store = router.inner.store.lock().await;
+        // One observed native child, one observed workspace child, one
+        // routing-only entry with no Store custody, and one bare workspace
+        // preparation with no observed child.
+        let launch = |store: &mut eliot_store::Store, project: &str| {
             let launch_id = ulid::Ulid::new().to_string();
             let agent = store
                 .submit(
@@ -7590,7 +7497,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                         selector: None,
                         verb: "launch".to_owned(),
                         args: json!({
-                            "project":"drain-stop-idle", "workspace":"synthetic-workspace",
+                            "project":project, "workspace":"synthetic-workspace",
                             "harness":"codex", "profile":"synthetic", "profile_snapshot":{},
                         }),
                         expected_generation: Some(0),
@@ -7605,83 +7512,252 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .target
                 .unwrap();
             store.dispatch(&launch_id, now_ms()).unwrap();
-            crate::test_support::install_fixture_sources(
-                &mut store,
-                &agent,
-                &launch_id,
-                1,
-                now_ms(),
-            );
-            read_fixture_event(
-                &mut store,
-                &agent,
-                "session.ready",
-                json!({"native_scope":"fixture-scope", "native_ref":"fixture-ref"}),
-            );
-            store
-                .settle(&launch_id, CommandState::Applied, None, now_ms())
-                .unwrap();
             agent
         };
-        // Idle controlled Agent with no live runtime in fixtures: the
-        // ordinary stop will settle as rejected (native_not_dispatched),
-        // never as auto-resolved failure or unknown.
+        let prepare_workspace = |store: &mut eliot_store::Store, project: &str| {
+            let branch = format!("codex/drain-custody-{project}");
+            let worktree = format!("/synthetic-worktree-{project}");
+            store
+                .submit_with_workspace(
+                    "owner",
+                    SubmitCommand {
+                        id: ulid::Ulid::new().to_string(),
+                        target: None,
+                        selector: None,
+                        verb: "launch".to_owned(),
+                        args: json!({"project":project, "workspace":"/synthetic-source", "worktree":branch, "harness":"codex", "profile":"fixture", "profile_snapshot":{}}),
+                        expected_generation: Some(0),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    WorkspacePreparationInput {
+                        project: project.to_owned(),
+                        repo_path: "/synthetic-source".to_owned(),
+                        repo_common_dir: "/synthetic-source/.git".to_owned(),
+                        requested_branch: branch,
+                        base_ref: None,
+                        base_oid: "b".repeat(40),
+                        worktree_path: worktree,
+                        frozen_setup: Vec::new(),
+                    },
+                    now_ms(),
+                )
+                .unwrap()
+                .command
+                .target
+                .unwrap()
+        };
+        let (plugin_agent, workspace_agent, routing_only, bare_preparation) = {
+            let mut store = router.inner.store.lock().await;
+            let plugin_agent = launch(&mut store, "drain-custody-plugin");
+            store
+                .ensure_process_source(&plugin_agent, 1, now_ms())
+                .unwrap();
+            store
+                .observe_processes(
+                    &plugin_agent,
+                    1,
+                    &[eliot_core::ProcessRecord {
+                        identity: eliot_core::ProcessIdentity {
+                            host_boot_id: "drain-boot".to_owned(),
+                            pid: 7,
+                            start_time: 1,
+                        },
+                        owner: format!("agent:{plugin_agent}#1"),
+                        role: "harness".to_owned(),
+                        state: eliot_core::ProcessState::Running,
+                        exit_code: None,
+                        updated_at: now_ms(),
+                    }],
+                    now_ms(),
+                )
+                .unwrap();
+            let workspace_agent = prepare_workspace(&mut store, "drain-custody-ws");
+            store
+                .ensure_workspace_process_source(&workspace_agent, 1, now_ms())
+                .unwrap();
+            store
+                .observe_workspace_processes(
+                    &workspace_agent,
+                    1,
+                    &eliot_core::ProcessSnapshot {
+                        samples: vec![eliot_core::ProcessSample {
+                            record: eliot_core::ProcessRecord {
+                                identity: eliot_core::ProcessIdentity {
+                                    host_boot_id: "drain-boot".to_owned(),
+                                    pid: 8,
+                                    start_time: 1,
+                                },
+                                owner: format!("workspace:{workspace_agent}#1"),
+                                role: "setup".to_owned(),
+                                state: eliot_core::ProcessState::Running,
+                                exit_code: None,
+                                updated_at: now_ms(),
+                            },
+                            cpu_time_ns: None,
+                            rss_bytes: None,
+                        }],
+                        complete: true,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            let routing_only = launch(&mut store, "drain-custody-routing");
+            let bare_preparation = prepare_workspace(&mut store, "drain-custody-bare");
+            (
+                plugin_agent,
+                workspace_agent,
+                routing_only,
+                bare_preparation,
+            )
+        };
+        // Routing eligibility alone is not custody: no Store process record
+        // backs this generation.
         router
             .inner
             .plugin_host
-            .mark_generation_controlled_for_test(&agent, 1);
-        let id = ulid::Ulid::new().to_string();
-        let first = router
+            .mark_generation_controlled_for_test(&routing_only, 1);
+        let shutdown = router
             .shutdown(
-                &json!({"id":id, "mode":"drain", "stop_idle":true}),
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
                 &Principal::Owner,
             )
             .await
             .unwrap();
-        assert_eq!(first["mode"], json!("drain"));
-        let drain = first["drain"].as_object().expect("drain report");
-        let stopped = drain["stopped_idle_commands"]
+        let drain = shutdown["drain"].as_object().expect("drain report");
+        let owned = drain["owned_processes"]
             .as_array()
-            .expect("stopped idle");
-        assert_eq!(stopped.len(), 1);
-        assert_eq!(drain["stopped_idle_count"], json!(1));
-        assert_eq!(drain["stopped_idle_truncated"], json!(false));
-        let stop_id = stopped[0].as_str().expect("stop id").to_owned();
-        // Ordinary stop semantics apply: fixtures have no runtime, so the
-        // stop proves no native I/O started (rejected), and the idle Agent
-        // still blocks drain.
-        tokio::task::yield_now().await;
-        let store = router.inner.store.lock().await;
-        let stop = store.get_command(&stop_id).unwrap().expect("stop command");
-        assert_eq!(stop.verb, "stop");
-        assert_eq!(stop.target.as_deref(), Some(agent.as_str()));
-        assert_eq!(stop.generation, Some(1));
-        drop(store);
-        // Retry with the same mutation id returns the retained reply without
-        // submitting a duplicate stop.
-        let retained = router
+            .expect("owned processes");
+        assert_eq!(owned.len(), 2);
+        assert!(
+            owned
+                .iter()
+                .any(|process| process["agent"] == json!(plugin_agent)
+                    && process["generation"] == json!(1)
+                    && process["kind"] == json!("plugin"))
+        );
+        assert!(
+            owned
+                .iter()
+                .any(|process| process["agent"] == json!(workspace_agent)
+                    && process["generation"] == json!(1)
+                    && process["kind"] == json!("workspace"))
+        );
+        assert!(
+            !owned
+                .iter()
+                .any(|process| process["agent"] == json!(routing_only)),
+            "routing-only generation must not read as custody"
+        );
+        assert!(
+            !owned
+                .iter()
+                .any(|process| process["agent"] == json!(bare_preparation)),
+            "bare workspace preparation must not read as a live process"
+        );
+        assert_eq!(drain["owned_processes_count"], json!(2));
+        assert_eq!(drain["owned_processes_truncated"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn drain_report_truncation_covers_list_bound() {
+        let router = router();
+        {
+            let mut store = router.inner.store.lock().await;
+            for _ in 0..70 {
+                store
+                    .submit(
+                        "owner",
+                        SubmitCommand {
+                            id: ulid::Ulid::new().to_string(),
+                            target: None,
+                            selector: None,
+                            verb: "launch".to_owned(),
+                            args: json!({
+                                "project":"drain-truncation", "workspace":"synthetic-workspace",
+                                "harness":"codex", "profile":"synthetic", "profile_snapshot":{},
+                            }),
+                            expected_generation: Some(0),
+                            expected_turn_id: None,
+                            request_id: None,
+                            probe: false,
+                        },
+                        now_ms(),
+                    )
+                    .unwrap();
+            }
+        }
+        let shutdown = router
             .shutdown(
-                &json!({"id":id, "mode":"drain", "stop_idle":true}),
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
                 &Principal::Owner,
             )
             .await
             .unwrap();
-        assert_eq!(retained, first);
-        let store = router.inner.store.lock().await;
-        let stops = store
-            .list_unsettled_commands(1000)
-            .unwrap()
-            .into_iter()
-            .filter(|command| {
-                command.verb == "stop" && command.target.as_deref() == Some(agent.as_str())
-            })
-            .count()
-            + store
-                .get_command(&stop_id)
-                .unwrap()
-                .filter(|command| command.state.is_terminal())
-                .map_or(0, |_| 1);
-        assert_eq!(stops, 1);
+        let drain = shutdown["drain"].as_object().expect("drain report");
+        let unsettled = drain["unsettled_commands"]
+            .as_array()
+            .expect("unsettled commands");
+        assert_eq!(unsettled.len(), 64);
+        assert_eq!(drain["unsettled_commands_count"], json!(64));
+        assert_eq!(drain["unsettled_commands_truncated"], json!(true));
+        // No Agent has an active turn, but the Agent page itself is capped,
+        // so a hidden turn can never read back as complete.
+        assert_eq!(drain["running_turns"], json!([]));
+        assert_eq!(drain["running_turns_count"], json!(0));
+        assert_eq!(drain["running_turns_truncated"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn drain_report_truncation_covers_byte_trimmed_pages() {
+        let router = router();
+        {
+            let mut store = router.inner.store.lock().await;
+            let (agent, _) = result_fixture(&mut store);
+            let big = "x".repeat(100_000);
+            for _ in 0..12 {
+                store
+                    .submit(
+                        "owner",
+                        SubmitCommand {
+                            id: ulid::Ulid::new().to_string(),
+                            target: Some(agent.clone()),
+                            selector: None,
+                            verb: "send".to_owned(),
+                            args: json!({"text": big}),
+                            expected_generation: Some(1),
+                            expected_turn_id: None,
+                            request_id: None,
+                            probe: false,
+                        },
+                        now_ms(),
+                    )
+                    .unwrap();
+            }
+        }
+        let shutdown = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        let drain = shutdown["drain"].as_object().expect("drain report");
+        let unsettled = drain["unsettled_commands"]
+            .as_array()
+            .expect("unsettled commands");
+        // Twelve ~100 KiB sends plus the fixture send overflow the ~900 KiB
+        // page, so the bounded prefix omits qualifying commands.
+        assert!(
+            unsettled.len() < 13,
+            "byte-trimmed page kept {}",
+            unsettled.len()
+        );
+        assert_eq!(drain["unsettled_commands_count"], json!(unsettled.len()));
+        assert_eq!(drain["unsettled_commands_truncated"], json!(true));
+        // The single Agent page is complete, so its turn flag stays false.
+        assert_eq!(drain["running_turns_truncated"], json!(false));
     }
 
     #[tokio::test]

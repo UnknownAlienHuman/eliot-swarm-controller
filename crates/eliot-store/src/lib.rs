@@ -71,16 +71,30 @@ const INITIAL_SOURCE: &str = "stream";
 const PROCESS_SOURCE: &str = "os";
 const WORKSPACE_PROCESS_SOURCE: &str = "workspace_process";
 const GIT_SOURCE: &str = "git";
-const LIST_UNSETTLED_COMMANDS_SQL: &str = "SELECT id, principal, method, target, expected_generation, generation,
+/// Rows that still block drain: neither settled nor pruned observer
+/// attach/detach noise. Shared by the bounded list and its total so the
+/// drain report can mark truncation honestly for any omission (the list
+/// bound or the page byte bound trimming full command rows).
+const UNSETTLED_COMMANDS_WHERE: &str = "state IN ('accepted', 'queued', 'dispatched', 'unknown')
+                  AND NOT (state = 'unknown' AND verb IN ('attach','detach')
+                    AND EXISTS(SELECT 1 FROM agents a WHERE a.id = commands.target AND a.observe_only = 1)
+                    AND NOT EXISTS(SELECT 1 FROM source_state s WHERE s.agent = commands.target
+                        AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state = 'open'))";
+const LIST_UNSETTLED_COMMANDS_COLUMNS: &str =
+    "SELECT id, principal, method, target, expected_generation, generation,
                         expected_turn_id, turn_id, request_id, verb, args, state, outcome,
                         created_at, updated_at, probe, selector
-                 FROM commands
-                 WHERE state IN ('accepted', 'queued', 'dispatched', 'unknown')
-                   AND NOT (state = 'unknown' AND verb IN ('attach','detach')
-                     AND EXISTS(SELECT 1 FROM agents a WHERE a.id = commands.target AND a.observe_only = 1)
-                     AND NOT EXISTS(SELECT 1 FROM source_state s WHERE s.agent = commands.target
-                         AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state = 'open'))
-                 ORDER BY created_at, rowid LIMIT ?1";
+                 FROM commands";
+/// Live Agent rows that can still produce work. Shared by the bounded drain
+/// list and its total for the same honest-truncation reason as unsettled
+/// commands.
+const NONTERMINAL_AGENTS_WHERE: &str =
+    "observe_only = 0 AND state IN ('created', 'starting', 'idle', 'busy', 'waiting')";
+const LIST_NONTERMINAL_AGENTS_COLUMNS: &str = "SELECT id, generation, name, project, harness, profile,
+                        profile_snapshot, native_scope, native_ref, workspace, effective,
+                        pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
+                        parent, root, depth, control
+                 FROM agents";
 const RECOVER_ACCEPTED_COMMAND_FILTER: &str =
     "state IN ('accepted', 'queued', 'dispatched', 'unknown')
        AND state = 'accepted' AND principal = 'owner' AND parent_command IS NULL
@@ -294,21 +308,6 @@ impl Store {
     /// Whether a previous SQLite commit failure fenced this Store instance.
     pub fn is_write_faulted(&self) -> bool {
         self.write_faulted.get()
-    }
-
-    /// Peek at a retained idempotent write without recording a new one. Used
-    /// by drain with stop-idle so a retry with the same mutation id returns
-    /// the retained reply without submitting duplicate stop commands.
-    /// Returns the stored result JSON when the id is bound to a write.
-    pub fn peek_write_result(&self, id: &str) -> Result<Option<Value>> {
-        let row: Option<String> = self
-            .connection
-            .query_row("SELECT result FROM writes WHERE id = ?1", [id], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map_err(sql_error)?;
-        row.map(|raw| decode_json(&raw)).transpose()
     }
 
     /// Refuse retained-command reads if a failed transaction left the
@@ -1094,18 +1093,10 @@ impl Store {
     /// Return live Agent projections independently of historical-row volume.
     pub fn list_nonterminal_agents(&self, limit: usize) -> Result<Vec<Agent>> {
         validate_limit(limit)?;
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT id, generation, name, project, harness, profile,
-                        profile_snapshot, native_scope, native_ref, workspace, effective,
-                        pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                        parent, root, depth, control
-                 FROM agents
-                 WHERE observe_only = 0 AND state IN ('created', 'starting', 'idle', 'busy', 'waiting')
-                 ORDER BY id LIMIT ?1",
-            )
-            .map_err(sql_error)?;
+        let sql = format!(
+            "{LIST_NONTERMINAL_AGENTS_COLUMNS} WHERE {NONTERMINAL_AGENTS_WHERE} ORDER BY id LIMIT ?1"
+        );
+        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
         let rows = statement
             .query_map([limit as i64], agent_record_from_row)
             .map_err(sql_error)?;
@@ -1120,13 +1111,69 @@ impl Store {
         Ok(agents)
     }
 
+    /// Total nonterminal Agents ignoring the drain list bound and the page
+    /// byte bound. Compare with the bounded list to mark truncation honestly
+    /// for any omission reason.
+    pub fn count_nonterminal_agents(&self) -> Result<i64> {
+        let sql = format!("SELECT COUNT(*) FROM agents WHERE {NONTERMINAL_AGENTS_WHERE}");
+        self.connection
+            .query_row(&sql, [], |row| row.get(0))
+            .map_err(sql_error)
+    }
+
+    /// Total unsettled commands ignoring the drain list bound and the page
+    /// byte bound. Compare with the bounded list to mark truncation honestly
+    /// for any omission reason.
+    pub fn count_unsettled_commands(&self) -> Result<i64> {
+        let sql = format!("SELECT COUNT(*) FROM commands WHERE {UNSETTLED_COMMANDS_WHERE}");
+        self.connection
+            .query_row(&sql, [], |row| row.get(0))
+            .map_err(sql_error)
+    }
+
+    /// Live custody snapshot from the Store source of truth: distinct process
+    /// owners with at least one non-exited (`running`/`unknown`) process
+    /// record, ordered by owner. Returns the bounded prefix and the total
+    /// distinct owner count; the caller reports truncation as
+    /// `owners.len() < total`, so no omission can read back as completeness.
+    /// A held workspace operation lock alone writes no process record and
+    /// never appears here; only observed live children do.
+    pub fn live_process_owners(&self, limit: usize) -> Result<(Vec<LiveProcessOwner>, usize)> {
+        validate_limit(limit)?;
+        let total: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM (SELECT DISTINCT owner FROM processes WHERE state IN ('running','unknown'))",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT owner FROM processes WHERE state IN ('running','unknown')
+                 ORDER BY owner LIMIT ?1",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([limit as i64], |row| row.get::<_, String>(0))
+            .map_err(sql_error)?;
+        let mut owners = Vec::new();
+        for row in rows {
+            if let Some(owner) = parse_live_process_owner(&row.map_err(sql_error)?) {
+                owners.push(owner);
+            }
+        }
+        Ok((owners, usize::try_from(total.max(0)).unwrap_or(0)))
+    }
+
     /// Return unsettled commands without letting terminal history consume the limit.
     pub fn list_unsettled_commands(&self, limit: usize) -> Result<Vec<Command>> {
         validate_limit(limit)?;
-        let mut statement = self
-            .connection
-            .prepare(LIST_UNSETTLED_COMMANDS_SQL)
-            .map_err(sql_error)?;
+        let sql = format!(
+            "{LIST_UNSETTLED_COMMANDS_COLUMNS} WHERE {UNSETTLED_COMMANDS_WHERE} ORDER BY created_at, rowid LIMIT ?1"
+        );
+        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
         let rows = statement
             .query_map([limit as i64], command_record_from_row)
             .map_err(sql_error)?;
@@ -3076,6 +3123,38 @@ impl AgentListFilter {
         }
         Ok(())
     }
+}
+
+/// One live custody owner: an Agent generation with at least one
+/// non-exited process record. `workspace` distinguishes live workspace
+/// children (`workspace:` owners) from controlled native children
+/// (`agent:` owners).
+pub struct LiveProcessOwner {
+    pub agent: String,
+    pub generation: i64,
+    pub workspace: bool,
+}
+
+/// Parse a stored process owner (`agent:<id>#<generation>` or
+/// `workspace:<id>#<generation>`). Anything else is a corrupt row the drain
+/// report must not fabricate custody from.
+fn parse_live_process_owner(owner: &str) -> Option<LiveProcessOwner> {
+    let (scope, rest) = owner.split_once(':')?;
+    let workspace = match scope {
+        "agent" => false,
+        "workspace" => true,
+        _ => return None,
+    };
+    let (agent, generation) = rest.rsplit_once('#')?;
+    let generation = generation.parse::<i64>().ok()?;
+    if agent.trim().is_empty() || generation < 0 {
+        return None;
+    }
+    Some(LiveProcessOwner {
+        agent: agent.to_owned(),
+        generation,
+        workspace,
+    })
 }
 
 /// One filtered, scope-checked fleet page: ordered summaries, the matching
