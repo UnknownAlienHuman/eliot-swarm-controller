@@ -418,6 +418,63 @@ pub struct ConfigModel {
 }
 
 // ---------------------------------------------------------------------------
+// Provider and model readback (adopted local backends)
+// ---------------------------------------------------------------------------
+
+/// `GET /api/provider/:providerID` subset for the adopted-backend check:
+/// the exact provider identity, the native package rendering the route, and
+/// the effective base URL. Unknown fields are ignored; a missing field
+/// reports unavailable, never a fabricated default.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderReadback {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub package: Option<String>,
+    #[serde(default)]
+    pub settings: Option<ProviderSettingsReadback>,
+}
+
+/// Effective provider settings subset. The API key value is never retained:
+/// only its presence is observed (`apiKey` decodes as ignored), so no
+/// resolved key can reach diagnostics, snapshots or logs.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSettingsReadback {
+    #[serde(default, rename = "baseURL")]
+    pub base_url: Option<String>,
+    #[serde(default, rename = "apiKey")]
+    pub api_key: Option<serde::de::IgnoredAny>,
+}
+
+/// `GET /api/model` item subset: one entry per effective model. The endpoint
+/// answers an array; the caller selects the exact API model id locally.
+/// Limits absent on the wire report unavailable, never zero.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeModelEntry {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default, rename = "providerID")]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<NativeModelLimit>,
+}
+
+/// Effective per-model limit subset (`limit.context/input/output`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeModelLimit {
+    #[serde(default)]
+    pub context: Option<i64>,
+    #[serde(default)]
+    pub input: Option<i64>,
+    #[serde(default)]
+    pub output: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
 // Error bodies
 // ---------------------------------------------------------------------------
 
@@ -849,6 +906,54 @@ mod tests {
         })
         .expect("switch agent encodes");
         assert_eq!(agent, serde_json::json!({"agent": "general"}));
+    }
+
+    #[test]
+    fn provider_readback_observes_presence_never_key_values() {
+        // An env-key provider observes the base URL and that a key is
+        // configured; the resolved key value never decodes into retention.
+        let provider: ProviderReadback = serde_json::from_value(serde_json::json!({
+            "id": "eliot-local",
+            "package": "@opencode/ai/providers/openai-compatible",
+            "settings": {"baseURL": "http://127.0.0.1:1234/v1", "apiKey": "{env:LOCAL_LLM_KEY}"},
+        }))
+        .expect("provider shape decodes");
+        assert_eq!(provider.id.as_deref(), Some("eliot-local"));
+        assert_eq!(
+            provider.package.as_deref(),
+            Some("@opencode/ai/providers/openai-compatible")
+        );
+        let settings = provider.settings.expect("settings");
+        assert_eq!(
+            settings.base_url.as_deref(),
+            Some("http://127.0.0.1:1234/v1")
+        );
+        assert!(settings.api_key.is_some(), "key presence observed");
+
+        // No-auth mode carries no apiKey key at all, not an empty string.
+        let provider: ProviderReadback = serde_json::from_value(serde_json::json!({
+            "id": "eliot-local",
+            "settings": {"baseURL": "http://127.0.0.1:8080/v1"},
+        }))
+        .expect("no-auth provider decodes");
+        let settings = provider.settings.expect("settings");
+        assert!(settings.api_key.is_none());
+
+        // Model entries decode with explicit limits; absent limits stay
+        // absent (unavailable), never zero.
+        let entry: NativeModelEntry = serde_json::from_value(serde_json::json!({
+            "id": "qwen3-8b", "providerID": "eliot-local",
+            "limit": {"context": 131072, "output": 8192},
+        }))
+        .expect("model entry decodes");
+        assert_eq!(entry.id.as_deref(), Some("qwen3-8b"));
+        let limit = entry.limit.expect("limit");
+        assert_eq!(limit.context, Some(131072));
+        assert_eq!(limit.output, Some(8192));
+        assert_eq!(limit.input, None);
+        let bare: NativeModelEntry =
+            serde_json::from_value(serde_json::json!({"id": "m"})).expect("sparse entry decodes");
+        assert!(bare.limit.is_none());
     }
 
     #[test]

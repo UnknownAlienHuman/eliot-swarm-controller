@@ -56,6 +56,7 @@ pub use routing::{
 pub use secrets::SecretPolicy;
 pub use source_handoff::{SourceHandoff, SourceHandoffAck, SourceHandoffGap};
 
+use crate::api::AgentConfigView;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt::{self, Display, Formatter};
@@ -390,6 +391,12 @@ pub struct Agent {
     pub profile: String,
     #[serde(default = "empty_object")]
     pub profile_snapshot: Value,
+    /// Whether the launch froze the parent's snapshot verbatim: true only
+    /// for an Agent child that reused its own parent's snapshot at launch
+    /// freeze. An Owner launch that resolves the same profile is not
+    /// inherited, and a child on an allowed different profile is neither.
+    #[serde(default)]
+    pub profile_inherited: bool,
     #[serde(default)]
     pub native_scope: Option<String>,
     #[serde(default)]
@@ -439,6 +446,7 @@ impl Agent {
             harness: harness.into(),
             profile: profile.into(),
             profile_snapshot: empty_object(),
+            profile_inherited: false,
             native_scope: None,
             native_ref: None,
             workspace: None,
@@ -526,6 +534,20 @@ pub struct Command {
     pub updated_at: i64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub probe: bool,
+    /// Configuration revision the command was admitted or dispatched under:
+    /// 0 runs under the frozen profile snapshot, otherwise the exact
+    /// `agent_config` revision for its retained generation. Trailing field;
+    /// absent on old wire payloads.
+    #[serde(default)]
+    pub config_revision: i64,
+    /// Retained configuration the command was admitted or dispatched under,
+    /// resolved from its exact retained generation and revision: the
+    /// requested and effective model/effort, the revision, the provenance,
+    /// and the profile name. `None` when the command runs under the frozen
+    /// snapshot or carries no native configuration. Trailing field; absent
+    /// on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<AgentConfigView>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -695,6 +717,13 @@ pub struct Turn {
     /// turn request carried. Trailing field; absent on old wire payloads.
     #[serde(default)]
     pub config_revision: i64,
+    /// Retained configuration the turn ran under, resolved from its exact
+    /// retained generation and revision: the requested and effective
+    /// model/effort, the revision, the provenance, and the profile name.
+    /// `None` when the turn ran under the frozen snapshot. Trailing field;
+    /// absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<AgentConfigView>,
 }
 
 /// Native token usage attributed to one terminal turn. Every member is
@@ -1046,6 +1075,17 @@ impl Error {
     /// A bounded, schema-owned field path and expectation; never a rejected value.
     pub fn invalid_field(field: impl Into<String>, expected: impl Into<String>) -> Self {
         Self::new("invalid", "invalid parameters").with_field(field, expected)
+    }
+
+    /// Mutation-id format rejection shared by Store admission and the Router
+    /// `goal.round` pre-check. It names `params.id` with the ULID format and
+    /// the MCP omission rule, so a fresh agent learns the retry contract
+    /// instead of hand-minting ids.
+    pub fn invalid_mutation_id() -> Self {
+        Self::new("invalid", "mutation id must be a ULID").with_field(
+            "params.id",
+            "ULID (26 uppercase Crockford base32 characters); omit id on MCP and the server mints one, or mint a fresh ULID for a new write",
+        )
     }
 
     pub fn with_field(mut self, field: impl Into<String>, expected: impl Into<String>) -> Self {

@@ -424,6 +424,16 @@ struct ProfileEntry {
     setup: Vec<crate::setup::SetupEntry>,
     #[serde(default = "default_scratch")]
     scratch: Vec<String>,
+    #[serde(default)]
+    provider_base_url: Option<String>,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    context_limit: Option<i64>,
+    #[serde(default)]
+    output_limit: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -1080,6 +1090,20 @@ fn snapshot_from_entry(
             "unsupported",
         ));
     }
+    // Adopted local backends are an OpenCode-only path (Codex against
+    // these backends stays unsupported until readiness, catalog/context,
+    // history and exact tool formats are resolved separately). Any local
+    // field on another harness is rejected, never silently frozen.
+    if harness != "opencode" && has_local_backend_fields(entry) {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "provider_base_url",
+            "adopted local backends have no mapping on this harness",
+            "unsupported",
+        ));
+    }
     if harness == "muse" {
         return muse_snapshot_from_entry(name, entry, table_offset, source);
     }
@@ -1522,9 +1546,9 @@ fn muse_snapshot_from_entry(
 /// required explicit native `cmd` (no PATH default: a resolved wrapper would
 /// orphan the real CLI on stop), the CLI permission modes mapped from
 /// `approval`, and approve/deny replies through the stdio permission
-/// callback. Reasoning effort, collaboration presets, non-default
-/// permissions, and a non-`never` Eliot-side `approval_policy` stay rejected
-/// until their mappings land.
+/// callback, and the CLI `--effort` level (low, medium, high, xhigh, max).
+/// Collaboration presets, non-default permissions, and a non-`never`
+/// Eliot-side `approval_policy` stay rejected until their mappings land.
 fn claude_snapshot_from_entry(
     name: &str,
     entry: &ProfileEntry,
@@ -1547,20 +1571,22 @@ fn claude_snapshot_from_entry(
             )
         })?;
     validate_model(name, model, source, table_offset)?;
-    if entry
-        .effort
-        .as_deref()
-        .is_some_and(|effort| !effort.trim().is_empty())
-    {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "effort",
-            "the Claude slice has no reasoning-effort mapping",
-            "unsupported",
-        ));
-    }
+    // Claude Code 2.1.278 `--effort <level>`: the CLI's closed vocabulary.
+    // Absent effort keeps the CLI default; no value is fabricated.
+    let effort = match entry.effort.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(level @ ("low" | "medium" | "high" | "xhigh" | "max")) => Some(level.to_owned()),
+        Some(_) => {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                "effort",
+                "unknown Claude effort level (low, medium, high, xhigh, or max)",
+                "profile_error",
+            ));
+        }
+    };
     let permission_mode = match entry.approval.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(mode) => match mode {
@@ -1701,6 +1727,9 @@ fn claude_snapshot_from_entry(
     if let Some(mode) = permission_mode {
         snapshot.insert("permission_mode".to_owned(), Value::String(mode));
     }
+    if let Some(effort) = effort {
+        snapshot.insert("effort".to_owned(), Value::String(effort));
+    }
     freeze_mcp_policy(
         &mut snapshot,
         name,
@@ -1728,6 +1757,277 @@ fn claude_snapshot_from_entry(
     Ok(Value::Object(snapshot))
 }
 
+/// Dedicated OpenCode provider ID for adopted local backends. The frozen
+/// model on a local profile must use this provider segment
+/// (`eliot-local/<api-model-id>`); it has no canonical alias, so a local
+/// profile never imports an unrelated canonical credential and project
+/// overrides cannot silently retarget the route to another provider.
+const OPENCODE_LOCAL_PROVIDER_ID: &str = "eliot-local";
+
+/// Expected native package rendering the adopted OpenAI-compatible route.
+/// Pinned by the issue's source review of OpenCode 2.0.32
+/// (`packages/ai/src/providers/openai-compatible`).
+const OPENCODE_LOCAL_PROVIDER_PACKAGE: &str = "@opencode/ai/providers/openai-compatible";
+
+/// Canonical adopted-backend kinds through the single OpenCode provider
+/// path. These are presets and metadata mappings, not separate Agent
+/// executors: Ollama and vLLM reuse the same OpenAI-compatible route.
+fn normalize_local_backend(raw: &str) -> Option<&'static str> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "strata" => Some("strata"),
+        "unsloth" | "unsloth-studio" => Some("unsloth"),
+        "lmstudio" | "lm-studio" => Some("lmstudio"),
+        "llama.cpp" | "llama-cpp" | "llama_cpp" => Some("llama.cpp"),
+        "ollama" => Some("ollama"),
+        "vllm" => Some("vllm"),
+        "generic" => Some("generic"),
+        _ => None,
+    }
+}
+
+fn has_local_backend_fields(entry: &ProfileEntry) -> bool {
+    entry.provider_base_url.is_some()
+        || entry.api_key_env.is_some()
+        || entry.backend.is_some()
+        || entry.context_limit.is_some()
+        || entry.output_limit.is_some()
+}
+
+fn validate_provider_base_url(
+    name: &str,
+    raw: &str,
+    source: &str,
+    offset: usize,
+) -> core::Result<String> {
+    let url = raw.trim();
+    if url.is_empty() || url.len() > 2048 || url.chars().any(char::is_control) {
+        return Err(profile_field_error(
+            source,
+            offset,
+            name,
+            "provider_base_url",
+            "must be a non-empty http(s) URL of at most 2048 characters",
+            "profile_error",
+        ));
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|_| {
+        profile_field_error(
+            source,
+            offset,
+            name,
+            "provider_base_url",
+            "must be an absolute http(s) endpoint URL without credentials",
+            "profile_error",
+        )
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none_or(|host| host.is_empty())
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || url.split("://").nth(1).is_some_and(|rest| {
+            rest.split(['/', '?', '#'])
+                .next()
+                .is_some_and(|authority| authority.contains('@'))
+        })
+    {
+        return Err(profile_field_error(
+            source,
+            offset,
+            name,
+            "provider_base_url",
+            "must be an absolute http(s) endpoint URL without credentials",
+            "profile_error",
+        ));
+    }
+    Ok(url.to_owned())
+}
+
+fn validate_local_limit(
+    name: &str,
+    field: &str,
+    value: i64,
+    source: &str,
+    offset: usize,
+) -> core::Result<i64> {
+    if value <= 0 || value > 100_000_000 {
+        return Err(profile_field_error(
+            source,
+            offset,
+            name,
+            field,
+            "must be a positive token count of at most 100000000",
+            "profile_error",
+        ));
+    }
+    Ok(value)
+}
+
+/// Freeze the adopted local backend tail of an OpenCode profile. The model
+/// must use the dedicated local provider segment, the endpoint/backend/
+/// limits must all be explicit, `auth_integration` must be absent (no
+/// canonical credential is imported on this path), and an optional
+/// `api_key_env` must name an entry of the frozen `pass_env` allowlist
+/// (absent means explicit no-auth mode; a missing or empty required key is
+/// rejected before startup by the plugin, never silently downgraded).
+#[allow(clippy::too_many_arguments)]
+fn freeze_local_backend(
+    snapshot: &mut serde_json::Map<String, Value>,
+    name: &str,
+    entry: &ProfileEntry,
+    tail: &ProfileTail,
+    table_offset: usize,
+    source: &str,
+) -> core::Result<()> {
+    let model = entry
+        .model
+        .as_deref()
+        .expect("OpenCode model validated before local freeze");
+    let (provider, _) = split_provider_model(model).ok_or_else(|| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "model",
+            "must be provider/model with non-empty slash segments and no variant suffix",
+            "profile_error",
+        )
+    })?;
+    if provider != OPENCODE_LOCAL_PROVIDER_ID {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "model",
+            "an adopted local backend profile must use the dedicated eliot-local provider segment",
+            "profile_error",
+        ));
+    }
+    if entry.auth_integration.is_some() {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "auth_integration",
+            "an adopted local backend profile must not name a canonical auth_integration",
+            "profile_error",
+        ));
+    }
+    let base_url = entry.provider_base_url.as_deref().ok_or_else(|| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "provider_base_url",
+            "an adopted local backend profile requires an explicit provider_base_url",
+            "profile_error",
+        )
+    })?;
+    let base_url = validate_provider_base_url(name, base_url, source, table_offset)?;
+    let backend = entry.backend.as_deref().ok_or_else(|| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "backend",
+            "an adopted local backend profile requires an explicit backend kind",
+            "profile_error",
+        )
+    })?;
+    let backend = normalize_local_backend(backend).ok_or_else(|| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "backend",
+            "must be strata, unsloth, lmstudio, llama.cpp, ollama, vllm or generic",
+            "profile_error",
+        )
+    })?;
+    let context_limit = entry.context_limit.ok_or_else(|| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "context_limit",
+            "an adopted local backend profile requires an explicit context_limit",
+            "profile_error",
+        )
+    })?;
+    let output_limit = entry.output_limit.ok_or_else(|| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "output_limit",
+            "an adopted local backend profile requires an explicit output_limit",
+            "profile_error",
+        )
+    })?;
+    let context_limit =
+        validate_local_limit(name, "context_limit", context_limit, source, table_offset)?;
+    let output_limit =
+        validate_local_limit(name, "output_limit", output_limit, source, table_offset)?;
+    if let Some(raw) = entry.api_key_env.as_deref() {
+        let names = validate_pass_env(name, &[raw.to_owned()], source, table_offset)?;
+        let key = names.into_iter().next().ok_or_else(|| {
+            profile_field_error(
+                source,
+                table_offset,
+                name,
+                "api_key_env",
+                "invalid API key environment name",
+                "profile_error",
+            )
+        })?;
+        if native_store_selector(&key).is_some() {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                "api_key_env",
+                "API key cannot use a native store selector",
+                "profile_error",
+            ));
+        }
+        let allowed = tail.pass_env.iter().any(|allowed| {
+            if cfg!(windows) {
+                allowed.eq_ignore_ascii_case(&key)
+            } else {
+                allowed == &key
+            }
+        });
+        if !allowed {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                "api_key_env",
+                "api_key_env must be explicitly allowed by profile pass_env",
+                "profile_error",
+            ));
+        }
+        snapshot.insert("api_key_env".to_owned(), Value::String(key));
+    }
+    snapshot.insert("provider_base_url".to_owned(), Value::String(base_url));
+    snapshot.insert("backend".to_owned(), Value::String(backend.to_owned()));
+    snapshot.insert(
+        "context_limit".to_owned(),
+        Value::Number(context_limit.into()),
+    );
+    snapshot.insert(
+        "output_limit".to_owned(),
+        Value::Number(output_limit.into()),
+    );
+    snapshot.insert(
+        "provider_package".to_owned(),
+        Value::String(OPENCODE_LOCAL_PROVIDER_PACKAGE.to_owned()),
+    );
+    Ok(())
+}
+
 /// Freeze an OpenCode profile. The L6.2 PR1 slice carries an explicit model
 /// id in the installed `provider/model` form (split at the first slash) and a required explicit
 /// native `cmd` (the Muse treatment: stop and process registration address
@@ -1737,6 +2037,13 @@ fn claude_snapshot_from_entry(
 /// requires it at admission. Effort, approval, collaboration, permission and
 /// approval-policy presets have no OpenCode mapping and stay rejected until
 /// one lands.
+///
+/// An adopted local backend profile instead pins `provider_base_url`,
+/// `backend`, `context_limit` and `output_limit` with an optional
+/// `api_key_env` reference (absent means explicit no-auth mode). The model
+/// must use the dedicated `eliot-local` provider segment, and
+/// `auth_integration` must be absent so no unrelated canonical credential
+/// is imported. Key values stay runtime-only; only the env name is frozen.
 fn opencode_snapshot_from_entry(
     name: &str,
     entry: &ProfileEntry,
@@ -1824,7 +2131,9 @@ fn opencode_snapshot_from_entry(
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("opencode".to_owned()));
     snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
-    if let Some(selector) = entry.auth_integration.as_deref() {
+    if has_local_backend_fields(entry) {
+        freeze_local_backend(&mut snapshot, name, entry, &tail, table_offset, source)?;
+    } else if let Some(selector) = entry.auth_integration.as_deref() {
         snapshot.insert(
             "auth_integration".to_owned(),
             Value::String(selector.trim().to_owned()),
@@ -3837,7 +4146,15 @@ permissions = "workspace-write"
         assert_eq!(snapshot["permissions"], "workspace-write");
         assert_eq!(snapshot["approval_policy"], "never");
         assert!(snapshot.get("permission_mode").is_none());
+        assert!(snapshot.get("effort").is_none());
         assert_eq!(snapshot["pass_env"], json!(["EXAMPLE_API_KEY"]));
+
+        // The CLI `--effort` vocabulary freezes verbatim under `effort`.
+        let source = format!(
+            "[profiles.claude]\nharness = \"claude\"\ncmd = '{cmd}'\nmodel = \"claude-opus-4-6\"\neffort = \"xhigh\"\n"
+        );
+        let snapshot = resolve_text_profile(&source, "claude").unwrap();
+        assert_eq!(snapshot["effort"], "xhigh");
 
         // The approval vocabulary is the CLI permission-mode vocabulary and
         // freezes under the CLI-exact key. Both cases use the platform-native
@@ -3856,7 +4173,7 @@ permissions = "workspace-write"
 
         for source in [
             "[profiles.claude]\nharness='claude'\n",
-            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\neffort='high'\n",
+            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\neffort='extreme'\n",
             "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncollaboration_mode='plan'\n",
             "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\npermissions='read-only'\n",
             "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\napproval_policy='on-request'\n",
@@ -4028,6 +4345,157 @@ pass_env = ["OPENAI_API_KEY"]
                 "profile_error",
                 "{model:?}"
             );
+        }
+    }
+
+    #[test]
+    fn opencode_local_backend_freezes_explicit_provider_and_limits() {
+        let source = r#"
+[profiles.local]
+harness = "opencode"
+cmd = "C:/Tools/OpenCode/opencode.exe"
+model = "eliot-local/qwen3-8b"
+provider_base_url = "http://127.0.0.1:1234/v1"
+backend = "lmstudio"
+context_limit = 131072
+output_limit = 8192
+"#;
+        let snapshot = resolve_text_profile(source, "local").unwrap();
+        assert_eq!(snapshot["harness"], "opencode");
+        assert_eq!(snapshot["model"], "eliot-local/qwen3-8b");
+        assert_eq!(snapshot["provider_base_url"], "http://127.0.0.1:1234/v1");
+        assert_eq!(snapshot["backend"], "lmstudio");
+        assert_eq!(snapshot["context_limit"], 131072);
+        assert_eq!(snapshot["output_limit"], 8192);
+        assert_eq!(
+            snapshot["provider_package"],
+            "@opencode/ai/providers/openai-compatible"
+        );
+        assert!(snapshot.get("auth_integration").is_none());
+        assert!(snapshot.get("api_key_env").is_none());
+
+        // Env-key mode freezes only the name; the value stays runtime-only.
+        let source = r#"
+[profiles.local]
+harness = "opencode"
+cmd = "C:/Tools/OpenCode/opencode.exe"
+model = "eliot-local/mistral-7b"
+provider_base_url = "http://127.0.0.1:8080/v1"
+backend = "llama.cpp"
+api_key_env = "LOCAL_LLM_KEY"
+pass_env = ["LOCAL_LLM_KEY"]
+context_limit = 65536
+output_limit = 4096
+"#;
+        let snapshot = resolve_text_profile(source, "local").unwrap();
+        assert_eq!(snapshot["api_key_env"], "LOCAL_LLM_KEY");
+        assert_eq!(snapshot["pass_env"], json!(["LOCAL_LLM_KEY"]));
+        assert!(snapshot.get("auth_integration").is_none());
+
+        // Backend aliases normalize to the canonical preset kind.
+        for (raw, canonical) in [
+            ("llama-cpp", "llama.cpp"),
+            ("LM-Studio", "lmstudio"),
+            ("Unsloth-Studio", "unsloth"),
+        ] {
+            let source = format!(
+                "[profiles.local]\nharness='opencode'\nmodel='eliot-local/m'\n\
+                 cmd='C:/Tools/OpenCode/opencode.exe'\nprovider_base_url='http://127.0.0.1:8080'\n\
+                 backend='{raw}'\ncontext_limit=32768\noutput_limit=4096\n"
+            );
+            let snapshot = resolve_text_profile(&source, "local").unwrap();
+            assert_eq!(snapshot["backend"], canonical, "{raw}");
+        }
+    }
+
+    #[test]
+    fn opencode_local_backend_rejects_mixed_or_partial_profiles() {
+        let base = "[profiles.local]\nharness='opencode'\nmodel='eliot-local/m'\n\
+            cmd='C:/Tools/OpenCode/opencode.exe'\nprovider_base_url='http://127.0.0.1:8080'\n\
+            backend='llama.cpp'\ncontext_limit=32768\noutput_limit=4096\n";
+        // A canonical credential must never ride the local path.
+        let error =
+            resolve_text_profile(&format!("{base}auth_integration='openrouter'\n"), "local")
+                .expect_err("local plus canonical auth must fail");
+        assert_eq!(error.code, "profile_error");
+        // A non-local provider segment cannot carry local fields.
+        let error = resolve_text_profile(
+            &base.replace("model='eliot-local/m'", "model='openrouter/m'"),
+            "local",
+        )
+        .expect_err("non-local provider must fail");
+        assert_eq!(error.code, "profile_error");
+        // Unknown backend kinds are not frozen.
+        let error = resolve_text_profile(
+            &base.replace("backend='llama.cpp'", "backend='unknown-rt'"),
+            "local",
+        )
+        .expect_err("unknown backend must fail");
+        assert_eq!(error.code, "profile_error");
+        // Partial local profiles fail closed instead of falling back.
+        for source in [
+            base.replace("provider_base_url='http://127.0.0.1:8080'\n", ""),
+            base.replace("backend='llama.cpp'\n", ""),
+            base.replace("context_limit=32768\n", ""),
+            base.replace("output_limit=4096\n", ""),
+            "[profiles.local]\nharness='opencode'\nmodel='eliot-local/m'\n\
+             cmd='C:/Tools/OpenCode/opencode.exe'\nbackend='ollama'\n\
+             context_limit=32768\noutput_limit=4096\n"
+                .to_string(),
+        ] {
+            let error =
+                resolve_text_profile(&source, "local").expect_err("partial local must fail");
+            assert_eq!(error.code, "profile_error", "{source}");
+        }
+        // The key reference must be an allowed pass_env name, never a
+        // native-store selector, and bad endpoints/limits fail.
+        for (source, fragment) in [
+            (format!("{base}api_key_env='MISSING_KEY'\n"), "pass_env"),
+            (
+                format!("{base}api_key_env='CODEX_HOME'\npass_env=['CODEX_HOME']\n"),
+                "native store",
+            ),
+            (
+                base.replace(
+                    "provider_base_url='http://127.0.0.1:8080'",
+                    "provider_base_url='ftp://127.0.0.1:8080'",
+                ),
+                "provider_base_url",
+            ),
+            (
+                base.replace("context_limit=32768", "context_limit=0"),
+                "context_limit",
+            ),
+            (
+                base.replace("output_limit=4096", "output_limit=-1"),
+                "output_limit",
+            ),
+        ] {
+            let error = resolve_text_profile(&source, "local").expect_err("must reject");
+            assert!(
+                error.message.contains(fragment),
+                "{fragment} missing in {}",
+                error.message
+            );
+        }
+        // Local fields have no mapping on other harnesses, including Codex:
+        // Codex against these backends stays unsupported.
+        for (profile, source) in [
+            (
+                "c",
+                "[profiles.c]\nharness='codex'\nmodel='gpt-6-luna'\nprovider_base_url='http://127.0.0.1:8080'\n",
+            ),
+            (
+                "m",
+                "[profiles.m]\nharness='muse'\nmodel='m'\ncmd='C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe'\nbackend='ollama'\n",
+            ),
+            (
+                "c",
+                "[profiles.c]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='C:/Tools/Claude/claude.exe'\ncontext_limit=32768\n",
+            ),
+        ] {
+            let error = resolve_text_profile(source, profile).expect_err("must reject");
+            assert_eq!(error.code, "unsupported", "{source}");
         }
     }
 

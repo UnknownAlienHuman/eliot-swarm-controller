@@ -84,11 +84,15 @@ fail with `not_allowed`. Each tool call still uses the existing local client and
 which validates the Agent credential and current generation. `--require-agent --http` is a
 usage error; ordinary Owner MCP stdio and StreamableHTTP behavior are unchanged.
 
-The caller supplies and retains the mutation ULID in `params` before a write. A retry
-must carry the same id, principal, method and semantic payload; a different binding is
-`id_conflict`, and an expired id is `id_expired`. Unknown outcomes keep the existing exact
-readback/resolution contract. The server does not mint or rewrite ids, automatically
-retry uncertain calls, or treat cancellation as rollback.
+A mutation call may omit `params.id`: the MCP server mints one fresh ULID for that
+call, forwards it, and returns it as top-level `id` in the tool result, so the caller
+retains it for exact retry. An explicit id is forwarded untouched and still validated
+by the daemon. A retry must carry the same id, principal, method and semantic payload;
+a different binding is `id_conflict`, and an expired id is `id_expired`. Unknown outcomes
+keep the existing exact readback/resolution contract. The server never automatically
+retries uncertain calls and never treats cancellation as rollback. Id admission errors
+(`invalid` shape, `id_expired`, future-skew `invalid`) name `params.id` with the ULID
+format and the retry window, matching the DTO field errors.
 
 The stdio transport MUST bound each frame to [`MAX_RPC_FRAME_BYTES`](../../crates/eliot-daemon/src/daemon.rs)
 (4 MiB) using [`BoundedLineWriter`](../../crates/eliot/src/mcp/bounded_io.rs). Forwarded RPC data and list/history
@@ -172,7 +176,9 @@ implements it.
 
 ## Mutation ids
 
-External writes carry a ULID generated/printed before send. Bind it to principal,
+External writes carry a ULID generated/printed before send, except that MCP callers
+may omit `params.id` and the MCP server mints and returns one per the
+[MCP stdio server](#mcp-stdio-server) contract. Bind the id to principal,
 method and canonical semantic payload. Exclude JSON-RPC id, output format, paging and
 wait timeout. Same binding returns the retained result; different binding is
 `id_conflict`; absent expired id is `id_expired`. A ULID more than the allowed
@@ -265,7 +271,8 @@ the summary, example, mutation rules, scope/capability limits and CLI aliases. C
 are not RPC names. Every registered Router method has a descriptor. Help is capped at
 256 KiB; it never includes credentials or another principal's identity. Examples naming
 existing resources require actual retained IDs/profile/source/view; new writes require
-a fresh caller-retained mutation ULID rather than reusing the illustrative example ID.
+a fresh caller-retained mutation ULID rather than reusing the illustrative example ID,
+or omit `id` on MCP so the server mints one.
 
 `api.identity` returns the authenticated principal kind, Agent id/generation when present,
 and its allowed scope patterns. An Agent's variable scope defaults to its actual project;
@@ -507,20 +514,42 @@ change needs a new native session and returns `unsupported`
 per-turn mechanism (Claude, OpenCode, Antigravity). The Router stores the
 overlay after dispatch, then settles `applied` with the requested and
 effective values, the monotonically increasing `config_revision` for the
-generation, and `application:\"next_turn\"`. Each send keeps the revision
-current at its own dispatch, each turn records the revision it ran under, and
-the first overlay turn's readback repeats the effective values; a send
-committed before an overlay never runs under newer configuration. The lane is
-ordered by shared admission order: a configure does not apply while an
-earlier-admitted send is still queued or undispatched, an earlier queued send
-passes a later configure, and a later input waits for an earlier configure.
-When the native turn request carries a resolved effort the overlay left absent
-(for example a model-only configure on a profile with omitted effort), the
-turn association records it on the overlay, so the turn and the generation
-readback show the effort actually sent; the requested values stay exactly what
-the owner asked. Retention keeps every command a retained overlay references:
-pruning never deletes a command named by `agent_config`, so configuration
-provenance survives expiry.
+generation, `application:\"next_turn\"`, and provenance `\"configure\"`.
+Each admitted native command (`launch`, `resume`, `send`) records the
+configuration it runs under as the retained profile-snapshot identity plus
+its stamped `config_revision`; each turn records the revision it ran under.
+`command.get` and `command.children` return the command's retained
+`config_revision` plus its `config` view (requested and effective
+model/effort, revision, provenance, profile name), and `turn.get` and
+`agent.result` return the same view for each turn: the view resolves from
+the command's or turn's exact retained generation and revision, never from
+the current overlay or the live file. `launch` without an overlay stays at
+0 with no view, `send` freezes the revision current at its own dispatch,
+and `resume` carries its inherited revision. A send committed before an
+overlay never runs under newer configuration, and a config-file reload
+never rewrites a retained generation, a pending command, or an
+unknown-outcome resolution: after revision 2 applies, a retained
+revision-1 turn still reads back revision 1's configuration. Readback
+validators reject a negative `config_revision` and a `config` view whose
+revision does not match the stamped revision. A `resume` explicitly inherits
+the previous generation's latest overlay as its new generation's revision 1
+with provenance `\"inherited_from\"` (the frozen snapshot is unchanged;
+generations without an overlay start at 0). The lane is ordered by shared admission order: a
+configure does not apply while an earlier-admitted send is still queued or
+undispatched, an earlier queued send passes a later configure, and a later
+input waits for an earlier configure. When the native turn request carries a
+resolved effort the overlay left absent (for example a model-only configure on
+a profile with omitted effort), the turn association records it on the
+overlay, so the turn and the generation readback show the effort actually
+sent; the requested values stay exactly what the owner asked. Retention keeps
+every command a retained overlay references, including inherited revisions
+and their source configures: pruning never deletes a command named by
+`agent_config`, so configuration provenance survives expiry. `agent.get`
+distinguishes the original request (profile name and requested overrides,
+plus the launch-time `profile_inherited` decision: true only for an Agent
+child that reused its own parent's snapshot verbatim, never for an Owner
+launch that resolves the same profile) from the resolved configuration
+(effective values, provenance, and revision).
 
 Resolve the target and validate principal/capability/state before persisting the command
 binding and events. Each verb checks `expected_generation` at its defined admission or
@@ -919,6 +948,13 @@ All native control verbs reject observe-only targets, including an owner-issued
 targeted stop; only a tree `stop` expansion skips them and reports them as skipped.
 `mode:"control"` is unsupported. The vendor plugin method is `agent.attach`; it is not
 a second public mutation method.
+
+A reader may return a bound `failed` attach result only when preparation refused before
+native startup or Codex reported `native_start_failed` under its proven no-effect startup
+contract. The Router verifies the exact Agent generation, command, and native subject, and
+accepts `failed` only after the owned reader is confirmed closed. Same-command retries replay
+the retained failure; a changed binding conflicts. An uncertain startup or cleanup remains
+`unknown`.
 
 `agent.history` is a separate owner-only read. `source` is required and must be
 `native` or `rollout`; `view` is required and must be `subject`, `turns` or `items`.

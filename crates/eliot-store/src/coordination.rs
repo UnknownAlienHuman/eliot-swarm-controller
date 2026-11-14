@@ -1752,7 +1752,7 @@ mod tests {
             })
             .expect("read Store migration version");
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 35);
+        assert_eq!(version, 37);
         for table in ["messages", "vars", "mail_notices", "claims"] {
             let found: i64 = store
                 .connection
@@ -2486,6 +2486,51 @@ mod tests {
             .mail_send("owner", &edge, MailLimits::default(), now)
             .expect("skew-boundary send admits");
         assert_eq!(unread(&store, &a), 1);
+    }
+
+    #[test]
+    fn mutation_id_errors_name_params_id_with_format_and_window() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", now);
+        let principal = agent_principal(&a);
+        // A hand-minted (non-ULID) id fails with the field, the ULID format
+        // and the MCP omission rule, so a fresh caller learns the contract.
+        let mut bad = send_request(vec![a.clone()], "bad id");
+        bad.id = "hand-minted".to_owned();
+        let error = store
+            .mail_send("owner", &bad, MailLimits::default(), now)
+            .unwrap_err();
+        assert_eq!(error.code, "invalid");
+        let details = error.details.expect("id format error names its field");
+        assert_eq!(details.field, "params.id");
+        assert!(details.expected.contains("ULID"));
+        assert!(details.expected.contains("omit id on MCP"));
+        // An id older than the retry window reads expired on the same field.
+        let mut stale = send_request(vec![a.clone()], "stale");
+        stale.id = ulid_at(now - DAY_MS - 1, 7);
+        let error = store
+            .mail_send("owner", &stale, MailLimits::default(), now)
+            .unwrap_err();
+        assert_eq!(error.code, "id_expired");
+        let details = error.details.expect("id expiry names its field");
+        assert_eq!(details.field, "params.id");
+        assert!(details.expected.contains("24 hours"));
+        // The same fielded contract holds on var.set.
+        let var = VarSetRequest {
+            id: "hand-minted".to_owned(),
+            scope: Some("project:app".to_owned()),
+            key: "k".to_owned(),
+            value: json!(1),
+            expect_version: None,
+            note: None,
+        };
+        let error = store.var_set(&principal, &var, now).unwrap_err();
+        assert_eq!(error.code, "invalid");
+        assert_eq!(
+            error.details.expect("var id error names its field").field,
+            "params.id"
+        );
     }
 
     #[test]

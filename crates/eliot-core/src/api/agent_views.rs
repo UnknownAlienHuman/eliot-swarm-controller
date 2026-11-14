@@ -38,18 +38,10 @@ impl AgentGetRequest {
                 .session_usage
                 .as_ref()
                 .is_some_and(|usage| usage.validate().is_err())
-            || reply.config.as_ref().is_some_and(|config| {
-                config.revision < 1
-                    || config.application != "next_turn"
-                    || config
-                        .requested_model
-                        .as_ref()
-                        .is_some_and(|value| value.trim().is_empty())
-                    || config
-                        .requested_effort
-                        .as_ref()
-                        .is_some_and(|value| value.trim().is_empty())
-            })
+            || reply
+                .config
+                .as_ref()
+                .is_some_and(|config| config.validate().is_err())
             || reply.source_states.iter().any(|source| {
                 source.agent_id != self.id
                     || source.generation < 0
@@ -648,7 +640,15 @@ pub struct AgentGetResponse {
 /// Retained model/effort overlay readback for one Agent generation. The
 /// original profile snapshot is never rewritten: `original_model` and
 /// `original_effort` repeat the frozen values while `model`/`effort` carry
-/// the effective values the next native turn request uses.
+/// the effective values the next native turn request uses. `profile` is the
+/// retained requested profile name, `profile_inherited` reports whether the
+/// Agent's snapshot was inherited from its parent launch, and `provenance`
+/// is `configure` for a directly configured overlay or `inherited_from` for
+/// a `resume` generation that explicitly inherited the previous generation.
+///
+/// The same view rides command and turn readbacks for their exact retained
+/// generation and revision, so a retained turn still reads back the
+/// configuration it ran under after later revisions apply.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentConfigView {
     /// Monotonically increasing revision within the Agent generation; 0 is
@@ -657,6 +657,12 @@ pub struct AgentConfigView {
     /// Where the change applies: `next_turn`. A change needing a new
     /// native session is refused as `unsupported`, never stored.
     pub application: String,
+    /// How this revision arose: `configure` or `inherited_from`.
+    pub provenance: String,
+    /// Retained requested profile name (the original launch request).
+    pub profile: String,
+    /// Whether the Agent snapshot was inherited from a parent launch.
+    pub profile_inherited: bool,
     /// Exactly what the owner requested (each `None` when not requested).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_model: Option<String>,
@@ -673,6 +679,31 @@ pub struct AgentConfigView {
     pub original_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_effort: Option<String>,
+}
+
+impl AgentConfigView {
+    /// Pure reply-shape check shared by the Agent, command and turn
+    /// readbacks: a stored revision is always positive, the application
+    /// point is `next_turn`, the provenance is one of the two retained
+    /// origins, and the profile and requested values are nonblank.
+    pub fn validate(&self) -> Result<()> {
+        if self.revision < 1
+            || self.application != "next_turn"
+            || !matches!(self.provenance.as_str(), "configure" | "inherited_from")
+            || self.profile.trim().is_empty()
+            || self
+                .requested_model
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty())
+            || self
+                .requested_effort
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]

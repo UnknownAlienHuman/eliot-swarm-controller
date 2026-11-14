@@ -144,12 +144,7 @@ impl ObserverSession {
         metadata_secrets: Vec<String>,
         deadline: Instant,
     ) -> Result<(Self, Value)> {
-        validate_attach(&params, &secrets)?;
-        if encoded_len(&params.profile)? > MAX_PROFILE_BYTES
-            || encoded_len(&params.target_environment)? > MAX_PROFILE_BYTES
-        {
-            return Err(too_large());
-        }
+        validate_attach_preparation(&params, &secrets)?;
 
         let store = probe_store(
             &launch,
@@ -1089,7 +1084,7 @@ impl ObserverSession {
     }
 }
 
-fn validate_attach(params: &ObserverAttachParams, secrets: &[String]) -> Result<()> {
+pub(crate) fn validate_attach_binding(params: &ObserverAttachParams) -> Result<()> {
     if params.mode != "observe"
         || !params.profile.is_object()
         || !params.target_environment.is_object()
@@ -1104,9 +1099,42 @@ fn validate_attach(params: &ObserverAttachParams, secrets: &[String]) -> Result<
         params.native_ref.as_str(),
     ] {
         validate_id(value)?;
-        reject_immutable_secret(value, secrets)?;
     }
     Ok(())
+}
+
+pub(crate) fn validate_attach_preparation(
+    params: &ObserverAttachParams,
+    secrets: &[String],
+) -> Result<()> {
+    validate_attach_binding(params)?;
+    for value in [
+        params.agent_id.as_str(),
+        params.command_id.as_str(),
+        params.native_scope.as_str(),
+        params.native_ref.as_str(),
+    ] {
+        reject_immutable_secret(value, secrets)?;
+    }
+    if encoded_len(&params.profile)? > MAX_PROFILE_BYTES
+        || encoded_len(&params.target_environment)? > MAX_PROFILE_BYTES
+    {
+        return Err(too_large());
+    }
+    Ok(())
+}
+
+pub(crate) fn failed_attach_result(params: &ObserverAttachParams, reason: &'static str) -> Value {
+    json!({
+        "agent_id": params.agent_id,
+        "generation": params.generation,
+        "command_id": params.command_id,
+        "native_scope": params.native_scope,
+        "native_ref": params.native_ref,
+        "state": "failed",
+        "observation_state": "unknown",
+        "reason": reason,
+    })
 }
 
 async fn read_subject(
