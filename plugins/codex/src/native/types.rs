@@ -495,10 +495,15 @@ pub struct NativeTurnCompletedNotification {
     pub turn: NativeTurn,
 }
 
-/// One per-turn token delta from installed 0.167.1
-/// `thread/tokenUsage/updated` (`tokenUsage.last`). The sibling `total` is a
-/// cumulative per-thread snapshot and `modelContextWindow` is capacity: neither
-/// is per-turn expenditure and neither is mapped to turn usage.
+/// One per-response token delta from installed 0.167.1
+/// `thread/tokenUsage/updated` (`tokenUsage.last`). Usage flows once per
+/// upstream model response inside a turn (see the installed
+/// `RawResponseCompletedNotification`: "the exact usage from one upstream
+/// Responses API completion", keyed by turn), so `last` is the latest
+/// response's delta, not the whole turn. The sibling `total` is the
+/// cumulative per-thread snapshot and `modelContextWindow` is capacity:
+/// neither is per-turn expenditure and neither is mapped to turn usage
+/// directly; the turn total is `total` minus the turn-start baseline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeTokenUsageDelta {
@@ -517,10 +522,11 @@ pub struct NativeTokenUsageDelta {
 }
 
 /// Fresh `thread/tokenUsage/updated` notification (required: threadId +
-/// turnId + tokenUsage). Only `tokenUsage.last` is per-turn expenditure;
-/// `total` (cumulative per thread) and `modelContextWindow` (capacity) stay
-/// unmapped so context occupancy and running totals can never read as turn
-/// tokens.
+/// turnId + tokenUsage). `tokenUsage.last` is the latest per-response delta
+/// and `tokenUsage.total` the cumulative per-thread snapshot; turn
+/// expenditure is their difference against the turn-start baseline, never a
+/// raw `last`. `modelContextWindow` (capacity) stays unmapped so context
+/// occupancy can never read as turn tokens.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeThreadTokenUsageUpdatedNotification {
@@ -529,8 +535,9 @@ pub struct NativeThreadTokenUsageUpdatedNotification {
     pub token_usage: NativeThreadTokenUsage,
 }
 
-/// Installed 0.167.1 `ThreadTokenUsage` body: `last` is the per-turn delta
-/// for `turnId`, `total` the cumulative per-thread snapshot.
+/// Installed 0.167.1 `ThreadTokenUsage` body: `last` is the latest
+/// per-response delta for `turnId`, `total` the cumulative per-thread
+/// snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeThreadTokenUsage {

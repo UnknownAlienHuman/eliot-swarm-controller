@@ -186,10 +186,14 @@ struct EventProcessor {
     writes_blocked: bool,
     gap_reported: bool,
     final_text: Option<String>,
-    /// Latest per-turn token delta for the exact active turn, from
-    /// `thread/tokenUsage/updated` (`tokenUsage.last`). Replaced on each
-    /// update, never summed; consumed once by the terminal `turn.completed`.
-    turn_usage: Option<(String, TurnUsage)>,
+    /// Usage baseline and latest cumulative snapshot for the exact active
+    /// turn, from `thread/tokenUsage/updated`. The baseline is the cumulative
+    /// `total` minus the first observed per-response `last` (the thread total
+    /// as the turn started); the latest is the newest cumulative `total`.
+    /// The terminal `turn.completed` reports latest-minus-baseline, so a
+    /// repeated notification cannot double count and raw `last` values are
+    /// never summed.
+    turn_usage: Option<(String, NativeTokenUsageDelta, NativeTokenUsageDelta)>,
     native_scope: String,
     child_bindings: HashMap<String, ChildBinding>,
     child_states: HashMap<String, ChildState>,
@@ -1741,11 +1745,14 @@ impl EventProcessor {
         self.commit_event("tool.completed", native_id, data).await
     }
 
-    /// Retain the latest per-turn token delta for the exact active turn from
-    /// `thread/tokenUsage/updated` (`tokenUsage.last`). A repeated update
-    /// replaces the retained delta, never sums. An update naming any other
-    /// turn (late, stale, or pre-association) is dropped without a gap: the
-    /// terminal turn keeps null usage rather than another turn's counters.
+    /// Fold one `thread/tokenUsage/updated` into the exact active turn's
+    /// usage baseline. The first update for a turn captures the baseline
+    /// (cumulative `total` minus that update's per-response `last`); later
+    /// updates only advance the latest cumulative `total`. An update naming
+    /// any other turn (late, stale, or pre-association) is dropped without a
+    /// gap: the terminal turn keeps null usage rather than another turn's
+    /// counters. An update without the cumulative `total` cannot anchor the
+    /// robust difference, so it leaves the retained snapshots alone.
     /// Structural mismatch (wrong thread, malformed body) gaps like any
     /// other notification arm.
     fn note_token_usage(&mut self, params: &Value) -> Result<()> {
@@ -1760,8 +1767,17 @@ impl EventProcessor {
         if self.status.active_turn_id.as_deref() != Some(notification.turn_id.as_str()) {
             return Ok(());
         }
-        if let Some(usage) = turn_usage_from_delta(&notification.token_usage.last) {
-            self.turn_usage = Some((notification.turn_id, usage));
+        let Some(total) = notification.token_usage.total.clone() else {
+            return Ok(());
+        };
+        match self.turn_usage.as_mut() {
+            Some((turn_id, _, latest)) if turn_id == &notification.turn_id => {
+                *latest = total;
+            }
+            _ => {
+                let baseline = usage_baseline(&total, &notification.token_usage.last);
+                self.turn_usage = Some((notification.turn_id, baseline, total));
+            }
         }
         Ok(())
     }
@@ -1805,16 +1821,19 @@ impl EventProcessor {
         if let Some(restriction) = provider_restriction {
             attach_provider_restriction(&mut data, restriction, &secrets);
         }
-        // Optional per-turn token delta from `thread/tokenUsage/updated`:
+        // Optional turn expenditure from `thread/tokenUsage/updated`
+        // (latest cumulative snapshot minus the turn-start baseline):
         // attach before `attach_final_text` so the existing bounded
         // terminal-text accounting includes the usage bytes. A repeated
-        // update replaced the retained delta instead of summing; a missing
-        // or foreign-turn update leaves `data.usage` unset.
+        // notification leaves the difference unchanged instead of double
+        // counting, and raw `last` deltas are never summed; a missing or
+        // foreign-turn baseline leaves `data.usage` unset.
         let turn_usage = self
             .turn_usage
             .take()
-            .filter(|(turn_id, _)| *turn_id == notification.turn.id);
-        if let Some((_, usage)) = turn_usage {
+            .filter(|(turn_id, _, _)| *turn_id == notification.turn.id)
+            .and_then(|(_, baseline, latest)| turn_expenditure(&baseline, &latest));
+        if let Some(usage) = turn_usage {
             data["usage"] = serde_json::to_value(&usage).unwrap_or(Value::Null);
         }
         if let Some(text) = self.final_text.as_ref() {
@@ -2969,11 +2988,67 @@ fn spawned_parent_thread(thread: &Value) -> Option<&str> {
         .filter(|parent| !parent.trim().is_empty())
 }
 
-/// Map one installed 0.167.1 `tokenUsage.last` delta to turn expenditure at
-/// `turn` scope. Only genuinely supplied nonnegative counters are mapped;
-/// missing values stay null (never zero), and a delta with no usable counter
-/// yields no usage at all. The cumulative `total` and `modelContextWindow`
-/// capacity never enter this mapping.
+/// Turn-start baseline from the first observed update: cumulative `total`
+/// minus that update's per-response `last`, per counter. A counter is
+/// baselined only when both snapshots supply a nonnegative value with the
+/// total ahead; otherwise that counter stays unprovable (null), never
+/// derived.
+fn usage_baseline(
+    total: &NativeTokenUsageDelta,
+    last: &NativeTokenUsageDelta,
+) -> NativeTokenUsageDelta {
+    let base = |total: Option<i64>, last: Option<i64>| match (total, last) {
+        (Some(total), Some(last)) if total >= 0 && last >= 0 && total >= last => Some(total - last),
+        _ => None,
+    };
+    NativeTokenUsageDelta {
+        input_tokens: base(total.input_tokens, last.input_tokens),
+        cached_input_tokens: base(total.cached_input_tokens, last.cached_input_tokens),
+        output_tokens: base(total.output_tokens, last.output_tokens),
+        reasoning_output_tokens: base(total.reasoning_output_tokens, last.reasoning_output_tokens),
+        total_tokens: base(total.total_tokens, last.total_tokens),
+        cache_write_input_tokens: base(
+            total.cache_write_input_tokens,
+            last.cache_write_input_tokens,
+        ),
+    }
+}
+
+/// Turn expenditure as latest-minus-baseline per counter. A counter
+/// projects only when both snapshots supply it and the latest is still ahead
+/// (a backward snapshot stays null, never negative); otherwise that counter
+/// is unprovable. Raw `last` deltas are never summed, so a repeated
+/// notification cannot inflate the count.
+fn turn_expenditure(
+    baseline: &NativeTokenUsageDelta,
+    latest: &NativeTokenUsageDelta,
+) -> Option<TurnUsage> {
+    let diff = |latest: Option<i64>, baseline: Option<i64>| match (latest, baseline) {
+        (Some(latest), Some(baseline)) if latest >= 0 && baseline >= 0 && latest >= baseline => {
+            Some(latest - baseline)
+        }
+        _ => None,
+    };
+    turn_usage_from_delta(&NativeTokenUsageDelta {
+        input_tokens: diff(latest.input_tokens, baseline.input_tokens),
+        cached_input_tokens: diff(latest.cached_input_tokens, baseline.cached_input_tokens),
+        output_tokens: diff(latest.output_tokens, baseline.output_tokens),
+        reasoning_output_tokens: diff(
+            latest.reasoning_output_tokens,
+            baseline.reasoning_output_tokens,
+        ),
+        total_tokens: diff(latest.total_tokens, baseline.total_tokens),
+        cache_write_input_tokens: diff(
+            latest.cache_write_input_tokens,
+            baseline.cache_write_input_tokens,
+        ),
+    })
+}
+
+/// Map one per-turn expenditure delta to `TurnUsage` at `turn` scope. Only
+/// genuinely supplied nonnegative counters are mapped; missing values stay
+/// null (never zero), and a delta with no usable counter yields no usage at
+/// all. `modelContextWindow` capacity never enters this mapping.
 fn turn_usage_from_delta(delta: &NativeTokenUsageDelta) -> Option<TurnUsage> {
     let counter = |value: Option<i64>| value.filter(|value| *value >= 0);
     let input_tokens = counter(delta.input_tokens);
@@ -3650,35 +3725,98 @@ mod tests {
         assert_eq!(turn_usage_from_delta(&negative), None);
     }
 
+    fn breakdown(input: Option<i64>, output: Option<i64>) -> NativeTokenUsageDelta {
+        NativeTokenUsageDelta {
+            input_tokens: input,
+            cached_input_tokens: None,
+            output_tokens: output,
+            reasoning_output_tokens: None,
+            total_tokens: None,
+            cache_write_input_tokens: None,
+        }
+    }
+
+    #[test]
+    fn turn_expenditure_spans_two_model_responses_without_summing_lasts() {
+        // Response 1 spends in=10/out=1 on a thread already at in=100/out=50;
+        // response 2 spends in=30/out=5. The turn spent 40/6: both responses,
+        // not the last response alone (30/5).
+        let baseline = usage_baseline(
+            &breakdown(Some(110), Some(51)),
+            &breakdown(Some(10), Some(1)),
+        );
+        assert_eq!(baseline.input_tokens, Some(100));
+        assert_eq!(baseline.output_tokens, Some(50));
+        let usage = turn_expenditure(&baseline, &breakdown(Some(140), Some(56)))
+            .expect("two responses map");
+        assert_eq!(usage.scope, Some("turn".to_owned()));
+        assert_eq!(usage.input_tokens, Some(40));
+        assert_eq!(usage.output_tokens, Some(6));
+        // A repeated notification holds the difference instead of inflating it.
+        let repeated =
+            turn_expenditure(&baseline, &breakdown(Some(140), Some(56))).expect("repeat maps");
+        assert_eq!(repeated.input_tokens, Some(40));
+        // A single-response turn reports exactly that response.
+        let single = turn_expenditure(&baseline, &breakdown(Some(110), Some(51)))
+            .expect("single response maps");
+        assert_eq!(single.input_tokens, Some(10));
+        assert_eq!(single.output_tokens, Some(1));
+    }
+
+    #[test]
+    fn turn_expenditure_leaves_unprovable_counters_null() {
+        let baseline = usage_baseline(
+            &breakdown(Some(110), Some(51)),
+            &breakdown(Some(10), Some(1)),
+        );
+        // Counter absent from the latest snapshot stays null.
+        let missing =
+            turn_expenditure(&baseline, &breakdown(Some(140), None)).expect("partial maps");
+        assert_eq!(missing.input_tokens, Some(40));
+        assert_eq!(missing.output_tokens, None);
+        // A backward snapshot stays null, never negative.
+        let backward = turn_expenditure(&baseline, &breakdown(Some(90), Some(56)));
+        assert!(backward.is_none_or(|usage| usage.input_tokens.is_none()));
+    }
+
     #[tokio::test]
-    async fn token_usage_update_replaces_instead_of_summing() {
+    async fn token_usage_two_responses_accumulate_once_and_duplicates_hold() {
         let (_native, mut processor) = child_test_processor().await;
         processor.status.thread_id = Some("owned".to_owned());
         processor.status.active_turn_id = Some("turn-1".to_owned());
-        let update = |input: i64| {
+        let update = |input: i64, output: i64, total_in: i64, total_out: i64| {
             json!({
                 "threadId": "owned",
                 "turnId": "turn-1",
                 "tokenUsage": {
-                    "last": {"inputTokens": input, "outputTokens": 1},
-                    "total": {"inputTokens": 999, "outputTokens": 999},
+                    "last": {"inputTokens": input, "outputTokens": output},
+                    "total": {"inputTokens": total_in, "outputTokens": total_out},
                     "modelContextWindow": 200000,
                 },
             })
         };
         processor
-            .process_notification("thread/tokenUsage/updated", update(10))
+            .process_notification("thread/tokenUsage/updated", update(10, 1, 110, 51))
             .await
-            .expect("first update retains");
+            .expect("first response baselines");
         processor
-            .process_notification("thread/tokenUsage/updated", update(30))
+            .process_notification("thread/tokenUsage/updated", update(30, 5, 140, 56))
             .await
-            .expect("second update retains");
-        let (turn_id, usage) = processor.turn_usage.as_ref().expect("delta retained");
+            .expect("second response advances");
+        // A duplicate delivery changes nothing.
+        processor
+            .process_notification("thread/tokenUsage/updated", update(30, 5, 140, 56))
+            .await
+            .expect("duplicate holds");
+        let (turn_id, baseline, latest) = processor.turn_usage.as_ref().expect("snapshots kept");
         assert_eq!(turn_id, "turn-1");
-        // Replaced (30), never summed (40); cumulative `total` never leaks in.
-        assert_eq!(usage.input_tokens, Some(30));
-        assert_eq!(usage.output_tokens, Some(1));
+        assert_eq!(baseline.input_tokens, Some(100));
+        assert_eq!(baseline.output_tokens, Some(50));
+        assert_eq!(latest.input_tokens, Some(140));
+        assert_eq!(latest.output_tokens, Some(56));
+        let usage = turn_expenditure(baseline, latest).expect("turn maps");
+        assert_eq!(usage.input_tokens, Some(40));
+        assert_eq!(usage.output_tokens, Some(6));
     }
 
     #[tokio::test]
