@@ -35,7 +35,6 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsString,
     path::Path,
-    process::ExitStatus,
 };
 use tokio::{
     sync::mpsc,
@@ -53,13 +52,11 @@ struct MusePlugin {
     initialized: Option<Initialized>,
     session: Option<AgentSession>,
     failed_start: Option<FailedStart>,
-    native_endpoint_retirement_pending: bool,
 }
 
 enum HostLoopEvent {
     Request(Option<RpcRequest>),
-    NativeExit(Result<ExitStatus>),
-    NativeOutputReader(Result<()>),
+    NativeExit,
 }
 
 struct Initialized {
@@ -138,49 +135,37 @@ pub(crate) async fn run() -> Result<()> {
     let mut plugin = MusePlugin::default();
     let mut completed_shutdown = false;
     let mut native_endpoint_retired = false;
+    let mut native_retirement = Ok(());
     let mut pending_request: Option<(RpcRequest, Option<Instant>)> = None;
     loop {
         let mut carried_stop_deadline = None;
         let event = if let Some((request, stop_deadline)) = pending_request.take() {
             carried_stop_deadline = stop_deadline;
             HostLoopEvent::Request(Some(request))
-        } else if plugin.native_endpoint_retirement_pending {
-            if plugin.native_endpoint_exit_observed() {
-                tokio::select! {
-                    request = requests.recv() => HostLoopEvent::Request(request),
-                    output = plugin.wait_for_native_output_reader() => {
-                        HostLoopEvent::NativeOutputReader(output)
-                    }
-                }
-            } else {
-                tokio::select! {
-                    request = requests.recv() => HostLoopEvent::Request(request),
-                    exit = plugin.wait_for_native_endpoint_exit() => HostLoopEvent::NativeExit(exit),
-                }
-            }
         } else {
-            HostLoopEvent::Request(requests.recv().await)
+            tokio::select! {
+                biased;
+                () = eliot_plugin::native_lifecycle::wait_for_native_exit(
+                    plugin.session.as_mut().map(|session| &mut session.native.transport)
+                ) => HostLoopEvent::NativeExit,
+                request = requests.recv() => HostLoopEvent::Request(request),
+            }
         };
         match event {
-            HostLoopEvent::NativeExit(exit) => {
-                if exit.is_ok() {
-                    native_endpoint_retired = plugin
-                        .retire_native_endpoint_after_unknown_start(false)
-                        .await;
-                    if native_endpoint_retired {
-                        break;
-                    }
-                } else {
-                    plugin.native_endpoint_retirement_pending = false;
-                }
-            }
-            HostLoopEvent::NativeOutputReader(_result) => {
-                native_endpoint_retired = plugin
-                    .retire_native_endpoint_after_unknown_start(true)
+            HostLoopEvent::NativeExit => {
+                if let Some(session) = plugin.session.as_mut() {
+                    native_retirement = eliot_plugin::native_lifecycle::drain_native_exit(
+                        &mut session.native.transport,
+                        async {
+                            session.events.drain_native().await?;
+                            session.events.close().await;
+                            Ok(())
+                        },
+                    )
                     .await;
-                if native_endpoint_retired {
-                    break;
                 }
+                native_endpoint_retired = true;
+                break;
             }
             HostLoopEvent::Request(None) => break,
             HostLoopEvent::Request(Some(request)) => {
@@ -239,12 +224,14 @@ pub(crate) async fn run() -> Result<()> {
         }
     }
 
-    if !completed_shutdown {
+    if !completed_shutdown && !native_endpoint_retired {
         plugin.shutdown_owned().await;
     }
     reader.abort();
     let _ = reader.await;
-    if completed_shutdown || native_endpoint_retired {
+    if native_endpoint_retired {
+        native_retirement
+    } else if completed_shutdown {
         Ok(())
     } else {
         Err(Error::new(
@@ -255,71 +242,6 @@ pub(crate) async fn run() -> Result<()> {
 }
 
 impl MusePlugin {
-    async fn wait_for_native_endpoint_exit(&mut self) -> Result<ExitStatus> {
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| Error::new("bad_state", "Muse endpoint-exit wait has no session"))?;
-        session.native.transport.wait_for_process_exit().await
-    }
-
-    async fn wait_for_native_output_reader(&mut self) -> Result<()> {
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| Error::new("bad_state", "Muse output-reader wait has no session"))?;
-        session
-            .native
-            .transport
-            .wait_for_output_reader_finished()
-            .await
-    }
-
-    fn native_endpoint_exit_observed(&self) -> bool {
-        self.session
-            .as_ref()
-            .is_some_and(|session| session.native.transport.process_exit_observed())
-    }
-
-    async fn retire_native_endpoint_after_unknown_start(
-        &mut self,
-        output_wait_completed: bool,
-    ) -> bool {
-        let matches_unknown_start = self.session.as_ref().is_some_and(|session| {
-            session.phase == SessionPhase::Unknown
-                && self.failed_start.as_ref().is_some_and(|failed| {
-                    failed.agent_id == session.agent_id
-                        && failed.generation == session.generation
-                        && failed.command_id == session.start_command_id
-                })
-        });
-        if !matches_unknown_start {
-            self.native_endpoint_retirement_pending = false;
-            return false;
-        }
-
-        let drained = if let Some(session) = self.session.as_mut() {
-            confirm_native_endpoint_exit(session).await
-        } else {
-            false
-        };
-        if drained {
-            self.native_endpoint_retirement_pending = false;
-            // The retained FailedStart is only an Unknown replay fence. Dropping
-            // the session releases its native/event owners without settling a task.
-            drop(self.session.take());
-            return true;
-        }
-        let output_reader_finished = self
-            .session
-            .as_ref()
-            .is_some_and(|session| session.native.transport.output_reader_finished());
-        if output_wait_completed || output_reader_finished {
-            self.native_endpoint_retirement_pending = false;
-        }
-        false
-    }
-
     async fn dispatch(
         &mut self,
         request: &RpcRequest,
@@ -634,13 +556,6 @@ impl MusePlugin {
                 return Err(self.retain_failed_start(&params, error));
             }
             Err(error) => {
-                let native_endpoint_exited = confirm_native_endpoint_exit(&mut session).await;
-                if native_endpoint_exited {
-                    // Let the event processor commit its sticky gap before
-                    // daemon cleanup. The dispatched native outcome stays unknown.
-                    self.session = Some(session);
-                    return Err(native_endpoint_exit_error());
-                }
                 let error = contextual_error(
                     error,
                     "unknown",
@@ -649,7 +564,6 @@ impl MusePlugin {
                     ),
                 );
                 let error = self.retain_failed_start(&params, error);
-                self.native_endpoint_retirement_pending = true;
                 self.session = Some(session);
                 return Err(error);
             }
@@ -1668,26 +1582,6 @@ impl MusePlugin {
             session.events.close().await;
         }
     }
-}
-
-async fn confirm_native_endpoint_exit(session: &mut AgentSession) -> bool {
-    if !session
-        .native
-        .transport
-        .confirm_exit_and_output_drained()
-        .await
-    {
-        return false;
-    }
-    session.events.close().await;
-    true
-}
-
-fn native_endpoint_exit_error() -> Error {
-    Error::new(
-        eliot_plugin::native_stdio::NATIVE_ENDPOINT_EXITED,
-        "Muse native endpoint exited after start/resume dispatch; outcome remains unknown",
-    )
 }
 
 async fn terminate_session(

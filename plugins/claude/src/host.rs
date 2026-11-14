@@ -55,6 +55,9 @@ struct FailedStart {
     generation: i64,
     command_id: String,
     error: Error,
+    /// Retained with the exact start binding after native exit and output drain;
+    /// retirement does not depend on delivery of the start RPC response.
+    endpoint_exited: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -154,6 +157,7 @@ enum DispatchOutcome {
 /// What woke the run loop while a steer reply was deferred. A dropped
 /// waiter sender (`None`) means the event task died without settling.
 enum SteerWake {
+    NativeExit,
     Request(Option<RpcRequest>),
     Outcome(Option<SteerOutcome>),
     Deadline,
@@ -187,13 +191,32 @@ pub(crate) async fn run() -> Result<()> {
 
     let mut plugin = ClaudePlugin::default();
     let mut completed_shutdown = false;
+    let mut native_endpoint_retired = false;
+    let mut native_retirement = Ok(());
     let mut pending_request = None;
     loop {
+        if plugin
+            .failed_start
+            .as_ref()
+            .is_some_and(|failed| failed.endpoint_exited)
+        {
+            native_endpoint_retired = true;
+            break;
+        }
         let Some(mut waiter) = plugin.deferred_steer.take() else {
             let request = if let Some(request) = pending_request.take() {
                 Some(request)
             } else {
-                requests.recv().await
+                tokio::select! {
+                    biased;
+                    () = eliot_plugin::native_lifecycle::wait_for_native_exit(
+                        plugin.session.as_mut().map(|session| &mut session.native.transport)
+                    ) => {
+                        native_endpoint_retired = true;
+                        None
+                    }
+                    request = requests.recv() => request,
+                }
             };
             let Some(request) = request else {
                 break;
@@ -223,6 +246,10 @@ pub(crate) async fn run() -> Result<()> {
             SteerWake::Request(Some(pending))
         } else if let Some(cancel_ack) = waiter.cancel_ack.as_mut() {
             tokio::select! {
+                biased;
+                () = eliot_plugin::native_lifecycle::wait_for_native_exit(
+                    plugin.session.as_mut().map(|session| &mut session.native.transport)
+                ) => SteerWake::NativeExit,
                 request = requests.recv() => SteerWake::Request(request),
                 outcome = &mut waiter.outcome => SteerWake::Outcome(outcome.ok()),
                 acknowledged = cancel_ack => {
@@ -231,12 +258,21 @@ pub(crate) async fn run() -> Result<()> {
             }
         } else {
             tokio::select! {
+                biased;
+                () = eliot_plugin::native_lifecycle::wait_for_native_exit(
+                    plugin.session.as_mut().map(|session| &mut session.native.transport)
+                ) => SteerWake::NativeExit,
                 request = requests.recv() => SteerWake::Request(request),
                 outcome = &mut waiter.outcome => SteerWake::Outcome(outcome.ok()),
                 _ = tokio::time::sleep_until(waiter.deadline) => SteerWake::Deadline,
             }
         };
         let serve = match wake {
+            SteerWake::NativeExit => {
+                plugin.deferred_steer = Some(waiter);
+                native_endpoint_retired = true;
+                break;
+            }
             SteerWake::Request(request) => {
                 let Some(request) = request else { break };
                 plugin.deferred_steer = Some(waiter);
@@ -280,12 +316,30 @@ pub(crate) async fn run() -> Result<()> {
         }
     }
 
-    if !completed_shutdown {
+    if native_endpoint_retired {
+        if let Some(session) = plugin.session.as_mut() {
+            native_retirement = eliot_plugin::native_lifecycle::drain_native_exit(
+                &mut session.native.transport,
+                async {
+                    session.events.drain_native().await?;
+                    session.events.close().await;
+                    Ok(())
+                },
+            )
+            .await;
+        }
+        if let Some(mut waiter) = plugin.deferred_steer.take() {
+            let arrived = waiter.outcome.try_recv().ok();
+            let _ = plugin.settle_deferred_steer(&client, waiter, arrived).await;
+        }
+    } else if !completed_shutdown {
         plugin.shutdown_owned().await;
     }
     reader.abort();
     let _ = reader.await;
-    if completed_shutdown {
+    if native_endpoint_retired {
+        native_retirement
+    } else if completed_shutdown {
         Ok(())
     } else {
         Err(Error::new(
@@ -398,6 +452,19 @@ async fn respond_deferred(client: &PeerClient, request_id: Value, result: Result
 }
 
 impl ClaudePlugin {
+    /// Called only after native exit and reader cleanup succeeded. Keep this
+    /// exact binding until the host loop retires, even if its RPC reply is late.
+    fn retain_exited_start(&mut self, params: &AgentStartParams, error: Error) -> Error {
+        self.failed_start = Some(FailedStart {
+            agent_id: params.agent_id.clone(),
+            generation: params.generation,
+            command_id: params.command_id.clone(),
+            error: error.clone(),
+            endpoint_exited: true,
+        });
+        error
+    }
+
     async fn dispatch(&mut self, request: &RpcRequest, client: &PeerClient) -> DispatchOutcome {
         let result = match request.method.as_str() {
             "initialize" => self.initialize(&request.params),
@@ -719,13 +786,7 @@ impl ClaudePlugin {
             return contextual_error(error, "unknown", message);
         }
         let error = session.native_client.diagnostic_error(error);
-        self.failed_start = Some(FailedStart {
-            agent_id: params.agent_id.clone(),
-            generation: params.generation,
-            command_id: params.command_id.clone(),
-            error: error.clone(),
-        });
-        error
+        self.retain_exited_start(params, error)
     }
 
     /// Discard a failed start and retain its error for replays. A start
@@ -769,14 +830,16 @@ impl ClaudePlugin {
             );
             return contextual_error(error, "unknown", message);
         }
+        // Cleanup proved native exit and reader drain. Keep the dispatched
+        // initialize/resume effect unknown while the daemon separately proves
+        // plugin custody exit and settles this starting generation.
+        let error = if error.code == "unknown" {
+            error.with_code(eliot_plugin::native_stdio::NATIVE_ENDPOINT_EXITED)
+        } else {
+            error
+        };
         let error = session.native_client.diagnostic_error(error);
-        self.failed_start = Some(FailedStart {
-            agent_id: params.agent_id.clone(),
-            generation: params.generation,
-            command_id: params.command_id.clone(),
-            error: error.clone(),
-        });
-        error
+        self.retain_exited_start(params, error)
     }
 
     /// Run `initialize` and check the effective profile BEFORE readiness: on
@@ -2212,7 +2275,8 @@ fn target_environment(
 #[cfg(test)]
 mod tests {
     use super::{
-        check_mcp_allow_empty, claude_manifest, claude_scope, mcp_argv, new_uuid, setter_error,
+        ClaudePlugin, check_mcp_allow_empty, claude_manifest, claude_scope, mcp_argv, new_uuid,
+        setter_error,
     };
     use eliot_core::Error;
     use eliot_core::McpPolicy;
@@ -2221,6 +2285,25 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
 
     const FAMILIES: &[&str] = &["session", "turn", "message", "request"];
+
+    #[test]
+    fn exited_start_retires_without_response_delivery_and_keeps_exact_replay() {
+        let mut plugin = ClaudePlugin::default();
+        let params = eliot_plugin::AgentStartParams::new("a7", 4, "start-4");
+        let error =
+            plugin.retain_exited_start(&params, Error::new("unknown", "registration timed out"));
+        // No peer/respond operation occurs: exit evidence is owned by the
+        // plugin, rather than by acknowledgement of the expired start RPC.
+        assert!(plugin.failed_start.as_ref().unwrap().endpoint_exited);
+        assert!(plugin.session.is_none());
+        let replay = plugin.replay_start(&params).unwrap().unwrap_err();
+        assert_eq!(replay, error);
+        let newer = eliot_plugin::AgentStartParams::new("a7", 5, "start-5");
+        assert_eq!(
+            plugin.replay_start(&newer).unwrap().unwrap_err().code,
+            "bad_state"
+        );
+    }
 
     #[test]
     fn uuid_mints_unique_hyphenated_ids() {

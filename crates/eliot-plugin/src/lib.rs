@@ -1,4 +1,5 @@
 mod file_identity;
+pub mod native_lifecycle;
 pub mod native_stdio;
 pub mod native_transport;
 pub mod peer;

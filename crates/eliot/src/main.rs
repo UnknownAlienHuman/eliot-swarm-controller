@@ -1077,11 +1077,22 @@ impl Failure {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    run(cli)
+    if matches!(&cli.command, Some(CliCommand::Plugin(_))) {
+        match eliot_plugin::native_lifecycle::run_plugin_entry(run_inner(cli)) {
+            Ok(exit_code) => exit_code,
+            Err(error) => report_failure(Failure::new(1, error.to_string())),
+        }
+    } else {
+        run(cli)
+    }
 }
 
 #[tokio::main]
 async fn run(cli: Cli) -> ExitCode {
+    run_inner(cli).await
+}
+
+async fn run_inner(cli: Cli) -> ExitCode {
     let data_dir = match resolve_data_dir(cli.data_dir.as_deref()) {
         Ok(path) => path,
         Err(failure) => return report_failure(failure),

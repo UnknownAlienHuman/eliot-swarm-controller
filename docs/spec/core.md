@@ -95,6 +95,7 @@ not duplicated Agent columns. No managed row means these projections are absent.
 | observe attach dispatch and exact identity readback | target generation, unknown until current native state is proven |
 | lost start reply without proven endpoint and owner cleanup | starting, start command unknown |
 | proven native endpoint exit plus completed owner cleanup | lost, start command remains unknown |
+| proven native endpoint exit while controlled, after bounded native tail and plugin owner cleanup | lost unless already terminal; preserve terminal turn evidence, otherwise unresolved turn unknown |
 | exact turn start | busy with captured active turn |
 | first request / last resolved request | waiting / busy |
 | exact active turn terminal result | idle, clear that turn's pending requests |

@@ -48,6 +48,7 @@ const DENY_CHOICE_ID: &str = "deny";
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventStatus {
+    pub native_drained: bool,
     pub ready: bool,
     pub session_id: Option<String>,
     pub active_command_id: Option<String>,
@@ -605,6 +606,11 @@ impl EventHandle {
         let _ = timeout_at(Instant::now() + EVENT_DEADLINE, reply_rx).await;
     }
 
+    pub async fn drain_native(&self) -> Result<()> {
+        eliot_plugin::native_lifecycle::wait_for_native_tail(&self.status, |s| s.native_drained)
+            .await
+    }
+
     pub fn status(&self) -> EventStatus {
         self.status.borrow().clone()
     }
@@ -685,7 +691,9 @@ async fn run(
 }
 
 fn publish(processor: &EventProcessor, status: &watch::Sender<EventStatus>) {
-    let _ = status.send_replace(processor.status.clone());
+    let mut current = processor.status.clone();
+    current.native_drained = processor.frames_drained;
+    let _ = status.send_replace(current);
 }
 
 /// Serve one control behind any queued frame. True ends the run loop.

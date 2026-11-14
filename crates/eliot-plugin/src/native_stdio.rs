@@ -184,6 +184,7 @@ impl<C: NativeStdioConfig> StdioProcess<C> {
             C::MAX_FRAME_BYTES,
             C::OVERSIZED_KNOWN_METHODS,
             classify_jsonrpc_frame::<C>,
+            None,
         )
         .await?;
         let client = StdioClient {

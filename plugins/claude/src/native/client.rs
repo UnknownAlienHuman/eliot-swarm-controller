@@ -74,6 +74,7 @@ impl ClaudeProcess {
             DEFAULT_MAX_NATIVE_FRAME_BYTES,
             OVERSIZED_KNOWN_METHODS,
             classify_claude_frame,
+            None,
         )
         .await?;
         let client = ClaudeClient {

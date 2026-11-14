@@ -58,10 +58,13 @@ pub(crate) async fn run() -> Result<()> {
     let mut deferred_count = 0_usize;
     let mut shutdown_requested = false;
     let mut shutdown = false;
+    let mut native_endpoint_retired = false;
+    let mut native_retirement = Ok(());
     let mut transport_closed = false;
     let mut pending_request = None;
     while !shutdown_requested || deferred_count > 0 {
         enum Next {
+            NativeExit,
             Request(Option<RpcRequest>),
             Deferred(Option<DeferredCompletion>),
         }
@@ -69,11 +72,25 @@ pub(crate) async fn run() -> Result<()> {
             Next::Request(Some(request))
         } else {
             tokio::select! {
+                biased;
+                () = async {
+                    match plugin.session.as_mut() {
+                        Some(session) => session.wait_for_native_exit().await,
+                        None => std::future::pending().await,
+                    }
+                }, if !shutdown_requested => Next::NativeExit,
                 request = requests.recv(), if !shutdown_requested => Next::Request(request),
                 completed = deferred_rx.recv(), if deferred_count > 0 => Next::Deferred(completed),
             }
         };
         match next {
+            Next::NativeExit => {
+                if let Some(session) = plugin.session.as_mut() {
+                    native_retirement = session.retire_native_exit().await;
+                }
+                native_endpoint_retired = true;
+                shutdown_requested = true;
+            }
             Next::Request(Some(request)) => {
                 let stopping = request.method == "shutdown";
                 let dispatch = if request.method == "agent.snapshot" {
@@ -191,12 +208,14 @@ pub(crate) async fn run() -> Result<()> {
             }
         }
     }
-    if let Some(session) = &mut plugin.session {
+    if !native_endpoint_retired && let Some(session) = &mut plugin.session {
         let _ = session.terminate(true).await;
     }
     reader.abort();
     let _ = reader.await;
-    if shutdown && !transport_closed {
+    if native_endpoint_retired && !transport_closed {
+        native_retirement
+    } else if shutdown && !transport_closed {
         Ok(())
     } else {
         Err(Error::new(

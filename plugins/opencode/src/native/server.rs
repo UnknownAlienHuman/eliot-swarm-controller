@@ -90,6 +90,13 @@ pub struct OwnedServer {
 }
 
 impl OwnedServer {
+    /// Await the owned server handle, never infer death from the SSE source.
+    pub async fn wait_for_process_exit(&mut self) {
+        if self.child.wait().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+
     /// Write the per-generation config, prepare the selected native
     /// credential in the isolated store, reserve a loopback port, spawn the
     /// server on the per-Agent store, and wait for readiness. Any failure
