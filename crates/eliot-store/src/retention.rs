@@ -1292,7 +1292,7 @@ mod tests {
         request.args = json!({
             "project": "retention-project",
             "workspace": "retention-workspace",
-            "harness": "fake",
+            "harness": "codex",
             "profile": "fake",
             "profile_snapshot": {},
         });
@@ -1319,7 +1319,7 @@ mod tests {
         fresh.args = json!({
             "project": "retention-project",
             "workspace": "retention-workspace",
-            "harness": "fake",
+            "harness": "codex",
             "profile": "fake",
             "profile_snapshot": {},
         });
@@ -1519,7 +1519,7 @@ mod tests {
         launch.args = json!({
             "project": project,
             "workspace": "retention-workspace",
-            "harness": "fake",
+            "harness": "codex",
             "profile": "fake",
             "profile_snapshot": {},
         });
@@ -1527,6 +1527,7 @@ mod tests {
         let admission = store.submit("owner", launch, now).unwrap();
         let agent = admission.command.target.unwrap();
         store.dispatch(&launch_id, now).unwrap();
+        crate::tests::install_fixture_sources(store, &agent, &launch_id, 1, now);
         (agent, launch_id)
     }
 
@@ -2115,6 +2116,9 @@ mod tests {
         request.args = json!({
             "project": "retention-skew-project",
             "workspace": "retention-skew-workspace",
+            "harness": "codex",
+            "profile": "fake",
+            "profile_snapshot": {},
         });
         request.expected_generation = Some(0);
         let admission = store

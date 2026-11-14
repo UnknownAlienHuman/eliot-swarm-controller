@@ -1446,7 +1446,7 @@ mod tests {
                     target: None,
                     selector: None,
                     verb: "launch".to_owned(),
-                    args: json!({"project":project, "workspace":"synthetic-workspace"}),
+                    args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"codex", "profile":"fixture", "profile_snapshot":{}}),
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
@@ -1457,6 +1457,7 @@ mod tests {
             .expect("admit launch");
         let agent = admission.command.target.expect("launch target");
         store.dispatch(&launch_id, now).expect("dispatch launch");
+        crate::test_support::install_fixture_sources(&mut store, &agent, &launch_id, 1, now);
         store
             .put_batch(
                 SourceBatch {
@@ -1934,20 +1935,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response["outcome"], "continued");
-        assert_eq!(response["command_id"], id);
-        assert_eq!(response["continuation"]["command_id"], id);
+        // The continuation send carries the claim-minted id (#353), not the
+        // round request id, so the request itself is never a command.
+        let continuation = response["continuation"]["command_id"]
+            .as_str()
+            .expect("continuation command");
+        assert_eq!(response["command_id"], continuation);
+        assert_ne!(continuation, id);
         assert_eq!(response["view"]["generation"], 1);
         assert_eq!(response["view"]["revision"], 2);
         assert_eq!(response["view"]["counters"]["rounds"], 1);
         assert_eq!(response["view"]["counters"]["last_exit_code"], 7);
         assert_eq!(response["view"]["last_round_key"], format!("idle:{key}"));
         assert!(response["view"]["round_marker"].is_null());
+        assert!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .get_command(&id)
+                .unwrap()
+                .is_none()
+        );
         let send = router
             .inner
             .store
             .lock()
             .await
-            .get_command(&id)
+            .get_command(continuation)
             .unwrap()
             .unwrap();
         assert_eq!(send.verb, "send");
@@ -2092,28 +2108,44 @@ mod tests {
         let router = router();
         // Each unknown outcome burns its round key, so each runner gets a
         // fresh Agent and Goal.
+        // A non-quiescent unknown holds the round exclusion (#353) instead of
+        // burning it: only the custody case keeps a Running marker.
         let cases = [
-            ("goal-unknown", unknown_runner as GoalCheckRunner, "unknown"),
+            (
+                "goal-unknown",
+                unknown_runner as GoalCheckRunner,
+                "unknown",
+                eliot_core::api::GoalMarkerState::Unknown,
+            ),
             (
                 "goal-custody",
                 custody_unknown_runner as GoalCheckRunner,
                 "unknown",
+                eliot_core::api::GoalMarkerState::Running,
             ),
             (
                 "goal-missing-capture",
                 missing_capture_runner as GoalCheckRunner,
                 "unknown",
+                eliot_core::api::GoalMarkerState::Unknown,
             ),
-            ("goal-timeout", timeout_runner as GoalCheckRunner, "unknown"),
+            (
+                "goal-timeout",
+                timeout_runner as GoalCheckRunner,
+                "unknown",
+                eliot_core::api::GoalMarkerState::Unknown,
+            ),
             (
                 "goal-timeout-capture",
                 timeout_capture_runner as GoalCheckRunner,
                 "unknown",
+                eliot_core::api::GoalMarkerState::Unknown,
             ),
             (
                 "goal-cancelled",
                 cancelled_runner as GoalCheckRunner,
                 "unavailable",
+                eliot_core::api::GoalMarkerState::Unknown,
             ),
         ]
         .into_iter();
@@ -2122,8 +2154,9 @@ mod tests {
             "goal-unproven-capture",
             unproven_capture_runner as GoalCheckRunner,
             "unknown",
+            eliot_core::api::GoalMarkerState::Unknown,
         )));
-        for (project, runner, code) in cases {
+        for (project, runner, code, marker_state) in cases {
             let agent = ready_agent(&router, project).await;
             set_goal(&router, &agent, definition("keep green")).await;
             let key = high_water(&router).await;
@@ -2160,7 +2193,7 @@ mod tests {
             assert!(view.last_round_key.is_none());
             assert_eq!(view.status, eliot_core::api::GoalStatus::Active);
             let marker = view.round_marker.expect("burned key stays visible");
-            assert_eq!(marker.state, eliot_core::api::GoalMarkerState::Unknown);
+            assert_eq!(marker.state, marker_state);
             assert_eq!(marker.round_key, format!("idle:{key}"));
         }
     }
@@ -2954,7 +2987,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first["outcome"], "continued");
-        complete_send(&router, &agent, &first_id, "turn-incomplete-progress").await;
+        let first_continuation = first["continuation"]["command_id"]
+            .as_str()
+            .expect("continuation command")
+            .to_owned();
+        complete_send(
+            &router,
+            &agent,
+            &first_continuation,
+            "turn-incomplete-progress",
+        )
+        .await;
         let key = high_water(&router).await;
         let second_id = ulid::Ulid::new().to_string();
         let second = router
@@ -2966,7 +3009,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second["outcome"], "continued");
-        assert_eq!(second["continuation"]["command_id"], second_id);
+        // Each round mints a fresh claim-bound continuation id (#353).
+        let second_continuation = second["continuation"]["command_id"]
+            .as_str()
+            .expect("continuation command");
+        ulid::Ulid::from_string(second_continuation).expect("continuation ULID");
+        assert_ne!(second_continuation, second_id.as_str());
         assert_eq!(second["view"]["status"], "active");
         assert_eq!(second["view"]["counters"]["rounds"], 2);
         assert_eq!(second["view"]["counters"]["consecutive_same_output"], 0);
@@ -2999,7 +3047,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first["outcome"], "continued");
-        complete_send(&router, &agent, &first_id, "turn-np-1").await;
+        let first_continuation = first["continuation"]["command_id"]
+            .as_str()
+            .expect("continuation command")
+            .to_owned();
+        complete_send(&router, &agent, &first_continuation, "turn-np-1").await;
         let key = high_water(&router).await;
         let second = router
             .goal_round_with(

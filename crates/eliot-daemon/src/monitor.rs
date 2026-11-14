@@ -1794,6 +1794,16 @@ mod tests {
             .target
             .unwrap();
         store.dispatch(&command_id, 1001).unwrap();
+        // The host owns the full native set; the handoff below moves only
+        // `families`, so the stream retains the remainder.
+        crate::test_support::install_fixture_source_plan(
+            &mut store,
+            &agent,
+            &command_id,
+            1,
+            1001,
+            &["message", "request", "session", "turn"],
+        );
         store
             .record_source_handoff(
                 eliot_core::SourceHandoff {

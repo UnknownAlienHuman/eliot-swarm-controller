@@ -512,14 +512,7 @@ fn producer(store: &mut Store, native_ref: &str) -> String {
         .target
         .unwrap();
     store.dispatch(&command, NOW).unwrap();
-    // Match the current host handshake before publishing native facts.
-    let plan = ["session", "turn", "message", "tool", "request"]
-        .into_iter()
-        .map(|family| (family.to_owned(), INITIAL_SOURCE.to_owned()))
-        .collect();
-    store
-        .install_plugin_sources(&id, 1, &command, &plan, NOW)
-        .unwrap();
+    crate::tests::install_fixture_sources(store, &id, &command, 1, NOW);
     store.put_batch(SourceBatch {
         batch_id: format!("{native_ref}:ready"), agent_id: id.clone(), generation: 1,
         source: INITIAL_SOURCE.to_owned(), cursor: None,
@@ -770,9 +763,12 @@ fn registration_rejects_changed_binding_foreign_parent_and_stale_generation() {
     assert_eq!(store.high_water().unwrap(), high_water);
     assert_eq!(count(&store, "native_child_registrations"), 1);
     let current = store.get_agent(&child.agent.id).unwrap().unwrap();
+    // A registered child with no turns has no terminal evidence, so the
+    // activity derivation reports Unknown until its first completed turn
+    // (TERMINAL_ACTIVITY_SQL finds nothing; #418).
     assert_eq!(
         current.activity.as_ref().unwrap().state,
-        NativeChildActivityState::Idle
+        NativeChildActivityState::Unknown
     );
     let mut expected = child.agent;
     expected.activity = current.activity.clone();
@@ -849,10 +845,25 @@ fn native_child_batch_uses_its_grant_without_widening_control_or_external_attach
     assert_eq!(turns[0].state, TurnState::Completed);
     assert_eq!(turns[0].final_text.as_deref(), Some("child result"));
     assert!(store.list_turns(&parent, 1, 100).unwrap().is_empty());
+    // Committing the child's completed turn advances its derived activity to
+    // Idle with a progress timestamp (#418), so the register-time snapshot
+    // no longer matches exactly.
+    let current = store.get_agent(&child.agent.id).unwrap().unwrap();
     assert_eq!(
-        store.get_agent(&child.agent.id).unwrap().unwrap(),
-        child.agent
+        current.activity.as_ref().unwrap().state,
+        NativeChildActivityState::Idle
     );
+    assert!(
+        current
+            .activity
+            .as_ref()
+            .unwrap()
+            .last_progress_at
+            .is_some()
+    );
+    let mut expected = child.agent;
+    expected.activity = current.activity.clone();
+    assert_eq!(current, expected);
     assert_eq!(
         store.get_agent(&parent).unwrap().unwrap().state,
         AgentState::Idle
@@ -1563,6 +1574,7 @@ fn resume_recovered_producer(store: &mut Store, root: &str) {
     let resume_id = resume.id.clone();
     store.submit("owner", resume, NOW + 52).unwrap();
     store.dispatch(&resume_id, NOW + 53).unwrap();
+    crate::tests::install_fixture_sources(store, root, &resume_id, 2, NOW + 53);
     store
         .put_batch(
             SourceBatch {
@@ -1825,6 +1837,7 @@ fn muse_producer(store: &mut Store, native_ref: &str) -> String {
         .target
         .unwrap();
     store.dispatch(&command, NOW).unwrap();
+    crate::tests::install_fixture_sources(store, &id, &command, 1, NOW);
     store
         .put_batch(
             SourceBatch {

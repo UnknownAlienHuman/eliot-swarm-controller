@@ -424,6 +424,7 @@ mod tests {
             .unwrap();
         let agent = admitted.command.target.unwrap();
         store.dispatch(&command_id, now).unwrap();
+        crate::tests::install_fixture_sources(&mut store, &agent, &command_id, 1, now);
         store
             .put_batch(
                 SourceBatch {

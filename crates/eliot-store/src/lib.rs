@@ -4463,7 +4463,7 @@ fn install_stream_source_plan(
 fn family_for_kind(kind: &str) -> Result<&'static str> {
     match kind {
         "session.ready" | "session.ended" => Ok("session"),
-        "turn.started" | "turn.completed" => Ok("turn"),
+        "turn.started" | "turn.completed" | "turn.unknown" => Ok("turn"),
         "message.completed" => Ok("message"),
         "tool.started" | "tool.completed" | "hook.before_tool" => Ok("tool"),
         "hook.before_model" => Ok("turn"),

@@ -399,6 +399,28 @@ mod tests {
         )
     }
 
+    /// Router whose data root defines the real `fixture` codex profile, so
+    /// owner launches through `submit` resolve a frozen snapshot from config
+    /// instead of the removed fake profile.
+    fn router_with_fixture_profile() -> (Router, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("eliot-hierarchy-config-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.toml"),
+            "[profiles.fixture]\nharness = \"codex\"\nmodel = \"fixture-model\"\ncontrol = \"tree\"\n",
+        )
+        .unwrap();
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let router = Router::new(
+            root.clone(),
+            "owner-credential".to_owned(),
+            Arc::new(AsyncMutex::new(store)),
+            Bus::new(16),
+        );
+        (router, root)
+    }
+
     fn launch(
         store: &mut Store,
         project: &str,
@@ -409,6 +431,8 @@ mod tests {
         let mut args = json!({
             "project": project,
             "workspace": "synthetic-workspace",
+            "harness": "codex",
+            "profile": "fixture",
             "profile_snapshot": {"control": control},
         });
         if let Some(parent) = parent {
@@ -445,6 +469,7 @@ mod tests {
             .unwrap()
             .id;
         store.dispatch(&launch_id, now).unwrap();
+        crate::test_support::install_fixture_sources(&mut *store, agent, &launch_id, 1, now);
     }
 
     fn agent_principal(id: &str, generation: i64) -> Principal {
@@ -640,7 +665,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_launch_through_the_router_inherits_its_project() {
-        let router = router();
+        let (router, config_root) = router_with_fixture_profile();
         let workspace = std::env::temp_dir().join(format!("eliot-hierarchy-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&workspace).unwrap();
         // The owner launches the parent through the same frozen profile the
@@ -651,7 +676,7 @@ mod tests {
                     &json!({
                         "id": ulid::Ulid::new().to_string(),
                         "verb": "launch",
-                        "args": {"workspace": workspace, "profile": "fake"},
+                        "args": {"workspace": workspace, "profile": "fixture"},
                     }),
                     &Principal::Owner,
                 )
@@ -665,7 +690,7 @@ mod tests {
                 &json!({
                     "id": ulid::Ulid::new().to_string(),
                     "verb": "launch",
-                    "args": {"workspace": workspace, "profile": "fake"},
+                    "args": {"workspace": workspace, "profile": "fixture"},
                 }),
                 &agent_principal(&manager, 0),
             )
@@ -683,11 +708,12 @@ mod tests {
         assert_eq!(row.root, manager);
         assert_eq!(row.depth, 1);
         let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&config_root);
     }
 
     #[tokio::test]
     async fn agent_launch_outside_the_parent_workspace_is_not_allowed() {
-        let router = router();
+        let (router, config_root) = router_with_fixture_profile();
         let home = std::env::temp_dir().join(format!("eliot-hierarchy-home-{}", ulid::Ulid::new()));
         let away = std::env::temp_dir().join(format!("eliot-hierarchy-away-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&home).unwrap();
@@ -696,7 +722,7 @@ mod tests {
             json!({
                 "id": ulid::Ulid::new().to_string(),
                 "verb": "launch",
-                "args": {"workspace": workspace, "profile": "fake"},
+                "args": {"workspace": workspace, "profile": "fixture"},
             })
         };
         let response = router
@@ -705,7 +731,7 @@ mod tests {
             .unwrap();
         let typed: CommandSubmitResponse = serde_json::from_value(response).unwrap();
         let manager = typed.agent.unwrap();
-        // A Fake Agent cannot launch a child into another workspace: the
+        // An Agent cannot launch a child into another workspace: the
         // child would escape the parent's frozen authority.
         assert_eq!(
             router
@@ -719,6 +745,7 @@ mod tests {
         assert_eq!(store.agent_count().unwrap(), 1);
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&away);
+        let _ = std::fs::remove_dir_all(&config_root);
     }
 
     #[tokio::test]

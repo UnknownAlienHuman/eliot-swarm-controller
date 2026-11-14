@@ -1,5 +1,50 @@
+use std::collections::BTreeMap;
+
 use eliot_core::{ProcessIdentity, ProcessRecord, ProcessState};
 use eliot_store::Store;
+
+/// Install the fixture native source plan after dispatch, before any native
+/// batch. Fixture counterpart of the PluginHost manifest validation
+/// (`install_plugin_sources` after manifest check, before `agent.start`);
+/// the ownership gate refuses every native family until this plan commits.
+/// Uses the common five-family stream plan so every native kind used in
+/// fixtures has an owner.
+pub(crate) fn install_fixture_sources(
+    store: &mut Store,
+    agent: &str,
+    start_command_id: &str,
+    generation: i64,
+    now: i64,
+) {
+    install_fixture_source_plan(
+        store,
+        agent,
+        start_command_id,
+        generation,
+        now,
+        &["session", "turn", "message", "tool", "request"],
+    );
+}
+
+/// Install a scoped fixture native source plan. Handoff fixtures install
+/// exactly the families their handoffs move so the predecessor retains
+/// nothing outside the handoff universe.
+pub(crate) fn install_fixture_source_plan(
+    store: &mut Store,
+    agent: &str,
+    start_command_id: &str,
+    generation: i64,
+    now: i64,
+    families: &[&str],
+) {
+    let plan: BTreeMap<String, String> = families
+        .iter()
+        .map(|family| ((*family).to_owned(), "stream".to_owned()))
+        .collect();
+    store
+        .install_plugin_sources(agent, generation, start_command_id, &plan, now)
+        .expect("install fixture source plan");
+}
 
 /// Seed a live OS source and owned-plugin record through Store's public API.
 pub(crate) fn install_live_owned_process_source(

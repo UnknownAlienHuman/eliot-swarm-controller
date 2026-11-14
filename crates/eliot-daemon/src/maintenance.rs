@@ -633,6 +633,13 @@ mod tests {
                 .target
                 .unwrap();
             store.dispatch(&launch_id, admitted_at).unwrap();
+            crate::test_support::install_fixture_sources(
+                &mut store,
+                &agent,
+                &launch_id,
+                1,
+                admitted_at,
+            );
             store
                 .put_batch(
                     SourceBatch {

@@ -322,10 +322,15 @@ mod tests {
             profiles: Option<&[&str]>,
             actions: Option<&[&str]>,
         ) {
-            let mut source = format!(
+            // Project profiles must name an existing global profile, so every
+            // fixture registration resolves against this real codex profile.
+            let mut source = String::from(
+                "[profiles.fixture]\nharness = \"codex\"\nmodel = \"fixture-model\"\n",
+            );
+            source.push_str(&format!(
                 "[projects.app]\npath = {}\n",
                 toml_string(&checkout.to_string_lossy())
-            );
+            ));
             if let Some(profiles) = profiles {
                 source.push_str(&format!("profiles = {}\n", toml_array(profiles)));
             }
@@ -403,7 +408,7 @@ mod tests {
             .expect("project rule without action approval must be denied");
         assert_eq!(error.code, "not_allowed");
 
-        fixture.write_registration(&checkout, Some(&["fake"]), Some(&["stop"]));
+        fixture.write_registration(&checkout, Some(&["fixture"]), Some(&["stop"]));
         let approved = sole_registration(&fixture).await;
         fixture.write_registration(&checkout, Some(&[]), Some(&["stop"]));
         assert_eq!(
@@ -413,7 +418,7 @@ mod tests {
                 .code,
             "not_allowed"
         );
-        fixture.write_registration(&checkout, Some(&["fake"]), Some(&[]));
+        fixture.write_registration(&checkout, Some(&["fixture"]), Some(&[]));
         assert_eq!(
             verify_registration(&fixture.data_root, &approved)
                 .await
@@ -430,7 +435,7 @@ mod tests {
         fs::create_dir(&checkout).expect("create config checkout placeholder");
         fixture.write_registration(
             &checkout,
-            Some(&["fake"]),
+            Some(&["fixture"]),
             Some(&["interrupt", "send", "stop"]),
         );
 
@@ -438,7 +443,7 @@ mod tests {
             .expect("implemented project actions are approved");
         assert_eq!(configured[0].actions, ["interrupt", "send", "stop"]);
 
-        fixture.write_registration(&checkout, Some(&["fake"]), Some(&["sendfile"]));
+        fixture.write_registration(&checkout, Some(&["fixture"]), Some(&["sendfile"]));
         assert_eq!(
             config::load_project_registration_config(&fixture.data_root)
                 .expect_err("unimplemented sendfile must not be granted")
@@ -534,7 +539,7 @@ mod tests {
         fs::create_dir(&unregistered_workspace).expect("create unregistered workspace");
         fixture.write_rule(&checkout, "registered-rule");
         fixture.write_rule(&unregistered_workspace, "workspace-rule");
-        fixture.write_registration(&checkout, Some(&["fake"]), Some(&["stop"]));
+        fixture.write_registration(&checkout, Some(&["fixture"]), Some(&["stop"]));
 
         let registration = sole_registration(&fixture).await;
         assert_eq!(
@@ -569,7 +574,7 @@ mod tests {
         fs::create_dir(&metadata).expect("create project metadata directory");
         let linked_rules = metadata.join("rules");
         create_directory_link(&external_rules, &linked_rules);
-        fixture.write_registration(&checkout, Some(&["fake"]), Some(&["stop"]));
+        fixture.write_registration(&checkout, Some(&["fixture"]), Some(&["stop"]));
 
         let registration = sole_registration(&fixture).await;
         let error = load_project_rules(&fixture.data_root, registration.clone())

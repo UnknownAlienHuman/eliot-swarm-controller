@@ -366,6 +366,8 @@ mod tests {
                     args: json!({
                         "project": project,
                         "workspace": "synthetic-workspace",
+                        "harness": "codex",
+                        "profile": "fixture",
                         "profile_snapshot": snapshot,
                     }),
                     expected_generation: Some(0),
@@ -378,6 +380,7 @@ mod tests {
             .expect("admit launch");
         let agent = admission.command.target.expect("launch target");
         store.dispatch(&launch_id, now).expect("dispatch launch");
+        crate::test_support::install_fixture_sources(&mut store, &agent, &launch_id, 1, now);
         store
             .put_batch(
                 SourceBatch {
@@ -633,7 +636,7 @@ mod tests {
                         target: None,
                         selector: None,
                         verb: "launch".to_owned(),
-                        args: json!({"project":"app", "workspace":"synthetic-workspace"}),
+                        args: json!({"project":"app", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fixture", "profile_snapshot":{}}),
                         expected_generation: Some(0),
                         expected_turn_id: None,
                         request_id: None,

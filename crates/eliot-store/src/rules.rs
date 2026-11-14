@@ -3373,7 +3373,7 @@ mod tests {
         let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
         launch.args = json!({
             "project": project,
-            "harness": "fake",
+            "harness": "codex",
             "profile": "fake",
             "profile_snapshot": {},
             "workspace": format!("synthetic-{project}"),
@@ -3385,10 +3385,11 @@ mod tests {
             .unwrap()
             .command
             .target
-            .expect("Fake launch Agent");
+            .expect("fixture launch Agent");
         let native_scope = format!("{project}:{agent}:scope");
         let native_ref = format!("{project}:{agent}:thread");
         store.dispatch(&launch_id, now + 1).unwrap();
+        crate::tests::install_fixture_sources(store, &agent, &launch_id, 1, now + 1);
         store
             .put_batch(
                 SourceBatch {
@@ -5028,7 +5029,7 @@ mod tests {
                 let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
                 launch.args = json!({
                     "project": workspace,
-                    "harness": "fake",
+                    "harness": "codex",
                     "profile": "fake",
                     "profile_snapshot": {},
                     "workspace": workspace,
@@ -5765,6 +5766,7 @@ mod tests {
                 .generation,
             Some(2)
         );
+        crate::tests::install_fixture_sources(&mut store, &agent_id, &resume_id, 2, now + 6);
         store
             .put_batch(
                 SourceBatch {
@@ -5916,6 +5918,7 @@ mod tests {
             store.dispatch(&resume_id, now + 11).unwrap().value.state,
             CommandState::Dispatched
         );
+        crate::tests::install_fixture_sources(&mut store, &agent_id, &resume_id, 2, now + 11);
         let starting = store.get_agent(&agent_id).unwrap().unwrap();
         assert_eq!(starting.generation, 2);
         assert_eq!(starting.state, AgentState::Starting);
@@ -6308,6 +6311,7 @@ mod tests {
                                   native_ref: &str,
                                   now: i64| {
             store.dispatch(resume_id, now).unwrap();
+            crate::tests::install_fixture_sources(store, agent, resume_id, 2, now);
             store
                 .put_batch(
                     SourceBatch {
@@ -6640,7 +6644,7 @@ mod tests {
             let mut request = SubmitCommand::new(Ulid::new().to_string(), "launch");
             request.args = json!({
                 "project": workspace,
-                "harness": "fake",
+                "harness": "codex",
                 "profile": "fake",
                 "profile_snapshot": {},
                 "workspace": workspace,
@@ -6706,6 +6710,13 @@ mod tests {
                 .expect("successor launch Agent");
 
             store.dispatch(&first_launch_id, now + 1).unwrap();
+            crate::tests::install_fixture_sources(
+                &mut store,
+                &first_agent,
+                &first_launch_id,
+                1,
+                now + 1,
+            );
             store
                 .put_batch(
                     SourceBatch {
