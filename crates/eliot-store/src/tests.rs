@@ -9422,11 +9422,12 @@ fn ordered_store_reads_keep_unsettled_order_and_observer_exclusions() {
         .collect();
     assert_eq!(first_ids, expected[..3]);
 
-    let plan = explain_plan(
-        &store,
-        super::LIST_UNSETTLED_COMMANDS_SQL,
-        rusqlite::params![100],
+    let list_sql = format!(
+        "{} WHERE {} ORDER BY created_at, rowid LIMIT ?1",
+        super::LIST_UNSETTLED_COMMANDS_COLUMNS,
+        super::UNSETTLED_COMMANDS_WHERE
     );
+    let plan = explain_plan(&store, &list_sql, rusqlite::params![100]);
     assert_ordered_index_plan(
         &plan,
         "commands",
@@ -9436,11 +9437,7 @@ fn ordered_store_reads_keep_unsettled_order_and_observer_exclusions() {
         .connection
         .execute_batch("ANALYZE")
         .expect("analyze Store");
-    let analyzed_plan = explain_plan(
-        &store,
-        super::LIST_UNSETTLED_COMMANDS_SQL,
-        rusqlite::params![100],
-    );
+    let analyzed_plan = explain_plan(&store, &list_sql, rusqlite::params![100]);
     assert_ordered_index_plan(
         &analyzed_plan,
         "commands",
@@ -9495,6 +9492,38 @@ fn legacy_process_page(
         .expect("read legacy page");
     rows.collect::<Result<Vec<_>, _>>()
         .expect("collect legacy page")
+}
+
+#[test]
+fn live_process_owners_reports_only_non_exited_custody_with_honest_totals() {
+    let store = Store::open(Path::new(":memory:")).expect("open Store");
+    insert_process(&store, "boot", 1, 1, "agent:a1#1", "running");
+    insert_process(&store, "boot", 2, 1, "agent:a1#1", "exited");
+    insert_process(&store, "boot", 3, 1, "agent:a2#3", "unknown");
+    insert_process(&store, "boot", 4, 1, "workspace:a3#1", "running");
+    insert_process(&store, "boot", 5, 1, "workspace:a4#2", "exited");
+    insert_process(&store, "boot", 6, 1, "bogus-owner", "running");
+    let (owners, total) = store.live_process_owners(100).expect("live owners");
+    // Four distinct owners retain non-exited records; the malformed owner
+    // counts toward the total but never fabricates custody.
+    assert_eq!(total, 4);
+    assert_eq!(owners.len(), 3);
+    assert!(!owners.iter().any(|owner| owner.agent == "bogus-owner"));
+    let plugin: Vec<(&str, i64)> = owners
+        .iter()
+        .filter(|owner| !owner.workspace)
+        .map(|owner| (owner.agent.as_str(), owner.generation))
+        .collect();
+    assert_eq!(plugin, [("a1", 1), ("a2", 3)]);
+    let workspace: Vec<(&str, i64)> = owners
+        .iter()
+        .filter(|owner| owner.workspace)
+        .map(|owner| (owner.agent.as_str(), owner.generation))
+        .collect();
+    assert_eq!(workspace, [("a3", 1)]);
+    let (bounded, bounded_total) = store.live_process_owners(2).expect("bounded owners");
+    assert_eq!(bounded_total, 4);
+    assert_eq!(bounded.len(), 2);
 }
 
 #[test]

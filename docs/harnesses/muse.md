@@ -20,9 +20,10 @@ state; the installed stable and experimental schemas define this history-exclusi
 Native frame budget: the inbound NDJSON frame cap for the Muse host is 8 MiB
 (`MuseStdioConfig::MAX_FRAME_BYTES`; every other adapter keeps the shared 1 MiB
 default). The cap covers `view/page` readback (Eliot requests `limit: 1000`)
-plus envelope overhead. What it does not cover: Eliot makes no `item/readOutput`
-calls today, so that surface (6 MiB of stored bytes per page, exactly 8 MiB of
-base64 before envelope overhead) does not size this cap; and the installed
+plus envelope overhead, along with the single bounded `item/readOutput` patch
+page below (128 KiB of stored bytes). What still does not size this cap is the
+full `item/readOutput` surface (6 MiB of stored bytes per page, exactly 8 MiB of
+base64 before envelope overhead), which Eliot never fetches; and the installed
 `muse-bin-1.4.0-R4161.1` schema (`muse schema generate-json-schema`) publishes no
 per-surface text budget, so the true `view/page` maximum is unverified.
 `session/resume` with `excludeItems=true` serves `history.mode: "none"` (no items),
@@ -244,14 +245,23 @@ normalizes as the shared completed-file-change payload: `tool` `fileChange`
 with the verbatim native `status`, plus bounded `changed_paths` and
 `changed_paths_truncated` exactly as the Codex adapter emits for its
 `fileChange` items, bound to the exact session/turn while the turn runs. The
-paths come only from the item's inline `args` target (`path`); `args`
+paths come first from the item's inline `args` target (`path`); `args`
 itself, file contents, diffs and results are never persisted. Git
 observation alone cannot establish authorship: only this native hint
-attributes Muse edits. Limit: multi-file patch bodies stay behind the stored
-`patchRef`/`patchSummary` (fetched out of band via `item/readOutput`, which
-this adapter never calls), so a completed edit with no inline target commits
-empty `changed_paths` with `changed_paths_truncated` set, recording the
-coverage gap instead of presenting Git state as authorship.
+attributes Muse edits. When the item carries no inline target, the adapter
+makes exactly one bounded `item/readOutput` fetch of the stored `patchRef`
+(offset 0, 128 KiB page, 10 s deadline, before any commit and holding no
+Store lock) and attaches only the file paths from the patch headers
+(`*** Add/Update/Delete File:` and `*** Move to:` markers, plus unified-diff
+`---`/`+++` lines only as adjacent pairs with the `a/`/`b/` prefix stripped
+and never inside a `*** ... File:` section) in the verbatim
+relative-or-absolute form the Store hint normalizer accepts. The patch body,
+contents and args are never persisted. Limit: when the reference is absent,
+unservable, or the bounded read fails or times out, the completed edit
+commits empty `changed_paths` with `changed_paths_truncated` set; when the
+stored patch runs past the first page, the covered paths attach with
+`changed_paths_truncated` set, recording the coverage gap instead of
+presenting Git state as authorship.
 
 ## Host permissions
 

@@ -1067,18 +1067,42 @@ See [coordination](coordination.md#who-works-on-this) and
 `daemon.shutdown` uses the canonical `DaemonShutdownRequest`/`DaemonShutdownResponse`.
 
 This owner-only request requires exactly an `id` and the `ShutdownMode` value `drain` or
-`force`; unknown fields, missing fields, wrong types and nulls are `invalid`. Its first
-reply is retained under the literal mutation ID. An exact retry returns that same reply,
-including the original drain blocker snapshot; use owner-only `daemon.status` for current
-state. Reusing the ID with another mode returns `id_conflict`.
+`force`; unknown fields, missing fields, wrong types and nulls are `invalid`. Its
+first reply is retained under the literal mutation ID. An exact retry returns that
+same reply, including the original drain blocker snapshot; use owner-only
+`daemon.status` for current state. Reusing the ID with another mode returns
+`id_conflict`. A retained reply written before the drain report existed carries no
+`drain` field and still validates; a present report always validates.
 Force admission is monotonic; a later, in-flight, or replayed drain cannot downgrade it.
 
-Drain returns `state:"applied"` with an empty typed blocker list when no blockers were
-observed, otherwise `state:"dispatched"` with the captured `StatusBlocker` list. Force
-normally returns `state:"dispatched"` and no blocker list. If a Store write fault
-prevents retaining the force reply, the fallback still dispatches force and returns
-`store_write_faulted:true` with the dispatched state; that fallback is not a retained
-write result. When present, `store_write_faulted` is true.
+Drain is a pure read-side report: no effects run before the shutdown-ID claim, and
+the pre-change effect behavior is unchanged. Drain returns `state:"applied"` with an
+empty typed blocker list when no blockers were observed, otherwise
+`state:"dispatched"` with the captured `StatusBlocker` list. Drain also returns a
+bounded `drain` report reusing the existing blocker sources instead of
+a new registry: running turns (Agents with a recorded `active_turn`), unsettled
+commands, unknown commands and live owned processes. Live owned processes come from
+the Store custody snapshot (process records not yet `exited`), never from routing
+eligibility or workspace operation locks: a held workspace operation lock alone is
+not a live child and never appears. Every category carries a count, a bounded list
+and a truncation flag; the bound is 64 entries per list, and the flag is true
+whenever any qualifying record was omitted for any reason (the list bound or the
+Store page byte bound trimming the page). `AgentLive` blockers carry the
+observed `active_turn` when present. An empty report never proves that no native
+effect occurred: an unknown native effect remains unknown until evidence or an
+explicit owner resolution, and neither "session never ready" nor an empty stderr
+proves that no effect occurred. The daemon never auto-resolves unknown to finish
+drain and never forces on the drain path. Force normally returns `state:"dispatched"`
+and no blocker or drain list. If a Store write fault prevents retaining the force
+reply, the fallback still dispatches force and returns `store_write_faulted:true` with
+the dispatched state; that fallback is not a retained write result. When present,
+`store_write_faulted` is true.
+
+`daemon.status` carries the same bounded `drain` report; while draining it is the
+current blockers snapshot, while open it reflects the current fleet.
+`swarm daemon stop --drain` prints the retained `DaemonShutdownResponse` including
+`blockers` and `drain`; `swarm status` prints the typed `DaemonStatusResponse`
+including `blockers`, `unsettled_commands`, `unknown_commands` and `drain`.
 
 Drain rejects new turn-producing work and new automation, while continuing pre-admitted
 work and allowing exact stop/interrupt/request replies/cancel/detach/readback. Unknown
@@ -1116,7 +1140,7 @@ swarm stats A [--generation N]
 swarm git-status A [--generation N]
 swarm edits A [--generation N] [--after PATH] [--limit N]
 swarm send A TEXT [--probe] [--wait] [--timeout-seconds N] [--generation N]
-swarm steer A TEXT --turn ID [--generation N]
+swarm steer A TEXT [--generation N] [--turn ID]
 swarm inject A TEXT --point next_input|turn_safe_point|active_turn [--generation N] [--turn ID] [--expires-at-ms MS]
 swarm interrupt|abort A [--generation N] [--turn ID]
 swarm stop A [--force] [--tree | --generation N]
@@ -1177,6 +1201,16 @@ Only current-layer commands appear in help and Agent guidance. Exit codes: 0 suc
 queued; 1 definite failure; 2 usage; 3 pre-effect rejection; 4 unknown; 5 wait timeout;
 6 still dispatched/pending; 7 interrupted/cancelled. A queued/applied input is not
 successful task completion.
+
+`steer` and `interrupt` do not require `--generation`/`--turn`. When either flag
+is omitted the CLI reads the Agent's current generation and active turn, prints
+the exact target it captured (`<verb> target: agent=A generation=N turn=T` on
+stderr), and submits exactly that binding; an explicit flag always wins over the
+captured value, and when both flags are given the CLI submits them unchanged
+with no extra read. A missing active turn fails clearly (exit 3) before any
+submit. A captured submit that the Store rejects as `stale_generation` is
+reported as a race (exit 3, `race:` message naming the submitted binding) and is
+never retried against the new turn.
 
 Prompted waits (`send --wait`, and `launch --wait` / `resume --wait` with a
 prompt) return 0 only for a positively recognized `success` outcome. Lifecycle
