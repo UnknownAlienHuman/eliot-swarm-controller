@@ -9,6 +9,7 @@ mod git;
 mod goals;
 pub mod harness;
 mod hierarchy;
+mod maintenance;
 mod monitor_views;
 mod mutation_validation;
 mod mutations;
@@ -71,6 +72,7 @@ pub use hierarchy::{
     DEFAULT_MAX_CHILDREN_PER_AGENT, DEFAULT_MAX_DEPTH, DEFAULT_MAX_SELECTOR_TARGETS,
     DEFAULT_MAX_TREE_AGENTS, HierarchyLimits, parse_tree_selector, selector_child_id,
 };
+pub use maintenance::{MaintenanceRunRequest, MaintenanceRunResponse};
 pub use monitor_views::{
     FilesystemInvalidationState, FilesystemInvalidationView, GitObservation, GitView,
     LivenessBasis, LivenessView, MonitoringSourceState, ObservationData, ObservationView,

@@ -52,6 +52,8 @@ pub(crate) enum CliCommand {
     Daemon(DaemonArgs),
     /// Read daemon state without starting a daemon.
     Status,
+    /// Run the bounded retention maintenance pass now (owner only).
+    Maintenance(MaintenanceArgs),
     /// Serve one generic { method, params } MCP tool over stdio (default) or loopback StreamableHTTP.
     #[command(name = "mcp")]
     Mcp(McpArgs),
@@ -670,6 +672,18 @@ pub(crate) struct DaemonArgs {
 #[derive(Subcommand)]
 pub(crate) enum DaemonAction {
     Stop(ShutdownArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct MaintenanceArgs {
+    #[command(subcommand)]
+    pub(crate) command: MaintenanceCommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum MaintenanceCommand {
+    /// Run one bounded retention pass now and report pruned counts.
+    Run,
 }
 
 #[derive(Args)]

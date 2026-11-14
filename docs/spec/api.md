@@ -227,6 +227,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | --- | --- |
 | `api.methods/help/identity` | bounded authenticated method discovery, DTO schemas/examples, and credential-free caller scope |
 | `daemon.status/shutdown` | owner-only current state/admission and exact drain/force |
+| `maintenance.run` | owner-only immediate bounded retention pass reporting pruned counts |
 | `agent.list/get/result` | scoped, paginated Agent state and exact results |
 | `agent.processes/stats` | scoped process records and ephemeral OS samples |
 | `agent.git/edits` | current Git snapshot and paginated native-attributed edits |
@@ -354,6 +355,15 @@ shutdown); `failed` carries only a bounded code (`worker_panicked`, `worker_canc
 The rule worker propagates its actual exit reason from its admission-closed
 return sites: an intentional admission/shutdown exit surfaces as `stopped`,
 while any other `Ok(())` surfaces as `failed` (`worker_exited`).
+
+`maintenance.run` is owner-only and accepts an empty object. It reloads the
+daemon retention settings and runs the same bounded retention epochs as the
+hourly tick (same row and time budgets, same drain rule), returning the Core
+[`MaintenanceRunResponse`](../../crates/eliot-core/src/api/maintenance.rs)
+pruned counts and the retained-event watermark `pruned_through`. A rejected
+settings reload fails the call instead of pruning under stale windows. The
+manual pass adds no new retention semantics; the contract stays in
+[core](core.md#retention).
 
 `project.list` and `project.get` are owner-only readbacks of the owner-registered
 canonical checkout, repository common directory, explicit profile/action allowlists and

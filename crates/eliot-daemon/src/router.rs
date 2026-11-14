@@ -42,13 +42,13 @@ use eliot_core::{
         EventsBoundsRequest, EventsFilter, EventsReadRequest, EventsReadResponse,
         EventsSubscribeRequest, EventsSubscribeResponse, GitFetchDefinitionArgs, GitView,
         MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
-        NotifyDefinitionArgs, ObservationPage, ObservationQuery, ObservationView, OwnedProcessKind,
-        OwnedProcessSummary, ProcessPageCursor, ProjectRegistrationView, ProviderClearHoldRequest,
-        ProviderHoldsRequest, RuleGetRequest, RuleStateView, RunningTurnSummary, ShutdownMode,
-        SourceState, StatusBlocker, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest,
-        TimerStateView, TurnGetRequest, UnsettledCommandSummary, UsageScopeView,
-        UsageSummaryRequest, WaitEntryResult, WorkerTaskHealth, WorkerTaskStatus,
-        WorkspaceCustodyView,
+        MaintenanceRunRequest, MaintenanceRunResponse, NotifyDefinitionArgs, ObservationPage,
+        ObservationQuery, ObservationView, OwnedProcessKind, OwnedProcessSummary,
+        ProcessPageCursor, ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest,
+        RuleGetRequest, RuleStateView, RunningTurnSummary, ShutdownMode, SourceState,
+        StatusBlocker, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView,
+        TurnGetRequest, UnsettledCommandSummary, UsageScopeView, UsageSummaryRequest,
+        WaitEntryResult, WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -267,6 +267,7 @@ impl Router {
                 require_owner(&principal)?;
                 self.shutdown(&params, &principal).await
             }
+            "maintenance.run" => self.maintenance_run(&params, &principal).await,
             "command.submit" => {
                 self.submit_bound(&params, &principal, remote.as_ref())
                     .await
@@ -3643,6 +3644,35 @@ impl Router {
         Ok((events, cursor, high_water, truncated, encoded_bytes))
     }
 
+    /// Owner-triggered retention pass: reload the daemon retention settings
+    /// and run the same bounded epochs as the hourly tick, returning the
+    /// pruned counts and the retained-event watermark.
+    async fn maintenance_run(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: MaintenanceRunRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let policy = self.secret_policy_snapshot();
+        let report = crate::maintenance::run_now(
+            &self.inner.store,
+            &self.inner.data_root,
+            &policy,
+            now_ms(),
+        )
+        .await?;
+        let response = MaintenanceRunResponse {
+            events_deleted: report.events_deleted,
+            pruned_through: report.pruned_through,
+            commands_deleted: report.commands_deleted,
+            writes_deleted: report.writes_deleted,
+            mail_deleted: report.mail_deleted,
+            digests_deleted: report.digests_deleted,
+        };
+        request.validate_response(&response)?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "maintenance.run result could not be encoded"))
+    }
+
     async fn status(&self) -> Result<Value> {
         let blockers = self.status_blockers().await?;
         let drain = self.drain_report().await?;
@@ -5745,6 +5775,40 @@ mod tests {
             Arc::new(AsyncMutex::new(store)),
             Bus::new(16),
         )
+    }
+
+    #[tokio::test]
+    async fn maintenance_run_is_owner_only_and_reports_typed_counts() {
+        let router = router();
+        let agent = Principal::Agent {
+            id: "a1".to_owned(),
+            generation: 1,
+        };
+        assert_eq!(
+            router
+                .maintenance_run(&json!({}), &agent)
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        assert_eq!(
+            router
+                .maintenance_run(&json!({"extra": true}), &Principal::Owner)
+                .await
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
+        let value = router
+            .maintenance_run(&json!({}), &Principal::Owner)
+            .await
+            .unwrap();
+        let typed: MaintenanceRunResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(typed.commands_deleted, 0);
+        MaintenanceRunRequest::default()
+            .validate_response(&typed)
+            .unwrap();
     }
 
     #[tokio::test]
