@@ -60,8 +60,11 @@ vendor-owned. Eliot is not another coding harness.
 
 ## Non-goals
 
-No Task/Issue/review/acceptance/publication engine, GUI, multi-user security platform,
-proof packets, readiness registers or operational document-hash ceremony. Protocol
+No Task/Issue/review/acceptance/publication engine, multi-user security platform,
+proof packets, readiness registers or operational document-hash ceremony. The former
+GUI non-goal is superseded: one optional Windows desktop companion (`swarm-desktop`,
+driven by the daemon) is approved; the daemon/CLI remains the headless authority and
+default build. Protocol
 acknowledgement and mutation idempotency are ordinary implementation correctness, not
 permission to construct a generic receipt/provenance platform.
 

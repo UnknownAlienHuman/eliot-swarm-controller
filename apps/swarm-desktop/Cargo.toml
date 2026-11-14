@@ -1,0 +1,30 @@
+[package]
+name = "swarm-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "swarm-desktop"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+eliot-core.workspace = true
+eliot-daemon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1.53.2", features = ["rt", "net", "time"] }
+ulid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# First real code import of windows-reactor: Microsoft windows-rs 0.100.0
+# (https://github.com/microsoft/windows-rs), MIT OR Apache-2.0, rust-version
+# 1.95, below the pinned workspace toolchain 1.99.1. License texts live in
+# the crate (license-mit / license-apache-2.0); no donor source is copied,
+# the library is used directly. WinUI staging at runtime uses Reactor's own
+# bootstrap inside App::run; no self-contained exe is promised.
+windows-reactor = "=0.100.0"
