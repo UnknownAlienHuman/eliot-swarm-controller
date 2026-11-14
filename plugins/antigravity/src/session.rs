@@ -1186,6 +1186,12 @@ pub(crate) fn hook_helper_path() -> Result<PathBuf> {
 /// through `--add-dir`, so this root — never the instance directory — is
 /// the only `--add-dir` value. Both fresh starts and resumed sessions stage
 /// a new root on this same path; hook delivery itself is unchanged.
+///
+/// The stored root is a plain absolute path: on Windows, canonicalization
+/// adds the verbatim `\\?\` prefix, which the native CLI turns into an
+/// invalid `file://` URL escape and rejects, silently dropping the whole
+/// discovery root (and its hooks). Stripping the prefix names the identical
+/// directory, so staging, containment and cleanup are unaffected.
 pub(crate) fn stage_hook_config(
     instance_dir: &Path,
     workspace: &Path,
@@ -1314,12 +1320,45 @@ pub(crate) fn stage_hook_config(
             "Could not write the owned Antigravity hook config",
         ));
     }
+    // The filesystem work above ran on the canonical (possibly verbatim)
+    // paths naming these same files; store the plain spelling so `--add-dir`
+    // and diagnostics carry a path the native CLI can load. Deriving both
+    // from the stripped root keeps the guard consistent by construction.
+    let root = without_verbatim_prefix(&root);
+    let agents_dir = root.join(".agents");
+    let path = agents_dir.join("hooks.json");
     Ok(HookConfigGuard(Some(OwnedHookConfig {
         path,
         root,
         remove_agents_dir,
         remove_root: true,
     })))
+}
+
+/// Strip the Windows verbatim path prefix (`\\?\`, including the long-UNC
+/// `\\?\UNC\` form) so a canonicalized directory can be handed to native
+/// tooling that builds `file://` URLs from its roots: AGY 1.5.3 rejects the
+/// escaped `?` and drops the whole root, with its hooks, without firing.
+/// The stripped path names the identical directory on Windows; elsewhere,
+/// and for non-UTF-8 paths, this is the identity.
+pub(crate) fn without_verbatim_prefix(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let Some(text) = path.as_os_str().to_str() else {
+            return path.to_owned();
+        };
+        if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(plain) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(plain);
+        }
+        path.to_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_owned()
+    }
 }
 
 fn hook_command(helper: &Path) -> Result<String> {
@@ -1505,6 +1544,58 @@ mod tests {
         serde_json::to_string(&expected).unwrap()
     }
 
+    fn has_verbatim_prefix(path: &Path) -> bool {
+        path.as_os_str()
+            .to_str()
+            .is_some_and(|text| text.starts_with(r"\\?\"))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_prefix_is_stripped_for_native_roots() {
+        assert_eq!(
+            without_verbatim_prefix(Path::new(r"\\?\C:\a\b")),
+            PathBuf::from(r"C:\a\b")
+        );
+        assert_eq!(
+            without_verbatim_prefix(Path::new(r"\\?\UNC\srv\sh\root")),
+            PathBuf::from(r"\\srv\sh\root")
+        );
+        assert_eq!(
+            without_verbatim_prefix(Path::new(r"C:\a\b")),
+            PathBuf::from(r"C:\a\b")
+        );
+        assert_eq!(
+            without_verbatim_prefix(Path::new(r"\\srv\sh\root")),
+            PathBuf::from(r"\\srv\sh\root")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn verbatim_prefix_is_identity_off_windows() {
+        assert_eq!(
+            without_verbatim_prefix(Path::new("/tmp/eliot-hooks")),
+            PathBuf::from("/tmp/eliot-hooks")
+        );
+    }
+
+    // AGY 1.5.3 turns `--add-dir` into a `file://` URL and rejects the
+    // escaped `?` of a verbatim path, dropping the discovery root and its
+    // hooks without firing. The staged root must never carry the prefix.
+    #[test]
+    fn staged_hook_root_has_no_verbatim_prefix() {
+        let (base, instance_dir, workspace) = stage_dirs("plain");
+        let helper = Path::new("eliot-hook-helper");
+        let guard = stage_hook_config(&instance_dir, &workspace, helper).unwrap();
+        let inner = guard.0.as_ref().unwrap();
+        assert!(!has_verbatim_prefix(inner.root()));
+        assert!(!has_verbatim_prefix(&inner.path));
+        assert_eq!(inner.path.parent().unwrap().join("hooks.json"), inner.path);
+        drop(guard);
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn staged_hook_root_holds_only_hooks_json() {
         let (base, instance_dir, workspace) = stage_dirs("only");
@@ -1515,7 +1606,7 @@ mod tests {
         assert_ne!(guard.root(), instance_dir);
         assert_eq!(
             guard.root().parent().unwrap(),
-            fs::canonicalize(&base).unwrap()
+            without_verbatim_prefix(&fs::canonicalize(&base).unwrap())
         );
         let mut root_entries: Vec<_> = fs::read_dir(guard.root())
             .unwrap()

@@ -78,6 +78,16 @@ const METHODS: &[Method] = &[
     method!("command.resolve", CommandResolveRequest, CommandResolveResponse, true, true, "Record an owner resolution of an uncertain command; never replay its effect.", {"id":EXAMPLE_ID,"command_id":"previous-command","as":"failed","reason":"Owner verified failure."}),
     method!("agent.get", AgentGetRequest, AgentGetResponse, false, false, "Read Agent state, native capabilities and source health.", {"id":"a1"}),
     method!("agent.discover", AgentDiscoverRequest, DiscoverPage, true, false, "Discover native metadata through an installed profile without creating Agents.", {"profile":"codex","limit":20}),
+    method!(
+        "harness.list",
+        HarnessListRequest,
+        HarnessListResponse,
+        true,
+        false,
+        "List installed harness executables with versions; starts no model turn and performs no inference.",
+        {}
+    ),
+    method!("harness.models", HarnessModelsRequest, HarnessModelsResponse, true, false, "Read a harness native model catalogue through its own read-only method; starts no model turn and performs no inference.", {"harness":"codex"}),
     method!("agent.history", AgentHistoryRequest, ObservationPage, true, false, "Read a bounded native history view advertised by agent.get.", {"id":"a1","source":"native","view":"turns","limit":20}),
     method!("agent.list", AgentListRequest, AgentListResponse, false, false, "List scoped compact Agent summaries with indexed state/project/harness/parent/root filters, counts and explicit truncation.", {"limit":20,"state":"busy"}),
     method!("agent.result", AgentResultRequest, AgentResultResponse, false, false, "Read retained turns/results for one Agent.", {"id":"a1","limit":20}),
@@ -100,6 +110,7 @@ const METHODS: &[Method] = &[
     method!("events.read", EventsReadRequest, EventsReadResponse, false, false, "Read a bounded event page; history gaps remain explicit.", {"after":0,"limit":20}),
     method!("events.subscribe", EventsSubscribeRequest, EventsSubscribeResponse, false, false, "Long-poll a bounded event page, at most 30 seconds.", {"after":0,"limit":20,"wait_ms":1000}),
     method!("swarm.wait", SwarmWaitRequest, SwarmWaitResponse, false, false, "Wait up to 30 seconds for a frozen set of child commands/turns with all/any semantics.", {"commands":[EXAMPLE_ID],"turns":[],"mode":"all","wait_ms":1000}),
+    method!("swarm.digest", SwarmDigestRequest, SwarmDigestResponse, false, true, "Register a durable completion digest delivering one coalesced parent mailbox result with the standard mail wake.", {"id":EXAMPLE_ID,"to":"a1","mode":"all","commands":[EXAMPLE_ID],"turns":[]}),
     method!("project.get", ProjectGetRequest, ProjectRegistrationView, true, false, "Read one approved project registration.", {"id":"project-1"}),
     method!(
         "project.list",
@@ -244,6 +255,7 @@ impl Router {
             "var.set" => &["swarm var set"],
             "var.get" => &["swarm var get"],
             "swarm.wait" => &["swarm wait"],
+            "swarm.digest" => &["swarm digest"],
             _ => &[],
         };
         let mut unsupported = vec!["A method listing grants no additional authority. Unsupported native verbs reject; inspect agent.get for the exact target generation's capabilities.".to_owned()];

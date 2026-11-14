@@ -13,10 +13,10 @@
 
 use super::{
     Change, DaemonEventInput, Error, MAX_EVENT_BYTES, Result, Store, canonical, command_binding,
-    commit_transaction, decode_json, encode_json, enforce_page_bytes, has_pending_send_input,
-    has_unknown_gate, history_expired, insert_daemon_event_for_command, insert_daemon_event_input,
-    load_agent_by_num, load_command_record, provider_holds, sql_error, validate_id_age,
-    validate_limit, validate_ulid, write_binding,
+    commit_transaction, decode_json, digest_id_bound, encode_json, enforce_page_bytes,
+    has_pending_send_input, has_unknown_gate, history_expired, insert_daemon_event_for_command,
+    insert_daemon_event_input, load_agent_by_num, load_command_record, provider_holds, sql_error,
+    validate_id_age, validate_limit, validate_ulid, write_binding,
 };
 use eliot_core::{
     Agent, AgentState, CommandState,
@@ -280,12 +280,43 @@ impl Store {
         limits: MailLimits,
         now: i64,
     ) -> Result<MailSendResult> {
+        self.mail_send_filtered(principal, request, limits, now, false)
+    }
+
+    /// Digest delivery path: the mail id is the digest registration id by
+    /// design, so the shared-namespace guard in [`Store::mail_send_filtered`]
+    /// exempts it. Only the completion-digest driver may use this; every
+    /// other caller uses [`Store::mail_send`].
+    pub fn mail_send_digest_delivery(
+        &mut self,
+        principal: &str,
+        request: &MailSendRequest,
+        limits: MailLimits,
+        now: i64,
+    ) -> Result<MailSendResult> {
+        self.mail_send_filtered(principal, request, limits, now, true)
+    }
+
+    fn mail_send_filtered(
+        &mut self,
+        principal: &str,
+        request: &MailSendRequest,
+        limits: MailLimits,
+        now: i64,
+        allow_digest_id: bool,
+    ) -> Result<MailSendResult> {
         self.ensure_committed_reads()?;
         let prepared = self.prepare_mail_send(principal, request)?;
         if command_binding(&self.connection, &request.id)?.is_some() {
             return Err(Error::new(
                 "id_conflict",
                 "mail write id is already used by a command",
+            ));
+        }
+        if !allow_digest_id && digest_id_bound(&self.connection, &request.id)? {
+            return Err(Error::new(
+                "id_conflict",
+                "mail write id is already used by a completion digest",
             ));
         }
         if let Some(retained) = retained_write_binding(
@@ -306,7 +337,8 @@ impl Store {
             });
         }
         self.ensure_writer_healthy()?;
-        let result = self.mail_send_inner(principal, request, &prepared, limits, now);
+        let result =
+            self.mail_send_inner(principal, request, &prepared, limits, now, allow_digest_id);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -781,6 +813,7 @@ impl Store {
         prepared: &PreparedMailSend,
         limits: MailLimits,
         now: i64,
+        allow_digest_id: bool,
     ) -> Result<MailSendResult> {
         limits.validate()?;
         if request.mode != MailMode::Queue {
@@ -803,6 +836,12 @@ impl Store {
             return Err(Error::new(
                 "id_conflict",
                 "mail write id is already used by a command",
+            ));
+        }
+        if !allow_digest_id && digest_id_bound(&tx, &request.id)? {
+            return Err(Error::new(
+                "id_conflict",
+                "mail write id is already used by a completion digest",
             ));
         }
         if let Some(old_result) = retained_write_binding(
@@ -1752,7 +1791,7 @@ mod tests {
             })
             .expect("read Store migration version");
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 36);
+        assert_eq!(version, 37);
         for table in ["messages", "vars", "mail_notices", "claims"] {
             let found: i64 = store
                 .connection

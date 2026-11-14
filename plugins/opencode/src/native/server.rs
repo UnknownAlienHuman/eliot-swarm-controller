@@ -70,24 +70,25 @@ pub struct LocalProvider {
     pub package: String,
 }
 
-/// The generated per-Agent config: the frozen profile model plus an
-/// explicitly empty MCP set. On the cloud path there are no providers or
-/// credentials in this document: the Agent runs the server defaults, and
-/// the selected native credential arrives through the pre-serve auth
-/// transfer into the isolated store, never through this document. On the
+/// The generated per-Agent config: the frozen profile model when one was
+/// requested, otherwise no `model` key so the configured native default
+/// applies. An explicitly empty MCP set. On the cloud path there are no
+/// providers or credentials in this document: the Agent runs the server
+/// defaults, and the selected native credential arrives through the pre-serve
+/// auth transfer into the isolated store, never through this document. On the
 /// adopted local path the frozen provider block below renders the installed
 /// native schema (`providers`, `package`, `settings`, model capabilities
 /// and `limit.context/output`) with `{env:NAME}` references only, so key
 /// values stay runtime-only; no-auth mode carries no `apiKey` key at all,
-/// never an empty string.
-fn agent_config_json(model: &str, local: Option<&LocalProvider>) -> String {
-    match local {
+/// never an empty string. A local-backend profile always carries an explicit
+/// model (the eliot-local segment): absent model with a local provider is a
+/// profile error raised by the caller, never rendered here.
+fn agent_config_json(model: Option<&str>, local: Option<&LocalProvider>) -> String {
+    let mut document = match local {
         None => serde_json::json!({
             "$schema": "https://opencode.ai/config.json",
-            "model": model,
             "mcp": {},
-        })
-        .to_string(),
+        }),
         Some(provider) => {
             let mut settings = serde_json::Map::new();
             settings.insert(
@@ -114,7 +115,6 @@ fn agent_config_json(model: &str, local: Option<&LocalProvider>) -> String {
             );
             serde_json::json!({
                 "$schema": "https://opencode.ai/config.json",
-                "model": model,
                 "providers": {
                     &provider.provider_id: {
                         "package": provider.package,
@@ -124,9 +124,12 @@ fn agent_config_json(model: &str, local: Option<&LocalProvider>) -> String {
                 },
                 "mcp": {},
             })
-            .to_string()
         }
+    };
+    if let Some(model) = model {
+        document["model"] = serde_json::Value::String(model.to_owned());
     }
+    document.to_string()
 }
 
 pub struct ServerLaunch {
@@ -136,7 +139,7 @@ pub struct ServerLaunch {
     pub store_root: PathBuf,
     pub agent_id: String,
     pub environment: Vec<(OsString, OsString)>,
-    pub model: String,
+    pub model: Option<String>,
     pub auth: Option<AuthSetup>,
     pub local: Option<LocalProvider>,
 }
@@ -197,9 +200,15 @@ impl OwnedServer {
             )
         })?;
         let config_path = config_dir.join("opencode.jsonc");
+        if launch.local.is_some() && launch.model.is_none() {
+            return Err(Error::new(
+                "profile_error",
+                "OpenCode local backend requires an explicit model with the dedicated eliot-local provider segment",
+            ));
+        }
         std::fs::write(
             &config_path,
-            agent_config_json(&launch.model, launch.local.as_ref()),
+            agent_config_json(launch.model.as_deref(), launch.local.as_ref()),
         )
         .map_err(|error| {
             Error::new(
@@ -564,7 +573,7 @@ mod tests {
     #[test]
     fn generated_config_pins_model_and_empty_mcp() {
         let parsed: serde_json::Value =
-            serde_json::from_str(&agent_config_json("opencode/big-pickle", None))
+            serde_json::from_str(&agent_config_json(Some("opencode/big-pickle"), None))
                 .expect("valid JSON");
         assert_eq!(parsed["model"], "opencode/big-pickle");
         assert_eq!(parsed["mcp"], serde_json::json!({}));
@@ -591,7 +600,7 @@ mod tests {
     #[test]
     fn local_config_renders_provider_package_settings_limits_and_env_key_reference() {
         let parsed: serde_json::Value = serde_json::from_str(&agent_config_json(
-            "eliot-local/qwen3-8b",
+            Some("eliot-local/qwen3-8b"),
             Some(&local_provider_fixture(Some("LOCAL_LLM_KEY"))),
         ))
         .expect("valid JSON");
@@ -617,8 +626,10 @@ mod tests {
     fn local_no_auth_config_carries_no_key_not_an_empty_string() {
         // Missing key must never become no-auth mode with an empty string:
         // no-auth mode omits the key entirely.
-        let rendered =
-            agent_config_json("eliot-local/qwen3-8b", Some(&local_provider_fixture(None)));
+        let rendered = agent_config_json(
+            Some("eliot-local/qwen3-8b"),
+            Some(&local_provider_fixture(None)),
+        );
         let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
         let settings = &parsed["providers"]["eliot-local"]["settings"];
         assert_eq!(
@@ -629,6 +640,40 @@ mod tests {
         assert_eq!(settings["baseURL"], "http://127.0.0.1:1234/v1");
         assert!(settings.get("apiKey").is_none());
         assert!(!rendered.contains("apiKey"));
+    }
+
+    #[test]
+    fn absent_model_omits_the_key_for_the_native_default() {
+        // Requested-absent: no `model` key, so the configured native default
+        // applies; the effective value is read back from the session.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&agent_config_json(None, None)).expect("valid JSON");
+        assert!(parsed.get("model").is_none(), "native default applies");
+        assert_eq!(parsed["mcp"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn config_covers_absent_cloud_model_and_explicit_local_model() {
+        // Ad-hoc cloud launch without a model: no `model` key and no
+        // providers block, so the configured native default applies.
+        let cloud: serde_json::Value =
+            serde_json::from_str(&agent_config_json(None, None)).expect("valid JSON");
+        assert!(cloud.get("model").is_none());
+        assert!(cloud.get("providers").is_none());
+        assert_eq!(cloud["mcp"], serde_json::json!({}));
+        // Adopted local-backend profile: the explicit eliot-local model plus
+        // the frozen provider document.
+        let local: serde_json::Value = serde_json::from_str(&agent_config_json(
+            Some("eliot-local/qwen3-8b"),
+            Some(&local_provider_fixture(Some("LOCAL_LLM_KEY"))),
+        ))
+        .expect("valid JSON");
+        assert_eq!(local["model"], "eliot-local/qwen3-8b");
+        assert_eq!(
+            local["providers"]["eliot-local"]["settings"]["baseURL"],
+            "http://127.0.0.1:1234/v1"
+        );
+        assert_eq!(local["mcp"], serde_json::json!({}));
     }
 
     #[test]

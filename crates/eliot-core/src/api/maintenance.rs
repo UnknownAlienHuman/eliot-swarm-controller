@@ -31,6 +31,7 @@ pub struct MaintenanceRunResponse {
     pub commands_deleted: i64,
     pub writes_deleted: i64,
     pub mail_deleted: i64,
+    pub digests_deleted: i64,
 }
 
 impl MaintenanceRunResponse {
@@ -41,6 +42,7 @@ impl MaintenanceRunResponse {
             ("commands_deleted", self.commands_deleted),
             ("writes_deleted", self.writes_deleted),
             ("mail_deleted", self.mail_deleted),
+            ("digests_deleted", self.digests_deleted),
         ] {
             if value < 0 {
                 return Err(Error::new(
@@ -75,6 +77,7 @@ mod tests {
             commands_deleted: 3,
             writes_deleted: 4,
             mail_deleted: 0,
+            digests_deleted: 1,
         };
         response.validate().unwrap();
         request.validate_response(&response).unwrap();
@@ -86,6 +89,7 @@ mod tests {
                 "commands_deleted": 3,
                 "writes_deleted": 4,
                 "mail_deleted": 0,
+                "digests_deleted": 1,
             })
         );
         assert_eq!(

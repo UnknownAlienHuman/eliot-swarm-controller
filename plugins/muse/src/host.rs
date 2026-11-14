@@ -3,7 +3,7 @@ mod start;
 use crate::{
     events::{EventHandle, TurnFacts},
     native::{
-        NativeClient, NativeProcess,
+        NativeClient, NativeLaunch, NativeProcess,
         requests::describe_request,
         types::{
             NativeApprovalListPendingParams, NativeApprovalListPendingResult,
@@ -261,6 +261,7 @@ impl MusePlugin {
     ) -> Result<Value> {
         let result = match request.method.as_str() {
             "initialize" => self.initialize(&request.params),
+            "model.list" => self.model_list(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
             "agent.command" => self.command(&request.params).await,
             "agent.snapshot" => self.snapshot(&request.params).await,
@@ -489,7 +490,7 @@ impl MusePlugin {
 
         let initialized_native = match Self::initialize_native(
             &session.native_client,
-            &requested_model,
+            requested_model.as_deref(),
             requested_effort.as_deref(),
         )
         .await
@@ -587,7 +588,9 @@ impl MusePlugin {
         } else {
             let native_params = NativeSessionStartParams {
                 command_id: new_command_id(),
-                model_id: Some(requested_model.clone()),
+                // Omitted model defers to the server default; the effective
+                // id is read back from the session below.
+                model_id: requested_model.clone(),
                 workspace_root: Some(workspace.to_string_lossy().into_owned()),
                 approval_mode: requested_approval.clone(),
             };
@@ -759,7 +762,7 @@ impl MusePlugin {
                 &mut session,
                 &native_session,
                 resume_subject.is_some(),
-                &requested_model,
+                requested_model.as_deref(),
             )
             .await?;
         let approval_set = self
@@ -814,7 +817,11 @@ impl MusePlugin {
                         .map(|state| state.mode.clone()),
                 )
             };
-        let model_verified = effective_model.as_deref() == Some(requested_model.as_str());
+        // An omitted request accepts the server-selected model as
+        // effective; an explicit request must match exactly.
+        let model_verified = requested_model
+            .as_deref()
+            .is_none_or(|requested| effective_model.as_deref() == Some(requested));
         let approval_verified = requested_approval
             .as_deref()
             .is_some_and(|approval| effective_approval.as_deref() == Some(approval));
@@ -1770,10 +1777,186 @@ async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error
     session.native_client.diagnostic_error(error)
 }
 
+/// Pure catalogue selection: an explicit request matches exactly or fails
+/// honestly with no substitution; an omitted request proves the catalogue
+/// reachable and non-empty (an empty catalogue, e.g. Muse 1.4.20's
+/// `bundledCatalog` with zero models, serves no default) and defers to the
+/// server default, whose effective id is read back from the session.
+fn select_launch_model(
+    catalog: NativeModelListResult,
+    requested_model: Option<&str>,
+) -> Result<Option<NativeModelCatalogEntry>> {
+    let source = catalog
+        .source
+        .clone()
+        .unwrap_or_else(|| "unknown".to_owned());
+    let count = catalog.models.len();
+    match requested_model {
+        Some(requested) => catalog
+            .models
+            .into_iter()
+            .find(|model| model.model_id == requested)
+            .map(Some)
+            .ok_or_else(|| {
+                Error::new(
+                    "profile_error",
+                    format!(
+                        "Muse model catalogue (source {source}, {count} models) does not contain the exact requested model"
+                    ),
+                )
+            }),
+        None if catalog.models.is_empty() => Err(Error::new(
+            "profile_error",
+            format!(
+                "Muse model catalogue (source {source}, {count} models) names no default model; use an explicit model"
+            ),
+        )),
+        None => Ok(None),
+    }
+}
+
+impl MusePlugin {
+    /// Read-only native model catalogue for `harness.models`. A dedicated
+    /// reader instance spawns a transient `muse serve`, runs initialize
+    /// plus `model/list`, then terminates. No session, no turn, no input
+    /// and no inference. The catalogue names no default marker; the server
+    /// default applies at launch and is read back from the session.
+    async fn model_list(&self, raw: &Value) -> Result<Value> {
+        if self.session.is_some() || self.failed_start.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Muse model.list requires a dedicated reader plugin instance",
+            ));
+        }
+        let profile: Value = decode(raw, "Muse model.list params are invalid")?;
+        let snapshot = profile.get("profile").unwrap_or(&profile);
+        if snapshot.get("harness").and_then(Value::as_str) != Some("muse") {
+            return Err(Error::new(
+                "profile_error",
+                "Muse model.list received another harness",
+            ));
+        }
+        let program = snapshot
+            .get("cmd")
+            .and_then(Value::as_str)
+            .filter(|cmd| !cmd.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "profile_error",
+                    "Muse model.list requires a discovered native cmd",
+                )
+            })?;
+        let cwd = std::env::current_dir()
+            .map_err(|_| Error::new("internal", "Muse model.list could not read its cwd"))?;
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        let mut native = NativeProcess::spawn(
+            NativeLaunch {
+                program: OsString::from(program),
+                args: vec![OsString::from("serve")],
+                cwd,
+                environment: Vec::new(),
+            },
+            SecretPolicy::new(std::iter::empty::<String>()),
+        )
+        .await?;
+        let client = native.client();
+        let result: Result<Value> = async {
+            use crate::native::types::{
+                NativeClientCapabilities, NativeClientInfo, NativeInitializeParams,
+                NativeInitializeResult,
+            };
+            let init = NativeInitializeParams {
+                client_info: NativeClientInfo {
+                    name: "eliot-models".to_owned(),
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                    title: Some("Eliot models".to_owned()),
+                },
+                capabilities: Some(NativeClientCapabilities {
+                    user_input_dialogs: Some(true),
+                }),
+            };
+            let init_value = serde_json::to_value(init).map_err(|_| {
+                Error::new(
+                    "internal",
+                    "Muse model.list initialize params could not be encoded",
+                )
+            })?;
+            let _initialized: NativeInitializeResult = serde_json::from_value(
+                client
+                    .call("initialize", init_value, deadline)
+                    .await
+                    .map_err(|error| {
+                        let detail = error.message.clone();
+                        error.with_message(format!("Muse model.list initialize failed: {detail}"))
+                    })?,
+            )
+            .map_err(|_| {
+                Error::new(
+                    "profile_error",
+                    "Muse model.list initialize response was invalid",
+                )
+            })?;
+            client
+                .notify("initialized", None, deadline)
+                .await
+                .map_err(|error| {
+                    let detail = error.message.clone();
+                    error.with_message(format!(
+                        "Muse model.list initialized notify failed: {detail}"
+                    ))
+                })?;
+            let response = client
+                .call(
+                    "model/list",
+                    serde_json::to_value(NativeModelListParams { session_id: None }).map_err(
+                        |_| Error::new("internal", "Muse model.list params could not be encoded"),
+                    )?,
+                    deadline,
+                )
+                .await
+                .map_err(|error| {
+                    let detail = error.message.clone();
+                    error.with_message(format!(
+                        "Muse model.list did not return a catalogue: {detail}"
+                    ))
+                })?;
+            let catalog: NativeModelListResult =
+                serde_json::from_value(response).map_err(|_| {
+                    Error::new(
+                        "profile_error",
+                        "Muse model/list result did not match the installed schema",
+                    )
+                })?;
+            let models: Vec<Value> = catalog
+                .models
+                .into_iter()
+                .map(|entry| {
+                    let efforts = match entry.variants {
+                        Some(crate::native::types::NativeModelEffortVariants::Known(variants)) => {
+                            Some(variants)
+                        }
+                        _ => None,
+                    };
+                    json!({
+                        "id": entry.model_id,
+                        "default": false,
+                        "efforts": efforts,
+                    })
+                })
+                .collect();
+            Ok(json!({"models": models, "default": Value::Null}))
+        }
+        .await;
+        let result = result.map_err(|error| client.diagnostic_error(error));
+        let _ = native.terminate(false, Instant::now() + RPC_TIMEOUT).await;
+        result
+    }
+}
+
 async fn discover_model(
     client: &NativeClient,
-    requested_model: &str,
-) -> Result<NativeModelCatalogEntry> {
+    requested_model: Option<&str>,
+) -> Result<Option<NativeModelCatalogEntry>> {
     // `model/list` is a single snapshot call: v1 has no catalog pagination
     // and no catalog subscription.
     let response = client
@@ -1801,23 +1984,7 @@ async fn discover_model(
             "Muse model/list result did not match the installed schema",
         )
     })?;
-    let source = catalog
-        .source
-        .clone()
-        .unwrap_or_else(|| "unknown".to_owned());
-    let count = catalog.models.len();
-    catalog
-        .models
-        .into_iter()
-        .find(|model| model.model_id == requested_model)
-        .ok_or_else(|| {
-            Error::new(
-                "profile_error",
-                format!(
-                    "Muse model catalogue (source {source}, {count} models) does not contain the exact requested model"
-                ),
-            )
-        })
+    select_launch_model(catalog, requested_model)
 }
 
 async fn read_live_snapshot(
@@ -2486,9 +2653,9 @@ fn muse_serve_args(permissions: &str) -> Vec<OsString> {
 mod tests {
     use super::{
         MusePlugin, muse_manifest, muse_scope, muse_serve_args, new_command_id,
-        validate_resume_preflight,
+        select_launch_model, validate_resume_preflight,
     };
-    use crate::native::types::NativeSession;
+    use crate::native::types::{NativeModelListResult, NativeSession};
     use eliot_plugin::{AgentStartParams, Peer, session::validate_source_plan};
     use serde_json::{Value, json};
     use std::ffi::OsString;
@@ -2809,5 +2976,64 @@ mod tests {
             wire.get("reasoningEffort").is_none(),
             "absent effort omits the wire field"
         );
+    }
+
+    fn recorded_catalogue() -> NativeModelListResult {
+        // Recorded `model/list` shape: a provider catalogue with two models,
+        // the first carrying known effort variants.
+        serde_json::from_value(json!({
+            "models": [
+                {
+                    "modelId": "muse-spark",
+                    "providerId": "muse",
+                    "variants": ["low", "medium", "high"]
+                },
+                {
+                    "modelId": "muse-mini",
+                    "providerId": "muse",
+                    "variants": null
+                }
+            ],
+            "providerId": "muse",
+            "source": "providerCatalog"
+        }))
+        .expect("recorded Muse model/list decodes")
+    }
+
+    #[test]
+    fn absent_model_defers_to_the_server_default_after_proving_a_catalogue() {
+        let catalog = recorded_catalogue();
+        assert!(
+            select_launch_model(catalog, None)
+                .expect("absent defers")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn explicit_model_matches_exactly_and_unavailable_fails_without_substitution() {
+        let catalog = recorded_catalogue();
+        let selected = select_launch_model(catalog, Some("muse-mini")).expect("exact match");
+        assert_eq!(
+            selected.map(|entry| entry.model_id),
+            Some("muse-mini".to_owned())
+        );
+        let error = select_launch_model(recorded_catalogue(), Some("muse-ghost")).unwrap_err();
+        assert_eq!(error.code, "profile_error");
+    }
+
+    #[test]
+    fn empty_catalogue_names_no_default_and_fails_honestly() {
+        // The installed Muse 1.4.20 shape: `bundledCatalog` with zero models
+        // serves no default to fall back to, so an omitted request fails
+        // instead of substituting another model.
+        let empty: NativeModelListResult = serde_json::from_value(json!({
+            "models": [],
+            "providerId": "muse",
+            "source": "bundledCatalog"
+        }))
+        .expect("recorded empty Muse model/list decodes");
+        let error = select_launch_model(empty, None).unwrap_err();
+        assert_eq!(error.code, "profile_error");
     }
 }

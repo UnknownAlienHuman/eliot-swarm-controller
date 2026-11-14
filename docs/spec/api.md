@@ -234,6 +234,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `command.submit/get` | implemented immutable admission and command readback |
 | `turn.get` | implemented running/completed/unknown turn read |
 | `swarm.wait` | bounded wait over a frozen child command/turn set with all/any, timeout and honest per-entry outcomes |
+| `swarm.digest` | durable digest over a frozen child set delivering one coalesced parent mailbox result with the standard mail wake |
 | `command.resolve`, `turn.resolve` | constrained owner resolution of unknown outcomes; owner-only |
 | `command.children` | implemented scoped, paged child readback for a retained expansion |
 | `project.list/get` | owner-only read of registered project authority |
@@ -608,8 +609,18 @@ Worktree creation is opt-in on the same launch command:
 
 ```text
 command.submit {id, verb:"launch",
-  args:{profile?:NAME, workspace, worktree?:BRANCH, base?:REF, parent?:AGENT, text?}}
+  args:{profile?:NAME, harness?:HARNESS, model?:MODEL, effort?:EFFORT,
+        workspace, worktree?:BRANCH, base?:REF, parent?:AGENT, text?}}
 ```
+
+A parentless Owner launch names either a stored `profile` or an ad-hoc
+`harness` (mutually exclusive); `model`/`effort` are ad-hoc only and require
+`harness`. Ad-hoc launch is Owner-only and freezes a profile-equivalent
+snapshot from built-in safe defaults plus flags (see
+[configuration](configuration.md#ad-hoc-owner-launch-no-stored-profile));
+Agent principals keep the profile and `child_profiles` rules and cannot
+ad-hoc launch. Same-ID retries bind the exact requested payload: a changed
+ad-hoc model is `id_conflict`, while the frozen snapshot stays replay-stable.
 
 Without `worktree`, `workspace` remains the existing execution directory. With it,
 `workspace` names the source repository; the daemon chooses the managed destination.
@@ -856,13 +867,35 @@ terminal outcome of its exact captured command or turn. Per-entry `status` is on
 scope. An Agent caller may wait only on what its frozen control scope permits, the same
 rule as `agent.list` and direct reads; the set holds at most 256 entries. The daemon
 reuses existing command/turn readback and its event bus for wakeups; there is no
-scheduler, digest, or persistent workflow. Run and project-rule principals are rejected;
+scheduler or persistent workflow beyond the digest below. Run and project-rule principals are rejected;
 Owner and Agent principals are allowed. Timeout never cancels admitted work. The CLI is
 `swarm wait --all|--any --timeout-seconds N ID...`, where an `ID` containing `/` is an
 exact `agent/generation/turn_id` turn ref and any other `ID` is a command id. Exit codes
 follow the read section: 0 only when every entry succeeded (`--all`) or at least one
 succeeded (`--any`), 5 on timeout, 7 when an entry was interrupted, 4 for
 `unknown`/`not_found`/`not_visible`, 1 for plain failure.
+
+`swarm.digest` is the durable completion digest over the same frozen child set.
+The request carries `id` (caller ULID, stable effect identity), `to` (one parent
+Agent mailbox), `mode` (`all`/`any`), and `commands`/`turns` (1..=256 entries,
+frozen at admission like `swarm.wait`). An Agent caller may digest only to its own
+mailbox and only entries within its frozen control scope; out-of-scope entries read
+`not_visible` at registration and stay masked at delivery, which recomputes as
+owner and never widens scope. When the mode condition holds over terminal entries
+(`still_running` is the only non-terminal status; `not_found`/`not_visible` count
+as settled honest outcomes), the daemon delivers exactly one coalesced `mail.send`
+(queue) result to the parent: mail id is the digest id, thread is
+`completion-<id-prefix>`, and the body lists every entry outcome. Same id plus same
+payload replays the retained registration and mail without a second delivery; same
+id plus a different payload or principal rejects `id_conflict`. Reconnect or restart
+replays the same mail id, so the digest is never duplicated. The digest reuses the
+ordinary mail wake (one generic coalesced notice per minute, at most one open notice
+command) and emits no `x.user.agent.attention` event; a successful completion stays
+distinct from an attention incident and no model call is needed to poll. The CLI is
+`swarm digest --all|--any --to PARENT ID...` with the same `ID` shape as
+`swarm wait`; it exits 0 when the digest is accepted (pending or delivered).
+Neither the digest nor existing persistent HTTP notifications wake a
+disconnected/stateless external client.
 
 The following single-target server-side wait semantics are a future API contract; they
 do not add `agent.wait` to the current method set. Current CLI `--wait` behavior is
@@ -887,6 +920,13 @@ restores revoked control; unknown blocks another takeover.
 
 `agent.discover` uses `AgentDiscoverRequest`/`DiscoverPage`; `agent.history` uses
 `AgentHistoryRequest`/`ObservationPage` from the canonical native metadata DTOs.
+`harness.list` (`HarnessListRequest`/`HarnessListResponse`, no params) reports
+per-harness installation facts (installed, resolved `cmd`, `--version`);
+`harness.models` (`HarnessModelsRequest`/`HarnessModelsResponse`) returns the
+harness's own read-only catalogue (Codex/Muse native `model/list`, the OpenCode
+provider/model list; Claude reports aliases plus the CLI default, Antigravity
+reports no catalogue). Both are owner-only, read-only, and start no model turn
+and no inference (`swarm harnesses`, `swarm models --harness H`).
 `profile` and `id` are required nonempty strings. Present strings are checked for
 nonemptiness after trimming but are preserved as supplied. For `agent.discover`, optional
 `harness`, `native_scope` and `cursor` may be omitted or `null` to mean absent. For
