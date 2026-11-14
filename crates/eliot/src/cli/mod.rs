@@ -23,6 +23,7 @@ pub(crate) async fn dispatch(
         CliCommand::Daemon(args) => daemon::run_daemon(args, data_dir, json_output, id).await,
         CliCommand::Mcp(args) => daemon::run_mcp(args, data_dir, json_output).await,
         CliCommand::Status => daemon::run_status(data_dir, json_output).await,
+        CliCommand::Maintenance(args) => daemon::run_maintenance(args, data_dir, json_output).await,
         CliCommand::Provider(args) => rules::run_provider(args, data_dir, json_output, id).await,
         CliCommand::Project(args) => rules::run_project(args, data_dir, json_output).await,
         CliCommand::Rule(args) => rules::run_rule(args, data_dir, json_output, id).await,
