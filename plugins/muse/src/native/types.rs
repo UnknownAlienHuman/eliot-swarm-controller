@@ -4,9 +4,12 @@
 //! (`muse schema generate-json-schema`, Muse Code 1.4.0-R4161.1, bundle
 //! fingerprint `sha256:36466f63…0d3d7f`, re-verified for A1, for item
 //! normalization and for the single bounded `item/readOutput` patch fetch;
-//! re-verified read-only against 1.4.20-R8619.1 on 2026-11-14: every modelled
-//! shape is unchanged or additive-optional, and the 1.4.20 export carries no
-//! bundle fingerprint field).
+//! schema-checked read-only against 1.4.20-R8619.1 on 2026-11-14: every
+//! modelled shape is unchanged or additive-optional, and the 1.4.20 export
+//! carries no bundle fingerprint field. Schema-only: a live 1.4.20 stdio
+//! probe serves an empty `bundledCatalog`, so the exact-model lookup refuses
+//! the launch (failed, never unknown) before any `session/start`; the DTO
+//! still decodes both versions.
 //! Only the session-start, session-resume, turn-start, view-event,
 //! stop/close, request/decide/answer, readback, item tool-identity and
 //! stored-patch-reference shapes this path uses are modelled. Unknown fields
@@ -238,6 +241,15 @@ pub struct NativeModelListResult {
     #[serde(default)]
     pub models: Vec<NativeModelCatalogEntry>,
     pub provider_id: String,
+    /// Where the catalogue came from (`providerCatalog`, `bundledCatalog`,
+    /// ...; open enum). Only the source is modelled: the accompanying
+    /// `profileId` is account data and stays ignored, never persisted.
+    /// A `bundledCatalog` source with zero models is an honestly empty
+    /// account catalogue (Muse Code 1.4.20 serves exactly this on a host
+    /// whose provider catalogue is unreachable); the miss is reported,
+    /// never bypassed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1547,6 +1559,65 @@ mod tests {
         .expect("empty pending halves decode");
         assert!(result.approvals.is_empty());
         assert!(result.user_inputs.is_empty());
+    }
+
+    #[test]
+    fn model_list_result_decodes_1420_empty_bundled_catalog() {
+        // Live 1.4.20-R8619.1 `model/list` result shape, account data
+        // stripped (the served `profileId` is redacted to null): an honestly
+        // empty `bundledCatalog` must decode so the catalogue miss names its
+        // source instead of failing the DTO.
+        let result: NativeModelListResult = serde_json::from_value(json!({
+            "providerId": "meta",
+            "profileId": null,
+            "source": "bundledCatalog",
+            "models": [],
+        }))
+        .expect("1.4.20 empty bundled catalogue decodes");
+        assert!(result.models.is_empty());
+        assert_eq!(result.provider_id, "meta");
+        assert_eq!(result.source.as_deref(), Some("bundledCatalog"));
+    }
+
+    #[test]
+    fn model_list_entry_decodes_1420_variants_array() {
+        // Live 1.4.20 provider-catalogue entry shape (fields verbatim,
+        // identifiers synthetic): a present variants array decodes as Known
+        // so the requested-tier check applies instead of skipping.
+        let result: NativeModelListResult = serde_json::from_value(json!({
+            "providerId": "meta",
+            "profileId": null,
+            "source": "providerCatalog",
+            "models": [{
+                "modelId": "muse-spark-1.3-contributor",
+                "displayLabel": "muse-spark-1.3-contributor",
+                "providerId": "meta",
+                "profileId": null,
+                "releaseDate": "2026-09-02",
+                "description": null,
+                "contextLimit": 1007997,
+                "outputLimit": 128000,
+                "cost": null,
+                "isActive": false,
+                "isDefault": false,
+                "variants": ["minimal", "low", "medium", "high", "xhigh", "max"],
+            }],
+        }))
+        .expect("1.4.20 provider catalogue entry decodes");
+        assert_eq!(result.models.len(), 1);
+        assert_eq!(result.source.as_deref(), Some("providerCatalog"));
+        let entry = &result.models[0];
+        assert_eq!(entry.model_id, "muse-spark-1.3-contributor");
+        assert!(
+            matches!(
+                entry.variants,
+                Some(NativeModelEffortVariants::Known(ref tiers))
+                    if tiers.contains(&"low".to_owned())
+                        && tiers.contains(&"xhigh".to_owned())
+            ),
+            "variants array must decode as Known: {:?}",
+            entry.variants
+        );
     }
 }
 

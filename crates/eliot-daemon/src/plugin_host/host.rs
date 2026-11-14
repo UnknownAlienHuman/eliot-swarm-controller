@@ -2742,7 +2742,12 @@ fn validate_send_result(value: Value) -> Result<Value> {
 }
 
 fn validate_start_result(value: &Value, agent: &Agent, command: &Command) -> Result<()> {
-    if value.get("state").and_then(Value::as_str) == Some("ready")
+    // Ready establishes the session; failed is the plugin's authoritative
+    // proven-no-effect verdict (returned instead of an error only for checks
+    // before any native session effect). Both require the exact
+    // agent/generation/command binding.
+    let state = value.get("state").and_then(Value::as_str);
+    if matches!(state, Some("ready") | Some("failed"))
         && value.get("agent_id").and_then(Value::as_str) == Some(agent.id.as_str())
         && value.get("generation").and_then(Value::as_i64) == Some(agent.generation)
         && value.get("command_id").and_then(Value::as_str) == Some(command.id.as_str())
@@ -5436,6 +5441,30 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&data_root);
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn validate_start_result_accepts_bound_ready_or_failed() {
+        let agent_id = "agent-start-validate";
+        let mut agent = Agent::new(agent_id, "project", "muse", "fixture", 0);
+        agent.generation = 1;
+        let command = launch_command_for(agent_id, 1);
+        let bound = |state: &str| {
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": command.id,
+                "state": state,
+                "reason": "Muse test check failed",
+            })
+        };
+        assert!(validate_start_result(&bound("ready"), &agent, &command).is_ok());
+        assert!(validate_start_result(&bound("failed"), &agent, &command).is_ok());
+        assert!(validate_start_result(&json!({"state": "ready"}), &agent, &command).is_err());
+        assert!(validate_start_result(&bound("unknown"), &agent, &command).is_err());
+        let mut wrong_command = bound("failed");
+        wrong_command["command_id"] = json!("other-command");
+        assert!(validate_start_result(&wrong_command, &agent, &command).is_err());
     }
 
     #[tokio::test]

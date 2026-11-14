@@ -69,9 +69,11 @@ terminal turn result or replay retained start/input outcomes.
 ## Usage attribution
 
 Verified read-only 2026-11-13 against installed Muse 1.4.0-R4161.1
-(`muse schema generate-json-schema`, stable surface), and re-verified
+(`muse schema generate-json-schema`, stable surface), and schema-checked
 read-only 2026-11-14 against 1.4.20-R8619.1 (whose export carries no bundle
-fingerprint field):
+fingerprint field). Schema checks are not runtime proof: a live 1.4.20
+launch refuses before any session (see below), so the profile stays on
+1.4.0:
 `turn/completed.usage` (`TokenUsage`) is the turn's aggregate token usage,
 summed across the turn's model completions, and maps to `TurnUsage` at
 `turn` scope bound to the exact session/generation/turn. Only the explicit
@@ -114,8 +116,16 @@ Re-verified read-only 2026-11-14 against Muse Code `1.4.20-R8619.1`
 model calls): every shape the adapter models or calls is unchanged or
 additive-optional (new methods, notifications, `ItemKind` values, error
 kinds, and optional fields only; no removals except the orphaned
-`SessionDelete*` defs the adapter never referenced). Both versions are
-verified for the profile switch.
+`SessionDelete*` defs the adapter never referenced). Schema-level safety did
+not hold at runtime: a live 1.4.20 stdio probe sending the same
+`initialize` and `model/list` calls the plugin sends gets an empty
+`bundledCatalog` (`models: []`) where 1.4.0 serves the provider catalogue,
+so the exact-model lookup fails before any `session/start` is dispatched
+and the launch is refused. Do not switch the profile to 1.4.20 while its
+catalogue serves no models. Pre-session-effect refusals (profile, spawn,
+initialize, `model/list`, resume preflight) return a failed-state start
+result carrying a short non-secret reason, and the launch settles failed,
+never unknown; any failure after a native session effect stays unknown.
 `projectionUnavailable` is the projection-failed-closed health reason on the
 command plane, independent of view subscription membership. It is distinct from
 `view/gap`, whose opaque `after`/`next` cursors are exclusive bounds on dropped
