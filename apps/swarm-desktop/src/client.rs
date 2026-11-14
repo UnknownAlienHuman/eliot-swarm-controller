@@ -462,6 +462,7 @@ pub async fn list_rules(
 pub async fn harness_models(data_dir: &Path, harness: &str) -> Result<HarnessModelsResponse> {
     let params = HarnessModelsRequest {
         harness: harness.to_owned(),
+        profile: None,
     };
     params.validate()?;
     let reply: HarnessModelsResponse =

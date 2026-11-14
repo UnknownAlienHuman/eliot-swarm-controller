@@ -1,6 +1,6 @@
 //! HTTP/SSE client for one per-Agent `opencode serve`.
 //!
-//! Installed transport (v2.0.32): plain HTTP on loopback, routes under
+//! Installed transport (v2.2.7): plain HTTP on loopback, routes under
 //! `/api/...`, success bodies wrapped as `{"data": ...}`, errors as
 //! `{"_tag": ..., "message": ...}`, auth as
 //! `Authorization: Basic base64("opencode:" + password)` where the password
@@ -31,7 +31,7 @@ use crate::native::{
 /// anything larger is a protocol violation, never truncated into a decision.
 const MAX_HTTP_BYTES: usize = 1024 * 1024;
 const SSE_QUEUE: usize = 64;
-// OpenCode 2.0.32 uses this header to select the native directory context.
+// OpenCode 2.2.7 uses this header to select the native directory context.
 const OPENCODE_DIRECTORY_HEADER: &str = "x-opencode-directory";
 
 pub(crate) fn server_native_directory(path: &Path) -> std::io::Result<PathBuf> {

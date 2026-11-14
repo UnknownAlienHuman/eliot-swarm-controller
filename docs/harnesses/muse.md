@@ -122,6 +122,13 @@ commits `message.completed` and `turn.completed` with the real final message
 rather than settling unknown. A later healthy read does not establish
 live-edge recovery.
 
+Every unavailable-view episode and its outcome is exactly countable from
+`events.read`: unavailable views are `source.gap` events whose reason starts
+with the shared unavailable prefix, settled-unknown outcomes are
+`turn.unknown` events whose reason starts with the shared unknown prefix, and
+readback recoveries are `turn.completed` events carrying the fixed
+`view_recovery: "readback"` marker.
+
 Verified 2026-11-13 using the installed host's offline stable and experimental
 JSON/TypeScript exports: Muse Code `1.4.0-R4161.1`, executable SHA-256
 `B33B493069A2593E97CC63F9A4063FEB64269BF7F07A233F5DB2DB681AD5D950`, stable

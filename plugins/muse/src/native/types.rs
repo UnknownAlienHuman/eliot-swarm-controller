@@ -274,6 +274,59 @@ pub enum NativeModelEffortVariants {
     Unknown(serde_json::Value),
 }
 
+// ---------------------------------------------------------------------------
+// Subscription usage (F15: native quota readback)
+// ---------------------------------------------------------------------------
+
+/// `usage/read` params: a read-only query, not a command. The host mints no
+/// session and performs no model call; params stay empty.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUsageReadParams {}
+
+/// The current usage window (the provider's 5-hour-class block): verbatim
+/// provider percentages with the reset stamp normalized to epoch
+/// milliseconds. Observed live from `muse-bin-1.4.0-R4161.1` (spec 18742
+/// US-FR-004, ADR 32563 D2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSubscriptionUsageWindow {
+    pub used_percent: i64,
+    pub window_duration_mins: i64,
+    pub resets_at_ms: i64,
+}
+
+/// The rolling weekly block: same semantics as the window without a
+/// duration (ADR 32563 D2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSubscriptionUsageWeekly {
+    pub used_percent: i64,
+    pub resets_at_ms: i64,
+}
+
+/// The one usage payload shape: the `usage/read` result's `usage` member
+/// and the `usage/changed` params (ADR 32563 D2/D3). Point-in-time provider
+/// percentages; `observedAtMs` is the host's arrival stamp, so a client
+/// renders "as of", never live data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSubscriptionUsage {
+    pub window: NativeSubscriptionUsageWindow,
+    pub weekly: NativeSubscriptionUsageWeekly,
+    pub tier: String,
+    pub observed_at_ms: i64,
+}
+
+/// `usage/read` result: `{usage?}`, omitted (never `null`) when the host
+/// has observed nothing (ADR 32563 D2: truthful absence, no error).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUsageReadResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<NativeSubscriptionUsage>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeSessionReadParams {

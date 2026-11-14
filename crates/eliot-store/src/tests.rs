@@ -4105,7 +4105,7 @@ fn claude_legacy_rows_classify_from_the_raw_terminal_reason() {
         ("api_error_rate_limited", TurnOutcome::Failure),
         ("error", TurnOutcome::Failure),
         ("cancelled", TurnOutcome::Interrupted),
-        ("completed", TurnOutcome::Unknown),
+        ("completed", TurnOutcome::Success),
         ("bogus", TurnOutcome::Unknown),
     ] {
         tick += 10;
@@ -4139,7 +4139,7 @@ fn claude_legacy_rows_classify_from_the_raw_terminal_reason() {
     // The list path agrees with the `get_turn` classification.
     for (status, expected) in [
         ("cancelled", TurnOutcome::Interrupted),
-        ("completed", TurnOutcome::Unknown),
+        ("completed", TurnOutcome::Success),
         ("bogus", TurnOutcome::Unknown),
     ] {
         assert!(

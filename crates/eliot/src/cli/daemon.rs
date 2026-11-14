@@ -1,10 +1,10 @@
 //! Daemon lifecycle and serving commands: daemon, status, mcp.
-use super::args::{DaemonAction, DaemonArgs, McpArgs};
-use super::support::{Failure, mutation_id, print_value, response_exit_code};
+use super::args::{DaemonAction, DaemonArgs, MaintenanceArgs, MaintenanceCommand, McpArgs};
+use super::support::{Failure, mutation_id, print_value, read_and_print, response_exit_code};
 use crate::mcp;
 use eliot_core::api::{
     DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse,
-    ShutdownMode,
+    MaintenanceRunRequest, MaintenanceRunResponse, ShutdownMode,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -104,6 +104,24 @@ pub(crate) async fn run_mcp(
         .await
         .map_err(Failure::new_from_message)?;
     Ok(0)
+}
+
+pub(crate) async fn run_maintenance(
+    MaintenanceArgs { command }: MaintenanceArgs,
+    data_dir: PathBuf,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    match command {
+        MaintenanceCommand::Run => {
+            read_and_print!(
+                &data_dir,
+                json_output,
+                "maintenance.run",
+                MaintenanceRunRequest::default(),
+                MaintenanceRunResponse
+            )
+        }
+    }
 }
 
 pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u8, Failure> {

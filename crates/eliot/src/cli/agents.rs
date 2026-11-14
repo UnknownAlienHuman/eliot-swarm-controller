@@ -2,8 +2,8 @@
 use super::args::{
     AnswerArgs, ApproveArgs, AttachArgs, ConfigureArgs, DenyArgs, DetachArgs, DigestArgs,
     DiscoverArgs, GenerationArgs, InjectCliArgs, InterruptArgs, LaunchArgs, ModelsArgs, PageArgs,
-    ReadGenerationArgs, ResumeArgs, SendArgs, SteerArgs, StopArgs, WaitArgs, WorktreeArgs,
-    WorktreeCommand, WorktreeRemoveArgs,
+    QuotaArgs, ReadGenerationArgs, ResumeArgs, SendArgs, SteerArgs, StopArgs, WaitArgs,
+    WorktreeArgs, WorktreeCommand, WorktreeRemoveArgs,
 };
 use super::support::read_and_print;
 use super::support::{
@@ -14,8 +14,9 @@ use super::support::{
 };
 use eliot_core::api::{
     AgentDiscoverRequest, AgentGetRequest, AgentGetResponse, DiscoverPage, HarnessListRequest,
-    HarnessListResponse, HarnessModelsRequest, HarnessModelsResponse, MAX_SWARM_WAIT_TARGETS,
-    SwarmDigestRequest, SwarmDigestResponse, SwarmWaitRequest, SwarmWaitResponse, WaitTurnRef,
+    HarnessListResponse, HarnessModelsRequest, HarnessModelsResponse, HarnessQuotaRequest,
+    HarnessQuotaResponse, MAX_SWARM_WAIT_TARGETS, SwarmDigestRequest, SwarmDigestResponse,
+    SwarmWaitRequest, SwarmWaitResponse, WaitTurnRef,
 };
 use eliot_core::{InjectArgs, InjectPoint, SubmitCommand};
 use serde_json::Value;
@@ -67,19 +68,48 @@ pub(crate) async fn run_harnesses(data_dir: PathBuf, json_output: bool) -> Resul
 }
 
 pub(crate) async fn run_models(
-    ModelsArgs { harness }: ModelsArgs,
+    ModelsArgs { harness, profile }: ModelsArgs,
     data_dir: PathBuf,
     json_output: bool,
 ) -> Result<u8, Failure> {
     if harness.trim().is_empty() {
         return Err(Failure::new(2, "--harness must not be empty"));
     }
+    if profile
+        .as_deref()
+        .is_some_and(|profile| profile.trim().is_empty())
+    {
+        return Err(Failure::new(2, "--profile must not be empty"));
+    }
     read_and_print!(
         &data_dir,
         json_output,
         "harness.models",
-        HarnessModelsRequest { harness },
+        HarnessModelsRequest { harness, profile },
         HarnessModelsResponse
+    )
+}
+
+pub(crate) async fn run_quota(
+    QuotaArgs { harness, profile }: QuotaArgs,
+    data_dir: PathBuf,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    if harness.trim().is_empty() {
+        return Err(Failure::new(2, "--harness must not be empty"));
+    }
+    if profile
+        .as_deref()
+        .is_some_and(|profile| profile.trim().is_empty())
+    {
+        return Err(Failure::new(2, "--profile must not be empty"));
+    }
+    read_and_print!(
+        &data_dir,
+        json_output,
+        "harness.quota",
+        HarnessQuotaRequest { harness, profile },
+        HarnessQuotaResponse
     )
 }
 

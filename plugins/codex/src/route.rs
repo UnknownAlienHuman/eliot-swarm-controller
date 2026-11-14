@@ -101,7 +101,8 @@ impl CodexRoute {
         swarm_executable: &Path,
         data_dir: &Path,
         cwd: &Path,
-        mcp_disables: &[String],
+        mcp_disables: &[crate::mcp::EffectiveMcpServer],
+        plugin_disables: &[String],
     ) -> Result<Vec<OsString>> {
         if !swarm_executable.is_absolute() || !data_dir.is_absolute() || !cwd.is_absolute() {
             return Err(route_error(
@@ -110,9 +111,20 @@ impl CodexRoute {
         }
         if server_name.is_empty()
             || server_name.chars().any(char::is_control)
-            || mcp_disables
+            || mcp_disables.iter().any(|server| {
+                !crate::mcp::is_addressable_override_name(&server.name)
+                    || [server.command.as_deref(), server.url.as_deref()]
+                        .iter()
+                        .any(|transport| {
+                            transport.is_some_and(|value| {
+                                value.is_empty() || value.chars().any(char::is_control)
+                            })
+                        })
+                    || (server.command.is_none() && server.url.is_none())
+            })
+            || plugin_disables
                 .iter()
-                .any(|name| !crate::mcp::is_addressable_override_name(name))
+                .any(|id| !crate::mcp::is_suppressible_plugin_id(id))
         {
             return Err(route_error(
                 "Codex Agent MCP server names must be plain override segments",
@@ -138,11 +150,41 @@ impl CodexRoute {
         // Minimal policy: suppress every inherited server explicitly. A bare
         // `mcp_servers={}` override merges with file config instead of
         // replacing it (verified on 0.167.1), so each server needs its own
-        // `enabled=false` override; unaddressable names fail before spawn.
-        for name in mcp_disables {
+        // overrides; unaddressable names fail before spawn. Each disable
+        // re-emits the server's effective `command`/`url` because the native
+        // `-c` bootstrap validates a touched `mcp_servers.<name>` table on
+        // its own: a bare `enabled=false` breaks startup for names whose
+        // transport lives in a project/plugin layer or builtin (verified on
+        // 0.167.1: `invalid transport in 'mcp_servers.<name>'`). The
+        // transport never starts (the server stays disabled); remaining keys
+        // merge from the owner layers. Plugin-backed builtin servers never
+        // appear in `mcp_servers`, so each suppressed plugin needs its own
+        // `plugins.<id>.enabled=false` override instead.
+        for id in plugin_disables {
             push_override(
                 &mut mcp_override,
-                &format!("mcp_servers.{name}.enabled"),
+                &format!("plugins.{id}.enabled"),
+                "false".to_owned(),
+            );
+        }
+        for server in mcp_disables {
+            if let Some(command) = &server.command {
+                push_override(
+                    &mut mcp_override,
+                    &format!("mcp_servers.{}.command", server.name),
+                    quote(command)?,
+                );
+            }
+            if let Some(url) = &server.url {
+                push_override(
+                    &mut mcp_override,
+                    &format!("mcp_servers.{}.url", server.name),
+                    quote(url)?,
+                );
+            }
+            push_override(
+                &mut mcp_override,
+                &format!("mcp_servers.{}.enabled", server.name),
                 "false".to_owned(),
             );
         }
@@ -410,6 +452,7 @@ mod tests {
 
     #[test]
     fn agent_mcp_argv_adds_own_server_and_minimal_disables() {
+        use crate::mcp::EffectiveMcpServer;
         let route = CodexRoute::from_profile(&json!({"harness": "codex"})).unwrap();
         let (exe, data, cwd) = if cfg!(windows) {
             (
@@ -425,7 +468,7 @@ mod tests {
             )
         };
         let args = route
-            .args_with_agent_mcp("eliot_swarm_x", exe, data, cwd, &[])
+            .args_with_agent_mcp("eliot_swarm_x", exe, data, cwd, &[], &[])
             .unwrap()
             .into_iter()
             .map(|value| value.into_string().unwrap())
@@ -438,34 +481,94 @@ mod tests {
         assert!(own < app_server);
         assert!(args.iter().all(|arg| !arg.contains("enabled=false")));
 
-        // Minimal adds one `enabled=false` override per inherited server,
-        // before `app-server`, and rejects names no `-c` path can address.
+        // Minimal re-emits each inherited server's transport alongside its
+        // `enabled=false`, before `app-server`, and rejects names no `-c`
+        // path can address or entries with no usable transport. Suppressed
+        // plugins ride along as their own `plugins.<id>.enabled=false`.
+        let disables = [
+            EffectiveMcpServer {
+                name: "owner-a".to_owned(),
+                command: Some("a.exe".to_owned()),
+                url: None,
+            },
+            EffectiveMcpServer {
+                name: "owner-b".to_owned(),
+                command: None,
+                url: Some("https://b.example/mcp".to_owned()),
+            },
+        ];
+        let plugin_disables = ["computer-use@openai-bundled".to_owned()];
         let args = route
-            .args_with_agent_mcp(
-                "eliot_swarm_x",
-                exe,
-                data,
-                cwd,
-                &["owner-a".to_owned(), "owner-b".to_owned()],
-            )
+            .args_with_agent_mcp("eliot_swarm_x", exe, data, cwd, &disables, &plugin_disables)
             .unwrap()
             .into_iter()
             .map(|value| value.into_string().unwrap())
             .collect::<Vec<_>>();
         let app_server = args.iter().position(|arg| arg == "app-server").unwrap();
-        for name in ["owner-a", "owner-b"] {
+        for expected in [
+            "mcp_servers.owner-a.command=\"a.exe\"",
+            "mcp_servers.owner-a.enabled=false",
+            "mcp_servers.owner-b.url=\"https://b.example/mcp\"",
+            "mcp_servers.owner-b.enabled=false",
+            "plugins.computer-use@openai-bundled.enabled=false",
+        ] {
             let position = args
                 .iter()
-                .position(|arg| arg == &format!("mcp_servers.{name}.enabled=false"))
-                .unwrap();
+                .position(|arg| arg == expected)
+                .unwrap_or_else(|| panic!("missing {expected:?}"));
             assert!(position < app_server);
         }
+        // A bare `enabled=false` without a transport would break the native
+        // bootstrap for project/plugin-layer names, so it never reaches argv.
         assert!(
             route
-                .args_with_agent_mcp("eliot_swarm_x", exe, data, cwd, &["owner.x".to_owned()])
+                .args_with_agent_mcp(
+                    "eliot_swarm_x",
+                    exe,
+                    data,
+                    cwd,
+                    &[EffectiveMcpServer {
+                        name: "bare".to_owned(),
+                        command: None,
+                        url: None,
+                    }],
+                    &[],
+                )
                 .is_err()
         );
-        assert!(route.args_with_agent_mcp("", exe, data, cwd, &[]).is_err());
+        assert!(
+            route
+                .args_with_agent_mcp(
+                    "eliot_swarm_x",
+                    exe,
+                    data,
+                    cwd,
+                    &[EffectiveMcpServer {
+                        name: "owner.x".to_owned(),
+                        command: Some("x.exe".to_owned()),
+                        url: None,
+                    }],
+                    &[],
+                )
+                .is_err()
+        );
+        assert!(
+            route
+                .args_with_agent_mcp(
+                    "eliot_swarm_x",
+                    exe,
+                    data,
+                    cwd,
+                    &[],
+                    &["owner.x".to_owned()]
+                )
+                .is_err()
+        );
+        assert!(
+            route
+                .args_with_agent_mcp("", exe, data, cwd, &[], &[])
+                .is_err()
+        );
     }
 
     #[test]
