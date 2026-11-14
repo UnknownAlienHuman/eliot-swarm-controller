@@ -3,6 +3,7 @@ use crate::native_child::{
 };
 use eliot_core::{
     ChildRegistration, ContextItem, Error, ProviderRestriction, Result, SecretPolicy, SourceGap,
+    TurnUsage,
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
@@ -31,7 +32,8 @@ use crate::native::{
     requests::{self, CorePending},
     types::{
         NativeFileChangeItem, NativeItemCompletedNotification, NativePatchChangeKind,
-        NativeServerRequestResolvedNotification, NativeTurnCompletedNotification, NativeTurnError,
+        NativeServerRequestResolvedNotification, NativeThreadTokenUsageUpdatedNotification,
+        NativeTokenUsageDelta, NativeTurnCompletedNotification, NativeTurnError,
         NativeTurnStartedNotification, NativeTurnStatus,
     },
 };
@@ -184,6 +186,10 @@ struct EventProcessor {
     writes_blocked: bool,
     gap_reported: bool,
     final_text: Option<String>,
+    /// Latest per-turn token delta for the exact active turn, from
+    /// `thread/tokenUsage/updated` (`tokenUsage.last`). Replaced on each
+    /// update, never summed; consumed once by the terminal `turn.completed`.
+    turn_usage: Option<(String, TurnUsage)>,
     native_scope: String,
     child_bindings: HashMap<String, ChildBinding>,
     child_states: HashMap<String, ChildState>,
@@ -611,6 +617,7 @@ impl EventProcessor {
             writes_blocked: false,
             gap_reported: false,
             final_text: None,
+            turn_usage: None,
             native_scope: config.native_scope.clone(),
             child_bindings: HashMap::new(),
             child_states: HashMap::new(),
@@ -989,6 +996,7 @@ impl EventProcessor {
                 | "item/started"
                 | "item/completed"
                 | "serverRequest/resolved"
+                | "thread/tokenUsage/updated"
                 | "error"
         ) && (!self.status.ready || self.status.active_turn_id.is_none())
     }
@@ -1109,6 +1117,7 @@ impl EventProcessor {
         self.status.active_command_id = Some(command_id.clone());
         self.status.active_turn_id = Some(turn_id.clone());
         self.final_text = None;
+        self.turn_usage = None;
         let thread_id = self.status.thread_id.as_deref().unwrap_or_default();
         let native_id = event_id(thread_id, &turn_id, &turn_id, "turn.started")?;
         let mut data = json!({"command_id": command_id, "turn_id": turn_id});
@@ -1581,6 +1590,9 @@ impl EventProcessor {
             "turn/completed" => {
                 self.complete_turn(params).await?;
             }
+            "thread/tokenUsage/updated" => {
+                self.note_token_usage(&params)?;
+            }
             "serverRequest/resolved" => {
                 self.resolve_server_request(params).await?;
             }
@@ -1729,6 +1741,31 @@ impl EventProcessor {
         self.commit_event("tool.completed", native_id, data).await
     }
 
+    /// Retain the latest per-turn token delta for the exact active turn from
+    /// `thread/tokenUsage/updated` (`tokenUsage.last`). A repeated update
+    /// replaces the retained delta, never sums. An update naming any other
+    /// turn (late, stale, or pre-association) is dropped without a gap: the
+    /// terminal turn keeps null usage rather than another turn's counters.
+    /// Structural mismatch (wrong thread, malformed body) gaps like any
+    /// other notification arm.
+    fn note_token_usage(&mut self, params: &Value) -> Result<()> {
+        let notification: NativeThreadTokenUsageUpdatedNotification =
+            serde_json::from_value(params.clone()).map_err(|_| {
+                Error::new(
+                    "native_protocol",
+                    "Codex thread/tokenUsage/updated did not match the 0.167 schema",
+                )
+            })?;
+        validate_thread_and_turn(&self.status, &notification.thread_id, &notification.turn_id)?;
+        if self.status.active_turn_id.as_deref() != Some(notification.turn_id.as_str()) {
+            return Ok(());
+        }
+        if let Some(usage) = turn_usage_from_delta(&notification.token_usage.last) {
+            self.turn_usage = Some((notification.turn_id, usage));
+        }
+        Ok(())
+    }
+
     async fn complete_turn(&mut self, params: Value) -> Result<()> {
         let notification: NativeTurnCompletedNotification = serde_json::from_value(params)
             .map_err(|_| {
@@ -1767,6 +1804,18 @@ impl EventProcessor {
         // The semantic hold signal gets first claim on the bounded terminal data.
         if let Some(restriction) = provider_restriction {
             attach_provider_restriction(&mut data, restriction, &secrets);
+        }
+        // Optional per-turn token delta from `thread/tokenUsage/updated`:
+        // attach before `attach_final_text` so the existing bounded
+        // terminal-text accounting includes the usage bytes. A repeated
+        // update replaced the retained delta instead of summing; a missing
+        // or foreign-turn update leaves `data.usage` unset.
+        let turn_usage = self
+            .turn_usage
+            .take()
+            .filter(|(turn_id, _)| *turn_id == notification.turn.id);
+        if let Some((_, usage)) = turn_usage {
+            data["usage"] = serde_json::to_value(&usage).unwrap_or(Value::Null);
         }
         if let Some(text) = self.final_text.as_ref() {
             attach_final_text(&mut data, text, &notification.turn.status, &secrets);
@@ -1891,6 +1940,7 @@ impl EventProcessor {
         self.status.ready = false;
         self.status.active_command_id = None;
         self.status.active_turn_id = None;
+        self.turn_usage = None;
         Ok(())
     }
 
@@ -2919,6 +2969,41 @@ fn spawned_parent_thread(thread: &Value) -> Option<&str> {
         .filter(|parent| !parent.trim().is_empty())
 }
 
+/// Map one installed 0.167.1 `tokenUsage.last` delta to turn expenditure at
+/// `turn` scope. Only genuinely supplied nonnegative counters are mapped;
+/// missing values stay null (never zero), and a delta with no usable counter
+/// yields no usage at all. The cumulative `total` and `modelContextWindow`
+/// capacity never enter this mapping.
+fn turn_usage_from_delta(delta: &NativeTokenUsageDelta) -> Option<TurnUsage> {
+    let counter = |value: Option<i64>| value.filter(|value| *value >= 0);
+    let input_tokens = counter(delta.input_tokens);
+    let output_tokens = counter(delta.output_tokens);
+    let reasoning_tokens = counter(delta.reasoning_output_tokens);
+    let cache_read_tokens = counter(delta.cached_input_tokens);
+    let cache_write_tokens = counter(delta.cache_write_input_tokens);
+    let total_tokens = counter(delta.total_tokens);
+    if input_tokens.is_none()
+        && output_tokens.is_none()
+        && reasoning_tokens.is_none()
+        && cache_read_tokens.is_none()
+        && cache_write_tokens.is_none()
+        && total_tokens.is_none()
+    {
+        return None;
+    }
+    Some(TurnUsage {
+        scope: Some("turn".to_owned()),
+        message_id: None,
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        thinking_tokens: None,
+        cache_read_tokens,
+        cache_write_tokens,
+        total_tokens,
+    })
+}
+
 fn validate_thread_and_turn(status: &EventStatus, thread_id: &str, turn_id: &str) -> Result<()> {
     if status.thread_id.as_deref() != Some(thread_id) || turn_id.trim().is_empty() {
         return Err(Error::new(
@@ -3507,6 +3592,119 @@ mod tests {
                 assert_eq!(data, original);
             }
         }
+    }
+
+    #[test]
+    fn token_usage_delta_maps_counters_at_turn_scope() {
+        let delta = NativeTokenUsageDelta {
+            input_tokens: Some(10),
+            cached_input_tokens: Some(3),
+            output_tokens: Some(5),
+            reasoning_output_tokens: Some(2),
+            total_tokens: Some(15),
+            cache_write_input_tokens: Some(1),
+        };
+        let usage = turn_usage_from_delta(&delta).expect("usable delta maps");
+        assert_eq!(usage.scope, Some("turn".to_owned()));
+        assert_eq!(usage.message_id, None);
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(5));
+        assert_eq!(usage.reasoning_tokens, Some(2));
+        assert_eq!(usage.thinking_tokens, None);
+        assert_eq!(usage.cache_read_tokens, Some(3));
+        assert_eq!(usage.cache_write_tokens, Some(1));
+        assert_eq!(usage.total_tokens, Some(15));
+    }
+
+    #[test]
+    fn token_usage_delta_drops_negative_and_empty_without_zeroes() {
+        let delta = NativeTokenUsageDelta {
+            input_tokens: Some(-1),
+            cached_input_tokens: None,
+            output_tokens: Some(0),
+            reasoning_output_tokens: None,
+            total_tokens: None,
+            cache_write_input_tokens: None,
+        };
+        let usage = turn_usage_from_delta(&delta).expect("zero output still maps");
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, Some(0));
+        assert_eq!(usage.cache_read_tokens, None);
+        let empty = NativeTokenUsageDelta {
+            input_tokens: None,
+            cached_input_tokens: None,
+            output_tokens: None,
+            reasoning_output_tokens: None,
+            total_tokens: None,
+            cache_write_input_tokens: None,
+        };
+        assert_eq!(turn_usage_from_delta(&empty), None);
+        let negative = NativeTokenUsageDelta {
+            input_tokens: Some(-4),
+            cached_input_tokens: None,
+            output_tokens: None,
+            reasoning_output_tokens: None,
+            total_tokens: None,
+            cache_write_input_tokens: None,
+        };
+        assert_eq!(turn_usage_from_delta(&negative), None);
+    }
+
+    #[tokio::test]
+    async fn token_usage_update_replaces_instead_of_summing() {
+        let (_native, mut processor) = child_test_processor().await;
+        processor.status.thread_id = Some("owned".to_owned());
+        processor.status.active_turn_id = Some("turn-1".to_owned());
+        let update = |input: i64| {
+            json!({
+                "threadId": "owned",
+                "turnId": "turn-1",
+                "tokenUsage": {
+                    "last": {"inputTokens": input, "outputTokens": 1},
+                    "total": {"inputTokens": 999, "outputTokens": 999},
+                    "modelContextWindow": 200000,
+                },
+            })
+        };
+        processor
+            .process_notification("thread/tokenUsage/updated", update(10))
+            .await
+            .expect("first update retains");
+        processor
+            .process_notification("thread/tokenUsage/updated", update(30))
+            .await
+            .expect("second update retains");
+        let (turn_id, usage) = processor.turn_usage.as_ref().expect("delta retained");
+        assert_eq!(turn_id, "turn-1");
+        // Replaced (30), never summed (40); cumulative `total` never leaks in.
+        assert_eq!(usage.input_tokens, Some(30));
+        assert_eq!(usage.output_tokens, Some(1));
+    }
+
+    #[tokio::test]
+    async fn token_usage_update_for_other_turn_is_dropped_without_gap() {
+        let (_native, mut processor) = child_test_processor().await;
+        processor.status.thread_id = Some("owned".to_owned());
+        processor.status.active_turn_id = Some("turn-1".to_owned());
+        processor
+            .process_notification(
+                "thread/tokenUsage/updated",
+                json!({
+                    "threadId": "owned",
+                    "turnId": "turn-2",
+                    "tokenUsage": {"last": {"inputTokens": 7}},
+                }),
+            )
+            .await
+            .expect("foreign-turn update drops cleanly");
+        assert!(
+            processor.turn_usage.is_none(),
+            "another turn's counters must not attach here"
+        );
+        assert!(
+            !processor.status.source_unknown,
+            "stale telemetry is not a source gap"
+        );
     }
 
     #[test]

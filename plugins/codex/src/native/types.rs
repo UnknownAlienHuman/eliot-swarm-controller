@@ -495,6 +495,52 @@ pub struct NativeTurnCompletedNotification {
     pub turn: NativeTurn,
 }
 
+/// One per-turn token delta from installed 0.167.1
+/// `thread/tokenUsage/updated` (`tokenUsage.last`). The sibling `total` is a
+/// cumulative per-thread snapshot and `modelContextWindow` is capacity: neither
+/// is per-turn expenditure and neither is mapped to turn usage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTokenUsageDelta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_input_tokens: Option<i64>,
+}
+
+/// Fresh `thread/tokenUsage/updated` notification (required: threadId +
+/// turnId + tokenUsage). Only `tokenUsage.last` is per-turn expenditure;
+/// `total` (cumulative per thread) and `modelContextWindow` (capacity) stay
+/// unmapped so context occupancy and running totals can never read as turn
+/// tokens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeThreadTokenUsageUpdatedNotification {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub token_usage: NativeThreadTokenUsage,
+}
+
+/// Installed 0.167.1 `ThreadTokenUsage` body: `last` is the per-turn delta
+/// for `turnId`, `total` the cumulative per-thread snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeThreadTokenUsage {
+    pub last: NativeTokenUsageDelta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<NativeTokenUsageDelta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_window: Option<i64>,
+}
+
 /// Assistant phase hint (fresh `MessagePhase`); `None` means unknown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

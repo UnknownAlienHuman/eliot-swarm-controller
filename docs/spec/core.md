@@ -583,8 +583,14 @@ CREATE TABLE git_workspaces (
 `turns.usage` is the nullable serialized `TurnUsage` attributed at terminal time from
 `turn.completed` `data.usage`: `scope` names the native attribution (`message` for one
 assistant message with its `message_id`, `main_loop_turn` for one turn's main-loop-only
+usage with `message_id` null, `turn` for one turn's aggregate or per-turn-delta
 usage with `message_id` null), token members stay null when unavailable, and
-a present value replaces rather than sums. `agents.pending` is the serialized
+a present value replaces rather than sums. Context occupancy/capacity and
+cumulative session cost are separate session-scoped facts: they are never
+written here and never fill `input_tokens`/`total_tokens` (compaction can
+reduce occupancy, and cumulative cost needs its own unit). Missing per-turn
+counters stay null. `total_tokens` is set only when the native signal
+supplies a turn-scoped total, never derived from other members. `agents.pending` is the serialized
 pending-request projection; `pending_requests` stores
 indexed request lifecycle rows. These are separate current Store structures, not
 interchangeable schemas. `git_workspaces` stores the workspace Git-head cache. The
