@@ -436,6 +436,7 @@ mod tests {
             .expect("admit launch");
         let agent = admission.command.target.expect("launch target");
         store.dispatch(&launch_id, now).expect("dispatch launch");
+        crate::test_support::install_fixture_sources(&mut *store, &agent, &launch_id, 1, now);
         store
             .put_batch(
                 SourceBatch {
@@ -978,6 +979,7 @@ mod tests {
             )
             .expect("admit resume");
         store.dispatch(&resume_id, now).expect("dispatch resume");
+        crate::test_support::install_fixture_sources(&mut *store, &a, &resume_id, 2, now);
         let current = store
             .get_agent(&a)
             .expect("read resumed Agent")

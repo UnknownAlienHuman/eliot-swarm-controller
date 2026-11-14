@@ -296,7 +296,7 @@ mod tests {
         let now = now_ms();
         let launch_id = ulid::Ulid::new().to_string();
         let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
-        launch.args = json!({"project":"resolve-rpc", "workspace":"synthetic-workspace"});
+        launch.args = json!({"project":"resolve-rpc", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fixture", "profile_snapshot":{}});
         launch.expected_generation = Some(0);
         let agent = {
             let mut store = router.inner.store.lock().await;
@@ -339,7 +339,7 @@ mod tests {
         let now = now_ms();
         let launch_id = ulid::Ulid::new().to_string();
         let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
-        launch.args = json!({"project":"resolve-wake", "workspace":"synthetic-workspace"});
+        launch.args = json!({"project":"resolve-wake", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fixture", "profile_snapshot":{}});
         launch.expected_generation = Some(0);
         let (first_id, second_id) = {
             let mut store = router.inner.store.lock().await;
@@ -350,6 +350,13 @@ mod tests {
                 .target
                 .unwrap();
             store.dispatch(&launch_id, now).unwrap();
+            crate::test_support::install_fixture_sources(
+                &mut *store,
+                &agent,
+                &launch_id,
+                1,
+                now,
+            );
             store
                 .put_batch(
                     eliot_core::SourceBatch {
@@ -560,7 +567,7 @@ mod tests {
         let launch_id = ulid::Ulid::new().to_string();
         let mut store = router.inner.store.lock().await;
         let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
-        launch.args = json!({"project":project, "workspace":"synthetic-workspace"});
+        launch.args = json!({"project":project, "workspace":"synthetic-workspace", "harness":"codex", "profile":"fixture", "profile_snapshot":{}});
         launch.expected_generation = Some(0);
         let agent = store
             .submit("owner", launch, now)
@@ -569,6 +576,7 @@ mod tests {
             .target
             .unwrap();
         store.dispatch(&launch_id, now).unwrap();
+        crate::test_support::install_fixture_sources(&mut *store, &agent, &launch_id, 1, now);
         store
             .put_batch(
                 SourceBatch {
@@ -841,7 +849,7 @@ mod tests {
         {
             let mut store = router.inner.store.lock().await;
             let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
-            launch.args = json!({"project":"resolve-start-rpc", "workspace":"synthetic-workspace"});
+            launch.args = json!({"project":"resolve-start-rpc", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fixture", "profile_snapshot":{}});
             launch.expected_generation = Some(0);
             store.submit("owner", launch, now).unwrap();
             store.dispatch(&launch_id, now).unwrap();

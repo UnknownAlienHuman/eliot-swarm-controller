@@ -22,6 +22,7 @@ fn producer(store: &mut Store, native_ref: &str) -> String {
         .target
         .unwrap();
     store.dispatch(&command, NOW).unwrap();
+    crate::tests::install_fixture_sources(store, &id, &command, 1, NOW);
     store.put_batch(SourceBatch {
         batch_id: format!("{native_ref}:ready"), agent_id: id.clone(), generation: 1,
         source: INITIAL_SOURCE.to_owned(), cursor: None,
@@ -1057,6 +1058,7 @@ fn resume_recovered_producer(store: &mut Store, root: &str) {
     let resume_id = resume.id.clone();
     store.submit("owner", resume, NOW + 52).unwrap();
     store.dispatch(&resume_id, NOW + 53).unwrap();
+    crate::tests::install_fixture_sources(store, &root, &resume_id, 2, NOW + 53);
     store
         .put_batch(
             SourceBatch {
@@ -1319,6 +1321,7 @@ fn muse_producer(store: &mut Store, native_ref: &str) -> String {
         .target
         .unwrap();
     store.dispatch(&command, NOW).unwrap();
+    crate::tests::install_fixture_sources(store, &id, &command, 1, NOW);
     store
         .put_batch(
             SourceBatch {

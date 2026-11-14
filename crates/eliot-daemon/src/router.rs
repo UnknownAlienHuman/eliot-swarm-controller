@@ -6159,6 +6159,13 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                         .target
                         .unwrap();
                     store.dispatch(&launch_id, now_ms()).unwrap();
+                    crate::test_support::install_fixture_sources(
+                        store,
+                        &agent,
+                        &launch_id,
+                        1,
+                        now_ms(),
+                    );
                     read_fixture_event(
                         store,
                         &agent,
@@ -7533,6 +7540,13 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 )
                 .unwrap();
             store.dispatch(&launch_id, now_ms()).unwrap();
+            crate::test_support::install_fixture_sources(
+                &mut store,
+                &agent,
+                &launch_id,
+                1,
+                now_ms(),
+            );
             read_fixture_event(
                 &mut store,
                 &agent,
@@ -7783,6 +7797,13 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 )
                 .unwrap();
             store.dispatch(&launch_id, now_ms()).unwrap();
+            crate::test_support::install_fixture_sources(
+                &mut store,
+                &agent,
+                &launch_id,
+                1,
+                now_ms(),
+            );
             read_fixture_event(
                 &mut store,
                 &agent,
@@ -8011,6 +8032,13 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 )
                 .unwrap();
             store.dispatch(&launch_id, now_ms()).unwrap();
+            crate::test_support::install_fixture_sources(
+                &mut store,
+                &agent,
+                &launch_id,
+                1,
+                now_ms(),
+            );
             read_fixture_event(
                 &mut store,
                 &agent,
@@ -8219,6 +8247,9 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             launch.args = json!({
                 "project":"fault-accepted",
                 "workspace":"workspace-fault-accepted",
+                "harness":"codex",
+                "profile":"fixture",
+                "profile_snapshot":{},
             });
             launch.expected_generation = Some(0);
             store.submit("owner", launch, now_ms()).unwrap();
@@ -8461,6 +8492,13 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .target
                 .unwrap();
             store.dispatch(&launch_id, now_ms()).unwrap();
+            crate::test_support::install_fixture_sources(
+                &mut store,
+                &agent,
+                &launch_id,
+                1,
+                now_ms(),
+            );
             read_fixture_event(
                 &mut store,
                 &agent,
@@ -8740,6 +8778,13 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             store
                 .dispatch_with_native_store_binding(&launch_id, now_ms(), &expected_agent, &binding)
                 .unwrap();
+            crate::test_support::install_fixture_sources(
+                &mut store,
+                &agent,
+                &launch_id,
+                1,
+                now_ms(),
+            );
             read_fixture_event(
                 &mut store,
                 &agent,
@@ -9653,7 +9698,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             };
             let id = store.submit_with_workspace("owner", SubmitCommand {
                 id:ulid::Ulid::new().to_string(), target:None, selector:None, verb:"launch".to_owned(),
-                args:json!({"project":input.project, "workspace":input.repo_path, "worktree":input.requested_branch}),
+                args:json!({"project":input.project, "workspace":input.repo_path, "worktree":input.requested_branch, "harness":"codex", "profile":"fixture", "profile_snapshot":{}}),
                 expected_generation:Some(0), expected_turn_id:None, request_id:None, probe:false,
             }, input, now_ms()).unwrap().command.target.unwrap();
             store
@@ -10036,6 +10081,13 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .target
                 .unwrap();
             store.dispatch(&command_id, now_ms()).unwrap();
+            crate::test_support::install_fixture_sources(
+                &mut store,
+                &parent_id,
+                &command_id,
+                1,
+                now_ms(),
+            );
             store
                 .put_batch(
                     eliot_core::SourceBatch {
@@ -10249,6 +10301,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .target
             .unwrap();
         store.dispatch(&launch_id, now_ms()).unwrap();
+        crate::test_support::install_fixture_sources(store, &agent, &launch_id, 1, now_ms());
         crate::test_support::install_live_owned_process_source(store, &agent, 1, now_ms());
         read_fixture_event(
             store,
@@ -10294,6 +10347,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .target
             .unwrap();
         store.dispatch(&launch_id, now_ms()).unwrap();
+        crate::test_support::install_fixture_sources(store, &agent, &launch_id, 1, now_ms());
         read_fixture_event(
             store,
             &agent,
@@ -10457,6 +10511,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let old = now - 31 * 24 * 60 * 60 * 1_000;
         let (launch_id, agent) = launch_fixture(store, old, Some("children-probe"));
         store.dispatch(&launch_id, old).unwrap();
+        crate::test_support::install_fixture_sources(store, &agent, &launch_id, 1, old);
         read_fixture_event(
             store,
             &agent,

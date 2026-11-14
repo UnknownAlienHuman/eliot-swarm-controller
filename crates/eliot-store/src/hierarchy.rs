@@ -580,7 +580,7 @@ mod tests {
     }
 
     fn launch_request(project: &str, parent: Option<&str>) -> SubmitCommand {
-        let mut args = json!({"project":project, "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}});
+        let mut args = json!({"project":project, "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":{}});
         if let Some(parent) = parent {
             args["parent"] = json!(parent);
         }
@@ -622,7 +622,7 @@ mod tests {
                     target: None,
                     selector: None,
                     verb: "launch".to_owned(),
-                    args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"fake", "profile":"fake", "profile_snapshot":{}}),
+                    args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":{}}),
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
@@ -633,6 +633,7 @@ mod tests {
             .expect("admit launch");
         let agent = admission.command.target.expect("launch target");
         store.dispatch(&launch_id, now).expect("dispatch launch");
+        crate::tests::install_fixture_sources(store, &agent, &launch_id, 1, now);
         store
             .put_batch(
                 SourceBatch {
@@ -701,6 +702,7 @@ mod tests {
             )
             .unwrap();
         store.dispatch(&launch_id, now).expect("dispatch launch");
+        crate::tests::install_fixture_sources(store, agent, &launch_id, 1, now);
         store
             .put_batch(
                 SourceBatch {
@@ -734,7 +736,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 26);
+        assert_eq!(version, 28);
         let mut columns: Vec<String> = store
             .connection
             .prepare("SELECT name FROM pragma_table_info('agents')")
@@ -1342,7 +1344,7 @@ mod tests {
         ));
         {
             let legacy_store = Store::open(&path).unwrap();
-            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 26);
+            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 28);
             drop(legacy_store);
             // Downgrade to the v22 shape with two legacy rows, then reopen so
             // the v23 block backfills them exactly as it would on upgrade.
@@ -1365,6 +1367,10 @@ mod tests {
                      DELETE FROM schema_migrations WHERE version = 25;
                      DROP TABLE native_child_registrations;
                      DELETE FROM schema_migrations WHERE version = 26;
+                     ALTER TABLE turns DROP COLUMN usage;
+                     DELETE FROM schema_migrations WHERE version = 27;
+                     DROP INDEX commands_context_pending;
+                     DELETE FROM schema_migrations WHERE version = 28;
                      INSERT INTO agents(generation, project, harness, profile,
                                         workspace, state, created_at, updated_at)
                      VALUES (1, 'legacy', 'fake', 'fake',
@@ -1387,7 +1393,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 26);
+        assert_eq!(version, 28);
         for id in ["a1", "a2"] {
             let agent = store.get_agent(id).unwrap().expect("legacy row");
             assert_eq!(agent.root, id);

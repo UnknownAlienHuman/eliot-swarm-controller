@@ -3949,7 +3949,7 @@ mod tests {
                     target: None,
                     selector: None,
                     verb: "launch".to_owned(),
-                    args: json!({"project":"payload-guard", "workspace":"synthetic-workspace"}),
+                    args: json!({"project":"payload-guard", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fixture", "profile_snapshot":{}}),
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
@@ -3960,6 +3960,7 @@ mod tests {
             .unwrap();
         let agent_id = admission.command.target.unwrap();
         store.dispatch(&command_id, now).unwrap();
+        crate::test_support::install_fixture_sources(&mut store, &agent_id, &command_id, 1, now);
         let before_events = store.read_events(0, 1000, None).unwrap();
         let before_source = store.read_source_state(&agent_id, 1, "stream").unwrap();
         let store = Arc::new(AsyncMutex::new(store));
@@ -4082,7 +4083,7 @@ mod tests {
                     target: None,
                     selector: None,
                     verb: "launch".to_owned(),
-                    args: json!({"project":"handoff-boundary", "workspace":"synthetic-workspace"}),
+                    args: json!({"project":"handoff-boundary", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fixture", "profile_snapshot":{}}),
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
@@ -4095,6 +4096,14 @@ mod tests {
             .target
             .unwrap();
         store.dispatch(&command_id, now_ms()).unwrap();
+        crate::test_support::install_fixture_source_plan(
+            &mut store,
+            &agent_id,
+            &command_id,
+            1,
+            now_ms(),
+            &["message", "request", "session", "turn"],
+        );
         store
             .put_batch(
                 SourceBatch {
@@ -4789,6 +4798,7 @@ mod tests {
             .target
             .unwrap();
         store.dispatch(&start_id, now_ms()).unwrap();
+        crate::test_support::install_fixture_sources(&mut store, &agent, &start_id, 1, now_ms());
         let store = Arc::new(AsyncMutex::new(store));
         let bus = Bus::new(32);
         let secrets = Arc::new(Mutex::new(HashSet::new()));
@@ -5363,6 +5373,11 @@ mod tests {
         let mut agent = Agent::new(&agent_id, "prespawn", "codex", "fixture", 0);
         agent.generation = 1;
         agent.workspace = Some(workspace.clone());
+        agent.profile_snapshot = json!({
+            "harness":"codex",
+            "pass_env":[],
+            "pass_env_values":{"CODEX_HOME":null, "CODEX_SQLITE_HOME":null},
+        });
 
         let error = host
             .start(agent, launch_command_for(&agent_id, 1), None)

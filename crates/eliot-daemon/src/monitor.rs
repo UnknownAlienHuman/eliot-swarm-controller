@@ -1760,6 +1760,14 @@ mod tests {
             .target
             .unwrap();
         store.dispatch(&command_id, 1001).unwrap();
+        crate::test_support::install_fixture_source_plan(
+            &mut store,
+            &agent,
+            &command_id,
+            1,
+            1001,
+            families,
+        );
         store
             .record_source_handoff(
                 eliot_core::SourceHandoff {

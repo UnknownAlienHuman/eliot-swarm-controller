@@ -409,6 +409,8 @@ mod tests {
         let mut args = json!({
             "project": project,
             "workspace": "synthetic-workspace",
+            "harness": "codex",
+            "profile": "fixture",
             "profile_snapshot": {"control": control},
         });
         if let Some(parent) = parent {
@@ -445,6 +447,7 @@ mod tests {
             .unwrap()
             .id;
         store.dispatch(&launch_id, now).unwrap();
+        crate::test_support::install_fixture_sources(&mut *store, agent, &launch_id, 1, now);
     }
 
     fn agent_principal(id: &str, generation: i64) -> Principal {

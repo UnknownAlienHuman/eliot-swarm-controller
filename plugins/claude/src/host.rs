@@ -2213,6 +2213,7 @@ mod tests {
                 ("message".to_owned(), "stream".to_owned()),
                 ("request".to_owned(), "stream".to_owned()),
                 ("session".to_owned(), "stream".to_owned()),
+                ("tool".to_owned(), "stream".to_owned()),
                 ("turn".to_owned(), "stream".to_owned()),
             ])
         );

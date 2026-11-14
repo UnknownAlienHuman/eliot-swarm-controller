@@ -1103,6 +1103,7 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
                 .unwrap();
             let agent = launch.command.target.unwrap();
             store.dispatch(&launch_id, now_ms()).unwrap();
+            crate::test_support::install_fixture_sources(&mut *store, &agent, &launch_id, 1, now_ms());
             read_fixture_event(
                 &mut store,
                 &agent,
@@ -1137,6 +1138,13 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
             resume.expected_generation = Some(1);
             store.submit("owner", resume, now_ms()).unwrap();
             store.dispatch(&resume_id, now_ms()).unwrap();
+            crate::test_support::install_fixture_sources(
+                &mut store,
+                &agent,
+                &resume_id,
+                2,
+                now_ms(),
+            );
 
             let batch_id = ulid::Ulid::new().to_string();
             store
@@ -1255,6 +1263,7 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
                 )
                 .unwrap();
             store.dispatch(&launch_id, now_ms()).unwrap();
+            crate::test_support::install_fixture_sources(&mut *store, &pending_agent, &launch_id, 1, now_ms());
             read_fixture_event(
                 &mut store,
                 &pending_agent,
