@@ -227,6 +227,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | --- | --- |
 | `api.methods/help/identity` | bounded authenticated method discovery, DTO schemas/examples, and credential-free caller scope |
 | `daemon.status/shutdown` | owner-only current state/admission and exact drain/force |
+| `maintenance.run` | owner-only immediate bounded retention pass reporting pruned counts |
 | `agent.list/get/result` | scoped, paginated Agent state and exact results |
 | `agent.processes/stats` | scoped process records and ephemeral OS samples |
 | `agent.git/edits` | current Git snapshot and paginated native-attributed edits |
@@ -354,6 +355,15 @@ shutdown); `failed` carries only a bounded code (`worker_panicked`, `worker_canc
 The rule worker propagates its actual exit reason from its admission-closed
 return sites: an intentional admission/shutdown exit surfaces as `stopped`,
 while any other `Ok(())` surfaces as `failed` (`worker_exited`).
+
+`maintenance.run` is owner-only and accepts an empty object. It reloads the
+daemon retention settings and runs the same bounded retention epochs as the
+hourly tick (same row and time budgets, same drain rule), returning the Core
+[`MaintenanceRunResponse`](../../crates/eliot-core/src/api/maintenance.rs)
+pruned counts and the retained-event watermark `pruned_through`. A rejected
+settings reload fails the call instead of pruning under stale windows. The
+manual pass adds no new retention semantics; the contract stays in
+[core](core.md#retention).
 
 `project.list` and `project.get` are owner-only readbacks of the owner-registered
 canonical checkout, repository common directory, explicit profile/action allowlists and
@@ -921,10 +931,32 @@ additionally reports every discovered install newest first in `candidates`);
 `harness.models` (`HarnessModelsRequest`/`HarnessModelsResponse`) returns the
 harness's own read-only catalogue (Codex/Muse native `model/list`, the OpenCode
 provider/model list; Claude reports aliases plus the CLI default, Antigravity
-reports no catalogue). `harness.models` accepts an optional `cmd` overriding
-discovery for the catalogue harnesses (codex|muse|opencode). Both are
-owner-only, read-only, and start no model turn and no inference
-(`swarm harnesses`, `swarm models --harness H [--cmd PATH]`).
+reports no catalogue). An optional `profile` selects the native route/account
+(the named profile must exist and its frozen harness must match); omitted it
+means ad-hoc daemon defaults. The read is cached per native route/account
+scope with a freshness timestamp (`fetched_at_ms`, `ttl_ms`) and a nonsecret
+credential identity (a name, never a value); every response carries its
+`scope`, `fetched_at_ms`, `ttl_ms` and `credential`. Native model ids are
+retained verbatim and a failed read never selects another model or account.
+`harness.quota` (`HarnessQuotaRequest`/`HarnessQuotaResponse`) is the separate
+provider-supported account quota readback: timestamp (`fetched_at_ms`,
+`ttl_ms`), `scope` and `credential` as above, plus an explicit `status` of
+`supported`, `unsupported` or `unknown` naming the checked native surface and,
+when `supported`, provider-verbatim quota signals in `details` (an object, at
+most 8192 encoded bytes; never secrets or personal data). Codex reads
+`account/rateLimits/read` plus `account/usage/read` when useful (windows with
+used percent, reset time, credits and plan; `account/read` is never called so
+no email enters the response, logs or Store); Muse reads `usage/read`
+(window and weekly used percent, reset time, tier and arrival stamp; an empty
+`details` object means the host observed nothing and no numbers are
+fabricated). A method-not-found or schema mismatch stays `unsupported` or
+`unknown` naming the checked method. OpenCode/Claude/Antigravity expose no
+read-only quota endpoint, so they report `unsupported`. Support never comes
+from an inference probe or per-Agent polling. Both reads are owner-only,
+read-only, deduplicated per account through the same bounded per-scope cache,
+and start no model turn and no inference
+(`swarm harnesses`, `swarm models --harness H [--profile P]`,
+`swarm quota --harness H [--profile P]`).
 `profile` and `id` are required nonempty strings. Present strings are checked for
 nonemptiness after trimming but are preserved as supplied. For `agent.discover`, optional
 `harness`, `native_scope` and `cursor` may be omitted or `null` to mean absent. For
@@ -1010,6 +1042,10 @@ the opaque coverage object and do not synthesize completeness.
 Unsupported source/paging stays explicit. Observation never resumes a thread to obtain
 history. See the neutral
 `ObservationPage` bounds in [plugin protocol](plugin-protocol.md#host-requests).
+The native subject projection read at attach is retained with the applied attach
+outcome: when the live observer reader has lapsed, `source=native, view=subject` is
+served from that retained metadata bound to the current generation. Turns/items views
+still require the live reader, and a later detach still fences every read.
 Observe detach fences new reads, closes only its reader and records source closure
 after cleanup. It retains unknown native state and never reports native session end.
 
@@ -1034,7 +1070,10 @@ CLI `watch [AGENT]` reads these bounds once and starts at `hi`, delivering new e
 `watch [AGENT] --after SEQ` instead uses that exact exclusive replay cursor. A lost
 cursor, including explicit `--after 0` after pruning, returns `history_gap`; it is
 never clamped or replaced by a new tip. MCP notification bootstrap also uses bounds
-instead of replay from zero. A later retention gap still fails explicitly.
+instead of replay from zero. A later retention gap still fails explicitly. A transient
+transport timeout never ends the stream: the client re-issues `events.subscribe` from
+its last cursor with bounded backoff. Only a typed rejection ends it; on `history_gap`
+the client resolves the retained resume cursor from fresh bounds and reports it.
 
 Before printing events or advancing a cursor, validate each response page against the
 effective request cursor: `0 <= after <= next <= high_water`. Event `seq` values must be
@@ -1337,7 +1376,10 @@ failure rather than only the linked cancellation.
 Only current-layer commands appear in help and Agent guidance. Exit codes: 0 success/
 queued; 1 definite failure; 2 usage; 3 pre-effect rejection; 4 unknown; 5 wait timeout;
 6 still dispatched/pending; 7 interrupted/cancelled. A queued/applied input is not
-successful task completion.
+successful task completion. Every mutation prints its generated command id as `id=...`
+on stderr so stdout stays pure response JSON; Windows PowerShell 5.1 turns that stderr
+line into an error record when merged with `2>&1`, so callers must read the raw process
+exit code (`$LASTEXITCODE` / `%ERRORLEVEL%`) rather than `$?`.
 
 `steer` and `interrupt` do not require `--generation`/`--turn`. When either flag
 is omitted the CLI reads the Agent's current generation and active turn, prints

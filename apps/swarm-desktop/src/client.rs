@@ -1,25 +1,34 @@
 //! Typed RPC caller for the desktop client.
 //!
 //! Every call goes through the existing authenticated daemon client
-//! (`eliot_daemon::client_call_typed` and the `eliot_core::api` DTOs) with
-//! the same request/response validators the CLI runs. There is no second
-//! executor, no UI-owned database and no new endpoint: `project.list` is the
-//! one exception to the typed boundary because it returns a bare JSON array,
-//! so it is decoded from the raw client result with the same field checks.
+//! (`eliot_daemon::client_call_typed` and the `eliot_core::api` DTOs) and runs
+//! the same request/response validators the CLI runs; deserialization alone
+//! is not validation. There is no second executor, no UI-owned database and
+//! no new endpoint: `project.list` is the one exception to the typed boundary
+//! because it returns a bare JSON array, so it is decoded from the raw client
+//! result with the same field checks.
 
 use std::path::{Path, PathBuf};
 
 use eliot_core::api::{
     AgentGetRequest, AgentGetResponse, AgentListRequest, AgentListResponse, AgentResultRequest,
-    AgentResultResponse, AgentSummary, CommandGetRequest, CommandSubmitRequest,
-    CommandSubmitResponse, ProjectRegistrationView, TurnGetRequest, discovery::ProjectListRequest,
+    AgentResultResponse, CommandGetRequest, CommandSubmitRequest, CommandSubmitResponse,
+    EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
+    EventsSubscribeRequest, EventsSubscribeResponse, ProjectRegistrationView, UsageSummaryRequest,
+    UsageSummaryResponse, discovery::ProjectListRequest,
 };
-use eliot_core::{Command, CommandState, Error, Result, Turn, TurnState};
+use eliot_core::{Command, Error, Result};
+use futures_util::StreamExt;
 use serde_json::Value;
 
+use crate::chat::{CHAT_KINDS, InputText, bound_text};
+use crate::live::WAKE_WAIT_MS;
+
 const MAX_TEXT_BYTES: usize = 512 * 1024;
-const POLL_INTERVAL_MS: u64 = 500;
-const POLL_ROUNDS: usize = 240;
+/// Concurrent ordinary reads issued by one worker (the issue's initial cap).
+pub const MAX_CONCURRENT_READS: usize = 4;
+/// Server-side scan bound per `events.read` call.
+const EVENT_SCAN_ROWS: usize = 1_000;
 
 /// Resolve the daemon data directory exactly like the CLI: explicit override,
 /// then `ELIOT_HOME`, then `%LOCALAPPDATA%\Eliot`, then the home share.
@@ -93,21 +102,14 @@ pub async fn list_projects(data_dir: &Path) -> Result<Vec<ProjectRegistrationVie
     Ok(registrations)
 }
 
-/// Current Agents, optionally narrowed to one project. The UI always passes
-/// an explicit project filter; the unfiltered fleet view is not needed here.
-pub async fn list_agents(data_dir: &Path, project: Option<&str>) -> Result<Vec<AgentSummary>> {
-    let params = AgentListRequest {
-        project: project.map(str::to_owned),
-        limit: 100,
-        ..Default::default()
-    };
+/// One validated `agent.list` page. The response passes the canonical
+/// `validate_response` (row filters, cursor, totals), not only row checks.
+pub async fn list_agents(data_dir: &Path, params: &AgentListRequest) -> Result<AgentListResponse> {
     params.validate()?;
     let reply: AgentListResponse =
-        eliot_daemon::client_call_typed(data_dir, "agent.list", &params).await?;
-    for row in &reply.agents {
-        row.validate()?;
-    }
-    Ok(reply.agents.into_iter().map(|row| row.summary).collect())
+        eliot_daemon::client_call_typed(data_dir, "agent.list", params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
 }
 
 /// Full readback for one Agent: generation, active turn, pending requests,
@@ -121,19 +123,141 @@ pub async fn get_agent(data_dir: &Path, id: &str) -> Result<AgentGetResponse> {
     Ok(reply)
 }
 
-/// Latest retained final text for one Agent, with its turn binding.
-pub async fn latest_final_text(data_dir: &Path, agent: &str) -> Result<Option<(String, String)>> {
-    let params = AgentResultRequest::new(agent);
+/// Newest `limit` retained turns of the current generation of the Agent.
+/// `agent.result` has no cursor: older pages are a larger limit.
+pub async fn agent_results(
+    data_dir: &Path,
+    agent: &str,
+    limit: usize,
+) -> Result<AgentResultResponse> {
+    let mut params = AgentResultRequest::new(agent);
+    params.limit = limit;
     params.validate()?;
     let reply: AgentResultResponse =
         eliot_daemon::client_call_typed(data_dir, "agent.result", &params).await?;
-    let mut latest: Option<(String, String)> = None;
-    for turn in &reply.turns {
-        if let Some(text) = turn.final_text.as_deref() {
-            latest = Some((turn.turn_id.clone(), text.to_owned()));
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// Filter for one conversation: its Agent and the kinds the view consumes,
+/// so the feed never carries the tool/token traffic of the whole fleet.
+pub fn chat_filter(agent: &str) -> EventsFilter {
+    EventsFilter {
+        agents: vec![agent.to_owned()],
+        kinds: CHAT_KINDS.iter().map(|kind| (*kind).to_owned()).collect(),
+        sources: Vec::new(),
+    }
+}
+
+/// Retention floor and committed high-water: the snapshot cursor.
+pub async fn events_bounds(data_dir: &Path, filter: &EventsFilter) -> Result<EventsBoundsResponse> {
+    let params = EventsBoundsRequest {
+        filter: filter.clone(),
+    };
+    params.validate()?;
+    let reply: EventsBoundsResponse =
+        eliot_daemon::client_call_typed(data_dir, "events.bounds", &params).await?;
+    reply.validate()?;
+    Ok(reply)
+}
+
+/// One validated `events.read` page strictly after `after`.
+pub async fn events_read(
+    data_dir: &Path,
+    after: i64,
+    limit: usize,
+    filter: &EventsFilter,
+) -> Result<EventsReadResponse> {
+    let params = EventsReadRequest {
+        after,
+        limit,
+        filter: filter.clone(),
+    };
+    params.validate()?;
+    let reply: EventsReadResponse =
+        eliot_daemon::client_call_typed(data_dir, "events.read", &params).await?;
+    reply.validate(after)?;
+    Ok(reply)
+}
+
+/// Long-poll wake: limit 1 so the call returns on the first matching event
+/// instead of holding until the deadline; `wait_ms` is always explicit.
+pub async fn events_wake(
+    data_dir: &Path,
+    after: i64,
+    filter: &EventsFilter,
+) -> Result<EventsSubscribeResponse> {
+    let params = EventsSubscribeRequest {
+        after,
+        limit: 1,
+        wait_ms: WAKE_WAIT_MS,
+        filter: filter.clone(),
+    };
+    params.validate()?;
+    let reply: EventsSubscribeResponse =
+        eliot_daemon::client_call_typed(data_dir, "events.subscribe", &params).await?;
+    reply.validate(after)?;
+    Ok(reply)
+}
+
+/// Scan the journal window `(from, through]` for the filter. Events above
+/// `through` are dropped: live delivery continues from `through` and will
+/// carry them, so nothing is applied twice or skipped.
+pub async fn scan_events(
+    data_dir: &Path,
+    from: i64,
+    through: i64,
+    filter: &EventsFilter,
+) -> Result<Vec<eliot_core::Event>> {
+    let mut after = from;
+    let mut events = Vec::new();
+    while after < through {
+        let page = events_read(data_dir, after, EVENT_SCAN_ROWS, filter).await?;
+        events.extend(page.events.into_iter().filter(|event| event.seq <= through));
+        if page.next <= after || !page.truncated {
+            break;
+        }
+        after = page.next;
+    }
+    Ok(events)
+}
+
+/// Exclusive journal cursor just before the first retained event committed
+/// at or after `at_ms`, by binary search over single-row unfiltered reads
+/// (about log2 of the journal length). Commit timestamps follow sequence
+/// order closely; callers keep a margin below the result.
+pub async fn seq_before(data_dir: &Path, at_ms: i64, floor: i64, high: i64) -> Result<i64> {
+    let everything = EventsFilter::default();
+    let (mut low, mut high) = (floor, high);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let page = events_read(data_dir, mid, 1, &everything).await?;
+        match page.events.first() {
+            Some(event) if event.ts < at_ms => low = event.seq.max(mid + 1),
+            Some(_) => high = mid,
+            None => high = mid,
         }
     }
-    Ok(latest)
+    Ok(low)
+}
+
+/// Input texts of retained commands, at most `MAX_CONCURRENT_READS` at once.
+/// A failed read is reported per command, never retried as a new action.
+pub async fn input_texts(data_dir: &Path, commands: Vec<String>) -> Vec<(String, InputText)> {
+    futures_util::stream::iter(commands)
+        .map(|command| async move {
+            let text = match read_command(data_dir, &command).await {
+                Ok(read) => match read.args.get("text").and_then(Value::as_str) {
+                    Some(text) => InputText::Loaded(bound_text(text)),
+                    None => InputText::Unavailable("the command carries no text".to_owned()),
+                },
+                Err(error) => InputText::Unavailable(error.to_string()),
+            };
+            (command, text)
+        })
+        .buffer_unordered(MAX_CONCURRENT_READS)
+        .collect()
+        .await
 }
 
 fn submit_request(
@@ -156,21 +280,14 @@ async fn submit(data_dir: &Path, request: &CommandSubmitRequest) -> Result<Comma
     Ok(reply)
 }
 
-async fn read_command(data_dir: &Path, id: &str) -> Result<Command> {
+/// One retained command with its admitted args and state.
+pub async fn read_command(data_dir: &Path, id: &str) -> Result<Command> {
     let params = CommandGetRequest::new(id);
     params.validate()?;
     let command: Command =
         eliot_daemon::client_call_typed(data_dir, "command.get", &params).await?;
     params.validate_response(&command)?;
     Ok(command)
-}
-
-async fn read_turn(data_dir: &Path, agent: &str, generation: i64, turn_id: &str) -> Result<Turn> {
-    let params = TurnGetRequest::new(agent, generation, turn_id);
-    params.validate()?;
-    let turn: Turn = eliot_daemon::client_call_typed(data_dir, "turn.get", &params).await?;
-    params.validate_response(&turn)?;
-    Ok(turn)
 }
 
 /// First prompt as one submission: nonblank text rides the launch admission
@@ -226,29 +343,15 @@ pub async fn submit_send(
     .await
 }
 
-/// Interrupt exactly the bound turn. A missing turn binding is captured once
-/// from `agent.get` (the Agent's current active turn), like the CLI's exact
-/// target resolution; explicit flags are never re-read after capture.
+/// Interrupt exactly the turn and generation captured at click time; the
+/// binding is never re-read, so a later turn cannot be interrupted instead.
 pub async fn submit_interrupt(
     data_dir: &Path,
     mutation_id: String,
     agent: &str,
-    generation: Option<i64>,
-    turn_id: Option<String>,
+    generation: i64,
+    turn_id: String,
 ) -> Result<CommandSubmitResponse> {
-    let (generation, turn_id) = match (generation, turn_id) {
-        (Some(generation), Some(turn_id)) => (generation, turn_id),
-        (generation, turn_id) => {
-            let reply = get_agent(data_dir, agent).await?;
-            let active = reply.agent.active_turn.clone().ok_or_else(|| {
-                Error::new("invalid", "the agent has no active turn to interrupt")
-            })?;
-            (
-                generation.unwrap_or(reply.agent.generation),
-                turn_id.unwrap_or(active),
-            )
-        }
-    };
     let mut request = submit_request(
         mutation_id,
         Some(agent.to_owned()),
@@ -334,79 +437,36 @@ pub async fn submit_answer(
     submit(data_dir, &request).await
 }
 
-/// Settle one submitted command: applied, or a terminal outcome that keeps
-/// its contract meaning. Unknown stays unknown; cancellation is reported,
-/// never mistaken for success. Bounded so a UI worker always comes home.
-pub async fn wait_command_settled(data_dir: &Path, command_id: &str) -> Result<Command> {
-    for _ in 0..POLL_ROUNDS {
-        let command = read_command(data_dir, command_id).await?;
-        match command.state {
-            CommandState::Applied => return Ok(command),
-            CommandState::Accepted | CommandState::Queued | CommandState::Dispatched => {
-                tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
-            }
-            CommandState::Rejected => {
-                return Err(Error::new(
-                    "rejected",
-                    "command was rejected before native I/O",
-                ));
-            }
-            CommandState::Failed => return Err(Error::new("failed", "command failed")),
-            CommandState::Unknown => {
-                return Err(Error::new("unknown", "command outcome is unknown"));
-            }
-            CommandState::Cancelled => {
-                return Err(Error::new("cancelled", "command was cancelled"));
-            }
-        }
-    }
-    Err(Error::new(
-        "unknown",
-        "command did not settle in the readback window",
-    ))
+/// Bounded usage totals with explicit coverage for one Agent.
+pub async fn usage_summary(data_dir: &Path, agent: &str) -> Result<UsageSummaryResponse> {
+    let params = UsageSummaryRequest {
+        agent: Some(agent.to_owned()),
+        generation: None,
+        project: None,
+        root: None,
+    };
+    params.validate()?;
+    let reply: UsageSummaryResponse =
+        eliot_daemon::client_call_typed(data_dir, "usage.summary", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
 }
 
-/// Read back the final text behind one settled command: the command's own
-/// turn when it carries one, otherwise the linked `<id>/send` input turn
-/// created by a launch-with-text admission.
-pub async fn command_final_text(
+/// Lifecycle stop of exactly the generation observed at click time. This is
+/// the explicit Agent action, never a substitute for interrupting a turn.
+pub async fn submit_stop(
     data_dir: &Path,
-    command: &Command,
-    linked_command: Option<&str>,
-) -> Result<Option<(String, String)>> {
-    if let Some(turn_id) = command.turn_id.as_deref() {
-        let agent = command
-            .target
-            .as_deref()
-            .ok_or_else(|| Error::new("unknown", "settled command has no agent binding"))?;
-        let generation = command
-            .generation
-            .ok_or_else(|| Error::new("unknown", "settled command has no generation binding"))?;
-        for _ in 0..POLL_ROUNDS {
-            let turn = read_turn(data_dir, agent, generation, turn_id).await?;
-            match turn.state {
-                TurnState::Completed => {
-                    return Ok(turn
-                        .final_text
-                        .clone()
-                        .map(|text| (turn.turn_id.clone(), text)));
-                }
-                TurnState::Unknown => {
-                    return Err(Error::new("unknown", "turn outcome is unknown"));
-                }
-                TurnState::Running => {
-                    tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
-                }
-            }
-        }
-        return Err(Error::new(
-            "unknown",
-            "turn did not settle in the readback window",
-        ));
-    }
-    if let Some(linked_id) = linked_command {
-        let linked = wait_command_settled(data_dir, linked_id).await?;
-        return Box::pin(command_final_text(data_dir, &linked, None)).await;
-    }
-    Ok(None)
+    mutation_id: String,
+    agent: &str,
+    generation: i64,
+    force: bool,
+) -> Result<CommandSubmitResponse> {
+    let mut request = submit_request(
+        mutation_id,
+        Some(agent.to_owned()),
+        "stop",
+        serde_json::json!({ "force": force }),
+    )?;
+    request.expected_generation = Some(generation);
+    submit(data_dir, &request).await
 }

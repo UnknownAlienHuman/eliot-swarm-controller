@@ -63,6 +63,18 @@ fn notice_text(kind: NoticeKind, count: i64) -> String {
 
 impl Router {
     pub(super) async fn mail_send(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        self.mail_send_impl(params, principal, false).await
+    }
+
+    /// Shared mail send path. `allow_digest_id` is true only for
+    /// completion-digest delivery, whose mail id is the digest registration
+    /// id by design; the public endpoint always rejects digest-bound ids.
+    pub(super) async fn mail_send_impl(
+        &self,
+        params: &Value,
+        principal: &Principal,
+        allow_digest_id: bool,
+    ) -> Result<Value> {
         let request: MailSendRequest = decode_coordination_request(
             params,
             &self.inner.secrets,
@@ -73,7 +85,11 @@ impl Router {
         let limits = self.inner.mail.limits();
         let change = {
             let mut store = self.inner.store.lock().await;
-            let change = store.mail_send(&name, &request, limits, now_ms())?;
+            let change = if allow_digest_id {
+                store.mail_send_digest_delivery(&name, &request, limits, now_ms())?
+            } else {
+                store.mail_send(&name, &request, limits, now_ms())?
+            };
             if change.outcome == MailSendOutcome::Fresh {
                 self.publish_locked(&change.events);
             }

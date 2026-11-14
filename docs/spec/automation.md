@@ -82,6 +82,8 @@ missed watcher notifications. Already admitted commands retain their original in
 The [Core retention contract](core.md#retention) makes enabled current/retiring cursors
 pin the events they still need; disabled rules pin nothing.
 Physical retention is implemented by bounded Store cleanup during daemon maintenance.
+The same bounded pass also runs on demand through owner-only `maintenance.run`,
+which returns the pruned counts; see [api](api.md#methods).
 The implemented backlog policy bounds rule work and releases retention pins; it does not
 itself delete history. Daemon startup validates `automation.max_event_backlog` before readiness. The
 rule worker reloads it during startup and each two-second reconciliation, applying the

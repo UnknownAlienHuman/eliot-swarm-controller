@@ -3686,6 +3686,16 @@ fn write_binding(connection: &Connection, id: &str) -> Result<Option<StoredWrite
         .map_err(sql_error)
 }
 
+fn digest_id_bound(connection: &Connection, id: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM completion_digests WHERE id = ?1)",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
+}
+
 fn write_exists(connection: &Connection, id: &str) -> Result<bool> {
     connection
         .query_row(

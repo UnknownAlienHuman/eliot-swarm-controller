@@ -701,6 +701,55 @@ impl Store {
             && !detach_fenced(&self.connection, id, generation)?)
     }
 
+    /// Retained native subject from the latest applied observe attach.
+    ///
+    /// `agent.history` serves `source=native, view=subject` from this retained
+    /// attach metadata when the live observer reader has lapsed. Only an
+    /// applied attach that is still the latest observer command for the
+    /// generation qualifies: a later detach (or any non-applied attach) leaves
+    /// no retained subject, so the detach fence keeps failing reads instead of
+    /// serving superseded history.
+    pub fn retained_observe_subject(&self, agent: &str, generation: i64) -> Result<Option<Value>> {
+        let id = parse_agent_id(agent)?;
+        let current = load_agent_by_num(&self.connection, id)?
+            .ok_or_else(|| Error::new("not_found", "Agent was not found"))?;
+        if !current.observe_only
+            || current.origin != core::AgentOrigin::External
+            || current.own_identity
+            || current.generation != generation
+        {
+            return Ok(None);
+        }
+        let row: Option<(String, String, Option<String>)> = self
+            .connection
+            .query_row(
+                "SELECT verb, state, outcome FROM commands
+                 WHERE target = ?1 AND generation = ?2 AND verb IN ('attach','detach')
+                 ORDER BY rowid DESC LIMIT 1",
+                params![id, generation],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some((verb, state, outcome)) = row else {
+            return Ok(None);
+        };
+        if verb != "attach" || state != "applied" {
+            return Ok(None);
+        }
+        let outcome: Value = match outcome {
+            Some(outcome) => decode_json(&outcome)?,
+            None => return Ok(None),
+        };
+        match outcome
+            .get("metadata")
+            .and_then(|metadata| metadata.get("subject"))
+        {
+            Some(subject) if subject.is_object() => Ok(Some(subject.clone())),
+            _ => Ok(None),
+        }
+    }
+
     pub fn settle_observe_attach(
         &mut self,
         command_id: &str,

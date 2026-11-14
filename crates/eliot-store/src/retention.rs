@@ -33,6 +33,7 @@ pub struct RetentionReport {
     pub commands_deleted: i64,
     pub writes_deleted: i64,
     pub mail_deleted: i64,
+    pub digests_deleted: i64,
 }
 
 struct SubtreeMember {
@@ -52,8 +53,10 @@ impl Store {
     /// expired contiguous prefix below every live cursor; command pruning
     /// removes whole closed child-sets leaf-first; writes pruning removes
     /// expired mutation bindings; mail pruning removes acknowledged messages
-    /// older than the mail window, never unread mail. Projections, source
-    /// recovery state, timers, and the event id allocator are never touched.
+    /// older than the mail window, never unread mail; digest pruning removes
+    /// delivered completion digests older than the commands window, never
+    /// pending ones. Projections, source recovery state, timers, and the
+    /// event id allocator are never touched.
     /// An unset (`None`) window disables pruning for that side: no deletion
     /// without an owner window.
     pub fn prune_retention(
@@ -142,12 +145,17 @@ impl Store {
             Some(cutoff) => self.prune_mail(cutoff)?,
             None => 0,
         };
+        let digests_deleted = match commands_cutoff {
+            Some(cutoff) => self.prune_delivered_digests(cutoff)?,
+            None => 0,
+        };
         Ok(RetentionReport {
             events_deleted,
             pruned_through,
             commands_deleted,
             writes_deleted,
             mail_deleted,
+            digests_deleted,
         })
     }
 
@@ -335,6 +343,30 @@ impl Store {
         let writes = prune_writes_tx(&tx, cutoff)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok((deleted, writes))
+    }
+
+    /// Delete one bounded batch of delivered digests whose delivery is older
+    /// than the commands cutoff, oldest delivery first. Pending rows
+    /// (`delivered_at IS NULL`) never match, however old: an undelivered
+    /// digest is still live coordination. Deletion is silent and never
+    /// replays an effect: the digest mail row is untouched, and a later
+    /// re-registration of a pruned id reads `id_expired` through the
+    /// write-id age rule instead of a new row.
+    fn prune_delivered_digests(&mut self, cutoff: i64) -> Result<i64> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let deleted = db!(tx.execute(
+            "DELETE FROM completion_digests WHERE id IN (
+                 SELECT id FROM completion_digests
+                 WHERE delivered_at IS NOT NULL AND delivered_at <= ?1
+                 ORDER BY delivered_at, id LIMIT ?2
+             )",
+            params![cutoff, MAX_PAGE_ENTRIES as i64],
+        ));
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(deleted as i64)
     }
 
     /// Delete one bounded batch of acknowledged messages whose acknowledgement
@@ -2431,6 +2463,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hold_state, "probing");
+    }
+
+    #[test]
+    fn prune_delivered_digests_keeps_pending_and_recent_rows() {
+        use eliot_core::api::SwarmDigestRequest;
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        let agent = insert_agent(&mut store, 1);
+        let parent = format!("a{agent}");
+        let register = |store: &mut Store, tag: u128, at: i64| -> String {
+            let id = Ulid::from_parts(at as u64, tag).to_string();
+            let request = SwarmDigestRequest::new(
+                id.clone(),
+                parent.clone(),
+                "all".to_owned(),
+                vec!["c-old".to_owned()],
+                vec![],
+            );
+            store
+                .digest_register("owner", &request, &[false], at)
+                .unwrap();
+            id
+        };
+        let delivered_old = register(&mut store, 7, old);
+        store
+            .mark_digest_delivered(&delivered_old, "old-delivery", old)
+            .unwrap();
+        let pending_old = register(&mut store, 8, old);
+        let delivered_fresh = register(&mut store, 9, NOW);
+        store
+            .mark_digest_delivered(&delivered_fresh, "fresh-delivery", NOW)
+            .unwrap();
+        let report = store.prune_retention(None, Some(30), None, NOW).unwrap();
+        assert_eq!(report.digests_deleted, 1);
+        assert_eq!(report.commands_deleted, 0);
+        assert!(
+            store
+                .get_completion_digest(&delivered_old)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.get_completion_digest(&pending_old).unwrap().is_some());
+        assert!(
+            store
+                .get_completion_digest(&delivered_fresh)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

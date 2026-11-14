@@ -14,9 +14,10 @@ use eliot_core::api::{
     EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
     ObservationPage, TurnCounterMissing, UsageSummaryRequest, UsageSummaryResponse,
 };
-use eliot_core::{AgentState, NativeChildActivityState};
+use eliot_core::{AgentState, Error as CoreError, NativeChildActivityState};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub(crate) async fn run_ls(
     LsArgs {
@@ -316,6 +317,155 @@ pub(crate) async fn run_events(
     Ok(0)
 }
 
+/// Consecutive transient transport failures tolerated before one watch
+/// stream gives up with a typed error naming its resume cursor.
+pub(crate) const WATCH_TRANSIENT_RETRIES: u32 = 30;
+/// First retry delay; doubles per consecutive failure up to WATCH_MAX_BACKOFF.
+const WATCH_RETRY_BASE: Duration = Duration::from_millis(200);
+const WATCH_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// How a watch polling step ends without a usable page.
+enum WatchAttempt<T> {
+    /// A fresh page (or the initial cursor) is ready.
+    Ready(T),
+    /// Ctrl-C arrived; exit 0.
+    Cancelled,
+    /// A typed domain error; the caller decides how to report it.
+    Fatal(CoreError),
+    /// The transient budget ran out; already converted to a typed failure
+    /// naming the resume cursor when one is known.
+    Drained(Failure),
+}
+
+/// Transient transport failures a watch rides out by re-issuing
+/// `events.subscribe` from its last cursor: the client-side absolute
+/// deadline, a dropped connection, a failed frame write, an undecodable
+/// frame, or the daemon closing the live event bus while draining. Domain
+/// rejections (including `history_gap`) are never transient.
+pub(crate) fn is_transient_watch_error(error: &CoreError) -> bool {
+    match error.code.as_str() {
+        "unknown" => [
+            "daemon RPC exceeded its absolute deadline",
+            "daemon closed the RPC connection",
+            "daemon response frame is invalid",
+        ]
+        .iter()
+        .any(|marker| error.message.contains(marker)),
+        "unavailable" => ["daemon RPC write failed", "event bus is closed"]
+            .iter()
+            .any(|marker| error.message.contains(marker)),
+        _ => false,
+    }
+}
+
+/// The daemon is unreachable (not running, refused endpoint, unreadable data
+/// directory): fail fast, but keep the stream's resume cursor.
+fn is_watch_unreachable(error: &CoreError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "unavailable" | "platform_io" | "data_dir_unavailable"
+    ) && error.message.contains("hint: data_dir=")
+}
+
+/// Backoff before re-issuing a poll after `consecutive` transient failures.
+pub(crate) fn watch_retry_delay(consecutive: u32) -> Duration {
+    let shift = consecutive.min(5);
+    WATCH_RETRY_BASE
+        .checked_mul(1 << shift)
+        .unwrap_or(WATCH_MAX_BACKOFF)
+        .min(WATCH_MAX_BACKOFF)
+}
+
+/// Append the stream's resume cursor to a typed watch failure, so a dead
+/// watch never strands its position behind a generic error.
+fn with_watch_resume_cursor(mut failure: Failure, after: i64) -> Failure {
+    failure.message = format!("{}; resume with --after {after}", failure.message);
+    failure
+}
+
+/// Bounded retry around one watch RPC. Transient transport failures back off
+/// and re-issue from the same cursor; only Ctrl-C, typed domain errors, or
+/// an exhausted retry budget end the poll.
+async fn watch_poll<T, Fut>(
+    mut attempt: impl FnMut() -> Fut,
+    resume_after: Option<i64>,
+) -> WatchAttempt<T>
+where
+    Fut: std::future::Future<Output = Result<T, CoreError>>,
+{
+    let mut consecutive = 0_u32;
+    loop {
+        let poll = tokio::select! {
+            result = attempt() => result,
+            signal = tokio::signal::ctrl_c() => {
+                return match signal {
+                    Ok(()) => WatchAttempt::Cancelled,
+                    Err(error) => WatchAttempt::Drained(Failure::new(
+                        1,
+                        format!("cannot listen for Ctrl+C: {error}"),
+                    )),
+                };
+            }
+        };
+        match poll {
+            Ok(value) => return WatchAttempt::Ready(value),
+            Err(error) if is_transient_watch_error(&error) => {
+                consecutive += 1;
+                if consecutive > WATCH_TRANSIENT_RETRIES {
+                    let failure = Failure::from_core(error, false);
+                    return WatchAttempt::Drained(match resume_after {
+                        Some(after) => with_watch_resume_cursor(failure, after),
+                        None => failure,
+                    });
+                }
+                let cancelled = tokio::select! {
+                    () = tokio::time::sleep(watch_retry_delay(consecutive)) => false,
+                    signal = tokio::signal::ctrl_c() => {
+                        match signal {
+                            Ok(()) => true,
+                            Err(error) => {
+                                return WatchAttempt::Drained(Failure::new(
+                                    1,
+                                    format!("cannot listen for Ctrl+C: {error}"),
+                                ));
+                            }
+                        }
+                    }
+                };
+                if cancelled {
+                    return WatchAttempt::Cancelled;
+                }
+            }
+            Err(error) => return WatchAttempt::Fatal(error),
+        }
+    }
+}
+
+/// Translate a pruned watch cursor into the retained resume cursor: the
+/// journal's current prune floor replays exactly the retained history.
+async fn watch_gap_failure(data_dir: &Path, after: i64, error: CoreError) -> Failure {
+    let params = EventsBoundsRequest {
+        filter: EventsFilter::default(),
+    };
+    let cursor = match eliot_daemon::client_call_typed::<_, EventsBoundsResponse>(
+        data_dir,
+        "events.bounds",
+        &params,
+    )
+    .await
+    {
+        Ok(bounds) if bounds.validate().is_ok() && after < bounds.pruned_through => {
+            Some(bounds.pruned_through)
+        }
+        _ => None,
+    };
+    let failure = Failure::from_core(error, false);
+    match cursor {
+        Some(cursor) => with_watch_resume_cursor(failure, cursor),
+        None => with_watch_resume_cursor(failure, after),
+    }
+}
+
 pub(crate) async fn watch(
     data_dir: &Path,
     agent: Option<&str>,
@@ -329,20 +479,29 @@ pub(crate) async fn watch(
     let mut after = match after {
         Some(after) => after,
         None => {
-            let params = EventsBoundsRequest {
-                filter: filter.clone(),
-            };
-            params
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
-            let bounds: EventsBoundsResponse =
-                eliot_daemon::client_call_typed(data_dir, "events.bounds", &params)
-                    .await
-                    .map_err(|error| Failure::from_core(error, false))?;
-            bounds
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
-            bounds.hi
+            let filter = filter.clone();
+            match watch_poll(
+                || async {
+                    let params = EventsBoundsRequest {
+                        filter: filter.clone(),
+                    };
+                    params.validate()?;
+                    let bounds: EventsBoundsResponse =
+                        eliot_daemon::client_call_typed(data_dir, "events.bounds", &params).await?;
+                    bounds.validate()?;
+                    Ok(bounds.hi)
+                },
+                None,
+            )
+            .await
+            {
+                WatchAttempt::Ready(hi) => hi,
+                WatchAttempt::Cancelled => return Ok(0),
+                WatchAttempt::Fatal(error) => {
+                    return Err(Failure::from_core(error, false));
+                }
+                WatchAttempt::Drained(failure) => return Err(failure),
+            }
         }
     };
     loop {
@@ -355,14 +514,42 @@ pub(crate) async fn watch(
         params
             .validate()
             .map_err(|error| Failure::from_core(error, false))?;
-        let response: EventsSubscribeResponse = tokio::select! {
-            result = eliot_daemon::client_call_typed(data_dir, "events.subscribe", &params) => {
-                result.map_err(|error| Failure::from_core(error, false))?
+        let data_dir = data_dir.to_path_buf();
+        let response = match watch_poll(
+            || {
+                let params = EventsSubscribeRequest {
+                    after,
+                    limit: PAGE_SIZE,
+                    wait_ms: 1_000,
+                    filter: filter.clone(),
+                };
+                let data_dir = data_dir.clone();
+                async move {
+                    eliot_daemon::client_call_typed::<_, EventsSubscribeResponse>(
+                        &data_dir,
+                        "events.subscribe",
+                        &params,
+                    )
+                    .await
+                }
+            },
+            Some(after),
+        )
+        .await
+        {
+            WatchAttempt::Ready(response) => response,
+            WatchAttempt::Cancelled => return Ok(0),
+            WatchAttempt::Fatal(error) if error.code == "history_gap" => {
+                return Err(watch_gap_failure(&data_dir, after, error).await);
             }
-            signal = tokio::signal::ctrl_c() => {
-                signal.map_err(|error| Failure::new(1, format!("cannot listen for Ctrl+C: {error}")))?;
-                return Ok(0);
+            WatchAttempt::Fatal(error) if is_watch_unreachable(&error) => {
+                return Err(with_watch_resume_cursor(
+                    Failure::from_core(error, false),
+                    after,
+                ));
             }
+            WatchAttempt::Fatal(error) => return Err(Failure::from_core(error, false)),
+            WatchAttempt::Drained(failure) => return Err(failure),
         };
         response
             .validate(params.after)
@@ -717,11 +904,80 @@ pub(crate) fn yes_no(value: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        activity_state_name, age_cell, list_params, print_usage_table, state_cell, truncate_cell,
+        activity_state_name, age_cell, is_transient_watch_error, list_params, print_usage_table,
+        state_cell, truncate_cell, watch_retry_delay, with_watch_resume_cursor,
     };
     use crate::cli::args::ListFilterArgs;
+    use crate::cli::support::Failure;
     use eliot_core::api::{TurnCounterMissing, UsageSummaryRequest, UsageSummaryResponse};
-    use eliot_core::{AgentState, NativeChildActivityState};
+    use eliot_core::{AgentState, Error as CoreError, NativeChildActivityState};
+    use std::time::Duration;
+
+    #[test]
+    fn watch_rides_out_transport_timeouts_but_not_domain_rejections() {
+        for message in [
+            "daemon RPC exceeded its absolute deadline",
+            "daemon closed the RPC connection",
+            "daemon response frame is invalid",
+        ] {
+            assert!(
+                is_transient_watch_error(&CoreError::new("unknown", message)),
+                "{message}"
+            );
+        }
+        for message in [
+            "daemon RPC write failed; hint: data_dir=C:\\x",
+            "event bus is closed; hint: data_dir=C:\\x",
+        ] {
+            assert!(
+                is_transient_watch_error(&CoreError::new("unavailable", message)),
+                "{message}"
+            );
+        }
+        for (code, message) in [
+            (
+                "history_gap",
+                "requested event history is no longer retained",
+            ),
+            ("invalid", "after must be a nonnegative integer"),
+            ("unknown", "daemon response is malformed"),
+            ("unknown", "daemon response does not match the request"),
+            ("unavailable", "daemon is not running; hint: data_dir=C:\\x"),
+            ("not_allowed", "agent filter excludes the caller"),
+        ] {
+            assert!(
+                !is_transient_watch_error(&CoreError::new(code, message)),
+                "{code}:{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_backoff_stays_bounded() {
+        assert_eq!(watch_retry_delay(0), Duration::from_millis(200));
+        assert_eq!(watch_retry_delay(1), Duration::from_millis(400));
+        assert_eq!(watch_retry_delay(1_000), Duration::from_secs(5));
+        for consecutive in [5, 30, u32::MAX] {
+            assert!(
+                watch_retry_delay(consecutive) <= Duration::from_secs(5),
+                "{consecutive}"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_failures_name_the_resume_cursor() {
+        let failure = with_watch_resume_cursor(
+            Failure::new(1, "unknown: daemon RPC exceeded its absolute deadline"),
+            12_345,
+        );
+        assert_eq!(failure.exit_code, 1);
+        assert!(
+            failure.message.contains("--after 12345"),
+            "{}",
+            failure.message
+        );
+    }
     #[test]
     fn list_params_rejects_unknown_state_before_any_call() {
         let filter = |state: Option<&str>| ListFilterArgs {

@@ -220,7 +220,7 @@ impl Router {
         let mail_value = serde_json::to_value(&mail)
             .map_err(|_| Error::new("internal", "digest mail could not be encoded"))?;
         let owner = Principal::Owner;
-        let reply = match self.mail_send(&mail_value, &owner).await {
+        let reply = match self.mail_send_impl(&mail_value, &owner, true).await {
             Ok(reply) => reply,
             Err(error) => {
                 // A retained binding means the mail already exists (possibly

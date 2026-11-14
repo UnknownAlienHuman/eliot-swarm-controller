@@ -460,6 +460,37 @@ mod tests {
     }
 
     #[test]
+    fn mail_send_rejects_digest_bound_id() {
+        let mut store = open_store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "p", now);
+        let id = ulid::Ulid::new().to_string();
+        let req = digest_request(&id, &parent);
+        store
+            .digest_register("owner", &req, &[false], now)
+            .expect("register");
+        // A public mail send must not steal the digest registration id:
+        // digest delivery would later fail `id_conflict` permanently.
+        let mail = MailSendRequest {
+            id: id.clone(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "foreign mail reusing a digest id".to_owned(),
+            thread: None,
+            reply_to_delivery: None,
+        };
+        let err = store
+            .mail_send("owner", &mail, MailLimits::default(), now)
+            .unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        // The digest delivery path still delivers under the same id.
+        let delivered = store
+            .mail_send_digest_delivery("owner", &mail, MailLimits::default(), now)
+            .expect("digest delivery");
+        assert_eq!(delivered.outcome, crate::MailSendOutcome::Fresh);
+    }
+
+    #[test]
     fn digest_restart_keeps_single_mail_identity() {
         let mut store = open_store();
         let now = now_ms();
@@ -479,7 +510,7 @@ mod tests {
             reply_to_delivery: None,
         };
         let first = store
-            .mail_send("owner", &mail, MailLimits::default(), now)
+            .mail_send_digest_delivery("owner", &mail, MailLimits::default(), now)
             .expect("first mail");
         assert_eq!(first.outcome, crate::MailSendOutcome::Fresh);
         store
@@ -493,7 +524,7 @@ mod tests {
         assert_eq!(replay.outcome, DigestRegisterOutcome::Retained);
         assert!(replay.row.delivered_at.is_some());
         let second = store
-            .mail_send("owner", &mail, MailLimits::default(), now + 1)
+            .mail_send_digest_delivery("owner", &mail, MailLimits::default(), now + 1)
             .expect("second mail");
         assert_eq!(second.outcome, crate::MailSendOutcome::Retained);
         assert_eq!(first.value, second.value);
@@ -532,7 +563,7 @@ mod tests {
             reply_to_delivery: None,
         };
         store
-            .mail_send("owner", &mail, MailLimits::default(), now)
+            .mail_send_digest_delivery("owner", &mail, MailLimits::default(), now)
             .expect("digest mail");
         let claim = store
             .notice_claim(

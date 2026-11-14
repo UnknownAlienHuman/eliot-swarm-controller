@@ -111,6 +111,17 @@ fn validate_adhoc_auth(harness: &str, auth: &str) -> core::Result<String> {
     Ok(trimmed.to_owned())
 }
 
+/// Whether an ad-hoc snapshot resolves an OpenCode auth selector.
+/// Catalogue reads transfer no credential, so they resolve nothing; launches
+/// always freeze `auth_integration` (explicit, defaulted, or refused).
+#[derive(Clone, Copy)]
+pub(crate) enum AdhocAuth<'a> {
+    /// Catalogue read: skip auth entirely.
+    Skip,
+    /// Launch: freeze `auth_integration` from this explicit selector.
+    Resolve(Option<&'a str>),
+}
+
 /// Build and freeze an ad-hoc snapshot from per-harness safe defaults plus
 /// the requested model/effort/auth. `cmd` is the already-discovered absolute
 /// native path for harnesses that require one, or `None` for Codex (which
@@ -119,12 +130,13 @@ fn validate_adhoc_auth(harness: &str, auth: &str) -> core::Result<String> {
 /// `auth` is OpenCode-only: an explicit selector freezes verbatim, an
 /// omitted one defaults to the model provider prefix when the native auth
 /// list holds exactly that id, and anything else refuses before spawning.
+/// Catalogue snapshots (`AdhocAuth::Skip`) never touch auth.
 pub(crate) fn adhoc_snapshot(
     harness: &str,
     model: Option<&str>,
     effort: Option<&str>,
     cmd: Option<String>,
-    auth: Option<&str>,
+    auth: AdhocAuth<'_>,
 ) -> core::Result<Value> {
     let harness = validate_adhoc_harness(harness)?;
     let model = model
@@ -135,10 +147,15 @@ pub(crate) fn adhoc_snapshot(
         .filter(|value| !value.trim().is_empty())
         .map(|value| validate_adhoc_effort(&harness, value))
         .transpose()?;
-    let auth = auth
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| validate_adhoc_auth(&harness, value))
-        .transpose()?;
+    let auth = match auth {
+        AdhocAuth::Skip => None,
+        AdhocAuth::Resolve(explicit) => Some(
+            explicit
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| validate_adhoc_auth(&harness, value))
+                .transpose()?,
+        ),
+    };
     if harness == "antigravity" && model.is_none() {
         return Err(core::Error::new(
             "profile_error",
@@ -233,28 +250,35 @@ pub(crate) fn adhoc_snapshot(
                 )
             })?;
             let validated = validate_native_cmd(&profile_name, &cmd)?;
-            // An explicit selector freezes verbatim; an omitted one defaults
-            // to the model provider prefix only on an exact auth-list id
-            // match, and anything else refuses before spawning. The plugin's
-            // pre-serve transfer gate is unchanged: it still requires the
-            // frozen integration to hold exactly one canonical credential.
+            // Launch only: an explicit selector freezes verbatim; an omitted
+            // one defaults to the model provider prefix only on an exact
+            // auth-list id match, and anything else refuses before spawning.
+            // Catalogue snapshots (`AdhocAuth::Skip`) freeze no selector: the
+            // read transfers no credential. The plugin's pre-serve transfer
+            // gate is unchanged: it still requires the frozen integration to
+            // hold exactly one canonical credential.
             let selector = match auth {
-                Some(explicit) => explicit,
-                None => {
-                    let ids = opencode_auth_ids(&validated).ok_or_else(|| {
-                        core::Error::new(
-                            "profile_error",
-                            "ad-hoc opencode launch needs --auth <integration>; the native auth list could not be read",
-                        )
-                    })?;
-                    resolve_opencode_default(model.as_deref(), &ids)?
-                }
+                None => None,
+                Some(explicit) => Some(match explicit {
+                    Some(selector) => selector,
+                    None => {
+                        let ids = opencode_auth_ids(&validated).ok_or_else(|| {
+                            core::Error::new(
+                                "profile_error",
+                                "ad-hoc opencode launch needs --auth <integration>; the native auth list could not be read",
+                            )
+                        })?;
+                        resolve_opencode_default(model.as_deref(), &ids)?
+                    }
+                }),
             };
             snapshot.insert("cmd".to_owned(), Value::String(validated));
             if let Some(model) = model {
                 snapshot.insert("model".to_owned(), Value::String(model));
             }
-            snapshot.insert("auth_integration".to_owned(), Value::String(selector));
+            if let Some(selector) = selector {
+                snapshot.insert("auth_integration".to_owned(), Value::String(selector));
+            }
         }
         "antigravity" => {
             let cmd = cmd.ok_or_else(|| {
@@ -991,8 +1015,14 @@ mod tests {
 
     #[test]
     fn adhoc_snapshot_freezes_flags_plus_safe_defaults() {
-        let snapshot =
-            adhoc_snapshot("codex", Some("gpt-6-luna"), Some("medium"), None, None).unwrap();
+        let snapshot = adhoc_snapshot(
+            "codex",
+            Some("gpt-6-luna"),
+            Some("medium"),
+            None,
+            AdhocAuth::Resolve(None),
+        )
+        .unwrap();
         assert_eq!(snapshot["harness"], json!("codex"));
         assert_eq!(snapshot["model"], json!("gpt-6-luna"));
         assert_eq!(snapshot["effort"], json!("medium"));
@@ -1012,7 +1042,7 @@ mod tests {
 
     #[test]
     fn adhoc_snapshot_omits_absent_model_and_effort_for_native_default() {
-        let snapshot = adhoc_snapshot("codex", None, None, None, None).unwrap();
+        let snapshot = adhoc_snapshot("codex", None, None, None, AdhocAuth::Resolve(None)).unwrap();
         assert!(snapshot.get("model").is_none());
         assert!(snapshot.get("effort").is_none());
         let snapshot = adhoc_snapshot(
@@ -1020,7 +1050,7 @@ mod tests {
             None,
             None,
             Some(r"C:\Tools\MuseCode\muse-bin-1.exe".to_owned()),
-            None,
+            AdhocAuth::Resolve(None),
         )
         .unwrap();
         assert!(snapshot.get("model").is_none());
@@ -1031,7 +1061,7 @@ mod tests {
             None,
             None,
             Some(r"C:\bin\claude.exe".to_owned()),
-            None,
+            AdhocAuth::Resolve(None),
         )
         .unwrap();
         assert!(snapshot.get("model").is_none());
@@ -1046,7 +1076,7 @@ mod tests {
                 Some("model"),
                 Some("medium"),
                 Some(r"C:\bin\native.exe".to_owned()),
-                None,
+                AdhocAuth::Resolve(None),
             )
             .unwrap_err();
             assert_eq!(error.code, "unsupported", "{harness}");
@@ -1055,7 +1085,7 @@ mod tests {
 
     #[test]
     fn adhoc_snapshot_rejects_unknown_harness() {
-        let error = adhoc_snapshot("fake", None, None, None, None).unwrap_err();
+        let error = adhoc_snapshot("fake", None, None, None, AdhocAuth::Resolve(None)).unwrap_err();
         assert_eq!(error.code, "unsupported");
     }
 
@@ -1066,7 +1096,7 @@ mod tests {
             None,
             None,
             Some(r"C:\bin\Antigravity.exe".to_owned()),
-            None,
+            AdhocAuth::Resolve(None),
         )
         .unwrap_err();
         assert_eq!(error.code, "profile_error");
@@ -1079,7 +1109,7 @@ mod tests {
             Some("no-slash"),
             None,
             Some(r"C:\bin\opencode.exe".to_owned()),
-            None,
+            AdhocAuth::Resolve(None),
         )
         .unwrap_err();
         assert_eq!(error.code, "profile_error");
@@ -1094,7 +1124,7 @@ mod tests {
             Some("opencode/deepseek-v4.1-flash-free"),
             None,
             Some(r"C:\bin\opencode.exe".to_owned()),
-            Some("opencode-go"),
+            AdhocAuth::Resolve(Some("opencode-go")),
         )
         .unwrap();
         assert_eq!(snapshot["auth_integration"], json!("opencode-go"));
@@ -1113,6 +1143,22 @@ mod tests {
             validate_adhoc_auth("codex", "openrouter").unwrap_err().code,
             "unsupported"
         );
+    }
+
+    #[test]
+    fn adhoc_catalog_snapshot_skips_auth_without_native_read() {
+        // Catalogue reads transfer no credential: no `auth_integration` key
+        // is frozen and no native helper runs, even for OpenCode.
+        let snapshot = adhoc_snapshot(
+            "opencode",
+            None,
+            None,
+            Some(r"C:\bin\opencode.exe".to_owned()),
+            AdhocAuth::Skip,
+        )
+        .unwrap();
+        assert!(snapshot.get("auth_integration").is_none());
+        assert_eq!(snapshot["cmd"], json!(r"C:\bin\opencode.exe"));
     }
 
     #[test]
@@ -1173,7 +1219,7 @@ mod tests {
             None,
             None,
             Some(r"C:\bin\claude.cmd".to_owned()),
-            None,
+            AdhocAuth::Resolve(None),
         )
         .unwrap_err();
         assert_eq!(error.code, "profile_error");
@@ -1220,14 +1266,21 @@ mod tests {
         // binary the launcher no longer marks current); discovery is
         // bypassed and the path is frozen exactly as given.
         let pinned = r"C:\Tools\MuseCode\muse-bin-1.4.0-R4161.1.exe";
-        let snapshot = adhoc_snapshot("muse", None, None, Some(pinned.to_owned()), None).unwrap();
+        let snapshot = adhoc_snapshot(
+            "muse",
+            None,
+            None,
+            Some(pinned.to_owned()),
+            AdhocAuth::Resolve(None),
+        )
+        .unwrap();
         assert_eq!(snapshot["cmd"], json!(pinned));
         let error = adhoc_snapshot(
             "muse",
             None,
             None,
             Some(r"C:\Tools\MuseCode\muse.cmd".to_owned()),
-            None,
+            AdhocAuth::Resolve(None),
         )
         .unwrap_err();
         assert_eq!(error.code, "profile_error");

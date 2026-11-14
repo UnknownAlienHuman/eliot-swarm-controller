@@ -115,7 +115,12 @@ the digest registration id, so a reconnect or restart replays the same mail id a
 the existing mail stable effect identity makes the retry a no-op. The thread is
 `completion-<id-prefix>` (never `attention-*`, never `-advisory`), the body lists
 every frozen entry outcome, and no attention event is emitted: a successful
-completion stays distinct from an attention incident.
+completion stays distinct from an attention incident. Registration ids share the
+public write-id namespace: `mail.send` with an id bound to a completion digest
+rejects `id_conflict`, symmetric to the command/write checks at registration;
+only digest delivery itself reuses the id. Delivered digests are pruned under
+the commands retention window (see [core](core.md#retention)), oldest delivery
+first; pending digests are never pruned.
 
 ### Read and acknowledgement
 

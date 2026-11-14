@@ -197,6 +197,152 @@ impl PluginHost {
             .map_err(|_| Error::new("unavailable", "model.list reader stopped"))?
     }
 
+    /// Read-only native account quota for `harness.quota`. A dedicated
+    /// metadata reader calls the harness's own `quota.read` with no session,
+    /// no turn and no inference. Only Codex (`account/rateLimits/read` plus
+    /// `account/usage/read`) and Muse (`usage/read`) expose a read-only
+    /// quota surface; other harnesses stay `unsupported` without spawning a
+    /// reader.
+    pub(crate) async fn quota(&self, profile: Value) -> Result<Value> {
+        if !profile
+            .get("harness")
+            .and_then(Value::as_str)
+            .is_some_and(|harness| matches!(harness, "codex" | "muse"))
+        {
+            return Err(Error::new(
+                "unsupported",
+                "harness.quota needs a codex or muse profile",
+            ));
+        }
+        let environment = Value::Object(build_process_environment(&profile)?);
+        let (id, stop_rx, done_tx) = self.register_metadata_reader()?;
+        let host = self.clone();
+        let (reply, response) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let completion = host.read_quota(profile, environment, stop_rx).await;
+            host.finish_metadata_reader(&id, done_tx, completion.cleanup);
+            let _ = reply.send(completion.result);
+        });
+        response
+            .await
+            .map_err(|_| Error::new("unavailable", "quota.read reader stopped"))?
+    }
+
+    async fn read_quota(
+        &self,
+        profile: Value,
+        environment: Value,
+        mut stop: watch::Receiver<Option<Instant>>,
+    ) -> MetadataRead<Value> {
+        if stop.borrow().is_some() {
+            return MetadataRead {
+                result: Err(Error::new(
+                    "cancelled",
+                    "quota.read was cancelled before spawn",
+                )),
+                cleanup: ReaderCleanup::Confirmed,
+            };
+        }
+        let Some(harness) = profile["harness"].as_str() else {
+            return MetadataRead {
+                result: Err(Error::new("invalid", "missing harness")),
+                cleanup: ReaderCleanup::Confirmed,
+            };
+        };
+        let harness = harness.to_owned();
+        let checked = match harness.as_str() {
+            "codex" => "account/rateLimits/read",
+            "muse" => "usage/read",
+            _ => "quota.read",
+        }
+        .to_owned();
+        let opened = self
+            .open_reader_with_cleanup(
+                &AgentKey {
+                    id: "quota-read".to_owned(),
+                    generation: 0,
+                },
+                &harness,
+                &profile,
+                &environment,
+                None,
+            )
+            .await;
+        let mut reader = match opened.result {
+            Ok(reader) => reader,
+            Err(error) => {
+                return failed_metadata_open(error, opened.cleanup_confirmed, "quota.read");
+            }
+        };
+        let mut known: Vec<_> = self.state.secrets.lock_recover().iter().cloned().collect();
+        known.extend([self.state.owner_token.clone(), reader.credential.clone()]);
+        let metadata_secrets = metadata_secret_snapshot(&profile, &environment, known);
+        let until = Instant::now() + READER_DEADLINE;
+        let read = async {
+            let manifest = reader.initialize(&harness, until).await?;
+            require_proxy_capability(&profile, &manifest)?;
+            let request = serde_json::json!({"profile": profile});
+            let value = reader.client.call("quota.read", request, until).await?;
+            if SecretPolicy::new(metadata_secrets.iter()).contains_value(&value) {
+                return Err(Error::new(
+                    "source_integrity",
+                    "quota.read metadata contains reserved credentials",
+                ));
+            }
+            let details = value
+                .get("details")
+                .filter(|details| details.is_object())
+                .ok_or_else(|| {
+                    Error::new("source_integrity", "quota.read details are malformed")
+                })?;
+            if serde_json::to_vec(details)
+                .map(|bytes| bytes.len())
+                .unwrap_or(usize::MAX)
+                > 8192
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "quota.read details exceed 8192 encoded bytes",
+                ));
+            }
+            Ok(value)
+        };
+        let result = tokio::select! {
+            result = tokio::time::timeout_at(until, read) =>
+                result.unwrap_or_else(|_| Err(Error::new("unavailable", "quota.read deadline exceeded"))),
+            _ = stop.changed() => Err(Error::new("cancelled", "quota.read was cancelled")),
+        };
+        let result = result.map_err(|error| {
+            let message = error.message.clone();
+            if message.contains(&checked) {
+                error
+            } else {
+                error.with_message(format!("{checked}: {message}"))
+            }
+        });
+        let secrets = reader.secrets.clone();
+        let close_until = metadata_reader_close_deadline(&stop);
+        let closure = reader.close_until(self, None, close_until).await;
+        let result = require_reader_cleanup(result, closure.closed, "quota.read");
+        let result = result.map_err(|error| {
+            let error = redact_native_error(
+                error.with_stderr(StderrSource::Plugin, closure.stderr),
+                &secrets,
+            );
+            crate::logging::record(
+                &SecretPolicy::new(secrets.iter()),
+                &error.code,
+                &[("operation", "quota.read")],
+                Some(&error),
+            );
+            error
+        });
+        MetadataRead {
+            result,
+            cleanup: cleanup_state(closure.closed),
+        }
+    }
+
     async fn read_model_catalogue(
         &self,
         profile: Value,

@@ -1,6 +1,7 @@
 mod attention;
 mod attribution;
 mod auth;
+mod catalog;
 mod command;
 mod context;
 mod coordination;
@@ -42,13 +43,13 @@ use eliot_core::{
         EventsBoundsRequest, EventsFilter, EventsReadRequest, EventsReadResponse,
         EventsSubscribeRequest, EventsSubscribeResponse, GitFetchDefinitionArgs, GitView,
         MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
-        NotifyDefinitionArgs, ObservationPage, ObservationQuery, ObservationView, OwnedProcessKind,
-        OwnedProcessSummary, ProcessPageCursor, ProjectRegistrationView, ProviderClearHoldRequest,
-        ProviderHoldsRequest, RuleGetRequest, RuleStateView, RunningTurnSummary, ShutdownMode,
-        SourceState, StatusBlocker, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest,
-        TimerStateView, TurnGetRequest, UnsettledCommandSummary, UsageScopeView,
-        UsageSummaryRequest, WaitEntryResult, WorkerTaskHealth, WorkerTaskStatus,
-        WorkspaceCustodyView,
+        MaintenanceRunRequest, MaintenanceRunResponse, NotifyDefinitionArgs, ObservationPage,
+        ObservationQuery, ObservationView, OwnedProcessKind, OwnedProcessSummary,
+        ProcessPageCursor, ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest,
+        RuleGetRequest, RuleStateView, RunningTurnSummary, ShutdownMode, SourceState,
+        StatusBlocker, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView,
+        TurnGetRequest, UnsettledCommandSummary, UsageScopeView, UsageSummaryRequest,
+        WaitEntryResult, WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -107,6 +108,7 @@ struct RouterInner {
     unknown_commands: UnknownCommands,
     unknown_causes: Mutex<HashMap<String, String>>,
     rule_definitions: Mutex<HashMap<(String, String), (i64, RuleDefinition)>>,
+    catalog_cache: Mutex<catalog::CatalogCache>,
     plugin_host: PluginHost,
     monitoring: Monitoring,
     workspaces: WorkspaceManager,
@@ -223,6 +225,7 @@ impl Router {
                 unknown_commands,
                 unknown_causes: Mutex::new(HashMap::new()),
                 rule_definitions: Mutex::new(HashMap::new()),
+                catalog_cache: Mutex::new(catalog::CatalogCache::default()),
                 plugin_host,
                 monitoring,
                 workspaces,
@@ -267,6 +270,7 @@ impl Router {
                 require_owner(&principal)?;
                 self.shutdown(&params, &principal).await
             }
+            "maintenance.run" => self.maintenance_run(&params, &principal).await,
             "command.submit" => {
                 self.submit_bound(&params, &principal, remote.as_ref())
                     .await
@@ -278,6 +282,7 @@ impl Router {
             "agent.discover" => self.agent_discover(&params, &principal).await,
             "harness.list" => self.harness_list(&params, &principal).await,
             "harness.models" => self.harness_models(&params, &principal).await,
+            "harness.quota" => self.harness_quota(&params, &principal).await,
             "agent.history" => self.agent_history(&params, &principal).await,
             "agent.list" => self.agent_list(&params, &principal).await,
             "agent.result" => self.agent_result(&params, &principal).await,
@@ -1800,7 +1805,7 @@ impl Router {
                 model.as_deref(),
                 effort.as_deref(),
                 cmd,
-                auth.as_deref(),
+                crate::adhoc::AdhocAuth::Resolve(auth.as_deref()),
             )?;
             crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                 std::env::var_os(name)
@@ -2499,10 +2504,51 @@ impl Router {
             .map_err(|_| Error::new("internal", "harness list could not be encoded"))
     }
 
+    /// Resolve the frozen snapshot for a catalogue/quota read. A named
+    /// profile must exist and its frozen harness must match; otherwise the
+    /// daemon defaults cover live harnesses (Codex/Muse/OpenCode) while
+    /// static harnesses (Claude, Antigravity) need no snapshot at all.
+    fn resolve_catalog_snapshot(
+        &self,
+        harness: &str,
+        profile: Option<&str>,
+    ) -> Result<(Option<Value>, String)> {
+        if let Some(name) = profile {
+            let mut snapshot = crate::config::resolve_profile(&self.inner.data_root, name)?;
+            crate::config::capture_native_store_inputs(&mut snapshot, |name| {
+                std::env::var_os(name)
+            })?;
+            if snapshot.get("harness").and_then(Value::as_str) != Some(harness) {
+                return Err(Error::new(
+                    "invalid",
+                    "harness does not match the selected profile",
+                ));
+            }
+            return Ok((Some(snapshot), name.to_owned()));
+        }
+        if matches!(harness, "codex" | "muse" | "opencode") {
+            let cmd = crate::adhoc::discover_cmd_for_harness(harness)?;
+            let mut snapshot = crate::adhoc::adhoc_snapshot(
+                harness,
+                None,
+                None,
+                cmd,
+                crate::adhoc::AdhocAuth::Skip,
+            )?;
+            crate::config::capture_native_store_inputs(&mut snapshot, |name| {
+                std::env::var_os(name)
+            })?;
+            return Ok((Some(snapshot), "adhoc".to_owned()));
+        }
+        Ok((None, "adhoc".to_owned()))
+    }
+
     /// Read-only native model catalogue for a harness: no model turn, no
     /// inference. Codex/Muse/OpenCode use the harness's own read-only
-    /// method through a dedicated metadata reader; Claude reports aliases
-    /// plus the CLI default; Antigravity has no catalogue.
+    /// method through a dedicated metadata reader, cached per native
+    /// route/account with freshness and credential identity; Claude reports
+    /// aliases plus the CLI default; Antigravity has no catalogue. Native
+    /// model ids are retained verbatim: no fallback model is ever selected.
     async fn harness_models(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
         let request: eliot_core::api::HarnessModelsRequest =
@@ -2515,6 +2561,20 @@ impl Router {
                 "daemon is shutting down and rejects new discovery",
             ));
         }
+        let profile = request.profile.as_deref().map(str::trim);
+        let (snapshot, label) = self.resolve_catalog_snapshot(&harness, profile)?;
+        let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
+        let now = now_ms();
+        if let Some(hit) = self
+            .inner
+            .catalog_cache
+            .lock_recover()
+            .get_models(&scope, now)
+        {
+            request.validate_response(&hit)?;
+            return serde_json::to_value(hit)
+                .map_err(|_| Error::new("internal", "harness models could not be encoded"));
+        }
         let response = match harness.as_str() {
             "claude" => eliot_core::api::HarnessModelsResponse {
                 harness: harness.clone(),
@@ -2525,6 +2585,10 @@ impl Router {
                     "Claude accepts model aliases and the CLI default; no live catalogue exists"
                         .to_owned(),
                 ),
+                scope: scope.clone(),
+                fetched_at_ms: now_ms(),
+                ttl_ms: catalog::CATALOG_TTL_MS,
+                credential: credential.clone(),
             },
             "antigravity" => eliot_core::api::HarnessModelsResponse {
                 harness: harness.clone(),
@@ -2535,19 +2599,18 @@ impl Router {
                     "Antigravity exposes no model catalogue; a profile must name an explicit model"
                         .to_owned(),
                 ),
+                scope: scope.clone(),
+                fetched_at_ms: now_ms(),
+                ttl_ms: catalog::CATALOG_TTL_MS,
+                credential: credential.clone(),
             },
             "codex" | "muse" | "opencode" => {
-                // An explicit `cmd` pins the native executable (e.g. a Muse
-                // binary version the launcher no longer marks current);
-                // otherwise the installed executable is discovered.
-                let cmd = match request.cmd.clone() {
-                    Some(cmd) => Some(cmd),
-                    None => crate::adhoc::discover_cmd_for_harness(&harness)?,
+                let Some(snapshot) = snapshot else {
+                    return Err(Error::new(
+                        "internal",
+                        "live harness catalogue requires a frozen snapshot",
+                    ));
                 };
-                let mut snapshot = crate::adhoc::adhoc_snapshot(&harness, None, None, cmd, None)?;
-                crate::config::capture_native_store_inputs(&mut snapshot, |name| {
-                    std::env::var_os(name)
-                })?;
                 let raw = self.inner.plugin_host.models(snapshot).await?;
                 let models = raw
                     .get("models")
@@ -2603,6 +2666,10 @@ impl Router {
                     models: entries,
                     default,
                     note,
+                    scope: scope.clone(),
+                    fetched_at_ms: now_ms(),
+                    ttl_ms: catalog::CATALOG_TTL_MS,
+                    credential: credential.clone(),
                 }
             }
             _ => {
@@ -2612,9 +2679,203 @@ impl Router {
                 ));
             }
         };
-        response.validate()?;
+        request.validate_response(&response)?;
+        self.inner
+            .catalog_cache
+            .lock_recover()
+            .insert_models(response.clone());
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "harness models could not be encoded"))
+    }
+
+    /// Provider-supported account quota readback: timestamp, scope and an
+    /// explicit supported/unsupported/unknown status, cached per account.
+    /// Starts no model turn, performs no inference and never polls per
+    /// Agent. Codex reads `account/rateLimits/read` (plus `account/usage/read`
+    /// when useful) and Muse reads `usage/read` through a dedicated metadata
+    /// reader; OpenCode/Claude/Antigravity expose no read-only quota surface,
+    /// so those report `unsupported` naming the checked surface. A method-not-
+    /// found or schema mismatch stays `unsupported` or `unknown` naming the
+    /// checked method; no numbers are fabricated. A quota failure never
+    /// selects another model or account.
+    async fn harness_quota(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: eliot_core::api::HarnessQuotaRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let harness = request.harness.trim().to_owned();
+        if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+            return Err(Error::new(
+                "unavailable",
+                "daemon is shutting down and rejects new discovery",
+            ));
+        }
+        let profile = request.profile.as_deref().map(str::trim);
+        let (snapshot, label) = self.resolve_catalog_snapshot(&harness, profile)?;
+        let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
+        let now = now_ms();
+        if let Some(hit) = self
+            .inner
+            .catalog_cache
+            .lock_recover()
+            .get_quota(&scope, now)
+        {
+            request.validate_response(&hit)?;
+            return serde_json::to_value(hit)
+                .map_err(|_| Error::new("internal", "harness quota could not be encoded"));
+        }
+        if matches!(harness.as_str(), "codex" | "muse") {
+            let Some(snapshot) = snapshot else {
+                return Err(Error::new(
+                    "internal",
+                    "live harness quota requires a frozen snapshot",
+                ));
+            };
+            let checked = match harness.as_str() {
+                "codex" => "account/rateLimits/read",
+                _ => "usage/read",
+            };
+            let response = match self.inner.plugin_host.quota(snapshot).await {
+                Ok(raw) => {
+                    let details = raw
+                        .get("details")
+                        .cloned()
+                        .filter(|details| details.is_object());
+                    match details {
+                        Some(details) => {
+                            let empty = details.as_object().is_some_and(|map| map.is_empty());
+                            let note = if harness == "codex" {
+                                Some(
+                                    "Codex quota from account/rateLimits/read \
+                                     (account/usage/read when available); windows carry used \
+                                     percent, reset time, credits and plan"
+                                        .to_owned(),
+                                )
+                            } else if empty {
+                                Some(
+                                    "Muse usage/read reports no observed subscription usage"
+                                        .to_owned(),
+                                )
+                            } else {
+                                Some(
+                                    "Muse quota from usage/read \
+                                     (window and weekly used percent, reset time, tier)"
+                                        .to_owned(),
+                                )
+                            };
+                            eliot_core::api::HarnessQuotaResponse {
+                                harness: harness.clone(),
+                                scope: scope.clone(),
+                                fetched_at_ms: now_ms(),
+                                ttl_ms: catalog::CATALOG_TTL_MS,
+                                credential: credential.clone(),
+                                status: eliot_core::api::HARNESS_QUOTA_SUPPORTED.to_owned(),
+                                note,
+                                details: Some(details),
+                            }
+                        }
+                        None => Self::quota_unavailable(
+                            &harness,
+                            &scope,
+                            &credential,
+                            checked,
+                            "unknown",
+                            format!("{checked} result did not match the installed schema"),
+                        ),
+                    }
+                }
+                Err(error) => {
+                    let message = error.message.to_ascii_lowercase();
+                    let status = if error.code == "unsupported"
+                        || message.contains("method not found")
+                        || message.contains("not implemented")
+                        || message.contains("unknown method")
+                        || message.contains("no such method")
+                    {
+                        eliot_core::api::HARNESS_QUOTA_UNSUPPORTED
+                    } else {
+                        eliot_core::api::HARNESS_QUOTA_UNKNOWN
+                    };
+                    Self::quota_unavailable(
+                        &harness,
+                        &scope,
+                        &credential,
+                        checked,
+                        status,
+                        format!("{checked}: {}", error.message),
+                    )
+                }
+            };
+            request.validate_response(&response)?;
+            self.inner
+                .catalog_cache
+                .lock_recover()
+                .insert_quota(response.clone());
+            return serde_json::to_value(response)
+                .map_err(|_| Error::new("internal", "harness quota could not be encoded"));
+        }
+        let note = match harness.as_str() {
+            "opencode" => Some(
+                "OpenCode exposes no read-only account quota endpoint; auth list carries \
+                 providers and model inventory carries limits only"
+                    .to_owned(),
+            ),
+            "claude" => Some(
+                "Claude accepts model aliases and the CLI default; no live quota surface exists"
+                    .to_owned(),
+            ),
+            "antigravity" => {
+                Some("Antigravity exposes no model catalogue or quota surface".to_owned())
+            }
+            _ => {
+                return Err(Error::new(
+                    "unsupported",
+                    format!("unsupported harness {harness}"),
+                ));
+            }
+        };
+        let response = eliot_core::api::HarnessQuotaResponse {
+            harness: harness.clone(),
+            scope: scope.clone(),
+            fetched_at_ms: now_ms(),
+            ttl_ms: catalog::CATALOG_TTL_MS,
+            credential: credential.clone(),
+            status: eliot_core::api::HARNESS_QUOTA_UNSUPPORTED.to_owned(),
+            note,
+            details: None,
+        };
+        request.validate_response(&response)?;
+        self.inner
+            .catalog_cache
+            .lock_recover()
+            .insert_quota(response.clone());
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "harness quota could not be encoded"))
+    }
+
+    fn quota_unavailable(
+        harness: &str,
+        scope: &str,
+        credential: &str,
+        checked: &str,
+        status: &str,
+        detail: String,
+    ) -> eliot_core::api::HarnessQuotaResponse {
+        const MAX_DETAIL: usize = 512;
+        let mut note = format!("{checked}; {detail}");
+        if note.len() > MAX_DETAIL {
+            note.truncate(MAX_DETAIL);
+        }
+        eliot_core::api::HarnessQuotaResponse {
+            harness: harness.to_owned(),
+            scope: scope.to_owned(),
+            fetched_at_ms: now_ms(),
+            ttl_ms: catalog::CATALOG_TTL_MS,
+            credential: credential.to_owned(),
+            status: status.to_owned(),
+            note: Some(note),
+            details: None,
+        }
     }
 
     async fn agent_history(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -2671,7 +2932,13 @@ impl Router {
 
         // This is a private native read. It is deliberately not reduced, stored,
         // published, or used to settle a command or input acknowledgement.
-        let raw = self
+        //
+        // The native subject projection was already read at attach and is
+        // retained with the applied attach outcome. When the live observer
+        // reader has lapsed, `source=native, view=subject` is still served from
+        // that retained metadata; turns/items keep requiring the live reader,
+        // and a later detach still fences every read.
+        let raw = match self
             .inner
             .plugin_host
             .snapshot_observer(
@@ -2680,7 +2947,22 @@ impl Router {
                     Error::new("internal", "observation query could not be encoded")
                 })?,
             )
-            .await?;
+            .await
+        {
+            Ok(raw) => raw,
+            Err(error)
+                if query.source == "native"
+                    && query.view == "subject"
+                    && query.cursor.is_none()
+                    && query.turn_id.is_none() =>
+            {
+                match self.retained_observe_subject_page(&agent).await? {
+                    Some(raw) => raw,
+                    None => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
         let object = raw
             .as_object()
             .ok_or_else(|| Error::new("source_integrity", "observation page is not an object"))?;
@@ -2743,6 +3025,36 @@ impl Router {
             .map_err(|_| Error::new("internal", "observation page could not be encoded"))?;
         self.redact_native_value(&mut value);
         Ok(value)
+    }
+
+    /// Native subject page from the retained applied attach outcome.
+    ///
+    /// Returns `None` when the current generation has no applied attach with
+    /// subject metadata (including after a later detach), so the caller keeps
+    /// the original live-reader error and the detach fence stands.
+    async fn retained_observe_subject_page(&self, agent: &Agent) -> Result<Option<Value>> {
+        let subject = {
+            let store = self.inner.store.lock().await;
+            store.retained_observe_subject(&agent.id, agent.generation)?
+        };
+        let Some(subject) = subject else {
+            return Ok(None);
+        };
+        let page = ObservationPage {
+            agent_id: agent.id.clone(),
+            generation: agent.generation,
+            native_scope: agent.native_scope.clone().unwrap_or_default(),
+            native_ref: agent.native_ref.clone().unwrap_or_default(),
+            source: "native".to_owned(),
+            view: "subject".to_owned(),
+            entries: vec![subject],
+            next_cursor: None,
+            coverage: json!({"kind": "native_metadata", "complete": true, "live": false}),
+        };
+        page.validate()?;
+        serde_json::to_value(page)
+            .map_err(|_| Error::new("internal", "retained observation page could not be encoded"))
+            .map(Some)
     }
 
     async fn agent_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -3695,6 +4007,35 @@ impl Router {
         };
         let truncated = cursor < high_water;
         Ok((events, cursor, high_water, truncated, encoded_bytes))
+    }
+
+    /// Owner-triggered retention pass: reload the daemon retention settings
+    /// and run the same bounded epochs as the hourly tick, returning the
+    /// pruned counts and the retained-event watermark.
+    async fn maintenance_run(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: MaintenanceRunRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let policy = self.secret_policy_snapshot();
+        let report = crate::maintenance::run_now(
+            &self.inner.store,
+            &self.inner.data_root,
+            &policy,
+            now_ms(),
+        )
+        .await?;
+        let response = MaintenanceRunResponse {
+            events_deleted: report.events_deleted,
+            pruned_through: report.pruned_through,
+            commands_deleted: report.commands_deleted,
+            writes_deleted: report.writes_deleted,
+            mail_deleted: report.mail_deleted,
+            digests_deleted: report.digests_deleted,
+        };
+        request.validate_response(&response)?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "maintenance.run result could not be encoded"))
     }
 
     async fn status(&self) -> Result<Value> {
@@ -5802,6 +6143,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maintenance_run_is_owner_only_and_reports_typed_counts() {
+        let router = router();
+        let agent = Principal::Agent {
+            id: "a1".to_owned(),
+            generation: 1,
+        };
+        assert_eq!(
+            router
+                .maintenance_run(&json!({}), &agent)
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        assert_eq!(
+            router
+                .maintenance_run(&json!({"extra": true}), &Principal::Owner)
+                .await
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
+        let value = router
+            .maintenance_run(&json!({}), &Principal::Owner)
+            .await
+            .unwrap();
+        let typed: MaintenanceRunResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(typed.commands_deleted, 0);
+        MaintenanceRunRequest::default()
+            .validate_response(&typed)
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn public_emit_cannot_acquire_the_attention_binding() {
         let router = router();
         // A public emit naming the reserved topic is rejected: it can never
@@ -7009,7 +7384,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         };
         assert!(!faulted);
         router
-            .settle_dispatch_error(&invalid.id, &error, faulted, true)
+            .settle_dispatch_error(&invalid.id, &error, faulted)
             .await;
         let store = router.inner.store.lock().await;
         let rejected = store.get_command(&invalid.id).unwrap().unwrap();
@@ -8550,7 +8925,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 &id,
                 &Error::new("provider_held", "provider scope is held"),
                 false,
-                false,
             )
             .await;
 
@@ -9161,7 +9535,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         };
 
         router
-            .settle_dispatch_error(&resume_id, &dispatch_error, false, false)
+            .settle_dispatch_error(&resume_id, &dispatch_error, false)
             .await;
 
         let store = router.inner.store.lock().await;
@@ -9614,7 +9988,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(dispatch_error.code, "not_allowed");
         assert!(!write_faulted);
         router
-            .settle_dispatch_error(&resume_id, &dispatch_error, write_faulted, false)
+            .settle_dispatch_error(&resume_id, &dispatch_error, write_faulted)
             .await;
 
         let mut store = router.inner.store.lock().await;
@@ -10085,7 +10459,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .await;
             let dispatch_error = Error::new("internal", "injected Store dispatch failure");
             router
-                .settle_dispatch_error(id, &dispatch_error, true, false)
+                .settle_dispatch_error(id, &dispatch_error, true)
                 .await;
             let command: Command = serde_json::from_value(
                 router
@@ -10117,7 +10491,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .await;
         let dispatch_error = Error::new("internal", "injected Store dispatch failure");
         router
-            .settle_dispatch_error(&dispatched_id, &dispatch_error, true, false)
+            .settle_dispatch_error(&dispatched_id, &dispatch_error, true)
             .await;
         let persisted = router
             .inner
@@ -11820,6 +12194,113 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn retained_native_subject_survives_reader_lapse_but_not_detach() {
+        let router = router();
+        let attach_id = ulid::Ulid::new().to_string();
+        let subject = json!({
+            "native_ref": "fixture-native",
+            "source": "vscode",
+            "state": "unknown",
+            "created_at": 1794654462000i64,
+            "updated_at": 1794654487000i64,
+        });
+        let agent = {
+            let mut store = router.inner.store.lock().await;
+            let agent = store.submit("owner", SubmitCommand {
+                id:attach_id.clone(), target:None, selector:None, verb:"attach".to_owned(),
+                args:json!({"profile":"fixture", "harness":"codex", "mode":"observe",
+                    "native_scope":"fixture-scope", "native_ref":"fixture-native", "profile_snapshot":{}}),
+                expected_generation:Some(0), expected_turn_id:None, request_id:None, probe:false,
+            }, now_ms()).unwrap().command.target.unwrap();
+            store.dispatch(&attach_id, now_ms()).unwrap();
+            store
+                .settle_observe_attach(
+                    &attach_id,
+                    json!({
+                "agent_id":agent, "generation":1, "command_id":attach_id,
+                "native_scope":"fixture-scope", "native_ref":"fixture-native",
+                "state":"attached", "observation_state":"unknown",
+                "metadata":{"subject":subject}, "coverage":{"kind":"native_metadata"}}),
+                    now_ms(),
+                )
+                .unwrap();
+            agent
+        };
+        // No live observer reader exists in this test, yet the native subject
+        // view is served from the retained attach metadata.
+        let page = router
+            .agent_history(
+                &json!({"id":agent, "generation":1, "source":"native", "view":"subject"}),
+                &Principal::Owner,
+            )
+            .await
+            .expect("retained native subject serves without a live reader");
+        assert_eq!(page["entries"], json!([subject]));
+        assert_eq!(
+            page["coverage"],
+            json!({"kind":"native_metadata","complete":true,"live":false})
+        );
+        assert_eq!(page["native_ref"], json!("fixture-native"));
+        assert_eq!(page["native_scope"], json!("fixture-scope"));
+        // Turns still require the live reader.
+        assert_eq!(
+            router
+                .agent_history(
+                    &json!({"id":agent, "generation":1, "source":"native", "view":"turns"}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "unavailable"
+        );
+        // A later detach fences the retained subject too.
+        let detach_id = ulid::Ulid::new().to_string();
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: detach_id.clone(),
+                        target: Some(agent.clone()),
+                        selector: None,
+                        verb: "detach".to_owned(),
+                        args: json!({}),
+                        expected_generation: Some(1),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.dispatch(&detach_id, now_ms()).unwrap();
+            store
+                .settle_observe_detach(
+                    &detach_id,
+                    json!({
+                "agent_id":agent, "generation":2, "command_id":detach_id,
+                "native_scope":"fixture-scope", "native_ref":"fixture-native",
+                "state":"detached", "observation_state":"unknown"}),
+                    now_ms(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            router
+                .agent_history(
+                    &json!({"id":agent, "generation":2, "source":"native", "view":"subject"}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "unavailable"
+        );
     }
 
     #[tokio::test]
@@ -13571,6 +14052,74 @@ mod run_authorization_tests {
         normalize_launch(&mut request, &principal).expect("ad-hoc shape is valid");
         let error = router
             .freeze_launch_profile(&principal, &mut request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
+    }
+
+    #[tokio::test]
+    async fn catalog_models_caches_static_harness_per_scope() {
+        let router = router();
+        // Claude needs no native installation: the aliases read never spawns
+        // a reader, so this also proves the static path performs no I/O.
+        let first = router
+            .harness_models(&json!({"harness": "claude"}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(first["catalogue"], json!("aliases"));
+        assert_eq!(first["scope"], json!("profile:adhoc harness:claude"));
+        assert_eq!(first["credential"], json!("none"));
+        assert!(first["fetched_at_ms"].as_i64().unwrap_or(-1) >= 0);
+        let second = router
+            .harness_models(&json!({"harness": "claude"}), &Principal::Owner)
+            .await
+            .unwrap();
+        // Served from the per-scope cache: the freshness timestamp is kept.
+        assert_eq!(first["fetched_at_ms"], second["fetched_at_ms"]);
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn catalog_quota_reports_unsupported_with_scope_and_caches() {
+        let router = router();
+        // Antigravity exposes no catalogue surface: quota reports unsupported
+        // with scope and freshness, without spawning any native reader.
+        let first = router
+            .harness_quota(&json!({"harness": "antigravity"}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(first["status"], json!("unsupported"));
+        assert_eq!(first["scope"], json!("profile:adhoc harness:antigravity"));
+        assert_eq!(first["credential"], json!("none"));
+        assert!(first["fetched_at_ms"].as_i64().unwrap_or(-1) >= 0);
+        assert!(first["note"].as_str().is_some_and(|note| !note.is_empty()));
+        let second = router
+            .harness_quota(&json!({"harness": "antigravity"}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(first["fetched_at_ms"], second["fetched_at_ms"]);
+        assert_eq!(first, second);
+        // Unknown profiles fail before any native work, and Agent callers
+        // are rejected at the owner-only gate.
+        let error = router
+            .harness_quota(
+                &json!({"harness": "codex", "profile": "missing"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.code.is_empty());
+        let agent = Principal::Agent {
+            id: "a1".to_owned(),
+            generation: 0,
+        };
+        let error = router
+            .harness_quota(&json!({"harness": "codex"}), &agent)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
+        let error = router
+            .harness_models(&json!({"harness": "codex"}), &agent)
             .await
             .unwrap_err();
         assert_eq!(error.code, "not_allowed");

@@ -8,7 +8,11 @@
 use crate::{common::now_ms, config, logging};
 use eliot_core::{Result, SecretPolicy};
 use eliot_store::{RetentionReport, Store};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::{Mutex, watch};
 
 /// Hourly cleanup is plenty for day-granularity retention windows.
@@ -58,50 +62,102 @@ pub(crate) async fn run(
         // Retention catch-up: while an epoch spends a budget, run another
         // instead of leaving eligible backlog until the next hourly wake.
         // Only retention repeats here; the config reload above stays hourly.
-        loop {
-            // Shutdown is checked at the top of every epoch, so a signal
-            // arriving during the inter-epoch yield below still stops the
-            // wake before another deletion epoch runs.
-            if shutdown.has_changed().is_err() || *shutdown.borrow() {
-                return Ok(());
-            }
-            let epoch_start = std::time::Instant::now();
-            let report = match run_once(&store, &config.retention, now_ms()).await {
-                Ok(report) => report,
-                Err(error) => {
-                    logging::record(&policy, "daemon.retention_failed", &[], Some(&error));
-                    break;
-                }
-            };
-            let rows = report.events_deleted
-                + report.commands_deleted
-                + report.writes_deleted
-                + report.mail_deleted;
-            if rows > 0 {
-                logging::record_counts(
-                    &policy,
-                    "daemon.retention_pruned",
-                    logging::Counts {
-                        events: report.events_deleted.max(0) as u64,
-                        pruned_through: report.pruned_through.max(0) as u64,
-                        commands: report.commands_deleted.max(0) as u64,
-                        writes: report.writes_deleted.max(0) as u64,
-                        mail: report.mail_deleted.max(0) as u64,
-                    },
-                    None,
-                );
-            }
-            // Zero rows always means drained, even if lock waits pushed
-            // elapsed time past the budget. Otherwise a spent budget means
-            // more retention may be pending; a final empty epoch is harmless.
-            let exhausted = rows >= RETENTION_TICK_ROW_BUDGET
-                || epoch_start.elapsed() >= RETENTION_TICK_TIME_BUDGET;
-            if rows == 0 || !exhausted {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        // Epoch failures are already logged inside; the next hourly wake
+        // retries.
+        run_epochs(&store, &config.retention, &policy, now_ms(), || {
+            shutdown.has_changed().is_err() || *shutdown.borrow()
+        })
+        .await
+        .ok();
     }
+}
+
+/// Owner-triggered pass (`maintenance.run`): reload the daemon retention
+/// settings, then run the same bounded epochs as the hourly tick. A rejected
+/// reload fails the call so the owner fixes the config instead of pruning
+/// under stale windows.
+pub(crate) async fn run_now(
+    store: &Mutex<Store>,
+    data_root: &Path,
+    policy: &Arc<SecretPolicy>,
+    now: i64,
+) -> Result<RetentionReport> {
+    let config = config::load_daemon_config(data_root)?;
+    run_epochs(store, &config.retention, policy, now, || false).await
+}
+
+/// Run bounded retention epochs until an epoch drains or a budget runs out:
+/// the shared body of the hourly tick and the owner-triggered pass. Totals
+/// sum every epoch; `pruned_through` is the last epoch's watermark.
+/// `stop_requested` is checked at the top of every epoch; the tick wires it
+/// to daemon shutdown, the RPC path never stops early.
+pub(crate) async fn run_epochs(
+    store: &Mutex<Store>,
+    retention: &config::RetentionConfig,
+    policy: &Arc<SecretPolicy>,
+    now: i64,
+    mut stop_requested: impl FnMut() -> bool,
+) -> Result<RetentionReport> {
+    let mut total = RetentionReport {
+        events_deleted: 0,
+        pruned_through: 0,
+        commands_deleted: 0,
+        writes_deleted: 0,
+        mail_deleted: 0,
+        digests_deleted: 0,
+    };
+    loop {
+        // Shutdown is checked at the top of every epoch, so a signal
+        // arriving during the inter-epoch yield below still stops the
+        // wake before another deletion epoch runs.
+        if stop_requested() {
+            return Ok(total);
+        }
+        let epoch_start = std::time::Instant::now();
+        let report = match run_once(store, retention, now).await {
+            Ok(report) => report,
+            Err(error) => {
+                logging::record(policy, "daemon.retention_failed", &[], Some(&error));
+                return Err(error);
+            }
+        };
+        total.events_deleted += report.events_deleted;
+        total.pruned_through = report.pruned_through;
+        total.commands_deleted += report.commands_deleted;
+        total.writes_deleted += report.writes_deleted;
+        total.mail_deleted += report.mail_deleted;
+        total.digests_deleted += report.digests_deleted;
+        let rows = report.events_deleted
+            + report.commands_deleted
+            + report.writes_deleted
+            + report.mail_deleted
+            + report.digests_deleted;
+        if rows > 0 {
+            logging::record_counts(
+                policy,
+                "daemon.retention_pruned",
+                logging::Counts {
+                    events: report.events_deleted.max(0) as u64,
+                    pruned_through: report.pruned_through.max(0) as u64,
+                    commands: report.commands_deleted.max(0) as u64,
+                    writes: report.writes_deleted.max(0) as u64,
+                    mail: report.mail_deleted.max(0) as u64,
+                    digests: report.digests_deleted.max(0) as u64,
+                },
+                None,
+            );
+        }
+        // Zero rows always means drained, even if lock waits pushed
+        // elapsed time past the budget. Otherwise a spent budget means
+        // more retention may be pending; a final empty epoch is harmless.
+        let exhausted = rows >= RETENTION_TICK_ROW_BUDGET
+            || epoch_start.elapsed() >= RETENTION_TICK_TIME_BUDGET;
+        if rows == 0 || !exhausted {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(total)
 }
 
 /// Run one retention epoch now: bounded passes under the tick row and
@@ -140,6 +196,7 @@ pub(crate) async fn run_once_with_budgets(
         commands_deleted: 0,
         writes_deleted: 0,
         mail_deleted: 0,
+        digests_deleted: 0,
     };
     loop {
         let pass = {
@@ -156,15 +213,20 @@ pub(crate) async fn run_once_with_budgets(
         total.commands_deleted += pass.commands_deleted;
         total.writes_deleted += pass.writes_deleted;
         total.mail_deleted += pass.mail_deleted;
-        let pass_rows =
-            pass.events_deleted + pass.commands_deleted + pass.writes_deleted + pass.mail_deleted;
+        total.digests_deleted += pass.digests_deleted;
+        let pass_rows = pass.events_deleted
+            + pass.commands_deleted
+            + pass.writes_deleted
+            + pass.mail_deleted
+            + pass.digests_deleted;
         if pass_rows == 0 {
             break;
         }
         let total_rows = total.events_deleted
             + total.commands_deleted
             + total.writes_deleted
-            + total.mail_deleted;
+            + total.mail_deleted
+            + total.digests_deleted;
         if total_rows >= row_budget || start.elapsed() >= time_budget {
             break;
         }
@@ -699,5 +761,61 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn run_now_reloads_config_and_reports_bounded_totals() {
+        let root = std::env::temp_dir().join(format!("eliot-run-now-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.toml"),
+            "[daemon]\nretention.commands_days = 30\n",
+        )
+        .unwrap();
+        let store = Mutex::new(Store::open(std::path::Path::new(":memory:")).unwrap());
+        let admitted_at = now_ms();
+        let pruned_at = admitted_at + 31 * 24 * 60 * 60 * 1_000;
+        let settled = seed_settled_launches(&store, 3, admitted_at).await;
+        let open = {
+            let mut guard = store.lock().await;
+            let mut launch = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+            launch.args = json!({
+                "project": "run-now-project",
+                "workspace": "run-now-workspace",
+                "harness": "codex",
+                "profile": "fixture",
+                "profile_snapshot": {},
+            });
+            launch.expected_generation = Some(0);
+            let id = launch.id.clone();
+            guard.submit("owner", launch, admitted_at).unwrap();
+            id
+        };
+        let policy = Arc::new(SecretPolicy::new(["owner-credential"]));
+        let report = run_now(&store, &root, &policy, pruned_at).await.unwrap();
+        assert_eq!(report.commands_deleted, 3);
+        assert_eq!(report.events_deleted, 0);
+        {
+            let guard = store.lock().await;
+            for id in &settled {
+                assert!(guard.get_command(id).unwrap().is_none());
+            }
+            // Open work is kept by the same pass.
+            assert!(guard.get_command(&open).unwrap().is_some());
+        }
+        // A drained pass reports zeros and the same watermark.
+        let drained = run_now(&store, &root, &policy, pruned_at).await.unwrap();
+        assert_eq!(drained.commands_deleted, 0);
+        assert_eq!(drained.events_deleted, 0);
+        assert_eq!(drained.pruned_through, report.pruned_through);
+        // A rejected settings reload fails instead of pruning under stale
+        // windows.
+        std::fs::write(
+            root.join("config.toml"),
+            "[daemon]\nretention.commands_days = 0\n",
+        )
+        .unwrap();
+        assert!(run_now(&store, &root, &policy, pruned_at).await.is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -78,11 +78,17 @@ ignoring all other MCP configurations". Eliot never writes Claude's user
 configuration in either policy.
 
 Requested vs observed: `requested` carries `mcp_policy` and `mcp_allow`;
-`effective` carries `mcp_policy` and the server set as unknown (`null` /
-unverified). The installed stream-json protocol exposes no MCP inventory
-record, so the effective set is not read back and the requested set is never
+`effective` carries `mcp_policy` and the server set. The `initialize`
+control reply exposes no MCP inventory record, so the effective set stays
+unknown (`null` / unverified) at readiness and the requested set is never
 echoed as observed; the applied `--strict-mcp-config` argv is the qualified
-startup difference for `minimal`.
+startup difference for `minimal`. The first post-input `system`/`init`
+stream record carries `mcp_servers` (name plus connection status per
+server, verified live on installed 2.1.321); the plugin retains that
+observed set (names and statuses only, secret-redacted and bounded) and
+attaches it to the turn terminal, where the reducer merges it into the
+effective set with `mcp_servers_verified` true. An absent or malformed init
+inventory leaves the effective set unknown.
 
 Resolve Windows executables explicitly; never insert an unrequested shell wrapper.
 Avoid modes that disable required hooks/instructions.

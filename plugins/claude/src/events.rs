@@ -30,9 +30,9 @@ use crate::native::{
     ClaudeClient, ClaudeFrame,
     types::{
         CanUseToolBody, CommandLifecycle, ControlCancelRequest, HookCallbackBody,
-        HookCallbackResponse, OutboundControlResponse, OutboundControlResponseBody,
+        HookCallbackResponse, InitMcpServer, OutboundControlResponse, OutboundControlResponseBody,
         PermissionResult, ResultRecord, assistant_model, assistant_text, assistant_tool_use_ids,
-        result_session_usage, result_usage,
+        attach_mcp_readback, init_mcp_servers, result_session_usage, result_usage,
     },
 };
 
@@ -208,13 +208,14 @@ struct PendingNativeRequest {
 
 /// Canonical outcome for one Claude terminal reason, decided here at the
 /// plugin boundary; the verbatim reason is preserved as `native_status`
-/// next to it. `success` is the only recognized success. `cancelled` and
-/// `interrupted` are interrupts; supported native failures (`error`,
-/// `failed`, `failure` and the `api_error...` family) fail. Anything else
-/// is unknown: an unrecognized reason never defaults to success.
+/// next to it. `success` (2.1.278) and `completed` (live 2.1.321 terminal
+/// frame) are the recognized successes. `cancelled` and `interrupted` are
+/// interrupts; supported native failures (`error`, `failed`, `failure`
+/// and the `api_error...` family) fail. Anything else is unknown: an
+/// unrecognized reason never defaults to success.
 fn claude_outcome(reason: &str) -> &'static str {
     match reason.trim() {
-        "success" => "success",
+        "success" | "completed" => "success",
         "cancelled" | "interrupted" => "interrupted",
         "error" | "failed" | "failure" => "failure",
         reason => {
@@ -567,6 +568,11 @@ struct EventProcessor {
     pending_fault_gap: Option<String>,
     final_text: Option<String>,
     final_text_unavailable: bool,
+    /// Proven MCP surface from the owned stream's `system`/`init` record
+    /// (names plus statuses). Retained on observation and attached to the
+    /// next turn terminal so the reducer merges it into the effective set;
+    /// absent until the first post-input init arrives.
+    init_mcp_servers: Option<Vec<InitMcpServer>>,
     closed: bool,
     native: Option<ClaudeClient>,
     status_tx: watch::Sender<EventStatus>,
@@ -1062,6 +1068,7 @@ impl EventProcessor {
             pending_fault_gap: None,
             final_text: None,
             final_text_unavailable: false,
+            init_mcp_servers: None,
             closed: false,
             native: None,
             status_tx,
@@ -1445,6 +1452,7 @@ impl EventProcessor {
                     "Claude system record did not belong to the owned session",
                 ));
             }
+            self.retain_init_mcp_servers(record);
             return Ok(());
         }
         if self.status.ready {
@@ -1455,7 +1463,36 @@ impl EventProcessor {
             ));
         }
         self.status.session_id = Some(session_id.to_owned());
+        self.retain_init_mcp_servers(record);
         Ok(())
+    }
+
+    /// Retain the proven MCP surface from the owned session's
+    /// `system`/`init` record. Only an observed inventory is kept (with
+    /// secrets redacted); anything unprovable leaves the retained set
+    /// untouched so the effective servers stay unknown, never guessed.
+    fn retain_init_mcp_servers(&mut self, record: &Value) {
+        if record.get("subtype").and_then(Value::as_str) != Some("init") {
+            return;
+        }
+        let Some(servers) = init_mcp_servers(record) else {
+            return;
+        };
+        let policy = SecretPolicy::new(self.secrets.iter().cloned());
+        let redacted = servers
+            .into_iter()
+            .map(|server| InitMcpServer {
+                name: policy.redact_text(&server.name),
+                status: policy.redact_text(&server.status),
+            })
+            .collect::<Vec<_>>();
+        if redacted
+            .iter()
+            .any(|server| server.name.trim().is_empty() || server.status.trim().is_empty())
+        {
+            return;
+        }
+        self.init_mcp_servers = Some(redacted);
     }
 
     async fn observe_lifecycle(&mut self, record: &Value) -> Result<()> {
@@ -2885,6 +2922,11 @@ impl EventProcessor {
         if let Some(usage) = result_usage(record) {
             data["usage"] = serde_json::to_value(&usage).unwrap_or(Value::Null);
         }
+        // Proven MCP surface from the owned stream's `system`/`init`
+        // record: attached once observed, so the first terminal after init
+        // carries the readback into the effective set. Unobserved stays
+        // unattached and the effective set stays unknown.
+        attach_mcp_readback(&mut data, self.init_mcp_servers.as_deref());
         // Optional cumulative session cost from `total_cost_usd`, held for the
         // session fact that commits after the accepted terminal. Absent or
         // unusable cost simply commits no session fact.
@@ -3224,6 +3266,7 @@ mod tests {
     #[test]
     fn terminal_reasons_classify_without_defaulting_to_success() {
         assert_eq!(claude_outcome("success"), "success");
+        assert_eq!(claude_outcome("completed"), "success");
         assert_eq!(claude_outcome("cancelled"), "interrupted");
         assert_eq!(claude_outcome("interrupted"), "interrupted");
         for reason in [
@@ -3235,7 +3278,7 @@ mod tests {
         ] {
             assert_eq!(claude_outcome(reason), "failure", "reason={reason}");
         }
-        for reason in ["", "completed", "end_turn", "inProgress", "bogus"] {
+        for reason in ["", "end_turn", "inProgress", "bogus"] {
             assert_eq!(claude_outcome(reason), "unknown", "reason={reason}");
         }
     }
@@ -3255,6 +3298,53 @@ mod tests {
         let (outcome, status) = terminal_outcome_and_status("api_error", &plain);
         assert_eq!(outcome, "failure");
         assert_eq!(status, "api_error");
+    }
+
+    #[test]
+    fn result_terminal_completed_settles_success() {
+        // Live 2.1.321 terminal frame (captured from `claude -p
+        // --input-format stream-json --output-format stream-json --verbose`;
+        // trimmed to the decision-relevant fields plus unknown
+        // forward-compat fields the parser must tolerate). The proven
+        // completion carries `terminal_reason: "completed"`.
+        let record = json!({
+            "type": "result",
+            "subtype": "success",
+            "terminal_reason": "completed",
+            "stop_reason": "end_turn",
+            "is_error": false,
+            "num_turns": 1,
+            "result": "hello",
+            "session_id": "11111111-2222-4333-8444-555555555555",
+            "total_cost_usd": 0.00260901,
+            "usage": {
+                "input_tokens": 2,
+                "output_tokens": 4,
+                "cache_read_input_tokens": 20781,
+                "cache_creation_input_tokens": 11995,
+            },
+            "modelUsage": {},
+            "permission_denials": [],
+            "queued_turn_count": 0,
+            "result_index": 0,
+            "duration_ms": 1442,
+            "duration_api_ms": 1370,
+            "uuid": "6dd2511c-8daf-4c59-ada1-7069ad908df2",
+        });
+        let parsed: ResultRecord =
+            serde_json::from_value(record.clone()).expect("2.1.321 result decodes");
+        assert_eq!(parsed.terminal_reason, "completed");
+        let plain = SecretPolicy::new(Vec::<String>::new());
+        let (outcome, status) = terminal_outcome_and_status(&parsed.terminal_reason, &plain);
+        assert_eq!(outcome, "success");
+        assert_eq!(status, "completed");
+        let usage = result_usage(&record).expect("turn counters map");
+        assert_eq!(usage.input_tokens, Some(2));
+        assert_eq!(usage.output_tokens, Some(4));
+        assert_eq!(usage.cache_read_tokens, Some(20781));
+        assert_eq!(usage.cache_write_tokens, Some(11995));
+        assert_eq!(usage.scope.as_deref(), Some("main_loop_turn"));
+        assert!(result_session_usage(&record).is_some());
     }
 
     #[tokio::test]
