@@ -3,7 +3,8 @@
 
 use super::{GitView, ObservationView, ScriptInterpreter};
 use crate::{
-    Agent, AgentEdit, AgentState, CommandState, Error, ProcessIdentity, ProcessRecord, Result,
+    Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity, ProcessIdentity,
+    ProcessRecord, Result, TurnOutcome, TurnUsage,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -66,6 +67,41 @@ pub struct AgentListRequest {
     pub limit: usize,
     #[serde(default)]
     pub observations: bool,
+    /// Exact Agent state filter (`unknown`, `created`, `starting`, `idle`,
+    /// `busy`, `waiting`, `stopped`, `failed`, `lost`). Wrong types reject as
+    /// `invalid`; an unknown state name never matches silently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<AgentState>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_text"
+    )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
+    pub project: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_text"
+    )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
+    pub harness: Option<String>,
+    /// Direct-parent Agent ID filter (one subtree level).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_text"
+    )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
+    pub parent: Option<String>,
+    /// Subtree-root Agent ID filter (the frozen hierarchy root).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_text"
+    )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
+    pub root: Option<String>,
 }
 
 impl Default for AgentListRequest {
@@ -74,6 +110,11 @@ impl Default for AgentListRequest {
             after: None,
             limit: super::DEFAULT_LIMIT,
             observations: false,
+            state: None,
+            project: None,
+            harness: None,
+            parent: None,
+            root: None,
         }
     }
 }
@@ -83,6 +124,20 @@ impl AgentListRequest {
         if let Some(after) = &self.after {
             text(after)?;
         }
+        if let Some(project) = &self.project {
+            text(project)?;
+        }
+        if let Some(harness) = &self.harness {
+            text(harness)?;
+        }
+        if let Some(parent) = &self.parent {
+            text(parent)?;
+            crate::parse_agent_id(parent)?;
+        }
+        if let Some(root) = &self.root {
+            text(root)?;
+            crate::parse_agent_id(root)?;
+        }
         limit(self.limit)
     }
 
@@ -90,19 +145,149 @@ impl AgentListRequest {
         if self.validate().is_err() || reply.agents.len() > self.limit {
             return Err(invalid_response());
         }
+        if reply.total < reply.agents.len() {
+            return Err(invalid_response());
+        }
+        // The Store pages by Agent ID: every nonempty page carries `next` at
+        // the last returned row, and an empty page carries no cursor. A quiet
+        // nonempty page still requires continuing through `next` until empty.
+        match reply.agents.last() {
+            Some(last) => {
+                if reply.next.as_deref() != Some(last.summary.id.as_str()) {
+                    return Err(invalid_response());
+                }
+            }
+            None => {
+                if reply.next.is_some() {
+                    return Err(invalid_response());
+                }
+            }
+        }
+        if reply
+            .next
+            .as_ref()
+            .is_some_and(|next| self.after.as_ref() == Some(next))
+        {
+            return Err(invalid_response());
+        }
         let mut ids = BTreeSet::new();
         if reply.agents.iter().any(|row| {
-            !valid_agent(&row.agent)
-                || !ids.insert(&row.agent.id)
+            row.validate().is_err()
+                || !ids.insert(row.summary.id.clone())
                 || row.observation.is_some() != self.observations
-        }) || reply.next.as_ref().is_some_and(|next| {
-            reply.agents.last().is_none_or(|row| &row.agent.id != next)
-                || self.after.as_ref() == Some(next)
+                || self.state.is_some_and(|state| row.summary.state != state)
+                || self
+                    .project
+                    .as_ref()
+                    .is_some_and(|project| &row.summary.project != project)
+                || self
+                    .harness
+                    .as_ref()
+                    .is_some_and(|harness| &row.summary.harness != harness)
+                || self
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| row.summary.parent.as_ref() != Some(parent))
+                || self
+                    .root
+                    .as_ref()
+                    .is_some_and(|root| &row.summary.root != root)
         }) {
             return Err(invalid_response());
         }
-        // A self-principal list ignores `after` and returns `next: null`.
         // Neither a non-null next nor a full page promises another record.
+        Ok(())
+    }
+}
+
+/// Fixed compact fleet projection for `agent.list`. Identity, state, current
+/// turn and hierarchy position come from the live Agent row. `last_progress_at`
+/// is the newest native progress timestamp where the Store retains one;
+/// `progress_age_ms` is measured against the read clock and stays absent when
+/// no progress timestamp exists. `last_outcome` is the newest terminal turn's
+/// canonical outcome (legacy rows classify explicitly, never defaulting to
+/// success) with its `last_turn_id` and retained `usage` where available.
+/// `activity` is present only for native observed children. `updated_at` is
+/// the last controller-observed write: for detached or restarted sources it
+/// is freshness metadata, not proof of liveness. Full records stay available
+/// through `agent.get`.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentSummary {
+    pub id: String,
+    #[schemars(range(min = 0))]
+    pub generation: i64,
+    pub project: String,
+    pub harness: String,
+    pub state: AgentState,
+    #[serde(deserialize_with = "nullable")]
+    pub parent: Option<String>,
+    pub root: String,
+    #[serde(deserialize_with = "nullable")]
+    pub active_turn: Option<String>,
+    #[serde(deserialize_with = "nullable")]
+    pub last_progress_at: Option<i64>,
+    #[serde(deserialize_with = "nullable")]
+    pub progress_age_ms: Option<i64>,
+    #[serde(deserialize_with = "nullable")]
+    pub last_turn_id: Option<String>,
+    #[serde(deserialize_with = "nullable")]
+    pub last_outcome: Option<TurnOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<NativeChildActivity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TurnUsage>,
+    pub updated_at: i64,
+}
+
+impl AgentSummary {
+    pub fn validate(&self) -> Result<()> {
+        text(&self.id)?;
+        crate::parse_agent_id(&self.id)?;
+        if self.generation < 0 {
+            return Err(Error::new("invalid", "Agent summary generation is invalid"));
+        }
+        text(&self.project)?;
+        text(&self.harness)?;
+        text(&self.root)?;
+        crate::parse_agent_id(&self.root)?;
+        if let Some(parent) = &self.parent {
+            text(parent)?;
+            crate::parse_agent_id(parent)?;
+        }
+        if let Some(turn) = &self.active_turn {
+            text(turn)?;
+        }
+        if let Some(at) = self.last_progress_at
+            && at < 0
+        {
+            return Err(Error::new(
+                "invalid",
+                "Agent summary progress time is invalid",
+            ));
+        }
+        if let Some(age) = self.progress_age_ms
+            && age < 0
+        {
+            return Err(Error::new(
+                "invalid",
+                "Agent summary progress age is invalid",
+            ));
+        }
+        if self.last_outcome.is_none() && self.last_turn_id.is_some() {
+            return Err(Error::new(
+                "invalid",
+                "Agent summary turn needs its outcome",
+            ));
+        }
+        if let Some(turn) = &self.last_turn_id {
+            text(turn)?;
+        }
+        if self.updated_at < 0 {
+            return Err(Error::new(
+                "invalid",
+                "Agent summary observation time is invalid",
+            ));
+        }
         Ok(())
     }
 }
@@ -423,8 +608,8 @@ pub struct AgentGetResponse {
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentListRow {
-    #[serde(flatten, deserialize_with = "object_agent")]
-    pub agent: Agent,
+    #[serde(flatten, deserialize_with = "object_summary")]
+    pub summary: AgentSummary,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -433,12 +618,27 @@ pub struct AgentListRow {
     pub observation: Option<ObservationView>,
 }
 
+impl AgentListRow {
+    pub fn validate(&self) -> Result<()> {
+        self.summary.validate()
+    }
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentListResponse {
     #[serde(deserialize_with = "objects")]
     pub agents: Vec<AgentListRow>,
     #[serde(deserialize_with = "nullable")]
     pub next: Option<String>,
+    /// Matching records for the caller's scope and filters, ignoring the
+    /// page cursor. `agents.len()` is the returned prefix of that set.
+    /// Required on the wire: a missing count never reads back as zero.
+    pub total: usize,
+    /// True when the server knows records remain beyond this page: either a
+    /// further row matched or the byte bound trimmed the page. A false value
+    /// on a full page still requires continuing through `next` until the
+    /// server returns an empty page. Required on the wire.
+    pub truncated: bool,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -993,6 +1193,20 @@ fn nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     Option::<T>::deserialize(deserializer)
 }
 
+fn object_summary<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<AgentSummary, D::Error> {
+    let value = Map::<String, Value>::deserialize(deserializer)?;
+    for field in ["activity", "usage"] {
+        if value.get(field).is_some_and(|entry| !entry.is_object()) {
+            return Err(serde::de::Error::custom(
+                "Agent summary objects must be objects",
+            ));
+        }
+    }
+    serde_json::from_value(Value::Object(value)).map_err(serde::de::Error::custom)
+}
+
 fn object_agent<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Agent, D::Error> {
@@ -1440,20 +1654,50 @@ mod tests {
         assert!(serde_json::from_value::<AgentGetResponse>(malformed).is_err());
         let reply = AgentListResponse {
             agents: vec![AgentListRow {
-                agent,
+                summary: summary(),
                 observation: None,
             }],
             next: Some("a1".to_owned()),
+            total: 1,
+            truncated: false,
         };
         let wire = serde_json::to_value(&reply).unwrap();
         assert!(wire["agents"][0].get("observation").is_none());
         assert_eq!(
-            serde_json::from_value::<AgentListResponse>(wire).unwrap(),
+            serde_json::from_value::<AgentListResponse>(wire.clone()).unwrap(),
             reply
         );
         AgentListRequest::default()
             .validate_response(&reply)
             .unwrap();
+        // Compact objects reject nested positional arrays; full Agent rows
+        // stay on `agent.get`.
+        let mut malformed = wire.clone();
+        malformed["agents"][0]["activity"] = json!([["running"]]);
+        assert!(serde_json::from_value::<AgentListResponse>(malformed).is_err());
+        let mut malformed = wire;
+        malformed["agents"][0]["usage"] = json!([["message", "m1"]]);
+        assert!(serde_json::from_value::<AgentListResponse>(malformed).is_err());
+    }
+
+    fn summary() -> AgentSummary {
+        AgentSummary {
+            id: "a1".to_owned(),
+            generation: 0,
+            project: "p".to_owned(),
+            harness: "fake".to_owned(),
+            state: AgentState::Idle,
+            parent: None,
+            root: "a1".to_owned(),
+            active_turn: None,
+            last_progress_at: None,
+            progress_age_ms: None,
+            last_turn_id: None,
+            last_outcome: None,
+            activity: None,
+            usage: None,
+            updated_at: 7,
+        }
     }
 
     #[test]
@@ -1464,12 +1708,14 @@ mod tests {
         };
         let mut reply = AgentListResponse {
             agents: vec![AgentListRow {
-                agent: Agent::new("a1", "p", "fake", "fake", 0),
+                summary: summary(),
                 observation: None,
             }],
-            next: None,
+            next: Some("a1".to_owned()),
+            total: 1,
+            truncated: false,
         };
-        request.validate_response(&reply).unwrap(); // self-principal ignores after.
+        request.validate_response(&reply).unwrap(); // self-scope keeps one row with its cursor.
         reply.next = Some("wrong".to_owned());
         unknown(request.validate_response(&reply));
         reply.next = Some("a1".to_owned());
@@ -1482,10 +1728,133 @@ mod tests {
         request.validate_response(&reply).unwrap();
         reply.agents.push(reply.agents[0].clone());
         unknown(request.validate_response(&reply));
-        reply.agents[1].agent.id = "a2".to_owned();
+        reply.agents[1].summary.id = "a2".to_owned();
+        reply.agents[1].summary.root = "a2".to_owned();
         reply.next = Some("a2".to_owned());
         request.limit = 1;
         unknown(request.validate_response(&reply));
+    }
+
+    #[test]
+    fn list_filters_match_projection_and_report_counts_honestly() {
+        let request = AgentListRequest {
+            project: Some("p".to_owned()),
+            harness: Some("fake".to_owned()),
+            state: Some(AgentState::Idle),
+            root: Some("a1".to_owned()),
+            ..Default::default()
+        };
+        request.validate().unwrap();
+        let reply = AgentListResponse {
+            agents: vec![AgentListRow {
+                summary: summary(),
+                observation: None,
+            }],
+            next: Some("a1".to_owned()),
+            total: 1,
+            truncated: false,
+        };
+        request.validate_response(&reply).unwrap();
+        // A short page must not claim truncation; total covers the scope.
+        let mut short = reply.clone();
+        short.truncated = true;
+        short.next = None;
+        unknown(request.validate_response(&short));
+        let mut undercounted = reply.clone();
+        undercounted.total = 0;
+        unknown(request.validate_response(&undercounted));
+        // Filter mismatches reject instead of filtering silently.
+        for mutate in [
+            AgentListRequest {
+                project: Some("other".to_owned()),
+                ..request.clone()
+            },
+            AgentListRequest {
+                harness: Some("other".to_owned()),
+                ..request.clone()
+            },
+            AgentListRequest {
+                state: Some(AgentState::Busy),
+                ..request.clone()
+            },
+            AgentListRequest {
+                parent: Some("a2".to_owned()),
+                ..request.clone()
+            },
+            AgentListRequest {
+                root: Some("a2".to_owned()),
+                ..request.clone()
+            },
+        ] {
+            unknown(mutate.validate_response(&reply));
+        }
+        // Unknown filter shapes are invalid, never empty matches.
+        for invalid in [
+            AgentListRequest {
+                project: Some("  ".to_owned()),
+                ..Default::default()
+            },
+            AgentListRequest {
+                harness: Some(String::new()),
+                ..Default::default()
+            },
+            AgentListRequest {
+                parent: Some("a0".to_owned()),
+                ..Default::default()
+            },
+            AgentListRequest {
+                root: Some("nope".to_owned()),
+                ..Default::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+        assert!(serde_json::from_value::<AgentListRequest>(json!({"state": "done"})).is_err());
+    }
+
+    #[test]
+    fn list_pagination_requires_cursor_on_every_nonempty_page() {
+        let request = AgentListRequest::default();
+        let row = || AgentListRow {
+            summary: summary(),
+            observation: None,
+        };
+        // Every nonempty page carries `next` at the last returned id, even
+        // when nothing is truncated; an empty page carries no cursor.
+        let ok = AgentListResponse {
+            agents: vec![row()],
+            next: Some("a1".to_owned()),
+            total: 1,
+            truncated: false,
+        };
+        request.validate_response(&ok).unwrap();
+        let mut missing_cursor = ok.clone();
+        missing_cursor.next = None;
+        unknown(request.validate_response(&missing_cursor));
+        let mut wrong_cursor = ok.clone();
+        wrong_cursor.next = Some("a2".to_owned());
+        unknown(request.validate_response(&wrong_cursor));
+        let empty_ok = AgentListResponse {
+            agents: vec![],
+            next: None,
+            total: 1,
+            truncated: false,
+        };
+        request.validate_response(&empty_ok).unwrap();
+        let mut dangling = empty_ok.clone();
+        dangling.next = Some("a1".to_owned());
+        unknown(request.validate_response(&dangling));
+        // `total` and `truncated` are required on the wire: a missing count
+        // never reads back as zero, and a missing flag never reads as quiet.
+        let wire = serde_json::to_value(&ok).unwrap();
+        for field in ["total", "truncated"] {
+            let mut missing = wire.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<AgentListResponse>(missing).is_err(),
+                "{field} must be required"
+            );
+        }
     }
 
     #[test]

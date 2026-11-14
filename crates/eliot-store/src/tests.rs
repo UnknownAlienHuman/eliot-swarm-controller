@@ -7,9 +7,9 @@ use eliot_core::api::{
     TurnResolveRequest, TurnResolveStatus,
 };
 use eliot_core::{
-    AgentState, CommandState, EventCause, NativeEvent, NativeStoreBinding, ProcessIdentity,
-    ProcessRecord, ProcessState, ProviderHoldState, ProviderRestrictionKind, SourceBatch,
-    SourceGap, SubmitCommand, TurnOutcome, TurnState,
+    AgentControl, AgentState, CommandState, EventCause, NativeEvent, NativeStoreBinding,
+    ProcessIdentity, ProcessRecord, ProcessState, ProviderHoldState, ProviderRestrictionKind,
+    SourceBatch, SourceGap, SubmitCommand, TurnOutcome, TurnState,
 };
 use eliot_core::{
     WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparationInput,
@@ -6881,11 +6881,19 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     // Return the file to schema 16, as an older binary left it, and upgrade.
     // Drop the v29/v30 activity artifacts first: the v30 events triggers
     // would otherwise fire during the table rebuilds below while their
-    // native_child_registrations reads no longer resolve (#418).
+    // native_child_registrations reads no longer resolve (#418). Drop the
+    // v31 fleet indexes too, or the parent-column drop below fails and the
+    // reopen would recreate existing indexes.
     store
         .connection
         .execute_batch(
-            "DROP TRIGGER native_child_activity_revision;
+            "DROP INDEX agents_list_state;
+             DROP INDEX agents_list_project;
+             DROP INDEX agents_list_harness;
+             DROP INDEX agents_list_parent;
+             DROP INDEX agents_list_root;
+             DELETE FROM schema_migrations WHERE version = 31;
+             DROP TRIGGER native_child_activity_revision;
              DROP TRIGGER native_child_progress_pruned;
              DROP INDEX native_children_producer;
              DROP INDEX turns_native_activity;
@@ -8375,7 +8383,8 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
              CREATE TABLE agents(
                  id INTEGER PRIMARY KEY, generation INTEGER NOT NULL,
                  observe_only INTEGER NOT NULL, profile TEXT NOT NULL,
-                 profile_snapshot TEXT NOT NULL
+                 profile_snapshot TEXT NOT NULL,
+                 state TEXT NOT NULL, project TEXT NOT NULL, harness TEXT NOT NULL
              );
              CREATE TABLE commands(
                  id TEXT PRIMARY KEY, principal TEXT NOT NULL, method TEXT NOT NULL,
@@ -8457,8 +8466,9 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
             (10, 1, "pending-resume", pending_resume_snapshot),
         ] {
             old.execute(
-                "INSERT INTO agents(id, generation, observe_only, profile, profile_snapshot)
-                 VALUES (?1, ?2, 0, ?3, ?4)",
+                "INSERT INTO agents(id, generation, observe_only, profile, profile_snapshot,
+                                    state, project, harness)
+                 VALUES (?1, ?2, 0, ?3, ?4, 'idle', 'capacity-test', 'test-harness')",
                 rusqlite::params![id, generation, profile, snapshot],
             )
             .expect("insert v8 Agent");
@@ -11415,6 +11425,255 @@ fn local_user_event_atomic_commit_rejects_mismatch_and_leaves_unknown() {
     let command = store.get_command(&legacy).unwrap().unwrap();
     assert_eq!(command.state, CommandState::Unknown);
     assert_eq!(command.outcome, Some(json!({"reason": "daemon_restart"})));
+}
+
+#[test]
+fn agent_list_filters_use_indexes_and_pages_stay_ordered() {
+    use super::{AgentListFilter, agent_list_select};
+
+    fn fleet_agent(store: &mut Store, project: &str, now: i64) -> String {
+        let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+        launch.expected_generation = Some(0);
+        launch.args = json!({"harness": "codex", "profile": "codex-test",
+            "profile_snapshot": {}, "project": project, "workspace": "synthetic-workspace"});
+        let command = launch.id.clone();
+        let id = store
+            .submit("owner", launch, now)
+            .expect("admit fleet launch")
+            .command
+            .target
+            .expect("launch target");
+        store
+            .dispatch(&command, now)
+            .expect("dispatch fleet launch");
+        id
+    }
+
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let first = fleet_agent(&mut store, "fleet-a", now);
+    let second = fleet_agent(&mut store, "fleet-a", now + 1);
+    let third = fleet_agent(&mut store, "fleet-b", now + 2);
+    // Shape one child link so subtree filters have a descendant to find.
+    let first_num = eliot_core::parse_agent_id(&first).expect("parse fleet root");
+    let second_num = eliot_core::parse_agent_id(&second).expect("parse fleet child");
+    store
+        .connection
+        .execute(
+            "UPDATE agents SET parent = ?1, root = ?1, depth = 1 WHERE id = ?2",
+            [first_num, second_num],
+        )
+        .expect("link fleet child");
+
+    // Every new filter rides its composite index.
+    for (filter, index) in [
+        (
+            AgentListFilter {
+                state: Some(AgentState::Idle),
+                ..Default::default()
+            },
+            "agents_list_state",
+        ),
+        (
+            AgentListFilter {
+                project: Some("fleet-a".to_owned()),
+                ..Default::default()
+            },
+            "agents_list_project",
+        ),
+        (
+            AgentListFilter {
+                harness: Some("codex".to_owned()),
+                ..Default::default()
+            },
+            "agents_list_harness",
+        ),
+        (
+            AgentListFilter {
+                parent: Some(first.clone()),
+                ..Default::default()
+            },
+            "agents_list_parent",
+        ),
+        (
+            AgentListFilter {
+                root: Some(first.clone()),
+                ..Default::default()
+            },
+            "agents_list_root",
+        ),
+    ] {
+        let select =
+            agent_list_select(&filter, None, Some(0), Some(2), false).expect("build fleet query");
+        let mut statement = store
+            .connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", select.sql))
+            .expect("explain fleet query");
+        let plan = statement
+            .query_map(rusqlite::params_from_iter(select.params.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("read fleet plan")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect fleet plan")
+            .join(" | ");
+        assert!(
+            plan.contains(&format!("USING INDEX {index}")),
+            "filter must use {index}: {plan}"
+        );
+    }
+
+    // Ordered continuation across pages with honest counts.
+    let filter = AgentListFilter::default();
+    let mut after = None;
+    let mut seen = Vec::new();
+    for last in [false, false, true] {
+        let page = store
+            .list_agent_summaries(&filter, after.as_deref(), 1, now + 9)
+            .expect("page the fleet");
+        assert_eq!(page.total, 3);
+        assert_eq!(page.truncated, !last);
+        assert_eq!(page.summaries.len(), 1);
+        assert_eq!(page.next.as_deref(), Some(page.summaries[0].id.as_str()));
+        assert!(seen.iter().all(|id| id != &page.summaries[0].id));
+        if last {
+            assert!(page.summaries[0].id == third);
+        }
+        after = page.next;
+        seen.push(page.summaries.into_iter().next().unwrap().id);
+    }
+    assert!(seen.windows(2).all(|pair| pair[0] < pair[1]));
+    let drained = store
+        .list_agent_summaries(&filter, after.as_deref(), 1, now + 9)
+        .expect("drain the fleet");
+    assert!(drained.summaries.is_empty());
+    assert_eq!(drained.total, 3);
+    assert!(!drained.truncated);
+
+    // Filtered totals ignore the cursor.
+    let project = store
+        .list_agent_summaries(
+            &AgentListFilter {
+                project: Some("fleet-a".to_owned()),
+                ..Default::default()
+            },
+            Some(seen[1].as_str()),
+            10,
+            now + 9,
+        )
+        .expect("filter the fleet by project");
+    assert_eq!(project.total, 2);
+    assert!(!project.truncated);
+    let root = store
+        .list_agent_summaries(
+            &AgentListFilter {
+                root: Some(first.clone()),
+                ..Default::default()
+            },
+            None,
+            10,
+            now + 9,
+        )
+        .expect("filter the fleet by root");
+    assert_eq!(root.total, 2);
+    let parent = store
+        .list_agent_summaries(
+            &AgentListFilter {
+                parent: Some(first.clone()),
+                ..Default::default()
+            },
+            None,
+            10,
+            now + 9,
+        )
+        .expect("filter the fleet by parent");
+    assert_eq!(parent.total, 1);
+    assert_eq!(parent.summaries[0].id, second);
+    assert_eq!(parent.summaries[0].root, first);
+
+    // Compact rows carry freshness without fabricating outcomes.
+    let probe = &root.summaries[0];
+    assert_eq!(probe.last_outcome, None);
+    assert_eq!(probe.last_turn_id, None);
+    assert_eq!(probe.last_progress_at, None);
+    assert_eq!(probe.progress_age_ms, None);
+    assert!(probe.updated_at >= now);
+
+    // Scopes: self sees one row, tree sees the subtree, project the label.
+    let agent = store
+        .get_agent(&first)
+        .expect("read fleet root")
+        .expect("fleet root");
+    let mut tree = agent.clone();
+    tree.control = AgentControl::Tree;
+    let scoped = store
+        .list_agent_summaries_scoped(&tree, &AgentListFilter::default(), None, 10, now + 9)
+        .expect("list the fleet subtree");
+    assert_eq!(scoped.total, 2);
+    let mut project_caller = agent.clone();
+    project_caller.control = AgentControl::Project;
+    let scoped = store
+        .list_agent_summaries_scoped(
+            &project_caller,
+            &AgentListFilter::default(),
+            None,
+            10,
+            now + 9,
+        )
+        .expect("list the fleet project");
+    assert_eq!(scoped.total, 2);
+    let scoped = store
+        .list_agent_summaries_scoped(&agent, &AgentListFilter::default(), None, 10, now + 9)
+        .expect("list the fleet self row");
+    assert_eq!(scoped.total, 1);
+    assert_eq!(scoped.summaries[0].id, first);
+}
+
+#[test]
+fn tree_scope_listing_shares_bounded_depth_with_direct_reads() {
+    use super::hierarchy::ANCESTOR_WALK_CAP;
+    use super::{AgentListFilter, agent_list_select};
+
+    // Listing, totals and direct reads share one bounded scope rule: the
+    // tree CTE carries the same walk cap that gates parent-chain direct
+    // reads, so a tree caller cannot list or count an Agent its `agent.get`
+    // would deny.
+    let mut caller = eliot_core::Agent::new("a1", "p", "codex", "fixture", 7);
+    caller.control = eliot_core::AgentControl::Tree;
+    let filter = AgentListFilter::default();
+    for count in [false, true] {
+        let select = agent_list_select(&filter, Some(&caller), None, Some(2), count)
+            .expect("build tree scope query");
+        assert!(
+            select.sql.contains(&ANCESTOR_WALK_CAP.to_string()),
+            "tree scope must bound depth with the shared cap: {}",
+            select.sql
+        );
+        assert!(
+            select.sql.contains("subtree(id, depth)"),
+            "tree scope must track CTE depth: {}",
+            select.sql
+        );
+    }
+    // The selective structural index wins over state when both are present,
+    // so `state=idle,parent=a42` totals do not scan all idle Agents.
+    let combined = AgentListFilter {
+        state: Some(eliot_core::AgentState::Idle),
+        parent: Some("a42".to_owned()),
+        ..Default::default()
+    };
+    let select = agent_list_select(&combined, None, Some(0), Some(2), false)
+        .expect("build combined filter query");
+    assert!(
+        select.sql.contains("INDEXED BY agents_list_parent"),
+        "combined filters must prefer the parent index: {}",
+        select.sql
+    );
+    assert!(
+        !select.sql.contains("INDEXED BY agents_list_state"),
+        "combined filters must not force the state index: {}",
+        select.sql
+    );
 }
 
 #[test]

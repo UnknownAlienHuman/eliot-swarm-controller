@@ -1,7 +1,7 @@
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use eliot_core::{
-    Command as CoreCommand, CommandState, Error as CoreError, InjectArgs, InjectPoint,
-    SubmitCommand, Turn as CoreTurn, TurnOutcome, TurnState,
+    AgentState, Command as CoreCommand, CommandState, Error as CoreError, InjectArgs, InjectPoint,
+    NativeChildActivityState, SubmitCommand, Turn as CoreTurn, TurnOutcome, TurnState,
     api::{
         AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
         AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
@@ -76,7 +76,7 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     data_dir: Option<PathBuf>,
 
-    /// Print compact JSON instead of the default readable JSON output.
+    /// Print compact JSON instead of the default readable output.
     #[arg(long, global = true)]
     json: bool,
 
@@ -132,9 +132,9 @@ enum CliCommand {
     Deny(DenyArgs),
     /// Answer a pending native question from a bounded JSON file.
     Answer(AnswerArgs),
-    /// List Agents.
+    /// List compact Agent summaries in your scope.
     Ls(LsArgs),
-    /// Read one page of Agents with their current cached observations.
+    /// List compact Agent summaries with cached observations in your scope.
     Top(TopArgs),
     /// Show one Agent.
     Show(ShowArgs),
@@ -390,11 +390,33 @@ struct AnswerArgs {
 }
 
 #[derive(Args)]
+struct ListFilterArgs {
+    /// Exact Agent state: unknown, created, starting, idle, busy, waiting,
+    /// stopped, failed or lost.
+    #[arg(long, value_name = "STATE")]
+    state: Option<String>,
+    /// Exact project label.
+    #[arg(long, value_name = "PROJECT")]
+    project: Option<String>,
+    /// Exact harness name.
+    #[arg(long, value_name = "HARNESS")]
+    harness: Option<String>,
+    /// Direct-parent Agent ID.
+    #[arg(long, value_name = "AGENT")]
+    parent: Option<String>,
+    /// Subtree-root Agent ID.
+    #[arg(long, value_name = "AGENT")]
+    root: Option<String>,
+}
+
+#[derive(Args)]
 struct LsArgs {
     #[arg(long, value_name = "AGENT")]
     after: Option<String>,
     #[command(flatten)]
     page: PageArgs,
+    #[command(flatten)]
+    filter: ListFilterArgs,
 }
 
 #[derive(Args)]
@@ -403,6 +425,8 @@ struct TopArgs {
     after: Option<String>,
     #[command(flatten)]
     page: PageArgs,
+    #[command(flatten)]
+    filter: ListFilterArgs,
 }
 
 #[derive(Args)]
@@ -1913,26 +1937,32 @@ async fn dispatch(
         CliCommand::Ls(LsArgs {
             after,
             page: PageArgs { limit },
+            filter,
         }) => {
             validate_limit(limit)?;
-            let params = AgentListRequest {
-                after,
-                limit,
-                observations: false,
-            };
-            read_and_print!("agent.list", params, AgentListResponse)
+            let params = list_params(after, limit, false, filter)?;
+            if json_output {
+                read_and_print!("agent.list", params, AgentListResponse)
+            } else {
+                let response = read_agent_list(&data_dir, &params).await?;
+                print_agent_table(&response, false);
+                Ok(0)
+            }
         }
         CliCommand::Top(TopArgs {
             after,
             page: PageArgs { limit },
+            filter,
         }) => {
             validate_limit(limit)?;
-            let params = AgentListRequest {
-                after,
-                limit,
-                observations: true,
-            };
-            read_and_print!("agent.list", params, AgentListResponse)
+            let params = list_params(after, limit, true, filter)?;
+            if json_output {
+                read_and_print!("agent.list", params, AgentListResponse)
+            } else {
+                let response = read_agent_list(&data_dir, &params).await?;
+                print_agent_table(&response, true);
+                Ok(0)
+            }
         }
         CliCommand::Show(ShowArgs { agent }) => {
             read_and_print!("agent.get", AgentGetRequest::new(agent), AgentGetResponse)
@@ -2925,9 +2955,246 @@ fn print_value(value: &Value, json_output: bool) {
     }
 }
 
+/// Build a compact `agent.list` request from CLI paging, scope filters and the
+/// observations flag behind `swarm top`. Unknown state names reject here so a
+/// typo never reads back as an empty fleet.
+fn list_params(
+    after: Option<String>,
+    limit: usize,
+    observations: bool,
+    filter: ListFilterArgs,
+) -> Result<AgentListRequest, Failure> {
+    let state = filter
+        .state
+        .map(|value| {
+            serde_json::from_value::<AgentState>(Value::String(value)).map_err(|_| {
+                Failure::new(
+                    2,
+                    "state must be unknown, created, starting, idle, busy, waiting, stopped, failed or lost",
+                )
+            })
+        })
+        .transpose()?;
+    Ok(AgentListRequest {
+        after,
+        limit,
+        observations,
+        state,
+        project: filter.project,
+        harness: filter.harness,
+        parent: filter.parent,
+        root: filter.root,
+    })
+}
+
+async fn read_agent_list(
+    data_dir: &Path,
+    params: &AgentListRequest,
+) -> Result<AgentListResponse, Failure> {
+    params
+        .validate()
+        .map_err(|error| Failure::from_core(error, false))?;
+    let response: AgentListResponse =
+        eliot_daemon::client_call_typed(data_dir, "agent.list", params)
+            .await
+            .map_err(|error| Failure::from_core(error, false))?;
+    params
+        .validate_response(&response)
+        .map_err(|error| Failure::from_core(error, false))?;
+    Ok(response)
+}
+
+/// Readable fleet table for `swarm ls` (summaries) and `swarm top` (plus
+/// child activity, last-terminal usage and observation data availability).
+/// `ACT_TURN` is the live active turn; `LAST_OUT`/`LAST_TOK` belong to the
+/// last terminal turn (`last_turn_id`), not the active one. `DATA` reports
+/// observation data availability only, never freshness or liveness. `--json`
+/// keeps printing the raw response; this table never replaces it.
+fn print_agent_table(response: &AgentListResponse, with_observations: bool) {
+    if with_observations {
+        println!(
+            "{:<6} {:<4} {:<9} {:<11} {:<12} {:<6} {:<11} {:<8} {:<12}",
+            "ID", "GEN", "STATE", "ACTIVITY", "ACT_TURN", "AGE", "LAST_OUT", "LAST_TOK", "DATA"
+        );
+    } else {
+        println!(
+            "{:<6} {:<4} {:<9} {:<14} {:<9} {:<12} {:<6} {:<11} {:<6}",
+            "ID", "GEN", "STATE", "PROJECT", "HARNESS", "ACT_TURN", "AGE", "LAST_OUT", "SEEN"
+        );
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0);
+    for row in &response.agents {
+        let summary = &row.summary;
+        let turn = summary.active_turn.as_deref().unwrap_or("-");
+        let age = age_cell(summary.progress_age_ms);
+        let outcome = summary
+            .last_outcome
+            .map(|outcome| outcome.as_str())
+            .unwrap_or("-");
+        if with_observations {
+            let activity = summary
+                .activity
+                .as_ref()
+                .map(|activity| activity_state_name(activity.state))
+                .unwrap_or("-");
+            let tokens = summary
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.total_tokens)
+                .map(|tokens| tokens.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let observation = row
+                .observation
+                .as_ref()
+                .map(|view| match view {
+                    eliot_core::api::ObservationView::Data(_) => "data".to_owned(),
+                    eliot_core::api::ObservationView::Unavailable { error_code, .. } => {
+                        truncate_cell(error_code, 12)
+                    }
+                })
+                .unwrap_or_else(|| "-".to_owned());
+            println!(
+                "{:<6} {:<4} {:<9} {:<11} {:<12} {:<6} {:<11} {:<8} {:<12}",
+                truncate_cell(&summary.id, 6),
+                summary.generation,
+                state_cell(summary.state),
+                activity,
+                truncate_cell(turn, 12),
+                age,
+                outcome,
+                tokens,
+                observation,
+            );
+        } else {
+            let seen = age_cell(
+                now_ms
+                    .checked_sub(summary.updated_at)
+                    .filter(|age| *age >= 0),
+            );
+            println!(
+                "{:<6} {:<4} {:<9} {:<14} {:<9} {:<12} {:<6} {:<11} {:<6}",
+                truncate_cell(&summary.id, 6),
+                summary.generation,
+                state_cell(summary.state),
+                truncate_cell(&summary.project, 14),
+                truncate_cell(&summary.harness, 9),
+                truncate_cell(turn, 12),
+                age,
+                outcome,
+                seen,
+            );
+        }
+    }
+    if response.agents.is_empty() {
+        println!("(no Agents in scope for these filters)");
+    }
+    println!(
+        "total {} shown {} truncated {} next {} (full record: swarm show <id>)",
+        response.total,
+        response.agents.len(),
+        yes_no(response.truncated),
+        response.next.as_deref().unwrap_or("-"),
+    );
+}
+
+fn state_cell(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Unknown => "unknown",
+        AgentState::Created => "created",
+        AgentState::Starting => "starting",
+        AgentState::Idle => "idle",
+        AgentState::Busy => "busy",
+        AgentState::Waiting => "waiting",
+        AgentState::Stopped => "stopped",
+        AgentState::Failed => "failed",
+        AgentState::Lost => "lost",
+    }
+}
+
+fn activity_state_name(state: NativeChildActivityState) -> &'static str {
+    match state {
+        NativeChildActivityState::Running => "running",
+        NativeChildActivityState::Idle => "idle",
+        NativeChildActivityState::Interrupted => "interrupted",
+        NativeChildActivityState::Lost => "lost",
+        NativeChildActivityState::Unknown => "unknown",
+    }
+}
+
+fn age_cell(age_ms: Option<i64>) -> String {
+    let Some(age_ms) = age_ms else {
+        return "-".to_owned();
+    };
+    if age_ms < 0 {
+        return "-".to_owned();
+    }
+    let seconds = age_ms / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
+fn truncate_cell(value: &str, width: usize) -> String {
+    if value.len() <= width {
+        return value.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    value
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>()
+        + "~"
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_params_rejects_unknown_state_before_any_call() {
+        let filter = |state: Option<&str>| ListFilterArgs {
+            state: state.map(str::to_owned),
+            project: None,
+            harness: None,
+            parent: None,
+            root: None,
+        };
+        let params = list_params(None, 10, false, filter(Some("busy")))
+            .ok()
+            .expect("busy parses");
+        assert_eq!(params.state, Some(AgentState::Busy));
+        assert!(list_params(None, 10, false, filter(Some("done"))).is_err());
+        assert!(list_params(None, 10, false, filter(Some("BUSY"))).is_err());
+    }
+
+    #[test]
+    fn fleet_table_cells_stay_compact() {
+        assert_eq!(age_cell(None), "-");
+        assert_eq!(age_cell(Some(-1)), "-");
+        assert_eq!(age_cell(Some(45_000)), "45s");
+        assert_eq!(age_cell(Some(180_000)), "3m");
+        assert_eq!(age_cell(Some(7_200_000)), "2h");
+        assert_eq!(age_cell(Some(172_800_000)), "2d");
+        assert_eq!(truncate_cell("a1", 6), "a1");
+        assert_eq!(truncate_cell("alongprojectname", 6), "along~");
+        assert_eq!(state_cell(AgentState::Busy), "busy");
+        assert_eq!(activity_state_name(NativeChildActivityState::Lost), "lost");
+    }
 
     #[test]
     fn approval_cli_parser_keeps_explicit_choice_and_feedback() {

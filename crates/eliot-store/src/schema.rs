@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 30;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 31;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -751,6 +751,22 @@ impl Store {
                  END;
                  INSERT INTO schema_migrations(version) VALUES (30);",
             ).map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 31 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX agents_list_state ON agents(state, id);
+                 CREATE INDEX agents_list_project ON agents(project, id);
+                 CREATE INDEX agents_list_harness ON agents(harness, id);
+                 CREATE INDEX agents_list_parent ON agents(parent, id);
+                 CREATE INDEX agents_list_root ON agents(root, id);
+                 INSERT INTO schema_migrations(version) VALUES (31);",
+            )
+            .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
         Ok(())

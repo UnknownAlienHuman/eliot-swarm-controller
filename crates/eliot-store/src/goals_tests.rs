@@ -255,7 +255,7 @@ fn goal_migration_installs_v20_round_key_kind() {
         })
         .expect("read Store migration version");
     assert_eq!(version, super::schema::CURRENT_SCHEMA_VERSION);
-    assert_eq!(version, 30);
+    assert_eq!(version, 31);
     let found: i64 = store
         .connection
         .query_row(

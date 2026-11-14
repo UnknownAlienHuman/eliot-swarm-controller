@@ -47,8 +47,8 @@ use eliot_core::{
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
 use eliot_store::{
-    Admission, ProjectRegistrationInput, RuleProcessingState, TimerDefinitionInput,
-    TimerSlotAdmission, TimerSlotCommit,
+    Admission, AgentListFilter, ProjectRegistrationInput, RuleProcessingState,
+    TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit,
 };
 use serde_json::{Value, json};
 use std::{
@@ -2426,6 +2426,21 @@ impl Router {
         }
     }
 
+    /// Join one observation to its captured summary generation. A resume
+    /// between the summary read and the observation fetch must not attach the
+    /// new generation's observations to the old summary.
+    fn join_observation_for_summary(
+        summary_generation: i64,
+        agent: &Agent,
+        observation: ObservationView,
+    ) -> ObservationView {
+        if agent.generation != summary_generation {
+            ObservationView::unavailable("stale_generation")
+        } else {
+            observation
+        }
+    }
+
     async fn agent_processes(&self, params: &Value, principal: &Principal) -> Result<Value> {
         let request: AgentProcessesRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
@@ -2596,15 +2611,35 @@ impl Router {
     async fn agent_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
         let request: AgentListRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
-        let after = request.after.as_deref();
+        let filter = AgentListFilter {
+            state: request.state,
+            project: request.project.clone(),
+            harness: request.harness.clone(),
+            parent: request.parent.clone(),
+            root: request.root.clone(),
+        };
         let limit = request.limit;
         let observations = request.observations;
-        let agents = {
+        let page = {
             let store = self.inner.store.lock().await;
             match principal {
-                Principal::Owner => store.list_agents(after, limit)?,
+                Principal::Owner => store.list_agent_summaries(
+                    &filter,
+                    request.after.as_deref(),
+                    limit,
+                    now_ms(),
+                )?,
                 Principal::Agent { id, .. } => {
-                    store.get_agent(id)?.into_iter().collect::<Vec<Agent>>()
+                    let caller = store.get_agent(id)?.ok_or_else(|| {
+                        Error::new("not_found", format!("Agent {id} was not found"))
+                    })?;
+                    store.list_agent_summaries_scoped(
+                        &caller,
+                        &filter,
+                        request.after.as_deref(),
+                        limit,
+                        now_ms(),
+                    )?
                 }
                 Principal::Run { .. } => {
                     return Err(Error::new(
@@ -2620,54 +2655,73 @@ impl Router {
                 }
             }
         };
-        if observations {
-            let mut rows = Vec::new();
-            let mut encoded_bytes = 0_usize;
-            for agent in agents {
-                let observation = self.observation_view(&agent).await;
-                let row = AgentListRow {
-                    agent,
-                    observation: Some(observation),
-                };
-                let row_bytes = serde_json::to_vec(&row)
-                    .map_err(|_| Error::new("internal", "cannot encode Agent observation"))?
-                    .len();
-                if encoded_bytes.saturating_add(row_bytes + 1) > EVENT_RESPONSE_ENTRIES_MAX_BYTES {
-                    if rows.is_empty() {
-                        return Err(Error::new(
-                            "frame_too_large",
-                            "Agent observation exceeds the page byte limit",
-                        ));
-                    }
-                    break;
-                }
-                encoded_bytes += row_bytes + 1;
-                rows.push(row);
-            }
-            let next = match principal {
-                Principal::Owner => rows.last().map(|row| row.agent.id.clone()),
-                Principal::Agent { .. } => None,
-                Principal::Run { .. } => None,
-                Principal::ProjectRule { .. } => None,
-            };
-            return serde_json::to_value(AgentListResponse { agents: rows, next })
-                .map_err(|_| Error::new("internal", "Agent list could not be encoded"));
+        if !observations {
+            return serde_json::to_value(AgentListResponse {
+                agents: page
+                    .summaries
+                    .into_iter()
+                    .map(|summary| AgentListRow {
+                        summary,
+                        observation: None,
+                    })
+                    .collect(),
+                next: page.next,
+                total: page.total,
+                truncated: page.truncated,
+            })
+            .map_err(|_| Error::new("internal", "Agent list could not be encoded"));
         }
-        let next = match principal {
-            Principal::Owner => agents.last().map(|agent| agent.id.clone()),
-            Principal::Agent { .. } => None,
-            Principal::Run { .. } => None,
-            Principal::ProjectRule { .. } => None,
-        };
+        // Observations join one full row per summary for the captured
+        // Agent/generation; a resume between the summary read and this fetch
+        // must not attach the new generation's observations to the old
+        // summary. The byte bound trims the page the same way it trims the
+        // compact rows, and truncation stays explicit so polling managers can
+        // tell a quiet page from a cut one.
+        let mut rows = Vec::new();
+        let mut encoded_bytes = 0_usize;
+        let mut truncated = page.truncated;
+        for summary in page.summaries {
+            let summary_generation = summary.generation;
+            let agent = {
+                let store = self.inner.store.lock().await;
+                store.get_agent(&summary.id)?.ok_or_else(|| {
+                    Error::new("not_found", format!("Agent {} was not found", summary.id))
+                })?
+            };
+            let observation = if agent.generation != summary_generation {
+                // Drop the new generation's observations; the old summary
+                // keeps its generation without inheriting them.
+                ObservationView::unavailable("stale_generation")
+            } else {
+                let fetched = self.observation_view(&agent).await;
+                Self::join_observation_for_summary(summary_generation, &agent, fetched)
+            };
+            let row = AgentListRow {
+                summary,
+                observation: Some(observation),
+            };
+            let row_bytes = serde_json::to_vec(&row)
+                .map_err(|_| Error::new("internal", "cannot encode Agent observation"))?
+                .len();
+            if encoded_bytes.saturating_add(row_bytes + 1) > EVENT_RESPONSE_ENTRIES_MAX_BYTES {
+                if rows.is_empty() {
+                    return Err(Error::new(
+                        "frame_too_large",
+                        "Agent observation exceeds the page byte limit",
+                    ));
+                }
+                truncated = true;
+                break;
+            }
+            encoded_bytes += row_bytes + 1;
+            rows.push(row);
+        }
+        let next = rows.last().map(|row| row.summary.id.clone());
         serde_json::to_value(AgentListResponse {
-            agents: agents
-                .into_iter()
-                .map(|agent| AgentListRow {
-                    agent,
-                    observation: None,
-                })
-                .collect(),
+            agents: rows,
             next,
+            total: page.total,
+            truncated,
         })
         .map_err(|_| Error::new("internal", "Agent list could not be encoded"))
     }
@@ -9766,7 +9820,10 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .agent_list(&json!({"after":null}), &Principal::Owner)
             .await
             .unwrap();
-        assert_eq!(list, json!({"agents":[], "next":null}));
+        assert_eq!(
+            list,
+            json!({"agents":[], "next":null, "total":0, "truncated":false})
+        );
         assert_eq!(
             router
                 .agent_processes(&json!({"id":"a1", "scope":false}), &Principal::Owner)
@@ -9804,20 +9861,32 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         };
         for observations in [false, true] {
             let reply = router
-                .agent_list(
-                    &json!({"after":"not-canonical", "limit":1, "observations":observations}),
-                    &principal,
-                )
+                .agent_list(&json!({"limit":1, "observations":observations}), &principal)
                 .await
                 .unwrap();
-            assert_eq!(reply["next"], Value::Null);
+            // Self scope keeps one compact row; the cursor advances past it.
+            assert_eq!(reply["next"], json!(id));
             assert_eq!(reply["agents"].as_array().unwrap().len(), 1);
             assert_eq!(reply["agents"][0]["id"], json!(id));
+            assert_eq!(reply["total"], json!(1));
+            assert_eq!(reply["truncated"], json!(false));
             assert_eq!(
                 reply["agents"][0].get("observation").is_some(),
                 observations
             );
             assert!(reply["agents"][0].get("agent").is_none());
+            // Continuing past the row drains the page but keeps the total.
+            let drained = router
+                .agent_list(
+                    &json!({"after":id, "limit":1, "observations":observations}),
+                    &principal,
+                )
+                .await
+                .unwrap();
+            assert_eq!(drained["agents"], json!([]));
+            assert_eq!(drained["next"], Value::Null);
+            assert_eq!(drained["total"], json!(1));
+            assert_eq!(drained["truncated"], json!(false));
         }
         let get = router
             .agent_get(&json!({"id":id}), &principal)
@@ -9880,6 +9949,34 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .state,
             AgentState::Busy
         );
+    }
+
+    #[test]
+    fn list_observation_join_drops_new_generation_on_mismatch() {
+        let current = eliot_core::Agent::new("a1", "p", "codex", "fixture", 7);
+        // Matching generation keeps the fetched observation.
+        let kept = Router::join_observation_for_summary(
+            current.generation,
+            &current,
+            ObservationView::unavailable("probe"),
+        );
+        assert!(matches!(
+            kept,
+            ObservationView::Unavailable { ref error_code, .. } if error_code == "probe"
+        ));
+        // A resumed Agent (new generation) must not lend its observations to
+        // the captured old summary.
+        let mut resumed = current.clone();
+        resumed.generation += 1;
+        let dropped = Router::join_observation_for_summary(
+            current.generation,
+            &resumed,
+            ObservationView::unavailable("fresh"),
+        );
+        assert!(matches!(
+            dropped,
+            ObservationView::Unavailable { ref error_code, .. } if error_code == "stale_generation"
+        ));
     }
 
     #[tokio::test]
