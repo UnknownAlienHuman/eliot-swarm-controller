@@ -117,6 +117,14 @@ dropped. A delayed hook carrying only FIFO context is inject; steer is the
 separate verb above with its own exact-turn queue and mechanism. Neither is
 `active_turn` inject, which stays unsupported for this CLI.
 
+Terminal `result.usage` covers only the current user turn's main loop
+(subagents excluded) and maps to `TurnUsage` at `main_loop_turn` scope with
+`message_id` null; `result.modelUsage` and `total_cost_usd` are
+cumulative/estimated and are never read. Only genuinely supplied
+nonnegative counters project (`input_tokens`, `output_tokens`,
+`cache_read_input_tokens`, `cache_creation_input_tokens`); missing or
+wholly malformed usage stays null so completion proceeds.
+
 ## Hook tool diagnostics
 
 Each committed `hook.before_tool` fact carries the exact `turn_id` and opaque

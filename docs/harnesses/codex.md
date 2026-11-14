@@ -296,6 +296,33 @@ arguments/digests or replay input. See
 [profile binding](../spec/configuration.md#frozen-profile-and-route-binding) and the
 [shared binding type](../../crates/eliot-core/src/native_store.rs).
 
+## Usage attribution
+
+Verified read-only 2026-11-13 against installed Codex 0.167.1
+(`codex app-server generate-json-schema`): `turn/completed` carries no usage
+field (a Turn has id/items/status/error/timestamps only). Per-turn
+expenditure arrives separately as `thread/tokenUsage/updated`
+`{threadId, turnId, tokenUsage: {last, total, modelContextWindow}}`.
+`tokenUsage.last` is the latest per-response delta for that exact `turnId`
+(`inputTokens`, `cachedInputTokens`, `outputTokens`,
+`reasoningOutputTokens`, `totalTokens`, `cacheWriteInputTokens`): usage
+flows once per upstream model response inside a turn (the installed
+`RawResponseCompletedNotification` is "the exact usage from one upstream
+Responses API completion", keyed by turn), so one turn with tool calls sees
+several updates. Turn expenditure is the cumulative `total` of the latest
+update in the turn minus the turn-start baseline (`total` minus `last` of
+the first update in the turn), computed per counter and mapped to
+`TurnUsage` at `turn` scope, bound to the exact thread/generation/turn. Raw
+`last` values are never summed, so a repeated notification holds the
+difference instead of double counting; a counter present in only one
+snapshot (or a backward snapshot) stays null, and a late/stale update for
+another turn is dropped so the terminal keeps null usage rather than
+foreign counters. `tokenUsage.total` is a cumulative per-thread
+snapshot and `modelContextWindow` is capacity: session-scoped facts, never
+turn expenditure, and never mapped to `TurnUsage`. Account-level
+cost/credits (`GetAccountTokenUsage`) are account scope. Missing per-turn
+counters stay null.
+
 ## Recovery and later capabilities
 
 Installed Codex 0.161.0 discovery uses `initialize`/`initialized` followed by bounded

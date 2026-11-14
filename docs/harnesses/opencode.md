@@ -100,6 +100,18 @@ server may be ended only through its owned custody.
 Several inputs may join one execution. Persist all exact command associations; one
 uncertain unassociated input holds the next input lane until association/drop/readback.
 
+## Usage attribution
+
+Terminal readback maps the installed per-message `tokens`
+(`TokenUsage.Info`: `{input, output, reasoning, cache: {read, write}}`) on
+the newest assistant message strictly between the exact user input and the
+selected terminal idle message, at `message` scope with that message id. No
+assistant message in that slice (or no native tokens on the newest one)
+means unavailable usage: never an earlier message's usage, never a sum,
+never zero. The per-message counters' delta-vs-cumulative semantics are
+unverified, so the adapter retains message scope and does not aggregate
+across the slice.
+
 ## Source ownership and recovery
 
 Controlled exact-session SSE owns supplied lifecycle. Message/session reads repair
