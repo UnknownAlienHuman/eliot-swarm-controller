@@ -208,9 +208,11 @@ impl IpcStream {
 
             loop {
                 if Instant::now() >= until {
+                    // The pipe stayed busy: no request bytes were written, so
+                    // nothing was admitted and the call is safe to retry.
                     return Err(Error::new(
-                        "unknown",
-                        "daemon RPC exceeded its absolute deadline",
+                        "unavailable",
+                        "daemon IPC connect deadline elapsed before any request was sent",
                     ));
                 }
                 match ClientOptions::new().open(endpoint) {
@@ -373,8 +375,11 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("occupied pipe cannot accept the timed-out connection"),
         };
-        assert_eq!(error.code, "unknown");
-        assert_eq!(error.message, "daemon RPC exceeded its absolute deadline");
+        assert_eq!(error.code, "unavailable");
+        assert_eq!(
+            error.message,
+            "daemon IPC connect deadline elapsed before any request was sent"
+        );
     }
 
     #[tokio::test]

@@ -34,6 +34,7 @@ use ulid::Ulid;
 pub const MAX_RPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CLIENTS: usize = 128;
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(35);
+const OVERLOAD_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound for one server-side response write. A peer that stops reading must
 /// not hold its connection task past this deadline: the task ends and finishes
 /// response bookkeeping while the committed result stays readable by retry.
@@ -267,7 +268,14 @@ async fn run_owned(
                             serve_connection(stream, router, policy).await;
                         });
                     }
-                    Ok(_stream) => {}
+                    Ok(stream) => {
+                        // At the connection limit the request was never read
+                        // or routed, so nothing was admitted. Echo one typed
+                        // retryable refusal instead of dropping silently.
+                        tokio::spawn(async move {
+                            reply_overloaded(stream).await;
+                        });
+                    }
                     Err(error) => {
                         if router.is_force_requested() {
                             break Ok(());
@@ -729,7 +737,10 @@ async fn raw_client_call(
     let timeout = call_timeout(method, &params);
     let deadline = Instant::now() + timeout;
     let endpoint = endpoint.to_owned();
-    timeout_at(deadline, async move {
+    // Connect and send share one deadline: until the full frame is written the
+    // server cannot have admitted anything, so a send-phase timeout is a
+    // retryable `unavailable`, never an uncertain outcome.
+    let mut framed = timeout_at(deadline, async move {
         let stream = IpcStream::connect(&endpoint, deadline).await?;
         let mut framed = Framed::new(
             stream,
@@ -739,38 +750,44 @@ async fn raw_client_call(
             .send(frame)
             .await
             .map_err(|_| Error::new("unavailable", "daemon RPC write failed"))?;
-        // The request is written: a local reply-integrity failure cannot prove
-        // non-execution. Matching, decoded daemon errors keep their domain code.
-        let line = framed
-            .next()
-            .await
-            .ok_or_else(|| Error::new("unknown", "daemon closed the RPC connection"))?
-            .map_err(|_| Error::new("unknown", "daemon response frame is invalid"))?;
-        if line.len().saturating_add(1) > MAX_RPC_FRAME_BYTES {
-            return Err(Error::new(
-                "unknown",
-                "daemon response exceeds the 4 MiB frame limit",
-            ));
-        }
-        let response: RpcResponse = serde_json::from_str(&line)
-            .map_err(|_| Error::new("unknown", "daemon response is malformed"))?;
-        if response.jsonrpc != "2.0" || response.id != id {
-            return Err(Error::new(
-                "unknown",
-                "daemon response does not match the request",
-            ));
-        }
-        match (response.result, response.error) {
-            (Some(value), None) => Ok(value),
-            (None, Some(error)) => Err(core_error(error, policy)),
-            _ => Err(Error::new(
-                "unknown",
-                "daemon response must contain exactly one result or error",
-            )),
-        }
+        Ok::<_, Error>(framed)
     })
     .await
-    .map_err(|_| Error::new("unknown", "daemon RPC exceeded its absolute deadline"))?
+    .map_err(|_| {
+        Error::new(
+            "unavailable",
+            "daemon RPC send deadline elapsed before admission; safe to retry",
+        )
+    })??;
+    // The request is written: a local reply-integrity failure cannot prove
+    // non-execution. Matching, decoded daemon errors keep their domain code.
+    let line = timeout_at(deadline, framed.next())
+        .await
+        .map_err(|_| Error::new("unknown", "daemon RPC exceeded its absolute deadline"))?
+        .ok_or_else(|| Error::new("unknown", "daemon closed the RPC connection"))?
+        .map_err(|_| Error::new("unknown", "daemon response frame is invalid"))?;
+    if line.len().saturating_add(1) > MAX_RPC_FRAME_BYTES {
+        return Err(Error::new(
+            "unknown",
+            "daemon response exceeds the 4 MiB frame limit",
+        ));
+    }
+    let response: RpcResponse = serde_json::from_str(&line)
+        .map_err(|_| Error::new("unknown", "daemon response is malformed"))?;
+    if response.jsonrpc != "2.0" || response.id != id {
+        return Err(Error::new(
+            "unknown",
+            "daemon response does not match the request",
+        ));
+    }
+    match (response.result, response.error) {
+        (Some(value), None) => Ok(value),
+        (None, Some(error)) => Err(core_error(error, policy)),
+        _ => Err(Error::new(
+            "unknown",
+            "daemon response must contain exactly one result or error",
+        )),
+    }
 }
 
 /// Typed caller boundary over the existing authenticated client. Params are
@@ -802,6 +819,55 @@ fn decode_client_result<R: DeserializeOwned>(method: &str, result: Result<Value>
 
 async fn serve_connection(stream: IpcStream, router: Router, policy: Arc<SecretPolicy>) {
     serve_connection_with_write_timeout(stream, router, policy, RESPONSE_WRITE_TIMEOUT).await;
+}
+
+/// Refuse one connection past the client limit without reading it into the
+/// Router: the frame is decoded only to echo its id back with a typed
+/// retryable error, so the caller can retry knowing nothing was admitted.
+async fn reply_overloaded(stream: IpcStream) {
+    let mut framed = Framed::new(
+        stream,
+        LinesCodec::new_with_max_length(MAX_RPC_FRAME_BYTES.saturating_sub(1)),
+    );
+    let incoming = timeout_at(Instant::now() + OVERLOAD_READ_TIMEOUT, framed.next()).await;
+    let response = match incoming {
+        Ok(Some(Ok(line))) if line.len().saturating_add(1) <= MAX_RPC_FRAME_BYTES => {
+            match decode_request(&line) {
+                Ok(request) => RpcResponse {
+                    jsonrpc: "2.0".to_owned(),
+                    id: request.id,
+                    result: None,
+                    error: Some(RpcError {
+                        code: -32000,
+                        message: "daemon is at its connection limit; retry the call".to_owned(),
+                        data: Some(json!({"code": "busy"})),
+                    }),
+                },
+                Err((id, error)) => RpcResponse {
+                    jsonrpc: "2.0".to_owned(),
+                    id,
+                    result: None,
+                    error: Some(error),
+                },
+            }
+        }
+        Ok(Some(Ok(_))) => RpcResponse {
+            jsonrpc: "2.0".to_owned(),
+            id: Value::Null,
+            result: None,
+            error: Some(RpcError {
+                code: -32600,
+                message: "request frame exceeds the 4 MiB limit".to_owned(),
+                data: Some(json!({"code": "frame_too_large"})),
+            }),
+        },
+        _ => return,
+    };
+    let frame = match serde_json::to_string(&response) {
+        Ok(frame) if frame.len().saturating_add(1) <= MAX_RPC_FRAME_BYTES => frame,
+        _ => return,
+    };
+    send_response_frame(&mut framed, frame, RESPONSE_WRITE_TIMEOUT).await;
 }
 
 /// Bound one server-side response write. A peer that stops reading must not

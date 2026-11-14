@@ -116,6 +116,13 @@ fn is_proven_observer_start_failure(error: &Error) -> bool {
     error.code == "native_start_failed"
 }
 
+/// A scope refusal is raised before any pinned reader spawns or thread is
+/// read, after only the read-only store probe ran and was cleaned up, so it
+/// proves the refused attach had no native effect.
+fn is_proven_scope_refusal(error: &Error) -> bool {
+    error.code == "scope_mismatch"
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionPhase {
     Ready,
@@ -602,6 +609,12 @@ impl CodexPlugin {
             &params,
             observe::failed_attach_result(&params, "native_start_failed"),
         );
+        // A scope refusal proves no native effect: only the read-only store
+        // probe ran. It retains a preparation failure for exact-binding replay.
+        let scope_failure = FailedObserverAttach::new(
+            &params,
+            observe::failed_attach_result(&params, "observer_preparation_failed"),
+        );
         let attach = ObserverSession::attach(
             params,
             launch,
@@ -621,6 +634,15 @@ impl CodexPlugin {
                     .failed_attach
                     .as_ref()
                     .expect("failed attach was just retained")
+                    .outcome
+                    .clone())
+            }
+            Err(error) if is_proven_scope_refusal(&error) => {
+                self.failed_attach = Some(scope_failure);
+                Ok(self
+                    .failed_attach
+                    .as_ref()
+                    .expect("scope refusal was just retained")
                     .outcome
                     .clone())
             }
@@ -3039,8 +3061,9 @@ mod tests {
     use super::{
         AgentSession, CodexPlugin, CodexRoute, FailedObserverAttach, FailedStart, Initialized,
         NativeLaunch, NativeProcess, SessionPhase, codex_manifest, contextual_error,
-        frozen_store_binding, is_proven_observer_start_failure, pre_dispatch_read_error,
-        target_environment, unconfirmed_pre_dispatch_error, validate_resume_preflight,
+        frozen_store_binding, is_proven_observer_start_failure, is_proven_scope_refusal,
+        pre_dispatch_read_error, target_environment, unconfirmed_pre_dispatch_error,
+        validate_resume_preflight,
     };
     use eliot_core::{Error, SecretPolicy, StderrSnapshot, StderrSource};
     use eliot_plugin::AgentStartParams;
@@ -3086,6 +3109,25 @@ mod tests {
                 "safe test reason"
             )));
         }
+        // A scope refusal happens before any pinned reader spawns or thread
+        // is read, so it is proven preparation failure, never an uncertain
+        // start. Other integrity errors stay uncertain.
+        assert!(is_proven_scope_refusal(&Error::new(
+            "scope_mismatch",
+            "Codex observation scope does not match its proven store"
+        )));
+        for code in ["source_integrity", "unknown", "native_start_failed"] {
+            assert!(!is_proven_scope_refusal(&Error::new(
+                code,
+                "safe test reason"
+            )));
+        }
+        let scope_outcome =
+            crate::observe::failed_attach_result(&params, "observer_preparation_failed");
+        assert_eq!(scope_outcome["state"], "failed");
+        assert_eq!(scope_outcome["reason"], "observer_preparation_failed");
+        let scope_failed = FailedObserverAttach::new(&params, scope_outcome.clone());
+        assert_eq!(scope_failed.replay(&params).unwrap(), scope_outcome);
     }
 
     #[test]

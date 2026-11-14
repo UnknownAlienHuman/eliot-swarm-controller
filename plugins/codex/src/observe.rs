@@ -155,8 +155,12 @@ impl ObserverSession {
         )
         .await?;
         if store.scope() != params.native_scope {
+            // The pinned reader is not spawned on this path and no thread is
+            // read: only the read-only store probe ran and was cleaned up.
+            // The handler maps this proven-no-effect refusal to a bound
+            // `failed` attach result instead of an uncertain error.
             return Err(Error::new(
-                "source_integrity",
+                "scope_mismatch",
                 "Codex observation scope does not match its proven store",
             ));
         }
