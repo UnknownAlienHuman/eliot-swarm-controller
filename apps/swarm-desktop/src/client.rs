@@ -222,6 +222,25 @@ pub async fn scan_events(
     Ok(events)
 }
 
+/// Exclusive journal cursor just before the first retained event committed
+/// at or after `at_ms`, by binary search over single-row unfiltered reads
+/// (about log2 of the journal length). Commit timestamps follow sequence
+/// order closely; callers keep a margin below the result.
+pub async fn seq_before(data_dir: &Path, at_ms: i64, floor: i64, high: i64) -> Result<i64> {
+    let everything = EventsFilter::default();
+    let (mut low, mut high) = (floor, high);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let page = events_read(data_dir, mid, 1, &everything).await?;
+        match page.events.first() {
+            Some(event) if event.ts < at_ms => low = event.seq.max(mid + 1),
+            Some(_) => high = mid,
+            None => high = mid,
+        }
+    }
+    Ok(low)
+}
+
 /// Input texts of retained commands, at most `MAX_CONCURRENT_READS` at once.
 /// A failed read is reported per command, never retried as a new action.
 pub async fn input_texts(data_dir: &Path, commands: Vec<String>) -> Vec<(String, InputText)> {
@@ -324,29 +343,15 @@ pub async fn submit_send(
     .await
 }
 
-/// Interrupt exactly the bound turn. A missing turn binding is captured once
-/// from `agent.get` (the Agent's current active turn), like the CLI's exact
-/// target resolution; explicit flags are never re-read after capture.
+/// Interrupt exactly the turn and generation captured at click time; the
+/// binding is never re-read, so a later turn cannot be interrupted instead.
 pub async fn submit_interrupt(
     data_dir: &Path,
     mutation_id: String,
     agent: &str,
-    generation: Option<i64>,
-    turn_id: Option<String>,
+    generation: i64,
+    turn_id: String,
 ) -> Result<CommandSubmitResponse> {
-    let (generation, turn_id) = match (generation, turn_id) {
-        (Some(generation), Some(turn_id)) => (generation, turn_id),
-        (generation, turn_id) => {
-            let reply = get_agent(data_dir, agent).await?;
-            let active = reply.agent.active_turn.clone().ok_or_else(|| {
-                Error::new("invalid", "the agent has no active turn to interrupt")
-            })?;
-            (
-                generation.unwrap_or(reply.agent.generation),
-                turn_id.unwrap_or(active),
-            )
-        }
-    };
     let mut request = submit_request(
         mutation_id,
         Some(agent.to_owned()),

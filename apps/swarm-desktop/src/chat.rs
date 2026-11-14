@@ -18,7 +18,7 @@
 //! Agent's creation event was inside it, the retention floor, evictions and
 //! inputs whose text could not be read.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use eliot_core::{Event, Turn, TurnOutcome, TurnState};
 
@@ -26,8 +26,6 @@ use eliot_core::{Event, Turn, TurnOutcome, TurnState};
 pub const TURN_PAGE: usize = 20;
 /// `agent.result` upper bound.
 pub const MAX_RESULT_LIMIT: usize = 1_000;
-/// Journal rows scanned per activity window (the server scans 1,000 per read).
-pub const ACTIVITY_WINDOW: i64 = 8_000;
 /// Resident turns; older ones are evicted and reported.
 pub const MAX_RESIDENT_TURNS: usize = 200;
 /// Resident text bytes across all turns.
@@ -40,6 +38,8 @@ pub const MAX_RENDER_CHARS: usize = 12_000;
 pub const MAX_TOOL_ROWS: usize = 40;
 /// Progress messages kept per turn.
 pub const MAX_MESSAGES_PER_TURN: usize = 200;
+/// Progress text bytes kept per turn; later messages are counted, not kept.
+pub const MAX_TURN_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Event kinds the conversation and its readback invalidation consume.
 pub const CHAT_KINDS: &[&str] = &[
@@ -141,6 +141,10 @@ struct TurnEntry {
     read_back: bool,
     activity: Vec<Activity>,
     messages: usize,
+    message_bytes: usize,
+    messages_dropped: usize,
+    /// Tool item id to the index of the activity group that started it.
+    item_groups: HashMap<String, usize>,
 }
 
 impl TurnEntry {
@@ -156,6 +160,9 @@ impl TurnEntry {
             read_back: false,
             activity: Vec::new(),
             messages: 0,
+            message_bytes: 0,
+            messages_dropped: 0,
+            item_groups: HashMap::new(),
         }
     }
 
@@ -181,52 +188,53 @@ impl TurnEntry {
     }
 
     fn tool_event(&mut self, item_id: &str, tool: &str, status: Option<String>, done: bool) {
-        for entry in self.activity.iter_mut() {
-            if let Activity::Tools {
+        let failed_now = done && status.as_deref().is_some_and(|status| !is_success(status));
+        if let Some(&group) = self.item_groups.get(item_id)
+            && let Some(Activity::Tools {
                 rows,
                 done: done_count,
                 failed,
                 ..
-            } = entry
-                && let Some(row) = rows.iter_mut().find(|row| row.item_id == item_id)
-            {
-                if done && !row.done {
-                    row.done = true;
-                    *done_count += 1;
-                    if status.as_deref().is_some_and(|status| !is_success(status)) {
-                        *failed += 1;
+            }) = self.activity.get_mut(group)
+        {
+            match rows.iter_mut().find(|row| row.item_id == item_id) {
+                Some(row) => {
+                    if done && !row.done {
+                        row.done = true;
+                        *done_count += 1;
+                        *failed += usize::from(failed_now);
+                    }
+                    if status.is_some() || done {
+                        // A completion without status must not keep "running".
+                        row.status = status;
                     }
                 }
-                if status.is_some() {
-                    row.status = status;
+                None if done => {
+                    // The started row left the bounded list; counters stay exact
+                    // in the group that started the item.
+                    *done_count += 1;
+                    *failed += usize::from(failed_now);
                 }
-                return;
-            }
-        }
-        if done
-            && let Some(Activity::Tools {
-                done: count,
-                failed,
-                ..
-            }) = self.activity.iter_mut().rev().find(|entry| {
-                matches!(entry, Activity::Tools { rows, total, done, .. }
-                    if *total > rows.len() && *done < *total)
-            })
-        {
-            // The started row was evicted from the bounded list; keep counters exact.
-            *count += 1;
-            if status.as_deref().is_some_and(|status| !is_success(status)) {
-                *failed += 1;
+                None => {}
             }
             return;
         }
         let row = ToolRow {
             item_id: item_id.to_owned(),
             tool: tool.to_owned(),
-            status: status.clone(),
+            status,
             done,
         };
-        let failed_now = usize::from(done && status.as_deref().is_some_and(|s| !is_success(s)));
+        if !matches!(self.activity.last(), Some(Activity::Tools { .. })) {
+            self.activity.push(Activity::Tools {
+                key: format!("tools:{item_id}"),
+                rows: Vec::new(),
+                total: 0,
+                done: 0,
+                failed: 0,
+            });
+        }
+        let group = self.activity.len() - 1;
         if let Some(Activity::Tools {
             rows,
             total,
@@ -241,16 +249,9 @@ impl TurnEntry {
             }
             *total += 1;
             *done_count += usize::from(done);
-            *failed += failed_now;
-        } else {
-            self.activity.push(Activity::Tools {
-                key: format!("tools:{item_id}"),
-                rows: vec![row],
-                total: 1,
-                done: usize::from(done),
-                failed: failed_now,
-            });
+            *failed += usize::from(failed_now);
         }
+        self.item_groups.insert(item_id.to_owned(), group);
     }
 }
 
@@ -374,16 +375,19 @@ pub struct Invalidation {
     pub detail: bool,
     /// Commands linked to turns whose input text is not loaded.
     pub inputs: Vec<String>,
+    /// A newer generation started: the whole snapshot must be reread.
+    pub generation_changed: bool,
 }
 
 impl Invalidation {
     pub fn any(&self) -> bool {
-        self.turns || self.detail || !self.inputs.is_empty()
+        self.turns || self.detail || !self.inputs.is_empty() || self.generation_changed
     }
 
     pub fn merge(&mut self, other: Invalidation) {
         self.turns |= other.turns;
         self.detail |= other.detail;
+        self.generation_changed |= other.generation_changed;
         for input in other.inputs {
             if !self.inputs.contains(&input) {
                 self.inputs.push(input);
@@ -451,6 +455,8 @@ pub struct Conversation {
     local: Vec<String>,
     applied_seq: i64,
     coverage: Coverage,
+    /// Turns evicted by the resident bounds; late events never resurrect them.
+    evicted: HashSet<String>,
 }
 
 fn data_str<'a>(event: &'a Event, field: &str) -> Option<&'a str> {
@@ -479,6 +485,12 @@ impl Conversation {
 
     pub fn set_stale(&mut self, reason: Option<String>) {
         self.coverage.stale = reason;
+    }
+
+    /// Record the live cursor (the scan cursor also passes other Agents'
+    /// and filtered-out records).
+    pub fn advance_cursor(&mut self, next: i64) {
+        self.coverage.cursor = self.coverage.cursor.max(next);
     }
 
     /// Replace everything with one snapshot: coverage, authoritative turns,
@@ -527,6 +539,9 @@ impl Conversation {
                 && self.coverage.generation > 0
                 && generation != self.coverage.generation
             {
+                // Older generations are outside this view; a newer one means
+                // the Agent resumed and the snapshot must be reread.
+                invalidation.generation_changed |= generation > self.coverage.generation;
                 continue;
             }
             match event.kind.as_str() {
@@ -537,6 +552,9 @@ impl Conversation {
             let Some(turn_id) = data_str(event, "turn_id") else {
                 continue;
             };
+            if self.evicted.contains(turn_id) {
+                continue;
+            }
             let turn = self
                 .turns
                 .entry(turn_id.to_owned())
@@ -570,7 +588,12 @@ impl Conversation {
                     let phase = data_str(event, "phase").unwrap_or_default();
                     if matches!(phase, "final_answer" | "final") {
                         turn.event_final = Some(bound_text(text));
-                    } else if !text.trim().is_empty() && turn.messages < MAX_MESSAGES_PER_TURN {
+                    } else if !text.trim().is_empty()
+                        && (turn.messages >= MAX_MESSAGES_PER_TURN
+                            || turn.message_bytes + text.len() > MAX_TURN_MESSAGE_BYTES)
+                    {
+                        turn.messages_dropped += 1;
+                    } else if !text.trim().is_empty() {
                         let key = event
                             .native_id
                             .clone()
@@ -579,11 +602,10 @@ impl Conversation {
                             |entry| matches!(entry, Activity::Message { key: k, .. } if *k == key),
                         );
                         if !present {
+                            let text = bound_text(text);
                             turn.messages += 1;
-                            turn.activity.push(Activity::Message {
-                                key,
-                                text: bound_text(text),
-                            });
+                            turn.message_bytes += text.len();
+                            turn.activity.push(Activity::Message { key, text });
                         }
                     }
                 }
@@ -611,7 +633,7 @@ impl Conversation {
     /// Apply authoritative turn reads: state, outcome and public final text.
     pub fn apply_turns(&mut self, turns: &[Turn]) {
         for read in turns {
-            if read.agent != self.agent {
+            if read.agent != self.agent || self.evicted.contains(&read.turn_id) {
                 continue;
             }
             let turn = self
@@ -680,7 +702,11 @@ impl Conversation {
     fn enforce_bounds(&mut self) {
         loop {
             let bytes: usize = self.turns.values().map(TurnEntry::bytes).sum();
-            if self.turns.len() <= MAX_RESIDENT_TURNS && bytes <= MAX_RESIDENT_BYTES {
+            if self.turns.len() <= 1
+                || (self.turns.len() <= MAX_RESIDENT_TURNS && bytes <= MAX_RESIDENT_BYTES)
+            {
+                // The newest turn always stays: one oversized turn is bounded
+                // by its own per-message and per-turn caps instead.
                 return;
             }
             let Some(oldest) = self
@@ -692,6 +718,7 @@ impl Conversation {
                 return;
             };
             self.turns.remove(&oldest);
+            self.evicted.insert(oldest);
             self.coverage.evicted_turns += 1;
         }
     }
@@ -800,6 +827,18 @@ impl Conversation {
                     )
                 }
             });
+        }
+        if turn.messages_dropped > 0 {
+            parts.push(Part::new(
+                format!("dropped:{}", turn.turn_id),
+                PartKind::Notice,
+                "Progress".to_owned(),
+                format!(
+                    "{} further progress message(s) not kept by the per-turn bound.",
+                    turn.messages_dropped
+                ),
+                Vec::new(),
+            ));
         }
         let final_key = format!("final:{}", turn.turn_id);
         let final_text = turn.final_text.clone().or_else(|| turn.event_final.clone());
@@ -1088,6 +1127,75 @@ mod tests {
         assert_eq!(chat.items().len(), MAX_RESIDENT_TURNS);
         assert_eq!(chat.coverage().evicted_turns, 5);
         assert_eq!(chat.items()[0].key, "turn:t0005");
+    }
+
+    #[test]
+    fn evicted_turns_are_not_resurrected_by_late_events() {
+        let mut chat = Conversation::new("a1");
+        chat.reset(coverage(), &[], &[]);
+        let events: Vec<Event> = (0..(MAX_RESIDENT_TURNS as i64 + 1))
+            .map(|index| {
+                event(
+                    index + 1,
+                    "turn.started",
+                    json!({"turn_id": format!("t{index:04}")}),
+                )
+            })
+            .collect();
+        chat.apply_events(&events);
+        assert_eq!(chat.coverage().evicted_turns, 1);
+        chat.apply_events(&[event(9_000, "turn.completed", json!({"turn_id": "t0000"}))]);
+        assert_eq!(chat.items().len(), MAX_RESIDENT_TURNS);
+        assert!(chat.items().iter().all(|item| item.key != "turn:t0000"));
+    }
+
+    #[test]
+    fn one_oversized_turn_is_never_evicted_entirely() {
+        let mut chat = Conversation::new("a1");
+        chat.reset(coverage(), &[], &[]);
+        let big = "x".repeat(MAX_TEXT_BYTES - 1);
+        let events: Vec<Event> = (0..60)
+            .map(|index| {
+                event(
+                    index + 1,
+                    "message.completed",
+                    json!({"turn_id": "t1", "phase": "commentary", "text": big}),
+                )
+            })
+            .collect();
+        chat.apply_events(&events);
+        let items = chat.items();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].parts.iter().any(|part| part.key == "dropped:t1"));
+    }
+
+    #[test]
+    fn newer_generation_events_request_a_resnapshot() {
+        let mut chat = Conversation::new("a1");
+        chat.reset(coverage(), &[], &[]);
+        let mut resumed = event(5, "turn.started", json!({"turn_id": "t2"}));
+        resumed.generation = Some(2);
+        assert!(chat.apply_events(&[resumed]).generation_changed);
+    }
+
+    #[test]
+    fn completion_without_status_is_not_left_running() {
+        let mut chat = Conversation::new("a1");
+        chat.reset(coverage(), &[], &[]);
+        chat.apply_events(&[
+            event(
+                1,
+                "tool.started",
+                json!({"turn_id": "t1", "item_id": "i1", "tool": "exec", "status": "inProgress"}),
+            ),
+            event(
+                2,
+                "tool.completed",
+                json!({"turn_id": "t1", "item_id": "i1", "tool": "exec"}),
+            ),
+        ]);
+        let tools = &chat.items()[0].parts[1];
+        assert_eq!(tools.detail, vec!["✓ exec".to_owned()]);
     }
 
     #[test]

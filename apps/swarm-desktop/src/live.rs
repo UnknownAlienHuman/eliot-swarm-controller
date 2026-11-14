@@ -104,13 +104,15 @@ pub fn backoff_ms(attempt: u32) -> u64 {
         .min(BACKOFF_MAX_MS)
 }
 
-/// Decide after a successful page. `next` is the page's scan cursor.
-pub fn after_page(next: i64, truncated: bool, lagged: bool) -> Next {
+/// Decide after a successful page read strictly after `after`; `next` is
+/// the page's scan cursor. A truncated page that made no progress waits
+/// instead of draining again, so a stuck cursor cannot spin.
+pub fn after_page(after: i64, next: i64, truncated: bool, lagged: bool) -> Next {
     if lagged {
         Next::Resnapshot {
             reason: "live buffer overflowed".to_owned(),
         }
-    } else if truncated {
+    } else if truncated && next > after {
         Next::Drain { after: next }
     } else {
         Next::Wake { after: next }
@@ -148,14 +150,15 @@ mod tests {
 
     #[test]
     fn continue_from_next_and_drain_truncated_pages() {
-        assert_eq!(after_page(41, false, false), Next::Wake { after: 41 });
-        assert_eq!(after_page(41, true, false), Next::Drain { after: 41 });
+        assert_eq!(after_page(30, 41, false, false), Next::Wake { after: 41 });
+        assert_eq!(after_page(30, 41, true, false), Next::Drain { after: 41 });
+        assert_eq!(after_page(41, 41, true, false), Next::Wake { after: 41 });
     }
 
     #[test]
     fn lag_marks_stale_and_rereads() {
         assert!(matches!(
-            after_page(41, true, true),
+            after_page(30, 41, true, true),
             Next::Resnapshot { .. }
         ));
     }

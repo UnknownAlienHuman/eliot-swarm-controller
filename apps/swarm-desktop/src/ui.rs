@@ -119,7 +119,7 @@ enum Message {
     ProfileTextChanged(String),
     AnswerChanged(String, String),
     ProjectsLoaded(Fallible<Vec<UiProject>>),
-    AgentsLoaded(bool, Fallible<AgentPage>),
+    AgentsLoaded(u64, bool, Fallible<AgentPage>),
     ProjectSelected(Option<usize>),
     AgentSelected(Option<usize>),
     ProfileSelected(Option<usize>),
@@ -128,7 +128,8 @@ enum Message {
     NewConversation,
     SnapshotLoaded(u64, Fallible<Box<Snapshot>>),
     Delivered(u64, Fallible<Option<Box<Delivery>>>),
-    RereadLoaded(u64, Fallible<Box<Reread>>),
+    RereadLoaded(u64, Result<Box<Reread>, (String, Invalidation)>),
+    RereadRetry(u64),
     BackoffDone(u64, bool),
     LoadOlderRequested,
     JumpToLatest,
@@ -157,6 +158,8 @@ struct DesktopApp {
     agents_next: Option<String>,
     agents_total: usize,
     agents_loading: bool,
+    /// Tags agent-list loads; a reply for an older request is dropped.
+    list_epoch: u64,
     pending_select: Option<UiAgent>,
     profiles: Vec<String>,
     profile_idx: Option<usize>,
@@ -180,7 +183,7 @@ struct DesktopApp {
     items_revision: u64,
     expanded: HashSet<String>,
     unseen: usize,
-    end_anchor: ElementRef<Button>,
+    end_anchor: ElementRef<TextBox>,
     pending_local: Option<(String, String, String)>,
     // Mutations.
     drafts: DraftStore,
@@ -230,8 +233,9 @@ impl DesktopApp {
         self.status = status.into();
     }
 
-    /// Release the in-flight key after a definite admission; an uncertain
-    /// outcome keeps it so a retry reuses the same mutation id.
+    /// End the in-flight submission. A definite admission also releases the
+    /// ledger entry; an uncertain outcome keeps the entry, so the next click
+    /// of the same action reuses the same mutation id.
     fn settle_mutation(&mut self, admitted: bool) {
         if let Some(key) = self.in_flight_key.take()
             && admitted
@@ -337,18 +341,16 @@ impl DesktopApp {
         let epoch = self.epoch;
         self.reread_inflight = true;
         let _task = context.spawn_background(move |_| {
-            Message::RereadLoaded(
-                epoch,
-                feed::reread(
-                    &data_dir,
-                    &agent,
-                    limit,
-                    work.turns,
-                    work.detail,
-                    work.inputs,
-                )
-                .map(Box::new),
-            )
+            let result = feed::reread(
+                &data_dir,
+                &agent,
+                limit,
+                work.turns,
+                work.detail,
+                work.inputs.clone(),
+            );
+            // A failed reread hands its work back so it is retried, not lost.
+            Message::RereadLoaded(epoch, result.map(Box::new).map_err(|error| (error, work)))
         });
     }
 
@@ -410,6 +412,8 @@ impl DesktopApp {
             return;
         };
         let append = after.is_some();
+        self.list_epoch += 1;
+        let list_epoch = self.list_epoch;
         let request = AgentListRequest {
             after,
             limit: AGENT_PAGE,
@@ -418,7 +422,11 @@ impl DesktopApp {
         };
         self.agents_loading = true;
         let _task = context.spawn_background(move |_| {
-            Message::AgentsLoaded(append, load_agents_blocking(&data_dir, &request))
+            Message::AgentsLoaded(
+                list_epoch,
+                append,
+                load_agents_blocking(&data_dir, &request),
+            )
         });
     }
 }
@@ -544,6 +552,7 @@ impl Component for DesktopApp {
             agents_next: None,
             agents_total: 0,
             agents_loading: false,
+            list_epoch: 0,
             pending_select: None,
             profiles: Vec::new(),
             profile_idx: None,
@@ -607,7 +616,10 @@ impl Component for DesktopApp {
                 }
                 Err(error) => self.set_status(format!("project.list failed: {error}")),
             },
-            Message::AgentsLoaded(append, page) => {
+            Message::AgentsLoaded(list_epoch, append, page) => {
+                if list_epoch != self.list_epoch {
+                    return;
+                }
                 self.agents_loading = false;
                 match page {
                     Ok(page) => {
@@ -644,6 +656,8 @@ impl Component for DesktopApp {
                 self.project_idx = index;
                 self.agents.clear();
                 self.agent_idx = None;
+                self.agents_next = None;
+                self.agents_total = 0;
                 match self.selected_project().cloned() {
                     Some(project) => {
                         self.profiles = project.profiles.clone();
@@ -765,15 +779,28 @@ impl Component for DesktopApp {
                         let delivery = *delivery;
                         self.failures = 0;
                         self.docs.extend(delivery.docs);
-                        if !delivery.events.is_empty()
-                            && let Some(convo) = self.convo.as_mut()
-                        {
+                        let mut resnapshot = false;
+                        if let Some(convo) = self.convo.as_mut() {
                             let invalidation = convo.apply_events(&delivery.events);
-                            self.rebuild_items();
-                            self.queue_reread(invalidation, context);
+                            convo.advance_cursor(delivery.next);
+                            resnapshot = invalidation.generation_changed;
+                            if !delivery.events.is_empty() {
+                                self.rebuild_items();
+                                self.queue_reread(invalidation, context);
+                            }
                         }
-                        let next =
-                            live::after_page(delivery.next, delivery.truncated, delivery.lagged);
+                        let next = if resnapshot {
+                            Next::Resnapshot {
+                                reason: "a newer generation started".to_owned(),
+                            }
+                        } else {
+                            live::after_page(
+                                delivery.after,
+                                delivery.next,
+                                delivery.truncated,
+                                delivery.lagged,
+                            )
+                        };
                         self.follow_next(next, context);
                     }
                     Err(error) => {
@@ -808,10 +835,24 @@ impl Component for DesktopApp {
                             convo.apply_inputs(reread.inputs);
                         }
                         self.rebuild_items();
+                        self.queue_reread(Invalidation::default(), context);
                     }
-                    Err(error) => self.set_status(format!("Readback failed: {error}")),
+                    Err((error, work)) => {
+                        self.set_status(format!("Readback failed, retrying: {error}"));
+                        self.invalidated.merge(work);
+                        let delay = live::backoff_ms(self.failures.min(4));
+                        let _task = context.spawn_background(move |cancel| {
+                            let cancelled = || cancel.is_cancelled();
+                            let _ = feed::backoff(delay, &cancelled);
+                            Message::RereadRetry(epoch)
+                        });
+                    }
                 }
-                self.queue_reread(Invalidation::default(), context);
+            }
+            Message::RereadRetry(epoch) => {
+                if epoch == self.epoch {
+                    self.queue_reread(Invalidation::default(), context);
+                }
             }
             Message::LoadOlderRequested => {
                 self.depth = self.depth.older();
@@ -1047,8 +1088,8 @@ impl Component for DesktopApp {
                             &data_dir,
                             mutation_id,
                             &bound.agent,
-                            Some(bound.generation),
-                            bound.turn.clone(),
+                            bound.generation,
+                            bound.turn.clone().unwrap_or_default(),
                         )
                         .await
                         .map(|reply| submit_note(&reply))
@@ -1389,20 +1430,23 @@ impl DesktopApp {
             move |index| keys[index].key.clone(),
             move |index| views::item_view(&items[index], &expanded, &callbacks),
         );
-        let end_anchor = Button::new()
+        // The end anchor is an inline reply box bound to the same draft as the
+        // composer: WinUI brings a focused TextBox into view, which a focused
+        // Button is not, and Reactor exposes no ScrollViewer offset API.
+        let end_anchor = TextBox::new()
             .element_ref(&self.end_anchor)
-            .style(ButtonStyle::Subtle)
-            .automation_name("End of conversation")
-            .content(
-                TextBlock::new()
-                    .text(match self.convo.as_ref() {
-                        Some(_) if self.items.is_empty() => "No retained turns in coverage yet.",
-                        Some(_) => "— latest —",
-                        None => "",
-                    })
-                    .font_size(theme::type_scale::LABEL)
-                    .opacity(theme::MUTED_OPACITY),
-            );
+            .text(self.composer_text())
+            .placeholder_text(match self.convo.as_ref() {
+                Some(_) if self.items.is_empty() => {
+                    "No retained turns in coverage yet. Reply here…"
+                }
+                Some(_) => "End of conversation. Reply here…",
+                None => "",
+            })
+            .automation_name("End of conversation reply")
+            .accepts_return(true)
+            .text_wrapping(TextWrapping::Wrap)
+            .on_text_changed(context.callback(Message::ComposerChanged));
         let transcript = ScrollViewer::new()
             .grid_row(2)
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)

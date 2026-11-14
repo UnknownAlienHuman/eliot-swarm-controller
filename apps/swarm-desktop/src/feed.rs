@@ -22,8 +22,15 @@ use crate::client;
 use crate::live::{COALESCE_MS, DRAIN_LIMIT, DRAIN_PAGES};
 use crate::markdown::{self, Doc};
 
-/// Journal rows scanned at most, however often "Load older" is used.
-pub const MAX_WINDOW_ROWS: i64 = 80_000;
+/// Journal rows scanned by default, back from the cursor (about 1.5 s on
+/// the live journal: the server scans 1,000 rows per read).
+pub const DEFAULT_WINDOW_ROWS: i64 = 40_000;
+/// Journal rows scanned at most, however far back the Agent was created.
+pub const MAX_WINDOW_ROWS: i64 = 200_000;
+/// Rows kept below the located creation point (commit-time skew margin).
+const CREATION_MARGIN_ROWS: i64 = 64;
+/// Milliseconds subtracted from `created_at` before locating it.
+const CREATION_MARGIN_MS: i64 = 2_000;
 
 type Fallible<T> = Result<T, String>;
 
@@ -42,18 +49,19 @@ impl Default for Depth {
     fn default() -> Self {
         Self {
             result_limit: crate::chat::TURN_PAGE,
-            window_rows: crate::chat::ACTIVITY_WINDOW,
+            window_rows: DEFAULT_WINDOW_ROWS,
         }
     }
 }
 
 impl Depth {
-    /// One "Load older" step, bounded.
+    /// "Load older": one more page of turns and the window back to the
+    /// Agent's creation, within the bound.
     pub fn older(self) -> Self {
         Self {
             result_limit: (self.result_limit + crate::chat::TURN_PAGE)
                 .min(crate::chat::MAX_RESULT_LIMIT),
-            window_rows: (self.window_rows + crate::chat::ACTIVITY_WINDOW).min(MAX_WINDOW_ROWS),
+            window_rows: MAX_WINDOW_ROWS,
         }
     }
 }
@@ -81,6 +89,8 @@ pub struct Reread {
 /// One live delivery: events strictly after the cursor and the next cursor.
 #[derive(Clone, Debug)]
 pub struct Delivery {
+    /// The cursor this delivery read strictly after.
+    pub after: i64,
     pub events: Vec<Event>,
     pub next: i64,
     pub truncated: bool,
@@ -121,9 +131,20 @@ pub fn snapshot(data_dir: &Path, agent: &str, depth: Depth) -> Fallible<Snapshot
         let results = client::agent_results(data_dir, agent, depth.result_limit)
             .await
             .map_err(text)?;
+        // Start at the Agent's creation when it is inside the window, so a
+        // recent Agent reads complete and an old one names what it skipped.
+        let created = client::seq_before(
+            data_dir,
+            detail.agent.created_at - CREATION_MARGIN_MS,
+            bounds.pruned_through,
+            bounds.hi,
+        )
+        .await
+        .map_err(text)?;
         let window_from = bounds
             .pruned_through
             .max(bounds.hi.saturating_sub(depth.window_rows))
+            .max(created.saturating_sub(CREATION_MARGIN_ROWS))
             .max(0);
         let events = client::scan_events(data_dir, window_from, bounds.hi, &filter)
             .await
@@ -230,6 +251,7 @@ pub fn deliver(
             if page.lagged || (!woke && !page.truncated) {
                 let docs = parse_docs(Conversation::markdown_texts(&[], &events));
                 return Ok(Some(Delivery {
+                    after,
                     events,
                     next: cursor,
                     truncated: page.truncated,
@@ -257,6 +279,7 @@ pub fn deliver(
         }
         let docs = parse_docs(Conversation::markdown_texts(&[], &events));
         Ok(Some(Delivery {
+            after,
             events,
             next: cursor,
             truncated,
