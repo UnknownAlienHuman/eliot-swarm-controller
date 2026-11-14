@@ -52,7 +52,18 @@ struct FailedStart {
     agent_id: String,
     generation: i64,
     command_id: String,
-    error: Error,
+    outcome: SettledStartFailure,
+}
+
+/// How one retained start failure replays. `Uncertain` keeps the historical
+/// error replay (the daemon settles by error code, and a native effect may
+/// have happened). `ProvenNoEffect` carries the failed-state result value:
+/// no native session or prompt was ever dispatched, so the launch is
+/// definitely failed and the daemon retires the plugin and releases capacity
+/// on proven exit instead of pinning an unknown Agent.
+enum SettledStartFailure {
+    Uncertain(Error),
+    ProvenNoEffect(Value),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -158,6 +169,17 @@ struct ParsedStart {
 enum StartAdmission {
     Replay(Result<Value>),
     New(Box<ParsedStart>),
+}
+
+/// Outcome of start phase 4: either a created session ready for the
+/// readiness publish, or a pre-create adopted-backend failure that settled
+/// as a definite failed start (no native session or prompt was ever
+/// dispatched, so the daemon settles failed, never unknown). The session is
+/// boxed: it dwarfs the failed value, and the size gap would trip the
+/// large-variant lint.
+enum CreateOutcome {
+    Created(Box<AgentSession>, SessionInfo, Value),
+    ProvenFailed(Value),
 }
 
 /// Outcome of send admission: a replayed response, or a new send ready for
@@ -389,9 +411,35 @@ impl OpenCodePlugin {
             agent_id: params.agent_id.clone(),
             generation: params.generation,
             command_id: params.command_id.clone(),
-            error: error.clone(),
+            outcome: SettledStartFailure::Uncertain(error.clone()),
         });
         error
+    }
+
+    /// Retain a proven-no-effect start failure and build its failed-state
+    /// result: no native session was created and no prompt was sent, so the
+    /// launch is definitely failed, never unknown. The reason names the
+    /// failed check in short non-secret words; it is persisted in the daemon
+    /// outcome, so it must never carry endpoints, ids, values, or secrets.
+    fn retain_proven_no_effect_start(
+        &mut self,
+        params: &AgentStartParams,
+        reason: impl Into<String>,
+    ) -> Value {
+        let value = json!({
+            "agent_id": params.agent_id,
+            "generation": params.generation,
+            "command_id": params.command_id,
+            "state": "failed",
+            "reason": reason.into(),
+        });
+        self.failed_start = Some(FailedStart {
+            agent_id: params.agent_id.clone(),
+            generation: params.generation,
+            command_id: params.command_id.clone(),
+            outcome: SettledStartFailure::ProvenNoEffect(value.clone()),
+        });
+        value
     }
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
@@ -407,9 +455,17 @@ impl OpenCodePlugin {
         if parsed.resume.is_some() {
             return self.resume_start_session(*parsed, session).await;
         }
-        let (session, created, effective) = self.create_start_session(&parsed, session).await?;
-        self.ready_start_session(*parsed, session, created, effective)
-            .await
+        match self.create_start_session(&parsed, session).await? {
+            CreateOutcome::Created(session, created, effective) => {
+                self.ready_start_session(*parsed, *session, created, effective)
+                    .await
+            }
+            // Pre-create adopted-backend failure: no native session or
+            // prompt was ever dispatched, so this failed-state value (not
+            // an error) settles the launch failed and lets the daemon
+            // retire the plugin and release capacity on proven exit.
+            CreateOutcome::ProvenFailed(value) => Ok(value),
+        }
     }
 
     /// Start phase 1, admission: decode, replay guards, and frozen-profile
@@ -505,7 +561,10 @@ impl OpenCodePlugin {
                 && failed.generation == params.generation
                 && failed.command_id == params.command_id
             {
-                return Err(failed.error.clone());
+                return Ok(Some(StartAdmission::Replay(match &failed.outcome {
+                    SettledStartFailure::Uncertain(error) => Err(error.clone()),
+                    SettledStartFailure::ProvenNoEffect(value) => Ok(value.clone()),
+                })));
             }
             return Err(Error::new(
                 "bad_state",
@@ -675,12 +734,46 @@ impl OpenCodePlugin {
     /// effective model and directory against the frozen profile. A readback
     /// mismatch best-effort deletes the created session and surfaces the
     /// kill result; no session is kept.
+    ///
+    /// Adopted local path: the provider, catalogue, limits and backend
+    /// inventory verification runs BEFORE `POST /api/session` creates any
+    /// native session — right here at the top, after the owned server is up
+    /// but before the first native write. Nothing has been dispatched at
+    /// that point, so every verification failure (mismatch, unreachable
+    /// backend, or unreadable readback) settles as a definite failed start
+    /// (`ProvenFailed`, retained for a corrected retry), never as an unknown
+    /// that would pin the Agent, keep the plugin alive, and hold capacity.
+    /// Unknown is reserved for failures after a session or prompt may have
+    /// been admitted.
     async fn create_start_session(
         &mut self,
         parsed: &ParsedStart,
         mut session: AgentSession,
-    ) -> Result<(AgentSession, SessionInfo, Value)> {
+    ) -> Result<CreateOutcome> {
         session.native_scope = opencode_scope(session.server.data_dir());
+        // Pre-create verification: no native session or prompt exists yet.
+        let local_fragment = if let Some(local) = parsed.local.as_ref() {
+            let backend_key = local_key_value(&parsed.environment, local.api_key_env.as_deref());
+            match verify_local_effective(
+                &session.http,
+                local,
+                backend_key,
+                Instant::now() + RPC_TIMEOUT,
+            )
+            .await
+            {
+                Ok(fragment) => Some(fragment),
+                Err(error) => {
+                    let reason = error.message.clone();
+                    discard_failed_start(&mut session, error).await;
+                    return Ok(CreateOutcome::ProvenFailed(
+                        self.retain_proven_no_effect_start(&parsed.params, reason),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let title = format!(
             "eliot-{}-g{}",
             parsed.params.agent_id, parsed.params.generation
@@ -760,44 +853,13 @@ impl OpenCodePlugin {
             "model_variant": created.model.as_ref().and_then(|model| model.variant.clone()),
             "cwd": created.location.as_ref().map(|location| location.directory.clone()),
         });
-        // Adopted local path: verify the effective provider, catalogue and
-        // limits against the frozen profile (plus the passive backend
-        // inventory) before any inference. A known mismatch discards the
-        // created session like a model mismatch; transport ambiguity
-        // stashes the session as unknown without repeating the create.
-        if let Some(local) = parsed.local.as_ref() {
-            let backend_key = local_key_value(&parsed.environment, local.api_key_env.as_deref());
-            match verify_local_effective(
-                &session.http,
-                local,
-                backend_key,
-                Instant::now() + RPC_TIMEOUT,
-            )
-            .await
-            {
-                Ok(fragment) => {
-                    effective["local"] = fragment;
-                }
-                Err(error) if error.code == "profile_error" => {
-                    let kill_note = delete_created_session(&mut session, &created.id).await;
-                    let error = discard_failed_start(
-                        &mut session,
-                        Error::new(
-                            "profile_error",
-                            format!(
-                                "OpenCode effective adopted provider did not match the frozen profile ({}); {kill_note}",
-                                error.message
-                            ),
-                        ),
-                    )
-                    .await;
-                    return Err(self.retain_failed_start(&parsed.params, error));
-                }
-                Err(error) => {
-                    self.session = Some(session);
-                    return Err(error);
-                }
-            }
+        // The adopted provider fragment was proven before the session
+        // existed; merge it into the effective readback here. Post-create
+        // failures below keep their historical settlement: the create may
+        // have admitted native state, so they stay errors (unknown where
+        // ambiguous), never the pre-create failed value.
+        if let Some(fragment) = local_fragment {
+            effective["local"] = fragment;
         }
         let context_bound =
             bind_context_hooks(&session.http, &created.id, Instant::now() + RPC_TIMEOUT).await;
@@ -823,7 +885,11 @@ impl OpenCodePlugin {
             .await;
             return Err(self.retain_failed_start(&parsed.params, error));
         }
-        Ok((session, created, effective))
+        Ok(CreateOutcome::Created(
+            Box::new(session),
+            created,
+            effective,
+        ))
     }
 
     /// Resume: reattach to the exact retained native session in this new
@@ -2609,34 +2675,30 @@ async fn fetch_backend_inventory(
 /// Verify the effective adopted provider before inference: the exact
 /// provider identity, package and base URL from `GET /api/provider`, the
 /// frozen API model id selected locally from `GET /api/model`, and the
-/// frozen limits against observed ones. A known mismatch is `profile_error`
-/// (project overrides must not retarget the route); transport ambiguity is
-/// `unknown`. Absent observed fields report unavailable honestly instead of
-/// failing, and only nonsecret observations enter the fragment — never a
-/// resolved key or raw configuration.
+/// frozen limits against observed ones, plus the backend's own passive
+/// inventory. Every failure reason is short and non-secret: reasons are
+/// persisted in the daemon outcome, so they never carry endpoints, ids,
+/// values, or secrets. A known mismatch is `profile_error` (project
+/// overrides must not retarget the route); transport ambiguity is
+/// `unknown`. An unreachable backend is `profile_error`, never a silent
+/// pass: the start cannot infer without it. Absent observed provider fields
+/// report unavailable honestly instead of failing, and only nonsecret
+/// observations enter the fragment — never a resolved key or raw
+/// configuration.
 async fn verify_local_effective(
     http: &OpenCodeHttp,
     local: &LocalProvider,
     backend_key: Option<&str>,
     deadline: Instant,
 ) -> Result<Value> {
-    let unknown = |detail: &str| {
-        Error::new(
-            "unknown",
-            format!("OpenCode local provider readback is unresolved ({detail})"),
-        )
-    };
     let provider = http
         .get_provider(&local.provider_id, deadline)
         .await
-        .map_err(|error| unknown(&error.message))?;
+        .map_err(|_| Error::new("unknown", "adopted provider readback unresolved"))?;
     if let Some(observed) = provider.id.as_deref()
         && observed != local.provider_id
     {
-        return Err(Error::new(
-            "profile_error",
-            "OpenCode effective provider identity contradicts the frozen profile; project overrides must not retarget the route",
-        ));
+        return Err(Error::new("profile_error", "effective provider mismatch"));
     }
     let mut unavailable = Vec::new();
     let observed_package = provider.package.clone();
@@ -2644,7 +2706,7 @@ async fn verify_local_effective(
         if observed != local.package {
             return Err(Error::new(
                 "profile_error",
-                "OpenCode effective provider package contradicts the installed native schema",
+                "effective provider package mismatch",
             ));
         }
     } else {
@@ -2658,7 +2720,7 @@ async fn verify_local_effective(
         if normalize_endpoint(observed) != normalize_endpoint(&local.base_url) {
             return Err(Error::new(
                 "profile_error",
-                "OpenCode effective provider endpoint contradicts the frozen profile; project overrides must not retarget the route",
+                "effective provider endpoint mismatch",
             ));
         }
     } else {
@@ -2671,23 +2733,18 @@ async fn verify_local_effective(
     let models = http
         .list_native_models(deadline)
         .await
-        .map_err(|error| unknown(&error.message))?;
+        .map_err(|_| Error::new("unknown", "adopted provider readback unresolved"))?;
     let entry = models
         .iter()
         .find(|model| model.id.as_deref() == Some(local.api_model_id.as_str()))
-        .ok_or_else(|| {
-            Error::new(
-                "profile_error",
-                "OpenCode effective model catalogue does not contain the frozen API model id",
-            )
-        })?;
+        .ok_or_else(|| Error::new("profile_error", "effective catalogue mismatch"))?;
     let mut limits_unavailable = Vec::new();
     if let Some(limit) = entry.limit.as_ref() {
         match limit.context {
             Some(observed) if observed != local.context_limit => {
                 return Err(Error::new(
                     "profile_error",
-                    "OpenCode effective context limit contradicts the frozen profile",
+                    "effective context limit mismatch",
                 ));
             }
             None => limits_unavailable.push("context"),
@@ -2697,7 +2754,7 @@ async fn verify_local_effective(
             Some(observed) if observed != local.output_limit => {
                 return Err(Error::new(
                     "profile_error",
-                    "OpenCode effective output limit contradicts the frozen profile",
+                    "effective output limit mismatch",
                 ));
             }
             None => limits_unavailable.push("output"),
@@ -2706,20 +2763,18 @@ async fn verify_local_effective(
     } else {
         limits_unavailable.push("limit");
     }
-    let backend_kind = BackendKind::parse(&local.backend).ok_or_else(|| {
-        Error::new(
-            "profile_error",
-            "OpenCode local backend kind must be strata, unsloth, lmstudio, llama.cpp, ollama, vllm or generic",
-        )
-    })?;
+    let backend_kind = BackendKind::parse(&local.backend)
+        .ok_or_else(|| Error::new("profile_error", "effective backend mismatch"))?;
     let inventory =
         match fetch_backend_inventory(&local.base_url, backend_kind, backend_key, deadline).await {
-            None => "unavailable",
+            None => {
+                return Err(Error::new("profile_error", "adopted backend unreachable"));
+            }
             Some(ids) if ids.iter().any(|id| id == &local.api_model_id) => "matched",
             Some(_) => {
                 return Err(Error::new(
                     "profile_error",
-                    "adopted backend inventory does not list the frozen API model id",
+                    "adopted backend inventory mismatch",
                 ));
             }
         };
@@ -3002,8 +3057,10 @@ fn opencode_manifest() -> PluginManifest {
 #[cfg(test)]
 mod tests {
     use super::{
-        local_key_value, normalize_endpoint, opencode_manifest, opencode_scope,
-        parse_local_provider, split_model, start_auth_selector, start_model_ref,
+        BackendKind, LocalProvider, OpenCodeHttp, OpenCodePlugin, StartAdmission,
+        fetch_backend_inventory, local_key_value, normalize_endpoint, opencode_manifest,
+        opencode_scope, parse_local_provider, split_model, start_auth_selector, start_model_ref,
+        verify_local_effective,
     };
     use eliot_core::{AgentStartParams, Result};
     use eliot_plugin::session::{
@@ -3426,5 +3483,229 @@ mod tests {
         assert_eq!(local_key_value(&environment, Some("EMPTY_KEY")), None);
         assert_eq!(local_key_value(&environment, Some("MISSING")), None);
         assert_eq!(local_key_value(&environment, None), None);
+    }
+
+    /// A closed loopback port: binds are released before use, so connects
+    /// are refused fast with no listener, no redirect and no leak.
+    async fn closed_loopback_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("closed-port bind");
+        let port = listener.local_addr().expect("closed-port addr").port();
+        drop(listener);
+        port
+    }
+
+    /// A minimal stub of the owned OpenCode server: answers the two
+    /// readback routes the adopted-backend gate needs, nothing else.
+    async fn stub_owned_provider_server(
+        provider_body: String,
+        model_body: String,
+    ) -> (tokio::task::JoinHandle<()>, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stub bind");
+        let port = listener.local_addr().expect("stub addr").port();
+        let handle = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                loop {
+                    use tokio::io::AsyncReadExt;
+                    match stream.read(&mut byte).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            head.push(byte[0]);
+                            if head.len() >= 4 && head[head.len() - 4..] == *b"\r\n\r\n" {
+                                break;
+                            }
+                            if head.len() > 8192 {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let body = if head.starts_with(b"GET /api/provider/") {
+                    &provider_body
+                } else {
+                    &model_body
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                use tokio::io::AsyncWriteExt;
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (handle, port)
+    }
+
+    fn local_fixture(base_url: &str) -> LocalProvider {
+        LocalProvider {
+            provider_id: "eliot-local".to_owned(),
+            api_model_id: "test-model".to_owned(),
+            base_url: base_url.to_owned(),
+            api_key_env: None,
+            context_limit: 1000,
+            output_limit: 100,
+            backend: "generic".to_owned(),
+            package: "@opencode/ai/providers/openai-compatible".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_inventory_unreachable_reports_none() {
+        let closed = closed_loopback_port().await;
+        let base = format!("http://127.0.0.1:{closed}/v1");
+        let deadline = super::Instant::now() + std::time::Duration::from_secs(10);
+        // No listener: refused fast, with or without a key reference (the
+        // key is never sent when the endpoint is unreachable).
+        assert_eq!(
+            fetch_backend_inventory(&base, BackendKind::Generic, None, deadline).await,
+            None
+        );
+        assert_eq!(
+            fetch_backend_inventory(
+                &base,
+                BackendKind::Generic,
+                Some("LOCAL_TEST_KEY"),
+                deadline
+            )
+            .await,
+            None
+        );
+    }
+
+    /// The live 20261114 finding: with no backend listening, the launch
+    /// used to stash an unknown session (Agent stuck `starting`, plugin and
+    /// children alive, capacity held). The verification gate that runs
+    /// before any native session is created must fail definitely instead.
+    #[tokio::test]
+    async fn unreachable_backend_fails_before_any_native_session() {
+        let closed = closed_loopback_port().await;
+        let (stub, port) = stub_owned_provider_server(
+            format!(
+                "{{\"data\":{{\"id\":\"eliot-local\",\"package\":\"@opencode/ai/providers/openai-compatible\",\"settings\":{{\"baseURL\":\"http://127.0.0.1:{closed}/v1\"}}}}}}"
+            ),
+            "{\"data\":[{\"id\":\"test-model\",\"providerID\":\"eliot-local\",\"limit\":{\"context\":1000,\"output\":100}}]}".to_owned(),
+        )
+        .await;
+        let dir = std::env::temp_dir();
+        let http = OpenCodeHttp::new(port, "test-password".to_owned(), &dir).expect("stub client");
+        let local = local_fixture(&format!("http://127.0.0.1:{closed}/v1"));
+        let error = verify_local_effective(
+            &http,
+            &local,
+            None,
+            super::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect_err("unreachable backend must fail the start gate");
+        assert_eq!(error.code, "profile_error");
+        assert_eq!(error.message, "adopted backend unreachable");
+        // The short safe reason carries no endpoint, id, value or secret.
+        assert!(!error.message.contains("127.0.0.1"));
+        assert!(!error.message.contains("test-model"));
+        stub.abort();
+    }
+
+    /// The healthy path is unchanged: a listening backend whose inventory
+    /// lists the frozen model passes the gate with the fragment merged.
+    #[tokio::test]
+    async fn reachable_backend_with_matching_inventory_passes() {
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("backend bind");
+        let backend_port = backend.local_addr().expect("backend addr").port();
+        let backend_task = tokio::spawn(async move {
+            let Ok((mut stream, _)) = backend.accept().await else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                use tokio::io::AsyncReadExt;
+                match stream.read(&mut byte).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        head.push(byte[0]);
+                        if head.len() >= 4 && head[head.len() - 4..] == *b"\r\n\r\n" {
+                            break;
+                        }
+                        if head.len() > 8192 {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let body =
+                "{\"object\":\"list\",\"data\":[{\"id\":\"test-model\",\"object\":\"model\"}]}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            use tokio::io::AsyncWriteExt;
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        let (stub, port) = stub_owned_provider_server(
+            format!(
+                "{{\"data\":{{\"id\":\"eliot-local\",\"package\":\"@opencode/ai/providers/openai-compatible\",\"settings\":{{\"baseURL\":\"http://127.0.0.1:{backend_port}/v1\"}}}}}}"
+            ),
+            "{\"data\":[{\"id\":\"test-model\",\"providerID\":\"eliot-local\",\"limit\":{\"context\":1000,\"output\":100}}]}".to_owned(),
+        )
+        .await;
+        let dir = std::env::temp_dir();
+        let http = OpenCodeHttp::new(port, "test-password".to_owned(), &dir).expect("stub client");
+        let local = local_fixture(&format!("http://127.0.0.1:{backend_port}/v1"));
+        let fragment = verify_local_effective(
+            &http,
+            &local,
+            None,
+            super::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("healthy backend passes");
+        assert_eq!(fragment["inventory"], "matched");
+        assert_eq!(
+            fragment["provider_base_url"],
+            format!("http://127.0.0.1:{backend_port}/v1")
+        );
+        stub.abort();
+        backend_task.abort();
+    }
+
+    /// Proven-no-effect failures return the daemon-honored failed-state
+    /// value (never an error): the same start replays the value without new
+    /// native I/O, and any other start is refused.
+    #[test]
+    fn proven_no_effect_start_returns_failed_state_and_replays() {
+        let params = AgentStartParams::new("agent-1", 7, "0199-start-1");
+        let mut plugin = OpenCodePlugin::default();
+        let value = plugin.retain_proven_no_effect_start(&params, "adopted backend unreachable");
+        assert_eq!(value["state"], "failed");
+        assert_eq!(value["agent_id"], "agent-1");
+        assert_eq!(value["generation"], 7);
+        assert_eq!(value["command_id"], "0199-start-1");
+        assert_eq!(value["reason"], "adopted backend unreachable");
+        match plugin
+            .start_replay_admission(&params)
+            .expect("admission")
+            .expect("replay")
+        {
+            StartAdmission::Replay(Ok(replayed)) => assert_eq!(replayed, value),
+            StartAdmission::Replay(Err(_)) => panic!("proven failure must replay a value"),
+            StartAdmission::New(_) => panic!("settled start must replay"),
+        }
+        let other = AgentStartParams::new("agent-1", 7, "0199-start-2");
+        match plugin.start_replay_admission(&other) {
+            Err(error) => assert_eq!(error.code, "bad_state"),
+            Ok(_) => panic!("a different start must be refused"),
+        }
     }
 }

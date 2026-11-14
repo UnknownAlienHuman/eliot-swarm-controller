@@ -191,10 +191,17 @@ inference the plugin checks the exact provider through bounded native
 `GET /api/model` (the endpoint answers an array), and reads the backend's
 own passive `GET {base_url}/models` inventory — which never generates text,
 never sends `?reload=1` (that can unload running llama.cpp models), and
-never touches load/switch selectors. A known mismatch (foreign
-provider/package/endpoint, an absent catalogue id, divergent limits, or an
-inventory without the frozen id) refuses before inference; project overrides
-that retarget the route are rejected, never adopted. Absent observations
+never touches load/switch selectors. This verification runs before
+`POST /api/session` creates any native session: no session or prompt has
+been dispatched yet, so every verification failure — a known mismatch
+(foreign provider/package/endpoint, an absent catalogue id, divergent
+limits, or an inventory without the frozen id), an unreadable readback, or
+an unreachable backend with no inventory at all — settles the launch as a
+definite failure with a short safe reason (failed-state start result, never
+unknown), and the daemon retires the plugin and releases capacity on proven
+exit instead of pinning an unknown Agent. Unknown is reserved for failures
+after a session or prompt may have been admitted. Project overrides that
+retarget the route are rejected, never adopted. Absent provider observations
 report unavailable honestly instead of failing, and only nonsecret
 observations are retained — never a resolved key or raw configuration. The
 readback is a snapshot, not a guarantee about every request.

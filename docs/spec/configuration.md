@@ -158,7 +158,10 @@ credential is imported. `context_limit` and `output_limit` are the explicit
 effective limits; the plugin renders them with the installed
 `@opencode/ai/providers/openai-compatible` package and verifies the
 effective provider, catalogue entry, limits and passive backend inventory
-before inference, rejecting project overrides that retarget the route.
+before any native session is created — every verification failure
+(including an unreachable backend) settles the launch as failed with a
+short safe reason, never unknown — rejecting project overrides that
+retarget the route.
 There is no harness/model/account fallback. Codex profiles against these
 backends stay `unsupported` until readiness, catalog/context, history and
 exact tool formats are resolved separately. See the
