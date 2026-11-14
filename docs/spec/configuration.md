@@ -225,13 +225,11 @@ Agent-scoped server in addition to the owner's native MCP surface.
 `minimal` starts only the intended MCP surface: Eliot's Agent-scoped server
 plus the explicitly allowed native servers, with every other enumerated
 `mcp_servers` entry and every enumerated `plugins` entry disabled through
-per-run `-c` overrides, and the prompt-surface flags pinned
-(`include_*` instruction/environment text off, `agents.enabled=false`,
-contextual `features.*` off, `web_search="disabled"`).
-`project_doc_max_bytes` is untouched: project instructions stay wanted.
-Eliot's scoped `swarm mcp --require-agent` server is always present in both
-policies, and no policy edits the owner's global native config, copies
-`auth.json`, or changes native-store/observer bindings.
+per-run `-c` overrides. No prompt-surface flags are pinned: the policy is a
+tool-surface policy and must not silently change worker capabilities or
+safety context. Eliot's scoped `swarm mcp --require-agent` server is always
+present in both policies, and no policy edits the owner's global native
+config, copies `auth.json`, or changes native-store/observer bindings.
 
 Only the Codex and Claude harnesses implement `minimal`, each with its
 installed isolation mechanism; Muse, OpenCode and Antigravity keep

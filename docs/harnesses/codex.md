@@ -131,12 +131,12 @@ plus the explicitly allowed servers:
   plugin gets its own `-c plugins.<name>.enabled=false` override (plugin
   ids allow `@`, e.g. `browser@openai-bundled`); a name no `-c` path can
   address (Codex splits override paths on literal dots before decoding)
-  fails the start closed instead of silently inheriting. The worker also
-  pins the prompt-surface flags (`include_apps/collaboration_mode/
-  environment[_time]/permissions_instructions=false`, `agents.enabled=false`,
-  `features.{memories,multi_agent,mentions_v2,remote_plugin,tool_suggest}
-  =false`, `web_search="disabled"`); `project_doc_max_bytes` is untouched so
-  the workspace's own AGENTS.md stays wanted context.
+  fails the start closed instead of silently inheriting. The MCP policy
+  pins no prompt-surface flags: `include_*` instruction/environment text,
+  `agents.enabled` / `features.multi_agent` (subagents), `web_search` and
+  the other `features.*` were measured (see below) but are deliberately not
+  applied — `mcp = "minimal"` is a tool-surface policy and must not
+  silently change worker capabilities or safety context.
 - After `thread/start` (or `thread/resume`) and before any input, the
   installed `mcpServerStatus/list` inventory is read back scoped to the
   owned thread (`threadId`; names only, secret-checked) and reported as
@@ -197,14 +197,22 @@ account apps (17 enabled), `features.multi_agent/memories` on, all
 
 | Variant | `input_tokens` | Δ vs baseline |
 | --- | --- | --- |
-| (a) `inherit` via Swarm daemon | 27,050 | — baseline |
-| (a′) same prompt, raw app-server (no Eliot tool) | 26,971 | −79 (Eliot's own `swarm` tool schema) |
+| (a) `inherit` via Swarm daemon | 27,056 | — baseline |
+| (a′) same prompt, raw app-server (no Eliot tool) | 26,971 | −85 (Eliot's own `swarm` tool schema) |
 | 6 MCP servers disabled only | 26,840 | −131 |
 | 17 plugins disabled only | 25,151 | −1,820 |
-| Prompt-surface flags only (5× `include_*=false`, `web_search="disabled"`) | 24,150 | −2,821 |
-| Agent/feature flags only (`agents.enabled=false`, 5× `features.*=false`) | 20,808 | −6,163 |
-| (c) all of the above combined (35 `-c` overrides) | 15,386 | −11,585 (−43%) |
-| (b) `minimal` via Swarm daemon after this change | 15,464 | −11,586 (matches (c) plus the Eliot tool) |
+| (b) `minimal` via Swarm daemon after this change | 25,107 | −1,949 (MCP + plugin strips combined) |
+| Prompt-surface flags only, experimental (5× `include_*=false`, `web_search="disabled"`) | 24,150 | −2,821, not applied by the policy |
+| Agent/feature flags only, experimental (`agents.enabled=false`, 5× `features.*=false`) | 20,808 | −6,163, not applied by the policy |
+| (c) all of the above combined, experimental (35 `-c` overrides) | 15,386 | −11,585 (−43%), not applied by the policy |
+
+The (c) rows were measured with experimental per-run `-c` overrides through
+a raw app-server probe and are deliberately not applied: hiding
+`include_permissions_instructions` / `include_environment_context` removes
+sandbox, approval and cwd rules from the model, and
+`agents.enabled=false` / `features.multi_agent=false` (plus `web_search`
+and the other `features.*`) remove capabilities the owner relies on. An MCP
+policy must not make those calls.
 
 Before this change, `minimal` could not start on this surface at all: the
 thread inventory always shows the `codex_apps` account-connector aggregator
@@ -212,14 +220,13 @@ thread inventory always shows the `codex_apps` account-connector aggregator
 (`connected`), so verification failed closed with `plugin_outcome_unknown`
 (`profile_error`: unexpected enabled server). Asking the model for its
 `adobe.*` tools returns NONE with and without the strip, so `codex_apps`
-contributes zero model-side tokens; the remaining ~15.4k is the irreducible
-floor on this build (base prompt plus native tools). The runtime inventory
-also explains the 2.2 MB readback that sized the 8 MiB frame cap: disabled
-servers report `tools: 0`, while every listed server embeds its full tool
-catalogs, dominated by the phantom `codex_apps` entry.
+contributes zero model-side tokens. The runtime inventory also explains the
+2.2 MB readback that sized the 8 MiB frame cap: disabled servers report
+`tools: 0`, while every listed server embeds its full tool catalogs,
+dominated by the phantom `codex_apps` entry.
 
 Live proof after this change, same private daemon (debug build of this
-branch): trivial prompt under `minimal` returns `42` with 15,464 input
+branch): trivial prompt under `minimal` returns `42` with 25,107 input
 tokens and `effective.mcp_servers = ["codex_apps", "eliot_swarm_<own>"]`,
 `mcp_servers_verified = true`; a real small coding task under `minimal`
 (`Create hello.txt containing exactly hello without a newline`,

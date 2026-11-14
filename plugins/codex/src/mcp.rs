@@ -16,13 +16,17 @@
 //!
 //! Live-measured 2026-11-14 on the same build (trivial "reply 42" turn,
 //! `gpt-6.1-sol`, effort `low`): the inherited surface costs ~27.0k input
-//! tokens, and only ~0.1k of that is the six owner MCP servers. The rest is
-//! prompt-surface text (~9.0k from instruction/environment/agent/feature
-//! flags), plugin skills (~1.8k from 17 enabled owner plugins, including the
-//! `cua_repl` runtime server they contribute), and the ~15.4k irreducible
-//! floor (base prompt plus native tools). Minimal therefore also disables
-//! every enumerated `plugins` key and pins the prompt-surface flags below;
-//! the runtime `codex_apps` aggregator (568 account-connector tools,
+//! tokens, and only ~0.1k of that is the six owner MCP servers. Plugin
+//! skills cost ~1.8k (17 enabled owner plugins, including the `cua_repl`
+//! runtime server they contribute), so disabling them leaves minimal at
+//! ~25k. A further ~9k of prompt-surface text (instruction/environment/
+//! agent/feature flags) was measured with experimental `-c` overrides but
+//! is not pinned by this policy. Minimal therefore also disables
+//! every enumerated `plugins` key. Prompt-surface flags (`include_*`,
+//! `agents.enabled`, `features.*`, `web_search`) were measured separately
+//! and are deliberately not pinned: an MCP policy must not silently change
+//! worker capabilities or safety context. The runtime `codex_apps`
+//! aggregator (568 account-connector tools,
 //! perpetually `starting`) never reaches the model (the model answers NONE
 //! when asked for its tools, with and without the strip) but still appears
 //! in the inventory, so verification tolerates the known non-serving
@@ -121,31 +125,6 @@ pub(super) fn compute_plugin_disables(
     disables.sort();
     Ok(disables)
 }
-
-/// Prompt-surface flags pinned for every minimal worker, as `(key, TOML
-/// value)` pairs encoded into per-run `-c` overrides (owner config
-/// untouched). Each key is a plain override path (Codex splits on literal
-/// dots, so only `features.*`/`agents.*` nest one level) and each value is a
-/// fixed TOML literal. Verified one by one 2026-11-14 against installed Codex
-/// 0.167.1 (`config/read` shows every value with the `sessionFlags` origin;
-/// a trivial turn still succeeds with all of them set):
-/// instruction/environment text off, subagent delegation off, contextual
-/// features off, web search off. `project_doc_max_bytes` is deliberately
-/// absent: the workspace's own AGENTS.md stays wanted context.
-pub(super) const MINIMAL_PROMPT_OVERRIDES: &[(&str, &str)] = &[
-    ("include_apps_instructions", "false"),
-    ("include_collaboration_mode_instructions", "false"),
-    ("include_environment_context", "false"),
-    ("include_environment_context_time", "false"),
-    ("include_permissions_instructions", "false"),
-    ("agents.enabled", "false"),
-    ("features.memories", "false"),
-    ("features.multi_agent", "false"),
-    ("features.mentions_v2", "false"),
-    ("features.remote_plugin", "false"),
-    ("features.tool_suggest", "false"),
-    ("web_search", "\"disabled\""),
-];
 
 /// Codex built-in runtime servers with no config-table lever. They appear in
 /// the thread-scoped `mcpServerStatus/list` inventory without any
@@ -384,27 +363,6 @@ mod tests {
         assert_eq!(disables, vec!["browser@openai-bundled".to_owned()]);
         // Dotted plugin names cannot be addressed and fail closed.
         assert!(compute_plugin_disables(&["owner.search".to_owned()], &[]).is_err());
-    }
-
-    #[test]
-    fn prompt_overrides_stay_plain_override_paths() {
-        for &(key, value) in MINIMAL_PROMPT_OVERRIDES {
-            assert!(
-                !key.is_empty() && key.len() <= 128,
-                "prompt override key is not bounded: {key:?}"
-            );
-            assert!(
-                key.bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'_'),
-                "prompt override key is not a plain path: {key:?}"
-            );
-            assert!(!value.is_empty(), "override {key:?} has no value");
-            assert!(
-                key != "project_doc_max_bytes",
-                "project instructions stay wanted context"
-            );
-        }
-        assert!(MINIMAL_PROMPT_OVERRIDES.len() >= 12);
     }
 
     #[test]

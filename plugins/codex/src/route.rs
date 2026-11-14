@@ -95,9 +95,6 @@ impl CodexRoute {
         Ok(args)
     }
 
-    // Seven argv groups (own server, two disable lists, prompt flags, three
-    // paths); a struct would only rename the caller's tuple.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn args_with_agent_mcp(
         &self,
         server_name: &str,
@@ -106,7 +103,6 @@ impl CodexRoute {
         cwd: &Path,
         mcp_disables: &[String],
         plugin_disables: &[String],
-        prompt_overrides: &[(&str, &str)],
     ) -> Result<Vec<OsString>> {
         if !swarm_executable.is_absolute() || !data_dir.is_absolute() || !cwd.is_absolute() {
             return Err(route_error(
@@ -121,12 +117,6 @@ impl CodexRoute {
             || plugin_disables
                 .iter()
                 .any(|name| !crate::mcp::is_addressable_plugin_name(name))
-            || prompt_overrides.iter().any(|(key, value)| {
-                key.is_empty()
-                    || value.is_empty()
-                    || key.chars().any(|c| c.is_control() || c.is_whitespace())
-                    || value.chars().any(char::is_control)
-            })
         {
             return Err(route_error(
                 "Codex Agent MCP server names must be plain override segments",
@@ -160,19 +150,14 @@ impl CodexRoute {
                 "false".to_owned(),
             );
         }
-        // Minimal policy: suppress every inherited plugin the same way, and
-        // pin the prompt-surface flags (instruction/environment text,
-        // subagent delegation, contextual features, web search off). Inherit
-        // passes empty lists and keeps the current additive behavior.
+        // Minimal policy: suppress every inherited plugin the same way.
+        // Inherit passes empty lists and keeps the current additive behavior.
         for name in plugin_disables {
             push_override(
                 &mut mcp_override,
                 &format!("plugins.{name}.enabled"),
                 "false".to_owned(),
             );
-        }
-        for (key, value) in prompt_overrides {
-            push_override(&mut mcp_override, key, (*value).to_owned());
         }
         let mut result = Vec::with_capacity(args.len() + mcp_override.len());
         result.extend(args[..app_server_index].iter().cloned());
@@ -453,7 +438,7 @@ mod tests {
             )
         };
         let args = route
-            .args_with_agent_mcp("eliot_swarm_x", exe, data, cwd, &[], &[], &[])
+            .args_with_agent_mcp("eliot_swarm_x", exe, data, cwd, &[], &[])
             .unwrap()
             .into_iter()
             .map(|value| value.into_string().unwrap())
@@ -466,8 +451,9 @@ mod tests {
         assert!(own < app_server);
         assert!(args.iter().all(|arg| !arg.contains("enabled=false")));
 
-        // Minimal adds one `enabled=false` override per inherited server,
-        // before `app-server`, and rejects names no `-c` path can address.
+        // Minimal adds one `enabled=false` override per inherited server
+        // and plugin, before `app-server`, and rejects names no `-c` path
+        // can address.
         let args = route
             .args_with_agent_mcp(
                 "eliot_swarm_x",
@@ -476,7 +462,6 @@ mod tests {
                 cwd,
                 &["owner-a".to_owned(), "owner-b".to_owned()],
                 &["plug@x".to_owned()],
-                &[("features.memories", "false")],
             )
             .unwrap()
             .into_iter()
@@ -495,11 +480,6 @@ mod tests {
             .position(|arg| arg == "plugins.plug@x.enabled=false")
             .unwrap();
         assert!(plug < app_server);
-        let flag = args
-            .iter()
-            .position(|arg| arg == "features.memories=false")
-            .unwrap();
-        assert!(flag < app_server);
         assert!(
             route
                 .args_with_agent_mcp(
@@ -508,7 +488,6 @@ mod tests {
                     data,
                     cwd,
                     &["owner.x".to_owned()],
-                    &[],
                     &[]
                 )
                 .is_err()
@@ -521,27 +500,13 @@ mod tests {
                     data,
                     cwd,
                     &[],
-                    &["bad.name".to_owned()],
-                    &[]
+                    &["bad.name".to_owned()]
                 )
                 .is_err()
         );
         assert!(
             route
-                .args_with_agent_mcp(
-                    "eliot_swarm_x",
-                    exe,
-                    data,
-                    cwd,
-                    &[],
-                    &[],
-                    &[("bad key", "false")]
-                )
-                .is_err()
-        );
-        assert!(
-            route
-                .args_with_agent_mcp("", exe, data, cwd, &[], &[], &[])
+                .args_with_agent_mcp("", exe, data, cwd, &[], &[])
                 .is_err()
         );
     }
