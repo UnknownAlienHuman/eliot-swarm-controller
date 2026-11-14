@@ -72,7 +72,7 @@ pass_env = ["CODEX_HOME"]
 
 ## Ad-hoc Owner launch (no stored profile)
 
-`swarm launch --harness <codex|claude|muse|opencode|antigravity>
+`swarm launch --harness <codex|claude|muse|antigravity>
 [--model M] [--effort E] [--cmd PATH] --workspace W "prompt"` (and the same in
 `command.submit` `launch` args, where `cmd` rides beside `model`/`effort` in
 the exact retry-bound payload) is an Owner-only tool that builds and freezes
@@ -82,10 +82,10 @@ replay-safe. Requested `model`/`effort` may be omitted; the freeze records the
 requested value as absent separately from the effective value the harness
 resolves at start (Codex `model/list` default entry and its default effort,
 Muse server default (after proving the `model/list` catalogue is non-empty; Muse names no default marker), Claude CLI default with `--model`/`--effort`
-omitted and effective read back, OpenCode configured default model), never a
+omitted and effective read back), never a
 silent substitution: an unavailable requested model fails honestly. Authority
 fields default to the safe posture (Codex `workspace-write` + `never`,
-Claude CLI-default permission mode, Muse and OpenCode current conservative
+Claude CLI-default permission mode, Muse current conservative
 defaults); broader authority stays profile-only, owner-written choice. When
 `--cmd` is not given, the daemon resolves the installed native executable
 deterministically and freezes the absolute path: Claude prefers the newest
@@ -102,7 +102,9 @@ executable instead (e.g. a Muse binary version the launcher no longer marks
 current). A missing or ambiguous executable is a clear
 `unsupported`/`profile_error` naming what was searched. Agent principals keep
 the profile and `child_profiles` rules; they cannot ad-hoc launch
-(`not_allowed`).
+(`not_allowed`). Ad-hoc OpenCode launch is refused (`profile_error`): auth
+selection stays profile-only, so an OpenCode turn needs a stored profile
+with an explicit `auth_integration` selector.
 
 The profile author supplies an exact model string. Reasoning effort is optional
 on every Codex route: when the profile omits `effort`, the plugin omits the

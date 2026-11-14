@@ -237,15 +237,18 @@ for the installed server (the plugin owns no MCP surface of its own), so no
 
 ## Ad-hoc launch
 
-`swarm launch --harness opencode [--model PROVIDER/MODEL] [--cmd PATH]
---workspace W "prompt"` is Owner-only and freezes a profile-equivalent snapshot
-from conservative defaults (MCP `inherit`) plus flags. An omitted `--model`
-omits the config `model` key so the configured native default applies; the
-effective value is read back from the session echo. `--effort` has no mapping
-and is rejected. `cmd` is discovered by following the npm shim to the native
+Ad-hoc OpenCode launch (`swarm launch --harness opencode ...`, with or
+without `--model`/`--cmd`) is refused (`profile_error`): starting the
+per-Agent server always transfers one stored auth integration into the
+isolated native store, and auth selection stays profile-only with no ad-hoc
+default. Run OpenCode turns from a stored profile with an explicit
+`auth_integration` selector instead. `--effort` has no mapping and is
+rejected. `cmd` is discovered by following the npm shim to the native
 `opencode.exe` inside the package (the shim target
 `<shim-dir>/node_modules/@opencode/cli/bin/opencode.exe`, then the known
 package-local paths under every roaming root including the
-`USERPROFILE`-derived default when `APPDATA` is stripped); `--cmd` pins one
-explicit install instead. `swarm models --harness opencode` lists providers
-from native auth; full provider/model pairs resolve at launch.
+`USERPROFILE`-derived default when `APPDATA` is stripped); a stored profile
+pins one explicit install with `cmd`. `swarm models --harness opencode`
+lists providers from native auth; a stored profile resolves the full
+provider/model pair at launch (an omitted profile model leaves the
+configured native default, read back from the session echo).

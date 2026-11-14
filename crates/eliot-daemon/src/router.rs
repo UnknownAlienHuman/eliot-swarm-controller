@@ -1751,6 +1751,18 @@ impl Router {
                 .and_then(Value::as_str)
                 .ok_or_else(|| Error::new("invalid", "launch harness must be a non-empty string"))?
                 .to_owned();
+            // OpenCode start always transfers one stored auth integration
+            // into the isolated native store; auth selection stays
+            // profile-only with no ad-hoc default, so no ad-hoc OpenCode
+            // launch can pass the plugin start gate. Refuse at the freeze
+            // boundary with the typed reason instead of stranding an
+            // unknown launch after creating the Agent.
+            if harness == "opencode" {
+                return Err(Error::new(
+                    "profile_error",
+                    "ad-hoc opencode launch requires a stored profile with an explicit auth_integration selector",
+                ));
+            }
             let model = request
                 .args
                 .get("model")
@@ -13556,6 +13568,34 @@ mod run_authorization_tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, "not_allowed");
+    }
+
+    #[tokio::test]
+    async fn adhoc_opencode_launch_requires_stored_profile() {
+        let router = router();
+        let mut request = SubmitCommand {
+            id: ulid::Ulid::new().to_string().to_ascii_lowercase(),
+            target: None,
+            selector: None,
+            verb: "launch".to_owned(),
+            args: json!({"harness": "opencode", "model": "opencode/deepseek-v4.1-flash-free", "workspace": "/tmp"}),
+            expected_generation: None,
+            expected_turn_id: None,
+            request_id: None,
+            probe: false,
+        };
+        // The refusal sits before discovery, so it holds with or without the
+        // native executable installed; auth selection stays profile-only.
+        normalize_launch(&mut request, &Principal::Owner).expect("ad-hoc shape is valid");
+        let error = router
+            .freeze_launch_profile(&Principal::Owner, &mut request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "profile_error");
+        assert_eq!(
+            error.message,
+            "ad-hoc opencode launch requires a stored profile with an explicit auth_integration selector"
+        );
     }
 
     #[tokio::test]
