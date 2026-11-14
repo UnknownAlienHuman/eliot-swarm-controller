@@ -8,7 +8,7 @@ pub(crate) mod types;
 
 pub(crate) use auth::{
     AuthSetup, AuthTransfer, IntegrationSelector, ensure_no_credential_for_provider,
-    transfer_selected_integration,
+    list_providers, transfer_selected_integration,
 };
 pub(crate) use backends::BackendKind;
 pub(crate) use client::{HttpOutcome, OpenCodeHttp};

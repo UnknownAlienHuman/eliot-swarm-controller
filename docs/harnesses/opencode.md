@@ -234,3 +234,14 @@ This harness keeps `inherit` only: the frozen profile always records
 at config load. No verified native MCP isolation mechanism was established
 for the installed server (the plugin owns no MCP surface of its own), so no
 `minimal` mechanism is implemented.
+
+## Ad-hoc launch
+
+`swarm launch --harness opencode [--model PROVIDER/MODEL] --workspace W
+"prompt"` is Owner-only and freezes a profile-equivalent snapshot from
+conservative defaults (MCP `inherit`) plus flags. An omitted `--model` omits
+the config `model` key so the configured native default applies; the effective
+value is read back from the session echo. `--effort` has no mapping and is
+rejected. `cmd` is discovered by following the npm shim to the native
+`opencode.exe` inside the package. `swarm models --harness opencode` lists
+providers from native auth; full provider/model pairs resolve at launch.

@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+pub(crate) mod adhoc;
 pub(crate) mod automation;
 mod bus;
 pub mod cloud_mcp;

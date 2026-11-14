@@ -38,7 +38,7 @@ use tokio::time::Instant;
 
 pub(super) struct PreparedStart {
     pub(super) resume_subject: Option<ResumeSubject>,
-    pub(super) requested_model: String,
+    pub(super) requested_model: Option<String>,
     pub(super) requested_effort: Option<String>,
     pub(super) requested_approval: Option<String>,
     pub(super) requested_permissions: String,
@@ -94,12 +94,14 @@ pub(super) fn prepare_profile(
             "Muse plugin received a profile for another harness",
         ));
     }
-    let requested_model = profile
+    // An omitted model selects the harness native default: the catalogue
+    // must still prove reachable and non-empty (an empty catalogue serves
+    // no default), and the effective server-selected model is read back.
+    let requested_model: Option<String> = profile
         .get("model")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| Error::new("profile_error", "Muse profile requires an exact model id"))?
-        .to_owned();
+        .map(str::to_owned);
     let requested_effort = optional_profile_text(profile, "effort", "Muse")?;
     if let Some(effort) = requested_effort.as_deref()
         && !is_reasoning_effort_tier(effort)
@@ -232,7 +234,7 @@ pub(super) async fn spawn_owned_session(
 impl MusePlugin {
     pub(super) async fn initialize_native(
         client: &NativeClient,
-        requested_model: &str,
+        requested_model: Option<&str>,
         requested_effort: Option<&str>,
     ) -> Result<InitializedNative> {
         let init_params = NativeInitializeParams {
@@ -296,8 +298,8 @@ impl MusePlugin {
             })?;
 
         let model = discover_model(client, requested_model).await?;
-        if let Some(effort) = requested_effort
-            && let Some(NativeModelEffortVariants::Known(variants)) = model.variants.as_ref()
+        if let (Some(effort), Some(selected)) = (requested_effort, model.as_ref())
+            && let Some(NativeModelEffortVariants::Known(variants)) = selected.variants.as_ref()
             && !variants.iter().any(|variant| variant == effort)
         {
             return Err(Error::new(
@@ -429,16 +431,20 @@ impl MusePlugin {
         session: &mut AgentSession,
         native_session: &NativeSession,
         resuming: bool,
-        requested_model: &str,
+        requested_model: Option<&str>,
     ) -> Result<bool> {
         let mut setters_ran = false;
-        if resuming && native_session.model_id.as_deref() != Some(requested_model) {
+        // An omitted request accepts the retained server-selected model.
+        if let Some(requested) = requested_model
+            && resuming
+            && native_session.model_id.as_deref() != Some(requested)
+        {
             let model_command = new_command_id();
             let model_params = NativeSessionSetModelParams {
                 command_id: model_command.clone(),
                 session_id: native_session.session_id.clone(),
                 model: NativeModelSelection {
-                    model_id: requested_model.to_owned(),
+                    model_id: requested.to_owned(),
                 },
             };
             let model_value = serde_json::to_value(model_params).map_err(|_| {

@@ -153,11 +153,12 @@ impl OpenCodeHttp {
             .map_err(|_| Error::new("native_readback", "OpenCode config readback was invalid"))
     }
 
-    /// `POST /api/session`: create a session without input.
+    /// `POST /api/session`: create a session without input. An omitted
+    /// model defers to the configured native default.
     pub async fn create_session(
         &self,
         title: &str,
-        model: &ModelRef,
+        model: Option<&ModelRef>,
         directory: &str,
         deadline: Instant,
     ) -> std::result::Result<SessionInfo, HttpOutcome> {
@@ -175,7 +176,7 @@ impl OpenCodeHttp {
         }
         let body = serde_json::to_value(SessionCreateRequest {
             title: Some(title.to_owned()),
-            model: Some(model.clone()),
+            model: model.cloned(),
             location: Some(LocationRef {
                 directory: location_directory,
             }),
@@ -1148,7 +1149,7 @@ mod tests {
             variant: None,
         };
         match http
-            .create_session("test", &model, &directory_text, deadline)
+            .create_session("test", Some(&model), &directory_text, deadline)
             .await
         {
             Err(HttpOutcome::NotDispatched { reason }) => {
@@ -1239,7 +1240,7 @@ mod tests {
             variant: None,
         };
         match http
-            .create_session("test", &model, &directory_text, deadline)
+            .create_session("test", Some(&model), &directory_text, deadline)
             .await
         {
             Err(HttpOutcome::Unknown { reason }) => {

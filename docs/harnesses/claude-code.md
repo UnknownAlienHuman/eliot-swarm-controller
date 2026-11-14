@@ -189,3 +189,15 @@ Use documented base URL/auth/header variables in the frozen profile; exclude unr
 owner API keys. Report unavailable effective-route facts as unknown. Verify init ordering,
 late callbacks, context expiry, request ids, resumed inputs, transcript overlap and actual
 proxy/native billing in L7. Common generation/ack/custody rules remain in the plugin spec.
+
+## Ad-hoc launch
+
+`swarm launch --harness claude [--model M] --workspace W "prompt"` is
+Owner-only and freezes a profile-equivalent snapshot from safe defaults
+(`workspace-write`, `never`, MCP `inherit`) plus flags. An omitted `--model`
+omits `--model` so the CLI default applies; the effective model is read back
+from initialize/stream. `--effort` has no mapping and is rejected. `cmd` is
+discovered deterministically (`claude.exe` on `PATH` or the standard user
+install location; `.cmd`/`.bat`/`.ps1` wrappers are refused and never frozen).
+`swarm models --harness claude` reports aliases plus the CLI default; no live
+catalogue exists.
