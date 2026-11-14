@@ -9523,6 +9523,21 @@ fn ready_muse_agent(
         .dispatch(&launch_id, now + 1)
         .expect("dispatch muse launch");
     store
+        .install_plugin_sources(
+            &agent,
+            1,
+            &launch_id,
+            &BTreeMap::from([
+                ("session".to_owned(), "stream".to_owned()),
+                ("turn".to_owned(), "stream".to_owned()),
+                ("message".to_owned(), "stream".to_owned()),
+                ("tool".to_owned(), "stream".to_owned()),
+                ("request".to_owned(), "stream".to_owned()),
+            ]),
+            now + 1,
+        )
+        .expect("install muse stream source plan");
+    store
         .put_batch(
             SourceBatch {
                 batch_id: format!("{project}:ready"),
@@ -11165,4 +11180,117 @@ fn local_user_event_atomic_commit_rejects_mismatch_and_leaves_unknown() {
     let command = store.get_command(&legacy).unwrap().unwrap();
     assert_eq!(command.state, CommandState::Unknown);
     assert_eq!(command.outcome, Some(json!({"reason": "daemon_restart"})));
+}
+
+#[test]
+fn projection_gap_turn_unknown_settles_once_without_resurrection() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let (agent, _, _, _) = ready_muse_agent(
+        &mut store,
+        "projection-gap",
+        "muse-test",
+        "synthetic-projection-gap",
+        now,
+    );
+    let send = send_request(&agent, 1, "projection gap turn");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now + 4).expect("admit send");
+    store.dispatch(&send_id, now + 5).expect("dispatch send");
+    let turn_id = format!("fake-turn-{send_id}");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("projection-gap-{send_id}-started"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: format!("projection-gap-{send_id}:started"),
+                    data: json!({"command_id": send_id, "turn_id": turn_id.clone()}),
+                }],
+                cursor: None,
+            },
+            now + 6,
+        )
+        .expect("commit turn started");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("projection-gap-{send_id}-unknown"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.unknown".to_owned(),
+                    native_id: format!("projection-gap-{send_id}:turn.unknown"),
+                    data: json!({
+                        "command_id": send_id,
+                        "turn_id": turn_id.clone(),
+                        "reason": "Muse native view recovery did not prove live delivery after the recorded gap (projectionUnavailable)",
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 7,
+        )
+        .expect("commit turn unknown");
+    let agent_row = store
+        .get_agent(&agent)
+        .expect("read agent")
+        .expect("agent row");
+    assert_eq!(agent_row.state, AgentState::Idle);
+    assert_eq!(agent_row.active_turn, None);
+    assert!(!agent_row.is_terminal());
+    let turn = store
+        .get_turn(&agent, 1, &turn_id)
+        .expect("read turn")
+        .expect("turn row");
+    assert_eq!(turn.state, TurnState::Unknown);
+    assert_eq!(turn.outcome, Some(TurnOutcome::Unknown));
+    let late = store.put_batch(
+        SourceBatch {
+            batch_id: format!("projection-gap-{send_id}-late"),
+            agent_id: agent.clone(),
+            generation: 1,
+            source: "stream".to_owned(),
+            events: vec![NativeEvent {
+                ts: None,
+                kind: "turn.completed".to_owned(),
+                native_id: format!("projection-gap-{send_id}:late-completed"),
+                data: json!({"command_id": send_id, "turn_id": turn_id.clone(), "status": "completed"}),
+            }],
+            cursor: None,
+        },
+        now + 8,
+    );
+    assert!(
+        late.is_err(),
+        "late terminal must not resurrect the unknown turn"
+    );
+    let duplicate = store.put_batch(
+        SourceBatch {
+            batch_id: format!("projection-gap-{send_id}-unknown-again"),
+            agent_id: agent.clone(),
+            generation: 1,
+            source: "stream".to_owned(),
+            events: vec![NativeEvent {
+                ts: None,
+                kind: "turn.unknown".to_owned(),
+                native_id: format!("projection-gap-{send_id}:turn.unknown-again"),
+                data: json!({"command_id": send_id, "turn_id": turn_id.clone(), "reason": "retry"}),
+            }],
+            cursor: None,
+        },
+        now + 9,
+    );
+    assert!(duplicate.is_err(), "turn unknown settles exactly once");
+    let turn = store
+        .get_turn(&agent, 1, &turn_id)
+        .expect("read turn")
+        .expect("turn row");
+    assert_eq!(turn.state, TurnState::Unknown);
 }

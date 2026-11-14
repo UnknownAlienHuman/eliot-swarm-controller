@@ -1217,6 +1217,28 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 completed_at: now,
             });
         }
+        "turn.unknown" => {
+            // Live-host projection loss with failed view recovery: settle only
+            // the active turn unknown, keep the session alive for a later
+            // send/stop. Never a success or failure outcome.
+            require_live_turn(agent, event)?;
+            let command_id = required_text(event, "command_id")?;
+            let turn_id = required_text(event, "turn_id")?;
+            next.state = AgentState::Idle;
+            next.active_turn = None;
+            next.pending.clear();
+            effects.push(Effect::TurnTerminal {
+                command_id: Some(command_id),
+                turn_id,
+                state: TurnState::Unknown,
+                status: None,
+                outcome: Some(TurnOutcome::Unknown),
+                native_status: None,
+                final_text: None,
+                usage: None,
+                completed_at: now,
+            });
+        }
         "session.ended" => {
             if !matches!(
                 agent.state,

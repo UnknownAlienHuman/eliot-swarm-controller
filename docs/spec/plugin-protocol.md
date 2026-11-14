@@ -510,7 +510,11 @@ turn evidence is committed before retirement; retirement never manufactures
 `session.ended` or changes an already-applied command. The daemon independently
 confirms its owned plugin exit and drains the plugin reader before its existing
 generation-fenced loss settlement. Without a committed terminal turn, the running
-turn becomes `unknown`; completed turns remain completed. Retiring or duplicate
+turn becomes `unknown`; completed turns remain completed. A live host whose view
+projection fails without recovery settles only the gapped turn `unknown` via a
+committed `turn.unknown` fact (exact command/turn binding with the gap reason),
+without retiring the plugin, closing the session, or marking the Agent lost;
+later facts for that turn must not resurrect it. Retiring or duplicate
 exit observations cannot settle a newer generation and never authorize replay.
 An event owner closing before the tail barrier or a drain deadline expiring is
 an explicit unknown retirement error, never successful tail settlement. Retirement

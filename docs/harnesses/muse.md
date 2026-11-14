@@ -107,12 +107,20 @@ cursor after the observed subscription head, followed by acknowledged `ok` sourc
 health, can restore live observation; the historical gap stays visible. An actual
 replayed terminal can complete the exact turn while source health remains stale.
 An interrupt refused during the gap names the unavailable-view reason explicitly.
+When the recovery window expires without live proof (or recovery cannot be
+attempted), the adapter settles the active turn `unknown` with the recorded gap
+through the shared turn-unknown path (`turn.unknown` with the exact
+command/turn binding and the gap reason), never as success or failure. The
+plugin host stays alive and the Agent is not marked lost; the session remains
+for a later send/stop. Later facts for that turn gap instead of resurrecting
+it, and interrupt/stop afterwards behave as for any unknown turn.
 Subscription admission alone, a private page, or a timer never proves native turn
 completion or process/session exit. Live recovery after projection failure remains
 unqualified until exercised through Swarm by the controller.
-PR #422's shared native-exit lifecycle helper applies after actual endpoint exit;
-projection unavailability alone cannot invoke that exit path. This adapter does
-not copy that helper or report a stopped session to stand in for lost observation.
+PR #422's shared native-exit lifecycle helper still applies only after actual
+endpoint exit; projection unavailability alone cannot invoke that exit path.
+The projection path reuses the turn-unknown settlement without retiring the
+plugin or reporting a stopped session to stand in for lost observation.
 
 Guard a pending-request snapshot with a local observation counter so a newer stream
 resolution cannot be overwritten by stale snapshot data. This is an in-memory race guard,

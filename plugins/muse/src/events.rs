@@ -3427,10 +3427,82 @@ impl EventProcessor {
     async fn expire_view_recovery(&mut self) {
         self.view_recovery = None;
         self.status.source_unknown = true;
-        self.status.failure = Some(
-            "Muse native view recovery did not prove live delivery after the recorded gap"
-                .to_owned(),
+        self.settle_projection_gap_unknown().await;
+        if self.status.failure.is_none() {
+            self.status.failure = Some(
+                "Muse native view recovery did not prove live delivery after the recorded gap"
+                    .to_owned(),
+            );
+        }
+    }
+
+    /// Settle the projection-gapped turn `unknown` through the shared
+    /// turn-unknown path, never as success or failure. The plugin host stays
+    /// alive and the Agent is not marked lost: only the active turn is
+    /// cleared, so a later replayed terminal for the same turn gaps instead
+    /// of resurrecting it, and a later stop settles the session normally.
+    /// Idempotent: with no active turn there is nothing to settle.
+    async fn settle_projection_gap_unknown(&mut self) {
+        let (Some(command_id), Some(turn_id)) = (
+            self.status.active_command_id.clone(),
+            self.status.active_turn_id.clone(),
+        ) else {
+            return;
+        };
+        let reason_label = self
+            .status
+            .view_unavailable_reason
+            .map(|reason| reason.label().to_owned())
+            .unwrap_or_else(|| "unknown".to_owned());
+        let reason = format!(
+            "Muse native view recovery did not prove live delivery after the recorded gap ({reason_label})"
         );
+        let session_id = self.status.session_id.clone().unwrap_or_default();
+        let data = json!({
+            "command_id": command_id.clone(),
+            "turn_id": turn_id.clone(),
+            "reason": reason.clone(),
+        });
+        match event_id(&session_id, &turn_id, &turn_id, "turn.unknown") {
+            Ok(native_id) => {
+                let _ = self.commit_event("turn.unknown", native_id, data).await;
+                self.status.failure = Some(reason);
+            }
+            Err(_) => {
+                self.status.failure = Some(reason);
+            }
+        }
+        self.clear_projection_gap_turn(&command_id, &turn_id);
+    }
+
+    fn clear_projection_gap_turn(&mut self, command_id: &str, turn_id: &str) {
+        let dropped = self
+            .pending_requests
+            .iter()
+            .filter(|(_, entry)| entry.request.turn_id == turn_id)
+            .filter_map(|(id, entry)| {
+                pending_native_id(&entry.request).map(|native| (id.clone(), native.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        if !dropped.is_empty() {
+            let observed = self.observe();
+            for (request_id, native_id) in dropped {
+                self.pending_requests.remove(&request_id);
+                self.native_index.remove(&native_id);
+                self.remember_dropped(native_id, observed);
+            }
+        }
+        self.expected_requests.clear();
+        self.final_text = None;
+        self.status.last_turn = Some(TurnFacts {
+            command_id: command_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            status: None,
+            final_text: None,
+            terminal: false,
+        });
+        self.status.active_turn_id = None;
+        self.status.active_command_id = None;
     }
 
     fn invalidate_view_recovery(&mut self) {
@@ -4138,6 +4210,10 @@ mod tests {
         assert_eq!(
             event_id("session", "turn", "item", "message.completed").unwrap(),
             "muse:session:turn:item:message.completed"
+        );
+        assert_eq!(
+            event_id("session", "turn-1", "turn-1", "turn.unknown").unwrap(),
+            "muse:session:turn-1:turn-1:turn.unknown"
         );
     }
 
