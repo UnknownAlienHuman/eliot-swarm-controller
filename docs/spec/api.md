@@ -1116,7 +1116,7 @@ swarm stats A [--generation N]
 swarm git-status A [--generation N]
 swarm edits A [--generation N] [--after PATH] [--limit N]
 swarm send A TEXT [--probe] [--wait] [--timeout-seconds N] [--generation N]
-swarm steer A TEXT --turn ID [--generation N]
+swarm steer A TEXT [--generation N] [--turn ID]
 swarm inject A TEXT --point next_input|turn_safe_point|active_turn [--generation N] [--turn ID] [--expires-at-ms MS]
 swarm interrupt|abort A [--generation N] [--turn ID]
 swarm stop A [--force] [--tree | --generation N]
@@ -1177,6 +1177,16 @@ Only current-layer commands appear in help and Agent guidance. Exit codes: 0 suc
 queued; 1 definite failure; 2 usage; 3 pre-effect rejection; 4 unknown; 5 wait timeout;
 6 still dispatched/pending; 7 interrupted/cancelled. A queued/applied input is not
 successful task completion.
+
+`steer` and `interrupt` do not require `--generation`/`--turn`. When either flag
+is omitted the CLI reads the Agent's current generation and active turn, prints
+the exact target it captured (`<verb> target: agent=A generation=N turn=T` on
+stderr), and submits exactly that binding; an explicit flag always wins over the
+captured value, and when both flags are given the CLI submits them unchanged
+with no extra read. A missing active turn fails clearly (exit 3) before any
+submit. A captured submit that the Store rejects as `stale_generation` is
+reported as a race (exit 3, `race:` message naming the submitted binding) and is
+never retried against the new turn.
 
 Prompted waits (`send --wait`, and `launch --wait` / `resume --wait` with a
 prompt) return 0 only for a positively recognized `success` outcome. Lifecycle
