@@ -722,6 +722,122 @@ pub struct TurnUsage {
     pub total_tokens: Option<i64>,
 }
 
+/// Session-scoped usage snapshot for one Agent generation. Every member is
+/// nullable: absent native data stays null, never zero. Context
+/// occupancy/capacity (`context_used_tokens`/`context_window_tokens`) and
+/// cumulative session cost are never turn expenditure: they are not
+/// represented in [`TurnUsage`], never fill its counters, and compaction can
+/// reduce occupancy. `cumulative_tokens` carries only input/output/cache
+/// counters where the native signal supplies them (never derived totals);
+/// `cumulative_cost.amount` is the verbatim native amount with `unit` the
+/// verbatim native unit (for example `usd_estimate` for an estimated USD
+/// total), never converted and never assumed to be money. `source` names the
+/// adapter and native signal (for example `codex:thread/tokenUsage/updated`);
+/// `observed_at` is native epoch milliseconds. Unknown fields are ignored so
+/// harnesses decode forward.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionUsage {
+    #[serde(default)]
+    pub context_used_tokens: Option<i64>,
+    #[serde(default)]
+    pub context_window_tokens: Option<i64>,
+    #[serde(default)]
+    pub cumulative_tokens: Option<SessionTokenTotals>,
+    #[serde(default)]
+    pub cumulative_cost: Option<SessionCost>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub observed_at: Option<i64>,
+}
+
+/// Cumulative input/output/cache counters inside [`SessionUsage`]. Only
+/// counters the native signal actually supplies are present; missing members
+/// stay null, never zero, and no total is ever derived.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionTokenTotals {
+    #[serde(default)]
+    pub input_tokens: Option<i64>,
+    #[serde(default)]
+    pub output_tokens: Option<i64>,
+    #[serde(default)]
+    pub cache_read_tokens: Option<i64>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<i64>,
+}
+
+/// Cumulative session cost inside [`SessionUsage`]. `amount` is the verbatim
+/// native amount and `unit` the verbatim native unit (for example
+/// `usd_estimate` for an estimated USD total): never converted, and a unit
+/// that is not a currency never reads as money.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionCost {
+    #[serde(default)]
+    pub amount: Option<f64>,
+    #[serde(default)]
+    pub unit: Option<String>,
+}
+
+impl SessionUsage {
+    /// Validate one decoded session snapshot at its owning boundary. Absent
+    /// members stay null; present counters must be nonnegative, the cost
+    /// amount must be finite and nonnegative, and present text must be
+    /// non-empty. Wrong types are rejected by deserialization before this.
+    pub fn validate(&self) -> Result<()> {
+        let counter = |name: &str, value: Option<i64>| {
+            if value.is_some_and(|value| value < 0) {
+                return Err(Error::new(
+                    "invalid",
+                    format!("session usage field {name} must be nonnegative"),
+                ));
+            }
+            Ok(())
+        };
+        counter("context_used_tokens", self.context_used_tokens)?;
+        counter("context_window_tokens", self.context_window_tokens)?;
+        if let Some(tokens) = &self.cumulative_tokens {
+            counter("cumulative_tokens.input_tokens", tokens.input_tokens)?;
+            counter("cumulative_tokens.output_tokens", tokens.output_tokens)?;
+            counter(
+                "cumulative_tokens.cache_read_tokens",
+                tokens.cache_read_tokens,
+            )?;
+            counter(
+                "cumulative_tokens.cache_write_tokens",
+                tokens.cache_write_tokens,
+            )?;
+        }
+        if let Some(cost) = &self.cumulative_cost {
+            if let Some(amount) = cost.amount
+                && !(amount.is_finite() && amount >= 0.0)
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "session usage field cumulative_cost.amount must be a finite nonnegative number",
+                ));
+            }
+            if let Some(unit) = &cost.unit
+                && unit.trim().is_empty()
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "session usage field cumulative_cost.unit must be a non-empty string",
+                ));
+            }
+        }
+        if let Some(source) = &self.source
+            && source.trim().is_empty()
+        {
+            return Err(Error::new(
+                "invalid",
+                "session usage field source must be a non-empty string",
+            ));
+        }
+        counter("observed_at", self.observed_at)?;
+        Ok(())
+    }
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitCommand {
@@ -889,6 +1005,9 @@ pub enum Effect {
         #[serde(default)]
         usage: Option<TurnUsage>,
         completed_at: i64,
+    },
+    SessionUsageUpdated {
+        usage: SessionUsage,
     },
 }
 
@@ -1278,6 +1397,19 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             // Pure watch facts: exact active-turn binding only, no state change.
             require_live_turn(agent, event)?;
         }
+        "session.usage" => {
+            // Session-scoped usage snapshot for this Agent generation: no
+            // turn binding (occupancy and cumulative cost are not turn
+            // expenditure) and no projection change beyond the snapshot
+            // itself. Turn-scoped validation stays unchanged.
+            let mut usage = optional_session_usage(event)?
+                .ok_or_else(|| Error::new("invalid", "session.usage requires a usage object"))?;
+            usage.validate()?;
+            if usage.observed_at.is_none() {
+                usage.observed_at = event.ts.or(Some(now));
+            }
+            effects.push(Effect::SessionUsageUpdated { usage });
+        }
         "hook.before_model" => {
             // Receipt authority stays in Store settlement: selection
             // (claim) requires the exact active turn, but a confirmed
@@ -1400,6 +1532,24 @@ fn optional_usage(event: &NativeEvent) -> Result<Option<TurnUsage>> {
         Some(_) => Err(Error::new(
             "invalid",
             format!("{} field usage must be a usage object", event.kind),
+        )),
+    }
+}
+
+fn optional_session_usage(event: &NativeEvent) -> Result<Option<SessionUsage>> {
+    match event.data.get("usage") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(_)) => {
+            serde_json::from_value(event.data["usage"].clone()).map_err(|_| {
+                Error::new(
+                    "invalid",
+                    format!("{} field usage must be a session usage object", event.kind),
+                )
+            })
+        }
+        Some(_) => Err(Error::new(
+            "invalid",
+            format!("{} field usage must be a session usage object", event.kind),
         )),
     }
 }
@@ -1574,6 +1724,161 @@ mod outcome_tests {
                 "status={status:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod session_usage_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn live_agent() -> Agent {
+        let mut agent = Agent::new("a1", "project", "codex", "fake", 0);
+        agent.state = AgentState::Idle;
+        agent
+    }
+
+    fn usage_event(usage: Value, ts: Option<i64>) -> NativeEvent {
+        NativeEvent {
+            kind: "session.usage".to_owned(),
+            native_id: "n1".to_owned(),
+            data: json!({"usage": usage}),
+            ts,
+        }
+    }
+
+    #[test]
+    fn session_usage_applies_snapshot_and_defaults_observed_at() {
+        let agent = live_agent();
+        let (next, effects) = apply(
+            &agent,
+            &usage_event(
+                json!({
+                    "context_used_tokens": 100,
+                    "context_window_tokens": 200000,
+                    "cumulative_tokens": {"input_tokens": 10, "output_tokens": 20},
+                    "cumulative_cost": {"amount": 0.5, "unit": "usd_estimate"},
+                    "source": "codex:thread/tokenUsage/updated",
+                }),
+                None,
+            ),
+            42,
+        )
+        .unwrap();
+        assert_eq!(effects.len(), 1);
+        let Effect::SessionUsageUpdated { usage } = &effects[0] else {
+            panic!("expected SessionUsageUpdated, got {:?}", effects[0]);
+        };
+        assert_eq!(usage.context_used_tokens, Some(100));
+        assert_eq!(usage.context_window_tokens, Some(200000));
+        assert_eq!(
+            usage
+                .cumulative_tokens
+                .as_ref()
+                .and_then(|tokens| tokens.input_tokens),
+            Some(10)
+        );
+        assert_eq!(
+            usage
+                .cumulative_cost
+                .as_ref()
+                .and_then(|cost| cost.unit.as_deref()),
+            Some("usd_estimate")
+        );
+        assert_eq!(usage.observed_at, Some(42));
+        // Session scope never touches turn binding or lifecycle.
+        assert_eq!(next.state, AgentState::Idle);
+        assert_eq!(next.active_turn, None);
+        assert!(next.pending.is_empty());
+    }
+
+    #[test]
+    fn session_usage_keeps_explicit_observed_at_and_nulls_absent_fields() {
+        let agent = live_agent();
+        let (_, effects) = apply(
+            &agent,
+            &usage_event(
+                json!({"source": "claude:result", "observed_at": 7}),
+                Some(99),
+            ),
+            42,
+        )
+        .unwrap();
+        let Effect::SessionUsageUpdated { usage } = &effects[0] else {
+            panic!("expected SessionUsageUpdated, got {:?}", effects[0]);
+        };
+        assert_eq!(usage.observed_at, Some(7));
+        assert_eq!(usage.context_used_tokens, None);
+        assert_eq!(usage.cumulative_tokens, None);
+        assert_eq!(usage.cumulative_cost, None);
+    }
+
+    #[test]
+    fn session_usage_requires_a_usage_object_and_validates_it() {
+        let agent = live_agent();
+        for data in [
+            json!({}),
+            json!({"usage": Value::Null}),
+            json!({"usage": []}),
+            json!({"usage": {"context_used_tokens": -1}}),
+            json!({"usage": {"cumulative_cost": {"amount": -0.5}}}),
+        ] {
+            let event = NativeEvent {
+                kind: "session.usage".to_owned(),
+                native_id: "n1".to_owned(),
+                data,
+                ts: None,
+            };
+            assert!(apply(&agent, &event, 42).is_err());
+        }
+        // Non-finite costs are rejected at the owning boundary too.
+        let infinite = SessionUsage {
+            context_used_tokens: None,
+            context_window_tokens: None,
+            cumulative_tokens: None,
+            cumulative_cost: Some(SessionCost {
+                amount: Some(f64::INFINITY),
+                unit: Some("usd_estimate".to_owned()),
+            }),
+            source: None,
+            observed_at: None,
+        };
+        assert!(infinite.validate().is_err());
+    }
+
+    #[test]
+    fn session_usage_never_derives_or_clears_turn_usage() {
+        // A session snapshot commits without any turn effect or projection
+        // change, so per-turn TurnUsage can never gain session counters.
+        let agent = live_agent();
+        let (next, effects) = apply(
+            &agent,
+            &usage_event(json!({"cumulative_tokens": {"input_tokens": 9}}), None),
+            42,
+        )
+        .unwrap();
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::TurnTerminal { .. })),
+            "session facts must not emit turn effects"
+        );
+        let untouched = TurnUsage {
+            scope: None,
+            message_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            reasoning_tokens: None,
+            thinking_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            total_tokens: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&untouched).unwrap()["input_tokens"],
+            Value::Null
+        );
+        assert_eq!(next.state, agent.state);
     }
 }
 

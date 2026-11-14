@@ -208,11 +208,13 @@ stands in for another. ACP v1 `usage_update` carries context occupancy
 optional cumulative session `cost` with its currency/unit: session-scoped
 facts, not per-turn input/output totals. The adapter ignores them for turn
 attribution, so occupancy changes (compaction can reduce `used`) can never
-read as token expenditure. Live emission of `usage_update` by the
+read as token expenditure. The adapter folds `usage_update` into the
+retained `SessionUsage` snapshot and commits it as `session.usage` (source
+`antigravity:usage_update`): `used`/`size` replace the retained context
+counters and a supplied cost replaces the retained cumulative cost with
+its verbatim unit. Live emission of `usage_update` by the
 installed `agy` 1.5.3 server was not exercised (no model calls in this
-increment); when surfaced, occupancy and cost belong in separate
-session-scoped facts with units, source identity and freshness, never in
-`TurnUsage`.
+increment); occupancy and cost are never mapped to `TurnUsage`.
 
 There is no replay cursor/history API. Snapshots expose retained stream
 facts, not a native history poll. Loss means an explicit gap. Do not

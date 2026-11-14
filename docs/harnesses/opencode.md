@@ -110,7 +110,9 @@ assistant message in that slice (or no native tokens on the newest one)
 means unavailable usage: never an earlier message's usage, never a sum,
 never zero. The per-message counters' delta-vs-cumulative semantics are
 unverified, so the adapter retains message scope and does not aggregate
-across the slice.
+across the slice. No verified session-scoped usage field exists on this
+harness (per-message `tokens` are the only installed usage signal), so the
+adapter commits no `session.usage` fact; `session_usage` stays null.
 
 ## Source ownership and recovery
 

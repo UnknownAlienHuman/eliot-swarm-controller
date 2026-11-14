@@ -32,7 +32,7 @@ use crate::native::{
         CanUseToolBody, CommandLifecycle, ControlCancelRequest, HookCallbackBody,
         HookCallbackResponse, OutboundControlResponse, OutboundControlResponseBody,
         PermissionResult, ResultRecord, assistant_model, assistant_text, assistant_tool_use_ids,
-        result_usage,
+        result_session_usage, result_usage,
     },
 };
 
@@ -2885,6 +2885,10 @@ impl EventProcessor {
         if let Some(usage) = result_usage(record) {
             data["usage"] = serde_json::to_value(&usage).unwrap_or(Value::Null);
         }
+        // Optional cumulative session cost from `total_cost_usd`, held for the
+        // session fact that commits after the accepted terminal. Absent or
+        // unusable cost simply commits no session fact.
+        let session_usage = result_session_usage(record);
         let final_text = self.final_text.take();
         if self.final_text_unavailable {
             attach_final_text_unavailable(&mut data, &secrets);
@@ -2903,6 +2907,7 @@ impl EventProcessor {
         // racing the terminal must see the finished turn (same order as the
         // association path, which binds active before its own commit). A
         // failed commit still latches source_unknown with this terminal.
+        let session_turn_id = turn_id.clone();
         self.status.last_turn = Some(TurnFacts {
             command_id,
             turn_id,
@@ -2923,6 +2928,15 @@ impl EventProcessor {
         self.tool_use_tracking_fenced = false;
         self.publish_now();
         self.commit_event("turn.completed", native_id, data).await?;
+        // Session-scoped cost commits as its own `session.usage` fact after
+        // the accepted terminal, so session scope and turn scope can never be
+        // confused.
+        if let Some(session_usage) = session_usage {
+            let session_id = self.status.session_id.as_deref().unwrap_or_default();
+            let native_id = format!("claude:{session_id}:{session_turn_id}:session.usage");
+            self.commit_event("session.usage", native_id, json!({"usage": session_usage}))
+                .await?;
+        }
         Ok(())
     }
 

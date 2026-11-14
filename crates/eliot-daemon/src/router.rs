@@ -2484,10 +2484,15 @@ impl Router {
                     .map_err(|_| Error::new("internal", "source state view is invalid"))
             })
             .collect::<Result<Vec<_>>>()?;
+        let session_usage = {
+            let store = self.inner.store.lock().await;
+            store.get_session_usage(&agent.id, agent.generation)?
+        };
         serde_json::to_value(AgentGetResponse {
             agent,
             observation,
             source_states,
+            session_usage,
         })
         .map_err(|_| Error::new("internal", "Agent view could not be encoded"))
     }
@@ -2673,10 +2678,15 @@ impl Router {
             ));
         }
         let observation = self.observation_view(&agent).await;
+        let session_usage = {
+            let store = self.inner.store.lock().await;
+            store.get_session_usage(&agent.id, agent.generation)?
+        };
         serde_json::to_value(AgentStatsResponse {
             agent: agent.id,
             generation: agent.generation,
             observation,
+            session_usage,
         })
         .map_err(|_| Error::new("internal", "stats view could not be encoded"))
     }

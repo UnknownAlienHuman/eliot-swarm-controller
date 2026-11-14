@@ -2,8 +2,8 @@ use crate::native_child::{
     ChildBinding, binding_from_ack, build_registration, is_admission_rejection, register_child,
 };
 use eliot_core::{
-    ChildRegistration, ContextItem, Error, ProviderRestriction, Result, SecretPolicy, SourceGap,
-    TurnUsage,
+    ChildRegistration, ContextItem, Error, ProviderRestriction, Result, SecretPolicy,
+    SessionTokenTotals, SessionUsage, SourceGap, TurnUsage,
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
@@ -32,9 +32,10 @@ use crate::native::{
     requests::{self, CorePending},
     types::{
         NativeFileChangeItem, NativeItemCompletedNotification, NativePatchChangeKind,
-        NativeServerRequestResolvedNotification, NativeThreadTokenUsageUpdatedNotification,
-        NativeTokenUsageDelta, NativeTurnCompletedNotification, NativeTurnError,
-        NativeTurnStartedNotification, NativeTurnStatus,
+        NativeServerRequestResolvedNotification, NativeThreadTokenUsage,
+        NativeThreadTokenUsageUpdatedNotification, NativeTokenUsageDelta,
+        NativeTurnCompletedNotification, NativeTurnError, NativeTurnStartedNotification,
+        NativeTurnStatus,
     },
 };
 
@@ -194,6 +195,16 @@ struct EventProcessor {
     /// repeated notification cannot double count and raw `last` values are
     /// never summed.
     turn_usage: Option<(String, NativeTokenUsageDelta, NativeTokenUsageDelta)>,
+    /// Latest merged session-scoped snapshot from
+    /// `thread/tokenUsage/updated`: the cumulative per-thread `total` and
+    /// `modelContextWindow` capacity. Never turn expenditure; committed as
+    /// `session.usage` alongside the terminal and replaced wholesale on
+    /// every newer update.
+    session_usage: Option<SessionUsage>,
+    /// Last committed session snapshot content. The terminal commits the
+    /// retained snapshot only when it differs, so quiet turns (no usage
+    /// signals) commit no session fact.
+    session_usage_committed: Option<SessionUsage>,
     native_scope: String,
     child_bindings: HashMap<String, ChildBinding>,
     child_states: HashMap<String, ChildState>,
@@ -622,6 +633,8 @@ impl EventProcessor {
             gap_reported: false,
             final_text: None,
             turn_usage: None,
+            session_usage: None,
+            session_usage_committed: None,
             native_scope: config.native_scope.clone(),
             child_bindings: HashMap::new(),
             child_states: HashMap::new(),
@@ -1746,15 +1759,19 @@ impl EventProcessor {
     }
 
     /// Fold one `thread/tokenUsage/updated` into the exact active turn's
-    /// usage baseline. The first update for a turn captures the baseline
-    /// (cumulative `total` minus that update's per-response `last`); later
-    /// updates only advance the latest cumulative `total`. An update naming
-    /// any other turn (late, stale, or pre-association) is dropped without a
-    /// gap: the terminal turn keeps null usage rather than another turn's
-    /// counters. An update without the cumulative `total` cannot anchor the
-    /// robust difference, so it leaves the retained snapshots alone.
-    /// Structural mismatch (wrong thread, malformed body) gaps like any
-    /// other notification arm.
+    /// usage baseline and the generation's retained session snapshot. The
+    /// first update for a turn captures the baseline (cumulative `total`
+    /// minus that update's per-response `last`); later updates only advance
+    /// the latest cumulative `total`. An update naming any other turn (late,
+    /// stale, or pre-association) is dropped without a gap: the terminal
+    /// turn keeps null usage rather than another turn's counters. An update
+    /// without the cumulative `total` cannot anchor the robust difference,
+    /// so it leaves the turn baseline alone. The cumulative per-thread
+    /// `total` and `modelContextWindow` capacity additionally merge into the
+    /// retained session snapshot, committed as `session.usage` alongside the
+    /// terminal: session-scoped facts, never turn expenditure. Structural
+    /// mismatch (wrong thread, malformed body) gaps like any other
+    /// notification arm.
     fn note_token_usage(&mut self, params: &Value) -> Result<()> {
         let notification: NativeThreadTokenUsageUpdatedNotification =
             serde_json::from_value(params.clone()).map_err(|_| {
@@ -1767,17 +1784,21 @@ impl EventProcessor {
         if self.status.active_turn_id.as_deref() != Some(notification.turn_id.as_str()) {
             return Ok(());
         }
-        let Some(total) = notification.token_usage.total.clone() else {
-            return Ok(());
-        };
-        match self.turn_usage.as_mut() {
-            Some((turn_id, _, latest)) if turn_id == &notification.turn_id => {
-                *latest = total;
+        if let Some(total) = notification.token_usage.total.clone() {
+            match self.turn_usage.as_mut() {
+                Some((turn_id, _, latest)) if turn_id == &notification.turn_id => {
+                    *latest = total;
+                }
+                _ => {
+                    let baseline = usage_baseline(&total, &notification.token_usage.last);
+                    self.turn_usage = Some((notification.turn_id, baseline, total));
+                }
             }
-            _ => {
-                let baseline = usage_baseline(&total, &notification.token_usage.last);
-                self.turn_usage = Some((notification.turn_id, baseline, total));
-            }
+        }
+        if let Some(merged) =
+            session_usage_from_token_usage(&notification.token_usage, self.session_usage.as_ref())
+        {
+            self.session_usage = Some(merged);
         }
         Ok(())
     }
@@ -1847,6 +1868,24 @@ impl EventProcessor {
             "turn.completed",
         )?;
         self.commit_event("turn.completed", native_id, data).await?;
+        // Session-scoped snapshot from `thread/tokenUsage/updated` commits
+        // as its own `session.usage` fact after the accepted terminal, so
+        // session scope and turn scope can never be confused. Commits only
+        // when the retained snapshot changed since the last session fact,
+        // so quiet turns commit nothing extra.
+        if self.session_usage != self.session_usage_committed
+            && let Some(usage) = self.session_usage.clone()
+        {
+            let session_id = event_id(
+                self.status.thread_id.as_deref().unwrap_or_default(),
+                &notification.turn.id,
+                "session",
+                "session.usage",
+            )?;
+            self.commit_event("session.usage", session_id, json!({"usage": usage}))
+                .await?;
+            self.session_usage_committed = Some(usage);
+        }
         let closed_requests = self
             .transport_requests
             .iter()
@@ -3079,6 +3118,58 @@ fn turn_usage_from_delta(delta: &NativeTokenUsageDelta) -> Option<TurnUsage> {
     })
 }
 
+/// Merge one `thread/tokenUsage/updated` body into the retained session
+/// snapshot: the cumulative per-thread `total` replaces the retained
+/// cumulative counters (input/output/cache only, never a derived total) and
+/// `modelContextWindow` replaces the retained capacity. Yields `None` when
+/// the update contributes nothing new, so repeats commit nothing. Negative
+/// counters stay null (never zero); an update with no usable cumulative
+/// content keeps the retained snapshot.
+fn session_usage_from_token_usage(
+    token_usage: &NativeThreadTokenUsage,
+    previous: Option<&SessionUsage>,
+) -> Option<SessionUsage> {
+    let counter = |value: Option<i64>| value.filter(|value| *value >= 0);
+    let mut merged = previous.cloned().unwrap_or(SessionUsage {
+        context_used_tokens: None,
+        context_window_tokens: None,
+        cumulative_tokens: None,
+        cumulative_cost: None,
+        source: None,
+        observed_at: None,
+    });
+    let mut changed = false;
+    if let Some(total) = &token_usage.total {
+        let totals = SessionTokenTotals {
+            input_tokens: counter(total.input_tokens),
+            output_tokens: counter(total.output_tokens),
+            cache_read_tokens: counter(total.cached_input_tokens),
+            cache_write_tokens: counter(total.cache_write_input_tokens),
+        };
+        if (totals.input_tokens.is_some()
+            || totals.output_tokens.is_some()
+            || totals.cache_read_tokens.is_some()
+            || totals.cache_write_tokens.is_some())
+            && merged.cumulative_tokens.as_ref() != Some(&totals)
+        {
+            merged.cumulative_tokens = Some(totals);
+            changed = true;
+        }
+    }
+    if let Some(window) = counter(token_usage.model_context_window)
+        && merged.context_window_tokens != Some(window)
+    {
+        merged.context_window_tokens = Some(window);
+        changed = true;
+    }
+    if !changed {
+        return None;
+    }
+    merged.source = Some("codex:thread/tokenUsage/updated".to_owned());
+    merged.observed_at = None;
+    Some(merged)
+}
+
 fn validate_thread_and_turn(status: &EventStatus, thread_id: &str, turn_id: &str) -> Result<()> {
     if status.thread_id.as_deref() != Some(thread_id) || turn_id.trim().is_empty() {
         return Err(Error::new(
@@ -3734,6 +3825,72 @@ mod tests {
             total_tokens: None,
             cache_write_input_tokens: None,
         }
+    }
+
+    #[test]
+    fn session_usage_from_token_usage_maps_cumulative_and_capacity_only() {
+        let body = NativeThreadTokenUsage {
+            last: breakdown(Some(1), Some(1)),
+            total: Some(NativeTokenUsageDelta {
+                input_tokens: Some(110),
+                cached_input_tokens: Some(53),
+                output_tokens: Some(55),
+                reasoning_output_tokens: Some(7),
+                total_tokens: Some(165),
+                cache_write_input_tokens: Some(9),
+            }),
+            model_context_window: Some(200_000),
+        };
+        let merged = session_usage_from_token_usage(&body, None).expect("cumulative maps");
+        let totals = merged
+            .cumulative_tokens
+            .as_ref()
+            .expect("cumulative counters");
+        assert_eq!(totals.input_tokens, Some(110));
+        assert_eq!(totals.output_tokens, Some(55));
+        assert_eq!(totals.cache_read_tokens, Some(53));
+        assert_eq!(totals.cache_write_tokens, Some(9));
+        assert_eq!(merged.context_window_tokens, Some(200_000));
+        assert_eq!(merged.context_used_tokens, None);
+        assert_eq!(merged.cumulative_cost, None);
+        assert_eq!(
+            merged.source.as_deref(),
+            Some("codex:thread/tokenUsage/updated")
+        );
+        // A repeat contributes nothing new, so it commits nothing.
+        assert_eq!(session_usage_from_token_usage(&body, Some(&merged)), None);
+        // A window-only update without the cumulative total keeps the
+        // retained counters while replacing the capacity.
+        let window_only = NativeThreadTokenUsage {
+            last: breakdown(None, None),
+            total: None,
+            model_context_window: Some(100_000),
+        };
+        let resized = session_usage_from_token_usage(&window_only, Some(&merged))
+            .expect("capacity change merges");
+        assert_eq!(resized.context_window_tokens, Some(100_000));
+        assert_eq!(
+            resized
+                .cumulative_tokens
+                .as_ref()
+                .and_then(|totals| totals.input_tokens),
+            Some(110),
+            "capacity update must keep the retained cumulative counters"
+        );
+        // Negative counters stay null instead of zero or negative.
+        let negative = NativeThreadTokenUsage {
+            last: breakdown(None, None),
+            total: Some(NativeTokenUsageDelta {
+                input_tokens: Some(-4),
+                cached_input_tokens: None,
+                output_tokens: None,
+                reasoning_output_tokens: None,
+                total_tokens: None,
+                cache_write_input_tokens: None,
+            }),
+            model_context_window: Some(-1),
+        };
+        assert_eq!(session_usage_from_token_usage(&negative, None), None);
     }
 
     #[test]

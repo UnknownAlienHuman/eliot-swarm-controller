@@ -6879,16 +6879,19 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
         .dispatch(&launch_id, now + 1)
         .expect("dispatch launch");
     // Return the file to schema 16, as an older binary left it, and upgrade.
-    // Drop the v32 attention-wake table first so the reopen exercises
-    // its migration block. Drop the v29/v30 activity artifacts next: the
-    // v30 events triggers would otherwise fire during the table rebuilds
-    // below while their native_child_registrations reads no longer
-    // resolve (#418). Drop the v31 fleet indexes too, or the parent-column
-    // drop below fails and the reopen would recreate existing indexes.
+    // Drop the v33 session-usage table first so the reopen exercises
+    // its migration block, then the v32 attention-wake table. Drop the
+    // v29/v30 activity artifacts next: the v30 events triggers would
+    // otherwise fire during the table rebuilds below while their
+    // native_child_registrations reads no longer resolve (#418). Drop the
+    // v31 fleet indexes too, or the parent-column drop below fails and the
+    // reopen would recreate existing indexes.
     store
         .connection
         .execute_batch(
-            "DROP TABLE attention_wakes;
+            "DROP TABLE session_usage;
+             DELETE FROM schema_migrations WHERE version = 33;
+             DROP TABLE attention_wakes;
              DELETE FROM schema_migrations WHERE version = 32;
              DROP INDEX agents_list_state;
              DROP INDEX agents_list_project;
@@ -12150,5 +12153,119 @@ fn startup_lost_agents_pages_beyond_the_first_bound() {
     assert_eq!(
         losses[0].event_seq, None,
         "missing evidence surfaces as no sequence, never seq 0"
+    );
+}
+
+#[test]
+fn session_usage_keeps_only_the_latest_snapshot() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_agent(&mut store, "session-usage", now);
+    assert!(
+        store
+            .get_session_usage(&agent, 1)
+            .expect("read absent session usage")
+            .is_none()
+    );
+
+    let commit =
+        |store: &mut Store, batch_id: &str, native_id: &str, usage: serde_json::Value, at: i64| {
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: batch_id.to_owned(),
+                        agent_id: agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "session.usage".to_owned(),
+                            native_id: native_id.to_owned(),
+                            data: json!({"usage": usage}),
+                        }],
+                        cursor: None,
+                    },
+                    at,
+                )
+                .expect("commit session usage");
+        };
+
+    // First snapshot commits with the caller timestamp as observed_at.
+    commit(
+        &mut store,
+        "session-usage:1",
+        "session-usage:n1",
+        json!({
+            "context_used_tokens": 10,
+            "context_window_tokens": 1000,
+            "source": "codex:thread/tokenUsage/updated",
+        }),
+        now + 1,
+    );
+    let first = store
+        .get_session_usage(&agent, 1)
+        .expect("read session usage")
+        .expect("snapshot retained");
+    assert_eq!(first.context_used_tokens, Some(10));
+    assert_eq!(
+        first.source.as_deref(),
+        Some("codex:thread/tokenUsage/updated")
+    );
+
+    // A newer snapshot replaces the retained one.
+    commit(
+        &mut store,
+        "session-usage:2",
+        "session-usage:n2",
+        json!({
+            "context_used_tokens": 20,
+            "context_window_tokens": 1000,
+            "cumulative_cost": {"amount": 0.5, "unit": "usd_estimate"},
+            "source": "antigravity:usage_update",
+        }),
+        now + 2,
+    );
+    let second = store
+        .get_session_usage(&agent, 1)
+        .expect("read session usage")
+        .expect("snapshot replaced");
+    assert_eq!(second.context_used_tokens, Some(20));
+    assert_eq!(second.source.as_deref(), Some("antigravity:usage_update"));
+
+    // An older snapshot never regresses the readback.
+    commit(
+        &mut store,
+        "session-usage:3",
+        "session-usage:n3",
+        json!({
+            "context_used_tokens": 5,
+            "context_window_tokens": 1000,
+            "source": "codex:thread/tokenUsage/updated",
+            "observed_at": now,
+        }),
+        now + 3,
+    );
+    assert_eq!(
+        store
+            .get_session_usage(&agent, 1)
+            .expect("read session usage"),
+        Some(second.clone()),
+        "older snapshot must not replace a newer one"
+    );
+
+    // A byte-identical duplicate is ignored, even on a newer commit.
+    commit(
+        &mut store,
+        "session-usage:4",
+        "session-usage:n4",
+        serde_json::to_value(&second).expect("encode snapshot"),
+        now + 4,
+    );
+    assert_eq!(
+        store
+            .get_session_usage(&agent, 1)
+            .expect("read session usage"),
+        Some(second),
+        "duplicate snapshot must not replace the retained one"
     );
 }

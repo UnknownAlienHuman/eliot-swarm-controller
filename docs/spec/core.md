@@ -553,6 +553,11 @@ CREATE TABLE turns (
   final_text TEXT, usage TEXT, started_at INTEGER, completed_at INTEGER,
   PRIMARY KEY(agent,generation,turn_id)
 );
+CREATE TABLE session_usage (
+  agent INTEGER NOT NULL, generation INTEGER NOT NULL,
+  snapshot TEXT NOT NULL, observed_at INTEGER NOT NULL CHECK(observed_at >= 0),
+  PRIMARY KEY(agent,generation)
+);
 
 `turns.outcome` is the canonical task outcome (`success` | `failure` |
 `interrupted` | `unknown`) decided at the plugin boundary from the adapter's
@@ -590,7 +595,25 @@ cumulative session cost are separate session-scoped facts: they are never
 written here and never fill `input_tokens`/`total_tokens` (compaction can
 reduce occupancy, and cumulative cost needs its own unit). Missing per-turn
 counters stay null. `total_tokens` is set only when the native signal
-supplies a turn-scoped total, never derived from other members. `agents.pending` is the serialized
+supplies a turn-scoped total, never derived from other members. Session facts
+never derive per-turn usage: a terminal with no native turn counters keeps
+null usage even when session facts exist for that generation.
+
+`session_usage` retains only the latest serialized `SessionUsage` snapshot
+per Agent generation, committed from `session.usage` `data.usage` (`source`
+names the adapter and native signal, `observed_at` is native epoch
+milliseconds defaulted at the owning boundary). A newer snapshot replaces
+the retained one; an older snapshot or a byte-identical duplicate is
+ignored, so replays and out-of-order deliveries can never inflate or regress
+the readback. `context_used_tokens`/`context_window_tokens` carry occupancy
+and capacity, `cumulative_tokens` carries only input/output/cache counters
+where supplied (never a derived total), and `cumulative_cost` carries the
+verbatim native amount with its verbatim native unit (for example
+`usd_estimate` for an estimated USD total), never converted and never
+assumed to be money. There is no history table and no rollup: only the
+latest snapshot reads back, through `agent.get`/`agent.stats`
+`session_usage` in its own session-scope section.
+`agents.pending` is the serialized
 pending-request projection; `pending_requests` stores
 indexed request lifecycle rows. These are separate current Store structures, not
 interchangeable schemas. `git_workspaces` stores the workspace Git-head cache. The

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 32;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 33;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -783,6 +783,24 @@ impl Store {
                  );
                  CREATE INDEX attention_wakes_thread ON attention_wakes(thread);
                  INSERT INTO schema_migrations(version) VALUES (32);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 33 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE session_usage (
+                     agent INTEGER NOT NULL REFERENCES agents(id),
+                     generation INTEGER NOT NULL CHECK(generation > 0),
+                     snapshot TEXT NOT NULL,
+                     observed_at INTEGER NOT NULL CHECK(observed_at >= 0),
+                     PRIMARY KEY(agent, generation)
+                 );
+                 INSERT INTO schema_migrations(version) VALUES (33);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
