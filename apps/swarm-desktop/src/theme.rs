@@ -37,6 +37,7 @@ pub const MUTED_OPACITY: f64 = 0.72;
 pub mod layout {
     pub const NAV_WIDTH: f64 = 248.0;
     pub const READING_WIDTH: f64 = 820.0;
+    pub const MONITOR_WIDTH: f64 = 380.0;
     pub const COMPOSER_HEIGHT: f64 = 96.0;
 }
 

@@ -14,8 +14,8 @@ use eliot_core::api::{
     AgentGetRequest, AgentGetResponse, AgentListRequest, AgentListResponse, AgentResultRequest,
     AgentResultResponse, CommandGetRequest, CommandSubmitRequest, CommandSubmitResponse,
     EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
-    EventsSubscribeRequest, EventsSubscribeResponse, ProjectRegistrationView,
-    discovery::ProjectListRequest,
+    EventsSubscribeRequest, EventsSubscribeResponse, ProjectRegistrationView, UsageSummaryRequest,
+    UsageSummaryResponse, discovery::ProjectListRequest,
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -434,5 +434,39 @@ pub async fn submit_answer(
     )?;
     request.expected_generation = Some(generation);
     request.request_id = Some(request_id.to_owned());
+    submit(data_dir, &request).await
+}
+
+/// Bounded usage totals with explicit coverage for one Agent.
+pub async fn usage_summary(data_dir: &Path, agent: &str) -> Result<UsageSummaryResponse> {
+    let params = UsageSummaryRequest {
+        agent: Some(agent.to_owned()),
+        generation: None,
+        project: None,
+        root: None,
+    };
+    params.validate()?;
+    let reply: UsageSummaryResponse =
+        eliot_daemon::client_call_typed(data_dir, "usage.summary", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// Lifecycle stop of exactly the generation observed at click time. This is
+/// the explicit Agent action, never a substitute for interrupting a turn.
+pub async fn submit_stop(
+    data_dir: &Path,
+    mutation_id: String,
+    agent: &str,
+    generation: i64,
+    force: bool,
+) -> Result<CommandSubmitResponse> {
+    let mut request = submit_request(
+        mutation_id,
+        Some(agent.to_owned()),
+        "stop",
+        serde_json::json!({ "force": force }),
+    )?;
+    request.expected_generation = Some(generation);
     submit(data_dir, &request).await
 }

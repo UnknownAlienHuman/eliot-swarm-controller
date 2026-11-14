@@ -630,8 +630,21 @@ impl Conversation {
         invalidation
     }
 
-    /// Apply authoritative turn reads: state, outcome and public final text.
+    /// Apply authoritative turn reads (one `agent.result` page): state,
+    /// outcome and public final text. The page also refreshes the turn
+    /// coverage, so an Agent snapshotted at creation does not keep claiming
+    /// zero turns of generation 0 after its first turns complete.
     pub fn apply_turns(&mut self, turns: &[Turn]) {
+        if let Some(first) = turns.first()
+            && first.agent == self.agent
+        {
+            if self.coverage.generation == 0 {
+                self.coverage.generation = first.generation;
+            }
+            if first.generation == self.coverage.generation {
+                self.coverage.result_returned = turns.len();
+            }
+        }
         for read in turns {
             if read.agent != self.agent || self.evicted.contains(&read.turn_id) {
                 continue;
@@ -1046,6 +1059,25 @@ mod tests {
         assert_eq!(chat.items()[0].parts.last().unwrap().text, "done");
         chat.apply_turns(&[turn("t1", TurnState::Completed, Some("authoritative"))]);
         assert_eq!(chat.items()[0].parts.last().unwrap().text, "authoritative");
+    }
+
+    #[test]
+    fn turn_reads_refresh_coverage_of_a_fresh_snapshot() {
+        let mut chat = Conversation::new("a1");
+        chat.reset(
+            Coverage {
+                generation: 0,
+                ..coverage()
+            },
+            &[],
+            &[],
+        );
+        chat.apply_turns(&[turn("t1", TurnState::Completed, Some("ok"))]);
+        assert_eq!(chat.coverage().generation, 1);
+        assert_eq!(chat.coverage().result_returned, 1);
+        assert!(
+            chat.coverage().lines(0)[0].starts_with("Turns: all 1 retained turns of generation 1")
+        );
     }
 
     #[test]

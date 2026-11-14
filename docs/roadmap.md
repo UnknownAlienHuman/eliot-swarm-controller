@@ -317,6 +317,31 @@ of the explicitly selected release scope.
       cannot erase a newer draft and switching conversations cannot retarget
       controls; reopening stops or duplicates nothing. Headless and non-Windows
       builds stay WinUI-free. (Refs #407)
+- [x] **D2 Retained activity and long conversations.** The selected Agent's
+      retained conversation is rebuilt from existing reads: `agent.result` turns,
+      its journal window (`turn.started` links each input command,
+      `message.completed` progress and `tool.*` activity) and `command.get` input
+      text. The coverage statement covers turns against the limit, the scanned
+      window, whether creation was reached, the retention floor and evictions.
+      Markdown renders in native `RichTextBlock` controls (http/https links only;
+      HTML literal) with Copy message and Copy code. A virtualized turn list keeps
+      stable keys and bounded resident turns and bytes. Live events follow a
+      committed `events.bounds` cursor: a limit-1 wake with an explicit `wait_ms`,
+      then drains from `next`. A lag or `history_gap` marks the view stale and
+      rereads it; transport failures back off and resnapshot. Jump to latest is
+      explicit. Reactor 0.100.0 has no scroll offset API, so the view does not
+      auto-follow the bottom. (Refs #407)
+- [x] **D3 Swarm monitor.** An openable monitor pane uses one demand-driven
+      refresh chain, active only while open. Each refresh reads `agent.list` per
+      attention state with observations (with `total` as the exact counter), then
+      `agent.get` and `usage.summary` for the selected Agent only. At most four
+      reads run concurrently. Rows show attention first, with the daemon-reported
+      sample age and TTL, coverage and clock regression. CPU is core-equivalent
+      and differenced only between samples of matching process identities; a
+      changed set is marked partial. RSS is shown, the UI-only history is capped
+      and deduplicated, and two native bar sparklines are drawn. Stop, Force stop
+      and Interrupt are bound at click time to the Agent, generation and turn
+      shown, and are not offered for observe-only Agents. (Refs #407)
 
 ## Later
 

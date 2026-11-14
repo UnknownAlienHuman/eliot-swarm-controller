@@ -32,6 +32,8 @@ use crate::client;
 use crate::feed::{self, Delivery, Depth, Reread, Snapshot};
 use crate::live::{self, LiveStatus, Next};
 use crate::markdown::Doc;
+use crate::monitor::{self, Monitor, MonitorSnapshot};
+use crate::monitor_view::{self, MonitorActions};
 use crate::state::{BoundAction, DraftStore, MutationLedger, Selection};
 use crate::theme;
 use crate::views::{self, RenderCache, RenderedItem, RowCallbacks};
@@ -144,6 +146,13 @@ enum Message {
     ApprovalRequested(UiPending, bool),
     AnswerRequested(UiPending),
     ControlSubmitted(String, Fallible<String>),
+    HighlightAgent(String),
+    MonitorToggled(bool),
+    MonitorLoaded(u64, Option<Box<MonitorSnapshot>>),
+    MonitorSelected(Option<usize>),
+    MonitorOpenConversation(String),
+    MonitorStop(BoundAction, bool),
+    MonitorInterrupt(BoundAction),
 }
 
 struct DesktopApp {
@@ -191,6 +200,15 @@ struct DesktopApp {
     /// Ledger key of the single unresolved submission; blocks duplicates.
     in_flight_key: Option<String>,
     answers: HashMap<String, String>,
+    // Monitor: refreshes only while open, one task chain, epoch-gated.
+    monitor_open: bool,
+    monitor: Monitor,
+    monitor_epoch: u64,
+    monitor_task: Option<ComponentTask>,
+    monitor_selected: Option<String>,
+    /// Monitor rows published before the latest refresh; the native
+    /// selection never points past them (see `monitor_view`).
+    monitor_published: usize,
 }
 
 impl DesktopApp {
@@ -407,6 +425,54 @@ impl DesktopApp {
         self.start_snapshot(context);
     }
 
+    /// Schedule the next monitor refresh: one chain, one refresh in flight,
+    /// none while the monitor is hidden.
+    fn spawn_monitor(&mut self, context: &ComponentContext<Self>, delay_ms: u64) {
+        if let Some(task) = self.monitor_task.take() {
+            task.cancel();
+        }
+        let data_dir = match self.data_dir.clone() {
+            Ok(data_dir) => data_dir,
+            Err(error) => {
+                self.monitor.errors = vec![format!("no data directory: {error}")];
+                return;
+            }
+        };
+        self.monitor_epoch += 1;
+        let epoch = self.monitor_epoch;
+        let selected = self.monitor_selected.clone();
+        self.monitor_task = Some(context.spawn_background(move |cancel| {
+            let cancelled = || cancel.is_cancelled();
+            if delay_ms > 0 && !feed::backoff(delay_ms, &cancelled) {
+                return Message::MonitorLoaded(epoch, None);
+            }
+            let snapshot = client::block_on(monitor::refresh(&data_dir, selected, &cancelled));
+            Message::MonitorLoaded(epoch, snapshot.map(Box::new))
+        }));
+    }
+
+    fn submit_control(
+        &mut self,
+        context: &ComponentContext<Self>,
+        what: &str,
+        key: String,
+        work: impl FnOnce(&Path, String) -> Fallible<String> + Send + 'static,
+    ) {
+        if self.submitting() {
+            return;
+        }
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let mutation_id = self.ledger.id_for(&key);
+        self.in_flight_key = Some(key);
+        self.set_status(format!("{what} ({mutation_id})…"));
+        let what = what.to_owned();
+        let _task = context.spawn_background(move |_| {
+            Message::ControlSubmitted(what, work(&data_dir, mutation_id))
+        });
+    }
+
     fn load_agents(&mut self, context: &ComponentContext<Self>, after: Option<String>) {
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
@@ -581,6 +647,12 @@ impl Component for DesktopApp {
             ledger: MutationLedger::default(),
             in_flight_key: None,
             answers: HashMap::new(),
+            monitor_open: false,
+            monitor: Monitor::default(),
+            monitor_epoch: 0,
+            monitor_task: None,
+            monitor_selected: None,
+            monitor_published: 0,
         };
         if let Ok(data_dir) = app.data_dir.clone() {
             let _task = context.spawn_background(move |_| {
@@ -623,6 +695,7 @@ impl Component for DesktopApp {
                 self.agents_loading = false;
                 match page {
                     Ok(page) => {
+                        let published = self.agents.len();
                         if append {
                             self.agents.extend(page.rows);
                         } else {
@@ -641,12 +714,23 @@ impl Component for DesktopApp {
                             .take()
                             .map(|agent| agent.id)
                             .or_else(|| self.selection.agent.clone());
-                        self.agent_idx = selected
+                        let index = selected
                             .and_then(|id| self.agents.iter().position(|agent| agent.id == id));
-                        if let Some(agent) = self.selected_agent().cloned()
+                        if let Some(agent) = index.and_then(|index| self.agents.get(index)).cloned()
                             && self.convo.as_ref().map(Conversation::agent) != Some(&agent.id)
                         {
                             self.open_conversation(&agent, context);
+                        }
+                        // Never point the native SelectedIndex at a row this same
+                        // render adds: highlight a new row on the next tick.
+                        match index {
+                            Some(index) if index >= published => {
+                                self.agent_idx = None;
+                                let id = self.agents[index].id.clone();
+                                let _task =
+                                    context.spawn_background(move |_| Message::HighlightAgent(id));
+                            }
+                            other => self.agent_idx = other,
                         }
                     }
                     Err(error) => self.set_status(format!("agent.list failed: {error}")),
@@ -1179,6 +1263,105 @@ impl Component for DesktopApp {
                     Message::ControlSubmitted("Answer".to_owned(), result)
                 });
             }
+            Message::HighlightAgent(id) => {
+                if self.selection.agent.as_deref() == Some(id.as_str()) {
+                    self.agent_idx = self.agents.iter().position(|agent| agent.id == id);
+                }
+            }
+            Message::MonitorToggled(open) => {
+                self.monitor_open = open;
+                if open {
+                    // A cancelled chain may still finish its last reads; wait
+                    // a moment instead of overlapping them.
+                    let previous_running = self
+                        .monitor_task
+                        .as_ref()
+                        .is_some_and(|task| task.status() == ComponentTaskStatus::Running);
+                    self.spawn_monitor(context, if previous_running { 1_000 } else { 0 });
+                } else {
+                    // Hidden: no refresh, no render work; essential command
+                    // and conversation delivery continue elsewhere.
+                    self.monitor_epoch += 1;
+                    if let Some(task) = self.monitor_task.take() {
+                        task.cancel();
+                    }
+                }
+            }
+            Message::MonitorLoaded(epoch, snapshot) => {
+                if epoch != self.monitor_epoch || !self.monitor_open {
+                    return;
+                }
+                if let Some(snapshot) = snapshot {
+                    self.monitor_published = self.monitor.rows.len();
+                    self.monitor.apply(*snapshot);
+                    self.spawn_monitor(context, monitor::PERIOD_MS);
+                }
+            }
+            Message::MonitorSelected(index) => {
+                let id = index
+                    .and_then(|index| self.monitor.rows.get(index))
+                    .map(|row| row.id.clone());
+                if id.is_some() && id != self.monitor_selected {
+                    // The running chain reads the new selection on its next
+                    // cycle (within one period): still one refresh in flight.
+                    self.monitor_selected = id;
+                }
+            }
+            Message::MonitorOpenConversation(id) => {
+                let agent = self
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id == id)
+                    .cloned()
+                    .or_else(|| {
+                        self.monitor
+                            .rows
+                            .iter()
+                            .find(|row| row.id == id)
+                            .map(|row| UiAgent {
+                                id: row.id.clone(),
+                                generation: row.generation,
+                                harness: row.harness.clone(),
+                                state: monitor::state_name(row.state).to_owned(),
+                            })
+                    });
+                if let Some(agent) = agent {
+                    self.agent_idx = self.agents.iter().position(|known| known.id == agent.id);
+                    if self.convo.as_ref().map(Conversation::agent) != Some(&agent.id) {
+                        self.open_conversation(&agent, context);
+                    }
+                }
+            }
+            Message::MonitorStop(bound, force) => {
+                let what = if force { "Force stop" } else { "Stop" };
+                let key = format!("stop:{}:{}:{force}", bound.agent, bound.generation);
+                self.submit_control(context, what, key, move |data_dir, mutation_id| {
+                    client::block_on(client::submit_stop(
+                        data_dir,
+                        mutation_id,
+                        &bound.agent,
+                        bound.generation,
+                        force,
+                    ))
+                    .map(|reply| submit_note(&reply))
+                    .map_err(|error| error.to_string())
+                });
+            }
+            Message::MonitorInterrupt(bound) => {
+                let turn = bound.turn.clone().unwrap_or_default();
+                let key = format!("interrupt:{}:{}:{turn}", bound.agent, bound.generation);
+                self.submit_control(context, "Interrupt", key, move |data_dir, mutation_id| {
+                    client::block_on(client::submit_interrupt(
+                        data_dir,
+                        mutation_id,
+                        &bound.agent,
+                        bound.generation,
+                        turn,
+                    ))
+                    .map(|reply| submit_note(&reply))
+                    .map_err(|error| error.to_string())
+                });
+            }
             Message::ControlSubmitted(what, outcome) => {
                 self.settle_mutation(outcome.is_ok());
                 match outcome {
@@ -1208,6 +1391,11 @@ impl Component for DesktopApp {
                     .text("Swarm Desktop")
                     .font_size(theme::type_scale::TITLE)
                     .font_weight(FontWeight::BOLD),
+                ToggleButton::new()
+                    .is_checked(self.monitor_open)
+                    .automation_name("Monitor")
+                    .on_is_checked_changed(context.callback(Message::MonitorToggled))
+                    .content(TextBlock::new().text("Monitor")),
                 TextBlock::new()
                     .text(self.live.label())
                     .vertical_alignment(VerticalAlignment::Center)
@@ -1219,12 +1407,21 @@ impl Component for DesktopApp {
                     .opacity(theme::MUTED_OPACITY),
             ));
 
+        let mut columns = vec![
+            GridLength::Pixel(theme::layout::NAV_WIDTH),
+            GridLength::STAR,
+        ];
+        if self.monitor_open {
+            columns.push(GridLength::Pixel(theme::layout::MONITOR_WIDTH));
+        }
+        let monitor_pane = if self.monitor_open {
+            self.monitor_view(context)
+        } else {
+            View::empty()
+        };
         let main = Grid::new()
             .grid_row(1)
-            .columns([
-                GridLength::Pixel(theme::layout::NAV_WIDTH),
-                GridLength::STAR,
-            ])
+            .columns(columns)
             .column_spacing(theme::spacing::LG)
             .margin(Thickness::new(
                 theme::spacing::LG,
@@ -1232,7 +1429,11 @@ impl Component for DesktopApp {
                 theme::spacing::LG,
                 theme::spacing::LG,
             ))
-            .children((self.nav_view(context), self.chat_view(context)));
+            .children((
+                self.nav_view(context),
+                self.chat_view(context),
+                monitor_pane,
+            ));
 
         Grid::new()
             .rows([GridLength::Auto, GridLength::STAR])
@@ -1241,6 +1442,64 @@ impl Component for DesktopApp {
 }
 
 impl DesktopApp {
+    /// Monitor column. Control messages carry the Agent, generation and turn
+    /// of the detail shown on screen: what is clicked is what was displayed.
+    fn monitor_view(&self, context: &mut ViewContext<Self>) -> View {
+        let shown = self
+            .monitor
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.as_ref().ok())
+            .filter(|read| Some(&read.agent.agent.id) == self.monitor_selected.as_ref())
+            .map(|read| &read.agent.agent);
+        let controllable = shown.filter(|agent| !agent.observe_only);
+        let actions = MonitorActions {
+            select: context.callback(Message::MonitorSelected),
+            open: self
+                .monitor_selected
+                .clone()
+                .map(|id| context.message(Message::MonitorOpenConversation(id))),
+            interrupt: controllable.and_then(|agent| {
+                agent.active_turn.as_ref().map(|turn| {
+                    context.message(Message::MonitorInterrupt(BoundAction::turn_control(
+                        &agent.id,
+                        agent.generation,
+                        turn,
+                    )))
+                })
+            }),
+            stop: controllable.map(|agent| {
+                context.message(Message::MonitorStop(
+                    BoundAction {
+                        agent: agent.id.clone(),
+                        generation: agent.generation,
+                        turn: None,
+                        request: None,
+                    },
+                    false,
+                ))
+            }),
+            force_stop: controllable.map(|agent| {
+                context.message(Message::MonitorStop(
+                    BoundAction {
+                        agent: agent.id.clone(),
+                        generation: agent.generation,
+                        turn: None,
+                        request: None,
+                    },
+                    true,
+                ))
+            }),
+        };
+        monitor_view::monitor_pane(
+            &self.monitor,
+            self.monitor_selected.as_deref(),
+            self.monitor_published,
+            !self.submitting(),
+            actions,
+        )
+    }
+
     fn nav_view(&self, context: &mut ViewContext<Self>) -> View {
         let mut project_names = vec![ALL_PROJECTS.to_owned()];
         project_names.extend(self.projects.iter().map(|project| project.id.clone()));
