@@ -302,12 +302,14 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       queries/backlog handling alone do not. Keep open/unknown work and current
       projections; no full rewrite, forced unknown resolution or separate cleanup ledger.
 - [ ] Core/Store/API/reducer and event replay, including retention and non-reused ids.
-- [ ] CLI E2E on the real harness, exact generations/turns/requests, queue ordering and unknown outcomes.
+- [x] CLI E2E on the real harness, exact generations/turns/requests, queue ordering and unknown outcomes.
+      Qualified 2026-11-14 on Codex and Muse; the unknown-turn send fence it exposed was fixed (#468).
 - [ ] Crash at admission, native effect, event commit, reply and source-drain boundaries;
       verify no repeated prompt/setup/script/push and no false terminal result.
 - [ ] Live runs for the
       selected harnesses/routes. Verify effective model/account/permissions.
-- [ ] Rules/timers/hot reload, Goal limits, mail/ack, CAS, hierarchy and Git recovery.
+- [x] Rules/timers/hot reload, Goal limits, mail/ack, CAS, hierarchy and Git recovery.
+      Qualified 2026-11-14 with real Muse Agents on a private daemon.
 - [ ] Windows Job/handles/paths; supported Linux behavior and honest degraded custody;
       private IPC, credentials, resource bounds and adopted-service isolation.
 - [ ] Retention/WAL/backpressure and representative load. The 10,000-Agent,
