@@ -74,7 +74,7 @@ struct ToolArgs {
 /// `ELIOT_HOME` resolution in `main.rs`; no daemon is started here.
 pub async fn run_stdio(data_dir: PathBuf, require_agent: bool) -> Result<(), String> {
     if require_agent {
-        eliot_daemon::require_agent_identity()
+        eliot_daemon::require_agent_identity(&data_dir)
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
     }
     #[allow(deprecated)] // SEP-2577: LoggingLevel default is deprecated but functional in rmcp 3.9.

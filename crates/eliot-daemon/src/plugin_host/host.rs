@@ -3189,6 +3189,15 @@ fn build_target_environment(data_root: &Path, agent: &Agent, agent_token: &str) 
         .to_str()
         .ok_or_else(|| Error::new("invalid", "data directory path is not UTF-8"))?;
     insert_environment(&mut environment, "ELIOT_HOME", home.to_owned());
+    let scope_dir = crate::daemon::normalize_identity_data_dir(data_root);
+    let scope_dir = scope_dir
+        .to_str()
+        .ok_or_else(|| Error::new("invalid", "data directory path is not UTF-8"))?;
+    insert_environment(
+        &mut environment,
+        crate::daemon::AGENT_DATA_DIR_ENV,
+        scope_dir.to_owned(),
+    );
     insert_environment(&mut environment, "ELIOT_AGENT_ID", agent.id.clone());
     insert_environment(
         &mut environment,
@@ -3668,6 +3677,46 @@ pub(crate) fn forget_revoked_agent_token(
 mod tests {
     use super::*;
     use eliot_core::{AgentState, CommandState, NativeEvent, SubmitCommand};
+
+    #[test]
+    fn target_environment_scopes_identity_to_the_issuing_data_dir() {
+        let mut agent = Agent::new("a1", "proj", "muse", "fake", 0);
+        agent.generation = 1;
+        agent.profile_snapshot = json!({
+            "pass_env_values": {"CODEX_HOME": null, "CODEX_SQLITE_HOME": null},
+        });
+        let data_root = std::env::temp_dir().join("eliot-q20-spawn-test");
+        let environment = build_target_environment(&data_root, &agent, "agent-token")
+            .expect("target environment");
+        let data_dir = environment
+            .get("ELIOT_AGENT_DATA_DIR")
+            .and_then(Value::as_str)
+            .expect("issuing data dir is injected");
+        assert_eq!(
+            Path::new(data_dir),
+            data_root.as_path(),
+            "the issuing data dir is injected normalized"
+        );
+        assert_eq!(
+            environment.get("ELIOT_HOME").and_then(Value::as_str),
+            data_root.to_str(),
+        );
+        assert_eq!(
+            environment.get("ELIOT_AGENT_ID").and_then(Value::as_str),
+            Some("a1"),
+        );
+        assert!(
+            crate::daemon::identity_data_dirs_equal(&data_root.join("."), Path::new(data_dir)),
+            "spelling variants of the issuing dir stay in scope"
+        );
+        assert!(
+            !crate::daemon::identity_data_dirs_equal(
+                &data_root.join("sibling"),
+                Path::new(data_dir)
+            ),
+            "a sibling dir is out of scope"
+        );
+    }
 
     #[test]
     fn send_params_carry_the_resolved_revision_overrides() {
