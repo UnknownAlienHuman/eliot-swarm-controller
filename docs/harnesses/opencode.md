@@ -244,11 +244,24 @@ for the installed server (the plugin owns no MCP surface of its own), so no
 
 ## Ad-hoc launch
 
-`swarm launch --harness opencode [--model PROVIDER/MODEL] --workspace W
-"prompt"` is Owner-only and freezes a profile-equivalent snapshot from
-conservative defaults (MCP `inherit`) plus flags. An omitted `--model` omits
-the config `model` key so the configured native default applies; the effective
-value is read back from the session echo. `--effort` has no mapping and is
+Ad-hoc OpenCode launch (`swarm launch --harness opencode [--model
+PROVIDER/MODEL] [--auth INTEGRATION] [--cmd PATH] --workspace W "prompt"`)
+is Owner-only and freezes a profile-equivalent snapshot from conservative
+defaults (MCP `inherit`) plus flags, with one extra rule: starting the
+per-Agent server always transfers one stored auth integration into the
+isolated native store, so the frozen snapshot always carries
+`auth_integration`. An explicit `--auth` freezes verbatim like the profile
+selector; an omitted one defaults to the model provider prefix, but only
+when the native `opencode auth list` holds an entry with exactly that id.
+Anything else refuses before spawning with a typed `profile_error` naming
+`--auth` and listing the available integration ids — another provider's
+credential is never picked silently. `--effort` has no mapping and is
 rejected. `cmd` is discovered by following the npm shim to the native
-`opencode.exe` inside the package. `swarm models --harness opencode` lists
-providers from native auth; full provider/model pairs resolve at launch.
+`opencode.exe` inside the package (the shim target
+`<shim-dir>/node_modules/@opencode/cli/bin/opencode.exe`, then the known
+package-local paths under every roaming root including the
+`USERPROFILE`-derived default when `APPDATA` is stripped); `--cmd` pins one
+explicit install instead. `swarm models --harness opencode` lists providers
+from native auth; a launch resolves the full provider/model pair (an omitted
+model leaves the configured native default, read back from the session
+echo).

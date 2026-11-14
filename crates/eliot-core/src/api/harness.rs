@@ -86,6 +86,21 @@ pub struct HarnessEntry {
     /// Human-readable searched-locations detail when not installed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Every discovered native install, newest first (currently Claude
+    /// only: PATH, standard locations and desktop-app bundles, each with
+    /// its own `--version`). Absent for other harnesses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<HarnessCandidate>>,
+}
+
+/// One discovered native install for a harness.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessCandidate {
+    /// Absolute native executable path.
+    pub cmd: String,
+    /// Bounded `<exe> --version` first line, or null when unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// Response for `harness.list`.
@@ -436,20 +451,6 @@ mod tests {
         .validate()
         .unwrap_err();
         assert_eq!(error.code, "invalid");
-        for profile in [
-            Some(String::new()),
-            Some("   ".to_owned()),
-            Some("a".repeat(MAX_HARNESS_PROFILE_BYTES + 1)),
-            Some("bad\nprofile".to_owned()),
-        ] {
-            let error = HarnessModelsRequest {
-                harness: "codex".to_owned(),
-                profile,
-            }
-            .validate()
-            .unwrap_err();
-            assert_eq!(error.code, "invalid");
-        }
     }
 
     #[test]

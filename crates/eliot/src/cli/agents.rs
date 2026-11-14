@@ -145,6 +145,8 @@ pub(crate) async fn run_launch(
         harness,
         model,
         effort,
+        auth,
+        cmd,
         workspace,
         worktree,
         base,
@@ -171,8 +173,11 @@ pub(crate) async fn run_launch(
         return Err(Failure::new(2, "ad-hoc launch cannot have a parent"));
     }
     if harness.is_none() {
-        if model.is_some() || effort.is_some() {
-            return Err(Failure::new(2, "--model/--effort require --harness"));
+        if model.is_some() || effort.is_some() || auth.is_some() || cmd.is_some() {
+            return Err(Failure::new(
+                2,
+                "--model/--effort/--auth/--cmd require --harness",
+            ));
         }
     } else if let Some(name) = &model
         && name.trim().is_empty()
@@ -182,6 +187,14 @@ pub(crate) async fn run_launch(
         && name.trim().is_empty()
     {
         return Err(Failure::new(2, "--effort must not be empty"));
+    } else if let Some(name) = &auth
+        && name.trim().is_empty()
+    {
+        return Err(Failure::new(2, "--auth must not be empty"));
+    } else if let Some(name) = &cmd
+        && name.trim().is_empty()
+    {
+        return Err(Failure::new(2, "--cmd must not be empty"));
     }
     if profile.is_none() && harness.is_none() && parent.is_none() {
         return Err(Failure::new(
@@ -205,6 +218,12 @@ pub(crate) async fn run_launch(
     }
     if let Some(effort) = effort {
         args["effort"] = Value::String(effort);
+    }
+    if let Some(auth) = auth {
+        args["auth"] = Value::String(auth);
+    }
+    if let Some(cmd) = cmd {
+        args["cmd"] = Value::String(cmd);
     }
     if let Some(worktree) = worktree {
         args["worktree"] = Value::String(worktree);

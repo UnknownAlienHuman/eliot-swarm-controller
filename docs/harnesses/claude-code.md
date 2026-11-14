@@ -198,12 +198,15 @@ proxy/native billing in L7. Common generation/ack/custody rules remain in the pl
 
 ## Ad-hoc launch
 
-`swarm launch --harness claude [--model M] --workspace W "prompt"` is
-Owner-only and freezes a profile-equivalent snapshot from safe defaults
+`swarm launch --harness claude [--model M] [--cmd PATH] --workspace W "prompt"`
+is Owner-only and freezes a profile-equivalent snapshot from safe defaults
 (`workspace-write`, `never`, MCP `inherit`) plus flags. An omitted `--model`
 omits `--model` so the CLI default applies; the effective model is read back
 from initialize/stream. `--effort` has no mapping and is rejected. `cmd` is
-discovered deterministically (`claude.exe` on `PATH` or the standard user
-install location; `.cmd`/`.bat`/`.ps1` wrappers are refused and never frozen).
-`swarm models --harness claude` reports aliases plus the CLI default; no live
-catalogue exists.
+discovered deterministically by preferring the newest install by `--version`
+(`claude.exe` on `PATH`, the standard user install locations, and the
+desktop-app bundles under `%APPDATA%\Claude\claude-code\<version>\<hash>`;
+`.cmd`/`.bat`/`.ps1` wrappers are refused and never frozen); `--cmd` pins one
+explicit install instead. `swarm harnesses` reports every discovered install
+newest first in `candidates`. `swarm models --harness claude` reports aliases
+plus the CLI default; no live catalogue exists.
