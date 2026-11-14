@@ -1728,11 +1728,17 @@ impl Router {
             return Ok(true);
         }
 
-        // Agent-principal child launches reuse the parent's frozen snapshot
-        // verbatim. Re-resolving a named profile would compare a fresh
-        // snapshot (without the dispatch-derived `native_store_binding`
-        // the parent gained at its own dispatch) against the retained one
-        // and fail the full-snapshot authority check.
+        // Agent-principal child launches default to the parent profile and
+        // reuse the parent's frozen snapshot verbatim (including the
+        // dispatch-derived `native_store_binding` the parent gained at its
+        // own dispatch, which a fresh resolve would lack). A named profile
+        // that differs from the parent's must be in the parent snapshot's
+        // captured `child_profiles`; the captured list governs, so a later
+        // config edit cannot widen an already-running manager. The allowed
+        // child profile resolves now, before any native effect, and must use
+        // the parent's harness; it inherits the parent's captured credential
+        // bindings verbatim and must match the parent snapshot except for
+        // model, effort, and its own profile scope.
         let agent_child_snapshot = if matches!(principal, Principal::Agent { .. })
             && request.args.get("parent").is_some()
         {
@@ -1741,29 +1747,69 @@ impl Router {
                 .get("parent")
                 .and_then(Value::as_str)
                 .ok_or_else(|| Error::new("invalid", "launch parent must be an Agent id"))?;
-            let store = self.inner.store.lock().await;
-            let parent = store.get_agent(parent_id)?.ok_or_else(|| {
-                Error::new("not_found", format!("Agent {parent_id} was not found"))
-            })?;
+            let parent = {
+                let store = self.inner.store.lock().await;
+                store.get_agent(parent_id)?.ok_or_else(|| {
+                    Error::new("not_found", format!("Agent {parent_id} was not found"))
+                })?
+            };
             if !parent.profile_snapshot.is_object() {
                 return Err(Error::new(
                     "bad_state",
                     "retained parent profile snapshot is malformed",
                 ));
             }
-            if let Some(name) = request.args.get("profile").and_then(Value::as_str)
-                && name != parent.profile
-            {
-                return Err(Error::new(
-                    "not_allowed",
-                    "Agent children reuse their parent's frozen profile",
-                ));
+            let requested = request.args.get("profile").and_then(Value::as_str);
+            if requested.is_some_and(|name| name != parent.profile) {
+                let name =
+                    requested.ok_or_else(|| Error::new("internal", "launch profile vanished"))?;
+                let allowed = parent
+                    .profile_snapshot
+                    .get("child_profiles")
+                    .and_then(Value::as_array)
+                    .is_some_and(|allowed| {
+                        allowed.iter().any(|entry| entry.as_str() == Some(name))
+                    });
+                if !allowed {
+                    return Err(Error::new(
+                        "not_allowed",
+                        format!(
+                            "Agent children of {parent_id} may only use the parent profile or its frozen child_profiles"
+                        ),
+                    ));
+                }
+                let mut snapshot = crate::config::resolve_profile(&self.inner.data_root, name)?;
+                crate::config::capture_native_store_inputs(&mut snapshot, |name| {
+                    std::env::var_os(name)
+                })?;
+                let harness = snapshot
+                    .get("harness")
+                    .and_then(Value::as_str)
+                    .filter(|harness| !harness.trim().is_empty())
+                    .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
+                    .to_owned();
+                // Cross-harness children are not supported: equal policy
+                // names mean different native surfaces on different
+                // harnesses. The child inherits the parent's captured
+                // credential bindings verbatim and never re-discovers them.
+                if harness != parent.harness {
+                    return Err(Error::new(
+                        "not_allowed",
+                        format!(
+                            "cross-harness child profiles are not supported: parent profile uses {0} but child profile {name} uses {harness}",
+                            parent.harness
+                        ),
+                    ));
+                }
+                hierarchy::inherit_parent_launch_bindings(&mut snapshot, &parent.profile_snapshot);
+                Some((name.to_owned(), harness, snapshot))
+            } else {
+                Some((
+                    parent.profile.clone(),
+                    parent.harness.clone(),
+                    parent.profile_snapshot.clone(),
+                ))
             }
-            Some((
-                parent.profile.clone(),
-                parent.harness.clone(),
-                parent.profile_snapshot.clone(),
-            ))
         } else {
             None
         };
