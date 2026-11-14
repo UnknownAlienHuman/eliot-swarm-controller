@@ -123,12 +123,22 @@ plus the explicitly allowed servers:
 
 - Before spawn, a short-lived metadata reader (initialize, one `config/read`
   with the worker cwd, close; no thread) enumerates the worker-visible
-  `mcp_servers` keys. The reader is pinned to the frozen native-store
-  binding the same way the worker launch is pinned, and the pin is verified
-  before the enumeration is trusted. Every enumerated server outside the
-  allow list gets its own `-c mcp_servers.<name>.enabled=false` override; a
-  name no `-c` path can address (Codex splits override paths on literal dots
-  before decoding) fails the start closed instead of silently inheriting.
+  `mcp_servers` entries (key plus `command`/`url` transport) and the
+  `plugins` states (id plus `enabled` flag). The reader is pinned to the
+  frozen native-store binding the same way the worker launch is pinned, and
+  the pin is verified before the enumeration is trusted. Every enumerated
+  server outside the allow list gets its own transport plus
+  `-c mcp_servers.<name>.enabled=false` overrides; a name no `-c` path can
+  address (Codex splits override paths on literal dots before decoding), a
+  server with no usable transport, or a transport carrying a known secret
+  fails the start closed instead of silently inheriting. Plugin-backed
+  builtin servers never appear in `mcp_servers`, so each suppressed bundled
+  plugin (`computer-use`, `unified-computer-use`, `codex-app-tools`) gets
+  its own `-c plugins.<id>.enabled=false` override when present and
+  enabled; the ChatGPT-backed Apps runtime (`codex_apps`, likewise absent
+  from `mcp_servers`) gets a synthetic transport-carrying disable with a
+  nonexistent command alongside `enabled=false`. An explicit `mcp_allow`
+  entry for a plugin-backed server or `codex_apps` keeps it enabled.
 - After `thread/start` (or `thread/resume`) and before any input, the
   installed `mcpServerStatus/list` inventory is read back scoped to the
   owned thread (`threadId`; names only, secret-checked) and reported as
@@ -156,7 +166,22 @@ Verified read-only against installed Codex 0.167.1 (`codex --help`,
 app-server does not), `-c mcp_servers={}` merges with file config instead of
 replacing it (an isolated-`CODEX_HOME` `mcp list --json` probe still showed
 the file server), per-server `-c mcp_servers.<name>.enabled=false` disables
-that server (probe showed `enabled: false`), and `mcpServerStatus/list`
+a user-file-config server (probe showed `enabled: false`) only when the
+touched table keeps a valid transport: a bare `enabled=false` breaks the
+bootstrap for project/plugin-layer or builtin names (`invalid transport in
+'mcp_servers.<name>'`), while re-emitting the effective `command`/`url`
+alongside `enabled=false` disables those servers cleanly (probes disabled
+project-layer `codebase_memory`/`context7`/`rust_lsp` this way).
+Plugin-backed builtins (`cua_repl` from the computer-use plugins) are
+absent from `mcp_servers`, so a bare `enabled=false` breaks the bootstrap
+the same way (`invalid transport in 'mcp_servers.cua_repl'`); disabling
+their bundled plugins (`-c plugins.<id>.enabled=false`, verified live:
+`cua_repl` leaves the thread-scoped inventory) suppresses them instead,
+and the ChatGPT-backed Apps runtime (`codex_apps`, reported by
+`mcpServerStatus/list` but by neither `config/read` nor `codex mcp get`)
+is suppressed by a synthetic table carrying a nonexistent command plus
+`enabled=false` (verified live: the bootstrap accepts it and the inventory
+reports `disabled`; the command can never run). `mcpServerStatus/list`
 exists in the app-server protocol (v2 schema: `{data: [{name,
 runtimeStatus, ...}], nextCursor}`). The owner's global config is never
 edited and `auth.json` is never copied.
