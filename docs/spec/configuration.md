@@ -91,6 +91,17 @@ These values are frozen at admission. The supported approval and question callba
 are handled through exact pending request IDs; an unsupported callback receives an
 error, never a default choice.
 
+An owner may allow a profile's Agents to launch children on other configured
+profiles with `child_profiles`, e.g. `child_profiles = ["muse-worker", "codex-review"]`.
+Names must exist as configured profiles, and a profile must not list itself;
+absent or empty keeps today's behavior (Agent children reuse the parent profile
+only). The parent's launch captures the list in its frozen snapshot, so a later
+config edit cannot widen an already-running manager. A child on an allow-listed
+profile carries that profile's freshly frozen snapshot, with control narrowed or
+equal and every other authority knob no broader than the parent's; model, effort
+and harness may differ. See the launch authority check in
+[api](api.md) and [coordination](coordination.md#claims-and-hierarchy).
+
 An optional `collaboration_mode` selects Codex's `default` or `plan` preset for each
 turn. The selected mode is frozen with the profile; omission preserves the native
 default. Plan mode enables the native user-question workflow. Model and effort stay

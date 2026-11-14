@@ -30,6 +30,7 @@ const MAX_AUTH_INTEGRATION_LEN: usize = 128;
 const MAX_CMD_LEN: usize = 1024;
 const MAX_ENV_NAME_LEN: usize = 256;
 const MAX_PASS_ENV_ENTRIES: usize = 64;
+const MAX_CHILD_PROFILES: usize = 64;
 const APPROVAL_POLICY_NEVER: &str = "never";
 const APPROVAL_POLICY_ON_REQUEST: &str = "on-request";
 const PERMISSION_READ_ONLY: &str = "read-only";
@@ -415,6 +416,8 @@ struct ProfileEntry {
     dangerously_skip_permissions: Option<bool>,
     #[serde(default)]
     control: Option<String>,
+    #[serde(default)]
+    child_profiles: Option<Vec<String>>,
     #[serde(default)]
     pass_env: Option<Vec<String>>,
     #[serde(default)]
@@ -874,6 +877,14 @@ pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Valu
         )
     })?;
     let snapshot = snapshot_from_entry(name, entry.get_ref(), entry.span().start, &source)?;
+    let snapshot = freeze_child_profiles(
+        name,
+        entry.get_ref(),
+        &config,
+        entry.span().start,
+        &source,
+        snapshot,
+    )?;
     bind_route_and_capacity(
         name,
         entry.get_ref(),
@@ -882,6 +893,60 @@ pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Valu
         &source,
         snapshot,
     )
+}
+
+/// Freeze the owner-configured Agent child allow-list for this profile.
+/// Each name must be an existing configured profile and a profile must not
+/// list itself. The frozen list is captured in the parent snapshot, so a
+/// later config edit cannot widen an already-running manager. Absent means
+/// empty: Agent children reuse the parent profile only.
+fn freeze_child_profiles(
+    profile_name: &str,
+    entry: &ProfileEntry,
+    config: &FileConfig,
+    table_offset: usize,
+    source: &str,
+    mut snapshot: Value,
+) -> core::Result<Value> {
+    let fail = |message: &str| {
+        profile_field_error(
+            source,
+            table_offset,
+            profile_name,
+            "child_profiles",
+            message,
+            "profile_error",
+        )
+    };
+    let Some(raw) = entry.child_profiles.as_deref() else {
+        snapshot["child_profiles"] = Value::Array(Vec::new());
+        return Ok(snapshot);
+    };
+    if raw.len() > MAX_CHILD_PROFILES {
+        return Err(fail("exceeds 64 entries"));
+    }
+    let mut frozen = Vec::with_capacity(raw.len());
+    let mut seen = HashSet::with_capacity(raw.len());
+    for name in raw {
+        let child = name.trim();
+        if validate_profile_name(child).is_err() {
+            return Err(fail(
+                "must name existing configured profiles with letters, digits, hyphen and underscore",
+            ));
+        }
+        if child == profile_name {
+            return Err(fail("must not list the profile itself as a child profile"));
+        }
+        if !config.profiles.contains_key(child) {
+            return Err(fail(&format!("unknown child profile {child}")));
+        }
+        if !seen.insert(child.to_owned()) {
+            return Err(fail("contains a duplicate entry"));
+        }
+        frozen.push(Value::String(child.to_owned()));
+    }
+    snapshot["child_profiles"] = Value::Array(frozen);
+    Ok(snapshot)
 }
 fn read_config(data_root: &Path) -> core::Result<Option<(FileConfig, String)>> {
     let file = match std::fs::File::open(data_root.join("config.toml")) {
@@ -2758,6 +2823,43 @@ mod tests {
         let error = resolve_profile(&fixture.root, "fleet").unwrap_err();
         assert_eq!(error.code, "profile_error");
         assert!(error.message.contains("control"), "{}", error.message);
+    }
+
+    #[test]
+    fn child_profiles_freeze_and_validate() {
+        let fixture = AutomationConfigFixture::new();
+        fixture.write(
+            "[profiles.manager]\nharness = \"codex\"\nmodel = \"fixture-model\"\nchild_profiles = [\"worker\"]\n\
+             [profiles.worker]\nharness = \"codex\"\nmodel = \"fixture-cheap\"\n",
+        );
+        let snapshot = resolve_profile(&fixture.root, "manager").unwrap();
+        assert_eq!(snapshot["child_profiles"], json!(["worker"]));
+        let worker = resolve_profile(&fixture.root, "worker").unwrap();
+        assert_eq!(worker["child_profiles"], json!([]));
+        for (source, fragment) in [
+            (
+                "[profiles.manager]\nharness = \"codex\"\nmodel = \"fixture-model\"\nchild_profiles = [\"manager\"]\n",
+                "itself",
+            ),
+            (
+                "[profiles.manager]\nharness = \"codex\"\nmodel = \"fixture-model\"\nchild_profiles = [\"ghost\"]\n",
+                "unknown child profile",
+            ),
+            (
+                "[profiles.manager]\nharness = \"codex\"\nmodel = \"fixture-model\"\nchild_profiles = [\"worker\", \"worker\"]\n\
+                 [profiles.worker]\nharness = \"codex\"\nmodel = \"fixture-cheap\"\n",
+                "duplicate",
+            ),
+        ] {
+            fixture.write(source);
+            let error = resolve_profile(&fixture.root, "manager").unwrap_err();
+            assert_eq!(error.code, "profile_error", "source: {source}");
+            assert!(
+                error.message.contains("child_profiles") && error.message.contains(fragment),
+                "{}",
+                error.message
+            );
+        }
     }
 
     #[test]

@@ -557,11 +557,16 @@ inherits the parent's project label and tree root, and the configured fanout lim
 are checked at admission. The parent must be controlled. An Agent-principal child
 may omit `profile` or specify the parent's same profile name, with no `worktree`,
 and reuses the parent's frozen profile snapshot
-verbatim, without resolving a mutable named profile, then passes the authority
-check below. An Owner child launch may instead supply `profile`, a different
-workspace, and `worktree`, and remains unrestricted by that check. For an
-Agent-principal child, control is narrowed or equal, the workspace is shared, and
-no worktree is minted (see [coordination](coordination.md#claims-and-hierarchy)).
+verbatim, without resolving a mutable named profile. It may instead name a profile
+from the parent snapshot's captured `child_profiles` allow-list; the daemon resolves
+that configured profile now and freezes its snapshot for the child. Any other name
+is rejected before any native effect. Then the authority check below applies
+independently of profile equality: control is narrowed or equal, the workspace is
+shared, no worktree is minted, and every authority knob the child snapshot carries
+(permissions/sandbox, approval policy, `pass_env`, MCP inheritance) is no broader
+than the parent's; model, effort and harness may differ. An Owner child launch may
+instead supply `profile`, a different workspace, and `worktree`, and remains
+unrestricted by that check (see [coordination](coordination.md#claims-and-hierarchy)).
 
 Removal uses the same command admission and readback path:
 
