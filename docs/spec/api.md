@@ -388,12 +388,25 @@ wrong types and out-of-range values are `invalid`. `observations` defaults to fa
 when omitted and must be a boolean when present; explicit null is `invalid`. Absent
 optional members are omitted when requests are serialized.
 
-Owner `agent.list` calls page by Agent ID. An Agent principal gets only its own row and
-the Router ignores `after` and page selection for that self-only result, with `next:null`;
-generic response validation must not impose owner paging assumptions on it. `next` for
-an owner is the last returned ID on a nonempty page; pass it back unchanged. It is not
-proof another row exists. Typed response binding failures remain `unknown`; validate the
-reply before printing it or advancing a cursor.
+`agent.list` returns compact summaries ordered by Agent ID, never full Agent
+records; full records stay available through `agent.get`. Optional `state`,
+`project`, `harness`, `parent` and `root` filters are exact indexed matches:
+wrong types and unknown state names are `invalid`, and a filter never matches
+silently. Each summary carries identity, state, current turn, progress age,
+the last terminal outcome with its turn and retained usage where available,
+child activity for native observed children, and the last controller-observed
+write time. A missing outcome or progress timestamp reads back absent, never
+zero or success; `updated_at` is freshness metadata, not proof of liveness
+for a detached or restarted source. The response carries the matching `total`
+ignoring the cursor, explicit `truncated`, and `next` at the last returned
+row; continue through `next` until the page is empty. `truncated` set means
+further rows are known; unset on a full page promises nothing further.
+Owner calls page the whole fleet. An Agent principal pages only its frozen
+control scope: itself for `self`, its subtree for `tree`, its project for
+`project`. A self-scope page holds at most its own row. Typed response
+binding failures remain `unknown`; validate the reply before printing it or
+advancing a cursor. `swarm ls` and `swarm top` render these summaries as
+compact tables by default; `--json` keeps printing the raw response.
 
 For `agent.processes`, omitted generation selects the current Agent generation for
 `scope:"agent"`, or the managed workspace target generation for `scope:"workspace"`.

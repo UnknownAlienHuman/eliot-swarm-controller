@@ -30,6 +30,7 @@ pub use rules::{
 };
 pub use scripts::ScriptRunAdmission;
 
+use eliot_core::api::AgentSummary;
 use eliot_core::{
     self as core, Agent, AgentControl, AgentEdit, AgentState, BatchAck, Command, CommandState,
     Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage,
@@ -750,6 +751,160 @@ impl Store {
         }
         enforce_page_bytes(&mut agents)?;
         Ok(agents)
+    }
+
+    /// Compact fleet projection for `agent.list`: scope-checked, filtered,
+    /// ordered by Agent ID. Every equality filter rides one `agents_list_*`
+    /// composite index (forced with `INDEXED BY`, so `EXPLAIN QUERY PLAN`
+    /// shows the index); the cursor rides the primary key. The response
+    /// carries the matching total ignoring the cursor, honest truncation, and
+    /// the continuation cursor at the last returned row.
+    pub fn list_agent_summaries(
+        &self,
+        filter: &AgentListFilter,
+        after: Option<&str>,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<AgentListPage> {
+        self.list_agent_summaries_inner(None, filter, after, limit, now_ms)
+    }
+
+    /// Scope-checked fleet projection for an Agent caller: itself for `self`
+    /// control, its subtree for `tree`, its project for `project`. The caller
+    /// row itself is always in scope.
+    pub fn list_agent_summaries_scoped(
+        &self,
+        caller: &Agent,
+        filter: &AgentListFilter,
+        after: Option<&str>,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<AgentListPage> {
+        self.list_agent_summaries_inner(Some(caller), filter, after, limit, now_ms)
+    }
+
+    fn list_agent_summaries_inner(
+        &self,
+        caller: Option<&Agent>,
+        filter: &AgentListFilter,
+        after: Option<&str>,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<AgentListPage> {
+        validate_limit(limit)?;
+        filter.validate()?;
+        let after_num = after.map(parse_agent_id).transpose()?.unwrap_or(0);
+        // One extra row probes continuation; the byte bound may trim further.
+        let probe = i64::try_from(limit)
+            .map_err(|_| Error::new("invalid", "page limit must fit the index bound"))?
+            + 1;
+        let page = agent_list_select(filter, caller, Some(after_num), Some(probe), false)?;
+        let mut statement = self.connection.prepare(&page.sql).map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params_from_iter(page.params.iter()),
+                agent_record_from_row,
+            )
+            .map_err(sql_error)?;
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(self.summary_from_record(row.map_err(sql_error)?, now_ms)?);
+        }
+        let total_page = agent_list_select(filter, caller, None, None, true)?;
+        let total: i64 = self
+            .connection
+            .query_row(
+                &total_page.sql,
+                rusqlite::params_from_iter(total_page.params.iter()),
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        let mut truncated = summaries.len() > limit;
+        summaries.truncate(limit);
+        let kept = summaries.len();
+        enforce_page_bytes(&mut summaries)?;
+        truncated = truncated || summaries.len() < kept;
+        let next = summaries.last().map(|summary| summary.id.clone());
+        Ok(AgentListPage {
+            summaries,
+            total: usize::try_from(total.max(0)).unwrap_or(0),
+            truncated,
+            next,
+        })
+    }
+
+    fn summary_from_record(&self, record: AgentRecord, now_ms: i64) -> Result<AgentSummary> {
+        let state: AgentState = parse_enum(&record.state, "Agent state")?;
+        let id = format_agent_id(record.id);
+        let terminal = self.last_terminal_turn(record.id, record.generation, &record.harness)?;
+        let last_progress_at =
+            native_children::native_progress(&self.connection, record.id, record.generation)?;
+        Ok(AgentSummary {
+            id,
+            generation: record.generation,
+            project: record.project,
+            harness: record.harness,
+            state,
+            parent: record.parent.map(format_agent_id),
+            // A NULL root only arises from raw test rows without hierarchy
+            // metadata and reads self-rooted, matching `agent_from_record`.
+            root: format_agent_id(record.root.unwrap_or(record.id)),
+            active_turn: record.active_turn,
+            last_progress_at,
+            progress_age_ms: last_progress_at
+                .and_then(|at| now_ms.checked_sub(at))
+                .filter(|age| *age >= 0),
+            last_turn_id: terminal.as_ref().map(|turn| turn.0.clone()),
+            last_outcome: terminal.as_ref().and_then(|turn| turn.1),
+            activity: if record.origin == "native" && record.observe_only {
+                Some(native_children::activity(
+                    &self.connection,
+                    record.id,
+                    record.generation,
+                )?)
+            } else {
+                None
+            },
+            usage: terminal.and_then(|turn| turn.2),
+            updated_at: record.updated_at,
+        })
+    }
+
+    /// Newest terminal turn for one Agent generation: its canonical outcome
+    /// (legacy rows classify explicitly, never defaulting to success) with
+    /// the retained usage where the Store kept one. No terminal turn reads
+    /// back as no outcome, never a fabricated one.
+    fn last_terminal_turn(
+        &self,
+        agent: i64,
+        generation: i64,
+        harness: &str,
+    ) -> Result<Option<LastTerminalTurn>> {
+        let row: Option<StoredTerminalTurn> = self
+            .connection
+            .query_row(
+                "SELECT turn_id, outcome, status, usage FROM turns
+                 WHERE agent = ?1 AND generation = ?2 AND state = 'completed'
+                 ORDER BY COALESCE(completed_at, started_at, 0) DESC, rowid DESC LIMIT 1",
+                params![agent, generation],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        row.map(|(turn_id, outcome, status, usage)| {
+            let canonical = match outcome {
+                Some(value) => Some(TurnOutcome::parse(&value).ok_or_else(|| {
+                    Error::new("internal", format!("invalid stored turn outcome: {value}"))
+                })?),
+                None => Some(TurnOutcome::classify_legacy_status_for_harness(
+                    harness,
+                    status.as_deref(),
+                )),
+            };
+            let usage = usage.map(|value| decode_turn_usage(&value)).transpose()?;
+            Ok((turn_id, canonical, usage))
+        })
+        .transpose()
     }
 
     /// Page routed attention candidates. Registration existence is an indexed
@@ -2739,6 +2894,181 @@ struct TurnInsert<'a> {
     started_at: Option<i64>,
     completed_at: Option<i64>,
     usage: Option<&'a str>,
+}
+
+/// Indexed equality filters for the compact `agent.list` fleet projection.
+/// Unknown shapes reject at the Core DTO boundary, never as empty matches.
+#[derive(Clone, Debug, Default)]
+pub struct AgentListFilter {
+    pub state: Option<AgentState>,
+    pub project: Option<String>,
+    pub harness: Option<String>,
+    pub parent: Option<String>,
+    pub root: Option<String>,
+}
+
+impl AgentListFilter {
+    fn validate(&self) -> Result<()> {
+        if let Some(project) = &self.project {
+            require_filter_text(project)?;
+        }
+        if let Some(harness) = &self.harness {
+            require_filter_text(harness)?;
+        }
+        if let Some(parent) = &self.parent {
+            require_filter_text(parent)?;
+            parse_agent_id(parent)?;
+        }
+        if let Some(root) = &self.root {
+            require_filter_text(root)?;
+            parse_agent_id(root)?;
+        }
+        Ok(())
+    }
+}
+
+/// One filtered, scope-checked fleet page: ordered summaries, the matching
+/// total ignoring the cursor, honest truncation, and the continuation cursor.
+pub struct AgentListPage {
+    pub summaries: Vec<AgentSummary>,
+    pub total: usize,
+    pub truncated: bool,
+    pub next: Option<String>,
+}
+
+/// Newest terminal turn behind one summary row: turn id, canonical outcome,
+/// and retained usage where the Store kept one.
+type LastTerminalTurn = (String, Option<TurnOutcome>, Option<TurnUsage>);
+
+/// Stored terminal-turn columns before canonical classification.
+type StoredTerminalTurn = (String, Option<String>, Option<String>, Option<String>);
+
+struct AgentListSelect {
+    sql: String,
+    params: Vec<rusqlite::types::Value>,
+}
+
+fn require_filter_text(value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(Error::new("invalid", "Agent list filter must be nonblank"));
+    }
+    Ok(())
+}
+
+/// Assemble the fleet query for one scope, filter set, and window. Equality
+/// filters ride their `agents_list_*` composite (forced with `INDEXED BY`,
+/// so `EXPLAIN QUERY PLAN` reports the index); the cursor rides the primary
+/// key; tree scope walks descendants through the `agents_parent` index.
+/// The count variant drops the cursor and limit but keeps scope and filters.
+fn agent_list_select(
+    filter: &AgentListFilter,
+    caller: Option<&Agent>,
+    after_num: Option<i64>,
+    limit: Option<i64>,
+    count: bool,
+) -> Result<AgentListSelect> {
+    let columns = if count {
+        "COUNT(*)".to_owned()
+    } else {
+        "agents.id, agents.generation, agents.name, agents.project, agents.harness, agents.profile,
+                agents.profile_snapshot, agents.native_scope, agents.native_ref, agents.workspace, agents.effective,
+                agents.pending, agents.state, agents.active_turn, agents.created_at, agents.updated_at, agents.origin, agents.observe_only, (agents.token IS NOT NULL AND agents.observe_only = 0),
+                agents.parent, agents.root, agents.depth, agents.control"
+            .to_owned()
+    };
+    let mut predicates = Vec::new();
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+    // Forced index for the first present equality filter; project scope
+    // without a user filter rides the project composite the same way.
+    let mut forced_index: Option<&str> = None;
+    let mut equality = |column: &str, index: &'static str, value: rusqlite::types::Value| {
+        predicates.push(format!("agents.{column} = ?"));
+        params.push(value);
+        if forced_index.is_none() {
+            forced_index = Some(index);
+        }
+    };
+    if let Some(state) = filter.state {
+        equality(
+            "state",
+            "agents_list_state",
+            rusqlite::types::Value::from(agent_state_name(state).to_owned()),
+        );
+    }
+    if let Some(project) = &filter.project {
+        equality(
+            "project",
+            "agents_list_project",
+            rusqlite::types::Value::from(project.clone()),
+        );
+    }
+    if let Some(harness) = &filter.harness {
+        equality(
+            "harness",
+            "agents_list_harness",
+            rusqlite::types::Value::from(harness.clone()),
+        );
+    }
+    if let Some(parent) = &filter.parent {
+        equality(
+            "parent",
+            "agents_list_parent",
+            rusqlite::types::Value::from(parse_agent_id(parent)?),
+        );
+    }
+    if let Some(root) = &filter.root {
+        equality(
+            "root",
+            "agents_list_root",
+            rusqlite::types::Value::from(parse_agent_id(root)?),
+        );
+    }
+    let mut prefix = String::new();
+    if let Some(caller) = caller {
+        let caller_num = parse_agent_id(&caller.id)?;
+        match caller.control {
+            AgentControl::Slf => {
+                predicates.push("agents.id = ?".to_owned());
+                params.push(rusqlite::types::Value::from(caller_num));
+            }
+            AgentControl::Project => {
+                predicates.push("agents.project = ?".to_owned());
+                params.push(rusqlite::types::Value::from(caller.project.clone()));
+                if forced_index.is_none() {
+                    forced_index = Some("agents_list_project");
+                }
+            }
+            AgentControl::Tree => {
+                prefix = format!(
+                    "WITH RECURSIVE subtree(id) AS \
+                     (SELECT {caller_num} UNION ALL \
+                     SELECT a.id FROM agents a JOIN subtree s ON a.parent = s.id) "
+                );
+                predicates.push("agents.id IN (SELECT id FROM subtree)".to_owned());
+            }
+        }
+    }
+    if let Some(after) = after_num {
+        predicates.push("agents.id > ?".to_owned());
+        params.push(rusqlite::types::Value::from(after));
+    }
+    let table = match forced_index {
+        Some(index) => format!("agents INDEXED BY {index}"),
+        None => "agents".to_owned(),
+    };
+    let mut sql = format!("{prefix}SELECT {columns} FROM {table}");
+    if !predicates.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&predicates.join(" AND "));
+    }
+    if !count {
+        sql.push_str(" ORDER BY agents.id");
+    }
+    if let Some(limit) = limit {
+        sql.push_str(" LIMIT ?");
+        params.push(rusqlite::types::Value::from(limit));
+    }
+    Ok(AgentListSelect { sql, params })
 }
 
 fn agent_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {

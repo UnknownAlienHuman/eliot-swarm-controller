@@ -70,7 +70,7 @@ const METHODS: &[Method] = &[
     method!("agent.get", AgentGetRequest, AgentGetResponse, false, false, "Read Agent state, native capabilities and source health.", {"id":"a1"}),
     method!("agent.discover", AgentDiscoverRequest, DiscoverPage, true, false, "Discover native metadata through an installed profile without creating Agents.", {"profile":"codex","limit":20}),
     method!("agent.history", AgentHistoryRequest, ObservationPage, true, false, "Read a bounded native history view advertised by agent.get.", {"id":"a1","source":"native","view":"turns","limit":20}),
-    method!("agent.list", AgentListRequest, AgentListResponse, false, false, "List visible Agents with bounded pagination.", {"limit":20}),
+    method!("agent.list", AgentListRequest, AgentListResponse, false, false, "List scoped compact Agent summaries with indexed state/project/harness/parent/root filters, counts and explicit truncation.", {"limit":20,"state":"busy"}),
     method!("agent.result", AgentResultRequest, AgentResultResponse, false, false, "Read retained turns/results for one Agent.", {"id":"a1","limit":20}),
     method!("agent.processes", AgentProcessesRequest, AgentProcessesResponse, false, false, "Read bounded process observations for one Agent.", {"id":"a1"}),
     method!("agent.stats", AgentStatsRequest, AgentStatsResponse, false, false, "Read sampled Agent statistics with freshness metadata.", {"id":"a1"}),
@@ -196,7 +196,7 @@ impl Router {
                 Ok(IdentityResponse {
                     principal:"agent".to_owned(), agent_id:Some(id.clone()), generation:Some(*generation),
                     allowed_scopes:vec!["global".to_owned(), format!("project:{}", agent.project), format!("mailbox:{id}")],
-                    limits:"Variables default to your project. Global variables are read-only for Agents; other-project variables reject. agent.list and event visibility are self-scoped. Mail send addresses concrete Agents; mailbox reads/acks are self-only. Agent control/read visibility and approved child profiles remain checked at the existing authority boundaries.".to_owned(),
+                    limits:"Variables default to your project. Global variables are read-only for Agents; other-project variables reject. agent.list follows your frozen control scope (self, subtree, or project); event visibility is self-scoped. Mail send addresses concrete Agents; mailbox reads/acks are self-only. Agent control/read visibility and approved child profiles remain checked at the existing authority boundaries.".to_owned(),
                 })
             }
             _ => Err(Error::new("not_allowed", "principal has no discovery authority")),
