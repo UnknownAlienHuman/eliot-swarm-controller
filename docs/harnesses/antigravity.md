@@ -204,8 +204,9 @@ The terminal `session/prompt` response (`stopReason`) is authoritative
 for turn completion, correlated with the single outstanding prompt
 prepared before dispatch in the same uninterrupted process. A soft-denied
 tool remains visible as a failed `tool_call_update` even under a
-successful final turn. ACP prompt responses report no usage counters, so
-snapshots carry `usage: null` and terminal facts carry no usage counters;
+successful final turn. ACP `session/prompt` results carry only
+`stopReason`: no per-turn usage object and no `_meta` usage was observed,
+so terminal facts carry no usage counters and turn scope stays null;
 requested, verified and served model are separate facts and one never
 stands in for another. ACP v1 `usage_update` carries context occupancy
 (`used` tokens currently in context, `size` context-window capacity) and
@@ -217,9 +218,23 @@ retained `SessionUsage` snapshot and commits it as `session.usage` when
 accepted (source `antigravity:usage_update`), with `observed_at` captured at
 acceptance: `used`/`size` replace the retained context
 counters and a supplied cost replaces the retained cumulative cost with
-its verbatim unit. Live emission of `usage_update` by the
-installed `agy` 1.5.3 server was not exercised (no model calls in this
-increment); occupancy and cost are never mapped to `TurnUsage`.
+its verbatim unit. No cumulative input/output/cache counters exist on this
+route (`cumulative_tokens` stays null), and occupancy/cost are never mapped
+to `TurnUsage`: per-turn token usage is unavailable (`unsupported`) on the
+checked native surfaces below. Live 2026-11-14 with installed `agy` 1.5.3
+(`gemini-3.8-flash-high`, served as base `gemini-3.8-flash` plus
+`thought_level high`): one Agent, one short task (read `task.txt`, reply
+`42`), `end_turn` success with final text `42`. The checked surfaces
+reported no usage: the prompt result was `stopReason` only (checked for a
+`usage` object and `_meta` usage: absent), the `session/update` stream
+carried `agent_message_chunk`/`tool_call`/`tool_call_update` (plus
+`hook.before_model` from `PreInvocation`, whose input is only
+`conversationId`/`invocationNum`/`initialNumSteps`) and no `usage_update`
+kind, so no `session.usage` snapshot was committed (`session_usage: null`)
+and the terminal carried no `usage` (turn `usage: null`, `usage --agent`
+`turns_without_usage 1`, `sessions snapshots 0`,
+`generations_without_snapshot 1`). Text length is never used to estimate
+tokens.
 
 There is no replay cursor/history API. Snapshots expose retained stream
 facts, not a native history poll. Loss means an explicit gap. Do not

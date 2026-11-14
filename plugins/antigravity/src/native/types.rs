@@ -451,4 +451,64 @@ mod tests {
         assert_eq!(compacted.context_used_tokens, Some(1024));
         assert_eq!(compacted.context_window_tokens, Some(200000));
     }
+
+    #[test]
+    fn live_turn_without_usage_update_leaves_both_scopes_null() {
+        // Live 2026-11-14: agy 1.5.3 + gemini-3.8-flash-high, one short
+        // task (read task.txt, reply 42). The ACP session emitted
+        // message/tool notifications but no `usage_update`, and the
+        // `session/prompt` result carried only `stopReason`. Checked
+        // native surfaces: prompt result (`usage`/`_meta` absent),
+        // `session/update` stream (no `usage_update` kind), PreInvocation
+        // hook input (conversation/invocation/step counts only).
+        let prompt: PromptResult = serde_json::from_value(json!({
+            "stopReason": "end_turn",
+        }))
+        .expect("real prompt result parses");
+        assert_eq!(
+            prompt.terminal_status().expect("known stop"),
+            Some("completed")
+        );
+        // Checked-but-absent usage surfaces stay tolerated and still yield
+        // no turn usage: unknown members are ignored, never mapped.
+        let with_extras: PromptResult = serde_json::from_value(json!({
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 10, "outputTokens": 2},
+            "_meta": {"usage": {"input": 10}},
+        }))
+        .expect("prompt extras stay tolerated");
+        assert_eq!(
+            with_extras.terminal_status().expect("known stop"),
+            Some("completed")
+        );
+
+        // Real notification shapes from the live turn: assistant text 42
+        // and the File task.txt tool call. None is a session-usage fact.
+        let (_, message) = update(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"text": "42"},
+        }));
+        assert!(matches!(message, AcpUpdate::MessageChunk { text } if text == "42"));
+        let (_, tool) = update(json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-call_11475363737043308230",
+            "title": "File task.txt",
+            "status": "in_progress",
+        }));
+        assert!(matches!(tool, AcpUpdate::ToolCall { .. }));
+        let (_, tool_update) = update(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tool-call_11475363737043308230",
+            "title": "File /C:/Development/Rust/qa-scratch/k4-workspace/task.txt",
+            "status": "completed",
+        }));
+        assert!(matches!(tool_update, AcpUpdate::ToolCallUpdate { .. }));
+
+        // No `usage_update` in the sequence, so no session snapshot merges:
+        // both turn and session scopes stay null (never estimated).
+        assert_eq!(
+            session_usage_from_update(None, None, None, None, None),
+            None
+        );
+    }
 }
