@@ -42,7 +42,7 @@ use crate::native::{
         NativeTurnCompletedNotification, NativeTurnError, NativeTurnStartedNotification,
         NativeTurnTerminal, NativeUserInputAnswerResult, NativeUserInputCancelResult,
         NativeUserInputSettledNotification, NativeViewHealth, NativeViewSubscribeParams,
-        NativeViewSubscribeResult, NativeWorkflowChild, NativeWorkflowItemNotification,
+        NativeViewSubscribeResult, NativeWorkflowChild, NativeWorkflowItemNotification, turn_usage,
     },
 };
 
@@ -104,6 +104,26 @@ impl AppliedViewCursors {
             }
         }
     }
+}
+
+/// Identity of one applied view fact: the cursor names a view revision, so
+/// the method plus the item (id, revision) or turn identity distinguishes
+/// facts that share it. A replayed copy of the same fact yields the same key.
+fn applied_fact_key(method: &str, cursor: &str, params: &Value) -> String {
+    let item = params.get("item");
+    let field = |value: Option<&Value>| match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Number(number)) => number.to_string(),
+        _ => String::new(),
+    };
+    let item_id = field(item.and_then(|item| item.get("itemId")));
+    let revision = field(item.and_then(|item| item.get("revision")));
+    let turn_id = field(
+        params
+            .get("turnId")
+            .or_else(|| item.and_then(|item| item.get("turnId"))),
+    );
+    format!("{method}\u{1f}{cursor}\u{1f}{item_id}\u{1f}{revision}\u{1f}{turn_id}")
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2034,8 +2054,15 @@ impl EventProcessor {
             .flatten()
             .filter(|cursor| !cursor.trim().is_empty())
             .map(str::to_owned);
-        if let Some(cursor) = cursor.as_deref()
-            && self.applied_view_cursors.contains(cursor)
+        // `viewCursor` is a view-revision cursor, not a per-notification id:
+        // one revision can carry several facts (the final `item/completed`
+        // and `turn/completed` of a turn share it). Deduplicate the exact
+        // fact (method, cursor, item/turn identity), never the cursor alone.
+        let applied_key = cursor
+            .as_deref()
+            .map(|cursor| applied_fact_key(&method, cursor, &params));
+        if let Some(key) = applied_key.as_deref()
+            && self.applied_view_cursors.contains(key)
         {
             // Already-applied replayed copy (live facts queued past
             // `after` alongside their `(after, head]` replay): skip
@@ -2048,8 +2075,10 @@ impl EventProcessor {
             self.invalidate_view_recovery();
             return Err(error);
         }
+        if let Some(key) = applied_key {
+            self.applied_view_cursors.insert(key);
+        }
         if let Some(cursor) = cursor {
-            self.applied_view_cursors.insert(cursor.clone());
             let live = self.view_recovery.as_mut().is_some_and(|recovery| {
                 if recovery.head.as_ref() == Some(&cursor) {
                     recovery.head_seen = true;
@@ -2564,6 +2593,13 @@ impl EventProcessor {
         // The semantic hold signal gets first claim on the bounded terminal data.
         if let Some(restriction) = provider_restriction {
             attach_provider_restriction(&mut data, restriction, &secrets);
+        }
+        // Optional terminal turn-aggregate usage: attach before the final
+        // text so the existing bounded terminal-text accounting includes the
+        // usage bytes. Absent/malformed usage never blocks or gaps this
+        // terminal; it simply leaves `data.usage` unset.
+        if let Some(usage) = turn_usage(&notification) {
+            data["usage"] = serde_json::to_value(&usage).unwrap_or(Value::Null);
         }
         if let Some(text) = self.final_text.as_ref() {
             attach_final_text(
@@ -4781,6 +4817,7 @@ mod tests {
                 retryable: true,
             }),
             reason: None,
+            usage: None,
         };
         assert!(terminal_provider_restriction(&status, &notification).is_some());
 
@@ -4808,6 +4845,31 @@ mod tests {
         applied.insert("cursor-a".to_owned());
         assert!(applied.contains("cursor-a"));
         assert!(applied.contains("cursor-b"));
+    }
+
+    #[test]
+    fn turn_completed_sharing_the_final_item_cursor_is_not_a_replay() {
+        // Live 2026-11-13: every Muse turn stayed busy after its final
+        // message because `turn/completed` reused the revision cursor of the
+        // final `item/completed` and was dropped as an applied replay.
+        let item = json!({
+            "sessionId": "session-1",
+            "viewCursor": "rev-9",
+            "item": {"itemId": "item-final", "revision": 3, "turnId": "turn-1"},
+        });
+        let turn = json!({"sessionId": "session-1", "viewCursor": "rev-9", "turnId": "turn-1"});
+        let mut applied = AppliedViewCursors::default();
+        applied.insert(applied_fact_key("item/completed", "rev-9", &item));
+        assert!(!applied.contains(&applied_fact_key("turn/completed", "rev-9", &turn)));
+        // A replayed copy of the very same fact is still recognized.
+        assert!(applied.contains(&applied_fact_key("item/completed", "rev-9", &item)));
+        // Two items in one revision are distinct facts.
+        let other = json!({
+            "sessionId": "session-1",
+            "viewCursor": "rev-9",
+            "item": {"itemId": "item-tool", "revision": 1, "turnId": "turn-1"},
+        });
+        assert!(!applied.contains(&applied_fact_key("item/completed", "rev-9", &other)));
     }
 
     #[test]

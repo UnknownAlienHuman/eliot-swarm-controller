@@ -12,7 +12,7 @@
 //!
 //! No SDK code is copied here; these structs are written from the schema.
 
-use eliot_core::{ProviderRestriction, ProviderRestrictionKind};
+use eliot_core::{ProviderRestriction, ProviderRestrictionKind, TurnUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -539,6 +539,13 @@ impl NativeTurnError {
 }
 
 /// `turn/completed` params: the run's durable terminal record landed.
+/// `usage`, when present, is the installed schema's turn aggregate: the
+/// turn's aggregate token usage, summed across the turn's model completions
+/// (same shape as `session/tokenUsage.usage`). The per-completion
+/// `session/tokenUsage` events (raw counters plus the server-derived
+/// counted-once `promptTokens`/`totalTokens` and the session `cumulative`
+/// block) and the `session/contextUsage` occupancy triple are session-scoped
+/// facts, not turn expenditure, and stay unmapped here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeTurnCompletedNotification {
@@ -550,6 +557,67 @@ pub struct NativeTurnCompletedNotification {
     pub error: Option<NativeTurnError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<NativeTurnUsage>,
+}
+
+/// Installed `TokenUsage` (the runtime's `Usage`, camelCased): raw token
+/// counters verbatim from the durable record. `cachedTokens` is
+/// provider-convention-dependent (inside or beside `inputTokens`), so it is
+/// parsed but never mapped to a cache split; only the explicit
+/// `cacheReadTokens`/`cacheWriteTokens` splits project. Unknown fields are
+/// ignored per additive-optional evolution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTurnUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<i64>,
+}
+
+/// Map one terminal `turn/completed` usage block to turn expenditure at
+/// `turn` scope. Only genuinely supplied nonnegative counters are mapped;
+/// missing values stay null (never zero, never a sum), and an absent or
+/// wholly unusable block yields no usage at all so completion proceeds.
+/// `cachedTokens` is never mapped (ambiguous convention) and no total is
+/// ever derived: the counted-once derivations live in the per-completion
+/// `session/tokenUsage` session facts, not in the terminal.
+pub(crate) fn turn_usage(notification: &NativeTurnCompletedNotification) -> Option<TurnUsage> {
+    let usage = notification.usage.as_ref()?;
+    let counter = |value: Option<i64>| value.filter(|value| *value >= 0);
+    let input_tokens = counter(usage.input_tokens);
+    let output_tokens = counter(usage.output_tokens);
+    let reasoning_tokens = counter(usage.reasoning_tokens);
+    let cache_read_tokens = counter(usage.cache_read_tokens);
+    let cache_write_tokens = counter(usage.cache_write_tokens);
+    if input_tokens.is_none()
+        && output_tokens.is_none()
+        && reasoning_tokens.is_none()
+        && cache_read_tokens.is_none()
+        && cache_write_tokens.is_none()
+    {
+        return None;
+    }
+    Some(TurnUsage {
+        scope: Some("turn".to_owned()),
+        message_id: None,
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        thinking_tokens: None,
+        cache_read_tokens,
+        cache_write_tokens,
+        total_tokens: None,
+    })
 }
 
 /// One transcript item at one revision. Only the common identity fields, the
@@ -1108,6 +1176,57 @@ impl NativeTurnTerminal {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn completed_with_usage(usage: Value) -> NativeTurnCompletedNotification {
+        serde_json::from_value(json!({
+            "sessionId": "session-1",
+            "terminal": "completed",
+            "turnId": "turn-1",
+            "viewCursor": "cursor-1",
+            "usage": usage,
+        }))
+        .expect("terminal with usage decodes")
+    }
+
+    #[test]
+    fn terminal_usage_maps_explicit_counters_at_turn_scope() {
+        let notification = completed_with_usage(json!({
+            "inputTokens": 12,
+            "outputTokens": 4,
+            "reasoningTokens": 2,
+            "cachedTokens": 9,
+            "cacheReadTokens": 3,
+            "cacheWriteTokens": 1,
+        }));
+        let usage = turn_usage(&notification).expect("usable usage maps");
+        assert_eq!(usage.scope, Some("turn".to_owned()));
+        assert_eq!(usage.message_id, None);
+        assert_eq!(usage.input_tokens, Some(12));
+        assert_eq!(usage.output_tokens, Some(4));
+        assert_eq!(usage.reasoning_tokens, Some(2));
+        assert_eq!(usage.thinking_tokens, None);
+        assert_eq!(usage.cache_read_tokens, Some(3));
+        assert_eq!(usage.cache_write_tokens, Some(1));
+        // The ambiguous `cachedTokens` convention never maps, and no total
+        // is derived from the parts.
+        assert_eq!(usage.total_tokens, None);
+    }
+
+    #[test]
+    fn terminal_usage_without_usable_counters_stays_null() {
+        let absent: NativeTurnCompletedNotification = serde_json::from_value(json!({
+            "sessionId": "session-1",
+            "terminal": "completed",
+            "turnId": "turn-1",
+            "viewCursor": "cursor-1",
+        }))
+        .expect("terminal without usage decodes");
+        assert_eq!(turn_usage(&absent), None);
+        let empty = completed_with_usage(json!({}));
+        assert_eq!(turn_usage(&empty), None);
+        let negative = completed_with_usage(json!({"inputTokens": -5}));
+        assert_eq!(turn_usage(&negative), None);
+    }
 
     #[test]
     fn only_pre_admission_errors_prove_no_write() {
