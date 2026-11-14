@@ -112,6 +112,29 @@ const METHODS: &[Method] = &[
         "Read approved project registrations, bounded by the daemon page limit.",
         {}
     ),
+    method!(
+        "profile.list",
+        ProfileListRequest,
+        ProfileListResponse,
+        true,
+        false,
+        "List configured profiles as sanitized summaries (names, harness, model/effort, authority and route names) with launch-time resolvability; no environment or secret values.",
+        {}
+    ),
+    method!(
+        "config.profiles.read",
+        ProfilesReadRequest,
+        ProfilesReadResponse,
+        true,
+        false,
+        "Read the verbatim [profiles.*] sections of config.toml and the file revision; other sections stay server-side.",
+        {}
+    ),
+    method!("config.profiles.save", ProfilesSaveRequest, ProfilesSaveResponse, true, true, "Validate (dry_run) or replace the [profiles.*] sections of config.toml with the daemon's own parser and launch resolution, guarded by the file revision.", {"expected_revision":null,"source":"[profiles.codex]
+harness = \"codex\"
+model = \"gpt-6-luna\"
+","dry_run":true}),
+    method!("rule.list", RuleListRequest, RuleListResponse, true, false, "Page one rule namespace's stored states with canonical definitions and timer states.", {"limit":20}),
     method!("rule.get", RuleGetRequest, RuleStateView, true, false, "Read one rule's current and retiring cursors.", {"id":"rule-1"}),
     method!("rule.catch_up", RuleCatchUpRequest, Command, true, true, "Catch up a rule through a finite retained event interval.", {"id":EXAMPLE_ID,"rule":"rule-1","after_seq":0,"through_seq":10}),
     method!("timer.get", TimerGetRequest, TimerStateView, true, false, "Read one timer's state and next occurrence.", {"id":"timer-1"}),

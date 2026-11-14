@@ -19,6 +19,11 @@ do = [{ action = "send", target = "${event.agent}", expected_generation = "${eve
 limit = { max = 3, per = "agent", window = "1h" }
 ```
 
+`rule.list` reads one namespace's stored rule states, timer states and canonical
+definitions for owner screens. No operation pauses, resumes, enables or disables a rule or
+timer: `enabled` comes from the rule file and `paused_reason` is set only by the daemon
+(the backlog policy below).
+
 Required keys are `id`, `on`, `do`; optional keys are `enabled`, `limit`, `catch_up` and
 `allow_self`. `catch_up` configures timer-slot recovery; committed-history catch-up is an
 explicit owner request described below. Unknown keys and duplicate ids are errors. A

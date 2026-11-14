@@ -960,6 +960,7 @@ mod tests {
             outcome: Some(TurnOutcome::Success),
             native_status: None,
             config_revision: 0,
+            config: None,
         }
     }
 

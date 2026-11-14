@@ -2,6 +2,7 @@ mod attention;
 mod attribution;
 mod auth;
 mod command;
+mod config_ops;
 mod context;
 mod coordination;
 mod digests;
@@ -295,6 +296,10 @@ impl Router {
             "swarm.digest" => self.swarm_digest(&params, &principal).await,
             "project.get" => self.project_get(&params, &principal).await,
             "project.list" => self.project_list(&params, &principal).await,
+            "profile.list" => self.profile_list(&params, &principal).await,
+            "config.profiles.read" => self.config_profiles_read(&params, &principal).await,
+            "config.profiles.save" => self.config_profiles_save(&params, &principal).await,
+            "rule.list" => self.rule_list(&params, &principal).await,
             "rule.get" => self.rule_get(&params, &principal).await,
             "rule.catch_up" => self.rule_catch_up(&params, &principal).await,
             "timer.get" => self.timer_get(&params, &principal).await,

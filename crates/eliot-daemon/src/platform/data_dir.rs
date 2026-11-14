@@ -486,6 +486,65 @@ fn validate_private_root(path: &Path) -> Result<()> {
     }
 }
 
+/// Atomically replace one private file directly under a private data
+/// directory (used for `config.toml` profile saves): a new private
+/// temporary file is written and synced, then renamed over the target. On
+/// failure the previous file is untouched and the temporary is removed.
+pub(crate) fn replace_private_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    validate_text("file name", name, 255)?;
+    if name.contains(['/', '\\', ':']) || name.starts_with('.') {
+        return Err(Error::new(
+            "invalid",
+            "private file name must be a plain file name",
+        ));
+    }
+    #[cfg(any(windows, unix))]
+    {
+        let target = dir.join(name);
+        match fs::symlink_metadata(&target) {
+            Ok(_) => ensure_private_file(&target)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect private file", error)),
+        }
+        let temporary = dir.join(format!(".{name}.{}.tmp", ulid::Ulid::new()));
+        let mut temporary_created = false;
+        let result = (|| {
+            let mut file = create_new_private_file(&temporary)
+                .map_err(|error| io_error("create private file", error))?;
+            temporary_created = true;
+            ensure_private_file(&temporary)?;
+            file.write_all(bytes)
+                .map_err(|error| io_error("write private file", error))?;
+            file.sync_all()
+                .map_err(|error| io_error("sync private file", error))?;
+            drop(file);
+            replace_file(&temporary, &target)?;
+            // The file is already replaced: a later failure leaves an
+            // uncertain outcome, never "unchanged".
+            ensure_private_file(&target)
+                .and_then(|()| sync_directory(dir))
+                .map_err(|error| {
+                    Error::new(
+                        "unknown",
+                        format!("{name} was replaced, then {}", error.message),
+                    )
+                })
+        })();
+        if result.is_err() && temporary_created {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (dir, bytes);
+        Err(Error::new(
+            "platform_unsupported",
+            "private files are unsupported on this platform",
+        ))
+    }
+}
+
 fn validate_private_file(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {

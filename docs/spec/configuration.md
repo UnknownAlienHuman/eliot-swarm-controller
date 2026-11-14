@@ -675,6 +675,45 @@ model/effort, revision, provenance, profile name) resolved from the exact
 retained generation and revision for the same original-request versus
 resolved-configuration distinction.
 
+## Profile editing
+
+Launch admission resolves its profile from `config.toml` at admission (above), so the
+saved file is what the next launch uses and running or queued work keeps its frozen
+snapshot; only a successful `configure` changes a live Agent's next-turn model/effort.
+Daemon settings loaded once at startup (`[daemon]`, `[mail]`, `[automation]`) are not
+edited through this path.
+
+`config.profiles.read` returns the file revision (lowercase hex SHA-256 of its bytes)
+and the verbatim text of the `[profiles.*]` table blocks in file order. Every other
+section stays server-side. Comment and blank lines that end a profile block and precede
+another section belong to that section. The source is withheld (`editable=false` with a
+reason) when the file is not valid TOML, when profiles are defined outside
+`[profiles.*]` tables, or when the profile text contains a value the daemon's secret
+policy knows. Profile sections carry environment and credential names, never values.
+
+[`config.profiles.save`](../../crates/eliot-daemon/src/config/profiles_edit.rs) takes
+the full replacement text for those blocks, the revision it was read from, and
+`dry_run`. It accepts a draft only when all of these hold:
+
+- the draft holds only `[profiles.*]` tables;
+- splicing it in place of the old blocks keeps the text of every other section in
+  place (only boundary newlines may be added) and every non-profile value unchanged;
+- the strict config parser, launch-time resolution of every profile (including child
+  profiles and route binding) and project validation accept the result, within the
+  128 KiB bound;
+- the file still has the expected revision, otherwise `conflict`.
+
+A draft carrying the redaction marker fails request validation (`invalid`). A known
+secret value, in the raw text or in any decoded value, is `not_allowed`. A dry run
+stops after validation. A save rechecks the revision immediately before it writes a
+private temporary file in the data directory and renames it over `config.toml`. Only
+saves inside one daemon are serialized, so an external writer in the instant between
+that recheck and the rename can still be overwritten. A failure after the rename
+reports `unknown`, never "unchanged". The draft keeps the file's line ending. An
+identical result writes nothing. An invalid draft is never written, so the file keeps
+its last valid revision and the editor keeps the draft. The daemon holds no separate
+in-memory profile set to reload: the next admission reads the saved file.
+
 ## Frozen files
 
 Resolve explicit notes/setup/scripts/entry files under allowed roots, reject escapes,

@@ -1,0 +1,377 @@
+//! Owner configuration reads and the profile-section save, plus the
+//! automation rule list.
+//!
+//! `profile.list` is a sanitized summary for launch pickers: names, harness,
+//! model/effort, authority and route names, never values of secrets or
+//! environment. `config.profiles.read` returns the source text of the
+//! `[profiles.*]` sections only; every other section of `config.toml`
+//! (accounts, proxies, projects, cloud MCP, daemon, automation, mail) stays
+//! server-side. `config.profiles.save` replaces exactly those sections after
+//! the daemon's own parser and launch resolution accept the result, guarded
+//! by the file revision the editor started from. `rule.list` pages the
+//! stored rule states with their canonical definitions and timer states.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::{RuleStateView, TimerStateView};
+use crate::{Error, Result};
+
+/// Lowercase hexadecimal SHA-256 of the `config.toml` bytes.
+pub const CONFIG_REVISION_HEX_LEN: usize = 64;
+/// Upper bound on the profile source text (the whole file is 128 KiB).
+pub const MAX_PROFILES_SOURCE_BYTES: usize = 128 * 1024;
+/// Profiles listed at most (the config loader's own bound).
+pub const MAX_LISTED_PROFILES: usize = 256;
+/// Marker the daemon's secret policy writes; never accepted back.
+pub const REDACTION_MARKER: &str = "[REDACTED]";
+
+fn validate_revision(revision: &Option<String>) -> Result<()> {
+    if let Some(revision) = revision
+        && (revision.len() != CONFIG_REVISION_HEX_LEN
+            || !revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        return Err(Error::new(
+            "invalid",
+            "config revision must be 64 lowercase hexadecimal characters",
+        ));
+    }
+    Ok(())
+}
+
+/// Request for `profile.list`. Empty object.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileListRequest {}
+
+impl ProfileListRequest {
+    pub fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn validate_response(&self, reply: &ProfileListResponse) -> Result<()> {
+        validate_revision(&reply.revision)?;
+        if reply.profiles.len() > MAX_LISTED_PROFILES {
+            return Err(Error::new("invalid", "profile list exceeds 256 entries"));
+        }
+        if !reply.valid && !reply.profiles.is_empty() {
+            return Err(Error::new(
+                "invalid",
+                "an invalid configuration file cannot list profiles",
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for profile in &reply.profiles {
+            if profile.name.trim().is_empty() || !seen.insert(profile.name.as_str()) {
+                return Err(Error::new(
+                    "invalid",
+                    "profile list names are blank or repeated",
+                ));
+            }
+            if profile.launchable == profile.error.is_some() {
+                return Err(Error::new(
+                    "invalid",
+                    "a profile is launchable exactly when it carries no error",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Sanitized summary of one configured profile. Route and credential
+/// selectors appear by name only; no environment or secret value is read.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSummary {
+    pub name: String,
+    pub harness: String,
+    /// Requested model; absent means the harness native default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Requested effort; absent means the native default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<String>,
+    /// Selected proxy name, if any (direct route otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    /// Selected account name, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_live: Option<u64>,
+    #[serde(default)]
+    pub child_profiles: Vec<String>,
+    /// True when launch-time resolution of this profile succeeds now.
+    pub launchable: bool,
+    /// The resolution error when not launchable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Response for `profile.list`.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileListResponse {
+    /// Revision of the file read; absent when `config.toml` does not exist.
+    #[serde(default)]
+    pub revision: Option<String>,
+    /// False when the file does not parse; launches then fail until fixed.
+    pub valid: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub profiles: Vec<ProfileSummary>,
+}
+
+/// Request for `config.profiles.read`. Empty object.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfilesReadRequest {}
+
+impl ProfilesReadRequest {
+    pub fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn validate_response(&self, reply: &ProfilesReadResponse) -> Result<()> {
+        validate_revision(&reply.revision)?;
+        match (&reply.source, reply.editable) {
+            (Some(source), true) => {
+                if source.len() > MAX_PROFILES_SOURCE_BYTES || source.contains(REDACTION_MARKER) {
+                    return Err(Error::new(
+                        "invalid",
+                        "profile source is oversized or carries a redaction marker",
+                    ));
+                }
+            }
+            (None, false) if reply.reason.is_some() => {}
+            _ => {
+                return Err(Error::new(
+                    "invalid",
+                    "profile source is returned exactly when it is editable; otherwise a reason is given",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Response for `config.profiles.read`: the `[profiles.*]` sections only.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfilesReadResponse {
+    #[serde(default)]
+    pub revision: Option<String>,
+    /// Verbatim profile sections in file order, when editable.
+    #[serde(default)]
+    pub source: Option<String>,
+    pub editable: bool,
+    /// Why the source is withheld (invalid file, profiles defined outside
+    /// `[profiles.*]` tables, a known secret value present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Request for `config.profiles.save`.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfilesSaveRequest {
+    /// Revision the draft was edited from; absent only when the file did
+    /// not exist. A different current revision is `conflict`.
+    #[serde(default)]
+    pub expected_revision: Option<String>,
+    /// Replacement text for all `[profiles.*]` sections.
+    pub source: String,
+    /// Validate with the daemon's parser and launch resolution only.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+impl ProfilesSaveRequest {
+    pub fn validate(&self) -> Result<()> {
+        validate_revision(&self.expected_revision)?;
+        if self.source.len() > MAX_PROFILES_SOURCE_BYTES {
+            return Err(Error::new("invalid", "profile source exceeds 128 KiB"));
+        }
+        if self.source.contains(REDACTION_MARKER) {
+            return Err(Error::new(
+                "invalid",
+                "profile source carries a redaction marker; secrets are never saved through this path",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_response(&self, reply: &ProfilesSaveResponse) -> Result<()> {
+        validate_revision(&reply.revision)?;
+        if self.dry_run && reply.saved {
+            return Err(Error::new("invalid", "a dry run must not save"));
+        }
+        if reply.saved && reply.revision.is_none() {
+            return Err(Error::new(
+                "invalid",
+                "a saved file must carry its revision",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Response for `config.profiles.save`.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfilesSaveResponse {
+    /// True when the file was replaced (or already held exactly this text).
+    pub saved: bool,
+    /// Current file revision after the call.
+    #[serde(default)]
+    pub revision: Option<String>,
+    /// Profile names in the accepted source.
+    pub profiles: Vec<String>,
+}
+
+/// Request for `rule.list`: one page of a rule namespace.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleListRequest {
+    /// Registered project id; absent lists global rules.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Last rule id of the previous page.
+    #[serde(default)]
+    pub after: Option<String>,
+    #[serde(default = "super::default_limit")]
+    pub limit: usize,
+}
+
+impl Default for RuleListRequest {
+    fn default() -> Self {
+        Self {
+            project: None,
+            after: None,
+            limit: super::default_limit(),
+        }
+    }
+}
+
+impl RuleListRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.limit == 0 || self.limit > super::MAX_LIMIT {
+            return Err(Error::new("invalid", "limit must be 1 through 1000"));
+        }
+        for value in [&self.project, &self.after].into_iter().flatten() {
+            if value.trim().is_empty() {
+                return Err(Error::new("invalid", "project and after must not be blank"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_response(&self, reply: &RuleListResponse) -> Result<()> {
+        if reply.rules.len() > self.limit {
+            return Err(Error::new("invalid", "rule page exceeds its limit"));
+        }
+        let mut previous: Option<&str> = self.after.as_deref();
+        for entry in &reply.rules {
+            entry.state.validate()?;
+            if entry.state.project != self.project {
+                return Err(Error::new("invalid", "rule page mixes namespaces"));
+            }
+            if previous.is_some_and(|previous| entry.state.id.as_str() <= previous) {
+                return Err(Error::new("invalid", "rule page is not ordered by id"));
+            }
+            if let Some(timer) = &entry.timer
+                && (timer.id != entry.state.id || timer.project != entry.state.project)
+            {
+                return Err(Error::new("invalid", "timer state names another rule"));
+            }
+            if !entry.definition.is_object() {
+                return Err(Error::new("invalid", "rule definition must be an object"));
+            }
+            previous = Some(entry.state.id.as_str());
+        }
+        match (&reply.next, reply.rules.last()) {
+            (Some(next), Some(last)) if *next == last.state.id => Ok(()),
+            (None, _) => Ok(()),
+            _ => Err(Error::new(
+                "invalid",
+                "rule page cursor must be its last id",
+            )),
+        }
+    }
+}
+
+/// One stored rule: state, its timer state when it is a timer, and the
+/// canonical definition (`on`, `do`, `limit`, `catch_up`).
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuleListEntry {
+    pub state: RuleStateView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timer: Option<TimerStateView>,
+    pub definition: Value,
+}
+
+/// Response for `rule.list`.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuleListResponse {
+    pub rules: Vec<RuleListEntry>,
+    /// Last id of every nonempty page; continue until an empty page.
+    #[serde(default)]
+    pub next: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_rejects_redaction_markers_and_bad_revisions() {
+        let mut request = ProfilesSaveRequest {
+            expected_revision: Some("ab".repeat(32)),
+            source: "[profiles.a]\nharness = \"codex\"\n".to_owned(),
+            dry_run: false,
+        };
+        assert!(request.validate().is_ok());
+        request.source.push_str("model = \"[REDACTED]\"\n");
+        assert!(request.validate().is_err());
+        request.source = String::new();
+        request.expected_revision = Some("XYZ".to_owned());
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn read_response_returns_source_only_when_editable() {
+        let request = ProfilesReadRequest {};
+        let withheld = ProfilesReadResponse {
+            revision: None,
+            source: None,
+            editable: false,
+            reason: Some("invalid file".to_owned()),
+        };
+        assert!(request.validate_response(&withheld).is_ok());
+        let inconsistent = ProfilesReadResponse {
+            source: Some(String::new()),
+            ..withheld
+        };
+        assert!(request.validate_response(&inconsistent).is_err());
+    }
+
+    #[test]
+    fn dry_run_never_reports_saved() {
+        let request = ProfilesSaveRequest {
+            expected_revision: None,
+            source: String::new(),
+            dry_run: true,
+        };
+        let reply = ProfilesSaveResponse {
+            saved: true,
+            revision: Some("0".repeat(64)),
+            profiles: Vec::new(),
+        };
+        assert!(request.validate_response(&reply).is_err());
+    }
+}

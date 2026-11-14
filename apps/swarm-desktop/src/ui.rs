@@ -24,22 +24,53 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use eliot_core::api::{AgentGetResponse, AgentListRequest, CommandSubmitResponse};
+use eliot_core::api::{
+    AgentGetResponse, AgentListRequest, CommandSubmitResponse, ProfileListResponse, ProfileSummary,
+    ProfilesReadResponse, ProfilesSaveResponse, RuleListEntry,
+};
 use windows_reactor::*;
 
 use crate::chat::{Conversation, Invalidation};
-use crate::client;
+use crate::client::{self, LaunchTarget};
+use crate::config_view::{self, ProfilesActions, ProfilesData, RuleNamespace};
 use crate::feed::{self, Delivery, Depth, Reread, Snapshot};
 use crate::live::{self, LiveStatus, Next};
 use crate::markdown::Doc;
 use crate::monitor::{self, Monitor, MonitorSnapshot};
 use crate::monitor_view::{self, MonitorActions};
+use crate::profiles::{self, FORM_FIELDS};
 use crate::state::{BoundAction, DraftStore, MutationLedger, Selection};
 use crate::theme;
 use crate::views::{self, RenderCache, RenderedItem, RowCallbacks};
 
 /// Agent rows per `agent.list` page in the navigation list.
 const AGENT_PAGE: usize = 100;
+/// Harnesses an Owner ad-hoc launch accepts (the daemon validates again).
+const ADHOC_HARNESSES: [&str; 5] = ["codex", "claude", "muse", "opencode", "antigravity"];
+
+/// The three screens of the main column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Screen {
+    Chat,
+    Profiles,
+    Automation,
+}
+
+/// Profiles screen: one document draft over the daemon's profile source.
+#[derive(Clone, Debug, Default)]
+struct ProfilesEditor {
+    revision: Option<String>,
+    base: String,
+    draft: String,
+    editable: bool,
+    reason: Option<String>,
+    selected: Option<String>,
+    duplicate_name: String,
+    status: String,
+    busy: bool,
+    loaded: bool,
+}
+
 /// Index 0 of the project picker lists every Agent in scope.
 const ALL_PROJECTS: &str = "All projects (every Agent in scope)";
 
@@ -112,6 +143,8 @@ struct LaunchOutcome {
 }
 
 type Fallible<T> = Result<T, String>;
+/// One rule namespace read: its rules and whether more remain.
+type RulePage = (Vec<RuleListEntry>, bool);
 
 /// Messages are plain owned data so background workers can return them.
 #[derive(Clone, Debug)]
@@ -147,6 +180,29 @@ enum Message {
     AnswerRequested(UiPending),
     ControlSubmitted(String, Fallible<String>),
     HighlightAgent(String),
+    ScreenSelected(Screen),
+    ProfilesListed(Fallible<ProfileListResponse>),
+    PickerModeSelected(Option<usize>),
+    AdhocHarnessSelected(Option<usize>),
+    AdhocModelChanged(String),
+    AdhocEffortChanged(String),
+    HarnessModelsRequested,
+    HarnessModelsLoaded(String, Fallible<String>),
+    ConfigureModelChanged(String),
+    ConfigureEffortChanged(String),
+    ConfigureRequested,
+    ProfilesSourceLoaded(Fallible<ProfilesReadResponse>),
+    ProfilesDraftChanged(String),
+    ProfileEditSelected(Option<usize>),
+    ProfileFieldChanged(usize, String),
+    DuplicateNameChanged(String),
+    DuplicateRequested,
+    ProfilesValidateRequested,
+    ProfilesSaveRequested,
+    ProfilesSaved(bool, Fallible<ProfilesSaveResponse>),
+    ProfilesReloadRequested,
+    RulesLoaded(u64, Vec<(String, Fallible<RulePage>)>),
+    AutomationRefreshRequested,
     MonitorToggled(bool),
     MonitorLoaded(u64, Option<Box<MonitorSnapshot>>),
     MonitorSelected(Option<usize>),
@@ -206,6 +262,22 @@ struct DesktopApp {
     monitor_epoch: u64,
     monitor_task: Option<ComponentTask>,
     monitor_selected: Option<String>,
+    screen: Screen,
+    /// Daemon `profile.list` summaries for the launch picker.
+    profile_summaries: Vec<ProfileSummary>,
+    profile_list: Option<ProfileListResponse>,
+    picker_adhoc: bool,
+    adhoc_harness_idx: Option<usize>,
+    adhoc_model: String,
+    adhoc_effort: String,
+    harness_hint: String,
+    configure_model: String,
+    configure_effort: String,
+    editor: ProfilesEditor,
+    rules: Vec<RuleNamespace>,
+    rules_status: String,
+    /// Tags rule loads; an older reply is dropped.
+    rules_epoch: u64,
     /// Monitor rows published before the latest refresh; the native
     /// selection never points past them (see `monitor_view`).
     monitor_published: usize,
@@ -233,14 +305,126 @@ impl DesktopApp {
         }
     }
 
+    /// Launch-picker profiles: the daemon's summaries, narrowed to the
+    /// selected project's allowlist when one is selected.
+    fn picker_profiles(&self) -> Vec<&ProfileSummary> {
+        self.profile_summaries
+            .iter()
+            .filter(|profile| self.profiles.is_empty() || self.profiles.contains(&profile.name))
+            .collect()
+    }
+
     fn launch_profile(&self) -> Option<String> {
-        if self.profiles.is_empty() {
+        if self.profile_summaries.is_empty() {
             Some(self.profile_text.trim().to_owned()).filter(|profile| !profile.is_empty())
         } else {
             self.profile_idx
-                .and_then(|index| self.profiles.get(index))
-                .cloned()
+                .and_then(|index| self.picker_profiles().get(index).map(|p| p.name.clone()))
         }
+    }
+
+    fn launch_target(&self) -> Result<LaunchTarget, String> {
+        if self.picker_adhoc {
+            let harness = self
+                .adhoc_harness_idx
+                .and_then(|index| ADHOC_HARNESSES.get(index))
+                .ok_or("choose a harness")?;
+            Ok(LaunchTarget::Adhoc {
+                harness: (*harness).to_owned(),
+                model: Some(self.adhoc_model.trim().to_owned()).filter(|v| !v.is_empty()),
+                effort: Some(self.adhoc_effort.trim().to_owned()).filter(|v| !v.is_empty()),
+            })
+        } else {
+            self.launch_profile()
+                .map(LaunchTarget::Profile)
+                .ok_or_else(|| "choose or type a configured profile".to_owned())
+        }
+    }
+
+    fn load_profile_list(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let _task = context.spawn_background(move |_| {
+            Message::ProfilesListed(client::block_on(async {
+                client::list_profiles(&data_dir)
+                    .await
+                    .map_err(|error| error.to_string())
+            }))
+        });
+    }
+
+    fn load_profile_source(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        self.editor.busy = true;
+        let _task = context.spawn_background(move |_| {
+            Message::ProfilesSourceLoaded(client::block_on(async {
+                client::read_profiles_source(&data_dir)
+                    .await
+                    .map_err(|error| error.to_string())
+            }))
+        });
+    }
+
+    fn load_rules(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let projects: Vec<String> = self
+            .projects
+            .iter()
+            .map(|project| project.id.clone())
+            .collect();
+        self.rules_status = "Reading rules…".to_owned();
+        self.rules_epoch += 1;
+        let epoch = self.rules_epoch;
+        let _task = context.spawn_background(move |_| {
+            let mut namespaces = Vec::new();
+            client::block_on(async {
+                namespaces.push((
+                    "Global rules".to_owned(),
+                    client::list_rules(&data_dir, None)
+                        .await
+                        .map_err(|error| error.to_string()),
+                ));
+                for project in projects {
+                    let page = client::list_rules(&data_dir, Some(project.clone()))
+                        .await
+                        .map_err(|error| error.to_string());
+                    namespaces.push((format!("Project {project}"), page));
+                }
+            });
+            Message::RulesLoaded(epoch, namespaces)
+        });
+    }
+
+    fn save_profiles(&mut self, context: &ComponentContext<Self>, dry_run: bool) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        if self.editor.busy || !self.editor.editable {
+            return;
+        }
+        self.editor.busy = true;
+        self.editor.status = if dry_run {
+            "Validating with the daemon parser and launch resolution…".to_owned()
+        } else {
+            "Saving…".to_owned()
+        };
+        let revision = self.editor.revision.clone();
+        let draft = self.editor.draft.clone();
+        let _task = context.spawn_background(move |_| {
+            Message::ProfilesSaved(
+                dry_run,
+                client::block_on(async {
+                    client::save_profiles(&data_dir, revision, draft, dry_run)
+                        .await
+                        .map_err(|error| error.to_string())
+                }),
+            )
+        });
     }
 
     fn submitting(&self) -> bool {
@@ -404,6 +588,9 @@ impl DesktopApp {
 
     fn open_conversation(&mut self, agent: &UiAgent, context: &ComponentContext<Self>) {
         self.selection.select_agent(Some(agent.id.clone()));
+        // Configure values typed for one Agent never carry over to another.
+        self.configure_model.clear();
+        self.configure_effort.clear();
         self.convo = Some(Conversation::new(&agent.id));
         self.detail = None;
         self.depth = Depth::default();
@@ -573,27 +760,34 @@ fn request_summary(details: &serde_json::Value) -> String {
     }
 }
 
-/// Requested configuration revision and the effective native readback, kept
-/// apart: the profile is not proof of what the harness runs.
+/// Requested settings (the frozen profile snapshot, or a configure
+/// overlay) next to the effective native readback, kept apart: the request
+/// is not proof of what the harness runs.
 fn effective_summary(reply: &AgentGetResponse) -> String {
+    let read = |value: Option<&serde_json::Value>, key: &str| {
+        value
+            .and_then(|value| value.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let snapshot = Some(&reply.agent.profile_snapshot);
     let effective = reply.agent.effective.as_ref();
-    let model = effective
-        .and_then(|value| value.get("model"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("not read back");
-    let effort = effective
-        .and_then(|value| value.get("effort"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("not read back");
-    match reply.config.as_ref() {
-        Some(config) => format!(
-            "effective {model}/{effort} · requested rev {} {}/{}",
+    let requested_model = read(snapshot, "model").unwrap_or_else(|| "native default".to_owned());
+    let requested_effort = read(snapshot, "effort").unwrap_or_else(|| "native default".to_owned());
+    let model = read(effective, "model").unwrap_or_else(|| "not read back".to_owned());
+    let effort = read(effective, "effort").unwrap_or_else(|| "not read back".to_owned());
+    let mut summary =
+        format!("requested {requested_model}/{requested_effort} · effective {model}/{effort}");
+    if let Some(config) = reply.config.as_ref() {
+        summary.push_str(&format!(
+            " · configure rev {} ({}) requests {}/{} for the next turn",
             config.revision,
-            config.model.as_deref().unwrap_or("profile default"),
-            config.effort.as_deref().unwrap_or("profile default"),
-        ),
-        None => format!("effective {model}/{effort}"),
+            config.provenance,
+            config.requested_model.as_deref().unwrap_or("unchanged"),
+            config.requested_effort.as_deref().unwrap_or("unchanged"),
+        ));
     }
+    summary
 }
 
 fn submit_note(reply: &CommandSubmitResponse) -> String {
@@ -653,12 +847,27 @@ impl Component for DesktopApp {
             monitor_task: None,
             monitor_selected: None,
             monitor_published: 0,
+            screen: Screen::Chat,
+            profile_summaries: Vec::new(),
+            profile_list: None,
+            picker_adhoc: false,
+            adhoc_harness_idx: Some(0),
+            adhoc_model: String::new(),
+            adhoc_effort: String::new(),
+            harness_hint: String::new(),
+            configure_model: String::new(),
+            configure_effort: String::new(),
+            editor: ProfilesEditor::default(),
+            rules: Vec::new(),
+            rules_status: String::new(),
+            rules_epoch: 0,
         };
         if let Ok(data_dir) = app.data_dir.clone() {
             let _task = context.spawn_background(move |_| {
                 Message::ProjectsLoaded(load_projects_blocking(&data_dir))
             });
             app.load_agents(context, None);
+            app.load_profile_list(context);
         }
         app
     }
@@ -666,6 +875,7 @@ impl Component for DesktopApp {
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
         match message {
             Message::ComposerChanged(text) => {
+                let text = profiles::normalize_newlines(&text);
                 if let Some(agent) = self.selected_agent_id() {
                     self.drafts.set(&agent, text);
                 } else {
@@ -769,7 +979,8 @@ impl Component for DesktopApp {
             }
             Message::ProfileSelected(index) => {
                 self.profile_idx = index;
-                self.selection.profile = index.and_then(|index| self.profiles.get(index)).cloned();
+                self.selection.profile = index
+                    .and_then(|index| self.picker_profiles().get(index).map(|p| p.name.clone()));
             }
             Message::RefreshRequested => {
                 if let Ok(data_dir) = self.data_dir.clone() {
@@ -984,16 +1195,19 @@ impl Component for DesktopApp {
                 let Ok(data_dir) = self.data_dir.clone() else {
                     return;
                 };
-                let Some(profile) = self.launch_profile() else {
-                    self.set_status("Choose or type a configured profile first.");
-                    return;
+                let target = match self.launch_target() {
+                    Ok(target) => target,
+                    Err(error) => {
+                        self.set_status(format!("Cannot launch: {error}."));
+                        return;
+                    }
                 };
                 let text = self.launch_text.clone();
                 if text.trim().is_empty() || self.workspace.trim().is_empty() {
                     self.set_status("Type the workspace and the first message before launching.");
                     return;
                 }
-                let key = format!("launch:{profile}:{}:{}", self.workspace, self.launch_rev);
+                let key = format!("launch:{target:?}:{}:{}", self.workspace, self.launch_rev);
                 let mutation_id = self.ledger.id_for(&key);
                 self.in_flight_key = Some(key);
                 let workspace = self.workspace.clone();
@@ -1004,7 +1218,7 @@ impl Component for DesktopApp {
                         let reply = client::submit_launch(
                             &data_dir,
                             mutation_id,
-                            Some(profile),
+                            target,
                             &workspace,
                             Some(text.clone()),
                         )
@@ -1268,6 +1482,259 @@ impl Component for DesktopApp {
                     self.agent_idx = self.agents.iter().position(|agent| agent.id == id);
                 }
             }
+            Message::ScreenSelected(screen) => {
+                self.screen = screen;
+                match screen {
+                    Screen::Profiles if !self.editor.loaded && !self.editor.busy => {
+                        self.load_profile_source(context);
+                        self.load_profile_list(context);
+                    }
+                    Screen::Automation => self.load_rules(context),
+                    _ => {}
+                }
+            }
+            Message::ProfilesListed(result) => match result {
+                Ok(list) => {
+                    self.profile_summaries = list.profiles.clone();
+                    // Keep the chosen profile by name: a refreshed list may
+                    // reorder, add or drop profiles.
+                    self.profile_idx = self.selection.profile.as_ref().and_then(|name| {
+                        self.picker_profiles()
+                            .iter()
+                            .position(|profile| &profile.name == name)
+                    });
+                    if self.profile_idx.is_none() {
+                        self.selection.profile = None;
+                    }
+                    self.profile_list = Some(list);
+                }
+                Err(error) => self.set_status(format!("profile.list failed: {error}")),
+            },
+            Message::PickerModeSelected(index) => self.picker_adhoc = index == Some(1),
+            Message::AdhocHarnessSelected(index) => {
+                self.adhoc_harness_idx = index;
+                self.harness_hint.clear();
+            }
+            Message::AdhocModelChanged(text) => self.adhoc_model = text,
+            Message::AdhocEffortChanged(text) => self.adhoc_effort = text,
+            Message::HarnessModelsRequested => {
+                let (Ok(data_dir), Some(harness)) = (
+                    self.data_dir.clone(),
+                    self.adhoc_harness_idx
+                        .and_then(|index| ADHOC_HARNESSES.get(index)),
+                ) else {
+                    return;
+                };
+                let harness = (*harness).to_owned();
+                self.harness_hint = format!("Reading the {harness} catalogue…");
+                let _task = context.spawn_background(move |_| {
+                    let hint = client::block_on(async {
+                        client::harness_models(&data_dir, &harness)
+                            .await
+                            .map(|reply| {
+                                let default = reply
+                                    .models
+                                    .iter()
+                                    .find(|model| model.default)
+                                    .or_else(|| reply.models.first());
+                                let mut hint = format!(
+                                    "Unset model: {} · unset effort: {}",
+                                    reply.default.as_deref().unwrap_or("the native default"),
+                                    default
+                                        .and_then(|model| model.default_effort.as_deref())
+                                        .unwrap_or("the native default"),
+                                );
+                                if !reply.models.is_empty() {
+                                    let names: Vec<&str> = reply
+                                        .models
+                                        .iter()
+                                        .take(8)
+                                        .map(|m| m.id.as_str())
+                                        .collect();
+                                    hint.push_str(&format!(
+                                        " · {} model(s): {}{}",
+                                        reply.models.len(),
+                                        names.join(", "),
+                                        if reply.models.len() > 8 { ", …" } else { "" }
+                                    ));
+                                }
+                                if let Some(note) = reply.note {
+                                    hint.push_str(&format!(" · {note}"));
+                                }
+                                hint
+                            })
+                            .map_err(|error| error.to_string())
+                    });
+                    Message::HarnessModelsLoaded(harness, hint)
+                });
+            }
+            Message::HarnessModelsLoaded(harness, hint) => {
+                self.harness_hint = match hint {
+                    Ok(hint) => hint,
+                    Err(error) => format!("{harness} catalogue unavailable: {error}"),
+                };
+            }
+            Message::ConfigureModelChanged(text) => self.configure_model = text,
+            Message::ConfigureEffortChanged(text) => self.configure_effort = text,
+            Message::ConfigureRequested => {
+                let (Some(agent), Some(detail)) = (self.selected_agent_id(), self.detail.clone())
+                else {
+                    self.set_status("Select an Agent first.");
+                    return;
+                };
+                let model = Some(self.configure_model.trim().to_owned()).filter(|v| !v.is_empty());
+                let effort =
+                    Some(self.configure_effort.trim().to_owned()).filter(|v| !v.is_empty());
+                if model.is_none() && effort.is_none() {
+                    self.set_status("Configure needs a model or an effort.");
+                    return;
+                }
+                let generation = detail.generation;
+                let key = format!("configure:{agent}:{generation}:{model:?}:{effort:?}");
+                self.submit_control(context, "Configure", key, move |data_dir, mutation_id| {
+                    client::block_on(client::submit_configure(
+                        data_dir,
+                        mutation_id,
+                        &agent,
+                        generation,
+                        model,
+                        effort,
+                    ))
+                    .map(|reply| submit_note(&reply))
+                    .map_err(|error| error.to_string())
+                });
+            }
+            Message::ProfilesSourceLoaded(result) => {
+                self.editor.busy = false;
+                self.editor.loaded = true;
+                match result {
+                    Ok(read) => {
+                        // The TextBox reports LF-normalized text; compare
+                        // drafts in that form (the daemon keeps CRLF files CRLF).
+                        let source = profiles::normalize_newlines(&read.source.unwrap_or_default());
+                        self.editor.revision = read.revision;
+                        self.editor.base = source.clone();
+                        self.editor.draft = source;
+                        self.editor.editable = read.editable;
+                        self.editor.reason = read.reason;
+                        let names = profiles::profile_names(&self.editor.draft);
+                        if self
+                            .editor
+                            .selected
+                            .as_ref()
+                            .is_none_or(|name| !names.contains(name))
+                        {
+                            self.editor.selected = names.first().cloned();
+                        }
+                    }
+                    Err(error) => {
+                        self.editor.editable = false;
+                        self.editor.reason = Some(format!("config.profiles.read failed: {error}"));
+                    }
+                }
+            }
+            Message::ProfilesDraftChanged(text) => {
+                if self.editor.editable && !self.editor.busy {
+                    self.editor.draft = profiles::normalize_newlines(&text);
+                }
+            }
+            Message::ProfileEditSelected(index) => {
+                let names = profiles::profile_names(&self.editor.draft);
+                if let Some(name) = index.and_then(|index| names.get(index)) {
+                    self.editor.selected = Some(name.clone());
+                }
+            }
+            Message::ProfileFieldChanged(field, value) => {
+                if let (Some(name), Some(key)) =
+                    (self.editor.selected.clone(), FORM_FIELDS.get(field))
+                {
+                    let value = Some(value.trim()).filter(|value| !value.is_empty());
+                    match profiles::set_field(&self.editor.draft, &name, key, value) {
+                        Ok(draft) => self.editor.draft = draft,
+                        Err(error) => self.editor.status = error,
+                    }
+                }
+            }
+            Message::DuplicateNameChanged(text) => self.editor.duplicate_name = text,
+            Message::DuplicateRequested => {
+                if let Some(from) = self.editor.selected.clone() {
+                    let to = self.editor.duplicate_name.trim().to_owned();
+                    match profiles::duplicate(&self.editor.draft, &from, &to) {
+                        Ok(draft) => {
+                            self.editor.draft = draft;
+                            self.editor.selected = Some(to.clone());
+                            self.editor.duplicate_name.clear();
+                            self.editor.status = format!(
+                                "Duplicated {from} as {to} in the draft; Validate, then Save."
+                            );
+                        }
+                        Err(error) => self.editor.status = error,
+                    }
+                }
+            }
+            Message::ProfilesValidateRequested => self.save_profiles(context, true),
+            Message::ProfilesSaveRequested => self.save_profiles(context, false),
+            Message::ProfilesSaved(dry_run, result) => {
+                self.editor.busy = false;
+                match result {
+                    Ok(reply) if dry_run => {
+                        self.editor.status = format!(
+                            "Valid: {} profile(s) parse and resolve for launch ({}). Not saved yet.",
+                            reply.profiles.len(),
+                            reply.profiles.join(", ")
+                        );
+                    }
+                    Ok(reply) => {
+                        self.editor.status = format!(
+                            "Saved revision {}; the next launch uses it ({}).",
+                            reply
+                                .revision
+                                .as_deref()
+                                .map_or("?", |r| &r[..12.min(r.len())]),
+                            reply.profiles.join(", ")
+                        );
+                        self.editor.loaded = false;
+                        self.load_profile_source(context);
+                        self.load_profile_list(context);
+                    }
+                    Err(error) if error.starts_with("unknown:") => {
+                        self.editor.status = format!(
+                            "Save outcome uncertain; Reload to see the current file (the draft is kept): {error}"
+                        );
+                    }
+                    Err(error) => {
+                        self.editor.status = format!(
+                            "{} The draft is kept and the saved file is unchanged: {error}",
+                            if dry_run { "Invalid." } else { "Not saved." }
+                        );
+                    }
+                }
+            }
+            Message::ProfilesReloadRequested => {
+                self.editor.status = "Reloaded the saved profile sections.".to_owned();
+                self.load_profile_source(context);
+                self.load_profile_list(context);
+            }
+            Message::RulesLoaded(epoch, namespaces) => {
+                if epoch != self.rules_epoch {
+                    return;
+                }
+                self.rules = namespaces
+                    .into_iter()
+                    .map(|(label, page)| RuleNamespace {
+                        label,
+                        more: page.as_ref().is_ok_and(|(_, more)| *more),
+                        rules: page.map(|(rules, _)| rules),
+                    })
+                    .collect();
+                let count: usize = self
+                    .rules
+                    .iter()
+                    .map(|namespace| namespace.rules.as_ref().map_or(0, Vec::len))
+                    .sum();
+                self.rules_status = format!("{count} rule(s) and timer(s) read.");
+            }
+            Message::AutomationRefreshRequested => self.load_rules(context),
             Message::MonitorToggled(open) => {
                 self.monitor_open = open;
                 if open {
@@ -1392,6 +1859,27 @@ impl Component for DesktopApp {
                     .font_size(theme::type_scale::TITLE)
                     .font_weight(FontWeight::BOLD),
                 ToggleButton::new()
+                    .is_checked(self.screen == Screen::Chat)
+                    .automation_name("Chat screen")
+                    .on_is_checked_changed(
+                        context.callback(|_: bool| Message::ScreenSelected(Screen::Chat)),
+                    )
+                    .content(TextBlock::new().text("Chat")),
+                ToggleButton::new()
+                    .is_checked(self.screen == Screen::Profiles)
+                    .automation_name("Profiles screen")
+                    .on_is_checked_changed(
+                        context.callback(|_: bool| Message::ScreenSelected(Screen::Profiles)),
+                    )
+                    .content(TextBlock::new().text("Profiles")),
+                ToggleButton::new()
+                    .is_checked(self.screen == Screen::Automation)
+                    .automation_name("Automation screen")
+                    .on_is_checked_changed(
+                        context.callback(|_: bool| Message::ScreenSelected(Screen::Automation)),
+                    )
+                    .content(TextBlock::new().text("Automation")),
+                ToggleButton::new()
                     .is_checked(self.monitor_open)
                     .automation_name("Monitor")
                     .on_is_checked_changed(context.callback(Message::MonitorToggled))
@@ -1431,7 +1919,15 @@ impl Component for DesktopApp {
             ))
             .children((
                 self.nav_view(context),
-                self.chat_view(context),
+                match self.screen {
+                    Screen::Chat => self.chat_view(context),
+                    Screen::Profiles => self.profiles_view(context),
+                    Screen::Automation => config_view::automation_screen(
+                        &self.rules,
+                        &self.rules_status,
+                        context.message(Message::AutomationRefreshRequested),
+                    ),
+                },
                 monitor_pane,
             ));
 
@@ -1500,6 +1996,39 @@ impl DesktopApp {
         )
     }
 
+    fn profiles_view(&self, context: &mut ViewContext<Self>) -> View {
+        let list = self.profile_list.as_ref();
+        let data = ProfilesData {
+            revision: self.editor.revision.as_deref(),
+            file_valid: list.is_none_or(|list| list.valid),
+            file_error: list.and_then(|list| list.error.as_deref()),
+            editable: self.editor.editable,
+            reason: self.editor.reason.as_deref(),
+            draft: &self.editor.draft,
+            dirty: self.editor.draft != self.editor.base,
+            selected: self.editor.selected.as_deref(),
+            duplicate_name: &self.editor.duplicate_name,
+            status: &self.editor.status,
+            busy: self.editor.busy,
+            summaries: &self.profile_summaries,
+        };
+        let actions = ProfilesActions {
+            draft_changed: context.callback(Message::ProfilesDraftChanged),
+            select: context.callback(Message::ProfileEditSelected),
+            field_changed: (0..FORM_FIELDS.len())
+                .map(|index| {
+                    context.callback(move |text: String| Message::ProfileFieldChanged(index, text))
+                })
+                .collect(),
+            duplicate_name_changed: context.callback(Message::DuplicateNameChanged),
+            duplicate: context.message(Message::DuplicateRequested),
+            validate: context.message(Message::ProfilesValidateRequested),
+            save: context.message(Message::ProfilesSaveRequested),
+            reload: context.message(Message::ProfilesReloadRequested),
+        };
+        config_view::profiles_screen(data, actions)
+    }
+
     fn nav_view(&self, context: &mut ViewContext<Self>) -> View {
         let mut project_names = vec![ALL_PROJECTS.to_owned()];
         project_names.extend(self.projects.iter().map(|project| project.id.clone()));
@@ -1561,7 +2090,69 @@ impl DesktopApp {
             .on_click(context.message(Message::MoreAgentsRequested))
             .content(TextBlock::new().text("More Agents"));
 
-        let profile_input: View = if self.profiles.is_empty() {
+        let picker_profiles = self.picker_profiles();
+        let selected_summary = self
+            .profile_idx
+            .and_then(|index| picker_profiles.get(index).copied());
+        let picker_mode = ComboBox::new()
+            .items_source(vec![
+                "Configured profile".to_owned(),
+                "Ad-hoc harness".to_owned(),
+            ])
+            .selected_index(Some(usize::from(self.picker_adhoc)))
+            .automation_name("Launch mode")
+            .on_selection_changed(context.callback(Message::PickerModeSelected));
+        let profile_input: View = if self.picker_adhoc {
+            StackPanel::new().spacing(theme::spacing::XS).children((
+                ComboBox::new()
+                    .items_source(ADHOC_HARNESSES.map(str::to_owned).to_vec())
+                    .selected_index(self.adhoc_harness_idx)
+                    .automation_name("Ad-hoc harness")
+                    .on_selection_changed(context.callback(Message::AdhocHarnessSelected)),
+                TextBox::new()
+                    .text(self.adhoc_model.clone())
+                    .placeholder_text("model (unset: harness default)")
+                    .automation_name("Ad-hoc model")
+                    .on_text_changed(context.callback(Message::AdhocModelChanged)),
+                TextBox::new()
+                    .text(self.adhoc_effort.clone())
+                    .placeholder_text("effort (unset: harness default)")
+                    .automation_name("Ad-hoc effort")
+                    .on_text_changed(context.callback(Message::AdhocEffortChanged)),
+                Button::new()
+                    .on_click(context.message(Message::HarnessModelsRequested))
+                    .content(TextBlock::new().text("Harness defaults")),
+                TextBlock::new()
+                    .text(self.harness_hint.clone())
+                    .font_size(theme::type_scale::LABEL)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .opacity(theme::MUTED_OPACITY),
+            ))
+        } else if !self.profile_summaries.is_empty() {
+            StackPanel::new()
+                .spacing(theme::spacing::XS)
+                .children((
+                    ComboBox::new()
+                        .items_source(
+                            picker_profiles
+                                .iter()
+                                .map(|profile| profile.name.clone())
+                                .collect::<Vec<_>>(),
+                        )
+                        .selected_index(self.profile_idx)
+                        .placeholder_text("Profile")
+                        .automation_name("Profile")
+                        .on_selection_changed(context.callback(Message::ProfileSelected)),
+                    TextBlock::new()
+                        .text(selected_summary.map_or_else(
+                            || "Requested settings appear here; the Agent detail shows the effective readback after launch.".to_owned(),
+                            config_view::summary_line,
+                        ))
+                        .font_size(theme::type_scale::LABEL)
+                        .text_wrapping(TextWrapping::Wrap)
+                        .opacity(theme::MUTED_OPACITY),
+                ))
+        } else if self.profiles.is_empty() {
             TextBox::new()
                 .text(self.profile_text.clone())
                 .placeholder_text("Configured profile name")
@@ -1619,8 +2210,11 @@ impl DesktopApp {
                 agent_list,
                 counter.grid_row(4),
                 more,
-                section("Launch profile").grid_row(6),
-                Border::new().grid_row(7).content(profile_input),
+                section("Launch").grid_row(6),
+                StackPanel::new()
+                    .grid_row(7)
+                    .spacing(theme::spacing::XS)
+                    .children((picker_mode, profile_input)),
                 section("Workspace").grid_row(8),
                 workspace_box.grid_row(9),
                 StackPanel::new()
@@ -1843,11 +2437,37 @@ impl DesktopApp {
             } else {
                 "Jump to latest".to_owned()
             }));
+        let configure: View = if has_agent {
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(theme::spacing::XS)
+                .children((
+                    TextBox::new()
+                        .text(self.configure_model.clone())
+                        .placeholder_text("model")
+                        .automation_name("Configure model")
+                        .width(150.0)
+                        .on_text_changed(context.callback(Message::ConfigureModelChanged)),
+                    TextBox::new()
+                        .text(self.configure_effort.clone())
+                        .placeholder_text("effort")
+                        .automation_name("Configure effort")
+                        .width(90.0)
+                        .on_text_changed(context.callback(Message::ConfigureEffortChanged)),
+                    Button::new()
+                        .is_enabled(!self.submitting() && self.detail.is_some())
+                        .automation_name("Configure next turn")
+                        .on_click(context.message(Message::ConfigureRequested))
+                        .content(TextBlock::new().text("Configure next turn")),
+                ))
+        } else {
+            View::empty()
+        };
         let actions = StackPanel::new()
             .grid_row(5)
             .orientation(Orientation::Horizontal)
             .spacing(theme::spacing::SM)
-            .children((primary, interrupt, jump));
+            .children((primary, interrupt, jump, configure));
 
         Grid::new()
             .grid_column(1)
