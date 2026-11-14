@@ -1033,9 +1033,11 @@ enum PluginCommand {
     AntigravityHook,
 }
 
+#[derive(Debug)]
 struct Failure {
     exit_code: u8,
     message: String,
+    code: Option<String>,
     diagnostics: Vec<eliot_core::StderrDiagnostic>,
 }
 
@@ -1044,6 +1046,7 @@ impl Failure {
         Self {
             exit_code,
             message: message.into(),
+            code: None,
             diagnostics: Vec::new(),
         }
     }
@@ -1077,7 +1080,9 @@ impl Failure {
                 _ => 4,
             }
         };
+        let code = error.code.clone();
         let mut failure = Self::new(exit_code, error.to_string());
+        failure.code = Some(code);
         failure.diagnostics = error.diagnostics;
         eliot_core::bound_stderr_diagnostics(
             &mut failure.diagnostics,
@@ -1292,11 +1297,8 @@ async fn dispatch(
                     } else {
                         ShutdownMode::Force
                     };
-                    let result = shutdown_daemon(
-                        &data_dir,
-                        &DaemonShutdownRequest::new(mutation_id(id)?, mode),
-                    )
-                    .await?;
+                    let request = DaemonShutdownRequest::new(mutation_id(id)?, mode);
+                    let result = shutdown_daemon(&data_dir, &request).await?;
                     let value = serde_json::to_value(&result)
                         .map_err(|_| Failure::new(4, "daemon.shutdown response is invalid"))?;
                     print_value(&value, json_output);
@@ -1878,10 +1880,12 @@ async fn dispatch(
             turn,
         }) => {
             validate_text(Some(&text))?;
+            let (generation, turn, capture) =
+                resolve_exact_turn_target(&data_dir, "steer", &agent, generation, turn).await?;
             let mut params = submit_request(id, Some(agent), "steer", json!({ "text": text }))?;
             params.expected_generation = generation;
             params.expected_turn_id = turn;
-            submit_and_print(&data_dir, &params, json_output).await
+            submit_exact_turn_command(&data_dir, &params, json_output, capture.as_ref()).await
         }
         CliCommand::Inject(InjectCliArgs {
             agent,
@@ -1919,10 +1923,12 @@ async fn dispatch(
             generation: GenerationArgs { generation },
             turn,
         }) => {
+            let (generation, turn, capture) =
+                resolve_exact_turn_target(&data_dir, "interrupt", &agent, generation, turn).await?;
             let mut params = submit_request(id, Some(agent), "interrupt", json!({}))?;
             params.expected_generation = generation;
             params.expected_turn_id = turn;
-            submit_and_print(&data_dir, &params, json_output).await
+            submit_exact_turn_command(&data_dir, &params, json_output, capture.as_ref()).await
         }
         CliCommand::Approve(ApproveArgs {
             agent,
@@ -2784,6 +2790,130 @@ async fn submit_and_print(
     Ok(response_exit_code(result.state))
 }
 
+/// An exact turn binding the CLI captured from the Agent's current generation
+/// and active turn for an omitted `--generation`/`--turn` flag. The captured
+/// identity is submitted unchanged; a later rejection means the turn moved.
+struct ExactTurnCapture {
+    verb: &'static str,
+    agent: String,
+    generation: i64,
+    turn_id: String,
+}
+
+impl ExactTurnCapture {
+    /// A captured submit rejected as `stale_generation` lost a race: the
+    /// generation or active turn changed between the capture read and
+    /// admission. The command was rejected before any effect, so the CLI
+    /// reports the race and never retries against the new turn.
+    fn race(&self) -> Failure {
+        Failure::new(
+            3,
+            format!(
+                "{} race: Agent {} turn changed after capture \
+                 (submitted generation={} turn={}); \
+                 rejected before any effect, not retried",
+                self.verb, self.agent, self.generation, self.turn_id
+            ),
+        )
+    }
+}
+
+fn missing_turn_failure(verb: &str, agent: &str) -> Failure {
+    Failure::new(
+        3,
+        format!("{verb} requires an active turn: Agent {agent} has no active turn"),
+    )
+}
+
+/// A `stale_generation` rejection of a captured exact-target submit is a race,
+/// not a generic rejection. Every other failure passes through unchanged.
+fn race_or_failure(capture: Option<&ExactTurnCapture>, failure: Failure) -> Failure {
+    match capture {
+        Some(capture) if failure.code.as_deref() == Some("stale_generation") => {
+            let mut race = capture.race();
+            race.diagnostics = failure.diagnostics;
+            race
+        }
+        _ => failure,
+    }
+}
+
+/// Read the Agent's current generation and active turn for an omitted
+/// `--generation`/`--turn` flag. Fails clearly when there is no active turn.
+async fn capture_exact_turn(
+    data_dir: &Path,
+    verb: &'static str,
+    agent: &str,
+) -> Result<ExactTurnCapture, Failure> {
+    let params = AgentGetRequest::new(agent);
+    params
+        .validate()
+        .map_err(|error| Failure::from_core(error, false))?;
+    let response: AgentGetResponse =
+        eliot_daemon::client_call_typed(data_dir, "agent.get", &params)
+            .await
+            .map_err(|error| Failure::from_core(error, false))?;
+    params
+        .validate_response(&response)
+        .map_err(|error| Failure::from_core(error, false))?;
+    let turn_id = response
+        .agent
+        .active_turn
+        .clone()
+        .ok_or_else(|| missing_turn_failure(verb, agent))?;
+    Ok(ExactTurnCapture {
+        verb,
+        agent: agent.to_owned(),
+        generation: response.agent.generation,
+        turn_id,
+    })
+}
+
+/// Resolve the exact binding a turn-control command submits. Explicit flags
+/// are kept unchanged with no extra read; each omitted flag is filled from a
+/// single capture read, which is printed before submitting.
+async fn resolve_exact_turn_target(
+    data_dir: &Path,
+    verb: &'static str,
+    agent: &str,
+    generation: Option<i64>,
+    turn: Option<String>,
+) -> Result<(Option<i64>, Option<String>, Option<ExactTurnCapture>), Failure> {
+    if generation.is_some() && turn.is_some() {
+        return Ok((generation, turn, None));
+    }
+    let capture = capture_exact_turn(data_dir, verb, agent).await?;
+    let resolved_generation = generation.unwrap_or(capture.generation);
+    let resolved_turn = turn.unwrap_or_else(|| capture.turn_id.clone());
+    eprintln!("{verb} target: agent={agent} generation={resolved_generation} turn={resolved_turn}");
+    let submitted = ExactTurnCapture {
+        verb,
+        agent: agent.to_owned(),
+        generation: resolved_generation,
+        turn_id: resolved_turn.clone(),
+    };
+    Ok((
+        Some(resolved_generation),
+        Some(resolved_turn),
+        Some(submitted),
+    ))
+}
+
+async fn submit_exact_turn_command(
+    data_dir: &Path,
+    params: &SubmitCommand,
+    json_output: bool,
+    capture: Option<&ExactTurnCapture>,
+) -> Result<u8, Failure> {
+    match submit_command(data_dir, params).await {
+        Ok(submitted) => {
+            print_value(&submit_value(&submitted)?, json_output);
+            Ok(response_exit_code(submitted.state))
+        }
+        Err(failure) => Err(race_or_failure(capture, failure)),
+    }
+}
+
 async fn shutdown_daemon(
     data_dir: &Path,
     params: &DaemonShutdownRequest,
@@ -3495,9 +3625,7 @@ mod tests {
             parent: None,
             root: None,
         };
-        let params = list_params(None, 10, false, filter(Some("busy")))
-            .ok()
-            .expect("busy parses");
+        let params = list_params(None, 10, false, filter(Some("busy"))).expect("busy parses");
         assert_eq!(params.state, Some(AgentState::Busy));
         assert!(list_params(None, 10, false, filter(Some("done"))).is_err());
         assert!(list_params(None, 10, false, filter(Some("BUSY"))).is_err());
@@ -3521,16 +3649,12 @@ mod tests {
     fn swarm_wait_parse_and_exit_codes() {
         use eliot_core::api::WaitEntryResult;
 
-        let turn = parse_wait_turn_ref("a1/2/turn-9")
-            .ok()
-            .expect("turn parses");
+        let turn = parse_wait_turn_ref("a1/2/turn-9").expect("turn parses");
         assert_eq!(turn.agent, "a1");
         assert_eq!(turn.generation, 2);
         assert_eq!(turn.turn_id, "turn-9");
         // Turn ids may contain slashes after the generation.
-        let slashed = parse_wait_turn_ref("a1/2/turn/with/slash")
-            .ok()
-            .expect("slashed turn parses");
+        let slashed = parse_wait_turn_ref("a1/2/turn/with/slash").expect("slashed turn parses");
         assert_eq!(slashed.turn_id, "turn/with/slash");
         for bad in ["a1", "a1/", "/1/t", "a1/x/t", "a1/-1/t", "a1/1/", " /1/t"] {
             assert!(parse_wait_turn_ref(bad).is_err(), "id: {bad}");
@@ -3626,6 +3750,138 @@ mod tests {
                 approval_reply_args(choice, feedback),
                 serde_json::json!({"choice_id": "always", "feedback": "trust it"})
             );
+        }
+    }
+
+    #[test]
+    fn steer_and_interrupt_parse_without_exact_flags() {
+        let cli = Cli::try_parse_from(["swarm", "steer", "a1", "hello"]).unwrap();
+        let Some(CliCommand::Steer(SteerArgs {
+            agent,
+            text,
+            generation: GenerationArgs { generation },
+            turn,
+        })) = cli.command
+        else {
+            panic!("steer command required");
+        };
+        assert_eq!(agent, "a1");
+        assert_eq!(text, "hello");
+        assert_eq!(generation, None);
+        assert_eq!(turn, None);
+
+        let cli = Cli::try_parse_from(["swarm", "interrupt", "a2"]).unwrap();
+        let Some(CliCommand::Interrupt(InterruptArgs {
+            agent,
+            generation: GenerationArgs { generation },
+            turn,
+        })) = cli.command
+        else {
+            panic!("interrupt command required");
+        };
+        assert_eq!(agent, "a2");
+        assert_eq!(generation, None);
+        assert_eq!(turn, None);
+
+        // `abort` stays an alias of `interrupt`.
+        let cli = Cli::try_parse_from(["swarm", "abort", "a2"]).unwrap();
+        assert!(matches!(cli.command, Some(CliCommand::Interrupt(_))));
+
+        // Explicit bindings still parse for an exact submit with no capture.
+        let cli = Cli::try_parse_from([
+            "swarm",
+            "steer",
+            "a1",
+            "hello",
+            "--generation",
+            "3",
+            "--turn",
+            "turn-9",
+        ])
+        .unwrap();
+        let Some(CliCommand::Steer(SteerArgs {
+            generation: GenerationArgs { generation },
+            turn,
+            ..
+        })) = cli.command
+        else {
+            panic!("steer command required");
+        };
+        assert_eq!(generation, Some(3));
+        assert_eq!(turn.as_deref(), Some("turn-9"));
+
+        let cli = Cli::try_parse_from([
+            "swarm",
+            "interrupt",
+            "a2",
+            "--generation",
+            "3",
+            "--turn",
+            "turn-9",
+        ])
+        .unwrap();
+        let Some(CliCommand::Interrupt(InterruptArgs {
+            generation: GenerationArgs { generation },
+            turn,
+            ..
+        })) = cli.command
+        else {
+            panic!("interrupt command required");
+        };
+        assert_eq!(generation, Some(3));
+        assert_eq!(turn.as_deref(), Some("turn-9"));
+    }
+
+    #[test]
+    fn exact_turn_reports_missing_turn_and_race() {
+        let missing = missing_turn_failure("steer", "a1");
+        assert_eq!(missing.exit_code, 3);
+        assert!(missing.message.contains("a1"), "{missing:?}");
+        assert!(missing.message.contains("no active turn"), "{missing:?}");
+
+        let capture = ExactTurnCapture {
+            verb: "interrupt",
+            agent: "a2".to_owned(),
+            generation: 4,
+            turn_id: "turn-9".to_owned(),
+        };
+        let race = capture.race();
+        assert_eq!(race.exit_code, 3);
+        assert!(race.message.contains("race"), "{race:?}");
+        assert!(race.message.contains("a2"), "{race:?}");
+        assert!(race.message.contains("generation=4"), "{race:?}");
+        assert!(race.message.contains("turn-9"), "{race:?}");
+        assert!(race.message.contains("not retried"), "{race:?}");
+    }
+
+    #[test]
+    fn stale_rejection_of_a_capture_is_a_race() {
+        let capture = ExactTurnCapture {
+            verb: "steer",
+            agent: "a1".to_owned(),
+            generation: 2,
+            turn_id: "turn-3".to_owned(),
+        };
+        let stale = Failure::from_core(CoreError::new("stale_generation", "turn moved"), true);
+        assert_eq!(stale.exit_code, 3);
+        let race = race_or_failure(Some(&capture), stale);
+        assert_eq!(race.exit_code, 3);
+        assert!(race.message.contains("race"), "{race:?}");
+        assert!(race.message.contains("turn-3"), "{race:?}");
+
+        // Explicit submits keep the untouched rejection: no capture, no race.
+        let stale = Failure::from_core(CoreError::new("stale_generation", "turn moved"), true);
+        let untouched = race_or_failure(None, stale);
+        assert_eq!(untouched.exit_code, 3);
+        assert!(!untouched.message.contains("race"), "{untouched:?}");
+
+        // Non-stale failures pass through even after a capture.
+        for code in ["bad_state", "not_found", "failed", "internal"] {
+            let failure = Failure::from_core(CoreError::new(code, "other"), true);
+            let expected_exit = failure.exit_code;
+            let passed = race_or_failure(Some(&capture), failure);
+            assert_eq!(passed.exit_code, expected_exit, "code={code}");
+            assert!(!passed.message.contains("race"), "code={code}");
         }
     }
 }

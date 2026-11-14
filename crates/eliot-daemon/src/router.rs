@@ -36,12 +36,13 @@ use eliot_core::{
         AgentResultRequest, AgentResultResponse, AgentStatsRequest, AgentStatsResponse,
         CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest, CommandSubmitRequest,
         CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
-        DaemonStatusResponse, DiscoverPage, EmitDefinitionArgs, EventsBoundsRequest, EventsFilter,
-        EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
-        GitFetchDefinitionArgs, GitView, MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS,
-        MAX_SWARM_WAIT_TARGETS, NotifyDefinitionArgs, ObservationPage, ObservationQuery,
-        ObservationView, ProcessPageCursor, ProjectRegistrationView, ProviderClearHoldRequest,
-        ProviderHoldsRequest, RuleGetRequest, RuleStateView, ShutdownMode, SourceState,
+        DaemonStatusResponse, DiscoverPage, DrainReport, EmitDefinitionArgs, EventsBoundsRequest,
+        EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
+        EventsSubscribeResponse, GitFetchDefinitionArgs, GitView, MAX_OBSERVATION_PAGE_BYTES,
+        MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, NotifyDefinitionArgs, ObservationPage,
+        ObservationQuery, ObservationView, OwnedProcessKind, OwnedProcessSummary,
+        ProcessPageCursor, ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest,
+        RuleGetRequest, RuleStateView, RunningTurnSummary, ShutdownMode, SourceState,
         StatusBlocker, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView,
         TurnGetRequest, UnsettledCommandSummary, WaitEntryResult, WorkerTaskHealth,
         WorkerTaskStatus, WorkspaceCustodyView,
@@ -3303,20 +3304,23 @@ impl Router {
 
     async fn status(&self) -> Result<Value> {
         let blockers = self.status_blockers().await?;
+        let drain = self.drain_report().await?;
         let mode = self.mode_name();
-        let (agent_count, write_faulted, unsettled_commands) = {
+        let (agent_count, write_faulted, unsettled_commands, unsettled_total) = {
             let store = self.inner.store.lock().await;
             (
                 store.agent_count()?,
                 store.is_write_faulted(),
                 store.list_unsettled_commands(STATUS_BLOCKER_MAX)?,
+                store.count_unsettled_commands()?,
             )
         };
         let mut unknown_commands = self.unknown_ids();
         let unknown_commands_count = unknown_commands.len();
         let unknown_commands_truncated = unknown_commands.len() > STATUS_BLOCKER_MAX;
         unknown_commands.truncate(STATUS_BLOCKER_MAX);
-        let unsettled_commands_truncated = unsettled_commands.len() == STATUS_BLOCKER_MAX;
+        let unsettled_total = usize::try_from(unsettled_total.max(0)).unwrap_or(usize::MAX);
+        let unsettled_commands_truncated = unsettled_commands.len() < unsettled_total;
         let unsettled_command_details = unsettled_commands
             .iter()
             .map(|command| UnsettledCommandSummary {
@@ -3360,8 +3364,113 @@ impl Router {
             unsettled_commands: unsettled_command_details,
             unsettled_commands_truncated,
             blockers,
+            drain: Some(drain),
         })
         .map_err(|_| Error::new("internal", "daemon status could not be encoded"))
+    }
+
+    /// Bounded read-side drain report reusing the existing shutdown blockers'
+    /// sources. Running turns come from nonterminal Agents with a recorded
+    /// active turn; unsettled/unknown reuse the status projections; owned
+    /// processes come from the Store custody snapshot (process records not
+    /// yet exited), never from routing eligibility or workspace operation
+    /// locks. Every category carries a count, a bounded list and a truncation
+    /// flag that is true whenever any qualifying record was omitted for any
+    /// reason: the list bound or the Store page byte bound trimming the page.
+    /// Unknown stays unknown: an empty report never proves no native effect
+    /// occurred.
+    async fn drain_report(&self) -> Result<DrainReport> {
+        self.clear_terminal_unknown_cache().await;
+        let (agents, agents_total, unsettled_commands, unsettled_total, custody) = {
+            let store = self.inner.store.lock().await;
+            (
+                store.list_nonterminal_agents(STATUS_BLOCKER_MAX)?,
+                store.count_nonterminal_agents()?,
+                store.list_unsettled_commands(STATUS_BLOCKER_MAX)?,
+                store.count_unsettled_commands()?,
+                store.live_process_owners(STATUS_BLOCKER_MAX)?,
+            )
+        };
+        let (live_owners, live_total) = custody;
+        let agents_total = usize::try_from(agents_total.max(0)).unwrap_or(usize::MAX);
+        let unsettled_total = usize::try_from(unsettled_total.max(0)).unwrap_or(usize::MAX);
+        // Running turns derive solely from the Agent page: any omitted Agent
+        // may hide a turn, so the Agent omission decides this flag.
+        let running_turns_truncated = agents.len() < agents_total;
+        let mut running_turns = agents
+            .iter()
+            .filter_map(|agent| {
+                agent
+                    .active_turn
+                    .as_ref()
+                    .map(|turn_id| RunningTurnSummary {
+                        agent: agent.id.clone(),
+                        generation: agent.generation,
+                        turn_id: turn_id.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        running_turns.sort_by(|left, right| {
+            (&left.agent, left.generation, &left.turn_id).cmp(&(
+                &right.agent,
+                right.generation,
+                &right.turn_id,
+            ))
+        });
+        running_turns.truncate(STATUS_BLOCKER_MAX);
+        let running_turns_count = running_turns.len();
+        let unsettled_commands_truncated = unsettled_commands.len() < unsettled_total;
+        let unsettled_commands_count = unsettled_commands.len();
+        let unsettled_details = unsettled_commands
+            .iter()
+            .map(|command| UnsettledCommandSummary {
+                id: command.id.clone(),
+                agent: command.target.clone(),
+                generation: command.generation,
+                verb: command.verb.clone(),
+                state: command.state,
+            })
+            .collect::<Vec<_>>();
+        let mut unknown_commands = self.unknown_ids();
+        let unknown_commands_count = unknown_commands.len();
+        let unknown_commands_truncated = unknown_commands.len() > STATUS_BLOCKER_MAX;
+        unknown_commands.truncate(STATUS_BLOCKER_MAX);
+        let mut owned_processes = live_owners
+            .into_iter()
+            .map(|owner| OwnedProcessSummary {
+                agent: owner.agent,
+                generation: owner.generation,
+                kind: if owner.workspace {
+                    OwnedProcessKind::Workspace
+                } else {
+                    OwnedProcessKind::Plugin
+                },
+            })
+            .collect::<Vec<_>>();
+        owned_processes.sort_by(|left, right| {
+            (&left.agent, left.generation, left.kind as u8).cmp(&(
+                &right.agent,
+                right.generation,
+                right.kind as u8,
+            ))
+        });
+        let owned_processes_truncated = owned_processes.len() < live_total;
+        owned_processes.truncate(STATUS_BLOCKER_MAX);
+        let owned_processes_count = owned_processes.len();
+        Ok(DrainReport {
+            running_turns_count,
+            running_turns,
+            running_turns_truncated,
+            unsettled_commands_count,
+            unsettled_commands: unsettled_details,
+            unsettled_commands_truncated,
+            unknown_commands_count,
+            unknown_commands,
+            unknown_commands_truncated,
+            owned_processes_count,
+            owned_processes,
+            owned_processes_truncated,
+        })
     }
 
     async fn status_blockers(&self) -> Result<Vec<StatusBlocker>> {
@@ -3410,9 +3519,10 @@ impl Router {
                 continue;
             }
             blockers.push(StatusBlocker::AgentLive {
-                agent: agent.id,
+                agent: agent.id.clone(),
                 generation: agent.generation,
                 state: agent.state,
+                active_turn: agent.active_turn.clone(),
             });
         }
         let mut unsettled_ids = HashSet::new();
@@ -3449,16 +3559,21 @@ impl Router {
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let mode = request.mode;
-        let id = request.id.as_str();
+        let id = request.id.to_owned();
+        // Drain is a pure read-side report: no effects run before the
+        // shutdown-ID claim, so an exact retry replays the retained reply
+        // with no duplicate effects to guard.
         let result = if mode == ShutdownMode::Force {
             DaemonShutdownResponse {
                 state: CommandState::Dispatched,
                 mode,
                 blockers: None,
+                drain: None,
                 store_write_faulted: None,
             }
         } else {
             let blockers = self.status_blockers().await?;
+            let drain = self.drain_report().await?;
             DaemonShutdownResponse {
                 state: if blockers.is_empty() {
                     CommandState::Applied
@@ -3467,6 +3582,7 @@ impl Router {
                 },
                 mode,
                 blockers: Some(blockers),
+                drain: Some(drain),
                 store_write_faulted: None,
             }
         };
@@ -3474,11 +3590,12 @@ impl Router {
             .map_err(|_| Error::new("internal", "shutdown result could not be encoded"))?;
         let write = {
             let mut store = self.inner.store.lock().await;
+            let payload = json!({"mode": mode.as_str()});
             let write = match store.record_write(
-                id,
+                &id,
                 &principal_name(principal),
                 "daemon.shutdown",
-                &json!({"mode": mode.as_str()}),
+                &payload,
                 &result,
                 now_ms(),
             ) {
@@ -3514,6 +3631,7 @@ impl Router {
                 state: CommandState::Dispatched,
                 mode: ShutdownMode::Force,
                 blockers: None,
+                drain: None,
                 store_write_faulted: Some(true),
             }),
         };
@@ -7275,10 +7393,19 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let id = ulid::Ulid::new().to_string().to_ascii_lowercase();
         let request = json!({"id":id, "mode":"drain"});
         let first = router.shutdown(&request, &Principal::Owner).await.unwrap();
-        assert_eq!(
-            first,
-            json!({"state":"applied", "mode":"drain", "blockers":[]})
-        );
+        assert_eq!(first["state"], json!("applied"));
+        assert_eq!(first["mode"], json!("drain"));
+        assert_eq!(first["blockers"], json!([]));
+        let drain = first["drain"].as_object().expect("drain report");
+        for category in [
+            "running_turns",
+            "unsettled_commands",
+            "unknown_commands",
+            "owned_processes",
+        ] {
+            assert_eq!(drain[category], json!([]));
+        }
+        assert_eq!(drain["running_turns_count"], json!(0));
         {
             let mut store = router.inner.store.lock().await;
             admit(&mut store);
@@ -7298,6 +7425,385 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             "id_conflict"
         );
         assert_eq!(router.inner.mode.load(Ordering::SeqCst), MODE_DRAIN);
+    }
+
+    #[tokio::test]
+    async fn drain_report_covers_running_unsettled_unknown_and_owned() {
+        let router = router();
+        // Busy fixture Agent supplies the running turn; a second dispatched
+        // launch supplies one unsettled command that we also track as
+        // unknown. Fixtures have no live runtime, so owned processes stay
+        // honestly empty.
+        let (busy_agent, unsettled_id) = {
+            let mut store = router.inner.store.lock().await;
+            let (busy_agent, _) = result_fixture(&mut store);
+            let launch_id = ulid::Ulid::new().to_string();
+            store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: launch_id.clone(),
+                        target: None,
+                        selector: None,
+                        verb: "launch".to_owned(),
+                        args: json!({
+                            "project":"drain-report", "workspace":"synthetic-workspace",
+                            "harness":"codex", "profile":"synthetic", "profile_snapshot":{},
+                        }),
+                        expected_generation: Some(0),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.dispatch(&launch_id, now_ms()).unwrap();
+            (busy_agent, launch_id)
+        };
+        router
+            .note_unknown_if_uncertain(&unsettled_id, "drain_report_test")
+            .await;
+        let shutdown = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(shutdown["state"], json!("dispatched"));
+        assert_eq!(shutdown["mode"], json!("drain"));
+        let blockers = shutdown["blockers"].as_array().expect("blockers");
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker["kind"] == json!("agent_live")
+                    && blocker["agent"] == json!(busy_agent)
+                    && blocker["active_turn"] == json!("turn-1"))
+        );
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker["kind"] == json!("command_unsettled")
+                    && blocker["command_id"] == json!(unsettled_id))
+        );
+        let drain = shutdown["drain"].as_object().expect("drain report");
+        let running = drain["running_turns"].as_array().expect("running turns");
+        assert!(
+            running.iter().any(
+                |turn| turn["agent"] == json!(busy_agent) && turn["turn_id"] == json!("turn-1")
+            )
+        );
+        assert_eq!(drain["running_turns_truncated"], json!(false));
+        let unsettled = drain["unsettled_commands"]
+            .as_array()
+            .expect("unsettled commands");
+        assert!(
+            unsettled
+                .iter()
+                .any(|command| command["id"] == json!(unsettled_id))
+        );
+        assert_eq!(drain["unsettled_commands_truncated"], json!(false));
+        let unknown = drain["unknown_commands"]
+            .as_array()
+            .expect("unknown commands");
+        assert!(unknown.iter().any(|id| id == &json!(unsettled_id)));
+        assert_eq!(drain["unknown_commands_truncated"], json!(false));
+        // Fixtures have no live runtime or workspace child: the owned list is
+        // honestly empty and not truncated. An empty report never proves no
+        // native effect occurred.
+        assert_eq!(drain["owned_processes"], json!([]));
+        assert_eq!(drain["owned_processes_count"], json!(0));
+        assert_eq!(drain["owned_processes_truncated"], json!(false));
+        // Unknown stays unknown: drain never auto-resolves to failed. The
+        // Store stays Dispatched (unsettled) while the in-memory unknown set
+        // keeps the evidence-based unknown outcome.
+        let store = router.inner.store.lock().await;
+        assert_eq!(
+            store.get_command(&unsettled_id).unwrap().unwrap().state,
+            CommandState::Dispatched
+        );
+        assert!(router.unknown_ids().contains(&unsettled_id));
+    }
+
+    #[tokio::test]
+    async fn drain_report_uses_store_custody_not_routing_or_operation_locks() {
+        let router = router();
+        // One observed native child, one observed workspace child, one
+        // routing-only entry with no Store custody, and one bare workspace
+        // preparation with no observed child.
+        let launch = |store: &mut eliot_store::Store, project: &str| {
+            let launch_id = ulid::Ulid::new().to_string();
+            let agent = store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: launch_id.clone(),
+                        target: None,
+                        selector: None,
+                        verb: "launch".to_owned(),
+                        args: json!({
+                            "project":project, "workspace":"synthetic-workspace",
+                            "harness":"codex", "profile":"synthetic", "profile_snapshot":{},
+                        }),
+                        expected_generation: Some(0),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now_ms(),
+                )
+                .unwrap()
+                .command
+                .target
+                .unwrap();
+            store.dispatch(&launch_id, now_ms()).unwrap();
+            agent
+        };
+        let prepare_workspace = |store: &mut eliot_store::Store, project: &str| {
+            let branch = format!("codex/drain-custody-{project}");
+            let worktree = format!("/synthetic-worktree-{project}");
+            store
+                .submit_with_workspace(
+                    "owner",
+                    SubmitCommand {
+                        id: ulid::Ulid::new().to_string(),
+                        target: None,
+                        selector: None,
+                        verb: "launch".to_owned(),
+                        args: json!({"project":project, "workspace":"/synthetic-source", "worktree":branch, "harness":"codex", "profile":"fixture", "profile_snapshot":{}}),
+                        expected_generation: Some(0),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    WorkspacePreparationInput {
+                        project: project.to_owned(),
+                        repo_path: "/synthetic-source".to_owned(),
+                        repo_common_dir: "/synthetic-source/.git".to_owned(),
+                        requested_branch: branch,
+                        base_ref: None,
+                        base_oid: "b".repeat(40),
+                        worktree_path: worktree,
+                        frozen_setup: Vec::new(),
+                    },
+                    now_ms(),
+                )
+                .unwrap()
+                .command
+                .target
+                .unwrap()
+        };
+        let (plugin_agent, workspace_agent, routing_only, bare_preparation) = {
+            let mut store = router.inner.store.lock().await;
+            let plugin_agent = launch(&mut store, "drain-custody-plugin");
+            store
+                .ensure_process_source(&plugin_agent, 1, now_ms())
+                .unwrap();
+            store
+                .observe_processes(
+                    &plugin_agent,
+                    1,
+                    &[eliot_core::ProcessRecord {
+                        identity: eliot_core::ProcessIdentity {
+                            host_boot_id: "drain-boot".to_owned(),
+                            pid: 7,
+                            start_time: 1,
+                        },
+                        owner: format!("agent:{plugin_agent}#1"),
+                        role: "harness".to_owned(),
+                        state: eliot_core::ProcessState::Running,
+                        exit_code: None,
+                        updated_at: now_ms(),
+                    }],
+                    now_ms(),
+                )
+                .unwrap();
+            let workspace_agent = prepare_workspace(&mut store, "drain-custody-ws");
+            store
+                .ensure_workspace_process_source(&workspace_agent, 1, now_ms())
+                .unwrap();
+            store
+                .observe_workspace_processes(
+                    &workspace_agent,
+                    1,
+                    &eliot_core::ProcessSnapshot {
+                        samples: vec![eliot_core::ProcessSample {
+                            record: eliot_core::ProcessRecord {
+                                identity: eliot_core::ProcessIdentity {
+                                    host_boot_id: "drain-boot".to_owned(),
+                                    pid: 8,
+                                    start_time: 1,
+                                },
+                                owner: format!("workspace:{workspace_agent}#1"),
+                                role: "setup".to_owned(),
+                                state: eliot_core::ProcessState::Running,
+                                exit_code: None,
+                                updated_at: now_ms(),
+                            },
+                            cpu_time_ns: None,
+                            rss_bytes: None,
+                        }],
+                        complete: true,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            let routing_only = launch(&mut store, "drain-custody-routing");
+            let bare_preparation = prepare_workspace(&mut store, "drain-custody-bare");
+            (
+                plugin_agent,
+                workspace_agent,
+                routing_only,
+                bare_preparation,
+            )
+        };
+        // Routing eligibility alone is not custody: no Store process record
+        // backs this generation.
+        router
+            .inner
+            .plugin_host
+            .mark_generation_controlled_for_test(&routing_only, 1);
+        let shutdown = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        let drain = shutdown["drain"].as_object().expect("drain report");
+        let owned = drain["owned_processes"]
+            .as_array()
+            .expect("owned processes");
+        assert_eq!(owned.len(), 2);
+        assert!(
+            owned
+                .iter()
+                .any(|process| process["agent"] == json!(plugin_agent)
+                    && process["generation"] == json!(1)
+                    && process["kind"] == json!("plugin"))
+        );
+        assert!(
+            owned
+                .iter()
+                .any(|process| process["agent"] == json!(workspace_agent)
+                    && process["generation"] == json!(1)
+                    && process["kind"] == json!("workspace"))
+        );
+        assert!(
+            !owned
+                .iter()
+                .any(|process| process["agent"] == json!(routing_only)),
+            "routing-only generation must not read as custody"
+        );
+        assert!(
+            !owned
+                .iter()
+                .any(|process| process["agent"] == json!(bare_preparation)),
+            "bare workspace preparation must not read as a live process"
+        );
+        assert_eq!(drain["owned_processes_count"], json!(2));
+        assert_eq!(drain["owned_processes_truncated"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn drain_report_truncation_covers_list_bound() {
+        let router = router();
+        {
+            let mut store = router.inner.store.lock().await;
+            for _ in 0..70 {
+                store
+                    .submit(
+                        "owner",
+                        SubmitCommand {
+                            id: ulid::Ulid::new().to_string(),
+                            target: None,
+                            selector: None,
+                            verb: "launch".to_owned(),
+                            args: json!({
+                                "project":"drain-truncation", "workspace":"synthetic-workspace",
+                                "harness":"codex", "profile":"synthetic", "profile_snapshot":{},
+                            }),
+                            expected_generation: Some(0),
+                            expected_turn_id: None,
+                            request_id: None,
+                            probe: false,
+                        },
+                        now_ms(),
+                    )
+                    .unwrap();
+            }
+        }
+        let shutdown = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        let drain = shutdown["drain"].as_object().expect("drain report");
+        let unsettled = drain["unsettled_commands"]
+            .as_array()
+            .expect("unsettled commands");
+        assert_eq!(unsettled.len(), 64);
+        assert_eq!(drain["unsettled_commands_count"], json!(64));
+        assert_eq!(drain["unsettled_commands_truncated"], json!(true));
+        // No Agent has an active turn, but the Agent page itself is capped,
+        // so a hidden turn can never read back as complete.
+        assert_eq!(drain["running_turns"], json!([]));
+        assert_eq!(drain["running_turns_count"], json!(0));
+        assert_eq!(drain["running_turns_truncated"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn drain_report_truncation_covers_byte_trimmed_pages() {
+        let router = router();
+        {
+            let mut store = router.inner.store.lock().await;
+            let (agent, _) = result_fixture(&mut store);
+            let big = "x".repeat(100_000);
+            for _ in 0..12 {
+                store
+                    .submit(
+                        "owner",
+                        SubmitCommand {
+                            id: ulid::Ulid::new().to_string(),
+                            target: Some(agent.clone()),
+                            selector: None,
+                            verb: "send".to_owned(),
+                            args: json!({"text": big}),
+                            expected_generation: Some(1),
+                            expected_turn_id: None,
+                            request_id: None,
+                            probe: false,
+                        },
+                        now_ms(),
+                    )
+                    .unwrap();
+            }
+        }
+        let shutdown = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        let drain = shutdown["drain"].as_object().expect("drain report");
+        let unsettled = drain["unsettled_commands"]
+            .as_array()
+            .expect("unsettled commands");
+        // Twelve ~100 KiB sends plus the fixture send overflow the ~900 KiB
+        // page, so the bounded prefix omits qualifying commands.
+        assert!(
+            unsettled.len() < 13,
+            "byte-trimmed page kept {}",
+            unsettled.len()
+        );
+        assert_eq!(drain["unsettled_commands_count"], json!(unsettled.len()));
+        assert_eq!(drain["unsettled_commands_truncated"], json!(true));
+        // The single Agent page is complete, so its turn flag stays false.
+        assert_eq!(drain["running_turns_truncated"], json!(false));
     }
 
     #[tokio::test]

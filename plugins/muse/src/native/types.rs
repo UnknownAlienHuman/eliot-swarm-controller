@@ -2,11 +2,12 @@
 //! path (PR2) and the native-request path (A1: approve/deny/answer), derived
 //! from the installed host's exported stable schema
 //! (`muse schema generate-json-schema`, Muse Code 1.4.0-R4161.1, bundle
-//! fingerprint `sha256:36466f63…0d3d7f`, re-verified for A1 and for item
-//! normalization). Only the session-start, session-resume, turn-start,
-//! view-event, stop/close, request/decide/answer, readback and item
-//! tool-identity shapes this path uses are modelled. Unknown fields are
-//! ignored: the schema rules additive-optional evolution, so a strict DTO
+//! fingerprint `sha256:36466f63…0d3d7f`, re-verified for A1, for item
+//! normalization and for the single bounded `item/readOutput` patch fetch).
+//! Only the session-start, session-resume, turn-start, view-event,
+//! stop/close, request/decide/answer, readback, item tool-identity and
+//! stored-patch-reference shapes this path uses are modelled. Unknown fields
+//! are ignored: the schema rules additive-optional evolution, so a strict DTO
 //! would reject valid host frames.
 //!
 //! No SDK code is copied here; these structs are written from the schema.
@@ -620,14 +621,16 @@ pub(crate) fn turn_usage(notification: &NativeTurnCompletedNotification) -> Opti
 }
 
 /// One transcript item at one revision. Only the common identity fields, the
-/// `agentMessage` text used by PR1, the `toolCall`/`userShell` tool identity
-/// and the `toolCall` verbatim argument JSON consumed by item normalization
-/// are modelled: `tool` is the `toolCall` tool name (`userShell` carries none
-/// and normalizes under its kind), and `args` carries the model-authored
-/// argument JSON whose inline file target feeds native file-change hints.
-/// Every other per-kind field (`visibleOutput`, `outputRef`, `patchRef`,
-/// `patchSummary`, `commandText`, ...) stays unparsed: unknown fields are
-/// ignored, so additive schema evolution never rejects a frame.
+/// `agentMessage` text used by PR1, the `toolCall`/`userShell` tool identity,
+/// the `toolCall` verbatim argument JSON and the `toolCall` stored-patch
+/// reference consumed by item normalization are modelled: `tool` is the
+/// `toolCall` tool name (`userShell` carries none and normalizes under its
+/// kind), `args` carries the model-authored argument JSON whose inline file
+/// target feeds native file-change hints, and `patch_ref` carries only the
+/// durable stored-output id (plus its servability flag) behind which a
+/// multi-file edit diff waits. Every other per-kind field (`visibleOutput`,
+/// `outputRef`, `patchSummary`, `commandText`, ...) stays unparsed: unknown
+/// fields are ignored, so additive schema evolution never rejects a frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeItem {
@@ -642,7 +645,23 @@ pub struct NativeItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_ref: Option<NativePatchRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+}
+
+/// Stored structured-patch reference on a `toolCall` item (SS4.5.5, #33025):
+/// `kind: "tool_patch"`, `mediaType: "application/json"`, fetched via
+/// `item/readOutput` with `patch_ref.id` (never the `uri`, which is
+/// display/provenance). Only the fetch identity and the servability flag are
+/// modelled: the patch body itself is read once, bounded, and never
+/// persisted — only file paths from its headers reach the committed event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativePatchRef {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -659,6 +678,44 @@ pub struct NativeItemCompletedNotification {
     pub item: NativeItem,
     pub session_id: String,
     pub view_cursor: String,
+}
+
+// ---------------------------------------------------------------------------
+// item/readOutput readback (SS4.7.4)
+// ---------------------------------------------------------------------------
+
+/// `item/readOutput` params (tdd SS4.7.4): byte-ranged fetch of stored full
+/// output the view truncated. `output_ref` is the stored output's durable id
+/// (for a patch fetch, `patchRef.id` — never the `uri`); `offset_bytes` and
+/// `length_bytes` are stored-byte ranges (default and max 6 MiB). Read-only;
+/// works on loaded and unloaded sessions; takes no lease.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeItemReadOutputParams {
+    pub session_id: String,
+    pub item_id: String,
+    pub output_ref: String,
+    pub offset_bytes: i64,
+    pub length_bytes: i64,
+}
+
+/// `item/readOutput` result (tdd SS4.7.4): one stored-byte page. Text media
+/// is always served `utf8`; binary media is `base64` (closed vocabulary).
+/// Only the decoded `content` headers are ever consumed downstream, and only
+/// file paths from them are persisted — never the body itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeItemReadOutputResult {
+    #[serde(default)]
+    pub byte_len: i64,
+    pub content: String,
+    pub encoding: String,
+    #[serde(default)]
+    pub eof: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(default)]
+    pub offset_bytes: i64,
 }
 
 /// `session/started` params: the newly loaded session object.

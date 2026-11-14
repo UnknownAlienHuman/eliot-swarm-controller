@@ -76,6 +76,15 @@ impl DaemonShutdownRequest {
                 let Some(blockers) = &response.blockers else {
                     return Err(binding_mismatch());
                 };
+                // A retained reply written before the drain report existed
+                // carries no `drain`; exact retries replay it unchanged.
+                if response
+                    .drain
+                    .as_ref()
+                    .is_some_and(|drain| drain.validate().is_err())
+                {
+                    return Err(binding_mismatch());
+                }
                 let expected_state = if blockers.is_empty() {
                     CommandState::Applied
                 } else {
@@ -88,6 +97,7 @@ impl DaemonShutdownRequest {
             ShutdownMode::Force => {
                 if response.state != CommandState::Dispatched
                     || response.blockers.is_some()
+                    || response.drain.is_some()
                     || response.store_write_faulted == Some(false)
                 {
                     return Err(binding_mismatch());
@@ -389,6 +399,7 @@ mod tests {
 
     #[test]
     fn shutdown_drain_uses_only_its_retained_blockers() {
+        use super::super::DrainReport;
         let request = DaemonShutdownRequest::new("dummy-write", ShutdownMode::Drain);
         for blockers in [
             vec![],
@@ -396,37 +407,66 @@ mod tests {
                 command_id: "dummy-old-command".to_owned(),
             }],
         ] {
-            let reply = DaemonShutdownResponse {
-                state: if blockers.is_empty() {
-                    CommandState::Applied
-                } else {
+            for drain in [None, Some(DrainReport::empty())] {
+                let reply = DaemonShutdownResponse {
+                    state: if blockers.is_empty() {
+                        CommandState::Applied
+                    } else {
+                        CommandState::Dispatched
+                    },
+                    mode: ShutdownMode::Drain,
+                    blockers: Some(blockers.clone()),
+                    drain: drain.clone(),
+                    store_write_faulted: None,
+                };
+                let before = reply.clone();
+                request.validate_response(&reply).unwrap();
+                assert_eq!(reply, before);
+                let mut wrong = reply;
+                wrong.state = if wrong.state == CommandState::Applied {
                     CommandState::Dispatched
-                },
-                mode: ShutdownMode::Drain,
-                blockers: Some(blockers),
-                store_write_faulted: None,
-            };
-            let before = reply.clone();
-            request.validate_response(&reply).unwrap();
-            assert_eq!(reply, before);
-            let mut wrong = reply;
-            wrong.state = if wrong.state == CommandState::Applied {
-                CommandState::Dispatched
-            } else {
-                CommandState::Applied
-            };
-            assert_unknown(request.validate_response(&wrong));
+                } else {
+                    CommandState::Applied
+                };
+                assert_unknown(request.validate_response(&wrong));
+            }
         }
     }
 
     #[test]
+    fn shutdown_drain_accepts_legacy_reply_without_drain() {
+        use super::super::DrainReport;
+        // A retained reply from before the drain report existed has no
+        // `drain` field; an exact retry replays it unchanged.
+        let wire = json!({"state":"applied","mode":"drain","blockers":[]});
+        let reply: DaemonShutdownResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(reply.drain, None);
+        let request = DaemonShutdownRequest::new("dummy-write", ShutdownMode::Drain);
+        request.validate_response(&reply).unwrap();
+        assert_eq!(serde_json::to_value(reply).unwrap(), wire);
+        // A present but invalid report still rejects.
+        let mut invalid = DrainReport::empty();
+        invalid.running_turns_count = 1;
+        let bad = DaemonShutdownResponse {
+            state: CommandState::Applied,
+            mode: ShutdownMode::Drain,
+            blockers: Some(vec![]),
+            drain: Some(invalid),
+            store_write_faulted: None,
+        };
+        assert_unknown(request.validate_response(&bad));
+    }
+
+    #[test]
     fn shutdown_force_requires_dispatched_without_blockers_and_preserves_fault() {
+        use super::super::DrainReport;
         let force = DaemonShutdownRequest::new("dummy-write", ShutdownMode::Force);
         for fault in [None, Some(true)] {
             let reply = DaemonShutdownResponse {
                 state: CommandState::Dispatched,
                 mode: ShutdownMode::Force,
                 blockers: None,
+                drain: None,
                 store_write_faulted: fault,
             };
             let before = reply.clone();
@@ -437,6 +477,7 @@ mod tests {
             state: CommandState::Dispatched,
             mode: ShutdownMode::Force,
             blockers: None,
+            drain: None,
             store_write_faulted: None,
         };
         let mut wrong = base.clone();
@@ -444,6 +485,9 @@ mod tests {
         assert_unknown(force.validate_response(&wrong));
         let mut wrong = base.clone();
         wrong.blockers = Some(vec![]);
+        assert_unknown(force.validate_response(&wrong));
+        let mut wrong = base.clone();
+        wrong.drain = Some(DrainReport::empty());
         assert_unknown(force.validate_response(&wrong));
         for state in [
             CommandState::Accepted,
@@ -458,13 +502,15 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_rejects_wrong_mode_missing_drain_blockers_and_fault_fallthrough() {
+    fn shutdown_accepts_legacy_absent_drain_but_rejects_wrong_mode_and_fault() {
+        use super::super::DrainReport;
         let drain = DaemonShutdownRequest::new("dummy-write", ShutdownMode::Drain);
         let force = DaemonShutdownRequest::new("dummy-write", ShutdownMode::Force);
         let mut reply = DaemonShutdownResponse {
             state: CommandState::Dispatched,
             mode: ShutdownMode::Force,
             blockers: None,
+            drain: None,
             store_write_faulted: None,
         };
         assert_unknown(drain.validate_response(&reply));
@@ -473,6 +519,9 @@ mod tests {
         assert_unknown(drain.validate_response(&reply));
         reply.state = CommandState::Applied;
         reply.blockers = Some(vec![]);
+        // Absent drain is a legacy retained reply and stays valid.
+        drain.validate_response(&reply).unwrap();
+        reply.drain = Some(DrainReport::empty());
         for fault in [Some(false), Some(true)] {
             reply.store_write_faulted = fault;
             assert_unknown(drain.validate_response(&reply));
