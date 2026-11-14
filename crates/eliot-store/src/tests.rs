@@ -6881,11 +6881,19 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     // Return the file to schema 16, as an older binary left it, and upgrade.
     // Drop the v29/v30 activity artifacts first: the v30 events triggers
     // would otherwise fire during the table rebuilds below while their
-    // native_child_registrations reads no longer resolve (#418).
+    // native_child_registrations reads no longer resolve (#418). Drop the
+    // v31 fleet indexes too, or the parent-column drop below fails and the
+    // reopen would recreate existing indexes.
     store
         .connection
         .execute_batch(
-            "DROP TRIGGER native_child_activity_revision;
+            "DROP INDEX agents_list_state;
+             DROP INDEX agents_list_project;
+             DROP INDEX agents_list_harness;
+             DROP INDEX agents_list_parent;
+             DROP INDEX agents_list_root;
+             DELETE FROM schema_migrations WHERE version = 31;
+             DROP TRIGGER native_child_activity_revision;
              DROP TRIGGER native_child_progress_pruned;
              DROP INDEX native_children_producer;
              DROP INDEX turns_native_activity;
@@ -8375,7 +8383,8 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
              CREATE TABLE agents(
                  id INTEGER PRIMARY KEY, generation INTEGER NOT NULL,
                  observe_only INTEGER NOT NULL, profile TEXT NOT NULL,
-                 profile_snapshot TEXT NOT NULL
+                 profile_snapshot TEXT NOT NULL,
+                 state TEXT NOT NULL, project TEXT NOT NULL, harness TEXT NOT NULL
              );
              CREATE TABLE commands(
                  id TEXT PRIMARY KEY, principal TEXT NOT NULL, method TEXT NOT NULL,
@@ -8457,8 +8466,9 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
             (10, 1, "pending-resume", pending_resume_snapshot),
         ] {
             old.execute(
-                "INSERT INTO agents(id, generation, observe_only, profile, profile_snapshot)
-                 VALUES (?1, ?2, 0, ?3, ?4)",
+                "INSERT INTO agents(id, generation, observe_only, profile, profile_snapshot,
+                                    state, project, harness)
+                 VALUES (?1, ?2, 0, ?3, ?4, 'idle', 'capacity-test', 'test-harness')",
                 rusqlite::params![id, generation, profile, snapshot],
             )
             .expect("insert v8 Agent");
