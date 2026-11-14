@@ -42,7 +42,8 @@ environment; no independent Eliot token without actual isolated environment supp
 Run the installed native `claude` executable with `-p --input-format stream-json
 --output-format stream-json --verbose` and an Eliot-minted `--session-id`; pass
 `--model` for the frozen profile model, `--permission-mode` when the frozen
-profile sets one, and `--permission-prompt-tool stdio` always so every
+profile sets one, `--effort` when the frozen profile sets `effort` (the CLI
+vocabulary `low`/`medium`/`high`/`xhigh`/`max`; absent keeps the CLI default), and `--permission-prompt-tool stdio` always so every
 permission ask reaches Eliot. Pass `--resume <session-id>` only for explicit
 resume, instead of `--session-id`. Speak NDJSON on stdin/stdout: `control_request`
 envelopes (`initialize`, `set_model`, `set_permission_mode`, `interrupt`) with

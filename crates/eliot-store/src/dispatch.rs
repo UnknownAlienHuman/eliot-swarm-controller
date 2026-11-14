@@ -245,6 +245,39 @@ fn dispatch_resume_tx(
             "resume target changed before its new generation was committed",
         ));
     }
+    // A new generation explicitly inherits the previous generation's latest
+    // overlay as its own revision 1 with `inherited_from` provenance, so a
+    // `resume` never silently reverts to the frozen snapshot and the new
+    // generation's readback shows what it runs under. The frozen snapshot
+    // itself is unchanged (the Agent row carries it across generations).
+    // Generations without an overlay start at revision 0 with no row.
+    let inherited = current_config_revision_tx(tx, agent_num, old_generation)?;
+    if inherited > 0 {
+        let source =
+            get_agent_config_tx(tx, agent_num, old_generation, inherited)?.ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "resume source overlay disappeared before inheritance",
+                )
+            })?;
+        let requested = encode_json(&json!({
+            "model": source.requested_model,
+            "effort": source.requested_effort,
+        }))?;
+        let effective = encode_json(&json!({
+            "model": source.model,
+            "effort": source.effort,
+        }))?;
+        db!(tx.execute(
+            "INSERT INTO agent_config(agent, generation, revision, requested, effective, application, provenance, command_id, created_at)
+             VALUES (?1, ?2, 1, ?3, ?4, 'next_turn', 'inherited_from', ?5, ?6)",
+            params![agent_num, next_generation, requested, effective, id, now],
+        ));
+        db!(tx.execute(
+            "UPDATE commands SET config_revision = 1 WHERE id = ?1",
+            [id],
+        ));
+    }
     install_initial_source_plan(tx, agent_num, next_generation, now)?;
     update_command_state(
         tx,

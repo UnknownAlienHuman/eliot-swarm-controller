@@ -597,6 +597,53 @@ async fn import_once(
     ImportAttempt::Applied
 }
 
+/// Refuse when the isolated store unexpectedly holds a credential for the
+/// dedicated local provider ID. In env-key and no-auth modes no native
+/// credential may be active for that ID: a present entry means owner or
+/// project state selected a credential the frozen profile never named, so
+/// startup refuses before any inference instead of silently using it.
+pub async fn ensure_no_credential_for_provider(
+    program: &OsStr,
+    workspace: &Path,
+    import_environment: &[(OsString, OsString)],
+    isolated_config_home: &Path,
+    isolated_data_home: &Path,
+    provider_id: &str,
+    deadline: Instant,
+) -> Result<()> {
+    let mut command = Command::new(program);
+    command
+        .current_dir(workspace)
+        .envs(import_environment.iter().map(|(key, value)| (key, value)))
+        .env("XDG_CONFIG_HOME", isolated_config_home)
+        .env("XDG_DATA_HOME", isolated_data_home)
+        .kill_on_drop(true);
+    command
+        .args(list_argv())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let entries = run_list(command, deadline).await.map_err(|error| {
+        Error::new(
+            "unknown",
+            format!(
+                "OpenCode local provider credential check is unresolved ({})",
+                error.message
+            ),
+        )
+    })?;
+    if entries
+        .iter()
+        .any(|entry| entry.id == provider_id || entry.name == provider_id)
+    {
+        return Err(Error::new(
+            "profile_error",
+            "OpenCode local provider holds an unexpected native credential for the dedicated provider ID",
+        ));
+    }
+    Ok(())
+}
+
 /// Best-effort kill plus bounded reap, reporting positive exit proof: true
 /// only when the child's exit was actually reaped. `kill_on_drop` remains
 /// the backstop if this future is itself cancelled.

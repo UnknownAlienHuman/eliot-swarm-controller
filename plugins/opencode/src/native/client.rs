@@ -21,9 +21,9 @@ use crate::native::{
     sse::{SseFrame, SseParser},
     types::{
         AgentList, ConfigEntry, DataEnvelope, ErrorBody, FormInfo, FormReplyRequest, InboxPage,
-        InboxUser, InterruptResponse, LocationRef, MessagePage, ModelRef, PermissionReplyRequest,
-        PermissionRequest, PromptRequest, SessionCreateRequest, SessionInfo, SwitchAgentRequest,
-        SwitchModelRequest,
+        InboxUser, InterruptResponse, LocationRef, MessagePage, ModelRef, NativeModelEntry,
+        PermissionReplyRequest, PermissionRequest, PromptRequest, ProviderReadback,
+        SessionCreateRequest, SessionInfo, SwitchAgentRequest, SwitchModelRequest,
     },
 };
 
@@ -602,6 +602,67 @@ impl OpenCodeHttp {
             return Ok(list.data.into_iter().map(|entry| entry.id).collect());
         }
         Err(readback_error("agent list", &response))
+    }
+
+    /// `GET /api/provider/:providerID`: effective provider readback for
+    /// the adopted-backend check (identity, native package, base URL, key
+    /// presence). A read, so any failure is `native_readback`, never
+    /// `unknown`. Only nonsecret observations leave this call: the key
+    /// value never decodes into retention.
+    pub async fn get_provider(
+        &self,
+        provider_id: &str,
+        deadline: Instant,
+    ) -> Result<ProviderReadback> {
+        let path = format!(
+            "/api/provider/{}",
+            verified_segment(provider_id)
+                .map_err(|_| Error::new("invalid", "OpenCode provider identity is invalid"))?
+        );
+        let response = self
+            .send(reqwest::Method::GET, &path, &[], None, deadline)
+            .await
+            .map_err(readback_outcome_as_error)?;
+        if response.status == 200 {
+            if let Ok(envelope) =
+                serde_json::from_slice::<DataEnvelope<ProviderReadback>>(&response.body)
+            {
+                return Ok(envelope.data);
+            }
+            if let Ok(provider) = serde_json::from_slice::<ProviderReadback>(&response.body) {
+                return Ok(provider);
+            }
+            return Err(Error::new(
+                "native_readback",
+                "OpenCode provider readback was invalid",
+            ));
+        }
+        Err(readback_error("provider", &response))
+    }
+
+    /// `GET /api/model`: effective model catalogue. The endpoint answers
+    /// an array; the caller selects the exact API model id locally. A read,
+    /// so any failure is `native_readback`, never `unknown`.
+    pub async fn list_native_models(&self, deadline: Instant) -> Result<Vec<NativeModelEntry>> {
+        let response = self
+            .send(reqwest::Method::GET, "/api/model", &[], None, deadline)
+            .await
+            .map_err(readback_outcome_as_error)?;
+        if response.status == 200 {
+            if let Ok(envelope) =
+                serde_json::from_slice::<DataEnvelope<Vec<NativeModelEntry>>>(&response.body)
+            {
+                return Ok(envelope.data);
+            }
+            if let Ok(models) = serde_json::from_slice::<Vec<NativeModelEntry>>(&response.body) {
+                return Ok(models);
+            }
+            return Err(Error::new(
+                "native_readback",
+                "OpenCode model readback was invalid",
+            ));
+        }
+        Err(readback_error("model list", &response))
     }
 
     /// `GET /api/session/{id}/message`: newest-first message page.
