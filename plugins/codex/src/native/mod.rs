@@ -1,5 +1,6 @@
 mod client;
 pub(crate) mod requests;
+pub(crate) mod startup_gate;
 pub(crate) mod store_policy;
 pub(crate) mod types;
 

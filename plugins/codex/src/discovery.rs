@@ -5,6 +5,7 @@ use crate::{
     host::{contextual_error, native_scope},
     native::{
         NativeClient, NativeFrame, NativeLaunch, NativeProcess,
+        startup_gate::StartupGate,
         store_policy::ensure_store_pin_supported,
         types::{
             NativeClientInfo, NativeDiscoveryConfigReadResponse, NativeDiscoverySourceKind,
@@ -150,7 +151,7 @@ pub(crate) async fn read_effective_mcp_server_names(
 ) -> Result<Vec<String>> {
     let cwd = launch.cwd.clone();
     let pinned = pinned_launch_for_binding(launch, binding)?;
-    let (mut probe, drainer) = start_reader(pinned, diagnostic_secrets, deadline).await?;
+    let (mut probe, drainer, _startup) = start_reader(pinned, diagnostic_secrets, deadline).await?;
     let probe_result: Result<Vec<String>> = async {
         let client = probe.client();
         let initialized = initialize_reader(&client, metadata_secrets, deadline).await?;
@@ -356,7 +357,7 @@ pub(crate) async fn probe_store(
     diagnostic_secrets: &[String],
     deadline: Instant,
 ) -> Result<StoreContext> {
-    let (mut probe, drainer) = start_reader(
+    let (mut probe, drainer, _startup) = start_reader(
         NativeLaunch {
             program: launch.program.clone(),
             args: launch.args.clone(),
@@ -397,7 +398,7 @@ pub(crate) async fn open_pinned_reader(
     // thread_store is fixed at process startup (pinned message_processor.rs:301-304).
     // A config/read reload must not relabel one store's page with another root.
     let pinned = pinned_launch(launch, store.root())?;
-    let (mut query, drainer) = start_reader(pinned, diagnostic_secrets, deadline).await?;
+    let (mut query, drainer, _startup) = start_reader(pinned, diagnostic_secrets, deadline).await?;
     let result = async {
         let client = query.client();
         let initialized = initialize_reader(&client, metadata_secrets, deadline).await?;
@@ -425,7 +426,12 @@ async fn start_reader(
     launch: NativeLaunch,
     secrets: &[String],
     deadline: Instant,
-) -> Result<(NativeProcess, JoinHandle<()>)> {
+) -> Result<(NativeProcess, JoinHandle<()>, StartupGate)> {
+    // Every attachment has its own plugin process. Hold an OS lock, rather than
+    // a process-local mutex, from before spawn through initialization and store
+    // verification (or confirmed cleanup on failure). The unpinned probe cannot
+    // know the selected store before its effective-config readback.
+    let startup = StartupGate::acquire(deadline).await?;
     if Instant::now() >= deadline {
         return Err(Error::new(
             "native_readback",
@@ -452,7 +458,7 @@ async fn start_reader(
             }
         }
     });
-    Ok((native, drainer))
+    Ok((native, drainer, startup))
 }
 
 pub(crate) async fn finish_reader(
@@ -1040,12 +1046,33 @@ mod tests {
         CURSOR_PREFIX, Cursor, NativeLaunch, READ_TIMEOUT, StoreContext, binding_paths,
         decode_cursor, fingerprint, mcp_server_names, native_scope, pinned_launch,
         pinned_launch_for_binding, read_effective_mcp_server_names, request_binding, select_store,
-        sqlite_environment, store_scope, validate_pin, validate_store,
+        sqlite_environment, start_reader, store_scope, validate_pin, validate_store,
     };
     use crate::native::types::NativeDiscoveryConfigReadResponse;
     use eliot_core::{NativeStoreBinding, SecretPolicy};
     use serde_json::json;
     use std::{ffi::OsString, path::Path};
+
+    #[tokio::test]
+    async fn expired_startup_deadline_never_spawns_or_claims_whole_attach_non_admission() {
+        let launch = NativeLaunch {
+            program: "codex-must-not-be-executed".into(),
+            args: Vec::new(),
+            cwd: std::env::current_dir().unwrap(),
+            environment: Vec::new(),
+        };
+        let error = match start_reader(launch, &[], tokio::time::Instant::now()).await {
+            Ok(_) => panic!("expired startup must not spawn a native process"),
+            Err(error) => error,
+        };
+        // A spawn attempt would fail with native_spawn. Only waiting is retried;
+        // an earlier selection probe may already have initialized native state.
+        assert_eq!(error.code, "native_readback");
+        assert_eq!(
+            eliot_core::classify_dispatched_error(&error.code),
+            eliot_core::CommandState::Unknown,
+        );
+    }
 
     #[test]
     fn controlled_store_binding_pins_relative_workspace_selection_and_round_trips() {

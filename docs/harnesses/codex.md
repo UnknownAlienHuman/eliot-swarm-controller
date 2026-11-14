@@ -362,6 +362,41 @@ profile, environment and filters; state-DB-only enumeration covers only the SDK-
 subjects (retained archives for archived selection) and does not claim complete rollout,
 raw database/history-row, or capacity coverage.
 The reader never calls `thread/resume` or `thread/start` to obtain visibility.
+
+The 2026-11-14 isolated Windows probe with installed Codex 0.167.1 completed 4,168
+two-stage metadata attempts at 32 workers: 4,159 succeeded and nine selection probes
+failed before metadata, all among the first ten attempts against a fresh native home.
+All 8,327 started app-servers exited, without forced termination or cleanup errors.
+In a separate fresh home, 32 OS-lock-serialized metadata attempts all succeeded;
+all 64 native children exited successfully. These were direct app-server diagnostics,
+not qualification of the repaired Eliot/Swarm attachment path.
+This reproduces the startup symptom; it does not establish the original retained-store
+failure's cause. The underlying SQLite/OS error remains unobserved.
+At [upstream 0.167.1](https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/app-server/src/lib.rs),
+state-runtime initialization precedes installation of stderr and database tracing
+subscribers, and its error is formatted with `{err}` rather than the full error chain.
+Consequently `RUST_LOG=trace` still reported only `failed to initialize sqlite state
+runtime ... failed to initialize state runtime`, and native logs did not establish
+whether migration, journal setup or another initialization operation failed.
+Contention is a hypothesis; the mechanism below explicitly bounds startup overlap.
+
+Metadata readers (including observe attachment's selection probe and pinned reader)
+serialize startup across plugin processes with an OS file lock,
+`eliot-codex-state-init-v1.lock`, in the plugin's temporary directory. The probe's
+effective SQLite directory is unknown before startup, so this conservative gate
+covers all metadata stores sharing that temporary directory. It is held from before
+spawn through initialization and store verification; short-lived probes hold it
+through cleanup. A verified observer releases it before reading subject metadata
+and retaining its reader. The lock file is never removed or truncated, and process
+exit releases the OS lock. Waiting uses the existing read deadline. No failed native
+startup is retried: even metadata-only initialization can mutate native SQLite state.
+Errors and unconfirmed cleanup retain the existing uncertainty classification.
+The second startup and its exact home/root and `sessionFlags` proof remain required.
+
+This limits Eliot metadata-startup overlap; it does not coordinate owner-run Codex,
+controlled-session startup, other temporary directories, or background native writes.
+It is not a SQLite repair or proof that native initialization is free of failures.
+
 The installed stable and experimental schemas expose no passive subscription operation.
 `thread/read`, `thread/turns/list` and `thread/items/list` are separate bounded historical
 reads; metadata-only empty `turns` and reader-local `notLoaded` are not terminal evidence.
