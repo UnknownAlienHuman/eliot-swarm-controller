@@ -1297,11 +1297,8 @@ async fn dispatch(
                     } else {
                         ShutdownMode::Force
                     };
-                    let result = shutdown_daemon(
-                        &data_dir,
-                        &DaemonShutdownRequest::new(mutation_id(id)?, mode),
-                    )
-                    .await?;
+                    let request = DaemonShutdownRequest::new(mutation_id(id)?, mode);
+                    let result = shutdown_daemon(&data_dir, &request).await?;
                     let value = serde_json::to_value(&result)
                         .map_err(|_| Failure::new(4, "daemon.shutdown response is invalid"))?;
                     print_value(&value, json_output);

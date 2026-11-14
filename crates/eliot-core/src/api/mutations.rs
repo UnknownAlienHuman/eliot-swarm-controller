@@ -1,7 +1,7 @@
 //! Public grammar for the two implemented mutations. Authorization, retained
 //! bindings, hydration and effect settlement remain in the Router and Store.
 
-use super::StatusBlocker;
+use super::{DrainReport, StatusBlocker};
 use crate::{CommandState, Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -148,6 +148,8 @@ pub struct DaemonShutdownResponse {
         deserialize_with = "present_blockers"
     )]
     pub blockers: Option<Vec<StatusBlocker>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain: Option<DrainReport>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -443,6 +445,7 @@ mod tests {
             json!({"mode":"force"}),
             json!({"id":"id"}),
             json!({"id":"id","mode":"force","extra":0}),
+            json!({"id":"id","mode":"drain","stop_idle":true}),
         ] {
             assert!(serde_json::from_value::<DaemonShutdownRequest>(request).is_err());
         }
@@ -539,11 +542,21 @@ mod tests {
 
     #[test]
     fn shutdown_result_preserves_drain_force_and_store_fault_shapes() {
+        let empty_drain = json!({
+            "running_turns_count":0,"running_turns":[],"running_turns_truncated":false,
+            "unsettled_commands_count":0,"unsettled_commands":[],"unsettled_commands_truncated":false,
+            "unknown_commands_count":0,"unknown_commands":[],"unknown_commands_truncated":false,
+            "owned_processes_count":0,"owned_processes":[],"owned_processes_truncated":false
+        });
         for wire in [
             json!({"state":"applied","mode":"drain","blockers":[]}),
             json!({"state":"dispatched","mode":"drain","blockers":[{"kind":"agent_live","agent":"a1","generation":0,"state":"created"}]}),
             json!({"state":"dispatched","mode":"force"}),
             json!({"state":"dispatched","mode":"force","store_write_faulted":true}),
+            json!({"state":"applied","mode":"drain","blockers":[],"drain":empty_drain}),
+            json!({"state":"dispatched","mode":"drain",
+                "blockers":[{"kind":"agent_live","agent":"a1","generation":0,"state":"idle","active_turn":"t1"}],
+                "drain":empty_drain}),
         ] {
             let reply: DaemonShutdownResponse = serde_json::from_value(wire.clone()).unwrap();
             assert_eq!(serde_json::to_value(reply).unwrap(), wire);
