@@ -319,6 +319,7 @@ impl CodexPlugin {
             "discover" => self.discover(&request.params).await,
             "profile.store" => self.profile_store(&request.params).await,
             "model.list" => self.model_list(&request.params).await,
+            "quota.read" => self.quota_read(&request.params).await,
             "agent.attach" => self.attach(&request.params).await,
             "agent.detach" => self.detach(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
@@ -453,6 +454,37 @@ impl CodexPlugin {
             })
             .collect();
         Ok(json!({"models": models, "default": default}))
+    }
+
+    /// Read-only native account quota for `harness.quota`. A dedicated
+    /// reader plugin instance calls `account/rateLimits/read` (plus
+    /// `account/usage/read` when useful) with no thread, no input and no
+    /// inference. Only quota signals are projected into `details`; account
+    /// identity (including any email) is never read or returned.
+    async fn quota_read(&self, raw: &Value) -> Result<Value> {
+        if self.session.is_some() || self.failed_start.is_some() || self.observer.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Codex quota.read requires a dedicated reader plugin instance",
+            ));
+        }
+        let profile: Value = decode(raw, "Codex quota.read params are invalid")?;
+        let snapshot = profile.get("profile").unwrap_or(&profile);
+        if snapshot.get("harness").and_then(Value::as_str) != Some("codex") {
+            return Err(Error::new(
+                "profile_error",
+                "Codex quota.read received another harness",
+            ));
+        }
+        let (launch, secrets, metadata_secrets) = self.reader_launch(snapshot, &json!({}))?;
+        let details = crate::discovery::read_quota(
+            launch,
+            &metadata_secrets,
+            &secrets,
+            tokio::time::Instant::now() + crate::discovery::READ_TIMEOUT,
+        )
+        .await?;
+        Ok(json!({"details": details}))
     }
 
     fn reader_launch(

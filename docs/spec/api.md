@@ -925,8 +925,32 @@ per-harness installation facts (installed, resolved `cmd`, `--version`);
 `harness.models` (`HarnessModelsRequest`/`HarnessModelsResponse`) returns the
 harness's own read-only catalogue (Codex/Muse native `model/list`, the OpenCode
 provider/model list; Claude reports aliases plus the CLI default, Antigravity
-reports no catalogue). Both are owner-only, read-only, and start no model turn
-and no inference (`swarm harnesses`, `swarm models --harness H`).
+reports no catalogue). An optional `profile` selects the native route/account
+(the named profile must exist and its frozen harness must match); omitted it
+means ad-hoc daemon defaults. The read is cached per native route/account
+scope with a freshness timestamp (`fetched_at_ms`, `ttl_ms`) and a nonsecret
+credential identity (a name, never a value); every response carries its
+`scope`, `fetched_at_ms`, `ttl_ms` and `credential`. Native model ids are
+retained verbatim and a failed read never selects another model or account.
+`harness.quota` (`HarnessQuotaRequest`/`HarnessQuotaResponse`) is the separate
+provider-supported account quota readback: timestamp (`fetched_at_ms`,
+`ttl_ms`), `scope` and `credential` as above, plus an explicit `status` of
+`supported`, `unsupported` or `unknown` naming the checked native surface and,
+when `supported`, provider-verbatim quota signals in `details` (an object, at
+most 8192 encoded bytes; never secrets or personal data). Codex reads
+`account/rateLimits/read` plus `account/usage/read` when useful (windows with
+used percent, reset time, credits and plan; `account/read` is never called so
+no email enters the response, logs or Store); Muse reads `usage/read`
+(window and weekly used percent, reset time, tier and arrival stamp; an empty
+`details` object means the host observed nothing and no numbers are
+fabricated). A method-not-found or schema mismatch stays `unsupported` or
+`unknown` naming the checked method. OpenCode/Claude/Antigravity expose no
+read-only quota endpoint, so they report `unsupported`. Support never comes
+from an inference probe or per-Agent polling. Both reads are owner-only,
+read-only, deduplicated per account through the same bounded per-scope cache,
+and start no model turn and no inference
+(`swarm harnesses`, `swarm models --harness H [--profile P]`,
+`swarm quota --harness H [--profile P]`).
 `profile` and `id` are required nonempty strings. Present strings are checked for
 nonemptiness after trimming but are preserved as supplied. For `agent.discover`, optional
 `harness`, `native_scope` and `cursor` may be omitted or `null` to mean absent. For

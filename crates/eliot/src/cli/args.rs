@@ -75,6 +75,10 @@ pub(crate) enum CliCommand {
     /// Read a harness native model catalogue through its own read-only
     /// method. Starts no model turn and performs no inference.
     Models(ModelsArgs),
+    /// Read provider-supported account quota with timestamp, scope,
+    /// status and details when supported. Starts no model turn and performs
+    /// no inference.
+    Quota(QuotaArgs),
     /// Attach to an exact native subject without taking control of it.
     Attach(AttachArgs),
     /// Start an Agent using the named profile.
@@ -221,6 +225,21 @@ pub(crate) struct ModelsArgs {
     /// Harness code: codex|claude|muse|opencode|antigravity.
     #[arg(long, value_name = "HARNESS")]
     pub(crate) harness: String,
+    /// Optional named profile selecting the native route/account. Omitted
+    /// means ad-hoc daemon defaults for the harness.
+    #[arg(long, value_name = "PROFILE")]
+    pub(crate) profile: Option<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct QuotaArgs {
+    /// Harness code: codex|claude|muse|opencode|antigravity.
+    #[arg(long, value_name = "HARNESS")]
+    pub(crate) harness: String,
+    /// Optional named profile selecting the native route/account. Omitted
+    /// means ad-hoc daemon defaults for the harness.
+    #[arg(long, value_name = "PROFILE")]
+    pub(crate) profile: Option<String>,
 }
 
 #[derive(Args)]
@@ -1087,8 +1106,8 @@ pub(crate) enum PluginCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApproveArgs, Cli, CliCommand, DenyArgs, GenerationArgs, InterruptArgs, ReadGenerationArgs,
-        SteerArgs, UsageArgs,
+        ApproveArgs, Cli, CliCommand, DenyArgs, GenerationArgs, InterruptArgs, ModelsArgs,
+        QuotaArgs, ReadGenerationArgs, SteerArgs, UsageArgs,
     };
     use crate::cli::agents::approval_reply_args;
     use clap::Parser;
@@ -1125,6 +1144,37 @@ mod tests {
         assert!(
             Cli::try_parse_from(["swarm", "usage", "--project", "p1", "--root", "a2"]).is_err()
         );
+    }
+
+    #[test]
+    fn models_and_quota_cli_scope_catalog_and_quota_by_profile() {
+        let cli = Cli::try_parse_from(["swarm", "models", "--harness", "codex"]).unwrap();
+        let Some(CliCommand::Models(ModelsArgs { harness, profile })) = cli.command else {
+            panic!("models command required");
+        };
+        assert_eq!(harness, "codex");
+        assert_eq!(profile, None);
+        let cli = Cli::try_parse_from([
+            "swarm",
+            "models",
+            "--harness",
+            "codex",
+            "--profile",
+            "codex-main",
+        ])
+        .unwrap();
+        let Some(CliCommand::Models(ModelsArgs { harness, profile })) = cli.command else {
+            panic!("models command required");
+        };
+        assert_eq!(harness, "codex");
+        assert_eq!(profile.as_deref(), Some("codex-main"));
+        let cli = Cli::try_parse_from(["swarm", "quota", "--harness", "muse"]).unwrap();
+        let Some(CliCommand::Quota(QuotaArgs { harness, profile })) = cli.command else {
+            panic!("quota command required");
+        };
+        assert_eq!(harness, "muse");
+        assert_eq!(profile, None);
+        assert!(Cli::try_parse_from(["swarm", "quota"]).is_err());
     }
 
     #[test]
