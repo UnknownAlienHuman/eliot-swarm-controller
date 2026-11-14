@@ -178,7 +178,9 @@ claim. If the combined response cannot fit, context takes priority and steer
 remains pending for a later callback in the same prompt. After the helper
 confirms its stdout write, the plugin commits `hook.before_model` with the
 exact Eliot turn and consumer on the existing event path. A context outcome
-is included only when claimed context was written.
+is included only when claimed context was written. The `PreInvocation` payload
+carries no tool metadata (only conversation, invocation and step counts), so
+`hook.before_model` facts carry no tool diagnostics.
 
 `steer` retains its command id, generation, and captured turn while waiting
 for a live `PreInvocation` in that prompt. Its host response is deferred while

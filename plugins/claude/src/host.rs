@@ -2046,6 +2046,7 @@ async fn launch_session(
             agent_id: params.agent_id.clone(),
             generation: params.generation,
             secrets: plan.secrets.clone(),
+            workspace: plan.workspace.clone(),
         },
     );
     Ok(AgentSession {
