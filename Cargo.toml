@@ -10,6 +10,7 @@ members = [
     "plugins/claude",
     "plugins/opencode",
     "plugins/antigravity",
+    "apps/swarm-desktop",
 ]
 resolver = "3"
 
