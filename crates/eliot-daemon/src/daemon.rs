@@ -736,29 +736,29 @@ async fn raw_client_call(
 
     let timeout = call_timeout(method, &params);
     let deadline = Instant::now() + timeout;
-    let endpoint = endpoint.to_owned();
-    // Connect and send share one deadline: until the full frame is written the
-    // server cannot have admitted anything, so a send-phase timeout is a
-    // retryable `unavailable`, never an uncertain outcome.
-    let mut framed = timeout_at(deadline, async move {
-        let stream = IpcStream::connect(&endpoint, deadline).await?;
-        let mut framed = Framed::new(
-            stream,
-            LinesCodec::new_with_max_length(MAX_RPC_FRAME_BYTES.saturating_sub(1)),
-        );
-        framed
-            .send(frame)
-            .await
-            .map_err(|_| Error::new("unavailable", "daemon RPC write failed"))?;
-        Ok::<_, Error>(framed)
-    })
-    .await
-    .map_err(|_| {
-        Error::new(
-            "unavailable",
-            "daemon RPC send deadline elapsed before admission; safe to retry",
-        )
-    })??;
+    // Connect first, on its own: the handshake writes no request bytes, so a
+    // connect timeout or refusal positively establishes zero bytes written
+    // and stays a retryable `unavailable` — nothing was admitted.
+    let stream = timeout_at(deadline, IpcStream::connect(endpoint, deadline))
+        .await
+        .map_err(|_| {
+            Error::new(
+                "unavailable",
+                "daemon IPC connect deadline elapsed before any request was sent",
+            )
+        })??;
+    let mut framed = Framed::new(
+        stream,
+        LinesCodec::new_with_max_length(MAX_RPC_FRAME_BYTES.saturating_sub(1)),
+    );
+    // Once any byte of the frame may have been written, a stalled or failed
+    // send can no longer prove non-execution: `LinesCodec::decode_eof` yields
+    // a trailing unterminated line, so the daemon may admit a request the
+    // client never sees answered. Send-phase failures are `unknown`.
+    timeout_at(deadline, framed.send(frame))
+        .await
+        .map_err(|_| Error::new("unknown", "daemon RPC exceeded its absolute deadline"))?
+        .map_err(|_| Error::new("unknown", "daemon RPC write failed"))?;
     // The request is written: a local reply-integrity failure cannot prove
     // non-execution. Matching, decoded daemon errors keep their domain code.
     let line = timeout_at(deadline, framed.next())
@@ -1532,6 +1532,54 @@ mod tests {
         );
         assert!(!error.message.contains("dummy-private"));
         assert_eq!(params.0.get(), 1);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn rpc_connect_phase_stays_unavailable_while_send_phase_is_unknown() {
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        let policy = SecretPolicy::new(["test-credential"]);
+        let auth = json!({"kind": "owner", "credential": "test-credential"});
+        // Short deadline: events.subscribe with wait_ms 0 → 5s call timeout.
+        let params = json!({"wait_ms": 0});
+
+        // Connect phase: the sole pipe instance is occupied and nobody
+        // accepts, so no request byte can be written — the call stays
+        // retryable even at the deadline.
+        let busy_endpoint = format!(r"\\.\pipe\eliot-test-busy-{}", ulid::Ulid::new());
+        let _occupied = crate::platform::windows::create_pipe_server(&busy_endpoint, true).unwrap();
+        let _blocker = ClientOptions::new().open(&busy_endpoint).unwrap();
+        let connect_case = raw_client_call(
+            &busy_endpoint,
+            "events.subscribe",
+            params.clone(),
+            auth.clone(),
+            &policy,
+        );
+
+        // Send phase: the server accepts but never reads. The 1 MiB frame
+        // overfills the pipe buffer so the send cannot complete before the
+        // deadline — and even a fully-written frame would be uncertain, since
+        // `decode_eof` admits a trailing unterminated line.
+        let held_endpoint = format!(r"\\.\pipe\eliot-test-held-{}", ulid::Ulid::new());
+        let server = crate::platform::windows::create_pipe_server(&held_endpoint, true).unwrap();
+        let held = tokio::spawn(async move {
+            let _stream = server.connect().await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let mut stalled = params.clone();
+        stalled["pad"] = json!("x".repeat(1024 * 1024));
+        let send_case = raw_client_call(&held_endpoint, "events.subscribe", stalled, auth, &policy);
+
+        let (connect_result, send_result) = tokio::join!(connect_case, send_case);
+        let connect_error =
+            connect_result.expect_err("busy pipe must refuse before any request byte");
+        assert_eq!(connect_error.code, "unavailable");
+        let send_error =
+            send_result.expect_err("a stalled send must stay uncertain, never retryable");
+        assert_eq!(send_error.code, "unknown");
+        held.abort();
     }
 
     #[tokio::test]
