@@ -688,8 +688,10 @@ and the verbatim text of the `[profiles.*]` table blocks in file order. Every ot
 section stays server-side. Comment and blank lines that end a profile block and precede
 another section belong to that section. The source is withheld (`editable=false` with a
 reason) when the file is not valid TOML, when profiles are defined outside
-`[profiles.*]` tables, or when the profile text contains a value the daemon's secret
-policy knows. Profile sections carry environment and credential names, never values.
+`[profiles.*]` tables, when the profile text contains a value the daemon's secret
+policy knows, or when the profiles fail the daemon's strict field and URL
+validation (unknown fields and credential-bearing URLs are never handed to the
+editor as safe source). Profile sections carry environment and credential names, never values.
 
 [`config.profiles.save`](../../crates/eliot-daemon/src/config/profiles_edit.rs) takes
 the full replacement text for those blocks, the revision it was read from, and
@@ -709,8 +711,9 @@ stops after validation. A save rechecks the revision immediately before it write
 private temporary file in the data directory and renames it over `config.toml`. Only
 saves inside one daemon are serialized, so an external writer in the instant between
 that recheck and the rename can still be overwritten. A failure after the rename
-reports `unknown`, never "unchanged". The draft keeps the file's line ending. An
-identical result writes nothing. An invalid draft is never written, so the file keeps
+reports `unknown`, never "unchanged". The draft keeps the file's line ending. A
+leading UTF-8 BOM is preserved outside the profile blocks and is never handed
+to the editor. An identical result writes nothing. An invalid draft is never written, so the file keeps
 its last valid revision and the editor keeps the draft. The daemon holds no separate
 in-memory profile set to reload: the next admission reads the saved file.
 

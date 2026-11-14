@@ -924,15 +924,19 @@ current `config.toml` revision, whether it parses, and per profile the name,
 harness, requested model/effort (absent = native default), permissions,
 approval policy, control, proxy/account names, `max_live`, `child_profiles`
 and whether launch-time resolution succeeds now (`launchable`, else `error`).
-It reads no environment value, and a summary that would carry a value known to the
-daemon's secret policy is withheld (`launchable=false` with a reason). `config.profiles.read`
+It reads no environment value, and a profile whose summary would carry a value
+known to the daemon's secret policy is omitted from the list; parse diagnostics
+are redacted with that policy before they enter the reply. `config.profiles.read`
 and `config.profiles.save` follow [configuration](configuration.md#profile-editing).
 `rule.list` (`RuleListRequest`/`RuleListResponse`) pages one rule namespace
 (global, or `project`) by rule id with `after`/`limit`; each entry carries the
 stored `RuleStateView`, its `TimerStateView` when the rule is a timer, and the
-canonical stored definition (`on`, `do`, `limit`, `catch_up`). Like `agent.list`, every
-nonempty page sets `next` to its last id and the caller continues until an empty page;
-a page shortened by the byte budget never hides later rules. It changes nothing.
+canonical stored definition (`on`, `do`, `limit`, `catch_up`). Entries whose
+stored state, timer state or definition carry a value known to the daemon's
+secret policy (keys included) are withheld, and `next` names the last returned
+id. Like `agent.list`, every nonempty page sets `next` to its last id and the
+caller continues until an empty page; a page shortened by the byte budget never
+hides later rules. It changes nothing.
 `profile` and `id` are required nonempty strings. Present strings are checked for
 nonemptiness after trimming but are preserved as supplied. For `agent.discover`, optional
 `harness`, `native_scope` and `cursor` may be omitted or `null` to mean absent. For

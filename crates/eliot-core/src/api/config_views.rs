@@ -172,7 +172,8 @@ pub struct ProfilesReadResponse {
     pub source: Option<String>,
     pub editable: bool,
     /// Why the source is withheld (invalid file, profiles defined outside
-    /// `[profiles.*]` tables, a known secret value present).
+    /// `[profiles.*]` tables, a known secret value present, strict field and
+    /// URL validation failed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

@@ -116,8 +116,17 @@ fn split_blocks(source: &str) -> Vec<Block<'_>> {
     let mut spans: Vec<(usize, usize, bool)> = Vec::new();
     let mut start = 0;
     let mut profile = false;
-    let mut offset = 0;
-    for line in source.split_inclusive('\n') {
+    // A leading UTF-8 BOM is not TOML content: the pinned parser accepts it,
+    // but the header scan must not treat it as part of the first header. Keep
+    // its bytes in a leading non-profile span so reads never hand it to the
+    // editor and saves preserve it byte for byte.
+    if let Some(rest) = source.strip_prefix('\u{FEFF}') {
+        let bom = source.len() - rest.len();
+        spans.push((0, bom, false));
+        start = bom;
+    }
+    let mut offset = start;
+    for line in source[start..].split_inclusive('\n') {
         if let Some(path) = header_path(line) {
             if offset > start {
                 spans.push((start, offset, profile));
@@ -269,7 +278,46 @@ fn editability(source: &str, policy: &SecretPolicy) -> Option<&'static str> {
             "the profile sections contain a known secret value; edit config.toml directly",
         );
     }
+    // The TOML shape above is not enough: an unknown field or a
+    // credential-bearing URL must never be handed to the editor as safe
+    // source, even when no known secret is present. Launch-readiness alone
+    // (a missing model, a dangling child reference) stays a save-time error:
+    // it carries no credentials and the editor can repair it.
+    let config = match parse_config(source) {
+        Ok(config) => config,
+        Err(_) => {
+            return Some(
+                "the profiles fail the daemon's strict validation; edit config.toml directly",
+            );
+        }
+    };
+    if has_credentialed_url(&config, source) {
+        return Some("the profiles fail the daemon's strict validation; edit config.toml directly");
+    }
     None
+}
+
+/// Profiles or adopted proxies whose URL fields carry credentials (userinfo,
+/// query, fragment) must never be handed to the editor as safe source.
+fn has_credentialed_url(config: &super::FileConfig, source: &str) -> bool {
+    config.profiles.values().any(|entry| {
+        entry
+            .get_ref()
+            .provider_base_url
+            .as_deref()
+            .is_some_and(|raw| super::validate_provider_base_url("", raw, source, 0).is_err())
+    }) || config.proxies.iter().any(|(name, entry)| {
+        let proxy = entry.get_ref();
+        core::RouteBinding {
+            name: name.clone(),
+            endpoint: proxy.attach.clone(),
+            readiness_path: proxy.health.clone(),
+            provider_base_url: proxy.base_url_for.codex.clone(),
+            client_key_env_name: None,
+        }
+        .validate()
+        .is_err()
+    })
 }
 
 /// `config.profiles.read`: the `[profiles.*]` sections only, when editable.
@@ -308,10 +356,12 @@ pub(crate) fn list(data_root: &Path, policy: &SecretPolicy) -> core::Result<Prof
     let config = match parse_config(&source) {
         Ok(config) => config,
         Err(error) => {
+            // Parse diagnostics name the offending key, which can equal a
+            // known secret, so they are redacted before entering the reply.
             return Ok(ProfileListResponse {
                 revision,
                 valid: false,
-                error: Some(error.to_string()),
+                error: Some(policy.redact_text(&error.to_string())),
                 profiles: Vec::new(),
             });
         }
@@ -321,7 +371,7 @@ pub(crate) fn list(data_root: &Path, policy: &SecretPolicy) -> core::Result<Prof
     let profiles = names
         .into_iter()
         .take(MAX_LISTED_PROFILES)
-        .map(|name| {
+        .filter_map(|name| {
             let entry = config.profiles[name].get_ref();
             let resolved = resolve_profile_in(&config, &source, name);
             let summary = ProfileSummary {
@@ -342,26 +392,13 @@ pub(crate) fn list(data_root: &Path, policy: &SecretPolicy) -> core::Result<Prof
                 launchable: resolved.is_ok(),
                 error: resolved.err().map(|error| error.to_string()),
             };
-            // A summary never carries a known secret value.
+            // A secret-bearing profile is omitted entirely: even the name and
+            // harness are identifiers the picker would display, and resolution
+            // errors name the profile, so no redacted placeholder can carry
+            // them safely.
             match serde_json::to_value(&summary) {
-                Ok(value) if !policy.contains_value(&value) => summary,
-                _ => ProfileSummary {
-                    name: summary.name,
-                    harness: summary.harness,
-                    model: None,
-                    effort: None,
-                    permissions: None,
-                    approval_policy: None,
-                    control: None,
-                    proxy: None,
-                    account: None,
-                    max_live: None,
-                    child_profiles: Vec::new(),
-                    launchable: false,
-                    error: Some(
-                        "summary withheld: the profile contains a known secret value".to_owned(),
-                    ),
-                },
+                Ok(value) if !policy.contains_value(&value) => Some(summary),
+                _ => None,
             }
         })
         .collect();
@@ -637,5 +674,82 @@ mod tests {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         );
+    }
+
+    struct TestDataRoot(std::path::PathBuf);
+
+    impl TestDataRoot {
+        fn new(config: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let path =
+                std::env::temp_dir().join(format!("eliot-qa-profiles-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("create profiles fixture root");
+            std::fs::write(path.join("config.toml"), config).expect("write profiles fixture");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDataRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn secret_bearing_profiles_are_omitted_from_list() {
+        let policy = SecretPolicy::new(vec![
+            "qa-secret-007-x".to_owned(),
+            "qa-model-secret-1".to_owned(),
+        ]);
+        let root = TestDataRoot::new(
+            "[profiles.clean]\nharness = \"codex\"\nmodel = \"m1\"\n\n[profiles.qa-secret-007-x]\nharness = \"codex\"\nmodel = \"m1\"\n\n[profiles.leaky-model]\nharness = \"codex\"\nmodel = \"qa-model-secret-1\"\n",
+        );
+        let reply = list(&root.0, &policy).expect("list profiles");
+        assert!(reply.valid);
+        let names: Vec<&str> = reply
+            .profiles
+            .iter()
+            .map(|summary| summary.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["clean"]);
+        let encoded = serde_json::to_value(&reply).expect("encode list reply");
+        assert!(!policy.contains_value(&encoded));
+    }
+
+    #[test]
+    fn parse_diagnostics_are_redacted_in_list() {
+        let policy = SecretPolicy::new(vec!["zz-top-secret-key".to_owned()]);
+        let root =
+            TestDataRoot::new("[profiles.a]\nharness = \"codex\"\nzz-top-secret-key = \"x\"\n");
+        let reply = list(&root.0, &policy).expect("list profiles");
+        assert!(!reply.valid);
+        assert!(reply.profiles.is_empty());
+        let error = reply.error.expect("parse error is reported");
+        assert!(!error.contains("zz-top-secret-key"), "unredacted: {error}");
+        assert!(error.contains(REDACTION_MARKER));
+    }
+
+    #[test]
+    fn credential_bearing_invalid_profiles_are_not_editable() {
+        let policy = SecretPolicy::new(Vec::<String>::new());
+        let userinfo = "[profiles.local]\nharness = \"opencode\"\ncmd = \"C:/Tools/OpenCode/opencode.exe\"\nmodel = \"eliot-local/qwen3-8b\"\nprovider_base_url = \"http://user:password@localhost:1234/v1\"\nbackend = \"lmstudio\"\ncontext_limit = 131072\noutput_limit = 8192\n";
+        assert!(editability(userinfo, &policy).is_some());
+        let unknown = "[profiles.a]\nharness = \"codex\"\nmodel = \"m1\"\napi_key = \"hunter2\"\n";
+        assert!(editability(unknown, &policy).is_some());
+        assert!(editability(FILE, &policy).is_none());
+    }
+
+    #[test]
+    fn bom_prefixed_profiles_edit_as_text_and_keep_the_bom() {
+        let policy = SecretPolicy::new(Vec::<String>::new());
+        let file = "\u{FEFF}[profiles.a]\nharness = \"codex\"\nmodel = \"m1\"\n";
+        assert!(editability(file, &policy).is_none());
+        let text = profile_text(file);
+        assert!(!text.starts_with('\u{FEFF}'));
+        assert!(text.starts_with("[profiles.a]\n"));
+        let draft = "[profiles.a]\nharness = \"codex\"\nmodel = \"m2\"\n";
+        let (spliced, _) = validated(file, draft).expect("BOM file accepts a valid edit");
+        assert!(spliced.starts_with("\u{FEFF}[profiles.a]\nharness = \"codex\"\nmodel = \"m2\"\n"));
     }
 }
