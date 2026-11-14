@@ -1,8 +1,8 @@
 use crate::{
     events::{self, EventConfig, EventHandle, TurnFacts},
     mcp::{
-        McpReadback, compute_disables, merge_status_page, parse_status_page, policy_from_profile,
-        require_minimal_own_server,
+        McpReadback, compute_disables, compute_plugin_disables, merge_status_page,
+        parse_status_page, policy_from_profile, require_minimal_own_server, synthetic_apps_disable,
     },
     native::{
         NativeClient, NativeLaunch, NativeProcess,
@@ -794,18 +794,25 @@ impl CodexPlugin {
             .to_string()
             .to_ascii_lowercase();
         let mcp_server_name = format!("eliot_swarm_{start_command}");
-        // Minimal policy: enumerate the worker-visible native servers with a
-        // short-lived metadata reader, then suppress every non-allowed one
-        // with its own `enabled=false` override. Inherit keeps the current
-        // additive behavior with no extra process.
-        let mcp_disables = if mcp_policy == McpPolicy::Minimal {
+        // Minimal policy: enumerate the worker-visible native MCP surface
+        // with a short-lived metadata reader, then suppress every
+        // non-allowed server with its own transport-carrying
+        // `enabled=false` overrides. A bare `enabled=false` breaks the
+        // native bootstrap for project/plugin names (verified on 0.167.1),
+        // so each disable re-emits the enumerated `command`/`url`.
+        // Plugin-backed builtin servers never appear in `mcp_servers`, so
+        // each suppressed plugin takes its own `plugins.<id>.enabled=false`
+        // override, and the ChatGPT-backed Apps runtime (likewise absent
+        // from `mcp_servers`) takes a synthetic transport-carrying disable.
+        // Inherit keeps the current additive behavior with no extra process.
+        let (mcp_disables, plugin_disables) = if mcp_policy == McpPolicy::Minimal {
             let probe = NativeLaunch {
                 program: program.clone(),
                 args: route.args()?,
                 cwd: workspace.clone(),
                 environment: environment.clone(),
             };
-            let enumerated = crate::discovery::read_effective_mcp_server_names(
+            let surface = crate::discovery::read_effective_mcp_surface(
                 &probe,
                 &frozen_store,
                 &metadata_secrets,
@@ -820,9 +827,19 @@ impl CodexPlugin {
                     "Codex minimal MCP server enumeration failed before worker spawn",
                 )
             })?;
-            compute_disables(&enumerated, &mcp_allow, &mcp_server_name)?
+            let mut disables = compute_disables(
+                &surface.servers,
+                &mcp_allow,
+                &mcp_server_name,
+                &metadata_secrets,
+            )?;
+            if let Some(apps) = synthetic_apps_disable(&mcp_allow) {
+                disables.push(apps);
+            }
+            let plugins = compute_plugin_disables(&surface.plugins, &mcp_allow)?;
+            (disables, plugins)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let launch = NativeLaunch {
             program,
@@ -832,6 +849,7 @@ impl CodexPlugin {
                 &data_dir,
                 &mcp_cwd,
                 &mcp_disables,
+                &plugin_disables,
             )?,
             cwd: workspace.clone(),
             environment,
