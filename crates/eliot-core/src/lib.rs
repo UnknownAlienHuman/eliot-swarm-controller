@@ -1379,6 +1379,25 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             let native_status = optional_native_status(event)?;
             let final_text = optional_text(event, "final_text")?;
             let usage = optional_usage(event)?;
+            // A harness-observed MCP inventory rides the terminal the same
+            // way an observed model rides its message: merged as the only
+            // change into the effective set, so a proven readback surfaces
+            // while an unobserved one stays unknown.
+            if let Some((servers, verified)) = optional_observed_mcp_servers(event)? {
+                match &mut next.effective {
+                    Some(Value::Object(effective)) => {
+                        effective.insert("mcp_servers".to_owned(), servers);
+                        effective.insert("mcp_servers_verified".to_owned(), Value::Bool(verified));
+                    }
+                    None => {
+                        let mut effective = serde_json::Map::new();
+                        effective.insert("mcp_servers".to_owned(), servers);
+                        effective.insert("mcp_servers_verified".to_owned(), Value::Bool(verified));
+                        next.effective = Some(Value::Object(effective));
+                    }
+                    Some(_) => {}
+                }
+            }
             next.state = AgentState::Idle;
             next.active_turn = None;
             next.pending.clear();
@@ -1516,6 +1535,62 @@ fn required_text(event: &NativeEvent, field: &str) -> Result<String> {
                 format!("{} requires non-empty string field {field}", event.kind),
             )
         })
+}
+
+/// Merge source for a harness-observed MCP inventory carried on a turn
+/// terminal (Claude `system`/`init` via its plugin): an array of
+/// `{name, status}` objects plus the verification flag. Absent together
+/// means unobserved (no merge); a half-present or malformed pair is an
+/// invalid event, never a silent partial readback.
+fn optional_observed_mcp_servers(event: &NativeEvent) -> Result<Option<(Value, bool)>> {
+    const MAX_MERGED_MCP_SERVERS: usize = 1024;
+    const MAX_MERGED_MCP_TEXT_LEN: usize = 256;
+    let servers = event.data.get("mcp_servers");
+    let verified = event.data.get("mcp_servers_verified");
+    match (servers, verified) {
+        (None | Some(Value::Null), None | Some(Value::Null)) => Ok(None),
+        (Some(Value::Array(entries)), Some(Value::Bool(verified))) => {
+            if entries.len() > MAX_MERGED_MCP_SERVERS {
+                return Err(Error::new(
+                    "invalid",
+                    format!("{} field mcp_servers exceeds its bound", event.kind),
+                ));
+            }
+            for entry in entries {
+                let valid = entry.as_object().is_some_and(|object| {
+                    object
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| {
+                            !name.trim().is_empty() && name.len() <= MAX_MERGED_MCP_TEXT_LEN
+                        })
+                        && object
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .is_some_and(|status| {
+                                !status.trim().is_empty() && status.len() <= MAX_MERGED_MCP_TEXT_LEN
+                            })
+                });
+                if !valid {
+                    return Err(Error::new(
+                        "invalid",
+                        format!(
+                            "{} field mcp_servers must be name/status objects",
+                            event.kind
+                        ),
+                    ));
+                }
+            }
+            Ok(Some((Value::Array(entries.clone()), *verified)))
+        }
+        _ => Err(Error::new(
+            "invalid",
+            format!(
+                "{} fields mcp_servers and mcp_servers_verified must be a server array and a boolean together",
+                event.kind
+            ),
+        )),
+    }
 }
 
 fn optional_observed_model(event: &NativeEvent) -> Result<Option<String>> {
@@ -1947,6 +2022,97 @@ mod session_usage_tests {
             Value::Null
         );
         assert_eq!(next.state, agent.state);
+    }
+}
+
+#[cfg(test)]
+mod mcp_readback_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn busy_agent() -> Agent {
+        let mut agent = Agent::new("a1", "project", "claude", "fake", 0);
+        agent.state = AgentState::Busy;
+        agent.active_turn = Some("t1".to_owned());
+        agent
+    }
+
+    fn terminal(data: Value) -> NativeEvent {
+        let mut full = json!({
+            "command_id": "c1",
+            "turn_id": "t1",
+            "status": "completed",
+        });
+        for (key, value) in data.as_object().expect("object data") {
+            full[key] = value.clone();
+        }
+        NativeEvent {
+            kind: "turn.completed".to_owned(),
+            native_id: "n1".to_owned(),
+            data: full,
+            ts: None,
+        }
+    }
+
+    #[test]
+    fn turn_completed_merges_proven_inventory_into_effective() {
+        let (next, _) = apply(
+            &busy_agent(),
+            &terminal(json!({
+                "mcp_servers": [{"name": "eliot-swarm", "status": "connected"}],
+                "mcp_servers_verified": true,
+            })),
+            42,
+        )
+        .unwrap();
+        let effective = next.effective.expect("effective set");
+        assert_eq!(
+            effective["mcp_servers"],
+            json!([{"name": "eliot-swarm", "status": "connected"}])
+        );
+        assert_eq!(effective["mcp_servers_verified"], json!(true));
+        assert_eq!(next.state, AgentState::Idle);
+        assert_eq!(next.active_turn, None);
+    }
+
+    #[test]
+    fn turn_completed_preserves_existing_effective_fields() {
+        let mut agent = busy_agent();
+        agent.effective = Some(json!({"model": "claude-haiku-5-5", "mcp_servers": null}));
+        let (next, _) = apply(
+            &agent,
+            &terminal(json!({
+                "mcp_servers": [],
+                "mcp_servers_verified": true,
+            })),
+            42,
+        )
+        .unwrap();
+        let effective = next.effective.expect("effective kept");
+        assert_eq!(effective["model"], json!("claude-haiku-5-5"));
+        assert_eq!(effective["mcp_servers"], json!([]));
+        assert_eq!(effective["mcp_servers_verified"], json!(true));
+    }
+
+    #[test]
+    fn turn_completed_without_inventory_leaves_effective_alone() {
+        let mut agent = busy_agent();
+        agent.effective = Some(json!({"mcp_servers": null}));
+        let (next, _) = apply(&agent, &terminal(json!({})), 42).unwrap();
+        assert_eq!(next.effective, Some(json!({"mcp_servers": null})));
+    }
+
+    #[test]
+    fn turn_completed_rejects_half_present_or_malformed_inventory() {
+        for data in [
+            json!({"mcp_servers": [{"name": "a", "status": "connected"}]}),
+            json!({"mcp_servers_verified": true}),
+            json!({"mcp_servers": ["a"], "mcp_servers_verified": true}),
+            json!({"mcp_servers": [{"name": "", "status": "connected"}], "mcp_servers_verified": true}),
+            json!({"mcp_servers": [{"name": "a", "status": "connected"}], "mcp_servers_verified": "yes"}),
+        ] {
+            assert!(apply(&busy_agent(), &terminal(data), 42).is_err());
+        }
     }
 }
 
