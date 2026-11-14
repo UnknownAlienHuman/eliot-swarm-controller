@@ -1236,8 +1236,20 @@ impl MusePlugin {
                 "Muse plugin is stopping; no further input is accepted",
             ));
         }
-        if session.phase != SessionPhase::Ready || session.events.status().source_unknown {
-            let result = rejected_control("Muse interrupt does not match a healthy active turn");
+        let event_status = session.events.status();
+        if session.phase != SessionPhase::Ready || event_status.source_unknown {
+            let reason = if event_status.view_unavailable {
+                format!(
+                    "Muse interrupt refused: native view unavailable ({}); the recorded source gap leaves the turn outcome unknown",
+                    event_status
+                        .view_unavailable_reason
+                        .unwrap_or(crate::native::types::NativeHistoryNoneReason::Unknown)
+                        .label(),
+                )
+            } else {
+                "Muse interrupt does not match a healthy active turn".to_owned()
+            };
+            let result = rejected_control(&reason);
             settle_control(
                 session,
                 &params.command_id,
