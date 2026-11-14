@@ -130,6 +130,43 @@ permissions stay unknown (`null` / unverified) until a real native tool probe co
 posture. `collaboration_mode` and `approval_policy`
 presets stay rejected. See the [Muse page](../harnesses/muse.md).
 
+An OpenCode adopted-backend profile points one frozen profile at a local
+OpenAI-compatible endpoint instead of a canonical integration:
+
+```toml
+[profiles.opencode-local]
+harness = "opencode"
+cmd = "C:/Tools/OpenCode/opencode.exe"
+model = "eliot-local/qwen3-8b"
+provider_base_url = "http://127.0.0.1:1234/v1"
+backend = "lmstudio"
+context_limit = 131072
+output_limit = 8192
+# api_key_env = "LOCAL_LLM_KEY"  # plus a pass_env entry, when the backend needs a key
+# pass_env = ["LOCAL_LLM_KEY"]
+```
+
+`backend` is one preset through the single OpenCode provider path:
+`strata`, `unsloth`, `lmstudio`, `llama.cpp`, `ollama`, `vllm` or `generic`
+(Ollama and vLLM reuse the same path, not separate executors). `model` must
+use the dedicated `eliot-local` provider segment, which has no canonical
+alias. `api_key_env` names one `pass_env`-allowed environment holding the
+backend key; absent means explicit no-auth mode, and a missing or empty
+required key refuses before startup instead of silently becoming no-auth.
+`auth_integration` must be absent on this path so no unrelated canonical
+credential is imported. `context_limit` and `output_limit` are the explicit
+effective limits; the plugin renders them with the installed
+`@opencode/ai/providers/openai-compatible` package and verifies the
+effective provider, catalogue entry, limits and passive backend inventory
+before any native session is created — every verification failure
+(including an unreachable backend) settles the launch as failed with a
+short safe reason, never unknown — rejecting project overrides that
+retarget the route.
+There is no harness/model/account fallback. Codex profiles against these
+backends stay `unsupported` until readiness, catalog/context, history and
+exact tool formats are resolved separately. See the
+[OpenCode harness page](../harnesses/opencode.md#adopted-local-backends).
+
 ### Worker MCP policy
 
 Every profile selects a worker MCP inheritance policy in `mcp`: `inherit`
@@ -563,20 +600,46 @@ Antigravity have no verified per-turn mechanism and refuse the command. A
 catalog or quota failure at the next turn fails that turn honestly; it never
 selects another model or account.
 
-Each send keeps the revision current at its own dispatch; a send committed
+Each admitted command that executes natively under a configuration
+(`launch`, `resume`, `send`) records which configuration it runs under: the
+retained profile-snapshot identity plus the overlay `config_revision`
+stamped on its command row (`launch` and `resume` without an overlay stay at
+0; `send` freezes the revision current at its own dispatch). A send committed
 before an overlay never runs under newer configuration, and a send admitted
 after it dispatches under it. Each turn records the revision it ran under.
-The settings lane is ordered by shared admission order: a configure does not
-apply while an earlier-admitted send is still queued or undispatched, an
-earlier queued send passes a later configure, and a later input waits for an
-earlier configure; the Router redispatches on lane release. When the native
-turn request carries a resolved effort the overlay left absent, the turn
-association records it on the overlay's effective values while the requested
-values stay exactly what the owner asked. Retention keeps every command a
-retained overlay references: pruning never deletes a command named by the
-overlay, so configuration provenance survives expiry. `swarm show` (the
-`agent.get` view) reports the current effective values, the revision, and the
-original frozen values together.
+A config-file reload never rewrites the meaning of a retained generation, a
+pending command, or an unknown-outcome resolution: effective configuration
+always resolves from the retained command revision and the retained
+`agent_config` rows, never from the reloaded file. The settings lane is
+ordered by shared admission order: a configure does not apply while an
+earlier-admitted send is still queued or undispatched, an earlier queued send
+passes a later configure, and a later input waits for an earlier configure;
+the Router redispatches on lane release. When the native turn request carries
+a resolved effort the overlay left absent, the turn association records it on
+the overlay's effective values while the requested values stay exactly what
+the owner asked.
+
+A `resume` starts its new generation by explicitly inheriting the previous
+generation's latest overlay as its own revision 1 with provenance
+`inherited_from` (same requested and effective values, `command_id` naming
+the resume command); the frozen snapshot itself is unchanged. Generations
+without an overlay start at revision 0 with no row. The inherited row is the
+new generation's honest starting configuration: the next send runs under it,
+and the readback shows it. Retention keeps every command a retained overlay
+references, including the resume command of an inherited revision and the
+source configure it inherited from: pruning never deletes a command named by
+`agent_config`, so configuration provenance survives expiry. `swarm show`
+(the `agent.get` view) reports the retained profile name, the launch-time
+`profile_inherited` decision (recorded at launch freeze and exposed
+independently of overlays: true only for an Agent child that reused its own
+parent's snapshot verbatim, never for an Owner launch that resolves the same
+profile), the overlay provenance (`configure` or `inherited_from`), the
+revision, the requested overrides, the effective values, and the original
+frozen values together; turn and command readbacks carry their retained
+`config_revision` plus the full configuration view (requested and effective
+model/effort, revision, provenance, profile name) resolved from the exact
+retained generation and revision for the same original-request versus
+resolved-configuration distinction.
 
 ## Frozen files
 

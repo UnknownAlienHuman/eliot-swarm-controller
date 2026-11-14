@@ -103,6 +103,7 @@ pub(super) fn persist_turn_fact(
         completed_at: None,
         usage: None,
         config_revision: current_config_revision_tx(tx, id, agent.generation)?,
+        config: None,
     });
     match event.kind.as_str() {
         "turn.started" => {

@@ -3691,6 +3691,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             probe: false,
+            config_revision: 2,
+            config: None,
         };
         let config = eliot_store::AgentConfig {
             agent: "a1".to_owned(),
@@ -3701,6 +3703,7 @@ mod tests {
             model: Some("m1".to_owned()),
             effort: Some("low".to_owned()),
             application: "next_turn".to_owned(),
+            provenance: "configure".to_owned(),
             command_id: "configure-1".to_owned(),
             created_at: 0,
         };
@@ -3744,6 +3747,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             probe: false,
+            config_revision: 0,
+            config: None,
         };
         assert_eq!(resume_source_generation(&command).unwrap(), 2);
 
@@ -5480,6 +5485,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             probe: false,
+            config_revision: 0,
+            config: None,
         }
     }
 

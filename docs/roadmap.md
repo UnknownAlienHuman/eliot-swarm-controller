@@ -277,6 +277,18 @@ Codex or for unrelated adapters.
 The selected local scope remains in progress while the applicable L7
 qualification is incomplete; do not describe it as feature complete.
 
+- [ ] **Local adopted backends via OpenCode.** One documented usable
+      OpenCode + adopted-backend profile (Strata, Unsloth Studio, LM Studio
+      and llama.cpp presets with Ollama/vLLM on the same OpenAI-compatible
+      provider path; managed startup deferred to adopted endpoints only).
+      Completion: installed backend/harness versions with model/quantization
+      and effective context recorded; a coding turn with an actual tool
+      result, context/output-limit handling, interrupt/stop, and two Agents
+      sharing the server without cross-stop or extra model loading;
+      missing-key rejection and conflicting project settings checked. No
+      owner-global configuration edits or automatic harness/model/account
+      fallback. Codex against these backends stays unsupported.
+
 ## L7 — Qualification, repair and release
 
 Implement the bounded retention path first, then build/run the complete campaign against
@@ -305,8 +317,22 @@ Fix the root cause and keep focused regressions. No runtime readiness claim unti
 relevant real path is exercised. A missing optional harness does not block qualification
 of the explicitly selected release scope.
 
+## Desktop companion (optional WinUI 3 client)
+
+- [ ] **D1 Styled real chat.** One optional Windows package (`apps/swarm-desktop`,
+      binary `swarm-desktop`) on WinUI 3 through `windows-reactor`: native window and
+      a small Material 3 Expressive-inspired theme; project/Agent/profile selection;
+      `launch(text)` with its linked command; send to an existing Agent; the real
+      final output from result/turn readback; pending requests with exact bindings
+      and interrupt bound to the current generation and turn. First input is
+      submitted once (one ULID per user action, retries reuse it); a late reply
+      cannot erase a newer draft and switching conversations cannot retarget
+      controls; reopening stops or duplicates nothing. Headless and non-Windows
+      builds stay WinUI-free. (Refs #407)
+
 ## Later
 
-Service continuity across daemon replacement, GUI and Memory OS require an actual use
+Service continuity across daemon replacement and Memory OS require an actual use
 case. The current contracts are not instructions to build those products in advance.
+The optional desktop companion is tracked above.
 Remote/cloud MCP access is not Later: it is the required L6.7 contour above.

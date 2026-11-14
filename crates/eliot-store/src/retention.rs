@@ -1323,6 +1323,76 @@ mod tests {
     }
 
     #[test]
+    fn prune_commands_keep_inherited_overlay_and_its_source() {
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        let agent = insert_agent(&mut store, 2);
+        let configure = Ulid::new().to_string();
+        insert_command(
+            &mut store,
+            CommandSeed {
+                target: Some(agent),
+                generation: Some(1),
+                verb: "configure".to_owned(),
+                state: "applied".to_owned(),
+                ..command_seed(configure.clone(), old)
+            },
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_config(agent, generation, revision, requested, effective, application, provenance, command_id, created_at)
+                 VALUES (?1, 1, 1, '{\"model\":\"m1\",\"effort\":null}', '{\"model\":\"m1\",\"effort\":null}', 'next_turn', 'configure', ?2, ?3)",
+                params![agent, configure, old],
+            )
+            .unwrap();
+        let resume = Ulid::new().to_string();
+        insert_command(
+            &mut store,
+            CommandSeed {
+                target: Some(agent),
+                generation: Some(2),
+                verb: "resume".to_owned(),
+                state: "applied".to_owned(),
+                ..command_seed(resume.clone(), old)
+            },
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_config(agent, generation, revision, requested, effective, application, provenance, command_id, created_at)
+                 VALUES (?1, 2, 1, '{\"model\":\"m1\",\"effort\":null}', '{\"model\":\"m1\",\"effort\":null}', 'next_turn', 'inherited_from', ?2, ?3)",
+                params![agent, resume, old],
+            )
+            .unwrap();
+        let stale = Ulid::new().to_string();
+        insert_command(
+            &mut store,
+            CommandSeed {
+                state: "rejected".to_owned(),
+                ..command_seed(stale, old)
+            },
+        );
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
+        assert_eq!(report.commands_deleted, 1);
+        assert!(store.get_command(&configure).unwrap().is_some());
+        assert!(store.get_command(&resume).unwrap().is_some());
+        let previous = store
+            .get_agent_config(&format!("a{agent}"), 1, 1)
+            .expect("read source overlay")
+            .expect("source retained");
+        assert_eq!(previous.provenance, "configure");
+        let inherited = store
+            .get_agent_config_current(&format!("a{agent}"), 2)
+            .expect("read inherited overlay")
+            .expect("inherited retained");
+        assert_eq!(inherited.provenance, "inherited_from");
+        assert_eq!(inherited.command_id, resume);
+    }
+
+    #[test]
     fn prune_writes_deletes_only_expired_bindings() {
         let mut store = store();
         for (id, created_at) in [
