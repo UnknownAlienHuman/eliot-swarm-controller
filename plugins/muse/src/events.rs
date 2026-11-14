@@ -41,7 +41,7 @@ use crate::native::{
         NativeTurnError, NativeTurnStartedNotification, NativeTurnTerminal,
         NativeUserInputAnswerResult, NativeUserInputCancelResult,
         NativeUserInputSettledNotification, NativeViewHealth, NativeViewSubscribeParams,
-        NativeViewSubscribeResult, NativeWorkflowChild, NativeWorkflowItemNotification,
+        NativeViewSubscribeResult, NativeWorkflowChild, NativeWorkflowItemNotification, turn_usage,
     },
 };
 
@@ -2495,6 +2495,13 @@ impl EventProcessor {
         if let Some(restriction) = provider_restriction {
             attach_provider_restriction(&mut data, restriction, &secrets);
         }
+        // Optional terminal turn-aggregate usage: attach before the final
+        // text so the existing bounded terminal-text accounting includes the
+        // usage bytes. Absent/malformed usage never blocks or gaps this
+        // terminal; it simply leaves `data.usage` unset.
+        if let Some(usage) = turn_usage(&notification) {
+            data["usage"] = serde_json::to_value(&usage).unwrap_or(Value::Null);
+        }
         if let Some(text) = self.final_text.as_ref() {
             attach_final_text(
                 &mut data,
@@ -4378,6 +4385,7 @@ mod tests {
                 retryable: true,
             }),
             reason: None,
+            usage: None,
         };
         assert!(terminal_provider_restriction(&status, &notification).is_some());
 
