@@ -16,6 +16,7 @@ pub use context::ContextDispatch;
 pub use coordination::{
     MailSendOutcome, MailSendResult, NoticeClaim, NoticeKind, NoticePending, NoticeState,
 };
+pub use digests::{DigestRegisterOutcome, DigestRow, DigestTurn};
 pub use goals::{
     GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundClaim, GoalRoundCommit,
     GoalRoundCommitResult, GoalRoundKey, GoalRoundProbe,
@@ -123,6 +124,7 @@ mod attribution;
 mod command_children;
 mod context;
 mod coordination;
+mod digests;
 mod dispatch;
 mod git;
 mod goals;
@@ -3681,6 +3683,16 @@ fn write_binding(connection: &Connection, id: &str) -> Result<Option<StoredWrite
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
+        .map_err(sql_error)
+}
+
+fn digest_id_bound(connection: &Connection, id: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM completion_digests WHERE id = ?1)",
+            [id],
+            |row| row.get(0),
+        )
         .map_err(sql_error)
 }
 
