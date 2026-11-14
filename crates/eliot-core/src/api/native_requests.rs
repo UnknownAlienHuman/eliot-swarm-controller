@@ -9,28 +9,32 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDiscoverRequest {
     #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub profile: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_text"
     )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub harness: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_text"
     )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub native_scope: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_text"
     )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub cursor: Option<String>,
     #[serde(default, skip_serializing_if = "crate::is_false")]
     pub archived: bool,
@@ -38,6 +42,7 @@ pub struct AgentDiscoverRequest {
         default = "super::default_limit",
         deserialize_with = "super::event_limit"
     )]
+    #[schemars(range(min = 1, max = 1000))]
     pub limit: usize,
 }
 
@@ -111,37 +116,44 @@ impl AgentDiscoverRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentHistoryRequest {
     #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_generation"
     )]
+    #[schemars(range(min = 0))]
     pub generation: Option<i64>,
     #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub source: String,
     #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub view: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_text"
     )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub turn_id: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "optional_text"
     )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub cursor: Option<String>,
     #[serde(
         default = "super::default_limit",
         deserialize_with = "super::event_limit"
     )]
+    #[schemars(range(min = 1, max = 1000))]
     pub limit: usize,
 }
 

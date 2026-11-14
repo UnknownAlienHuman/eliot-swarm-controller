@@ -14,7 +14,7 @@
 //! (`method`, `params`) can never inject or override credentials, and no
 //! credential, token, or raw environment value is echoed to tool output or
 //! logs. The tool is intentionally generic: `{ method, params }` maps 1:1 to
-//! the existing management client; no verb catalogue or DTOs are copied.
+//! the existing management client; discovery and DTO schemas come from the daemon.
 //! Mutations keep their existing caller-known durable id — this frontend
 //! never auto-retries, never pretends rollback on cancel, and never replays.
 //! Incoming stdio frames are bounded by the SDK's own transport limit; the
@@ -58,9 +58,8 @@ use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
 
 const TOOL_NAME: &str = "swarm";
-const TOOL_DESCRIPTION: &str =
-    "Generic Eliot management call: { method, params } -> authenticated daemon RPC result";
-const REQUIRE_AGENT_INSTRUCTIONS: &str = "Use this server's swarm tool for Eliot controller and coordination operations instead of shell commands. Supply method and params using the current API DTO shape. Authentication is inherited from this Agent session; never put credentials or tokens in tool arguments.";
+const TOOL_DESCRIPTION: &str = "Generic Eliot management call. Start with api.identity and params:{} for your identity/scopes; api.methods and params:{query:\"mail\",limit:20} lists callable methods; api.help and params:{method:\"mail.send\"} returns the actual DTO schema, runnable example and limits. Use canonical mail.send and var.set. Authentication is inherited; never supply credentials. { method, params } -> authenticated daemon RPC result";
+const REQUIRE_AGENT_INSTRUCTIONS: &str = "Use this server's swarm tool for Eliot controller and coordination operations instead of shell commands. Discover your actual identity/scopes with api.identity params:{}, list/search methods with api.methods params:{query:\"mail\",limit:20}, then read api.help params:{method:\"mail.send\"} (or var.set) for DTO fields, examples and mutation-id rules. Authentication is inherited from this Agent session; never put credentials or tokens in tool arguments.";
 
 const INVALID_ARGS_MESSAGE: &str = "tool arguments must be an object with method and params";
 
@@ -348,7 +347,7 @@ fn tool_definition() -> Tool {
         serde_json::from_value(json!({
             "type": "object",
             "properties": {
-                "method": { "type": "string", "description": "Eliot management method, e.g. daemon.status, agent.get, command.get" },
+                "method": { "type": "string", "description": "Canonical Eliot method. Start with api.identity, api.methods (query/limit/after), then api.help (method) for actual DTO fields and examples." },
                 "params": { "type": "object", "description": "Method params object; auth is inherited server-side and cannot be overridden here" }
             },
             "required": ["method", "params"],

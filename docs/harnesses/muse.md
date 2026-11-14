@@ -16,6 +16,25 @@ generation; callbacks carry that generation. Native children need exact provenan
 remain parent-attributed unless an isolated child environment can actually be installed.
 Resume requests `excludeItems=true` so it receives only session metadata and live resume
 state; the installed stable and experimental schemas define this history-exclusion option.
+
+Native frame budget: the inbound NDJSON frame cap for the Muse host is 8 MiB
+(`MuseStdioConfig::MAX_FRAME_BYTES`; every other adapter keeps the shared 1 MiB
+default). The cap covers `view/page` readback (Eliot requests `limit: 1000`)
+plus envelope overhead. What it does not cover: Eliot makes no `item/readOutput`
+calls today, so that surface (6 MiB of stored bytes per page, exactly 8 MiB of
+base64 before envelope overhead) does not size this cap; and the installed
+`muse-bin-1.4.0-R4161.1` schema (`muse schema generate-json-schema`) publishes no
+per-surface text budget, so the true `view/page` maximum is unverified.
+`session/resume` with `excludeItems=true` serves `history.mode: "none"` (no items),
+so the resume response itself stays small when the host honors the option, which
+Eliot verifies before proceeding. A frame over the cap ends the session with an
+explicit `source.gap` carrying a bounded, secret-free diagnosis (byte length with
+a `>=` lower-bound marker when the fault published at the threshold, limit,
+envelope kind, allowlisted method); responses to Eliot's own calls are never
+skipped. Remaining uncertainty: a single live item notification in a tool-heavy
+turn could in theory still exceed 8 MiB; if that is ever observed, the gap
+diagnosis will name its kind and, when the method is a known protocol method,
+its method.
 After an uncertain start/resume reply, Muse reports `native_endpoint_exited` only when
 its owned process exit, closed reader and completed reader task are all observed. The
 daemon keeps the command `unknown` and settles Agent loss only after owner cleanup.
@@ -177,12 +196,20 @@ turn) stays unmapped, as do `agentMessage` (already `message.completed`),
 These committed facts advance liveness model progress like Codex tool events;
 CPU alone still never counts.
 
-The 1.4 item carries no inline workspace paths: edit-family `toolCall`
-revisions reference their diff through a stored `patchRef`/`patchSummary`
-whose body is fetched out of band (`item/readOutput`), never in the stream.
-The adapter therefore attaches no `changed_paths` to Muse `tool.completed`
-events, so native file-change hint attribution (`swarm edits`) still depends
-on the Git observer for Muse turns.
+A completed edit-family `toolCall` (`apply_patch`, `delete_file`,
+`edit_file`, `write_file` per the installed host's `DIRECT_MUTATORS` set)
+normalizes as the shared completed-file-change payload: `tool` `fileChange`
+with the verbatim native `status`, plus bounded `changed_paths` and
+`changed_paths_truncated` exactly as the Codex adapter emits for its
+`fileChange` items, bound to the exact session/turn while the turn runs. The
+paths come only from the item's inline `args` target (`path`); `args`
+itself, file contents, diffs and results are never persisted. Git
+observation alone cannot establish authorship: only this native hint
+attributes Muse edits. Limit: multi-file patch bodies stay behind the stored
+`patchRef`/`patchSummary` (fetched out of band via `item/readOutput`, which
+this adapter never calls), so a completed edit with no inline target commits
+empty `changed_paths` with `changed_paths_truncated` set, recording the
+coverage gap instead of presenting Git state as authorship.
 
 ## Host permissions
 
@@ -195,6 +222,14 @@ so effective permissions are reported as unknown (`permissions: null`,
 `permissions_verified: false`) and never derived from the requested flag or any
 unproven wire alias. The host flag remains applied at birth; a real native tool probe
 is still required to confirm effective posture.
+
+## Worker MCP policy
+
+This harness keeps `inherit` only: the frozen profile always records
+`mcp = "inherit"`, and a non-`inherit` policy is rejected as `unsupported`
+at config load. Verified read-only (`muse --help`, `muse mcp --help`): `muse
+mcp` covers OAuth login/logout only, and no `serve` isolation flag for MCP
+sources was observed, so no `minimal` mechanism is implemented.
 
 ## Workflow children (native, observe-only)
 

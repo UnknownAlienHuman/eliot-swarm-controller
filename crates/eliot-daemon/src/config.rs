@@ -7,8 +7,8 @@
 //! overlays) are rejected with unsupported, never silently substituted.
 //!
 //! Returns a bounded nonsecret snapshot object with the keys harness, cmd,
-//! model, effort, collaboration_mode, permissions, approval_policy, pass_env,
-//! raw setup and normalized relative scratch directories.
+//! model, effort, collaboration_mode, permissions, approval_policy, mcp,
+//! mcp_allow, pass_env, raw setup and normalized relative scratch directories.
 //! pass_env carries admitted environment variable names. Only the two nonsecret
 //! native-store selector inputs are captured before admission; all other values
 //! remain execution-time references and are never copied into the snapshot.
@@ -404,6 +404,10 @@ struct ProfileEntry {
     #[serde(default)]
     approval_policy: Option<String>,
     #[serde(default)]
+    mcp: Option<String>,
+    #[serde(default)]
+    mcp_allow: Option<Vec<String>>,
+    #[serde(default)]
     auth_integration: Option<String>,
     #[serde(default)]
     mode: Option<String>,
@@ -514,6 +518,8 @@ pub(crate) fn load_project_registration_config(
                         | "run"
                         | "notify"
                         | "emit"
+                        | "mail.send"
+                        | "var.set"
                 )
             },
         )?;
@@ -1154,6 +1160,18 @@ fn snapshot_from_entry(
         "approval_policy".to_owned(),
         Value::String(approval_policy.to_owned()),
     );
+    freeze_mcp_policy(
+        &mut snapshot,
+        name,
+        entry,
+        table_offset,
+        source,
+        McpHarnessSupport {
+            harness: "Codex",
+            minimal: true,
+            allow: true,
+        },
+    )?;
     insert_control(
         &mut snapshot,
         name,
@@ -1393,6 +1411,18 @@ fn muse_snapshot_from_entry(
     if let Some(approval) = approval {
         snapshot.insert("approval".to_owned(), Value::String(approval.to_owned()));
     }
+    freeze_mcp_policy(
+        &mut snapshot,
+        name,
+        entry,
+        table_offset,
+        source,
+        McpHarnessSupport {
+            harness: "Muse",
+            minimal: false,
+            allow: false,
+        },
+    )?;
     snapshot.insert(
         "permissions".to_owned(),
         Value::String(permissions.to_owned()),
@@ -1595,6 +1625,18 @@ fn claude_snapshot_from_entry(
     if let Some(mode) = permission_mode {
         snapshot.insert("permission_mode".to_owned(), Value::String(mode));
     }
+    freeze_mcp_policy(
+        &mut snapshot,
+        name,
+        entry,
+        table_offset,
+        source,
+        McpHarnessSupport {
+            harness: "Claude",
+            minimal: true,
+            allow: false,
+        },
+    )?;
     snapshot.insert(
         "pass_env".to_owned(),
         Value::Array(pass_env.into_iter().map(Value::String).collect()),
@@ -1712,6 +1754,18 @@ fn opencode_snapshot_from_entry(
             Value::String(selector.trim().to_owned()),
         );
     }
+    freeze_mcp_policy(
+        &mut snapshot,
+        name,
+        entry,
+        table_offset,
+        source,
+        McpHarnessSupport {
+            harness: "OpenCode",
+            minimal: false,
+            allow: false,
+        },
+    )?;
     insert_control(
         &mut snapshot,
         name,
@@ -1821,6 +1875,18 @@ fn antigravity_snapshot_from_entry(
         "dangerously_skip_permissions".to_owned(),
         Value::Bool(entry.dangerously_skip_permissions.unwrap_or(false)),
     );
+    freeze_mcp_policy(
+        &mut snapshot,
+        name,
+        entry,
+        table_offset,
+        source,
+        McpHarnessSupport {
+            harness: "Antigravity",
+            minimal: false,
+            allow: false,
+        },
+    )?;
     insert_control(
         &mut snapshot,
         name,
@@ -2129,6 +2195,91 @@ fn insert_control(
 ) -> core::Result<()> {
     let control = validated_control(profile, control, source, offset)?;
     snapshot.insert("control".to_owned(), Value::String(control.to_owned()));
+    Ok(())
+}
+
+/// Which worker MCP policy pieces a harness plugin implements.
+struct McpHarnessSupport<'a> {
+    harness: &'a str,
+    minimal: bool,
+    allow: bool,
+}
+
+/// Validate the worker MCP inheritance policy and freeze it with the profile
+/// snapshot. `minimal`/`allow` name whether the harness plugin implements an
+/// isolation mechanism for `minimal` (Codex, Claude) and selective inclusion
+/// of named native servers (Codex only: Claude minimal is Eliot-only config
+/// plus `--strict-mcp-config`, so an allow list would be silently dropped);
+/// other harnesses keep `inherit` only and reject `minimal` as unsupported.
+/// A non-empty allow list always requires `minimal`, so an allowed set
+/// cannot silently ride on the default.
+fn freeze_mcp_policy(
+    snapshot: &mut serde_json::Map<String, Value>,
+    name: &str,
+    entry: &ProfileEntry,
+    table_offset: usize,
+    source: &str,
+    support: McpHarnessSupport<'_>,
+) -> core::Result<()> {
+    let harness = support.harness;
+    let supports_minimal = support.minimal;
+    let supports_allow = support.allow;
+    let policy = core::McpPolicy::parse(entry.mcp.as_deref()).map_err(|error| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "mcp",
+            &error.message,
+            "profile_error",
+        )
+    })?;
+    let allow =
+        core::validate_allow_list(entry.mcp_allow.as_deref().unwrap_or(&[])).map_err(|error| {
+            profile_field_error(
+                source,
+                table_offset,
+                name,
+                "mcp_allow",
+                &error.message,
+                "profile_error",
+            )
+        })?;
+    if !allow.is_empty() && policy == core::McpPolicy::Inherit {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "mcp_allow",
+            "mcp_allow requires mcp = \"minimal\"",
+            "profile_error",
+        ));
+    }
+    if policy == core::McpPolicy::Minimal && !supports_minimal {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "mcp",
+            &format!("mcp = \"minimal\" has no {harness} mapping"),
+            "unsupported",
+        ));
+    }
+    if !allow.is_empty() && !supports_allow {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "mcp_allow",
+            &format!("mcp_allow has no {harness} mapping"),
+            "unsupported",
+        ));
+    }
+    snapshot.insert("mcp".to_owned(), Value::String(policy.as_str().to_owned()));
+    snapshot.insert(
+        "mcp_allow".to_owned(),
+        Value::Array(allow.into_iter().map(Value::String).collect()),
+    );
     Ok(())
 }
 
@@ -2796,6 +2947,26 @@ mod tests {
     }
 
     #[test]
+    fn project_coordination_actions_are_explicit_canonical_grants() {
+        let fixture = AutomationConfigFixture::new();
+        let project_path = format!("{:?}", fixture.root.to_string_lossy());
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path}\nactions = ['mail.send', 'var.set']\n"
+        ));
+        let configured = load_project_registration_config(&fixture.root).unwrap();
+        assert_eq!(configured[0].actions, vec!["mail.send", "var.set"]);
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path}\nactions = ['msg.send']\n"
+        ));
+        assert_eq!(
+            load_project_registration_config(&fixture.root)
+                .unwrap_err()
+                .code,
+            "profile_error"
+        );
+    }
+
+    #[test]
     fn project_steer_is_an_explicit_action_allowlist_grant() {
         let fixture = AutomationConfigFixture::new();
         let project_path = format!("{:?}", fixture.root.to_string_lossy());
@@ -3442,6 +3613,91 @@ permissions = "workspace-write"
         ] {
             let error = resolve_text_profile(source, "muse").expect_err("must reject");
             assert_eq!(error.code, "profile_error", "{source}");
+        }
+    }
+
+    #[test]
+    fn mcp_policy_defaults_to_inherit_and_freezes_minimal_where_supported() {
+        let direct = "[profiles.direct]\nharness='codex'\nmodel='gpt-6-luna'\n";
+        let snapshot = resolve_text_profile(direct, "direct").unwrap();
+        assert_eq!(snapshot["mcp"], "inherit");
+        assert_eq!(snapshot["mcp_allow"], json!([]));
+
+        let minimal = "[profiles.minimal]\nharness='codex'\nmodel='gpt-6-luna'\nmcp='minimal'\nmcp_allow=['owner-search']\n";
+        let snapshot = resolve_text_profile(minimal, "minimal").unwrap();
+        assert_eq!(snapshot["mcp"], "minimal");
+        assert_eq!(snapshot["mcp_allow"], json!(["owner-search"]));
+
+        // Unknown policies, dangling allow lists and malformed names fail
+        // at load; an allow list never rides on the inherit default.
+        for source in [
+            "[profiles.bad]\nharness='codex'\nmodel='gpt-6-luna'\nmcp='isolated'\n",
+            "[profiles.bad]\nharness='codex'\nmodel='gpt-6-luna'\nmcp_allow=['owner-search']\n",
+            "[profiles.bad]\nharness='codex'\nmodel='gpt-6-luna'\nmcp='minimal'\nmcp_allow=['']\n",
+            "[profiles.bad]\nharness='codex'\nmodel='gpt-6-luna'\nmcp='minimal'\nmcp_allow=['x', 'x']\n",
+        ] {
+            let error = resolve_text_profile(source, "bad").expect_err("must reject");
+            assert_eq!(error.code, "profile_error", "{source}");
+        }
+
+        // Claude implements minimal without selective inclusion, so a
+        // non-empty allow list is unsupported there; only Codex maps it.
+        // Muse, OpenCode and Antigravity keep inherit only until a harness
+        // isolation mechanism is verified.
+        let claude_cmd = if cfg!(windows) {
+            "C:/Users/test/.local/bin/claude.exe"
+        } else {
+            "/tmp/eliot-claude-cmd-test/claude"
+        };
+        let source = format!(
+            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='{claude_cmd}'\nmcp='minimal'\n"
+        );
+        let snapshot = resolve_text_profile(&source, "claude").unwrap();
+        assert_eq!(snapshot["mcp"], "minimal");
+        assert_eq!(snapshot["mcp_allow"], json!([]));
+
+        for (source, code) in [
+            (
+                format!(
+                    "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='{claude_cmd}'\nmcp='minimal'\nmcp_allow=['owner-search']\n"
+                ),
+                "unsupported",
+            ),
+            (
+                format!(
+                    "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='{claude_cmd}'\nmcp_allow=['owner-search']\n"
+                ),
+                "profile_error",
+            ),
+        ] {
+            let error = resolve_text_profile(&source, "claude").expect_err("must reject");
+            assert_eq!(error.code, code, "{source}");
+        }
+
+        for (name, source, code) in [
+            (
+                "muse",
+                "[profiles.muse]\nharness='muse'\nmodel='m'\ncmd='C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe'\nmcp='minimal'\n",
+                "unsupported",
+            ),
+            (
+                "opencode",
+                "[profiles.opencode]\nharness='opencode'\nmodel='openrouter/stealth/crouton-alpha'\ncmd='C:/Tools/OpenCode/opencode.exe'\nmcp='minimal'\n",
+                "unsupported",
+            ),
+            (
+                "agy",
+                "[profiles.agy]\nharness='antigravity'\nmodel='test-model'\ncmd='C:/Tools/Agy/agy.exe'\nmcp='minimal'\n",
+                "unsupported",
+            ),
+            (
+                "muse",
+                "[profiles.muse]\nharness='muse'\nmodel='m'\ncmd='C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe'\nmcp_allow=['owner-search']\n",
+                "profile_error",
+            ),
+        ] {
+            let error = resolve_text_profile(source, name).expect_err("must reject");
+            assert_eq!(error.code, code, "{source}");
         }
     }
 

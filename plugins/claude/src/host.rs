@@ -5,7 +5,7 @@ use crate::{
         types::{InitializeReadback, OutboundUserInput, OutboundUserMessage},
     },
 };
-use eliot_core::{ContextItem, Error, InjectPoint, Result, SecretPolicy};
+use eliot_core::{ContextItem, Error, InjectPoint, McpPolicy, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -55,6 +55,9 @@ struct FailedStart {
     generation: i64,
     command_id: String,
     error: Error,
+    /// Retained with the exact start binding after native exit and output drain;
+    /// retirement does not depend on delivery of the start RPC response.
+    endpoint_exited: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -105,6 +108,8 @@ struct StartPlan {
     session_id: String,
     requested_model: String,
     requested_permission_mode: Option<String>,
+    requested_mcp_policy: McpPolicy,
+    requested_mcp_allow: Vec<String>,
     resume_ref: Option<String>,
 }
 
@@ -152,6 +157,7 @@ enum DispatchOutcome {
 /// What woke the run loop while a steer reply was deferred. A dropped
 /// waiter sender (`None`) means the event task died without settling.
 enum SteerWake {
+    NativeExit,
     Request(Option<RpcRequest>),
     Outcome(Option<SteerOutcome>),
     Deadline,
@@ -185,13 +191,32 @@ pub(crate) async fn run() -> Result<()> {
 
     let mut plugin = ClaudePlugin::default();
     let mut completed_shutdown = false;
+    let mut native_endpoint_retired = false;
+    let mut native_retirement = Ok(());
     let mut pending_request = None;
     loop {
+        if plugin
+            .failed_start
+            .as_ref()
+            .is_some_and(|failed| failed.endpoint_exited)
+        {
+            native_endpoint_retired = true;
+            break;
+        }
         let Some(mut waiter) = plugin.deferred_steer.take() else {
             let request = if let Some(request) = pending_request.take() {
                 Some(request)
             } else {
-                requests.recv().await
+                tokio::select! {
+                    biased;
+                    () = eliot_plugin::native_lifecycle::wait_for_native_exit(
+                        plugin.session.as_mut().map(|session| &mut session.native.transport)
+                    ) => {
+                        native_endpoint_retired = true;
+                        None
+                    }
+                    request = requests.recv() => request,
+                }
             };
             let Some(request) = request else {
                 break;
@@ -221,6 +246,10 @@ pub(crate) async fn run() -> Result<()> {
             SteerWake::Request(Some(pending))
         } else if let Some(cancel_ack) = waiter.cancel_ack.as_mut() {
             tokio::select! {
+                biased;
+                () = eliot_plugin::native_lifecycle::wait_for_native_exit(
+                    plugin.session.as_mut().map(|session| &mut session.native.transport)
+                ) => SteerWake::NativeExit,
                 request = requests.recv() => SteerWake::Request(request),
                 outcome = &mut waiter.outcome => SteerWake::Outcome(outcome.ok()),
                 acknowledged = cancel_ack => {
@@ -229,12 +258,21 @@ pub(crate) async fn run() -> Result<()> {
             }
         } else {
             tokio::select! {
+                biased;
+                () = eliot_plugin::native_lifecycle::wait_for_native_exit(
+                    plugin.session.as_mut().map(|session| &mut session.native.transport)
+                ) => SteerWake::NativeExit,
                 request = requests.recv() => SteerWake::Request(request),
                 outcome = &mut waiter.outcome => SteerWake::Outcome(outcome.ok()),
                 _ = tokio::time::sleep_until(waiter.deadline) => SteerWake::Deadline,
             }
         };
         let serve = match wake {
+            SteerWake::NativeExit => {
+                plugin.deferred_steer = Some(waiter);
+                native_endpoint_retired = true;
+                break;
+            }
             SteerWake::Request(request) => {
                 let Some(request) = request else { break };
                 plugin.deferred_steer = Some(waiter);
@@ -278,12 +316,30 @@ pub(crate) async fn run() -> Result<()> {
         }
     }
 
-    if !completed_shutdown {
+    if native_endpoint_retired {
+        if let Some(session) = plugin.session.as_mut() {
+            native_retirement = eliot_plugin::native_lifecycle::drain_native_exit(
+                &mut session.native.transport,
+                async {
+                    session.events.drain_native().await?;
+                    session.events.close().await;
+                    Ok(())
+                },
+            )
+            .await;
+        }
+        if let Some(mut waiter) = plugin.deferred_steer.take() {
+            let arrived = waiter.outcome.try_recv().ok();
+            let _ = plugin.settle_deferred_steer(&client, waiter, arrived).await;
+        }
+    } else if !completed_shutdown {
         plugin.shutdown_owned().await;
     }
     reader.abort();
     let _ = reader.await;
-    if completed_shutdown {
+    if native_endpoint_retired {
+        native_retirement
+    } else if completed_shutdown {
         Ok(())
     } else {
         Err(Error::new(
@@ -396,6 +452,19 @@ async fn respond_deferred(client: &PeerClient, request_id: Value, result: Result
 }
 
 impl ClaudePlugin {
+    /// Called only after native exit and reader cleanup succeeded. Keep this
+    /// exact binding until the host loop retires, even if its RPC reply is late.
+    fn retain_exited_start(&mut self, params: &AgentStartParams, error: Error) -> Error {
+        self.failed_start = Some(FailedStart {
+            agent_id: params.agent_id.clone(),
+            generation: params.generation,
+            command_id: params.command_id.clone(),
+            error: error.clone(),
+            endpoint_exited: true,
+        });
+        error
+    }
+
     async fn dispatch(&mut self, request: &RpcRequest, client: &PeerClient) -> DispatchOutcome {
         let result = match request.method.as_str() {
             "initialize" => self.initialize(&request.params),
@@ -578,6 +647,13 @@ impl ClaudePlugin {
         // unset means the CLI-default posture.
         let requested_permission_mode =
             optional_profile_text(profile, "permission_mode", "Claude")?;
+        // Frozen worker MCP policy: inherit keeps the normal MCP precedence,
+        // minimal is enforced with the installed `--strict-mcp-config` flag.
+        let requested_mcp_policy = McpPolicy::parse_snapshot(profile)
+            .map_err(|error| Error::new("profile_error", format!("Claude {}", error.message)))?;
+        let requested_mcp_allow = eliot_core::parse_snapshot_allow_list(profile)
+            .map_err(|error| Error::new("profile_error", format!("Claude {}", error.message)))?;
+        check_mcp_allow_empty(&requested_mcp_allow)?;
         let workspace = params
             .workspace
             .as_deref()
@@ -664,6 +740,8 @@ impl ClaudePlugin {
             session_id,
             requested_model,
             requested_permission_mode,
+            requested_mcp_policy,
+            requested_mcp_allow,
             resume_ref,
         })
     }
@@ -708,13 +786,7 @@ impl ClaudePlugin {
             return contextual_error(error, "unknown", message);
         }
         let error = session.native_client.diagnostic_error(error);
-        self.failed_start = Some(FailedStart {
-            agent_id: params.agent_id.clone(),
-            generation: params.generation,
-            command_id: params.command_id.clone(),
-            error: error.clone(),
-        });
-        error
+        self.retain_exited_start(params, error)
     }
 
     /// Discard a failed start and retain its error for replays. A start
@@ -758,14 +830,16 @@ impl ClaudePlugin {
             );
             return contextual_error(error, "unknown", message);
         }
+        // Cleanup proved native exit and reader drain. Keep the dispatched
+        // initialize/resume effect unknown while the daemon separately proves
+        // plugin custody exit and settles this starting generation.
+        let error = if error.code == "unknown" {
+            error.with_code(eliot_plugin::native_stdio::NATIVE_ENDPOINT_EXITED)
+        } else {
+            error
+        };
         let error = session.native_client.diagnostic_error(error);
-        self.failed_start = Some(FailedStart {
-            agent_id: params.agent_id.clone(),
-            generation: params.generation,
-            command_id: params.command_id.clone(),
-            error: error.clone(),
-        });
-        error
+        self.retain_exited_start(params, error)
     }
 
     /// Run `initialize` and check the effective profile BEFORE readiness: on
@@ -877,12 +951,18 @@ impl ClaudePlugin {
         // reported on an actual native assistant record (message.completed).
         // Requested vs effective permission mode is reported, never forced:
         // launching with `manual` reads back `default` on the installed CLI.
+        // The installed stream-json protocol (2.1.278) exposes no MCP
+        // inventory record, so the effective server set stays unknown (null,
+        // unverified) for both policies instead of echoing the requested set.
         let effective = with_context_points(
             json!({
                 "model": null,
                 "permission_mode": effective_mode,
                 "session_state": readback.session_state,
                 "pid": readback.pid,
+                "mcp_policy": plan.requested_mcp_policy.as_str(),
+                "mcp_servers": null,
+                "mcp_servers_verified": false,
             }),
             &[InjectPoint::NextInput, InjectPoint::TurnSafePoint],
         );
@@ -931,6 +1011,8 @@ impl ClaudePlugin {
                 "model": plan.requested_model.clone(),
                 "permission_mode": plan.requested_permission_mode.clone(),
                 "cwd": plan.workspace.to_string_lossy(),
+                "mcp_policy": plan.requested_mcp_policy.as_str(),
+                "mcp_allow": plan.requested_mcp_allow.clone(),
             },
             "effective": effective,
         });
@@ -1937,10 +2019,10 @@ async fn launch_session(
         argv.push(OsString::from("--permission-mode"));
         argv.push(OsString::from(mode));
     }
-    // Use an additive per-run config. Never pass --strict-mcp-config: other
-    // native MCP sources remain governed by Claude Code's normal precedence.
-    argv.push(OsString::from("--mcp-config"));
-    argv.push(mcp_config.path().as_os_str().to_owned());
+    argv.extend(mcp_argv(
+        plan.requested_mcp_policy,
+        mcp_config.path().as_os_str(),
+    ));
     // The CLI keeps its own login (not the desktop app's): check it, and run
     // its browser login when it is logged out, before any native resource.
     crate::native::ensure_logged_in(&plan.program, &plan.workspace, &plan.environment).await?;
@@ -2059,6 +2141,36 @@ fn setter_error(error: Error, subtype: &str) -> Error {
     }
 }
 
+/// Claude has no selective-inclusion mechanism: minimal is the Eliot-only
+/// per-run config plus `--strict-mcp-config`, so a non-empty allow list
+/// would be silently dropped. Reject it as unsupported at config load, so a
+/// stale snapshot fails closed instead of losing explicitly allowed
+/// integrations.
+fn check_mcp_allow_empty(allow: &[String]) -> Result<()> {
+    if allow.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "unsupported",
+            "Claude mcp_allow has no selective-inclusion mapping",
+        ))
+    }
+}
+
+/// MCP argv pair for the frozen policy. Minimal adds `--strict-mcp-config`
+/// ahead of the per-run config so only it applies (installed CLI 2.1.278:
+/// the flag ignores all other MCP configurations); inherit passes only the
+/// additive per-run config and keeps the normal precedence.
+fn mcp_argv(policy: McpPolicy, config_path: &std::ffi::OsStr) -> Vec<OsString> {
+    let mut argv = Vec::with_capacity(3);
+    if policy == McpPolicy::Minimal {
+        argv.push(OsString::from("--strict-mcp-config"));
+    }
+    argv.push(OsString::from("--mcp-config"));
+    argv.push(config_path.to_owned());
+    argv
+}
+
 fn claude_manifest() -> PluginManifest {
     let controlled = BTreeMap::from([
         ("message".to_owned(), "stream".to_owned()),
@@ -2162,13 +2274,36 @@ fn target_environment(
 
 #[cfg(test)]
 mod tests {
-    use super::{claude_manifest, claude_scope, new_uuid, setter_error};
+    use super::{
+        ClaudePlugin, check_mcp_allow_empty, claude_manifest, claude_scope, mcp_argv, new_uuid,
+        setter_error,
+    };
     use eliot_core::Error;
+    use eliot_core::McpPolicy;
     use eliot_plugin::session::{parse_resume_subject, validate_source_plan};
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, HashSet};
 
     const FAMILIES: &[&str] = &["session", "turn", "message", "request"];
+
+    #[test]
+    fn exited_start_retires_without_response_delivery_and_keeps_exact_replay() {
+        let mut plugin = ClaudePlugin::default();
+        let params = eliot_plugin::AgentStartParams::new("a7", 4, "start-4");
+        let error =
+            plugin.retain_exited_start(&params, Error::new("unknown", "registration timed out"));
+        // No peer/respond operation occurs: exit evidence is owned by the
+        // plugin, rather than by acknowledgement of the expired start RPC.
+        assert!(plugin.failed_start.as_ref().unwrap().endpoint_exited);
+        assert!(plugin.session.is_none());
+        let replay = plugin.replay_start(&params).unwrap().unwrap_err();
+        assert_eq!(replay, error);
+        let newer = eliot_plugin::AgentStartParams::new("a7", 5, "start-5");
+        assert_eq!(
+            plugin.replay_start(&newer).unwrap().unwrap_err().code,
+            "bad_state"
+        );
+    }
 
     #[test]
     fn uuid_mints_unique_hyphenated_ids() {
@@ -2186,6 +2321,33 @@ mod tests {
             );
             assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
         }
+    }
+
+    #[test]
+    fn mcp_argv_is_strict_only_for_minimal() {
+        let config = std::ffi::OsStr::new("agent-mcp.json");
+        assert_eq!(
+            mcp_argv(McpPolicy::Inherit, config),
+            vec![
+                std::ffi::OsString::from("--mcp-config"),
+                std::ffi::OsString::from("agent-mcp.json"),
+            ]
+        );
+        assert_eq!(
+            mcp_argv(McpPolicy::Minimal, config),
+            vec![
+                std::ffi::OsString::from("--strict-mcp-config"),
+                std::ffi::OsString::from("--mcp-config"),
+                std::ffi::OsString::from("agent-mcp.json"),
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_mcp_allow_is_unsupported() {
+        assert!(check_mcp_allow_empty(&[]).is_ok());
+        let error = check_mcp_allow_empty(&["owner-search".to_owned()]).unwrap_err();
+        assert_eq!(error.code, "unsupported");
     }
 
     #[test]

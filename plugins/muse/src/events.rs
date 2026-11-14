@@ -50,6 +50,9 @@ const EARLY_EVENT_LIMIT: usize = 128;
 const EARLY_EVENT_BYTES: usize = 256 * 1024;
 const MAX_PENDING_REQUESTS: usize = 128;
 const RESOLVED_REQUEST_HISTORY: usize = 128;
+/// Bound on persisted native file-change hints per completion, mirroring the
+/// Codex adapter's bound exactly.
+const MAX_CHANGED_PATHS: usize = 1_000;
 
 struct ViewRecovery {
     head: Option<String>,
@@ -59,6 +62,7 @@ struct ViewRecovery {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventStatus {
+    pub native_drained: bool,
     pub ready: bool,
     pub session_id: Option<String>,
     pub active_command_id: Option<String>,
@@ -481,6 +485,11 @@ impl EventHandle {
         }
     }
 
+    pub async fn drain_native(&self) -> Result<()> {
+        eliot_plugin::native_lifecycle::wait_for_native_tail(&self.status, |s| s.native_drained)
+            .await
+    }
+
     pub fn status(&self) -> EventStatus {
         self.status.borrow().clone()
     }
@@ -692,7 +701,7 @@ impl EventProcessor {
             StreamState::Malformed(fault) => {
                 self.defer_gap(format!(
                     "Muse session host stream fault ({})",
-                    fault.label()
+                    fault.describe()
                 ));
                 self.transport_loss = true;
             }
@@ -2269,9 +2278,15 @@ impl EventProcessor {
     /// tool item, mirroring the Codex adapter's completion DTO (the start
     /// fields plus the verbatim native `status`). Non-terminal revisions
     /// carry no committed fact; their terminal `item/completed` follows.
-    /// The 1.4 item carries no inline workspace paths (`patchRef` names a
-    /// stored patch document whose body is fetched out of band, never in
-    /// the stream), so no `changed_paths` are attached here.
+    /// A completed edit-family `toolCall` normalizes as the shared
+    /// completed-file-change payload (`tool` `fileChange`, verbatim
+    /// `status`, bounded `changed_paths`/`changed_paths_truncated`) that
+    /// native file-change hint attribution accepts, mirroring exactly what
+    /// the Codex adapter emits for its `fileChange` items. Only the inline
+    /// target path is attached: multi-file patch bodies stay behind
+    /// `patchRef` (fetched via `item/readOutput`, which this adapter never
+    /// calls), so an edit with no inline path commits empty `changed_paths`
+    /// with the truncation flag set.
     async fn complete_tool(&mut self, item: &NativeItem) -> Result<()> {
         let Some(tool) = tool_label(item) else {
             if tool_item_kind(&item.kind) {
@@ -2294,13 +2309,54 @@ impl EventProcessor {
                 .record_gap("Muse tool completion omitted its exact item id")
                 .await;
         }
-        let data = json!({
+        let completed_file_change = completed_file_change(item);
+        let mut data = json!({
             "command_id": command_id,
             "turn_id": turn_id,
             "item_id": item.item_id,
             "tool": tool,
             "status": item.status,
         });
+        if completed_file_change {
+            // Installed Codex 0.161 `fileChange` budgeting, mirrored
+            // exactly: reserve the complete envelope, then admit inline
+            // paths while they fit. `true` is shorter than `false`, so
+            // marking truncation cannot exceed this budget.
+            data["changed_paths"] = json!([]);
+            data["changed_paths_truncated"] = Value::Bool(false);
+            let mut metadata_bytes = serde_json::to_vec(&data)
+                .map_err(|_| {
+                    Error::new("internal", "Muse fileChange metadata could not be encoded")
+                })?
+                .len();
+            let mut changed_paths = Vec::new();
+            let mut truncated = false;
+            'paths: for path in edit_hint_paths(item) {
+                let path_bytes = serde_json::to_vec(&path)
+                    .map_err(|_| {
+                        Error::new("internal", "Muse fileChange path could not be encoded")
+                    })?
+                    .len()
+                    + usize::from(!changed_paths.is_empty());
+                if path.is_empty()
+                    || changed_paths.len() >= MAX_CHANGED_PATHS
+                    || metadata_bytes.saturating_add(path_bytes) > MAX_EVENT_BYTES
+                {
+                    truncated = true;
+                    break 'paths;
+                }
+                metadata_bytes += path_bytes;
+                changed_paths.push(path);
+            }
+            if changed_paths.is_empty() {
+                // No inline target: the diff, if any, lives behind `patchRef`
+                // and was not resolved here, so downstream coverage is
+                // incomplete by construction.
+                truncated = true;
+            }
+            data["changed_paths"] = json!(changed_paths);
+            data["changed_paths_truncated"] = Value::Bool(truncated);
+        }
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
             return self
                 .record_gap("Muse tool completion exceeded the persisted-event bound")
@@ -2377,6 +2433,8 @@ impl EventProcessor {
             "command_id": command_id.clone(),
             "turn_id": notification.turn_id,
             "status": status_text,
+            "outcome": turn_outcome(&notification.terminal),
+            "native_status": native_terminal(&notification.terminal),
         });
         // The semantic hold signal gets first claim on the bounded terminal data.
         if let Some(restriction) = provider_restriction {
@@ -2919,9 +2977,14 @@ impl EventProcessor {
                     self.start_workflow_child_turn(&key).await;
                     return Ok(());
                 }
-                PlannedAction::Complete { status } => {
-                    self.complete_workflow_child_turn(&key, status, notification.item.revision)
-                        .await;
+                PlannedAction::Complete { status, native } => {
+                    self.complete_workflow_child_turn(
+                        &key,
+                        status,
+                        native,
+                        notification.item.revision,
+                    )
+                    .await;
                     return Ok(());
                 }
             }
@@ -3088,10 +3151,13 @@ impl EventProcessor {
 
     /// Commit the ONE `turn.completed`, starting first when the live states
     /// were never observed: an explicit terminal proves the turn ran.
+    /// `status` is the normalized turn status; `native` is the raw wire
+    /// terminal preserved as `native_status`.
     async fn complete_workflow_child_turn(
         &mut self,
         key: &WorkflowChildKey,
         status: &'static str,
+        native: &'static str,
         revision: i64,
     ) {
         if self
@@ -3128,7 +3194,7 @@ impl EventProcessor {
                 return;
             }
         };
-        let data = complete_event_data(key, status);
+        let data = complete_event_data(key, status, native);
         let host = self.host.clone();
         let credential = self.credential.clone();
         let sink = &mut self.sink;
@@ -3511,6 +3577,7 @@ async fn run(
                 }
             }
         }
+        processor.status.native_drained = processor.frames_drained;
         let _ = status_tx.send(processor.status.clone());
     }
 }
@@ -3622,15 +3689,94 @@ fn tool_item_kind(kind: &str) -> bool {
 }
 
 /// Display tool for a normalized item: the `toolCall` tool name, or the
-/// `userShell` kind itself. A `userShell` `commandText` is a full shell
-/// invocation and is never persisted; a blank `toolCall` tool name proves
-/// nothing and the caller gaps instead.
+/// `userShell` kind itself. An edit-family `toolCall` normalizes as
+/// `fileChange`, mirroring the Codex adapter's `fileChange` item type, so
+/// native file-change hint attribution accepts the completion. A
+/// `userShell` `commandText` is a full shell invocation and is never
+/// persisted; a blank `toolCall` tool name proves nothing and the caller
+/// gaps instead.
 fn tool_label(item: &NativeItem) -> Option<String> {
     match item.kind.as_str() {
-        "toolCall" => item.tool.clone().filter(|tool| !tool.trim().is_empty()),
+        "toolCall" => item
+            .tool
+            .clone()
+            .filter(|tool| !tool.trim().is_empty())
+            .map(|tool| {
+                if is_edit_tool(&tool) {
+                    "fileChange".to_owned()
+                } else {
+                    tool
+                }
+            }),
         "userShell" => Some("userShell".to_owned()),
         _ => None,
     }
+}
+
+/// Muse edit-family tool names: workspace mutators whose terminal revision
+/// carries the edit diff. Observed read-only in the installed host binary
+/// (`muse-bin-1.4.0-R4161.1.exe` embeds
+/// `DIRECT_MUTATORS = { "apply_patch", "delete_file", "edit_file",
+/// "write_file" }`); shell tools (`bash`, `exec_command`, `shell`) and
+/// readers stay under their raw tool name.
+fn is_edit_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "apply_patch" | "delete_file" | "edit_file" | "write_file"
+    )
+}
+
+/// A completed edit-family `toolCall` carries the shared
+/// completed-file-change payload exactly when the native status is
+/// `completed`, mirroring the Codex adapter's `fileChange` + `completed`
+/// gate that hint attribution requires. Other terminal statuses keep the
+/// `fileChange` tool name with their verbatim status but no paths.
+fn completed_file_change(item: &NativeItem) -> bool {
+    item.kind == "toolCall"
+        && item.tool.as_deref().is_some_and(is_edit_tool)
+        && item.status == "completed"
+}
+
+/// Inline file targets carried by an edit-family `toolCall`. The 1.4 schema
+/// keeps `args` verbatim for clients to parse; workspace file tools address
+/// their target under `path` (observed in the installed host:
+/// `tools.workspace.read_file({ path: ... })`, and write tools reject a
+/// target that does not resolve to an absolute path). Only those path
+/// strings are returned, at most one bound over the adapter limit; `args`
+/// itself, file contents, diffs and results are never persisted. An absent,
+/// undecodable or almost-JSON `args` yields no paths here: the diff, if any,
+/// lives behind `patchRef` and stays unresolved.
+fn edit_hint_paths(item: &NativeItem) -> Vec<String> {
+    let Some(args) = item.args.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(args) else {
+        return Vec::new();
+    };
+    let Some(fields) = parsed.as_object() else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    if let Some(raw) = fields.get("path") {
+        if let Some(path) = raw.as_str() {
+            if !path.is_empty() {
+                paths.push(path.to_owned());
+            }
+        } else if let Some(items) = raw.as_array() {
+            for raw in items {
+                if paths.len() > MAX_CHANGED_PATHS {
+                    break;
+                }
+                if let Some(path) = raw.as_str().filter(|path| !path.is_empty()) {
+                    paths.push(path.to_owned());
+                }
+            }
+        }
+    }
+    if paths.len() > MAX_CHANGED_PATHS + 1 {
+        paths.truncate(MAX_CHANGED_PATHS + 1);
+    }
+    paths
 }
 
 /// Terminal item revisions commit tool facts. The schema folds terminal as
@@ -3649,6 +3795,29 @@ pub(crate) fn turn_status(terminal: &NativeTurnTerminal) -> Option<&'static str>
         NativeTurnTerminal::Completed => Some("completed"),
         NativeTurnTerminal::Failed => Some("failed"),
         NativeTurnTerminal::Cancelled => Some("interrupted"),
+        NativeTurnTerminal::Unknown => None,
+    }
+}
+
+/// Canonical outcome for the MSP terminal vocabulary (`completed` | `failed`
+/// | `cancelled`): decided here at the plugin boundary, with the raw wire
+/// terminal preserved as `native_status`. `cancelled` is an interrupt.
+pub(crate) fn turn_outcome(terminal: &NativeTurnTerminal) -> Option<&'static str> {
+    match terminal {
+        NativeTurnTerminal::Completed => Some("success"),
+        NativeTurnTerminal::Failed => Some("failure"),
+        NativeTurnTerminal::Cancelled => Some("interrupted"),
+        NativeTurnTerminal::Unknown => None,
+    }
+}
+
+/// Raw wire terminal verbatim, preserved as `native_status` next to the
+/// canonical outcome.
+pub(crate) fn native_terminal(terminal: &NativeTurnTerminal) -> Option<&'static str> {
+    match terminal {
+        NativeTurnTerminal::Completed => Some("completed"),
+        NativeTurnTerminal::Failed => Some("failed"),
+        NativeTurnTerminal::Cancelled => Some("cancelled"),
         NativeTurnTerminal::Unknown => None,
     }
 }
@@ -3801,6 +3970,7 @@ mod tests {
             status: "inProgress".to_owned(),
             text: None,
             tool: Some("shell".to_owned()),
+            args: None,
             turn_id: Some("turn-1".to_owned()),
         };
         assert_eq!(tool_label(&call), Some("shell".to_owned()));
@@ -3822,6 +3992,80 @@ mod tests {
         assert_eq!(tool_label(&message), None);
     }
 
+    fn edit_item(tool: &str, status: &str, args: Option<&str>) -> NativeItem {
+        NativeItem {
+            item_id: "item-edit".to_owned(),
+            kind: "toolCall".to_owned(),
+            revision: 3,
+            status: status.to_owned(),
+            text: None,
+            tool: Some(tool.to_owned()),
+            args: args.map(str::to_owned),
+            turn_id: Some("turn-1".to_owned()),
+        }
+    }
+
+    #[test]
+    fn edit_family_normalizes_as_file_change() {
+        for tool in ["apply_patch", "delete_file", "edit_file", "write_file"] {
+            let item = edit_item(tool, "completed", None);
+            assert!(is_edit_tool(tool), "tool={tool}");
+            assert_eq!(tool_label(&item), Some("fileChange".to_owned()));
+            assert!(completed_file_change(&item), "tool={tool}");
+        }
+        for tool in ["shell", "read_file", "search", "bash", "exec_command"] {
+            let item = edit_item(tool, "completed", None);
+            assert!(!is_edit_tool(tool), "tool={tool}");
+            assert_eq!(tool_label(&item), Some(tool.to_owned()));
+            assert!(!completed_file_change(&item), "tool={tool}");
+        }
+    }
+
+    #[test]
+    fn only_completed_edits_carry_the_file_change_payload() {
+        let completed = edit_item("edit_file", "completed", Some(r#"{"path":"crates/a.rs"}"#));
+        assert!(completed_file_change(&completed));
+        for status in ["failed", "cancelled", "rejected", "timedOut", "inProgress"] {
+            let item = edit_item("edit_file", status, None);
+            assert!(!completed_file_change(&item), "status={status}");
+        }
+        let shell = edit_item("shell", "completed", None);
+        assert!(!completed_file_change(&shell));
+        let shell_kind = NativeItem {
+            kind: "userShell".to_owned(),
+            ..shell
+        };
+        assert!(!completed_file_change(&shell_kind));
+    }
+
+    #[test]
+    fn edit_hints_carry_only_the_inline_target_path() {
+        let item = edit_item(
+            "write_file",
+            "completed",
+            Some(
+                r#"{"path":"crates/a.rs","content":"SECRET_MUST_NOT_PERSIST","diff":"DIFF_MUST_NOT_PERSIST"}"#,
+            ),
+        );
+        let paths = edit_hint_paths(&item);
+        assert_eq!(paths, vec!["crates/a.rs".to_owned()]);
+        for marker in ["SECRET_MUST_NOT_PERSIST", "DIFF_MUST_NOT_PERSIST"] {
+            assert!(!paths.iter().any(|path| path.contains(marker)));
+        }
+        let no_target = edit_item(
+            "apply_patch",
+            "completed",
+            Some(r#"{"patch":"--- a/x\n+++ b/x\n"}"#),
+        );
+        assert!(edit_hint_paths(&no_target).is_empty());
+        let absent = edit_item("edit_file", "completed", None);
+        assert!(edit_hint_paths(&absent).is_empty());
+        let almost_json = edit_item("edit_file", "completed", Some("{not json"));
+        assert!(edit_hint_paths(&almost_json).is_empty());
+        let blank = edit_item("edit_file", "completed", Some(r#"{"path":""}"#));
+        assert!(edit_hint_paths(&blank).is_empty());
+    }
+
     #[test]
     fn tool_facts_commit_on_any_non_in_progress_status() {
         assert!(!is_terminal_item_status("inProgress"));
@@ -3840,10 +4084,10 @@ mod tests {
     #[test]
     fn tool_items_decode_the_schema_field_names() {
         // `muse schema generate-json-schema` (stable, 1.4.0-R4161.1): the
-        // `toolCall` tool name, `userShell` command execution and the common
-        // identity fields. Per-kind payloads (`args`, `commandText`,
-        // `patchRef`, `visibleOutput`, ...) stay unparsed and must not
-        // break decoding.
+        // `toolCall` tool name and verbatim argument JSON, `userShell`
+        // command execution and the common identity fields. Other per-kind
+        // payloads (`commandText`, `patchRef`, `visibleOutput`, ...) stay
+        // unparsed and must not break decoding.
         let call: NativeItem = serde_json::from_value(json!({
             "itemId": "item-1",
             "kind": "toolCall",
@@ -3856,6 +4100,7 @@ mod tests {
         }))
         .expect("toolCall decodes");
         assert_eq!(tool_label(&call), Some("shell".to_owned()));
+        assert_eq!(call.args.as_deref(), Some("{\"command\":\"cargo build\"}"));
         let shell: NativeItem = serde_json::from_value(json!({
             "itemId": "item-2",
             "kind": "userShell",

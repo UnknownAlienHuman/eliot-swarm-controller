@@ -470,7 +470,8 @@ hidden wait/acceptance state to the router.
 | --- | --- |
 | Agent verb | router with generation/turn/request binding |
 | `launch` | targetless ordinary launch command at generation 0; optional nonblank text creates the normal linked `send` |
-| `msg.send`, `var.set` | scoped coordination command; available after L5 |
+| `mail.send` | targetless ordinary command; Store atomically commits one scoped queued-mail fanout with its Applied outcome |
+| `var.set` | targetless ordinary command; Store atomically commits one versioned variable write with its Applied outcome |
 | `run` | targetless `SubmitCommand` via Router; bounded child under saved authority; emitted commands become ordered children |
 | `notify` | targetless ordinary command; Store atomically commits one persisted `x.user.notify` event with its Applied outcome (local log only) |
 | `emit` | targetless ordinary command; Store atomically commits one persisted `x.user.<topic>` event with its Applied outcome (local log only) |
@@ -493,6 +494,44 @@ readback carries that event's kind and seq as the standard command readback,
 and a commit failure settles Unknown. A future desktop or
 approved-webhook increment must add its own delivery binding and must not
 reuse this local path as a transport.
+
+`mail.send` and `var.set` are scoped coordination actions through the existing
+Router/admission path, not a new executor. Both are targetless ordinary
+commands (`target = null`, no generation/turn/request binding) whose Core
+[`MailDefinitionArgs`/`VarDefinitionArgs`](../../crates/eliot-core/src/api/coordination.rs)
+are validated literally at admission (no templates; bounded, secret-checked
+payloads); the rule file also accepts `msg.send` as a compatibility alias for
+`mail.send`, and the canonical verb is `mail.send` (the CLI spells the same
+effect `msg send`). Admission freezes recipient/project scope under the saved
+originating principal: Owner reaches any existing Agent and names its variable
+scope explicitly, while a project principal `project:ID` reaches only Agents in
+its own project and writes only its own `project:ID` scope (an omitted scope
+defaults to it). Project registration must grant each canonical verb explicitly in `actions`;
+the captured registration revision is checked at dispatch and effect commit.
+Execution reuses the existing authorization, payload validation, mailbox limits,
+compare-and-swap/version semantics and
+delivery/acknowledgement semantics; a stale or unauthorized destination fails
+explicitly. Each admitted rule child commits its effect together with its
+Applied settlement in a single Store transaction without entering the public
+write-id namespace, then publishes the committed batch in order while still
+serialized with the writer: `mail.send` publishes `command.applied` carrying
+the delivery readback and fans out mailbox wakes only after commit through the
+existing coordination wake path; `var.set` publishes `var.changed` first, then
+`command.applied` carrying the write readback. These rule-produced events carry
+the exact child command's verified cause, preserving the depth-five guard;
+standalone coordination events keep their existing semantics. Mail delivery IDs
+use `rule:<ULID>/<recipient>` outside the public write namespace: the ULID's
+timestamp is the child's persisted admission time and its entropy is derived
+deterministically from the child identity. Pruned deliveries therefore retain
+the ordinary idempotent acknowledgement age semantics. Definite validation,
+authority, mailbox-capacity and CAS refusals settle Rejected with their code;
+uncertain persistence or commit failures remain Unknown.
+Malformed action fields report the recognized action, field path and reason
+without including rejected values or rule source excerpts.
+Replayed or restarted source events never duplicate the effect: an
+already Applied child returns its recorded result without a new delivery or
+write. Direct control actions stay bound to their event subject, and scripts
+are not turned into Owner RPC clients.
 
 ## Git actions
 
@@ -944,12 +983,36 @@ generations, and anything while automation is draining; it waits while an
 active native Goal drives. Each automatic round runs in its own task, at most
 one per Goal and four Goals at once, so a slow check never stalls another
 Goal's round; a newer event for a Goal with a round in flight is driven as
-a follow-up when that round resolves. Events dropped past the cap or to bus
-lag are logged, as are stale rounds. Other races against explicit rounds
-resolve through the
+a follow-up when that round resolves. Bus events dropped past the cap or to
+bus lag are logged, as are queued waits and stale rounds. Other races
+against explicit rounds resolve through the
 single-flight marker and the burn and stay silent. Shutdown cancels every
 in-flight automatic check through its custody cancellation and waits only for
 the rounds to resolve their markers (`unknown`, never rerun).
+
+Setting or resuming an enabled idle-keyed Goal also reconciles the
+retained exact-generation idle subject: the set/resume wakes the driver,
+which sweeps every active non-cadenced Goal bound to its Agent's current
+generation and reserves a round on the latest event only when that row
+still names an idle event of that generation. The sweep uses the same
+reservation as a bus event — same scope, enablement and single-flight —
+without re-offering mail, and waits for a real event when the
+subject is missing (pruned, superseded or never retained), leaving the
+Goal's marker and counters untouched on the readback. A spent subject is
+skipped before taking a scheduler slot, so burned keys cannot starve
+eligible Goals past the cap; a retained subject that finds its Goal busy
+or the cap full waits in revision-bound order and is revalidated when a
+round resolves. A busy Agent or a
+drifted generation skips silently; a set/resume never resumes a lost
+Agent, and only the round path itself may pause a drifted Goal. Startup
+performs no sweep: the restart marks every owned session lost, so no
+retained subject is eligible.
+A consumed idle subject rearms only through a new Goal revision: a
+definition change clears the committed key, so the next sweep may round
+the still-current subject again. Unknown-burned keys never rerun within
+the generation, and the same revision never rerounds a consumed key —
+repeated set/retry, reads and daemon restart cannot create another
+round.
 
 No-progress compares check output digests and the read-only workspace
 fingerprint together. The fingerprint digests the committed Git observation —

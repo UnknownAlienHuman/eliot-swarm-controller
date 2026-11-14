@@ -44,7 +44,10 @@ pub(super) fn dispatch_tx(
             .ok_or_else(|| Error::new("internal", "dispatched run command disappeared"))?;
         return Ok(Some(command));
     }
-    if matches!(command.command.verb.as_str(), "notify" | "emit") {
+    if matches!(
+        command.command.verb.as_str(),
+        "notify" | "emit" | "mail.send" | "var.set"
+    ) {
         if command.target.is_some()
             || command.command.generation.is_some()
             || command.command.expected_generation.is_some()
@@ -53,7 +56,7 @@ pub(super) fn dispatch_tx(
         {
             return Err(Error::new(
                 "source_integrity",
-                "stored notify/emit command has an Agent binding",
+                "stored targetless action has an Agent binding",
             ));
         }
         projects::validate_project_command_dispatch_tx(tx, command)?;
@@ -76,7 +79,7 @@ pub(super) fn dispatch_tx(
             json!({"command_id": id, "verb": command.command.verb}),
         )?);
         let command = load_command(tx, id)?
-            .ok_or_else(|| Error::new("internal", "dispatched notify/emit disappeared"))?;
+            .ok_or_else(|| Error::new("internal", "dispatched targetless action disappeared"))?;
         return Ok(Some(command));
     }
     if command.command.verb == "git.fetch" {

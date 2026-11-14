@@ -273,6 +273,13 @@ observation only and never grants permission to signal a stale numeric PGID.
 retrospective assertion about historical commands. Unknown prior Unix custody after
 daemon replacement cannot be promoted to an exact stopped result.
 
+Runtime operation slots retain current preparation/cancellation/removal evidence and
+unconfirmed process quiescence. Obsolete or settled slots retire only after all
+operation, cancellation and run references release them, under the same lookup and
+startup/cleanup serialization used for registration. Durable removed rows remain;
+they do not require an idle runtime slot. Recovery and FORCE cleanup consume bounded
+pages of pending preparations, selecting actionable phases before allocating slots.
+
 `worktree.remove` uses normal command admission. No other live Agent may use that
 checkout; the `removing` marker blocks concurrent launch into it. Cleanup may remove
 only untracked/ignored entries under frozen scratch paths, never tracked changes or
@@ -352,6 +359,13 @@ still have `complete=false`. Executable Git filters are disabled, and applicable
 attributes make raw status partial; bounded attribution-path coverage can also make a
 snapshot partial. An empty partial dirty set does not prove the workspace clean.
 
+The in-memory Git cache has no inactive diagnostic allowance: a workspace entry retires
+after its last current or settling binding releases it. Final hint attribution and
+source closure precede binding retirement. Registration and eviction share a registry
+gate; watcher/backend disposal happens outside map and Store locks. A retired cache
+reads as unavailable with inactive filesystem invalidation; its durable baseline and
+edit attribution remain available from Store.
+
 `history_complete` / `history_gap` describe commit coverage separately. Recovery uses
 the persisted workspace HEAD baseline, with at most 64 commits per probe and bounded
 time/output. No baseline or non-ancestor history records a gap; bounded/truncated history
@@ -371,7 +385,7 @@ CREATE TABLE agent_edits (
 ```
 
 Only an authoritative, generation-matched native completed `fileChange` tool event can
-supply edit hints. Codex retains bounded path metadata, not patch contents; the daemon
+supply edit hints. Codex and Muse retain bounded path metadata, not patch contents; the daemon
 validates each hint against the admitted workspace's filesystem containment. Store
 verifies the exact native cause before publishing `file.changed` and upserting attribution.
 A current dirty-path intersection is not required: native writes reverted before polling
@@ -493,10 +507,52 @@ threshold, never a timeout verdict that the Agent died.
 Stopped Agents do not open source-unhealthy incidents; existing ones retire
 without a recovery claim, while no-progress may still recover on explicit stop.
 
+Native child activity also feeds a manager-health incident (`children_unattended`).
+The exact controlled producer of registered native descendants is their nearest
+controlled ancestor, including nested observe-only children. Aggregate its current
+generation's unfinished children: notify when the manager is idle or stopped, or
+has no committed native progress through the suspicion window. A stalled or lost
+child also warrants attention while the manager is busy. All-finished children,
+and a progressing manager with healthy progressing children, open no child incident.
+An open turn with a lost/gapped source remains unfinished; silence is never completion.
+
+These reports capture complete unfinished/lost/stalled counts and at most sixteen
+child activity samples, with explicit truncation. Reports go only to the manager's
+existing queued mail path (which wakes an eligible idle recipient), plus the Owner
+notice even when the manager itself has a parent. A stopped manager receives queued
+mail but is not automatically resumed. No child is addressed, controlled or stopped;
+no native snapshot or model call is needed for this decision. CPU and Git are not
+progress. Sweeps include idle/stopped managers with current native registrations;
+the candidate lookup checks registration existence without traversing child turns.
+Descendant capture visits at most `NATIVE_CHILD_ATTENTION_PAGE_SIZE` registrations
+per Store lock, including finished/no-facts rows; the registration cursor advances
+over every visited row. Store is released between pages and the manager generation
+and parent turn are rechecked after each page and before publishing. Each capture
+freezes its last registration ID so concurrent child creation cannot extend the pass
+indefinitely. Open-turn reads stop at the first indexed match; latest terminal and
+native-progress reads likewise use indexed limit queries, never per-child counts.
+A transactional `agents.native_child_revision` stamp tracks relevant child
+registration, turn/progress and native source changes, including pruned child
+progress facts. Capture validates that same stamp across every page and final
+readback. A mutation discards the capture for the next sweep. The stamp is checked
+again under Store before freezing an incident or retiring its finished cohort, so
+an omitted new child or a changing existing child cannot falsely clear/rearm it.
+Unrelated mail, CPU and Git events do not invalidate this child-cohort stamp.
+
+One frozen report covers an unfinished child cohort per manager generation. Parent
+turn changes, mail wakes, manager progress and child fanout do not rearm it. It retires
+only after no observed child turn remains open, without recovery mail that would wake
+the manager again. Unknown source health alone never clears open work. This shares
+the existing bounded incident set, reservations and exact-ID delivery retries; no
+per-child incident registry or unbounded report fanout is introduced. Like other
+attention incidents, deduplication is transient across daemon restart.
+
 Before reporting, capture the Agent generation, active turn, pending requests,
-source owners/health, and model-progress time from Store; release Store before
-the exact-generation `agent.snapshot` readback; then recheck the generation and
-turn before publishing. Readback is read-only and preemptible by a subsequent
+source owners/health, and model-progress time from Store. Child-cohort reports
+recheck the generation, turn and child summary before freezing. Controlled-Agent
+source/no-progress reports release Store before the exact-generation
+`agent.snapshot` readback, then recheck the generation and turn before publishing.
+Readback is read-only and preemptible by a subsequent
 host control. The daemon copies observation basis and freshness only when the
 plugin explicitly supplies them and the exact generation/turn binding matches;
 otherwise it reports `plugin_snapshot` and `freshness_unspecified` without

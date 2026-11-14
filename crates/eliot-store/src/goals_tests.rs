@@ -173,15 +173,24 @@ fn failed_check(digest: &str) -> GoalCheckResult {
     }
 }
 
-fn claim(store: &mut Store, agent: &str, revision: i64, key: i64, now: i64) {
+/// Claim one idle round and return the reservation the commit must reuse:
+/// the claim's request id, observed sequence and continuation id.
+fn claim(
+    store: &mut Store,
+    agent: &str,
+    revision: i64,
+    key: i64,
+    now: i64,
+) -> (String, i64, String) {
+    let request_id = Ulid::new().to_string();
     let probe = store
         .goal_round_probe(agent, "eliot", GoalRoundKey::Idle(key), now)
         .expect("probe before claim");
-    store
+    let (seq, continuation_id) = store
         .goal_claim_round(
             "owner",
             &eliot_core::api::GoalRoundRequest {
-                id: Ulid::new().to_string(),
+                id: request_id.clone(),
                 agent: (agent).to_owned(),
                 mode: GoalMode::parse("eliot").unwrap(),
                 idle_seq: match GoalRoundKey::Idle(key) {
@@ -198,10 +207,14 @@ fn claim(store: &mut Store, agent: &str, revision: i64, key: i64, now: i64) {
             now,
         )
         .map(|claim| match claim {
-            super::GoalRoundClaim::Claimed { seq, .. } => seq,
+            super::GoalRoundClaim::Claimed {
+                seq,
+                continuation_id,
+            } => (seq, continuation_id),
             super::GoalRoundClaim::Replay(_) => panic!("expected a new claim"),
         })
         .expect("claim round");
+    (request_id, seq, continuation_id)
 }
 
 /// Drive one admitted send through a full turn so the Agent is cleanly idle
@@ -3679,4 +3692,162 @@ fn goal_reopen_reads_idle_and_slot_markers_as_unknown() {
         ]
     );
     remove_goal_crash_store_files(&path);
+}
+
+#[test]
+fn goal_reconcile_candidates_cover_only_active_idle_keyed_goals() {
+    let mut store = store();
+    let now = now_ms();
+    let agent = ready_agent(&mut store, "goal-reconcile", now);
+    let key = store.high_water().unwrap();
+    store
+        .goal_set(
+            &agent,
+            "eliot",
+            &Ulid::new().to_string(),
+            "owner",
+            &definition("green"),
+            now,
+        )
+        .unwrap();
+    let candidates = store.goal_reconcile_candidates().unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].agent, agent);
+    assert_eq!(candidates[0].generation, 1);
+    assert_eq!(candidates[0].revision, 1);
+    assert_eq!(candidates[0].agent_state, AgentState::Idle);
+    assert_eq!(candidates[0].idle_seq, Some(key));
+    assert!(!candidates[0].key_consumed);
+    // A paused Goal takes no rounds until resumed.
+    store
+        .goal_pause(
+            &agent,
+            "eliot",
+            &Ulid::new().to_string(),
+            "owner",
+            None,
+            now,
+        )
+        .unwrap();
+    assert!(store.goal_reconcile_candidates().unwrap().is_empty());
+    store
+        .goal_resume(&agent, "eliot", &Ulid::new().to_string(), "owner", now)
+        .unwrap();
+    assert_eq!(store.goal_reconcile_candidates().unwrap().len(), 1);
+    // A cadenced Goal rounds on slots, never on retained idle events.
+    let slot_agent = ready_agent(&mut store, "goal-reconcile-slot", now);
+    store
+        .goal_set(
+            &slot_agent,
+            "eliot",
+            &Ulid::new().to_string(),
+            "owner",
+            &cadenced_definition("green"),
+            now,
+        )
+        .unwrap();
+    let agents: Vec<String> = store
+        .goal_reconcile_candidates()
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.agent)
+        .collect();
+    assert_eq!(agents, vec![agent]);
+}
+
+#[test]
+fn goal_reconcile_candidate_names_the_consumed_key() {
+    let mut store = store();
+    let now = now_ms();
+    let agent = ready_agent(&mut store, "goal-reconcile-burn", now);
+    let view = store
+        .goal_set(
+            &agent,
+            "eliot",
+            &Ulid::new().to_string(),
+            "owner",
+            &definition("green"),
+            now,
+        )
+        .unwrap();
+    let key = store.high_water().unwrap();
+    let fresh = store.goal_reconcile_candidates().unwrap();
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].idle_seq, Some(key));
+    assert!(!fresh[0].key_consumed);
+    // An unknown round spends its key without admitting a continuation,
+    // so the Goal stays active on the still current key and the sweep
+    // must skip it. The abandon reuses the claim's request id.
+    let (request_id, _, _) = claim(&mut store, &agent, view.revision, key, now + 1);
+    store
+        .goal_abandon_round(
+            "owner",
+            &eliot_core::api::GoalRoundRequest {
+                id: request_id,
+                agent: agent.to_owned(),
+                mode: GoalMode::parse("eliot").unwrap(),
+                idle_seq: match GoalRoundKey::Idle(key) {
+                    GoalRoundKey::Idle(seq) => Some(seq),
+                    _ => None,
+                },
+                slot: match GoalRoundKey::Idle(key) {
+                    GoalRoundKey::Slot(slot) => Some(slot),
+                    _ => None,
+                },
+            },
+            &eliot_core::Error::new("unknown", "round abandoned"),
+            now + 1,
+        )
+        .unwrap();
+    assert_eq!(
+        store.goal_get(&agent, "eliot").unwrap().unwrap().status,
+        GoalStatus::Active
+    );
+    let spent = store.goal_reconcile_candidates().unwrap();
+    assert_eq!(spent.len(), 1);
+    assert_eq!(spent[0].idle_seq, Some(key));
+    assert!(spent[0].key_consumed);
+}
+
+#[test]
+fn goal_reconcile_candidate_rearms_after_definition_change() {
+    let mut store = store();
+    let now = now_ms();
+    let agent = ready_agent(&mut store, "goal-reconcile-rearm", now);
+    let view = store
+        .goal_set(
+            &agent,
+            "eliot",
+            &Ulid::new().to_string(),
+            "owner",
+            &definition("green"),
+            now,
+        )
+        .unwrap();
+    let key = store.high_water().unwrap();
+    // A completed round consumes its key and completes the Goal, so the
+    // sweep sees no candidate. The commit reuses the claim's request id
+    // and observed sequence.
+    let (request_id, seq, _) = claim(&mut store, &agent, view.revision, key, now + 1);
+    let mut commit = commit_for(&agent, view.revision, key, Some(passed_check()), None, None);
+    commit.id = request_id;
+    commit.claim_seq = seq;
+    let committed = store.goal_commit_round(&commit, now + 1).unwrap();
+    assert_eq!(committed.view.status, GoalStatus::Completed);
+    assert!(store.goal_reconcile_candidates().unwrap().is_empty());
+    // A new definition rearms the still-current subject.
+    store
+        .goal_set(
+            &agent,
+            "eliot",
+            &Ulid::new().to_string(),
+            "owner",
+            &definition("greener"),
+            now + 2,
+        )
+        .unwrap();
+    let rearmed = store.goal_reconcile_candidates().unwrap();
+    assert_eq!(rearmed.len(), 1);
+    assert_eq!(rearmed[0].idle_seq, Some(key));
+    assert!(!rearmed[0].key_consumed);
 }

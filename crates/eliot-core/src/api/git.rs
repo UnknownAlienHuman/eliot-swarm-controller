@@ -13,7 +13,7 @@ pub const DEFAULT_GIT_FETCH_TIMEOUT_MS: i64 = 10 * 60 * 1_000;
 
 /// Literal rule input. The Router freezes registration and transport state before
 /// admitting a command.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitFetchDefinitionArgs {
     pub repository: String,

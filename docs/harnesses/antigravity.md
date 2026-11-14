@@ -227,6 +227,15 @@ automatic retries, defaults, or speculative rollbacks. Output frames and stdio l
 strictly bounded to [`MAX_RPC_FRAME_BYTES`](../../crates/eliot-daemon/src/daemon.rs) (4 MiB) via
 [`BoundedLineWriter`](../../crates/eliot/src/mcp/bounded_io.rs).
 
+## Worker MCP policy
+
+This harness keeps `inherit` only: the frozen profile always records
+`mcp = "inherit"`, and a non-`inherit` policy is rejected as `unsupported`
+at config load. Verified read-only (`agy acp --help`): the ACP server flags
+expose no MCP isolation mechanism (no strict/ignore-MCP flag; `--settings`
+is an unverified session-settings surface, not a verified isolation
+mechanism), so no `minimal` mechanism is implemented.
+
 ## Permissions and final checks
 
 Use explicit native permission settings and verified effective session

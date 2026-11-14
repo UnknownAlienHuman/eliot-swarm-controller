@@ -241,7 +241,17 @@ impl WorkspaceManager {
         let Some((_, preparation)) = self.start(command_id).await? else {
             return Ok(());
         };
-        let slot = self.register_slot(&preparation).await?;
+        let result = self.prepare_workspace(command_id, &preparation).await;
+        self.retire_slots(&preparation.agent).await;
+        result
+    }
+
+    async fn prepare_workspace(
+        &self,
+        command_id: &str,
+        preparation: &WorkspacePreparation,
+    ) -> Result<()> {
+        let slot = self.register_slot(preparation).await?;
         let _operation = slot.operation.lock().await;
         let git = WorkspaceGit::new()?;
         loop {
@@ -251,7 +261,7 @@ impl WorkspaceManager {
                     "workspace preparation disappeared",
                 ));
             };
-            require_same(&preparation, &current)?;
+            require_same(preparation, &current)?;
             if cancelled(&current) {
                 return Err(problem("bad_state", "workspace cancellation is pending"));
             }
@@ -506,23 +516,33 @@ impl WorkspaceManager {
             .await
             .get_workspace(agent)?
             .ok_or_else(|| problem("not_found", "managed workspace was not found"))?;
-        let slot = self.register_slot(&preparation).await?;
+        let result = self.remove_workspace(command, &preparation).await;
+        self.retire_slots(agent).await;
+        result
+    }
+
+    async fn remove_workspace(
+        &self,
+        command: &CoreCommand,
+        preparation: &WorkspacePreparation,
+    ) -> Result<Value> {
+        let slot = self.register_slot(preparation).await?;
         let _operation = slot.operation.lock().await;
         {
             let _gate = slot.gate.clone().lock_owned().await;
-            slot.begin_removal(&command.id, &preparation);
+            slot.begin_removal(&command.id, preparation);
         }
         let outcome = match WorkspaceGit::new() {
             Ok(git) => {
-                self.remove_prepared(command, &preparation, &slot, &git)
+                self.remove_prepared(command, preparation, &slot, &git)
                     .await
             }
             Err(_) => removal_refused(),
         };
         let _gate = slot.gate.clone().lock_owned().await;
         let outcome = if matches!(&outcome, WorkspaceRemovalOutcome::Failed { .. })
-            && (slot.removal_may_have_begun(&command.id, &preparation)
-                || self.require_removing(&preparation, command).await.is_err())
+            && (slot.removal_may_have_begun(&command.id, preparation)
+                || self.require_removing(preparation, command).await.is_err())
         {
             removal_unknown("workspace_removal_marker_changed")
         } else {
@@ -844,102 +864,131 @@ impl WorkspaceManager {
 
     pub(crate) async fn recover(&self) -> Result<Vec<String>> {
         let mut forward = Vec::new();
-        let preparations = self.preparations().await?;
-        if preparations.is_empty() {
-            return Ok(forward);
-        }
-        let git = WorkspaceGit::new()?;
-        for preparation in preparations {
-            let slot = self.slot(&preparation);
-            let _operation = slot.operation.lock().await;
-            if !workspace_git_effect_quiescent(&slot) {
-                continue;
+        let mut after = None;
+        loop {
+            let page = self.preparations(after.as_deref()).await?;
+            if page.is_empty() {
+                return Ok(forward);
             }
-            let stage = preparation
-                .outcome
-                .as_ref()
-                .and_then(|value| value.get("stage"))
-                .and_then(Value::as_str);
-            if preparation.phase == WorkspacePhase::Unknown {
-                match stage {
-                    Some("creation") if !cancelled(&preparation) => {
-                        let reuse = preparation
-                            .outcome
-                            .as_ref()
-                            .and_then(|value| value.get("reuse"))
-                            .and_then(Value::as_bool)
-                            == Some(true);
-                        let outcome = if reuse {
-                            git.inspect_retained(&preparation).await
-                        } else {
-                            git.inspect(&preparation).await
-                        };
-                        if matches!(outcome, WorkspaceCreationOutcome::Verified { .. }) {
-                            let _gate = slot.gate.clone().lock_owned().await;
-                            let mut store = self.inner.store.lock().await;
-                            let change = store.settle_workspace_creation(
-                                &preparation.start_command_id,
-                                preparation.target_generation,
-                                safe_creation(outcome),
-                                now_ms(),
-                            )?;
-                            self.publish(&change.events);
-                        }
-                    }
-                    Some("removal") => {
-                        let id = preparation
-                            .outcome
-                            .as_ref()
-                            .and_then(|value| value.get("command_id"))
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| {
-                                problem("source_integrity", "unknown removal has no command id")
-                            })?;
-                        if let outcome @ WorkspaceRemovalOutcome::Removed { .. } =
-                            git.inspect_removal(&preparation).await
-                        {
-                            let _gate = slot.gate.clone().lock_owned().await;
-                            let mut store = self.inner.store.lock().await;
-                            let change = store.settle_workspace_removal(
-                                id,
-                                preparation.target_generation,
-                                outcome,
-                                now_ms(),
-                            )?;
-                            self.publish(&change.events);
-                        }
-                    }
-                    _ => {}
+            after = page.last().map(|preparation| preparation.agent.clone());
+            for preparation in page {
+                let result = self.recover_workspace(&preparation).await;
+                self.retire_slots(&preparation.agent).await;
+                if let Some(id) = result? {
+                    forward.push(id);
                 }
             }
-            let store = self.inner.store.lock().await;
-            let current = store
-                .get_workspace(&preparation.agent)?
-                .ok_or_else(|| problem("not_found", "workspace disappeared during recovery"))?;
-            let command = store
-                .get_command(&current.start_command_id)?
-                .ok_or_else(|| problem("source_integrity", "workspace start is missing"))?;
-            let agent = store
-                .get_agent(&current.agent)?
-                .ok_or_else(|| problem("not_found", "workspace Agent disappeared"))?;
-            let eligible = matches!(
-                current.phase,
-                WorkspacePhase::Ready | WorkspacePhase::SetupReady
-            ) && !cancelled(&current)
-                && matches!(command.state, CommandState::Accepted | CommandState::Queued)
-                && agent.generation.checked_add(1) == Some(current.target_generation)
-                && command.generation == Some(agent.generation);
-            drop(store);
-            if eligible
-                && matches!(
-                    git.inspect_retained(&current).await,
-                    WorkspaceCreationOutcome::Verified { .. }
-                )
-            {
-                forward.push(current.start_command_id);
+        }
+    }
+
+    async fn pending_start(&self, preparation: &WorkspacePreparation) -> Result<bool> {
+        if !matches!(
+            preparation.phase,
+            WorkspacePhase::Ready | WorkspacePhase::SetupReady
+        ) || cancelled(preparation)
+        {
+            return Ok(false);
+        }
+        let store = self.inner.store.lock().await;
+        let command = store
+            .get_command(&preparation.start_command_id)?
+            .ok_or_else(|| problem("source_integrity", "workspace start is missing"))?;
+        let agent = store
+            .get_agent(&preparation.agent)?
+            .ok_or_else(|| problem("not_found", "workspace Agent disappeared"))?;
+        Ok(
+            matches!(command.state, CommandState::Accepted | CommandState::Queued)
+                && agent.generation.checked_add(1) == Some(preparation.target_generation)
+                && command.generation == Some(agent.generation),
+        )
+    }
+
+    async fn recover_workspace(
+        &self,
+        preparation: &WorkspacePreparation,
+    ) -> Result<Option<String>> {
+        let stage = preparation
+            .outcome
+            .as_ref()
+            .and_then(|value| value.get("stage"))
+            .and_then(Value::as_str);
+        let readback = preparation.phase == WorkspacePhase::Unknown
+            && (stage == Some("removal") || stage == Some("creation") && !cancelled(preparation));
+        if !readback && !self.pending_start(preparation).await? {
+            return Ok(None);
+        }
+        let slot = self.register_slot(preparation).await?;
+        let _operation = slot.operation.lock().await;
+        if !workspace_git_effect_quiescent(&slot) {
+            return Ok(None);
+        }
+        let git = WorkspaceGit::new()?;
+        if preparation.phase == WorkspacePhase::Unknown {
+            match stage {
+                Some("creation") if !cancelled(preparation) => {
+                    let reuse = preparation
+                        .outcome
+                        .as_ref()
+                        .and_then(|value| value.get("reuse"))
+                        .and_then(Value::as_bool)
+                        == Some(true);
+                    let outcome = if reuse {
+                        git.inspect_retained(preparation).await
+                    } else {
+                        git.inspect(preparation).await
+                    };
+                    if matches!(outcome, WorkspaceCreationOutcome::Verified { .. }) {
+                        let _gate = slot.gate.clone().lock_owned().await;
+                        let mut store = self.inner.store.lock().await;
+                        let change = store.settle_workspace_creation(
+                            &preparation.start_command_id,
+                            preparation.target_generation,
+                            safe_creation(outcome),
+                            now_ms(),
+                        )?;
+                        self.publish(&change.events);
+                    }
+                }
+                Some("removal") => {
+                    let id = preparation
+                        .outcome
+                        .as_ref()
+                        .and_then(|value| value.get("command_id"))
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            problem("source_integrity", "unknown removal has no command id")
+                        })?;
+                    if let outcome @ WorkspaceRemovalOutcome::Removed { .. } =
+                        git.inspect_removal(preparation).await
+                    {
+                        let _gate = slot.gate.clone().lock_owned().await;
+                        let mut store = self.inner.store.lock().await;
+                        let change = store.settle_workspace_removal(
+                            id,
+                            preparation.target_generation,
+                            outcome,
+                            now_ms(),
+                        )?;
+                        self.publish(&change.events);
+                    }
+                }
+                _ => {}
             }
         }
-        Ok(forward)
+        let store = self.inner.store.lock().await;
+        let current = store
+            .get_workspace(&preparation.agent)?
+            .ok_or_else(|| problem("not_found", "workspace disappeared during recovery"))?;
+        drop(store);
+        if self.pending_start(&current).await?
+            && matches!(
+                git.inspect_retained(&current).await,
+                WorkspaceCreationOutcome::Verified { .. }
+            )
+        {
+            return Ok(Some(current.start_command_id));
+        }
+        Ok(None)
     }
 
     pub(crate) fn has_owned_processes(&self) -> bool {
@@ -968,78 +1017,87 @@ impl WorkspaceManager {
         };
         // In-memory custody cancellation must still run if Store cannot read or
         // persist cancellation. Durable unsettled effects remain unknown.
-        let preparations = self.preparations().await.unwrap_or_default();
-        for preparation in preparations {
-            if preparation.phase == WorkspacePhase::Removing {
-                let slot = self.slot(&preparation);
-                let _gate = slot.gate.clone().lock_owned().await;
-                let Some(id) = preparation
-                    .outcome
-                    .as_ref()
-                    .and_then(|value| value.get("command_id"))
-                    .and_then(Value::as_str)
-                else {
-                    continue;
-                };
-                let mut store = self.inner.store.lock().await;
-                let Ok(Some(current)) = store.get_workspace(&preparation.agent) else {
-                    continue;
-                };
-                // A worker may have settled while the preparation snapshot was
-                // collected. Never replace an already uncertain/settled outcome.
-                if current.phase != WorkspacePhase::Removing {
-                    continue;
-                }
-                let Ok(change) = store.settle_workspace_removal(
-                    id,
-                    preparation.target_generation,
-                    slot.refuse_removal(id, &current),
-                    now_ms(),
-                ) else {
-                    continue;
-                };
-                self.publish(&change.events);
-                drop(store);
-                if let Some(active) = slot.active.lock_recover().as_ref() {
-                    active.cancel.send_replace(true);
-                }
-                continue;
-            }
-            let id = if let Some(id) = stop_id(&preparation) {
-                id.to_owned()
-            } else {
-                let mut store = self.inner.store.lock().await;
-                let Ok(Some(start)) = store.get_command(&preparation.start_command_id) else {
-                    continue;
-                };
-                if !matches!(
-                    start.state,
-                    CommandState::Accepted | CommandState::Queued | CommandState::Unknown
-                ) {
-                    continue;
-                }
-                let Ok(Some(agent)) = store.get_agent(&preparation.agent) else {
-                    continue;
-                };
-                let id = Ulid::new().to_string();
-                let request = SubmitCommand {
-                    id: id.clone(),
-                    target: Some(agent.id),
-                    selector: None,
-                    verb: "stop".to_owned(),
-                    args: json!({"force": true}),
-                    expected_generation: Some(agent.generation),
-                    expected_turn_id: None,
-                    request_id: None,
-                    probe: false,
-                };
-                let Ok(admission) = store.submit("owner", request, now_ms()) else {
-                    continue;
-                };
-                self.publish(&admission.events);
-                id
+        let mut after = None;
+        loop {
+            let Ok(page) = self.preparations(after.as_deref()).await else {
+                break;
             };
-            let _ = self.cancel(&id).await;
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().map(|preparation| preparation.agent.clone());
+            for preparation in page {
+                if preparation.phase == WorkspacePhase::Removing {
+                    let slot = self.slot(&preparation);
+                    let _gate = slot.gate.clone().lock_owned().await;
+                    let Some(id) = preparation
+                        .outcome
+                        .as_ref()
+                        .and_then(|value| value.get("command_id"))
+                        .and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    let mut store = self.inner.store.lock().await;
+                    let Ok(Some(current)) = store.get_workspace(&preparation.agent) else {
+                        continue;
+                    };
+                    // A worker may have settled while the preparation snapshot was
+                    // collected. Never replace an already uncertain/settled outcome.
+                    if current.phase != WorkspacePhase::Removing {
+                        continue;
+                    }
+                    let Ok(change) = store.settle_workspace_removal(
+                        id,
+                        preparation.target_generation,
+                        slot.refuse_removal(id, &current),
+                        now_ms(),
+                    ) else {
+                        continue;
+                    };
+                    self.publish(&change.events);
+                    drop(store);
+                    if let Some(active) = slot.active.lock_recover().as_ref() {
+                        active.cancel.send_replace(true);
+                    }
+                    continue;
+                }
+                let id = if let Some(id) = stop_id(&preparation) {
+                    id.to_owned()
+                } else {
+                    let mut store = self.inner.store.lock().await;
+                    let Ok(Some(start)) = store.get_command(&preparation.start_command_id) else {
+                        continue;
+                    };
+                    if !matches!(
+                        start.state,
+                        CommandState::Accepted | CommandState::Queued | CommandState::Unknown
+                    ) {
+                        continue;
+                    }
+                    let Ok(Some(agent)) = store.get_agent(&preparation.agent) else {
+                        continue;
+                    };
+                    let id = Ulid::new().to_string();
+                    let request = SubmitCommand {
+                        id: id.clone(),
+                        target: Some(agent.id),
+                        selector: None,
+                        verb: "stop".to_owned(),
+                        args: json!({"force": true}),
+                        expected_generation: Some(agent.generation),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    };
+                    let Ok(admission) = store.submit("owner", request, now_ms()) else {
+                        continue;
+                    };
+                    self.publish(&admission.events);
+                    id
+                };
+                let _ = self.cancel(&id).await;
+            }
         }
         // Removal cancellation also waits for the owner, without replaying a signal.
         for slot in slots {
@@ -1068,22 +1126,12 @@ impl WorkspaceManager {
         }
     }
 
-    async fn preparations(&self) -> Result<Vec<WorkspacePreparation>> {
-        let mut result = Vec::new();
-        let mut after = None;
-        loop {
-            let page = self
-                .inner
-                .store
-                .lock()
-                .await
-                .list_workspace_preparations(after.as_deref(), PAGE_SIZE)?;
-            if page.is_empty() {
-                return Ok(result);
-            }
-            after = page.last().map(|preparation| preparation.agent.clone());
-            result.extend(page);
-        }
+    async fn preparations(&self, after: Option<&str>) -> Result<Vec<WorkspacePreparation>> {
+        self.inner
+            .store
+            .lock()
+            .await
+            .list_pending_workspace_preparations(after, PAGE_SIZE)
     }
 
     async fn start(&self, id: &str) -> Result<Option<(Agent, WorkspacePreparation)>> {
@@ -1155,7 +1203,59 @@ impl WorkspaceManager {
         if self.inner.startup_closed.load(Ordering::SeqCst) {
             return Err(problem("unavailable", "workspace startup is closed"));
         }
+        self.retire_slots_locked(&preparation.agent).await;
         Ok(self.slot(preparation))
+    }
+
+    async fn retire_slots(&self, agent: &str) {
+        let _startup = self.inner.startup_gate.lock().await;
+        self.retire_slots_locked(agent).await;
+    }
+
+    // Caller holds startup_gate, as do registration, spawn and FORCE's snapshot.
+    // Keep Store through map removal so the retained identity cannot change
+    // between the durable decision and retirement. All slot lookups use this map.
+    async fn retire_slots_locked(&self, agent: &str) {
+        let store = self.inner.store.lock().await;
+        let current = match store.get_workspace(agent) {
+            Ok(current) => current,
+            Err(_) => return,
+        };
+        let needs_current = match current.as_ref() {
+            Some(current) => match current.phase {
+                WorkspacePhase::Removed => false,
+                WorkspacePhase::Ready | WorkspacePhase::Failed => {
+                    match store.get_command(&current.start_command_id) {
+                        Ok(Some(command)) => matches!(
+                            command.state,
+                            CommandState::Accepted | CommandState::Queued | CommandState::Unknown
+                        ),
+                        _ => return,
+                    }
+                }
+                _ => true,
+            },
+            None => false,
+        };
+        self.inner.slots.lock_recover().retain(|key, slot| {
+            if key.agent != agent
+                || (needs_current
+                    && current
+                        .as_ref()
+                        .is_some_and(|current| key.target_generation == current.target_generation))
+            {
+                return true;
+            }
+            // Strong references cover callers waiting on operation/cancel/run.
+            // Checking while holding the lookup map prevents two independent
+            // gates for one key. Unconfirmed custody remains live evidence even
+            // when the durable workspace has advanced to another generation.
+            Arc::strong_count(slot) != 1
+                || Arc::strong_count(&slot.gate) != 1
+                || slot.operation.try_lock().is_err()
+                || slot.active.lock_recover().is_some()
+                || slot.last.lock_recover().is_some_and(|last| !last.quiescent)
+        });
     }
 
     fn publish(&self, events: &[eliot_core::Event]) {
@@ -1208,14 +1308,24 @@ impl WorkspaceManager {
             }
             preparation
         };
-        let slot = self.slot(&preparation);
+        let result = self.cancel_workspace(stop_command_id, &preparation).await;
+        self.retire_slots(&preparation.agent).await;
+        result
+    }
+
+    async fn cancel_workspace(
+        &self,
+        stop_command_id: &str,
+        preparation: &WorkspacePreparation,
+    ) -> Result<bool> {
+        let slot = self.slot(preparation);
         let gate = slot.gate.clone().lock_owned().await;
         let phase = {
             let mut store = self.inner.store.lock().await;
             let current = store
                 .get_workspace(&preparation.agent)?
                 .ok_or_else(|| problem("not_found", "workspace preparation disappeared"))?;
-            require_same(&preparation, &current)?;
+            require_same(preparation, &current)?;
             if cancelled(&current) {
                 if stop_id(&current) != Some(stop_command_id) {
                     return Err(problem(

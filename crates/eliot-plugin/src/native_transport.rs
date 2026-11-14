@@ -26,13 +26,26 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
 };
-use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
+use tokio_util::{
+    bytes::BytesMut,
+    codec::{Decoder, FramedRead, FramedWrite, LinesCodec},
+};
 
 use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
 
 use crate::{StderrCapture, StderrView, spawn_stderr, sync::LockExt};
 
-const MAX_NATIVE_FRAME_BYTES: usize = 1024 * 1024;
+/// Default inbound native frame cap (1 MiB), kept by every adapter without
+/// evidence of larger protocol frames.
+pub const DEFAULT_MAX_NATIVE_FRAME_BYTES: usize = 1024 * 1024;
+/// Largest per-adapter inbound frame cap the pump accepts (16 MiB).
+pub const MAX_SUPPORTED_NATIVE_FRAME_BYTES: usize = 16 * 1024 * 1024;
+/// Leading bytes of an oversized line kept for envelope diagnosis. The
+/// JSON-RPC `method`/`id` head always fits; bodies never do.
+const OVERSIZED_PREFIX_CAP: usize = 2048;
+/// Longest recorded JSON-RPC method name. Protocol tokens are short; longer
+/// or non-token input is treated as not parseable, never stored.
+const OVERSIZED_METHOD_CAP: usize = 64;
 const NATIVE_EVENT_QUEUE: usize = 64;
 const NATIVE_EXIT_DRAIN: Duration = Duration::from_secs(1);
 
@@ -407,11 +420,13 @@ pub enum StreamState {
 /// Fixed classes only: no frame bytes, bodies, or credentials cross here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeStreamFault {
-    /// Tokio's bounded line codec rejected a line over its configured limit.
-    FrameOversized,
-    /// The line codec returned `Io(InvalidData)`, including its UTF-8 decoder path.
+    /// The bounded line reader rejected a line over its configured limit.
+    /// Carries the measured length, the limit, and whatever the bounded
+    /// prefix proved about the JSON-RPC envelope.
+    FrameOversized(OversizedFrame),
+    /// The line reader returned `InvalidData`, including its UTF-8 decoder path.
     FrameInvalidData,
-    /// The line codec returned an I/O error other than `InvalidData`.
+    /// The line reader returned an I/O error other than `InvalidData`.
     FrameIo,
     /// A framed line was not valid JSON.
     Json,
@@ -426,7 +441,7 @@ pub enum NativeStreamFault {
 impl NativeStreamFault {
     pub fn label(self) -> &'static str {
         match self {
-            Self::FrameOversized => "frame_oversized",
+            Self::FrameOversized(_) => "frame_oversized",
             Self::FrameInvalidData => "frame_invalid_data",
             Self::FrameIo => "frame_io",
             Self::Json => "invalid_json",
@@ -435,6 +450,319 @@ impl NativeStreamFault {
             Self::Unclassified => "unclassified",
         }
     }
+
+    /// Bounded, secret-free gap detail. Identical to [`label`](Self::label)
+    /// except an oversized frame appends its measured length, the limit, and
+    /// whatever the bounded prefix proved (envelope kind, token-filtered
+    /// method). Never carries frame bytes, bodies, or credentials.
+    pub fn describe(self) -> String {
+        match self {
+            Self::FrameOversized(detail) => detail.describe(),
+            _ => self.label().to_owned(),
+        }
+    }
+}
+
+/// What the bounded oversized-line prefix proved about the frame's JSON-RPC
+/// envelope. Presence-only: id values are never recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OversizedFrameKind {
+    /// No top-level `method` or `id` key parsed from the prefix.
+    Unknown,
+    /// Top-level `method` without `id`: a server-to-client notification.
+    Notification,
+    /// Top-level `method` and `id`: a server-to-client request.
+    Request,
+    /// Top-level `id` without `method`: a response to one of our own calls.
+    Response,
+}
+
+impl OversizedFrameKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Notification => "notification",
+            Self::Request => "request",
+            Self::Response => "response",
+        }
+    }
+}
+
+/// Bounded, secret-free description of one over-limit native frame.
+/// Fixed shape only: byte counts, the envelope kind the bounded prefix
+/// proved, and an allowlisted method name when one parsed. The method is
+/// recorded only when it exactly matches the caller's per-adapter known
+/// protocol set (plus a token-charset guard), so arbitrary host tokens,
+/// identifiers and free-text bodies can never be recorded here even when
+/// the frame is malformed. `lower_bound` marks lengths observed while the
+/// line was still open (fault published at the threshold): the true line
+/// is at least this long.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OversizedFrame {
+    limit_bytes: u32,
+    length_bytes: u64,
+    kind: OversizedFrameKind,
+    lower_bound: bool,
+    method_len: u8,
+    method_bytes: [u8; OVERSIZED_METHOD_CAP],
+}
+
+impl OversizedFrame {
+    /// Diagnose from a bounded line prefix with an exact length (the line
+    /// ended at a newline or EOF, so its total is known).
+    pub fn parse(
+        limit_bytes: usize,
+        length_bytes: u64,
+        prefix: &[u8],
+        known_methods: &[&str],
+    ) -> Self {
+        let (kind, method) = parse_oversized_prefix(prefix);
+        Self::new(
+            limit_bytes,
+            length_bytes,
+            kind,
+            method.as_deref(),
+            known_methods,
+            false,
+        )
+    }
+
+    /// Diagnose from a bounded prefix while the line is still open: the
+    /// threshold was crossed without a newline, so the length is a lower
+    /// bound (`len>=n` in [`Self::describe`]).
+    pub fn parse_lower_bound(
+        limit_bytes: usize,
+        length_bytes: u64,
+        prefix: &[u8],
+        known_methods: &[&str],
+    ) -> Self {
+        let (kind, method) = parse_oversized_prefix(prefix);
+        Self::new(
+            limit_bytes,
+            length_bytes,
+            kind,
+            method.as_deref(),
+            known_methods,
+            true,
+        )
+    }
+
+    /// Fallback when the line itself is in hand but no prefix was captured.
+    /// Defensive only: the bounded reader always captures a prefix.
+    pub fn unparsed(limit_bytes: usize, length_bytes: u64) -> Self {
+        Self::new(
+            limit_bytes,
+            length_bytes,
+            OversizedFrameKind::Unknown,
+            None,
+            &[],
+            false,
+        )
+    }
+
+    fn new(
+        limit_bytes: usize,
+        length_bytes: u64,
+        kind: OversizedFrameKind,
+        method: Option<&str>,
+        known_methods: &[&str],
+        lower_bound: bool,
+    ) -> Self {
+        let mut method_bytes = [0u8; OVERSIZED_METHOD_CAP];
+        let mut method_len = 0u8;
+        if let Some(name) = method
+            && !name.is_empty()
+            && name.len() <= OVERSIZED_METHOD_CAP
+            && name.bytes().all(is_oversized_method_char)
+            && known_methods.contains(&name)
+        {
+            method_bytes[..name.len()].copy_from_slice(name.as_bytes());
+            method_len = name.len() as u8;
+        }
+        Self {
+            limit_bytes: u32::try_from(limit_bytes).unwrap_or(u32::MAX),
+            length_bytes,
+            kind,
+            lower_bound,
+            method_len,
+            method_bytes,
+        }
+    }
+
+    pub fn limit_bytes(self) -> u32 {
+        self.limit_bytes
+    }
+
+    pub fn length_bytes(self) -> u64 {
+        self.length_bytes
+    }
+
+    pub fn kind(self) -> OversizedFrameKind {
+        self.kind
+    }
+
+    /// True when the length was observed while the line was still open
+    /// (fault published at the threshold): the true line is at least this
+    /// long.
+    pub fn is_lower_bound(self) -> bool {
+        self.lower_bound
+    }
+
+    /// The parsed JSON-RPC method, if one parsed and matched the adapter's
+    /// known protocol set. `None` means absent, unknown, or not allowlisted,
+    /// never a redaction.
+    pub fn method(&self) -> Option<&str> {
+        if self.method_len == 0 {
+            return None;
+        }
+        // Token-filtered ASCII by construction, so this cannot fail.
+        std::str::from_utf8(&self.method_bytes[..usize::from(self.method_len)]).ok()
+    }
+
+    /// Bounded one-line diagnosis, e.g.
+    /// `frame_oversized len=1834521 limit=8388608 kind=response` or
+    /// `frame_oversized len=2100000 limit=8388608 kind=notification method=item/completed`.
+    /// Lower-bound lengths (fault published at the threshold, before the
+    /// newline) render as `len>=n`.
+    pub fn describe(self) -> String {
+        let mut text = format!(
+            "frame_oversized len{}={} limit={} kind={}",
+            if self.lower_bound { ">" } else { "" },
+            self.length_bytes,
+            self.limit_bytes,
+            self.kind.as_str(),
+        );
+        if self.method_len != 0
+            && let Ok(method) =
+                std::str::from_utf8(&self.method_bytes[..usize::from(self.method_len)])
+        {
+            text.push_str(" method=");
+            text.push_str(method);
+        }
+        text
+    }
+}
+
+fn is_oversized_method_char(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-'
+    )
+}
+
+/// Parse a bounded line prefix for the JSON-RPC envelope head. Tracks brace
+/// depth and string state so nested values or string bodies cannot fake
+/// top-level `method`/`id` keys. Returns the envelope kind and the raw
+/// method text (charsets are enforced by [`OversizedFrame`], not here).
+fn parse_oversized_prefix(prefix: &[u8]) -> (OversizedFrameKind, Option<String>) {
+    let mut rest = prefix;
+    while rest.first().is_some_and(|byte| byte.is_ascii_whitespace()) {
+        rest = &rest[1..];
+    }
+    if rest.first() != Some(&b'{') {
+        return (OversizedFrameKind::Unknown, None);
+    }
+    let mut depth = 0u32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut has_id = false;
+    let mut method: Option<String> = None;
+    let mut index = 0;
+    while index < prefix.len() {
+        let byte = prefix[index];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'"' if depth == 1 => {
+                let Some((key, after_key)) = read_oversized_json_string(prefix, index) else {
+                    // Truncated or escaped: resume inside the string.
+                    in_string = true;
+                    index += 1;
+                    continue;
+                };
+                let mut next = after_key;
+                while next < prefix.len() && prefix[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                if prefix.get(next) != Some(&b':') {
+                    index = after_key;
+                    continue;
+                }
+                if key == "id" {
+                    has_id = true;
+                } else if key == "method" && method.is_none() {
+                    let mut value_at = next + 1;
+                    while value_at < prefix.len() && prefix[value_at].is_ascii_whitespace() {
+                        value_at += 1;
+                    }
+                    if prefix.get(value_at) == Some(&b'"')
+                        && let Some((value, _)) = read_oversized_json_string(prefix, value_at)
+                        && !value.is_empty()
+                        && value.len() <= OVERSIZED_METHOD_CAP
+                    {
+                        method = Some(value);
+                    }
+                }
+                index = after_key;
+            }
+            b'"' => {
+                in_string = true;
+                index += 1;
+            }
+            b'{' | b'[' => {
+                depth = depth.saturating_add(1);
+                index += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+    let kind = match (method.is_some(), has_id) {
+        (true, true) => OversizedFrameKind::Request,
+        (true, false) => OversizedFrameKind::Notification,
+        (false, true) => OversizedFrameKind::Response,
+        (false, false) => OversizedFrameKind::Unknown,
+    };
+    (kind, method)
+}
+
+/// Read one JSON string starting at the opening quote. Rejects escapes,
+/// control bytes, non-UTF-8, and truncation: envelope keys and method
+/// tokens never need them, so anything else is simply not parseable.
+fn read_oversized_json_string(bytes: &[u8], start: usize) -> Option<(String, usize)> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut end = start + 1;
+    while end < bytes.len() {
+        match bytes[end] {
+            b'"' => {
+                let raw = bytes.get(start + 1..end)?;
+                if raw.contains(&b'\\') {
+                    return None;
+                }
+                let text = std::str::from_utf8(raw).ok()?.to_owned();
+                return Some((text, end + 1));
+            }
+            0x00..=0x1F => return None,
+            _ => end += 1,
+        }
+    }
+    None
 }
 
 /// One owned native child: process waiter, stdin writer queue, stdout-reader
@@ -1145,7 +1473,7 @@ pub fn encode_frame(server: &'static str, message: &impl Serialize) -> Result<St
             format!("{server} frame could not be encoded"),
         )
     })?;
-    if encoded.len().saturating_add(1) > MAX_NATIVE_FRAME_BYTES {
+    if encoded.len().saturating_add(1) > DEFAULT_MAX_NATIVE_FRAME_BYTES {
         return Err(Error::new(
             "frame_too_large",
             format!("{server} frame exceeds 1 MiB"),
@@ -1161,14 +1489,25 @@ pub fn encode_frame(server: &'static str, message: &impl Serialize) -> Result<St
 /// once; each builds its own client over the returned writer/pending pair.
 /// The caller selects the pump mode explicitly: JSON-RPC keeps
 /// [`PumpMode::LossyOverflow`], only the reply-less stream-json caller
-/// selects [`PumpMode::LosslessBackpressure`].
+/// selects [`PumpMode::LosslessBackpressure`]. The caller also selects the
+/// inbound frame cap: [`DEFAULT_MAX_NATIVE_FRAME_BYTES`] unless the
+/// adapter's native protocol documents larger frames (bounded by
+/// [`MAX_SUPPORTED_NATIVE_FRAME_BYTES`]). The caller also passes its
+/// static known-method allowlist for oversized-frame diagnosis: only these
+/// exact method names are ever recorded, everything else is omitted.
+/// Fenced event consumers may map record-local faults into this same ordered
+/// queue. Other consumers keep their existing watch-only fault contract.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_pumped<Frame, Classify>(
     launch: NativeLaunch,
     policy: SecretPolicy,
     labels: NativeLabels,
     id_prefix: &'static str,
     mode: PumpMode,
+    max_frame_bytes: usize,
+    known_methods: &'static [&'static str],
     classify: Classify,
+    ordered_fault: Option<fn(NativeStreamFault) -> Frame>,
 ) -> Result<(
     NativeChild,
     PendingCalls,
@@ -1179,6 +1518,15 @@ where
     Frame: Send + 'static,
     Classify: FnMut(Value) -> PumpAction<Frame> + Send + 'static,
 {
+    if max_frame_bytes == 0 || max_frame_bytes > MAX_SUPPORTED_NATIVE_FRAME_BYTES {
+        return Err(Error::new(
+            "invalid",
+            format!(
+                "{server} native frame limit is out of bounds",
+                server = labels.server
+            ),
+        ));
+    }
     let (mut transport, stdout) = NativeChild::spawn(launch, policy, labels).await?;
     let process_exit = transport.process_exit_signal();
     let pending = PendingCalls::new(id_prefix, labels, transport.writer().reader_closed_flag());
@@ -1192,7 +1540,10 @@ where
         transport.writer(),
         process_exit,
         mode,
+        max_frame_bytes,
+        known_methods,
         classify,
+        ordered_fault,
     ));
     transport.set_output_reader(output_reader);
     Ok((transport, pending, frame_rx, stream_rx))
@@ -1285,6 +1636,129 @@ async fn send_held_frame<Frame>(
     }
 }
 
+/// What one raw stdout line decode produced. Oversized lines carry their
+/// measured length and a bounded head prefix; nothing else is retained.
+/// `lower_bound` is true when the threshold was crossed while the line was
+/// still open (no newline yet): the true line is at least this long.
+#[derive(Debug)]
+enum BoundedLineError {
+    Oversized {
+        length_bytes: u64,
+        prefix: Vec<u8>,
+        lower_bound: bool,
+    },
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for BoundedLineError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// Length-checked NDJSON line codec with bounded oversized diagnosis.
+/// Lines within the limit decode exactly like [`LinesCodec`] (trailing
+/// `\r` stripped, UTF-8 enforced, and a final lone `\r` at EOF ignored).
+/// A line over the limit fails as soon as the threshold is crossed, even
+/// without a newline, keeping only the first [`OVERSIZED_PREFIX_CAP`]
+/// bytes; the pump reports it once as [`NativeStreamFault::FrameOversized`]
+/// with the observed length marked as a lower bound, so a host that keeps
+/// stdout open can never delay diagnosis or pending-call failure. Buffers
+/// never hold more than the limit plus one read, so a multi-gigabyte line
+/// still holds kilobytes of memory.
+#[derive(Debug)]
+struct BoundedLineCodec {
+    max_frame_bytes: usize,
+}
+
+impl BoundedLineCodec {
+    fn new(max_frame_bytes: usize) -> Self {
+        Self { max_frame_bytes }
+    }
+
+    fn oversized(&self, total: u64, prefix: Vec<u8>, lower_bound: bool) -> BoundedLineError {
+        debug_assert!(prefix.len() <= OVERSIZED_PREFIX_CAP);
+        BoundedLineError::Oversized {
+            length_bytes: total,
+            prefix,
+            lower_bound,
+        }
+    }
+
+    fn decode_content(
+        &self,
+        mut content: &[u8],
+    ) -> std::result::Result<Option<String>, BoundedLineError> {
+        if content.last() == Some(&b'\r') {
+            content = &content[..content.len().saturating_sub(1)];
+        }
+        match std::str::from_utf8(content) {
+            Ok(valid) => Ok(Some(valid.to_owned())),
+            Err(_) => Err(BoundedLineError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "native line is not valid UTF-8",
+            ))),
+        }
+    }
+}
+
+impl Decoder for BoundedLineCodec {
+    type Item = String;
+    type Error = BoundedLineError;
+
+    fn decode(
+        &mut self,
+        src: &mut BytesMut,
+    ) -> std::result::Result<Option<String>, BoundedLineError> {
+        if let Some(newline) = src.iter().position(|byte| *byte == b'\n') {
+            let end = newline.saturating_add(1);
+            if newline.saturating_add(1) > self.max_frame_bytes {
+                let take = newline.min(OVERSIZED_PREFIX_CAP);
+                let prefix = src[..take].to_vec();
+                let _ = src.split_to(end);
+                return Err(self.oversized(end as u64, prefix, false));
+            }
+            let line = src.split_to(end);
+            return self.decode_content(&line[..newline]);
+        }
+        if src.len() > self.max_frame_bytes {
+            // No newline yet and already over the limit: publish the fault
+            // now instead of waiting for a newline or EOF that may never
+            // come. The true line is at least this long.
+            let take = src.len().min(OVERSIZED_PREFIX_CAP);
+            let prefix = src[..take].to_vec();
+            let total = src.len() as u64;
+            src.clear();
+            return Err(self.oversized(total, prefix, true));
+        }
+        Ok(None)
+    }
+
+    fn decode_eof(
+        &mut self,
+        src: &mut BytesMut,
+    ) -> std::result::Result<Option<String>, BoundedLineError> {
+        if src.is_empty() {
+            return Ok(None);
+        }
+        if src.len() == 1 && src[0] == b'\r' {
+            // Match `LinesCodec` 0.7.20: a final lone `\r` at EOF is an
+            // encoding suffix, not an empty frame.
+            src.clear();
+            return Ok(None);
+        }
+        if src.len().saturating_add(1) > self.max_frame_bytes {
+            let take = src.len().min(OVERSIZED_PREFIX_CAP);
+            let prefix = src[..take].to_vec();
+            let total = src.len() as u64;
+            src.clear();
+            return Err(self.oversized(total, prefix, false));
+        }
+        let line = src.split_to(src.len());
+        self.decode_content(&line)
+    }
+}
+
 /// Bounded stdout line pump: length-checked NDJSON lines, protocol
 /// classification of each parsed record, one overflow gap, and a bounded
 /// post-exit drain before any loss conclusion. The classifier owns every
@@ -1298,17 +1772,17 @@ async fn pump_framed_lines<Frame, Classify>(
     writer: NativeWriter,
     mut process_exit: watch::Receiver<Option<ProcessExit>>,
     mode: PumpMode,
+    max_frame_bytes: usize,
+    known_methods: &'static [&'static str],
     mut classify: Classify,
+    ordered_fault: Option<fn(NativeStreamFault) -> Frame>,
 ) -> Result<()>
 where
     Frame: Send + 'static,
     Classify: FnMut(Value) -> PumpAction<Frame>,
 {
     let server = writer.labels.server;
-    let mut reader = FramedRead::new(
-        stdout,
-        LinesCodec::new_with_max_length(MAX_NATIVE_FRAME_BYTES.saturating_sub(1)),
-    );
+    let mut reader = FramedRead::new(stdout, BoundedLineCodec::new(max_frame_bytes));
     let mut overflowed = false;
     let mut exit_deadline = process_exit
         .borrow()
@@ -1379,24 +1853,58 @@ where
             break;
         };
         let line = match line {
-            Ok(line) if line.len().saturating_add(1) <= MAX_NATIVE_FRAME_BYTES => line,
-            Ok(_) => {
+            Ok(line) if line.len().saturating_add(1) <= max_frame_bytes => line,
+            Ok(line) => {
+                // Unreachable through BoundedLineCodec, which rejects
+                // over-limit lines with a captured prefix; kept so no
+                // oversized line can pass undiagnosed.
+                let detail =
+                    OversizedFrame::unparsed(max_frame_bytes, line.len().saturating_add(1) as u64);
                 return Err(mark_stream_malformed(
                     stream,
                     pending,
                     &writer,
-                    NativeStreamFault::FrameOversized,
-                    &format!("{server} stream ended on a frame over the configured limit"),
+                    NativeStreamFault::FrameOversized(detail),
+                    &format!(
+                        "{server} stream ended on an oversized frame ({})",
+                        detail.describe()
+                    ),
                 ));
             }
-            Err(error) => {
+            Err(BoundedLineError::Oversized {
+                length_bytes,
+                prefix,
+                lower_bound,
+            }) => {
+                let detail = if lower_bound {
+                    OversizedFrame::parse_lower_bound(
+                        max_frame_bytes,
+                        length_bytes,
+                        &prefix,
+                        known_methods,
+                    )
+                } else {
+                    OversizedFrame::parse(max_frame_bytes, length_bytes, &prefix, known_methods)
+                };
+                return Err(mark_stream_malformed(
+                    stream,
+                    pending,
+                    &writer,
+                    NativeStreamFault::FrameOversized(detail),
+                    &format!(
+                        "{server} stream ended on an oversized frame ({})",
+                        detail.describe()
+                    ),
+                ));
+            }
+            Err(BoundedLineError::Io(error)) => {
                 let fault = native_codec_fault(error);
                 return Err(mark_stream_malformed(
                     stream,
                     pending,
                     &writer,
                     fault,
-                    &format!("{server} line codec failed ({})", fault.label()),
+                    &format!("{server} line codec failed ({})", fault.describe()),
                 ));
             }
         };
@@ -1406,6 +1914,12 @@ where
                 // Record-local: the bounded UTF-8 line boundary is proven, so
                 // record the typed fault, fail current pending Unknown, and
                 // keep this same reader routing later well-formed records.
+                overflowed = queue_ordered_fault(
+                    &frames,
+                    ordered_fault,
+                    NativeStreamFault::Json,
+                    overflowed,
+                );
                 record_stream_fault(
                     &stream,
                     &pending,
@@ -1447,6 +1961,12 @@ where
                 // Record-local envelope fault: same bounded-line boundary as
                 // invalid JSON above; record typed fault, fail current
                 // pending Unknown, continue with later well-formed records.
+                overflowed = queue_ordered_fault(
+                    &frames,
+                    ordered_fault,
+                    NativeStreamFault::Envelope,
+                    overflowed,
+                );
                 record_stream_fault(&stream, &pending, NativeStreamFault::Envelope, &message);
                 recorded_fault = true;
             }
@@ -1484,13 +2004,24 @@ where
     Ok(())
 }
 
-fn native_codec_fault(error: LinesCodecError) -> NativeStreamFault {
-    match error {
-        LinesCodecError::MaxLineLengthExceeded => NativeStreamFault::FrameOversized,
-        LinesCodecError::Io(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-            NativeStreamFault::FrameInvalidData
-        }
-        LinesCodecError::Io(_) => NativeStreamFault::FrameIo,
+/// A fenced terminal response shares this queue with its preceding updates.
+/// Put record-local faults on that same boundary before publishing the watch,
+/// so the consumer never applies a later fault to an earlier terminal. If the
+/// marker cannot fit, preserve the queued prefix and suppress subsequent emits.
+fn queue_ordered_fault<Frame>(
+    frames: &mpsc::Sender<Frame>,
+    make_frame: Option<fn(NativeStreamFault) -> Frame>,
+    fault: NativeStreamFault,
+    overflowed: bool,
+) -> bool {
+    overflowed || make_frame.is_some_and(|make| frames.try_send(make(fault)).is_err())
+}
+
+fn native_codec_fault(error: std::io::Error) -> NativeStreamFault {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        NativeStreamFault::FrameInvalidData
+    } else {
+        NativeStreamFault::FrameIo
     }
 }
 
@@ -1524,6 +2055,45 @@ fn record_stream_fault(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_fault_keeps_terminal_prefix_ahead_of_fault_and_suffix() {
+        let (frames, mut received) = mpsc::channel(3);
+        frames.try_send("terminal").unwrap();
+        assert!(!queue_ordered_fault(
+            &frames,
+            Some(NativeStreamFault::label),
+            NativeStreamFault::Json,
+            false,
+        ));
+        frames.try_send("later response").unwrap();
+        assert_eq!(received.try_recv().unwrap(), "terminal");
+        assert_eq!(received.try_recv().unwrap(), "invalid_json");
+        assert_eq!(received.try_recv().unwrap(), "later response");
+    }
+
+    #[test]
+    fn full_ordered_fault_queue_preserves_prefix_and_latches_overflow() {
+        let (frames, mut received) = mpsc::channel(1);
+        frames.try_send("terminal").unwrap();
+        let overflowed = queue_ordered_fault(
+            &frames,
+            Some(NativeStreamFault::label),
+            NativeStreamFault::Envelope,
+            false,
+        );
+        assert!(overflowed);
+        assert_eq!(received.try_recv().unwrap(), "terminal");
+        // Once a fault marker was lost, the pump keeps its overflow fence even
+        // if queue space reappears; later emits cannot cross the missing gap.
+        assert!(queue_ordered_fault(
+            &frames,
+            Some(NativeStreamFault::label),
+            NativeStreamFault::Json,
+            overflowed,
+        ));
+        assert!(received.try_recv().is_err());
+    }
 
     #[cfg(unix)]
     fn exit_status() -> ExitStatus {
@@ -1568,5 +2138,257 @@ mod tests {
         let (_exit_tx, exit_rx) = watch::channel(None);
         let status = read_process_exit(&exit_rx, "Test").expect("pending");
         assert!(status.is_none());
+    }
+
+    /// Adapter-shaped allowlist for these unit tests: mirrors the
+    /// Muse/Codex inbound sets relevant to the fixtures below.
+    const TEST_KNOWN_METHODS: &[&str] = &["item/completed", "approval/request"];
+
+    #[test]
+    fn oversized_prefix_parses_notification_method() {
+        let prefix =
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"item/completed\",\"params\":{\"sessionId\":\"s\"}}";
+        let detail = OversizedFrame::parse(1024 * 1024, 2_000_000, prefix, TEST_KNOWN_METHODS);
+        assert_eq!(detail.length_bytes(), 2_000_000);
+        assert_eq!(detail.limit_bytes(), 1024 * 1024);
+        assert_eq!(detail.kind(), OversizedFrameKind::Notification);
+        assert!(!detail.is_lower_bound());
+        assert_eq!(detail.method(), Some("item/completed"));
+        let text = detail.describe();
+        assert!(text.contains("len=2000000"), "{text}");
+        assert!(!text.contains("len>="), "{text}");
+        assert!(text.contains("limit=1048576"), "{text}");
+        assert!(text.contains("kind=notification"), "{text}");
+        assert!(text.contains("method=item/completed"), "{text}");
+        assert_eq!(
+            NativeStreamFault::FrameOversized(detail).label(),
+            "frame_oversized"
+        );
+    }
+
+    #[test]
+    fn oversized_prefix_parses_response_without_method() {
+        let prefix = br#"{"jsonrpc":"2.0","id":"muse-42","result":{"session":{"sessionId":"s"}}"#;
+        let detail = OversizedFrame::parse(8 * 1024 * 1024, 9_000_000, prefix, TEST_KNOWN_METHODS);
+        assert_eq!(detail.kind(), OversizedFrameKind::Response);
+        assert_eq!(detail.method(), None);
+        let text = detail.describe();
+        assert!(text.contains("kind=response"), "{text}");
+        assert!(!text.contains("method="), "{text}");
+    }
+
+    #[test]
+    fn oversized_prefix_parses_request_with_id() {
+        let prefix = br#"{"jsonrpc":"2.0","id":7,"method":"approval/request","params":{}}"#;
+        let detail = OversizedFrame::parse(1024 * 1024, 2_000_000, prefix, TEST_KNOWN_METHODS);
+        assert_eq!(detail.kind(), OversizedFrameKind::Request);
+        assert_eq!(detail.method(), Some("approval/request"));
+    }
+
+    #[test]
+    fn oversized_detail_never_carries_body_or_secrets() {
+        // Free-text bodies fail the token filter, so no method is recorded,
+        // and the description never contains body bytes.
+        let secret = "sekrit body payload 12345";
+        let prefix =
+            format!(r#"{{"jsonrpc":"2.0","method":"{secret}","params":{{"text":"{secret}"}}}}"#);
+        let detail = OversizedFrame::parse(
+            1024 * 1024,
+            5_000_000,
+            prefix.as_bytes(),
+            TEST_KNOWN_METHODS,
+        );
+        assert_eq!(detail.method(), None);
+        let text = detail.describe();
+        assert!(!text.contains(secret), "{text}");
+        assert!(text.len() < 256, "{text}");
+
+        // A token-shaped but unallowlisted method is omitted: only the
+        // envelope kind and lengths are recorded, never the token, the
+        // surrounding body or the id value.
+        let prefix = format!(
+            r#"{{"jsonrpc":"2.0","id":"muse-9","method":"sekrit-token","params":{{"text":"{secret}"}}}}"#
+        );
+        let detail = OversizedFrame::parse(
+            1024 * 1024,
+            5_000_000,
+            prefix.as_bytes(),
+            TEST_KNOWN_METHODS,
+        );
+        assert_eq!(detail.kind(), OversizedFrameKind::Request);
+        assert_eq!(detail.method(), None);
+        let text = detail.describe();
+        assert!(!text.contains("sekrit-token"), "{text}");
+        assert!(!text.contains(secret), "{text}");
+        assert!(!text.contains("muse-9"), "{text}");
+        assert!(!text.contains("method="), "{text}");
+        assert!(text.len() < 256, "{text}");
+
+        // An allowlisted method records only the method name itself.
+        let prefix = format!(
+            r#"{{"jsonrpc":"2.0","id":"muse-9","method":"approval/request","params":{{"text":"{secret}"}}}}"#
+        );
+        let detail = OversizedFrame::parse(
+            1024 * 1024,
+            5_000_000,
+            prefix.as_bytes(),
+            TEST_KNOWN_METHODS,
+        );
+        assert_eq!(detail.kind(), OversizedFrameKind::Request);
+        assert_eq!(detail.method(), Some("approval/request"));
+        let text = detail.describe();
+        assert!(text.contains("method=approval/request"), "{text}");
+        assert!(!text.contains(secret), "{text}");
+        assert!(!text.contains("muse-9"), "{text}");
+        assert!(text.len() < 256, "{text}");
+    }
+
+    #[test]
+    fn oversized_method_outside_allowlist_is_omitted() {
+        // A well-formed token that is not a known protocol method carries
+        // no diagnosis value and could be an identifier: omit it while
+        // keeping the kind and length.
+        let prefix = b"{\"jsonrpc\":\"2.0\",\"method\":\"session/evil\",\"params\":{\"x\":1}}";
+        let detail = OversizedFrame::parse(1024 * 1024, 2_000_000, prefix, TEST_KNOWN_METHODS);
+        assert_eq!(detail.kind(), OversizedFrameKind::Notification);
+        assert_eq!(detail.method(), None);
+        let text = detail.describe();
+        assert!(text.contains("kind=notification"), "{text}");
+        assert!(!text.contains("session/evil"), "{text}");
+        assert!(!text.contains("method="), "{text}");
+    }
+
+    #[test]
+    fn oversized_lower_bound_marks_length_as_minimum() {
+        let prefix = b"{\"jsonrpc\":\"2.0\",\"method\":\"item/completed\",\"params\":{\"text\":\"";
+        let detail = OversizedFrame::parse_lower_bound(32, 33, prefix, TEST_KNOWN_METHODS);
+        assert!(detail.is_lower_bound());
+        assert_eq!(detail.method(), Some("item/completed"));
+        let text = detail.describe();
+        assert!(text.contains("len>=33"), "{text}");
+        assert!(!text.contains("len=33 limit"), "{text}");
+
+        let exact = OversizedFrame::parse(1024 * 1024, 2_000_000, prefix, TEST_KNOWN_METHODS);
+        assert!(!exact.is_lower_bound());
+        assert!(exact.describe().contains("len=2000000"), "{exact:?}");
+    }
+
+    #[test]
+    fn oversized_prefix_ignores_nested_method_keys() {
+        let prefix = br#"{"jsonrpc":"2.0","id":"muse-1","result":{"method":"not-a-real-method","items":[]}}"#;
+        let detail = OversizedFrame::parse(1024 * 1024, 2_000_000, prefix, TEST_KNOWN_METHODS);
+        assert_eq!(detail.kind(), OversizedFrameKind::Response);
+        assert_eq!(detail.method(), None);
+    }
+
+    #[test]
+    fn bounded_codec_reports_oversized_at_threshold_without_newline() {
+        use tokio_util::codec::Decoder;
+        // The fault publishes as soon as the buffered bytes cross the cap,
+        // even while the host keeps stdout open with no newline: the length
+        // is a lower bound and only the bounded prefix is kept.
+        let mut codec = BoundedLineCodec::new(64);
+        let mut src = BytesMut::from(&b"{\"jsonrpc\":\"2.0\",\"method\":\""[..]);
+        assert!(codec.decode(&mut src).expect("need more").is_none());
+        src.extend_from_slice(b"item/completed\",\"params\":{\"text\":\"");
+        assert!(codec.decode(&mut src).expect("need more").is_none());
+        src.extend_from_slice(&[b'x'; 64]);
+        let error = codec.decode(&mut src).expect_err("oversized at threshold");
+        let BoundedLineError::Oversized {
+            length_bytes,
+            prefix,
+            lower_bound,
+        } = error
+        else {
+            panic!("expected oversized, got Io");
+        };
+        assert!(lower_bound);
+        assert!(length_bytes > 64, "{length_bytes}");
+        assert!(prefix.len() <= OVERSIZED_PREFIX_CAP);
+        assert!(prefix.starts_with(b"{\"jsonrpc\""));
+        // The over-limit bytes were consumed with the fault: a following
+        // well-formed line still decodes.
+        src.extend_from_slice(b"{}\n");
+        let line = codec
+            .decode(&mut src)
+            .expect("valid line")
+            .expect("one line");
+        assert_eq!(line, "{}");
+    }
+
+    #[test]
+    fn bounded_codec_reports_newline_oversized_with_exact_length() {
+        use tokio_util::codec::Decoder;
+        // A short line that ends at a newline over the cap carries its
+        // exact total, not a lower bound.
+        let mut codec = BoundedLineCodec::new(8);
+        let mut src = BytesMut::from(&b"{\"a\":12}\n"[..]);
+        let error = codec.decode(&mut src).expect_err("oversized");
+        let BoundedLineError::Oversized {
+            length_bytes,
+            lower_bound,
+            ..
+        } = error
+        else {
+            panic!("expected oversized, got Io");
+        };
+        assert!(!lower_bound);
+        assert_eq!(length_bytes, 9);
+    }
+
+    #[test]
+    fn bounded_codec_ignores_lone_cr_at_eof_like_lines_codec() {
+        use tokio_util::codec::Decoder;
+        // Parity with `LinesCodec` 0.7.20: a final lone `\r` at EOF is an
+        // encoding suffix, not an empty frame.
+        let mut codec = BoundedLineCodec::new(1024 * 1024);
+        let mut src = BytesMut::from(&b"\r"[..]);
+        assert!(
+            codec
+                .decode_eof(&mut src)
+                .expect("lone CR is ignored")
+                .is_none()
+        );
+        assert!(src.is_empty());
+        // A real payload ending in `\r` at EOF still strips to its content.
+        let mut src = BytesMut::from(&b"{}\r"[..]);
+        let line = codec
+            .decode_eof(&mut src)
+            .expect("valid line")
+            .expect("one line");
+        assert_eq!(line, "{}");
+    }
+
+    #[test]
+    fn bounded_codec_within_limit_matches_lines_codec() {
+        use tokio_util::codec::Decoder;
+        let mut codec = BoundedLineCodec::new(1024 * 1024);
+        let mut src = BytesMut::from(&b"{}\r\n"[..]);
+        let line = codec
+            .decode(&mut src)
+            .expect("valid line")
+            .expect("one line");
+        assert_eq!(line, "{}");
+        let mut src = BytesMut::from(&b"{\"a\":1}\n trailing"[..]);
+        let line = codec
+            .decode(&mut src)
+            .expect("valid line")
+            .expect("one line");
+        assert_eq!(line, "{\"a\":1}");
+    }
+
+    #[test]
+    fn bounded_codec_rejects_invalid_utf8_like_lines_codec() {
+        use tokio_util::codec::Decoder;
+        let mut codec = BoundedLineCodec::new(1024 * 1024);
+        let mut src = BytesMut::from(&[0xFF, 0xFE, b'\n'][..]);
+        let error = codec.decode(&mut src).expect_err("invalid utf-8");
+        let BoundedLineError::Io(error) = error else {
+            panic!("expected Io variant");
+        };
+        assert_eq!(
+            native_codec_fault(error).label(),
+            NativeStreamFault::FrameInvalidData.label()
+        );
     }
 }
