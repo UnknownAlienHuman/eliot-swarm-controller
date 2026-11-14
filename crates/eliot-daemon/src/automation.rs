@@ -2770,13 +2770,7 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
                 .target
                 .unwrap();
             store.dispatch(&seed_id, now_ms()).unwrap();
-            crate::test_support::install_fixture_sources(
-                &mut store,
-                &agent,
-                &seed_id,
-                1,
-                now_ms(),
-            );
+            crate::test_support::install_fixture_sources(&mut store, &agent, &seed_id, 1, now_ms());
             store
                 .put_batch(
                     eliot_core::SourceBatch {
