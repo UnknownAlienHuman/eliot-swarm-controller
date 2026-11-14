@@ -168,6 +168,13 @@ async fn run_owned(
             crate::router::run_mail_reoffer(mail_router, mail_shutdown).await
         });
     }
+    {
+        let digest_router = router.clone();
+        let digest_shutdown = attention_stop.subscribe();
+        attention_tasks.spawn(async move {
+            crate::router::run_completion_digest(digest_router, digest_shutdown).await
+        });
+    }
     let mut recovery = JoinSet::new();
     let recovery_router = router.clone();
     recovery.spawn(async move { ("workspace", recovery_router.recover_workspaces().await) });

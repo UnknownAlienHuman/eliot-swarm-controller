@@ -3,6 +3,7 @@
 
 mod agent_views;
 mod coordination;
+mod digests;
 pub mod discovery;
 mod git;
 mod goals;
@@ -46,6 +47,10 @@ pub use coordination::{
     VarDefinitionArgs, VarGetRequest, VarGetResponse, VarScope, VarSetRequest, VarSetResponse,
     WhoRequest, WhoResponse, WhoSharedWorkspace, WhoWorker, claim_glob_matches,
     claim_globs_overlap, claim_globs_overlap_normalized, normalize_claim_glob, parse_var_scope,
+};
+pub use digests::{
+    DIGEST_THREAD_PREFIX, SwarmDigestRequest, SwarmDigestResponse, digest_mode_completed,
+    digest_text, digest_thread,
 };
 pub use git::{
     DEFAULT_GIT_FETCH_TIMEOUT_MS, FrozenGitFetch, GitFetchDefinitionArgs, GitFetchOutcome,

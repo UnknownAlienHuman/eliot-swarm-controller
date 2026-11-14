@@ -16,6 +16,7 @@ pub use context::ContextDispatch;
 pub use coordination::{
     MailSendOutcome, MailSendResult, NoticeClaim, NoticeKind, NoticePending, NoticeState,
 };
+pub use digests::{DigestRegisterOutcome, DigestRow, DigestTurn};
 pub use goals::{
     GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundClaim, GoalRoundCommit,
     GoalRoundCommitResult, GoalRoundKey, GoalRoundProbe,
@@ -123,6 +124,7 @@ mod attribution;
 mod command_children;
 mod context;
 mod coordination;
+mod digests;
 mod dispatch;
 mod git;
 mod goals;

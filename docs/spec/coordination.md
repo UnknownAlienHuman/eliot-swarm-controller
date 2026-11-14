@@ -108,6 +108,15 @@ include a short bounded diagnosis from the structured report and point to the
 `x.user.agent.attention` event for details. They contain no native transcript and never
 replay the Agent's prompt or job.
 
+A completion digest (`swarm.digest`, see [api](api.md#waiting)) reuses the same
+ordinary queued mail and wake policy for a different purpose: exactly one coalesced
+parent result when a captured child set satisfies `all`/`any`. The digest mail id is
+the digest registration id, so a reconnect or restart replays the same mail id and
+the existing mail stable effect identity makes the retry a no-op. The thread is
+`completion-<id-prefix>` (never `attention-*`, never `-advisory`), the body lists
+every frozen entry outcome, and no attention event is emitted: a successful
+completion stays distinct from an attention incident.
+
 ### Read and acknowledgement
 
 `mail.inbox` returns at most 100 unread rows within the encoded frame limit for the
