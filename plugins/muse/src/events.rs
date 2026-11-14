@@ -27,6 +27,7 @@ use self::workflow_child::{
     child_event_id, complete_event_data, is_admission_rejection, is_workflow_item_frame,
     muse_child_key, register_child, should_bypass_parent_buffer, start_event_data,
 };
+use crate::host::{MAX_VIEW_PAGES, VIEW_PAGE_SIZE};
 use crate::native::{
     NativeClient, NativeFrame, StreamState, native_error_code,
     requests::{
@@ -41,8 +42,9 @@ use crate::native::{
         NativeSessionContextUsageNotification, NativeSessionStartedNotification,
         NativeSessionTokenUsageNotification, NativeSessionViewHealthChangedNotification,
         NativeTurnCompletedNotification, NativeTurnError, NativeTurnStartedNotification,
-        NativeTurnTerminal, NativeUserInputAnswerResult, NativeUserInputCancelResult,
-        NativeUserInputSettledNotification, NativeViewHealth, NativeViewSubscribeParams,
+        NativeTurnTerminal, NativeUnframedViewEvent, NativeUserInputAnswerResult,
+        NativeUserInputCancelResult, NativeUserInputSettledNotification, NativeViewHealth,
+        NativeViewPageParams, NativeViewPageResult, NativeViewSubscribeParams,
         NativeViewSubscribeResult, NativeWorkflowChild, NativeWorkflowItemNotification,
         session_usage_from_context_usage, session_usage_from_token_usage, turn_usage,
     },
@@ -73,6 +75,11 @@ const PATCH_READ_BYTES: i64 = 128 * 1024;
 /// RPC timeout; expiry keeps today's empty-paths coverage gap instead of
 /// stalling the loop behind a hung host.
 const PATCH_READ_DEADLINE: Duration = Duration::from_secs(10);
+/// Deadline for one recovery `view/page` fetch. The event actor stalls while
+/// a page is in flight, so the bound mirrors the patch read: expiry already
+/// fired, and a hung page behind a projection-failed host must not stall the
+/// loop past one bounded wait per page.
+const RECOVERY_PAGE_DEADLINE: Duration = Duration::from_secs(10);
 
 struct ViewRecovery {
     head: Option<String>,
@@ -3756,17 +3763,149 @@ impl EventProcessor {
         }
     }
 
-    /// Settle the projection-gapped turn `unknown` through the shared
-    /// turn-unknown path, never as success or failure. The plugin host stays
-    /// alive and the Agent is not marked lost: only the active turn is
-    /// cleared, so a later replayed terminal for the same turn gaps instead
-    /// of resurrecting it, and a later stop settles the session normally.
-    /// Idempotent: with no active turn there is nothing to settle. The local
-    /// binding drops only after the terminal write is acknowledged; a failed
-    /// commit (for example a lost gap ack latching `writes_blocked` so
-    /// `turn.unknown` cannot be submitted) keeps the binding and re-arms an
-    /// expiry so the next opportunity retries instead of stranding the
-    /// Store's running turn while the adapter looks idle.
+    /// One backward `view/page` fetch for recovery, newest records first.
+    /// `None` cursor starts at the view head; the caller chains
+    /// `next_cursor` exactly like the snapshot readback. Read-only: changes
+    /// no session/turn/input state.
+    async fn read_recovery_page(
+        &self,
+        session_id: &str,
+        cursor: Option<String>,
+    ) -> Result<NativeViewPageResult> {
+        let params = NativeViewPageParams {
+            session_id: session_id.to_owned(),
+            limit: VIEW_PAGE_SIZE,
+            direction: Some("backward".to_owned()),
+            cursor,
+        };
+        let params = serde_json::to_value(params)
+            .map_err(|_| Error::new("internal", "Muse view/page params could not be encoded"))?;
+        serde_json::from_value(
+            self.native
+                .call("view/page", params, Instant::now() + RECOVERY_PAGE_DEADLINE)
+                .await?,
+        )
+        .map_err(|_| Error::new("native_readback", "Muse view/page response was invalid"))
+    }
+
+    /// Durable terminal proof for the exact active turn, paged newest-first
+    /// from the retained view: the raw `turn/completed` params plus the raw
+    /// `item/completed` agentMessage params carrying the latest final text
+    /// when the durable view holds one. `None` when no bounded page proves
+    /// the terminal — the turn may still be running, the projection may be
+    /// gone entirely, or an exact-turn record may be undecodable. Never
+    /// synthesizes: only records the native view durably holds.
+    async fn readback_projection_terminal(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Option<(Value, Option<Value>)> {
+        let mut scan = RecoveryScan::default();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        for _ in 0..MAX_VIEW_PAGES {
+            let page = self
+                .read_recovery_page(session_id, cursor.clone())
+                .await
+                .ok()?;
+            for event in &page.events {
+                match fold_recovery_event(&mut scan, event, session_id, turn_id) {
+                    RecoveryFold::Complete => {
+                        return scan
+                            .turn_params
+                            .map(|terminal| (terminal, scan.message_params));
+                    }
+                    RecoveryFold::Unproven => return None,
+                    RecoveryFold::Continue => {}
+                }
+            }
+            match page.next_cursor {
+                Some(next) if !next.is_empty() && seen_cursors.insert(next.clone()) => {
+                    cursor = Some(next);
+                }
+                // No (or a repeated) cursor: no older page can prove more.
+                // A proven terminal still returns below; otherwise the
+                // terminal stays unproven.
+                _ => break,
+            }
+        }
+        scan.turn_params
+            .map(|terminal| (terminal, scan.message_params))
+    }
+
+    /// Commit a durably proven terminal for the projection-gapped active
+    /// turn through the exact live shapes — the final message first (when
+    /// the durable view proved one), then the terminal — and retire the
+    /// recovery deadline. Never replays a prompt and never fabricates a
+    /// terminal: every committed fact re-parses through the live commit
+    /// paths, which re-validate the exact session/turn binding. The recorded
+    /// source gap and stale health stay latched (private readback cannot
+    /// clear a live-source gap), and later facts for the turn still gap
+    /// instead of resurrecting it. Recovered records are marked applied so a
+    /// later live replay of the same revision skips normalization instead of
+    /// recommitting the native id. Returns false when nothing was proven or
+    /// the terminal would not persist, so the caller still settles unknown.
+    async fn recover_projection_terminal(&mut self) -> bool {
+        let (Some(session_id), Some(turn_id)) = (
+            self.status.session_id.clone(),
+            self.status.active_turn_id.clone(),
+        ) else {
+            return false;
+        };
+        let Some((turn_params, message_params)) = self
+            .readback_projection_terminal(&session_id, &turn_id)
+            .await
+        else {
+            return false;
+        };
+        if let Some(params) = message_params.clone()
+            && let Ok(message) =
+                serde_json::from_value::<NativeItemCompletedNotification>(params.clone())
+            && let Some(text) = message.item.text.clone()
+            && self
+                .complete_message(&turn_id, &message.item.item_id, &text)
+                .await
+                .is_ok()
+            && let Some(cursor) = params.get("viewCursor").and_then(Value::as_str)
+            && !cursor.trim().is_empty()
+        {
+            self.applied_view_cursors
+                .insert(applied_fact_key("item/completed", cursor, &params));
+        }
+        if self.complete_turn(turn_params.clone()).await.is_err() {
+            return false;
+        }
+        if let Some(cursor) = turn_params.get("viewCursor").and_then(Value::as_str)
+            && !cursor.trim().is_empty()
+        {
+            self.applied_view_cursors.insert(applied_fact_key(
+                "turn/completed",
+                cursor,
+                &turn_params,
+            ));
+        }
+        self.view_recovery = None;
+        if let Some(reason) = self.status.view_unavailable_reason {
+            self.status.failure = Some(format!(
+                "Muse native view is unavailable ({})",
+                reason.label()
+            ));
+        }
+        true
+    }
+
+    /// Settle the projection-gapped turn: first attempt durable recovery of
+    /// the exact terminal from the retained view, and only then settle
+    /// `unknown` through the shared turn-unknown path, never as success or
+    /// failure. The plugin host stays alive and the Agent is not marked lost:
+    /// only the active turn is cleared, so a later replayed terminal for the
+    /// same turn gaps instead of resurrecting it, and a later stop settles
+    /// the session normally. Idempotent: with no active turn there is nothing
+    /// to settle. The local binding drops only after the terminal write is
+    /// acknowledged; a failed commit (for example a lost gap ack latching
+    /// `writes_blocked` so `turn.unknown` cannot be submitted) keeps the
+    /// binding and re-arms an expiry so the next opportunity retries instead
+    /// of stranding the Store's running turn while the adapter looks idle.
     async fn settle_projection_gap_unknown(&mut self) {
         let (Some(command_id), Some(turn_id)) = (
             self.status.active_command_id.clone(),
@@ -3774,6 +3913,14 @@ impl EventProcessor {
         ) else {
             return;
         };
+        // The live view is lost, but the durable view may still hold the
+        // exact terminal: page it before giving the turn up for unknown. A
+        // proven terminal commits through the exact live shapes with the real
+        // final message and retires recovery; only an unproven terminal
+        // settles unknown below.
+        if self.recover_projection_terminal().await {
+            return;
+        }
         let reason_label = self
             .status
             .view_unavailable_reason
@@ -3795,8 +3942,9 @@ impl EventProcessor {
                 .is_ok(),
             Err(_) => false,
         };
-        // No event-batch readback handle is retained on this path, so nothing
-        // is readback-proven here; see the health readback for that pattern.
+        // Durable recovery above either committed the proven terminal (and
+        // returned) or proved nothing, so only the acknowledged unknown write
+        // clears the binding here.
         if !unknown_settlement_clears(acknowledged, false) {
             self.status.failure = Some(reason);
             self.view_recovery = Some(ViewRecovery {
@@ -4005,6 +4153,85 @@ fn validate_session_and_turn(status: &EventStatus, session_id: &str, turn_id: &s
 /// leaves the committed `turn.started` with no settlement deadline.
 fn should_arm_recovery_after_associate(status: &EventStatus, has_recovery: bool) -> bool {
     status.view_unavailable && !has_recovery && status.active_turn_id.is_some()
+}
+
+/// Durable terminal proof accumulated across `view/page` records for the
+/// exact active turn, newest first. Raw params only: the commit path
+/// re-parses and re-validates everything through the exact live shapes, so
+/// recovery can never synthesize a terminal the durable view does not hold.
+#[derive(Default)]
+struct RecoveryScan {
+    turn_params: Option<Value>,
+    message_params: Option<Value>,
+}
+
+/// One recovery-fold step over a single durable view record.
+enum RecoveryFold {
+    /// Keep paging: nothing decisive yet.
+    Continue,
+    /// Terminal and final message both proven; stop paging.
+    Complete,
+    /// An exact-turn record disproves provability (malformed or unknown
+    /// terminal): stop paging, the terminal stays unproven.
+    Unproven,
+}
+
+/// Fold one durable `view/page` record into the recovery scan. The caller
+/// iterates newest-first so the first (newest) terminal and final
+/// agentMessage win, mirroring live replacement of `final_text`. Records for
+/// other sessions or turns are skipped. A record this turn cannot decode —
+/// or an unknown terminal for this turn — ends provability instead of
+/// guessing, exactly like the snapshot readback treats an undecodable
+/// exact-turn record as unproven.
+fn fold_recovery_event(
+    scan: &mut RecoveryScan,
+    event: &NativeUnframedViewEvent,
+    session_id: &str,
+    turn_id: &str,
+) -> RecoveryFold {
+    match event.method.as_str() {
+        "turn/completed" => {
+            let Ok(completed) =
+                serde_json::from_value::<NativeTurnCompletedNotification>(event.params.clone())
+            else {
+                return RecoveryFold::Unproven;
+            };
+            if completed.session_id != session_id || completed.turn_id != turn_id {
+                return RecoveryFold::Continue;
+            }
+            if completed.terminal == NativeTurnTerminal::Unknown {
+                return RecoveryFold::Unproven;
+            }
+            if scan.turn_params.is_none() {
+                scan.turn_params = Some(event.params.clone());
+            }
+        }
+        "item/completed" => {
+            let Ok(completed) =
+                serde_json::from_value::<NativeItemCompletedNotification>(event.params.clone())
+            else {
+                return RecoveryFold::Unproven;
+            };
+            if completed.session_id != session_id
+                || completed.item.kind != "agentMessage"
+                || completed.item.turn_id.as_deref() != Some(turn_id)
+            {
+                return RecoveryFold::Continue;
+            }
+            if scan.message_params.is_none()
+                && let Some(text) = completed.item.text.as_deref()
+                && text.len() <= MAX_EVENT_BYTES
+            {
+                scan.message_params = Some(event.params.clone());
+            }
+        }
+        _ => {}
+    }
+    if scan.turn_params.is_some() && scan.message_params.is_some() {
+        RecoveryFold::Complete
+    } else {
+        RecoveryFold::Continue
+    }
 }
 
 /// Whether a projection-gap unknown settlement may drop the local turn
@@ -5209,5 +5436,282 @@ mod tests {
         // Readback-proven persistence also clears, without a fresh ack.
         assert!(unknown_settlement_clears(false, true));
         assert!(unknown_settlement_clears(true, true));
+    }
+
+    fn recovery_event(method: &str, params: Value) -> NativeUnframedViewEvent {
+        NativeUnframedViewEvent {
+            method: method.to_owned(),
+            params,
+        }
+    }
+
+    fn fold_recovery_all(
+        events: &[NativeUnframedViewEvent],
+        session_id: &str,
+        turn_id: &str,
+    ) -> (RecoveryScan, RecoveryFold) {
+        let mut scan = RecoveryScan::default();
+        let mut folded = RecoveryFold::Continue;
+        for event in events {
+            folded = fold_recovery_event(&mut scan, event, session_id, turn_id);
+            if matches!(folded, RecoveryFold::Complete | RecoveryFold::Unproven) {
+                break;
+            }
+        }
+        (scan, folded)
+    }
+
+    #[test]
+    fn recovery_fold_proves_terminal_and_final_message_from_real_shapes() {
+        // Real 1.4 notification shapes (stable schema): the durable view
+        // holds the exact turn's terminal plus its final agentMessage,
+        // newest first, with older tool noise and a foreign turn around it.
+        let session = "session-1";
+        let turn = "turn-1";
+        let events = vec![
+            recovery_event(
+                "turn/completed",
+                json!({
+                    "sessionId": session, "terminal": "completed", "turnId": turn,
+                    "viewCursor": "rev-9",
+                }),
+            ),
+            recovery_event(
+                "item/completed",
+                json!({
+                    "sessionId": session, "viewCursor": "rev-9",
+                    "item": {"itemId": "item-final", "kind": "agentMessage",
+                             "revision": 3, "status": "completed",
+                             "turnId": turn, "text": "done"},
+                }),
+            ),
+            recovery_event(
+                "item/completed",
+                json!({
+                    "sessionId": session, "viewCursor": "rev-7",
+                    "item": {"itemId": "item-tool", "kind": "toolCall",
+                             "revision": 2, "status": "completed",
+                             "turnId": turn, "tool": "shell",
+                             "args": "{\"command\":\"cargo build\"}"},
+                }),
+            ),
+            recovery_event(
+                "turn/completed",
+                json!({
+                    "sessionId": session, "terminal": "completed",
+                    "turnId": "turn-9", "viewCursor": "rev-6",
+                }),
+            ),
+        ];
+        let (scan, folded) = fold_recovery_all(&events, session, turn);
+        assert!(matches!(folded, RecoveryFold::Complete));
+        let terminal: NativeTurnCompletedNotification =
+            serde_json::from_value(scan.turn_params.expect("terminal proven"))
+                .expect("recovery must keep the live turn/completed shape");
+        assert_eq!(terminal.turn_id, turn);
+        assert_eq!(terminal.terminal, NativeTurnTerminal::Completed);
+        let message: NativeItemCompletedNotification =
+            serde_json::from_value(scan.message_params.expect("message proven"))
+                .expect("recovery must keep the live item/completed shape");
+        assert_eq!(message.item.text.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn recovery_fold_newest_final_message_wins() {
+        // Two agentMessages for the exact turn, newest first: live delivery
+        // replaces `final_text` on each one, so the scan keeps the latest.
+        let session = "session-1";
+        let turn = "turn-1";
+        let events = vec![
+            recovery_event(
+                "item/completed",
+                json!({
+                    "sessionId": session, "viewCursor": "rev-8",
+                    "item": {"itemId": "item-new", "kind": "agentMessage",
+                             "revision": 4, "status": "completed",
+                             "turnId": turn, "text": "second"},
+                }),
+            ),
+            recovery_event(
+                "item/completed",
+                json!({
+                    "sessionId": session, "viewCursor": "rev-7",
+                    "item": {"itemId": "item-old", "kind": "agentMessage",
+                             "revision": 3, "status": "completed",
+                             "turnId": turn, "text": "first"},
+                }),
+            ),
+        ];
+        let (scan, folded) = fold_recovery_all(&events, session, turn);
+        assert!(matches!(folded, RecoveryFold::Continue));
+        assert!(scan.turn_params.is_none());
+        let message: NativeItemCompletedNotification =
+            serde_json::from_value(scan.message_params.expect("message proven"))
+                .expect("live shape");
+        assert_eq!(message.item.item_id, "item-new");
+        assert_eq!(message.item.text.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn recovery_fold_skips_foreign_sessions_and_turns() {
+        // Other turns and sessions never prove this turn's terminal, even
+        // when their records are well-formed.
+        let session = "session-1";
+        let turn = "turn-1";
+        let events = vec![
+            recovery_event(
+                "turn/completed",
+                json!({
+                    "sessionId": session, "terminal": "completed",
+                    "turnId": "turn-9", "viewCursor": "rev-6",
+                }),
+            ),
+            recovery_event(
+                "item/completed",
+                json!({
+                    "sessionId": session, "viewCursor": "rev-6",
+                    "item": {"itemId": "item-foreign", "kind": "agentMessage",
+                             "revision": 1, "status": "completed",
+                             "turnId": "turn-9", "text": "not ours"},
+                }),
+            ),
+            recovery_event(
+                "turn/completed",
+                json!({
+                    "sessionId": "session-2", "terminal": "completed",
+                    "turnId": turn, "viewCursor": "rev-5",
+                }),
+            ),
+        ];
+        let (scan, folded) = fold_recovery_all(&events, session, turn);
+        assert!(matches!(folded, RecoveryFold::Continue));
+        assert!(scan.turn_params.is_none());
+        assert!(scan.message_params.is_none());
+    }
+
+    #[test]
+    fn recovery_fold_proves_non_completed_terminals() {
+        // Recovery is not success-only: a durably failed terminal commits as
+        // `failed`, never as `unknown`.
+        let session = "session-1";
+        let turn = "turn-1";
+        let events = vec![recovery_event(
+            "turn/completed",
+            json!({
+                "sessionId": session, "terminal": "failed", "turnId": turn,
+                "viewCursor": "rev-9",
+                "error": {"kind": "authRequired", "message": "login expired",
+                          "retryable": true},
+            }),
+        )];
+        let (scan, folded) = fold_recovery_all(&events, session, turn);
+        assert!(matches!(folded, RecoveryFold::Continue));
+        let terminal: NativeTurnCompletedNotification =
+            serde_json::from_value(scan.turn_params.expect("terminal proven")).expect("live shape");
+        assert_eq!(terminal.terminal, NativeTurnTerminal::Failed);
+        assert!(scan.message_params.is_none());
+    }
+
+    #[test]
+    fn recovery_fold_unknown_terminal_is_unproven() {
+        // A wire-open terminal the adapter does not model can never prove
+        // the turn: the unknown settlement below stays honest.
+        let session = "session-1";
+        let turn = "turn-1";
+        let events = vec![recovery_event(
+            "turn/completed",
+            json!({
+                "sessionId": session, "terminal": "futureTerminal",
+                "turnId": turn, "viewCursor": "rev-9",
+            }),
+        )];
+        let (scan, folded) = fold_recovery_all(&events, session, turn);
+        assert!(matches!(folded, RecoveryFold::Unproven));
+        assert!(scan.turn_params.is_none());
+    }
+
+    #[test]
+    fn recovery_fold_undecodable_record_is_unproven() {
+        // An exact-turn record that does not match the 1.4 schema ends
+        // provability instead of guessing, like the snapshot readback.
+        let session = "session-1";
+        let turn = "turn-1";
+        let (scan, folded) = fold_recovery_all(
+            &[recovery_event("item/completed", json!({"bogus": true}))],
+            session,
+            turn,
+        );
+        assert!(matches!(folded, RecoveryFold::Unproven));
+        assert!(scan.turn_params.is_none());
+        let (scan, folded) = fold_recovery_all(
+            &[recovery_event("turn/completed", json!({"bogus": true}))],
+            session,
+            turn,
+        );
+        assert!(matches!(folded, RecoveryFold::Unproven));
+        assert!(scan.turn_params.is_none());
+    }
+
+    #[test]
+    fn recovery_fold_oversize_final_text_keeps_terminal_only() {
+        // A final message past the persisted-event bound is skipped, but the
+        // proven terminal still commits without it — exactly like live
+        // delivery, where an oversize message gaps but the terminal follows.
+        let session = "session-1";
+        let turn = "turn-1";
+        let events = vec![
+            recovery_event(
+                "turn/completed",
+                json!({
+                    "sessionId": session, "terminal": "completed",
+                    "turnId": turn, "viewCursor": "rev-9",
+                }),
+            ),
+            recovery_event(
+                "item/completed",
+                json!({
+                    "sessionId": session, "viewCursor": "rev-9",
+                    "item": {"itemId": "item-huge", "kind": "agentMessage",
+                             "revision": 3, "status": "completed",
+                             "turnId": turn,
+                             "text": "x".repeat(MAX_EVENT_BYTES + 1)},
+                }),
+            ),
+        ];
+        let (scan, folded) = fold_recovery_all(&events, session, turn);
+        assert!(matches!(folded, RecoveryFold::Continue));
+        assert!(scan.turn_params.is_some());
+        assert!(scan.message_params.is_none());
+    }
+
+    #[test]
+    fn recovery_page_uses_the_schema_field_names() {
+        // `muse schema generate-json-schema` (stable, 1.4.0): cursor-paged
+        // reads of the session view, 1-1000 events, newest first.
+        assert_eq!(VIEW_PAGE_SIZE, 1_000);
+        let params = NativeViewPageParams {
+            session_id: "session-1".to_owned(),
+            limit: VIEW_PAGE_SIZE,
+            direction: Some("backward".to_owned()),
+            cursor: None,
+        };
+        assert_eq!(
+            serde_json::to_value(params).expect("params encode"),
+            json!({
+                "sessionId": "session-1",
+                "limit": 1000,
+                "direction": "backward",
+            })
+        );
+        let next = NativeViewPageParams {
+            session_id: "session-1".to_owned(),
+            limit: VIEW_PAGE_SIZE,
+            direction: Some("backward".to_owned()),
+            cursor: Some("cursor-9".to_owned()),
+        };
+        assert_eq!(
+            serde_json::to_value(next).expect("params encode")["cursor"],
+            json!("cursor-9")
+        );
     }
 }

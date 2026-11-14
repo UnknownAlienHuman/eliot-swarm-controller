@@ -17,7 +17,7 @@ use crate::{
             ThreadStartReadback,
         },
     },
-    observe::ObserverSession,
+    observe::{self, ObserverSession},
     route::CodexRoute,
 };
 use eliot_core::{
@@ -64,6 +64,7 @@ struct CodexPlugin {
     initialized: Option<Initialized>,
     session: Option<AgentSession>,
     failed_start: Option<FailedStart>,
+    failed_attach: Option<FailedObserverAttach>,
     observer: Option<ObserverSession>,
 }
 
@@ -77,6 +78,42 @@ struct FailedStart {
     generation: i64,
     command_id: String,
     error: Error,
+}
+
+struct FailedObserverAttach {
+    params: ObserverAttachParams,
+    outcome: Value,
+}
+
+impl FailedObserverAttach {
+    fn new(params: &ObserverAttachParams, outcome: Value) -> Self {
+        Self {
+            params: params.clone(),
+            outcome,
+        }
+    }
+
+    fn replay(&self, params: &ObserverAttachParams) -> Result<Value> {
+        let exact = serde_json::to_value(&self.params)
+            .and_then(|retained| serde_json::to_value(params).map(|params| retained == params))
+            .map_err(|_| {
+                Error::new(
+                    "internal",
+                    "Codex observer attach binding could not be compared",
+                )
+            })?;
+        if exact {
+            return Ok(self.outcome.clone());
+        }
+        Err(Error::new(
+            "id_conflict",
+            "Codex observer attach retry changed its retained binding",
+        ))
+    }
+}
+
+fn is_proven_observer_start_failure(error: &Error) -> bool {
+    error.code == "native_start_failed"
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -141,9 +178,6 @@ struct NativeStartContext<'a> {
     route: &'a CodexRoute,
     store: &'a NativeStoreBinding,
     metadata_secrets: &'a [String],
-    mcp_policy: McpPolicy,
-    mcp_allow: &'a [String],
-    own_mcp_server: &'a str,
 }
 
 pub(crate) async fn run() -> Result<()> {
@@ -356,7 +390,11 @@ impl CodexPlugin {
     }
 
     async fn discover(&self, raw: &Value) -> Result<Value> {
-        if self.session.is_some() || self.failed_start.is_some() || self.observer.is_some() {
+        if self.session.is_some()
+            || self.failed_start.is_some()
+            || self.failed_attach.is_some()
+            || self.observer.is_some()
+        {
             return Err(Error::new(
                 "bad_state",
                 "Codex discovery requires a dedicated reader plugin instance",
@@ -429,7 +467,11 @@ impl CodexPlugin {
     }
 
     async fn profile_store(&mut self, raw: &Value) -> Result<Value> {
-        if self.session.is_some() || self.failed_start.is_some() || self.observer.is_some() {
+        if self.session.is_some()
+            || self.failed_start.is_some()
+            || self.failed_attach.is_some()
+            || self.observer.is_some()
+        {
             return Err(Error::new(
                 "bad_state",
                 "Codex profile.store requires a dedicated metadata instance",
@@ -482,21 +524,59 @@ impl CodexPlugin {
                 "Codex observation requires a dedicated plugin instance",
             ));
         }
+        observe::validate_attach_binding(&params)?;
+        if let Some(failed) = &self.failed_attach {
+            return failed.replay(&params);
+        }
         if let Some(observer) = &self.observer {
             return observer.repeat_attach(&params);
         }
-        let (launch, secrets, metadata_secrets) =
-            self.reader_launch(&params.profile, &params.target_environment)?;
-        let (observer, result) = ObserverSession::attach(
+        let (launch, secrets, metadata_secrets) = match self
+            .reader_launch(&params.profile, &params.target_environment)
+        {
+            Ok(launch) => launch,
+            Err(_) => {
+                let result = observe::failed_attach_result(&params, "observer_preparation_failed");
+                self.failed_attach = Some(FailedObserverAttach::new(&params, result.clone()));
+                return Ok(result);
+            }
+        };
+        if let Err(error) = observe::validate_attach_preparation(&params, &secrets) {
+            if error.code == "frame_too_large" {
+                let result = observe::failed_attach_result(&params, "observer_preparation_failed");
+                self.failed_attach = Some(FailedObserverAttach::new(&params, result.clone()));
+                return Ok(result);
+            }
+            return Err(error);
+        }
+        let failure = FailedObserverAttach::new(
+            &params,
+            observe::failed_attach_result(&params, "native_start_failed"),
+        );
+        let attach = ObserverSession::attach(
             params,
             launch,
             secrets,
             metadata_secrets,
             Instant::now() + crate::discovery::READ_TIMEOUT,
         )
-        .await?;
-        self.observer = Some(observer);
-        Ok(result)
+        .await;
+        match attach {
+            Ok((observer, result)) => {
+                self.observer = Some(observer);
+                Ok(result)
+            }
+            Err(error) if is_proven_observer_start_failure(&error) => {
+                self.failed_attach = Some(failure);
+                Ok(self
+                    .failed_attach
+                    .as_ref()
+                    .expect("failed attach was just retained")
+                    .outcome
+                    .clone())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn detach(&mut self, raw: &Value) -> Result<Value> {
@@ -509,7 +589,7 @@ impl CodexPlugin {
     }
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
-        if self.observer.is_some() {
+        if self.observer.is_some() || self.failed_attach.is_some() {
             return Err(Error::new(
                 "unsupported",
                 "an observer cannot start a controlled session",
@@ -836,7 +916,7 @@ impl CodexPlugin {
             return Err(error);
         }
 
-        let (selected_effort, native_scope, mcp_readback) = match Self::initialize_native(
+        let (selected_effort, native_scope) = match Self::initialize_native(
             &session.native_client,
             &workspace,
             &requested_model,
@@ -846,14 +926,11 @@ impl CodexPlugin {
                 route: &route,
                 store: &frozen_store,
                 metadata_secrets: &metadata_secrets,
-                mcp_policy,
-                mcp_allow: &mcp_allow,
-                own_mcp_server: &mcp_server_name,
             },
         )
         .await
         {
-            Ok((effort, scope, mcp_readback)) => (effort, scope, mcp_readback),
+            Ok((effort, scope)) => (effort, scope),
             Err(error) => {
                 let error = discard_failed_start(&mut session, error).await;
                 return Err(self.settle_pre_dispatch_outcome(
@@ -1054,6 +1131,45 @@ impl CodexPlugin {
                 "Codex thread/resume did not prove the resumed thread idle; no input was sent",
             ));
         }
+        // Requested vs observed MCP surface: read the thread-scoped
+        // `mcpServerStatus/list` inventory now that the owned thread is
+        // loaded (pre-thread runtimes are unavailable per the installed
+        // schema, so this read cannot move earlier). Minimal fails closed
+        // here when the surface is unverifiable, shows an enabled
+        // non-allowed server, or omits the Agent-scoped server; inherit
+        // performs no inventory readback and reports the set as unknown
+        // instead of echoing the requested set. No input has been sent: the
+        // thread is empty, and a failed start settles deterministically
+        // like any rejected dispatch.
+        let mcp_readback = if mcp_policy == McpPolicy::Minimal {
+            match Self::read_mcp_status(
+                &session.native_client,
+                &readback.thread.id,
+                &mcp_allow,
+                &mcp_server_name,
+                &metadata_secrets,
+            )
+            .await
+            {
+                Ok(inventory) => inventory,
+                Err(error) => {
+                    let error = discard_failed_start(&mut session, error).await;
+                    self.failed_start = Some(FailedStart {
+                        agent_id: params.agent_id.clone(),
+                        generation: params.generation,
+                        command_id: params.command_id.clone(),
+                        error: error.clone(),
+                    });
+                    return Err(error);
+                }
+            }
+        } else {
+            // Inherit keeps the exact previous startup path: no inventory
+            // RPCs. Each inventory RPC owns up to the whole outer
+            // `agent.start` budget, so even an optional read regresses
+            // default startup; the set stays unknown instead.
+            McpReadback::unverified()
+        };
         // Only a requested effort is verified/enforced. An omitted effort
         // leaves the native default in `effective.effort`, reported
         // separately from `requested.effort` (null).
@@ -1203,7 +1319,7 @@ impl CodexPlugin {
         requested_effort: Option<&str>,
         experimental_api: bool,
         context: NativeStartContext<'_>,
-    ) -> Result<(Option<String>, String, McpReadback)> {
+    ) -> Result<(Option<String>, String)> {
         let init_params = NativeInitializeParams {
             client_info: NativeClientInfo {
                 name: "eliot".to_owned(),
@@ -1338,43 +1454,17 @@ impl CodexPlugin {
             .route
             .verify_config(effective_config, context.metadata_secrets)?;
 
-        // Requested vs observed MCP surface: read the installed
-        // `mcpServerStatus/list` inventory (verified in the 0.167.1
-        // app-server schema) and keep names only. Minimal fails closed
-        // when the visible surface cannot be verified, shows an enabled
-        // non-allowed server, or omits the Agent-scoped server; inherit
-        // performs no inventory readback on the readiness path and reports
-        // the set as unknown instead of echoing the requested set.
-        let enforce_minimal = context.mcp_policy == McpPolicy::Minimal;
-        let mcp_readback = if enforce_minimal {
-            Self::read_mcp_status(
-                client,
-                context.mcp_allow,
-                context.own_mcp_server,
-                context.metadata_secrets,
-                true,
-            )
-            .await
-            .map_err(|error| {
-                pre_dispatch_read_error(
-                    error,
-                    "profile_error",
-                    "Codex minimal MCP isolation could not be verified",
-                )
-            })?
-        } else {
-            // Inherit keeps the exact previous startup path: no inventory
-            // RPCs on the readiness path. Each inventory RPC owns up to the
-            // whole outer `agent.start` budget, so even an optional read
-            // regresses default startup; the set stays unknown instead.
-            McpReadback::unverified()
-        };
-
+        // Requested vs observed MCP surface is read after thread dispatch
+        // (see `read_mcp_status`): the installed `mcpServerStatus/list`
+        // reports per-thread runtime state, and without a loaded thread
+        // every entry's status is unavailable, so a pre-thread read cannot
+        // prove anything about the isolated surface. Inherit performs no
+        // inventory readback at all and reports the set as unknown instead
+        // of echoing the requested set.
         if !context.route.requires_chatgpt() {
             return Ok((
                 context.route.optional_effort(requested_effort)?,
                 native_scope,
-                mcp_readback,
             ));
         }
 
@@ -1399,27 +1489,37 @@ impl CodexPlugin {
             // model exists; no medium/xhigh value is fabricated here.
             None => None,
         };
-        Ok((effort, native_scope, mcp_readback))
+        Ok((effort, native_scope))
     }
 
-    /// Read the native MCP inventory for requested-vs-observed reporting.
-    /// Names only: tool/resource payloads are never retained. A page that
-    /// echoes a known credential fails the read; truncation of the page loop
-    /// leaves the inventory incomplete, which is also a failure the caller
-    /// maps per policy (minimal aborts, inherit reports unknown).
+    /// Read the native MCP inventory for requested-vs-observed reporting,
+    /// scoped to the owned thread. The installed `mcpServerStatus/list`
+    /// reports per-thread runtime state (null/unavailable without a loaded
+    /// thread per the 0.167.1 schema), so only a thread-scoped read can
+    /// prove which servers are actually present and enabled; callers run
+    /// this after thread/start|resume and before any input. Names only:
+    /// tool/resource payloads are never retained. A page that echoes a
+    /// known credential fails the read; truncation of the page loop leaves
+    /// the inventory incomplete. The inventory itself is a read, so a failed
+    /// read stays deterministic: no input was dispatched and the caller
+    /// settles the empty thread without replaying an uncertain effect.
     async fn read_mcp_status(
         client: &NativeClient,
+        thread_id: &str,
         allow: &[String],
         own_mcp_server: &str,
         metadata_secrets: &[String],
-        enforce_minimal: bool,
     ) -> Result<McpReadback> {
         let mut accumulated: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut cursor: Option<String> = None;
         let mut incomplete = true;
         for _ in 0..crate::mcp::MAX_MCP_STATUS_PAGES {
-            let mut params = json!({"detail": "toolsAndAuthOnly", "limit": 100});
+            let mut params = json!({
+                "detail": "toolsAndAuthOnly",
+                "limit": 100,
+                "threadId": thread_id,
+            });
             if let Some(cursor) = cursor.as_deref() {
                 params["cursor"] = Value::String(cursor.to_owned());
             }
@@ -1427,11 +1527,12 @@ impl CodexPlugin {
                 .call("mcpServerStatus/list", params, Instant::now() + RPC_TIMEOUT)
                 .await
                 .map_err(|error| {
-                    // Only prerequisite reads ran; no thread or input was dispatched.
+                    // The inventory is a read: no input was dispatched, so a
+                    // failed read stays deterministic.
                     pre_dispatch_read_error(
                         error,
                         "native_readback",
-                        "Codex mcpServerStatus/list read failed",
+                        "Codex mcpServerStatus/list read failed; no input was sent",
                     )
                 })?;
             let page = parse_status_page(&response, allow, own_mcp_server)?;
@@ -1442,7 +1543,7 @@ impl CodexPlugin {
                     "Codex MCP inventory contains a known secret",
                 ));
             }
-            cursor = merge_status_page(&mut accumulated, &mut seen, page, enforce_minimal)?;
+            cursor = merge_status_page(&mut accumulated, &mut seen, page, true)?;
             if cursor.is_none() {
                 incomplete = false;
                 break;
@@ -1454,18 +1555,17 @@ impl CodexPlugin {
                 "Codex MCP inventory is paginated beyond its bound",
             ));
         }
-        if enforce_minimal {
-            // The completed inventory must show Eliot's own Agent-scoped
-            // server as present and enabled; an empty inventory or a
-            // disabled own entry proves nothing and fails closed here,
-            // before any thread or input.
-            require_minimal_own_server(&accumulated, own_mcp_server)?;
-        }
+        // The completed thread-scoped inventory must show Eliot's own
+        // Agent-scoped server as present and enabled; an empty inventory or
+        // a disabled own entry proves nothing and fails closed here, before
+        // any input. The empty thread is retained like any stopped Agent's
+        // thread; it never receives input.
+        require_minimal_own_server(&accumulated, own_mcp_server)?;
         Ok(McpReadback::verified(accumulated))
     }
 
     async fn command(&mut self, raw: &Value) -> Result<Value> {
-        if self.observer.is_some() {
+        if self.observer.is_some() || self.failed_attach.is_some() {
             return Err(Error::new(
                 "unsupported",
                 "an observer cannot issue native control commands",
@@ -2175,7 +2275,7 @@ impl CodexPlugin {
     }
 
     async fn stop(&mut self, raw: &Value) -> Result<Value> {
-        if self.observer.is_some() {
+        if self.observer.is_some() || self.failed_attach.is_some() {
             return Err(Error::new(
                 "unsupported",
                 "an observer cannot stop the native subject",
@@ -2843,10 +2943,10 @@ fn codex_manifest() -> PluginManifest {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentSession, CodexPlugin, CodexRoute, FailedStart, Initialized, NativeLaunch,
-        NativeProcess, SessionPhase, codex_manifest, contextual_error, frozen_store_binding,
-        pre_dispatch_read_error, target_environment, unconfirmed_pre_dispatch_error,
-        validate_resume_preflight,
+        AgentSession, CodexPlugin, CodexRoute, FailedObserverAttach, FailedStart, Initialized,
+        NativeLaunch, NativeProcess, SessionPhase, codex_manifest, contextual_error,
+        frozen_store_binding, is_proven_observer_start_failure, pre_dispatch_read_error,
+        target_environment, unconfirmed_pre_dispatch_error, validate_resume_preflight,
     };
     use eliot_core::{Error, SecretPolicy, StderrSnapshot, StderrSource};
     use eliot_plugin::AgentStartParams;
@@ -2856,6 +2956,43 @@ mod tests {
         ffi::OsString,
         path::PathBuf,
     };
+
+    #[test]
+    fn failed_observer_attach_replays_only_exact_binding_and_only_proven_start_errors() {
+        let params = eliot_plugin::ObserverAttachParams {
+            agent_id: "agent-1".to_owned(),
+            generation: 2,
+            command_id: "018f0a00-0000-7000-8000-000000000001".to_owned(),
+            mode: "observe".to_owned(),
+            native_scope: "scope-1".to_owned(),
+            native_ref: "thread-1".to_owned(),
+            profile: json!({"harness": "codex"}),
+            target_environment: json!({}),
+            source_plan: Some(json!({"message":"native_read"})),
+            source_state: Some(json!({"source":"observe"})),
+        };
+        let outcome = crate::observe::failed_attach_result(&params, "native_start_failed");
+        let failed = FailedObserverAttach::new(&params, outcome.clone());
+        assert_eq!(failed.replay(&params).unwrap(), outcome);
+
+        let mut changed = params.clone();
+        changed.native_ref = "another-thread".to_owned();
+        assert_eq!(failed.replay(&changed).unwrap_err().code, "id_conflict");
+        changed = params.clone();
+        changed.command_id = "018f0a00-0000-7000-8000-000000000002".to_owned();
+        assert_eq!(failed.replay(&changed).unwrap_err().code, "id_conflict");
+
+        assert!(is_proven_observer_start_failure(&Error::new(
+            "native_start_failed",
+            "safe test reason"
+        )));
+        for code in ["unknown", "native_readback", "native_not_dispatched"] {
+            assert!(!is_proven_observer_start_failure(&Error::new(
+                code,
+                "safe test reason"
+            )));
+        }
+    }
 
     #[test]
     fn store_metadata_policy_excludes_selector_names_not_colliding_credentials() {

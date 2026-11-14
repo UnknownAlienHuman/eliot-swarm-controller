@@ -52,6 +52,33 @@ cmd = "C:/Tools/OpenCode/opencode.exe"
 model = "openrouter/stealth/crouton-alpha"
 auth_integration = "openrouter"
 
+# OpenCode with an adopted local backend (per-Agent `serve` against an
+# already-running OpenAI-compatible endpoint). model must use the dedicated
+# eliot-local provider segment (no canonical alias). backend is one preset:
+# strata, unsloth, lmstudio, llama.cpp, ollama, vllm or generic. Fill in the
+# endpoint, model id and limits from the backend's own metadata (for LM
+# Studio read the loaded instance's config.context_length, not the model
+# maximum); when the backend needs a key, set api_key_env plus a pass_env
+# entry holding its name (absent means explicit no-auth mode). Managed
+# startup is not supported: start the backend yourself and keep it running.
+# Live qualification with a real coding turn is still required.
+[profiles.opencode-local]
+harness = "opencode"
+cmd = "C:/Tools/OpenCode/opencode.exe"
+model = "eliot-local/qwen3-8b"
+provider_base_url = "http://127.0.0.1:1234/v1"
+backend = "lmstudio"
+context_limit = 131072
+output_limit = 8192
+# api_key_env = "LOCAL_LLM_KEY"
+# pass_env = ["LOCAL_LLM_KEY"]
+# Preset shapes through the same path (replace endpoint, model and limits):
+# strata:  provider_base_url = "http://127.0.0.1:<engine-port>/v1", backend = "strata"
+# unsloth: provider_base_url = "http://127.0.0.1:<studio-port>/v1", backend = "unsloth", api_key_env + pass_env
+# llama.cpp (llama-server): provider_base_url = "http://127.0.0.1:8080/v1", backend = "llama.cpp"
+# ollama:  provider_base_url = "http://127.0.0.1:11434/v1", backend = "ollama"
+# vllm:    provider_base_url = "http://127.0.0.1:<vllm-port>/v1", backend = "vllm"
+
 # Antigravity. Point cmd at the installed native executable. mode is one of
 # plan, auto or accept-edits; effort/approval/collaboration/permissions presets
 # are rejected by this adapter.

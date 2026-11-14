@@ -129,13 +129,18 @@ plus the explicitly allowed servers:
   allow list gets its own `-c mcp_servers.<name>.enabled=false` override; a
   name no `-c` path can address (Codex splits override paths on literal dots
   before decoding) fails the start closed instead of silently inheriting.
-- After initialize, the installed `mcpServerStatus/list` inventory is read
-  back (names only, secret-checked) and reported as `effective.mcp_servers`
-  with `mcp_servers_verified`. `minimal` fails closed when the visible
-  surface cannot be verified, shows an enabled non-allowed server, or omits
-  the Agent-scoped server (an empty inventory or a disabled own entry proves
-  nothing); `inherit` performs no inventory readback on the readiness path
-  and reports `null` / unverified.
+- After `thread/start` (or `thread/resume`) and before any input, the
+  installed `mcpServerStatus/list` inventory is read back scoped to the
+  owned thread (`threadId`; names only, secret-checked) and reported as
+  `effective.mcp_servers` with `mcp_servers_verified`. Thread scope is
+  required: the installed 0.167.1 schema reports per-thread runtime state,
+  and without a loaded thread every entry's status is unavailable, so a
+  pre-thread read cannot prove the isolated surface. `minimal` fails closed
+  when the visible surface cannot be verified, shows an enabled non-allowed
+  server, or omits the Agent-scoped server (an empty inventory or a
+  disabled own entry proves nothing); the empty thread is retained like
+  any stopped Agent's thread and never receives input. `inherit` performs
+  no inventory readback and reports `null` / unverified.
 
 Requested vs observed: `requested` carries `mcp_policy` and `mcp_allow`;
 `effective` carries `mcp_policy`, `mcp_servers` (native-readback names, or
@@ -155,6 +160,22 @@ that server (probe showed `enabled: false`), and `mcpServerStatus/list`
 exists in the app-server protocol (v2 schema: `{data: [{name,
 runtimeStatus, ...}], nextCursor}`). The owner's global config is never
 edited and `auth.json` is never copied.
+
+Native frame budget: the inbound NDJSON frame cap for the Codex host is 8 MiB
+(`CodexStdioConfig::MAX_FRAME_BYTES`; every other adapter except Muse keeps
+the shared 1 MiB default). The cap covers the minimal-policy
+`mcpServerStatus/list` readback (Eliot requests `detail: toolsAndAuthOnly`,
+`limit: 100`, scoped to the owned thread): the installed 0.167.1 schema offers only `full` and
+`toolsAndAuthOnly`, and both embed every listed server's full tool catalogs
+with input/output schemas, so the response scales with the owner's inherited
+MCP surface even though Eliot retains names only. Live-observed 2026-11-14: a
+minimal-policy inventory response reached 1,990,613 bytes and ended the 1 MiB
+stream; 8 MiB covers that readback plus owner variance and envelope overhead.
+The inventory must stay a whole-list read: proving no unexpected enabled
+server requires seeing every entry, so per-server (`serverName`) reads cannot
+replace it. A frame over the cap ends the session with an explicit
+`source.gap` carrying the bounded diagnosis (`frame_oversized len=... limit=...
+kind=response`); responses carry no method by construction.
 
 Example lifecycle:
 
@@ -362,6 +383,48 @@ profile, environment and filters; state-DB-only enumeration covers only the SDK-
 subjects (retained archives for archived selection) and does not claim complete rollout,
 raw database/history-row, or capacity coverage.
 The reader never calls `thread/resume` or `thread/start` to obtain visibility.
+
+On 2026-11-14, real Windows Swarm observation qualification with installed Codex
+0.167.1 rejected a global metadata-startup lock: 448 gated attempts produced 90
+unknowns, including 84 lock-wait timeouts and two SQLite-init failures. The ungated
+baseline had no unknowns in 443 attempts; a cold home separately reproduced the
+initialization failure. The gated debug build's mean cycle was 15.5 seconds versus
+4.9 seconds for the release baseline, so that timing includes a build-mode difference.
+The lock has been removed. The underlying SQLite/OS error remains unknown; contention
+is a hypothesis, and Eliot cannot coordinate other Codex processes sharing the home.
+
+Each metadata process may retry initialization once after a short randomized backoff
+defined by [the startup retry helper](../../plugins/codex/src/native/startup_retry.rs),
+within the existing read deadline, only when its owned process independently exited
+unsuccessfully and complete stderr matches the state-runtime initialization signature.
+The retry boundary owns spawn and initialization: only `initialize` may have been sent
+to the failed process; no successful initialization, configuration read, thread/session
+request or binding on that process may precede a retry. An earlier selection probe may
+have completed its configuration reads, but it never creates or resumes a thread.
+Native initialization can touch SQLite internals; this proof is
+about absence of session/thread effects, not absence of native database writes.
+Cleanup and output drain must be confirmed before retry. An initial failure with a missing
+signature, incomplete diagnostics, unexpected native activity or unconfirmed exit/cleanup
+retains uncertainty and does not authorize retry. After that one retry, another failed
+`initialize` RPC settles definitely only with complete diagnostics, confirmed cleanup and
+no native activity or session/thread effect; its diagnostic text may differ. A received
+successful initialization response or failed `initialized` notification never qualifies
+for retry or this exhausted-start verdict. Later configuration, store verification and
+history failures are never retried by this mechanism.
+
+An exhausted eligible retry or a pre-spawn refusal returns a bound failed attachment
+result with a short safe reason, settling the attach command definitely failed rather
+than unknown. Generic transport loss and uncertain effects retain unknown outcomes.
+The second startup and its exact home/root and `sessionFlags` proof remain required.
+
+The subsequent eight-worker release Swarm sample applied 400/400 warm-home attaches,
+with all native subject/turn/item history reads and detaches succeeding. A private
+cold home copied only authentication and configuration, so its 400 attaches to refs
+from the warm store retained 400 `unknown/history_gap` outcomes and 400 applied detaches;
+these are absent-subject results, not successful attachment. Neither sample surfaced a
+SQLite-init failure. Successful internal retries are not exposed by the settled readback,
+so these observations do not prove that the retry branch ran or identify the SQLite cause.
+
 The installed stable and experimental schemas expose no passive subscription operation.
 `thread/read`, `thread/turns/list` and `thread/items/list` are separate bounded historical
 reads; metadata-only empty `turns` and reader-local `notLoaded` are not terminal evidence.

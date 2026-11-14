@@ -91,7 +91,7 @@ impl MailMode {
 #[serde(deny_unknown_fields)]
 pub struct MailSendRequest {
     #[schemars(
-        description = "Nonblank caller-retained mutation id; use a fresh ULID for a new write."
+        description = "Caller-retained mutation id; MCP callers may omit id and the server mints a ULID, returned for retry. Otherwise use a fresh ULID for a new write."
     )]
     pub id: String,
     #[schemars(length(min = 1, max = MAX_MAIL_RECIPIENTS), extend("uniqueItems" = true), description = "Distinct concrete canonical a<positive i64> Agent ids.")]
@@ -531,7 +531,7 @@ pub fn parse_var_scope(scope: &str) -> Result<VarScope> {
 #[serde(deny_unknown_fields)]
 pub struct VarSetRequest {
     #[schemars(
-        description = "Nonblank caller-retained mutation id; use a fresh ULID for a new write."
+        description = "Caller-retained mutation id; MCP callers may omit id and the server mints a ULID, returned for retry. Otherwise use a fresh ULID for a new write."
     )]
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

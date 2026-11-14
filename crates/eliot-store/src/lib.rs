@@ -31,7 +31,7 @@ pub use rules::{
 pub use scripts::ScriptRunAdmission;
 pub use usage::ResolvedUsageScope;
 
-use eliot_core::api::AgentSummary;
+use eliot_core::api::{AgentConfigView, AgentSummary};
 use eliot_core::{
     self as core, Agent, AgentControl, AgentEdit, AgentState, BatchAck, Command, CommandState,
     Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage,
@@ -94,7 +94,7 @@ const NONTERMINAL_AGENTS_WHERE: &str =
 const LIST_NONTERMINAL_AGENTS_COLUMNS: &str = "SELECT id, generation, name, project, harness, profile,
                         profile_snapshot, native_scope, native_ref, workspace, effective,
                         pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                        parent, root, depth, control
+                        parent, root, depth, control, profile_inherited
                  FROM agents";
 const RECOVER_ACCEPTED_COMMAND_FILTER: &str =
     "state IN ('accepted', 'queued', 'dispatched', 'unknown')
@@ -763,7 +763,7 @@ impl Store {
                 "SELECT id, generation, name, project, harness, profile,
                         profile_snapshot, native_scope, native_ref, workspace, effective,
                         pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                        parent, root, depth, control
+                        parent, root, depth, control, profile_inherited
                  FROM agents WHERE id > ?1 ORDER BY id LIMIT ?2",
             )
             .map_err(sql_error)?;
@@ -946,7 +946,7 @@ impl Store {
                 "SELECT id, generation, name, project, harness, profile,
                         profile_snapshot, native_scope, native_ref, workspace, effective,
                         pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                        parent, root, depth, control
+                        parent, root, depth, control, profile_inherited
                  FROM agents
                  WHERE id > ?1 AND observe_only = 0 AND (state IN ('busy', 'waiting')
                    OR EXISTS(SELECT 1 FROM native_child_registrations r
@@ -2875,6 +2875,7 @@ struct AgentRecord {
     root: Option<i64>,
     depth: i64,
     control: String,
+    profile_inherited: bool,
 }
 
 struct CommandRecord {
@@ -3216,7 +3217,7 @@ fn agent_list_select(
         "agents.id, agents.generation, agents.name, agents.project, agents.harness, agents.profile,
                 agents.profile_snapshot, agents.native_scope, agents.native_ref, agents.workspace, agents.effective,
                 agents.pending, agents.state, agents.active_turn, agents.created_at, agents.updated_at, agents.origin, agents.observe_only, (agents.token IS NOT NULL AND agents.observe_only = 0),
-                agents.parent, agents.root, agents.depth, agents.control"
+                agents.parent, agents.root, agents.depth, agents.control, agents.profile_inherited"
             .to_owned()
     };
     let mut predicates = Vec::new();
@@ -3344,6 +3345,7 @@ fn agent_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecor
         root: row.get(20)?,
         depth: row.get(21)?,
         control: row.get(22)?,
+        profile_inherited: row.get(23)?,
     })
 }
 
@@ -3375,6 +3377,7 @@ fn agent_from_record(connection: &Connection, record: AgentRecord) -> Result<Age
         harness: record.harness,
         profile: record.profile,
         profile_snapshot: decode_json(&record.profile_snapshot)?,
+        profile_inherited: record.profile_inherited,
         native_scope: record.native_scope,
         native_ref: record.native_ref,
         workspace: record.workspace,
@@ -3415,7 +3418,7 @@ fn load_agent_by_num(connection: &Connection, id: i64) -> Result<Option<Agent>> 
             "SELECT id, generation, name, project, harness, profile,
                     profile_snapshot, native_scope, native_ref, workspace, effective,
                     pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                    parent, root, depth, control
+                    parent, root, depth, control, profile_inherited
              FROM agents WHERE id = ?1",
             [id],
             agent_record_from_row,
@@ -3492,6 +3495,8 @@ fn command_from_raw(raw: CommandRecordRaw) -> Result<CommandRecord> {
             created_at: raw.created_at,
             updated_at: raw.updated_at,
             probe: raw.probe,
+            config_revision: raw.config_revision,
+            config: None,
         },
         state,
         target,
@@ -4404,6 +4409,7 @@ fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
         completed_at: record.completed_at,
         usage,
         config_revision: record.config_revision,
+        config: None,
     })
 }
 
@@ -4442,6 +4448,9 @@ impl Store {
 /// values from one `configure` command plus the effective values the next
 /// native turn carries. The original profile snapshot is never rewritten;
 /// it stays on the Agent row while these rows accumulate per generation.
+/// A `resume` starts its new generation by inheriting the previous
+/// generation's latest overlay as revision 1 with `provenance` set to
+/// `inherited_from`; directly configured rows carry `configure`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentConfig {
     pub agent: String,
@@ -4452,6 +4461,7 @@ pub struct AgentConfig {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub application: String,
+    pub provenance: String,
     pub command_id: String,
     pub created_at: i64,
 }
@@ -4498,8 +4508,9 @@ fn agent_config_from_row(
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         application: row.get(3)?,
-        command_id: row.get(4)?,
-        created_at: row.get(5)?,
+        provenance: row.get(4)?,
+        command_id: row.get(5)?,
+        created_at: row.get(6)?,
     })
 }
 
@@ -4521,7 +4532,7 @@ fn get_agent_config_tx(
     revision: i64,
 ) -> Result<Option<AgentConfig>> {
     tx.query_row(
-        "SELECT revision, requested, effective, application, command_id, created_at
+        "SELECT revision, requested, effective, application, provenance, command_id, created_at
          FROM agent_config WHERE agent = ?1 AND generation = ?2 AND revision = ?3",
         params![agent, generation, revision],
         |row| agent_config_from_row(agent, generation, row),
@@ -4547,7 +4558,7 @@ impl Store {
         let agent_num = parse_agent_id(agent)?;
         self.connection
             .query_row(
-                "SELECT revision, requested, effective, application, command_id, created_at
+                "SELECT revision, requested, effective, application, provenance, command_id, created_at
                  FROM agent_config WHERE agent = ?1 AND generation = ?2 AND revision = ?3",
                 params![agent_num, generation, revision],
                 |row| agent_config_from_row(agent_num, generation, row),
@@ -4596,31 +4607,147 @@ impl Store {
     /// Effective model/effort for one send command's retained revision, or
     /// `None` when the send runs under the frozen snapshot. Used by the
     /// plugin host before native turn construction and by settlement when
-    /// it records what the native request carried.
+    /// it records what the native request carried. Reads only the retained
+    /// revision stamped at dispatch, so a later config-file reload can never
+    /// rewrite a pending or unknown command's meaning.
     pub fn send_effective_config(&self, command_id: &str) -> Result<Option<AgentConfig>> {
+        self.command_effective_config(command_id, &["send"])
+    }
+
+    /// Effective configuration for one retained command's stamped revision,
+    /// or `None` when it runs under the frozen snapshot (revision 0). The
+    /// revision is read from the retained command row and resolved against
+    /// the retained `agent_config` rows only: config-file reloads never
+    /// rewrite a retained generation, a pending command, or an
+    /// unknown-outcome resolution. `allowed` lists the verbs that may carry
+    /// a native configuration (launch, resume, send, configure).
+    pub fn command_effective_config(
+        &self,
+        command_id: &str,
+        allowed: &[&str],
+    ) -> Result<Option<AgentConfig>> {
         let record = load_command_record(&self.connection, command_id)?.ok_or_else(|| {
             Error::new("not_found", format!("command {command_id} was not found"))
         })?;
-        if record.command.verb != "send" {
+        if !allowed.contains(&record.command.verb.as_str()) {
             return Err(Error::new(
                 "invalid",
-                "effective configuration resolves only for send commands",
+                "effective configuration resolves only for native commands",
             ));
         }
         let Some(target) = record.target else {
             return Err(Error::new(
                 "source_integrity",
-                "send command has no retained Agent target",
+                "command has no retained Agent target",
             ));
         };
-        let generation = record.command.generation.ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "send command has no retained generation",
-            )
-        })?;
+        let generation = record
+            .command
+            .generation
+            .ok_or_else(|| Error::new("source_integrity", "command has no retained generation"))?;
         let agent = format_agent_id(target);
         self.get_agent_config(&agent, generation, record.config_revision)
+    }
+
+    /// Effective configuration for one retained turn's stamped revision, or
+    /// `None` when the turn ran under the frozen snapshot. Reads only
+    /// retained rows, so reloads never rewrite a retained turn's meaning.
+    pub fn turn_effective_config(
+        &self,
+        agent: &str,
+        generation: i64,
+        turn_id: &str,
+    ) -> Result<Option<AgentConfig>> {
+        let turn = self
+            .get_turn(agent, generation, turn_id)?
+            .ok_or_else(|| Error::new("not_found", format!("turn {turn_id} was not found")))?;
+        self.get_agent_config(agent, generation, turn.config_revision)
+    }
+
+    /// Retained configuration view for one command's exact stamped
+    /// generation and revision: the requested and effective model/effort,
+    /// the revision, the provenance, and the profile name. `None` when the
+    /// command runs under the frozen snapshot, has no retained target, or
+    /// carries no native configuration. Reads only retained rows, so a
+    /// config-file reload never rewrites a retained generation, a pending
+    /// command, or an unknown-outcome resolution.
+    pub fn command_config_view(&self, command: &Command) -> Result<Option<AgentConfigView>> {
+        if !matches!(
+            command.verb.as_str(),
+            "launch" | "resume" | "send" | "configure"
+        ) {
+            return Ok(None);
+        }
+        if command.config_revision == 0 {
+            return Ok(None);
+        }
+        let Some(target) = command.target.as_deref() else {
+            return Ok(None);
+        };
+        let Some(generation) = command.generation else {
+            return Ok(None);
+        };
+        let agent = self.get_agent(target)?.ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                format!("command target {target} was not found"),
+            )
+        })?;
+        self.retained_config_view(&agent, generation, command.config_revision)
+    }
+
+    /// Retained configuration view for one turn's exact stamped generation
+    /// and revision. `None` when the turn ran under the frozen snapshot.
+    /// Reads only retained rows, so later revisions never rewrite it.
+    pub fn turn_config_view(&self, agent: &Agent, turn: &Turn) -> Result<Option<AgentConfigView>> {
+        if turn.config_revision == 0 {
+            return Ok(None);
+        }
+        self.retained_config_view(agent, turn.generation, turn.config_revision)
+    }
+
+    /// Build the readback view from the exact retained overlay row. The
+    /// profile name, snapshot originals, and launch inheritance come from
+    /// the retained Agent row; the revision, provenance, and requested and
+    /// effective values come from the retained `agent_config` row. A nonzero
+    /// revision without a retained row is corruption, never a silent
+    /// snapshot fallback.
+    fn retained_config_view(
+        &self,
+        agent: &Agent,
+        generation: i64,
+        revision: i64,
+    ) -> Result<Option<AgentConfigView>> {
+        let Some(overlay) = self.get_agent_config(&agent.id, generation, revision)? else {
+            return Err(Error::new(
+                "source_integrity",
+                format!(
+                    "retained agent_config revision {revision} for {} generation {generation} is missing",
+                    agent.id
+                ),
+            ));
+        };
+        Ok(Some(AgentConfigView {
+            revision: overlay.revision,
+            application: overlay.application.clone(),
+            provenance: overlay.provenance.clone(),
+            profile: agent.profile.clone(),
+            profile_inherited: agent.profile_inherited,
+            requested_model: overlay.requested_model.clone(),
+            requested_effort: overlay.requested_effort.clone(),
+            model: overlay.model.clone(),
+            effort: overlay.effort.clone(),
+            original_model: agent
+                .profile_snapshot
+                .get("model")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            original_effort: agent
+                .profile_snapshot
+                .get("effort")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+        }))
     }
 
     /// Commit one dispatched `configure` command's overlay and stamp the
@@ -4723,8 +4850,8 @@ impl Store {
         let requested_json = encode_json(&requested)?;
         let effective_json = encode_json(&effective)?;
         db!(tx.execute(
-            "INSERT INTO agent_config(agent, generation, revision, requested, effective, application, command_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO agent_config(agent, generation, revision, requested, effective, application, provenance, command_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'configure', ?7, ?8)",
             params![
                 agent_num,
                 generation,
@@ -5851,7 +5978,7 @@ fn format_agent_id(id: i64) -> String {
 }
 
 fn validate_ulid(id: &str) -> Result<Ulid> {
-    Ulid::from_string(id).map_err(|_| Error::new("invalid", "mutation id must be a ULID"))
+    Ulid::from_string(id).map_err(|_| Error::invalid_mutation_id())
 }
 
 /// ULID timestamp of `id` in commit-clock milliseconds, or `None` when the
@@ -5869,7 +5996,11 @@ fn validate_id_age(id: &str, now: i64) -> Result<()> {
     if now.saturating_sub(created_at) > RETRY_WINDOW_MS {
         return Err(Error::new(
             "id_expired",
-            "an absent mutation id is older than the 24-hour retry window",
+            "mutation id is older than the 24-hour retry window",
+        )
+        .with_field(
+            "params.id",
+            "ULID minted within the last 24 hours; the window has passed, so mint a fresh ULID for a new write (retries reuse the id returned by the first write)",
         ));
     }
     // A ULID further ahead than the allowed generator-clock skew is a client
@@ -5880,6 +6011,10 @@ fn validate_id_age(id: &str, now: i64) -> Result<()> {
         return Err(Error::new(
             "invalid",
             "mutation id is more than the allowed clock skew in the future",
+        )
+        .with_field(
+            "params.id",
+            "ULID with a timestamp within 5 minutes of the daemon clock; check the caller clock and mint a fresh ULID",
         ));
     }
     Ok(())
