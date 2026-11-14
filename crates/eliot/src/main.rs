@@ -3005,18 +3005,21 @@ async fn read_agent_list(
 }
 
 /// Readable fleet table for `swarm ls` (summaries) and `swarm top` (plus
-/// child activity, usage and observation freshness). `--json` keeps printing
-/// the raw response; this table never replaces it.
+/// child activity, last-terminal usage and observation data availability).
+/// `ACT_TURN` is the live active turn; `LAST_OUT`/`LAST_TOK` belong to the
+/// last terminal turn (`last_turn_id`), not the active one. `DATA` reports
+/// observation data availability only, never freshness or liveness. `--json`
+/// keeps printing the raw response; this table never replaces it.
 fn print_agent_table(response: &AgentListResponse, with_observations: bool) {
     if with_observations {
         println!(
             "{:<6} {:<4} {:<9} {:<11} {:<12} {:<6} {:<11} {:<8} {:<12}",
-            "ID", "GEN", "STATE", "ACTIVITY", "TURN", "AGE", "OUTCOME", "TOKENS", "OBS"
+            "ID", "GEN", "STATE", "ACTIVITY", "ACT_TURN", "AGE", "LAST_OUT", "LAST_TOK", "DATA"
         );
     } else {
         println!(
             "{:<6} {:<4} {:<9} {:<14} {:<9} {:<12} {:<6} {:<11} {:<6}",
-            "ID", "GEN", "STATE", "PROJECT", "HARNESS", "TURN", "AGE", "OUTCOME", "SEEN"
+            "ID", "GEN", "STATE", "PROJECT", "HARNESS", "ACT_TURN", "AGE", "LAST_OUT", "SEEN"
         );
     }
     let now_ms = std::time::SystemTime::now()
@@ -3047,7 +3050,7 @@ fn print_agent_table(response: &AgentListResponse, with_observations: bool) {
                 .observation
                 .as_ref()
                 .map(|view| match view {
-                    eliot_core::api::ObservationView::Data(_) => "ok".to_owned(),
+                    eliot_core::api::ObservationView::Data(_) => "data".to_owned(),
                     eliot_core::api::ObservationView::Unavailable { error_code, .. } => {
                         truncate_cell(error_code, 12)
                     }

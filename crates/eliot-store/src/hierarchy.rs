@@ -13,9 +13,10 @@ use super::*;
 use eliot_core::api::{HierarchyLimits, parse_tree_selector, selector_child_id};
 
 pub(super) const SELECTOR_LINK_KIND: &str = "selector";
-/// Bound on parent-chain walks; creation depth is fanout-limited, so this is
-/// only defense against legacy rows, never a reachable depth.
-const ANCESTOR_WALK_CAP: i64 = 4096;
+/// Bound on parent-chain walks and tree-scope listing; creation depth is
+/// fanout-limited, so this is only defense against legacy rows, never a
+/// reachable depth. Listing, totals and direct reads share this bound.
+pub(crate) const ANCESTOR_WALK_CAP: i64 = 4096;
 
 pub(super) enum Caller {
     Owner,

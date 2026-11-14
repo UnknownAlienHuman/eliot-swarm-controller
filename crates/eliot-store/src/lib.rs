@@ -2957,9 +2957,11 @@ fn require_filter_text(value: &str) -> Result<()> {
 
 /// Assemble the fleet query for one scope, filter set, and window. Equality
 /// filters ride their `agents_list_*` composite (forced with `INDEXED BY`,
-/// so `EXPLAIN QUERY PLAN` reports the index); the cursor rides the primary
-/// key; tree scope walks descendants through the `agents_parent` index.
-/// The count variant drops the cursor and limit but keeps scope and filters.
+/// so `EXPLAIN QUERY PLAN` reports the index, preferring the selective
+/// structural/scope index when several filters are present); the cursor rides
+/// the primary key; tree scope walks descendants through the bounded subtree
+/// CTE shared with direct reads. The count variant drops the cursor and limit
+/// but keeps scope and filters.
 fn agent_list_select(
     filter: &AgentListFilter,
     caller: Option<&Agent>,
@@ -2978,51 +2980,52 @@ fn agent_list_select(
     };
     let mut predicates = Vec::new();
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
-    // Forced index for the first present equality filter; project scope
-    // without a user filter rides the project composite the same way.
-    let mut forced_index: Option<&str> = None;
-    let mut equality = |column: &str, index: &'static str, value: rusqlite::types::Value| {
+    // Prefer the selective structural/scope index (parent/root/project) when
+    // present; state/harness composites only lead when no structural filter
+    // does. Project scope without a user filter rides the project composite
+    // the same way.
+    let mut equality = |column: &str, value: rusqlite::types::Value| {
         predicates.push(format!("agents.{column} = ?"));
         params.push(value);
-        if forced_index.is_none() {
-            forced_index = Some(index);
+    };
+    let mut structural: Option<&str> = None;
+    let mut fallback: Option<&str> = None;
+    let mut note_index = |index: &'static str, structural_filter: bool| {
+        if structural_filter {
+            if structural.is_none() {
+                structural = Some(index);
+            }
+        } else if fallback.is_none() {
+            fallback = Some(index);
         }
     };
-    if let Some(state) = filter.state {
-        equality(
-            "state",
-            "agents_list_state",
-            rusqlite::types::Value::from(agent_state_name(state).to_owned()),
-        );
-    }
-    if let Some(project) = &filter.project {
-        equality(
-            "project",
-            "agents_list_project",
-            rusqlite::types::Value::from(project.clone()),
-        );
-    }
-    if let Some(harness) = &filter.harness {
-        equality(
-            "harness",
-            "agents_list_harness",
-            rusqlite::types::Value::from(harness.clone()),
-        );
-    }
     if let Some(parent) = &filter.parent {
         equality(
             "parent",
-            "agents_list_parent",
             rusqlite::types::Value::from(parse_agent_id(parent)?),
         );
+        note_index("agents_list_parent", true);
     }
     if let Some(root) = &filter.root {
-        equality(
-            "root",
-            "agents_list_root",
-            rusqlite::types::Value::from(parse_agent_id(root)?),
-        );
+        equality("root", rusqlite::types::Value::from(parse_agent_id(root)?));
+        note_index("agents_list_root", true);
     }
+    if let Some(project) = &filter.project {
+        equality("project", rusqlite::types::Value::from(project.clone()));
+        note_index("agents_list_project", true);
+    }
+    if let Some(state) = filter.state {
+        equality(
+            "state",
+            rusqlite::types::Value::from(agent_state_name(state).to_owned()),
+        );
+        note_index("agents_list_state", false);
+    }
+    if let Some(harness) = &filter.harness {
+        equality("harness", rusqlite::types::Value::from(harness.clone()));
+        note_index("agents_list_harness", false);
+    }
+    let mut forced_index = structural.or(fallback);
     let mut prefix = String::new();
     if let Some(caller) = caller {
         let caller_num = parse_agent_id(&caller.id)?;
@@ -3039,10 +3042,14 @@ fn agent_list_select(
                 }
             }
             AgentControl::Tree => {
+                // Same depth bound as direct reads (`hierarchy::is_in_subtree_of`):
+                // descendants past the walk cap stay outside tree scope.
                 prefix = format!(
-                    "WITH RECURSIVE subtree(id) AS \
-                     (SELECT {caller_num} UNION ALL \
-                     SELECT a.id FROM agents a JOIN subtree s ON a.parent = s.id) "
+                    "WITH RECURSIVE subtree(id, depth) AS \
+                     (SELECT {caller_num}, 0 UNION ALL \
+                     SELECT a.id, s.depth + 1 FROM agents a JOIN subtree s ON a.parent = s.id \
+                     WHERE s.depth + 1 < {} ) ",
+                    hierarchy::ANCESTOR_WALK_CAP
                 );
                 predicates.push("agents.id IN (SELECT id FROM subtree)".to_owned());
             }

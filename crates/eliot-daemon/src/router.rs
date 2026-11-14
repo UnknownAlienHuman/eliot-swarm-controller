@@ -2426,6 +2426,21 @@ impl Router {
         }
     }
 
+    /// Join one observation to its captured summary generation. A resume
+    /// between the summary read and the observation fetch must not attach the
+    /// new generation's observations to the old summary.
+    fn join_observation_for_summary(
+        summary_generation: i64,
+        agent: &Agent,
+        observation: ObservationView,
+    ) -> ObservationView {
+        if agent.generation != summary_generation {
+            ObservationView::unavailable("stale_generation")
+        } else {
+            observation
+        }
+    }
+
     async fn agent_processes(&self, params: &Value, principal: &Principal) -> Result<Value> {
         let request: AgentProcessesRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
@@ -2656,20 +2671,31 @@ impl Router {
             })
             .map_err(|_| Error::new("internal", "Agent list could not be encoded"));
         }
-        // Observations join one full row per summary; the byte bound trims the
-        // page the same way it trims the compact rows, and truncation stays
-        // explicit so polling managers can tell a quiet page from a cut one.
+        // Observations join one full row per summary for the captured
+        // Agent/generation; a resume between the summary read and this fetch
+        // must not attach the new generation's observations to the old
+        // summary. The byte bound trims the page the same way it trims the
+        // compact rows, and truncation stays explicit so polling managers can
+        // tell a quiet page from a cut one.
         let mut rows = Vec::new();
         let mut encoded_bytes = 0_usize;
         let mut truncated = page.truncated;
         for summary in page.summaries {
+            let summary_generation = summary.generation;
             let agent = {
                 let store = self.inner.store.lock().await;
                 store.get_agent(&summary.id)?.ok_or_else(|| {
                     Error::new("not_found", format!("Agent {} was not found", summary.id))
                 })?
             };
-            let observation = self.observation_view(&agent).await;
+            let observation = if agent.generation != summary_generation {
+                // Drop the new generation's observations; the old summary
+                // keeps its generation without inheriting them.
+                ObservationView::unavailable("stale_generation")
+            } else {
+                let fetched = self.observation_view(&agent).await;
+                Self::join_observation_for_summary(summary_generation, &agent, fetched)
+            };
             let row = AgentListRow {
                 summary,
                 observation: Some(observation),
@@ -9864,6 +9890,34 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .state,
             AgentState::Busy
         );
+    }
+
+    #[test]
+    fn list_observation_join_drops_new_generation_on_mismatch() {
+        let current = eliot_core::Agent::new("a1", "p", "codex", "fixture", 7);
+        // Matching generation keeps the fetched observation.
+        let kept = Router::join_observation_for_summary(
+            current.generation,
+            &current,
+            ObservationView::unavailable("probe"),
+        );
+        assert!(matches!(
+            kept,
+            ObservationView::Unavailable { ref error_code, .. } if error_code == "probe"
+        ));
+        // A resumed Agent (new generation) must not lend its observations to
+        // the captured old summary.
+        let mut resumed = current.clone();
+        resumed.generation += 1;
+        let dropped = Router::join_observation_for_summary(
+            current.generation,
+            &resumed,
+            ObservationView::unavailable("fresh"),
+        );
+        assert!(matches!(
+            dropped,
+            ObservationView::Unavailable { ref error_code, .. } if error_code == "stale_generation"
+        ));
     }
 
     #[tokio::test]

@@ -11368,3 +11368,50 @@ fn agent_list_filters_use_indexes_and_pages_stay_ordered() {
     assert_eq!(scoped.total, 1);
     assert_eq!(scoped.summaries[0].id, first);
 }
+
+#[test]
+fn tree_scope_listing_shares_bounded_depth_with_direct_reads() {
+    use super::hierarchy::ANCESTOR_WALK_CAP;
+    use super::{AgentListFilter, agent_list_select};
+
+    // Listing, totals and direct reads share one bounded scope rule: the
+    // tree CTE carries the same walk cap that gates parent-chain direct
+    // reads, so a tree caller cannot list or count an Agent its `agent.get`
+    // would deny.
+    let mut caller = eliot_core::Agent::new("a1", "p", "codex", "fixture", 7);
+    caller.control = eliot_core::AgentControl::Tree;
+    let filter = AgentListFilter::default();
+    for count in [false, true] {
+        let select = agent_list_select(&filter, Some(&caller), None, Some(2), count)
+            .expect("build tree scope query");
+        assert!(
+            select.sql.contains(&ANCESTOR_WALK_CAP.to_string()),
+            "tree scope must bound depth with the shared cap: {}",
+            select.sql
+        );
+        assert!(
+            select.sql.contains("subtree(id, depth)"),
+            "tree scope must track CTE depth: {}",
+            select.sql
+        );
+    }
+    // The selective structural index wins over state when both are present,
+    // so `state=idle,parent=a42` totals do not scan all idle Agents.
+    let combined = AgentListFilter {
+        state: Some(eliot_core::AgentState::Idle),
+        parent: Some("a42".to_owned()),
+        ..Default::default()
+    };
+    let select = agent_list_select(&combined, None, Some(0), Some(2), false)
+        .expect("build combined filter query");
+    assert!(
+        select.sql.contains("INDEXED BY agents_list_parent"),
+        "combined filters must prefer the parent index: {}",
+        select.sql
+    );
+    assert!(
+        !select.sql.contains("INDEXED BY agents_list_state"),
+        "combined filters must not force the state index: {}",
+        select.sql
+    );
+}

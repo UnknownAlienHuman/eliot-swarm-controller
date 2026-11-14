@@ -148,16 +148,25 @@ impl AgentListRequest {
         if reply.total < reply.agents.len() {
             return Err(invalid_response());
         }
-        // `truncated` is honest: claiming more rows requires a continuation
-        // cursor at the last returned row. A quiet page carries no promise
-        // either way; the caller continues through `next` until empty.
-        if reply.truncated
-            && reply.next.as_ref().is_none_or(|next| {
-                reply
-                    .agents
-                    .last()
-                    .is_none_or(|row| &row.summary.id != next)
-            })
+        // The Store pages by Agent ID: every nonempty page carries `next` at
+        // the last returned row, and an empty page carries no cursor. A quiet
+        // nonempty page still requires continuing through `next` until empty.
+        match reply.agents.last() {
+            Some(last) => {
+                if reply.next.as_deref() != Some(last.summary.id.as_str()) {
+                    return Err(invalid_response());
+                }
+            }
+            None => {
+                if reply.next.is_some() {
+                    return Err(invalid_response());
+                }
+            }
+        }
+        if reply
+            .next
+            .as_ref()
+            .is_some_and(|next| self.after.as_ref() == Some(next))
         {
             return Err(invalid_response());
         }
@@ -183,16 +192,9 @@ impl AgentListRequest {
                     .root
                     .as_ref()
                     .is_some_and(|root| &row.summary.root != root)
-        }) || reply.next.as_ref().is_some_and(|next| {
-            reply
-                .agents
-                .last()
-                .is_none_or(|row| &row.summary.id != next)
-                || self.after.as_ref() == Some(next)
         }) {
             return Err(invalid_response());
         }
-        // A self-scope list returns at most its own row with `next: null`.
         // Neither a non-null next nor a full page promises another record.
         Ok(())
     }
@@ -630,13 +632,12 @@ pub struct AgentListResponse {
     pub next: Option<String>,
     /// Matching records for the caller's scope and filters, ignoring the
     /// page cursor. `agents.len()` is the returned prefix of that set.
-    #[serde(default)]
+    /// Required on the wire: a missing count never reads back as zero.
     pub total: usize,
     /// True when the server knows records remain beyond this page: either a
     /// further row matched or the byte bound trimmed the page. A false value
     /// on a full page still requires continuing through `next` until the
-    /// server returns an empty page.
-    #[serde(default)]
+    /// server returns an empty page. Required on the wire.
     pub truncated: bool,
 }
 
@@ -1710,11 +1711,11 @@ mod tests {
                 summary: summary(),
                 observation: None,
             }],
-            next: None,
+            next: Some("a1".to_owned()),
             total: 1,
             truncated: false,
         };
-        request.validate_response(&reply).unwrap(); // self-scope keeps one row.
+        request.validate_response(&reply).unwrap(); // self-scope keeps one row with its cursor.
         reply.next = Some("wrong".to_owned());
         unknown(request.validate_response(&reply));
         reply.next = Some("a1".to_owned());
@@ -1809,6 +1810,51 @@ mod tests {
             assert!(invalid.validate().is_err());
         }
         assert!(serde_json::from_value::<AgentListRequest>(json!({"state": "done"})).is_err());
+    }
+
+    #[test]
+    fn list_pagination_requires_cursor_on_every_nonempty_page() {
+        let request = AgentListRequest::default();
+        let row = || AgentListRow {
+            summary: summary(),
+            observation: None,
+        };
+        // Every nonempty page carries `next` at the last returned id, even
+        // when nothing is truncated; an empty page carries no cursor.
+        let ok = AgentListResponse {
+            agents: vec![row()],
+            next: Some("a1".to_owned()),
+            total: 1,
+            truncated: false,
+        };
+        request.validate_response(&ok).unwrap();
+        let mut missing_cursor = ok.clone();
+        missing_cursor.next = None;
+        unknown(request.validate_response(&missing_cursor));
+        let mut wrong_cursor = ok.clone();
+        wrong_cursor.next = Some("a2".to_owned());
+        unknown(request.validate_response(&wrong_cursor));
+        let empty_ok = AgentListResponse {
+            agents: vec![],
+            next: None,
+            total: 1,
+            truncated: false,
+        };
+        request.validate_response(&empty_ok).unwrap();
+        let mut dangling = empty_ok.clone();
+        dangling.next = Some("a1".to_owned());
+        unknown(request.validate_response(&dangling));
+        // `total` and `truncated` are required on the wire: a missing count
+        // never reads back as zero, and a missing flag never reads as quiet.
+        let wire = serde_json::to_value(&ok).unwrap();
+        for field in ["total", "truncated"] {
+            let mut missing = wire.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<AgentListResponse>(missing).is_err(),
+                "{field} must be required"
+            );
+        }
     }
 
     #[test]

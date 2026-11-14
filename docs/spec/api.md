@@ -392,21 +392,31 @@ optional members are omitted when requests are serialized.
 records; full records stay available through `agent.get`. Optional `state`,
 `project`, `harness`, `parent` and `root` filters are exact indexed matches:
 wrong types and unknown state names are `invalid`, and a filter never matches
-silently. Each summary carries identity, state, current turn, progress age,
-the last terminal outcome with its turn and retained usage where available,
-child activity for native observed children, and the last controller-observed
-write time. A missing outcome or progress timestamp reads back absent, never
-zero or success; `updated_at` is freshness metadata, not proof of liveness
-for a detached or restarted source. The response carries the matching `total`
-ignoring the cursor, explicit `truncated`, and `next` at the last returned
-row; continue through `next` until the page is empty. `truncated` set means
-further rows are known; unset on a full page promises nothing further.
-Owner calls page the whole fleet. An Agent principal pages only its frozen
-control scope: itself for `self`, its subtree for `tree`, its project for
-`project`. A self-scope page holds at most its own row. Typed response
-binding failures remain `unknown`; validate the reply before printing it or
-advancing a cursor. `swarm ls` and `swarm top` render these summaries as
-compact tables by default; `--json` keeps printing the raw response.
+silently. The selective structural/scope index (`parent`/`root`/`project`)
+leads when several filters are present. Each summary carries identity, state,
+current turn, progress age, the last terminal outcome with its turn and
+retained usage where available, child activity for native observed children,
+and the last controller-observed write time. A missing outcome or progress
+timestamp reads back absent, never zero or success; `updated_at` is freshness
+metadata, not proof of liveness for a detached or restarted source. The
+response carries the required matching `total` ignoring the cursor, the
+required explicit `truncated`, and `next` at the last returned row on every
+nonempty page (empty pages carry no cursor); continue through `next` until the
+page is empty. A missing `total` or `truncated` never reads back as zero or
+quiet. `truncated` set means further rows are known; unset on a full page
+promises nothing further. Owner calls page the whole fleet. An Agent principal
+pages only its frozen control scope: itself for `self`, its subtree for
+`tree`, its project for `project`. Tree scope for listing, totals and direct
+reads shares one bounded depth rule, so enumeration cannot list or count an
+Agent a direct read would deny. A self-scope page holds at most its own row
+with its cursor. Joined observations bind the captured summary generation; a
+resume between the summary read and the observation fetch drops the new
+generation's observations instead of attaching them to the old summary. Typed
+response binding failures remain `unknown`; validate the reply before printing
+it or advancing a cursor. `swarm ls` and `swarm top` render these summaries as
+compact tables by default, labeling the active turn separately from the
+last-terminal outcome/usage and reporting observation data availability only;
+`--json` keeps printing the raw response.
 
 For `agent.processes`, omitted generation selects the current Agent generation for
 `scope:"agent"`, or the managed workspace target generation for `scope:"workspace"`.
