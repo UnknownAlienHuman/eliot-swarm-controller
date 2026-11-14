@@ -11,6 +11,8 @@
 #[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
+mod config_view;
+#[cfg(windows)]
 mod monitor_view;
 #[cfg(windows)]
 mod ui;
@@ -29,6 +31,8 @@ mod live;
 mod markdown;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod monitor;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod profiles;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod state;
 #[cfg_attr(not(windows), allow(dead_code))]

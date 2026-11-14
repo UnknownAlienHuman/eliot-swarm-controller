@@ -2,6 +2,7 @@
 //! admission and effect handling remain in the Router and Store.
 
 mod agent_views;
+mod config_views;
 mod coordination;
 mod digests;
 pub mod discovery;
@@ -35,6 +36,12 @@ pub use agent_views::{
     PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectGitView, ProjectRegistrationView,
     RunningTurnSummary, SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary,
     WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
+};
+pub use config_views::{
+    CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,
+    ProfileListResponse, ProfileSummary, ProfilesReadRequest, ProfilesReadResponse,
+    ProfilesSaveRequest, ProfilesSaveResponse, REDACTION_MARKER, RuleListEntry, RuleListRequest,
+    RuleListResponse,
 };
 pub use coordination::{
     ClaimConflict, ClaimListRequest, ClaimListResponse, ClaimReleaseRequest, ClaimReleaseResponse,

@@ -358,6 +358,19 @@ of the explicitly selected release scope.
       and deduplicated, and two native bar sparklines are drawn. Stop, Force stop
       and Interrupt are bound at click time to the Agent, generation and turn
       shown, and are not offered for observe-only Agents. (Refs #407)
+- [ ] **D4 Launch picker, Profiles and Automation screens.** The launch picker
+      lists the daemon's sanitized `profile.list` summaries (requested settings,
+      with native defaults named when a field is unset) and an Owner ad-hoc
+      harness mode that shows the harness catalogue defaults. The Agent detail
+      shows requested settings beside the effective native readback. The
+      Profiles screen keeps one draft of the `[profiles.*]` source: form fields
+      and the source view both edit it. Validate and Save go through
+      `config.profiles.save`, which uses the daemon parser and launch resolution,
+      a revision guard and a temporary-file rename. An invalid draft is never
+      written and stays in the editor. The screen states that running Agents
+      keep their frozen settings. The Automation screen lists rules and timers
+      read-only through `rule.list`; no pause or resume operation exists.
+      (Refs #407)
 
 ## Later
 
