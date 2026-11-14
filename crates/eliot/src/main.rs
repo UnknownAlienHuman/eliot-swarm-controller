@@ -15,15 +15,15 @@ use eliot_core::{
         EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
         EventsSubscribeRequest, EventsSubscribeResponse, GoalClearRequest, GoalDefinition,
         GoalGetRequest, GoalMode, GoalPauseRequest, GoalResumeRequest, GoalRoundRequest,
-        GoalRoundResponse, GoalSetRequest, GoalView, MAX_VAR_VALUE_BYTES, MailAckRequest,
-        MailAckResponse, MailDelivery, MailInboxRequest, MailInboxResponse, MailMode,
-        MailReadRequest, MailSendRequest, MailSendResponse, ObservationPage,
+        GoalRoundResponse, GoalSetRequest, GoalView, MAX_SWARM_WAIT_TARGETS, MAX_VAR_VALUE_BYTES,
+        MailAckRequest, MailAckResponse, MailDelivery, MailInboxRequest, MailInboxResponse,
+        MailMode, MailReadRequest, MailSendRequest, MailSendResponse, ObservationPage,
         ProjectRegistrationView, ProviderClearHoldRequest, ProviderClearHoldResponse,
         ProviderCorrectiveEvidence, ProviderHoldsRequest, ProviderHoldsResponse,
-        RuleCatchUpRequest, RuleGetRequest, RuleStateView, ShutdownMode, TimerGetRequest,
-        TimerRunRequest, TimerStateView, TurnGetRequest, TurnResolveRequest, TurnResolveResponse,
-        TurnResolveStatus, VarGetRequest, VarGetResponse, VarSetRequest, VarSetResponse,
-        WhoRequest, WhoResponse,
+        RuleCatchUpRequest, RuleGetRequest, RuleStateView, ShutdownMode, SwarmWaitRequest,
+        SwarmWaitResponse, TimerGetRequest, TimerRunRequest, TimerStateView, TurnGetRequest,
+        TurnResolveRequest, TurnResolveResponse, TurnResolveStatus, VarGetRequest, VarGetResponse,
+        VarSetRequest, VarSetResponse, WaitTurnRef, WhoRequest, WhoResponse,
     },
 };
 use serde_json::{Value, json};
@@ -164,6 +164,8 @@ enum CliCommand {
     Turn(TurnArgs),
     /// Read committed events after a sequence number.
     Events(EventsArgs),
+    /// Wait for a frozen set of child commands/turns with all/any semantics.
+    Wait(WaitArgs),
     /// Send, read or acknowledge addressed Agent mail.
     Msg(MsgArgs),
     /// Read one page of unread mail for a mailbox.
@@ -555,6 +557,21 @@ struct EventsArgs {
     since: Option<i64>,
     #[command(flatten)]
     page: PageArgs,
+}
+
+#[derive(Args)]
+struct WaitArgs {
+    /// Complete when every entry is terminal.
+    #[arg(long, conflicts_with = "any")]
+    all: bool,
+    /// Complete when any entry is terminal.
+    #[arg(long, conflicts_with = "all")]
+    any: bool,
+    #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
+    timeout_seconds: u64,
+    /// Command ids, or `agent/generation/turn_id` for exact turn bindings.
+    #[arg(value_name = "ID")]
+    ids: Vec<String>,
 }
 
 #[derive(Args)]
@@ -2227,6 +2244,12 @@ async fn dispatch(
             print_value(&result, json_output);
             Ok(0)
         }
+        CliCommand::Wait(WaitArgs {
+            all,
+            any,
+            timeout_seconds,
+            ids,
+        }) => swarm_wait(&data_dir, all, any, timeout_seconds, ids, json_output).await,
         CliCommand::Msg(MsgArgs { command }) => match command {
             MsgCommand::Send(MsgSendArgs {
                 to,
@@ -2875,6 +2898,133 @@ fn turn_exit_code(turn: &CoreTurn) -> u8 {
     }
 }
 
+/// Bounded wait over a frozen set of child commands/turns. Positional ids are
+/// command ids, or `agent/generation/turn_id` for exact turn bindings. The set
+/// is frozen client-side before the RPC; the daemon never adds later turns or
+/// children. Exit 0 only when every entry succeeded (`--all`) or at least one
+/// succeeded (`--any`); timeout exits 5 with the honest per-entry snapshot.
+async fn swarm_wait(
+    data_dir: &Path,
+    all: bool,
+    any: bool,
+    timeout_seconds: u64,
+    ids: Vec<String>,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    if all == any {
+        return Err(Failure::new(
+            2,
+            "swarm wait requires exactly one of --all or --any",
+        ));
+    }
+    if timeout_seconds == 0 || timeout_seconds > 30 {
+        return Err(Failure::new(
+            2,
+            "--timeout-seconds must be between 1 and 30",
+        ));
+    }
+    if ids.is_empty() || ids.len() > MAX_SWARM_WAIT_TARGETS {
+        return Err(Failure::new(2, "swarm wait requires 1..=256 captured ids"));
+    }
+    let mode = if all { "all" } else { "any" };
+    let mut commands = Vec::new();
+    let mut turns = Vec::new();
+    for id in ids {
+        if id.contains('/') {
+            turns.push(parse_wait_turn_ref(&id)?);
+        } else {
+            if id.trim().is_empty() {
+                return Err(Failure::new(2, "swarm wait ids must be non-empty strings"));
+            }
+            commands.push(id);
+        }
+    }
+    if commands.is_empty() && turns.is_empty() {
+        return Err(Failure::new(2, "swarm wait requires 1..=256 captured ids"));
+    }
+    let wait_ms = timeout_seconds.saturating_mul(1_000);
+    let params = SwarmWaitRequest::new(commands, turns, mode, wait_ms);
+    params
+        .validate()
+        .map_err(|error| Failure::from_core(error, false))?;
+    let response: SwarmWaitResponse =
+        eliot_daemon::client_call_typed(data_dir, "swarm.wait", &params)
+            .await
+            .map_err(|error| Failure::from_core(error, false))?;
+    params
+        .validate_response(&response)
+        .map_err(|_| Failure::new(4, "swarm.wait response is invalid"))?;
+    let value = serde_json::to_value(&response)
+        .map_err(|_| Failure::new(4, "swarm.wait response is invalid"))?;
+    print_value(&value, json_output);
+    Ok(swarm_wait_exit_code(&response))
+}
+
+fn parse_wait_turn_ref(id: &str) -> Result<WaitTurnRef, Failure> {
+    let mut parts = id.splitn(3, '/');
+    let agent = parts.next().unwrap_or_default();
+    let generation = parts.next().unwrap_or_default();
+    let turn_id = parts.next().unwrap_or_default();
+    if agent.trim().is_empty() || turn_id.trim().is_empty() || generation.trim().is_empty() {
+        return Err(Failure::new(2, "turn ids must be agent/generation/turn_id"));
+    }
+    let generation: i64 = generation.parse().map_err(|_| {
+        Failure::new(
+            2,
+            "turn ids must be agent/generation/turn_id with a nonnegative generation",
+        )
+    })?;
+    if generation < 0 {
+        return Err(Failure::new(
+            2,
+            "turn ids must be agent/generation/turn_id with a nonnegative generation",
+        ));
+    }
+    let target = WaitTurnRef::new(agent, generation, turn_id);
+    target
+        .validate()
+        .map_err(|_| Failure::new(2, "turn ids must be agent/generation/turn_id"))?;
+    Ok(target)
+}
+
+/// Exit code for a settled `swarm wait`. Timeout (or an uncompleted snapshot)
+/// exits 5; otherwise 0 only when every entry succeeded (`all`) or at least
+/// one succeeded (`any`). Interrupted entries exit 7, unknown/not_found/
+/// not_visible entries exit 4, and plain failures exit 1.
+fn swarm_wait_exit_code(response: &SwarmWaitResponse) -> u8 {
+    if response.timed_out || !response.completed {
+        return 5;
+    }
+    let succeeded = response
+        .results
+        .iter()
+        .filter(|entry| entry.status == "succeeded")
+        .count();
+    if response.mode == "any" && succeeded > 0 {
+        return 0;
+    }
+    if response.mode == "all" && succeeded == response.results.len() && !response.results.is_empty()
+    {
+        return 0;
+    }
+    if response
+        .results
+        .iter()
+        .any(|entry| entry.status == "interrupted")
+    {
+        return INTERRUPTED_EXIT_CODE;
+    }
+    if response.results.iter().any(|entry| {
+        matches!(
+            entry.status.as_str(),
+            "unknown" | "not_found" | "not_visible"
+        )
+    }) {
+        return 4;
+    }
+    1
+}
+
 fn command_value(command: CoreCommand) -> Result<Value, Failure> {
     serde_json::to_value(command).map_err(|_| Failure::new(4, "command readback is unavailable"))
 }
@@ -3194,6 +3344,82 @@ mod tests {
         assert_eq!(truncate_cell("alongprojectname", 6), "along~");
         assert_eq!(state_cell(AgentState::Busy), "busy");
         assert_eq!(activity_state_name(NativeChildActivityState::Lost), "lost");
+    }
+
+    #[test]
+    fn swarm_wait_parse_and_exit_codes() {
+        use eliot_core::api::WaitEntryResult;
+
+        let turn = parse_wait_turn_ref("a1/2/turn-9")
+            .ok()
+            .expect("turn parses");
+        assert_eq!(turn.agent, "a1");
+        assert_eq!(turn.generation, 2);
+        assert_eq!(turn.turn_id, "turn-9");
+        // Turn ids may contain slashes after the generation.
+        let slashed = parse_wait_turn_ref("a1/2/turn/with/slash")
+            .ok()
+            .expect("slashed turn parses");
+        assert_eq!(slashed.turn_id, "turn/with/slash");
+        for bad in ["a1", "a1/", "/1/t", "a1/x/t", "a1/-1/t", "a1/1/", " /1/t"] {
+            assert!(parse_wait_turn_ref(bad).is_err(), "id: {bad}");
+        }
+        let completed = |mode: &str, statuses: &[&str]| SwarmWaitResponse {
+            mode: mode.to_owned(),
+            completed: true,
+            timed_out: false,
+            results: statuses
+                .iter()
+                .enumerate()
+                .map(|(index, status)| {
+                    WaitEntryResult::new("command", format!("c{index}"), (*status).to_owned())
+                })
+                .collect(),
+        };
+        assert_eq!(
+            swarm_wait_exit_code(&completed("all", &["succeeded", "succeeded"])),
+            0
+        );
+        assert_eq!(
+            swarm_wait_exit_code(&completed("any", &["failed", "succeeded"])),
+            0
+        );
+        assert_eq!(
+            swarm_wait_exit_code(&completed("all", &["succeeded", "failed"])),
+            1
+        );
+        assert_eq!(swarm_wait_exit_code(&completed("any", &["failed"])), 1);
+        assert_eq!(
+            swarm_wait_exit_code(&completed("all", &["succeeded", "unknown"])),
+            4
+        );
+        assert_eq!(swarm_wait_exit_code(&completed("any", &["not_found"])), 4);
+        assert_eq!(
+            swarm_wait_exit_code(&completed("all", &["succeeded", "interrupted"])),
+            INTERRUPTED_EXIT_CODE
+        );
+        let timed_out = SwarmWaitResponse {
+            mode: "all".to_owned(),
+            completed: false,
+            timed_out: true,
+            results: vec![WaitEntryResult::new("command", "c0", "still_running")],
+        };
+        assert_eq!(swarm_wait_exit_code(&timed_out), 5);
+        let cli = Cli::try_parse_from(["swarm", "wait", "--all", "--timeout-seconds", "7", "c1"])
+            .unwrap();
+        let Some(CliCommand::Wait(WaitArgs {
+            all,
+            any,
+            timeout_seconds,
+            ids,
+        })) = cli.command
+        else {
+            panic!("wait command required");
+        };
+        assert!(all);
+        assert!(!any);
+        assert_eq!(timeout_seconds, 7);
+        assert_eq!(ids, vec!["c1".to_owned()]);
     }
 
     #[test]
