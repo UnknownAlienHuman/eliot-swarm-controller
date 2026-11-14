@@ -7,11 +7,14 @@ mod reader;
 mod source_handoff;
 use crate::bus::Bus;
 use crate::common::{now_ms, secure_eq, valid_environment_name};
+use crate::logging::{ViewHealthRecord, record_view_health};
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
 use eliot_core::{
-    Agent, AgentStartParams, Command, ContextItem, Error, InjectArgs, InjectPoint, Result,
-    SecretPolicy, SourceBatch, SourceGap, SourceGapAck, StderrSource,
+    Agent, AgentStartParams, Command, ContextItem, Error, InjectArgs, InjectPoint,
+    MUSE_VIEW_UNAVAILABLE_REASON_PREFIX, Result, SecretPolicy, SourceBatch, SourceGap,
+    SourceGapAck, StderrSource, ViewHealthOutcome, classify_view_health_event,
+    muse_view_reason_label,
 };
 use eliot_plugin::{
     PluginManifest, StderrCapture, StderrView,
@@ -2054,6 +2057,35 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                                                 id: agent_id.clone(),
                                                 generation,
                                             };
+                                            // Pre-scan for view-health outcomes: the batch
+                                            // moves into the commit below.
+                                            let view_source = batch.source.clone();
+                                            let view_outcomes: Vec<(
+                                                ViewHealthOutcome,
+                                                Option<String>,
+                                            )> = batch
+                                                .events
+                                                .iter()
+                                                .filter_map(|event| {
+                                                    classify_view_health_event(
+                                                        &event.kind,
+                                                        &event.data,
+                                                    )
+                                                    .map(|outcome| {
+                                                        let reason = match outcome {
+                                                            ViewHealthOutcome::ReadbackRecovered => {
+                                                                None
+                                                            }
+                                                            _ => event
+                                                                .data
+                                                                .get("reason")
+                                                                .and_then(Value::as_str)
+                                                                .map(str::to_owned),
+                                                        };
+                                                        (outcome, reason)
+                                                    })
+                                                })
+                                                .collect();
                                             let result = match subject {
                                                 Some(subject) => store.put_observed_batch(
                                                     batch,
@@ -2065,6 +2097,15 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                                             match result {
                                                 Ok(commit) => {
                                                     bus.publish(&commit.events);
+                                                    record_view_health_outcomes(
+                                                        &mut store,
+                                                        &monitoring,
+                                                        &source_credentials,
+                                                        &agent_id,
+                                                        generation,
+                                                        &view_source,
+                                                        &view_outcomes,
+                                                    );
                                                     drop(store);
                                                     serde_json::to_value(commit.ack).map_err(|_| {
                                                         late_batch_error(
@@ -2143,7 +2184,22 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                             == Some(agent_id.as_str())
                             && params.get("generation").and_then(Value::as_i64) == Some(generation);
                         if is_producer {
-                            record_source_gap(
+                            // Pre-extract the view-health signal: params moves
+                            // into the gap commit below.
+                            let view_outcome = params
+                                .get("reason")
+                                .and_then(Value::as_str)
+                                .filter(|reason| {
+                                    reason.starts_with(MUSE_VIEW_UNAVAILABLE_REASON_PREFIX)
+                                })
+                                .map(|reason| {
+                                    (ViewHealthOutcome::Unavailable, Some(reason.to_owned()))
+                                });
+                            let view_source = params
+                                .get("source")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                            let result = record_source_gap(
                                 &store,
                                 &bus,
                                 params,
@@ -2151,7 +2207,24 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                                 &source_credentials,
                                 request_deadline,
                             )
-                            .await
+                            .await;
+                            if result.is_ok()
+                                && let (Some((outcome, reason)), Some(source)) =
+                                    (view_outcome, view_source)
+                                && let Ok(mut store) =
+                                    timeout_at(request_deadline, store.lock()).await
+                            {
+                                record_view_health_outcomes(
+                                    &mut store,
+                                    &monitoring,
+                                    &source_credentials,
+                                    &agent_id,
+                                    generation,
+                                    &source,
+                                    &[(outcome, reason)],
+                                );
+                            }
+                            result
                         } else if observation.is_some() {
                             Err(Error::new(
                                 "not_allowed",
@@ -2481,6 +2554,66 @@ fn redact_source_batch(batch: &mut SourceBatch, credentials: &[String]) -> Resul
         }
     }
     Ok(())
+}
+
+/// Count committed Muse view-health transitions and emit one bounded daemon
+/// log line per transition. Runs only after the triggering commit was
+/// acknowledged, on the caller's already-held Store lock; every context read
+/// is best-effort and a failed increment falls back to zeroed totals (the
+/// journal stays the source of truth), so this never alters the plugin
+/// acknowledgement. Each entry carries the raw event reason when the event
+/// has one; the readback-recovery outcome names its episode from the latest
+/// recorded gap reason instead.
+fn record_view_health_outcomes(
+    store: &mut eliot_store::Store,
+    monitoring: &Monitoring,
+    credentials: &[String],
+    agent_id: &str,
+    generation: i64,
+    source: &str,
+    outcomes: &[(ViewHealthOutcome, Option<String>)],
+) {
+    if outcomes.is_empty() {
+        return;
+    }
+    let now = now_ms();
+    let harness_rss_bytes = monitoring.cached_harness_rss(agent_id, generation);
+    let live_muse_hosts = store.count_live_harness_agents("muse").ok();
+    let turn_age_ms = store
+        .active_turn_age_ms(agent_id, generation, now)
+        .unwrap_or(None);
+    let policy = SecretPolicy::new(credentials.iter());
+    for (outcome, reason) in outcomes {
+        let counts = store
+            .record_view_health(agent_id, generation, source, *outcome, now)
+            .unwrap_or_default();
+        let reason_label = match reason.as_deref() {
+            Some(raw) => muse_view_reason_label(raw),
+            None if matches!(outcome, ViewHealthOutcome::ReadbackRecovered) => store
+                .latest_gap_reason(agent_id, generation, source)
+                .ok()
+                .flatten()
+                .map(|gap_reason| muse_view_reason_label(&gap_reason))
+                .unwrap_or("unknown"),
+            None => "unknown",
+        };
+        record_view_health(
+            &policy,
+            *outcome,
+            agent_id,
+            generation,
+            source,
+            &ViewHealthRecord {
+                unavailable: counts.unavailable,
+                readback_recovered: counts.readback_recovered,
+                settled_unknown: counts.settled_unknown,
+                live_muse_hosts,
+                turn_age_ms,
+                harness_rss_bytes,
+                reason_label,
+            },
+        );
+    }
 }
 
 async fn record_source_gap(
@@ -4199,6 +4332,96 @@ mod tests {
         expected.reason = "reader lost [REDACTED]".to_owned();
         redact_source_gap(&mut gap, &[SECRET.to_owned()]).unwrap();
         assert_eq!(gap, expected);
+    }
+
+    #[test]
+    fn view_health_outcomes_count_committed_transitions_only() {
+        let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
+        let command_id = Ulid::new().to_string();
+        let now = now_ms();
+        let admission = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: command_id.clone(),
+                    target: None,
+                    selector: None,
+                    verb: "launch".to_owned(),
+                    args: json!({"project":"view-health", "workspace":"synthetic-workspace", "harness":"muse", "profile":"fixture", "profile_snapshot":{}}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .unwrap();
+        let agent_id = admission.command.target.unwrap();
+        store.dispatch(&command_id, now).unwrap();
+        crate::test_support::install_fixture_sources(&mut store, &agent_id, &command_id, 1, now);
+        let monitoring = Monitoring::new(
+            Arc::new(AsyncMutex::new(
+                eliot_store::Store::open(Path::new(":memory:")).unwrap(),
+            )),
+            Bus::new(16),
+            Arc::new(Mutex::new(HashSet::new())),
+        );
+        let credentials = ["fixture-secret".to_owned()];
+
+        // No outcomes means no increments and no log line.
+        record_view_health_outcomes(
+            &mut store,
+            &monitoring,
+            &credentials,
+            &agent_id,
+            1,
+            "stream",
+            &[],
+        );
+        let states = store.list_source_states(&agent_id, 1).unwrap();
+        assert_eq!(states.len(), 1);
+
+        // Each outcome increments exactly its own counter.
+        record_view_health_outcomes(
+            &mut store,
+            &monitoring,
+            &credentials,
+            &agent_id,
+            1,
+            "stream",
+            &[(
+                ViewHealthOutcome::Unavailable,
+                Some("Muse native view is unavailable (projectionUnavailable)".to_owned()),
+            )],
+        );
+        record_view_health_outcomes(
+            &mut store,
+            &monitoring,
+            &credentials,
+            &agent_id,
+            1,
+            "stream",
+            &[(ViewHealthOutcome::ReadbackRecovered, None)],
+        );
+        record_view_health_outcomes(
+            &mut store,
+            &monitoring,
+            &credentials,
+            &agent_id,
+            1,
+            "stream",
+            &[(
+                ViewHealthOutcome::SettledUnknown,
+                Some(
+                    "Muse native view recovery did not prove live delivery after the recorded gap (projectionReadLimit)"
+                        .to_owned(),
+                ),
+            )],
+        );
+        let counts = store.read_source_state(&agent_id, 1, "stream").unwrap();
+        assert_eq!(counts["view_unavailable"], serde_json::json!(1));
+        assert_eq!(counts["view_readback_recovered"], serde_json::json!(1));
+        assert_eq!(counts["view_settled_unknown"], serde_json::json!(1));
     }
 
     #[tokio::test]

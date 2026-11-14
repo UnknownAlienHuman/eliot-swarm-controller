@@ -122,6 +122,15 @@ commits `message.completed` and `turn.completed` with the real final message
 rather than settling unknown. A later healthy read does not establish
 live-edge recovery.
 
+Every unavailable-view episode and its outcome is counted per agent: the
+adapter commits the unavailable-view gap with the fixed reason prefix, marks
+a readback-proven `turn.completed` with the fixed `view_recovery` marker, and
+commits the settled-unknown `turn.unknown` with its fixed reason prefix. The
+daemon counts exactly these committed signals into the source-state
+view-health counters (surfaced in `swarm show` observation) and emits one
+bounded daemon-log line per transition with the load context at the event
+(live Muse hosts, active-turn age, harness RSS, reason label).
+
 Verified 2026-11-13 using the installed host's offline stable and experimental
 JSON/TypeScript exports: Muse Code `1.4.0-R4161.1`, executable SHA-256
 `B33B493069A2593E97CC63F9A4063FEB64269BF7F07A233F5DB2DB681AD5D950`, stable

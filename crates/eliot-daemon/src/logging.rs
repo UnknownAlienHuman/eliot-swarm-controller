@@ -6,7 +6,8 @@ use crate::platform::{
     data_dir::{DaemonLock, open_private_log_file, rotate_private_log_file},
 };
 use eliot_core::{
-    Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SecretPolicy, bound_stderr_diagnostics,
+    Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SecretPolicy, ViewHealthOutcome,
+    bound_stderr_diagnostics,
 };
 use eliot_plugin::sync::LockExt;
 use serde_json::{Map, Value, json};
@@ -74,6 +75,42 @@ pub(crate) struct Counts {
     pub(crate) mail: u64,
 }
 
+/// One bounded Muse view-health log record: the cumulative per-agent counters
+/// after the increment plus the per-event load context. The reason is a fixed
+/// `noneReason` label (never free text); every other field is a typed number
+/// or null. Best effort like every other daemon-log write: encoding or
+/// filesystem failure never changes the caller's operation.
+pub(crate) struct ViewHealthRecord {
+    pub(crate) unavailable: u64,
+    pub(crate) readback_recovered: u64,
+    pub(crate) settled_unknown: u64,
+    pub(crate) live_muse_hosts: Option<i64>,
+    pub(crate) turn_age_ms: Option<i64>,
+    pub(crate) harness_rss_bytes: Option<u64>,
+    pub(crate) reason_label: &'static str,
+}
+
+pub(crate) fn record_view_health(
+    policy: &SecretPolicy,
+    outcome: ViewHealthOutcome,
+    agent_id: &str,
+    generation: i64,
+    source: &str,
+    record: &ViewHealthRecord,
+) {
+    let Some(bytes) = encode_view_health(policy, outcome, agent_id, generation, source, record)
+    else {
+        return;
+    };
+    let mut current = LOG.lock_recover();
+    if let Some(log) = current.as_mut()
+        && log.write(&bytes).is_err()
+    {
+        log.file = None;
+        eprintln!("error: daemon_log_unavailable");
+    }
+}
+
 pub(crate) fn record_counts(
     policy: &SecretPolicy,
     code: &str,
@@ -102,6 +139,43 @@ fn write_record(
         log.file = None;
         eprintln!("error: daemon_log_unavailable");
     }
+}
+
+fn encode_view_health(
+    policy: &SecretPolicy,
+    outcome: ViewHealthOutcome,
+    agent_id: &str,
+    generation: i64,
+    source: &str,
+    record: &ViewHealthRecord,
+) -> Option<Vec<u8>> {
+    let value = json!({
+        "ts": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        "code": outcome.log_code(),
+        "ids": {
+            "agent_id": bounded_text(policy, agent_id, 256),
+            "generation": generation,
+            "source": bounded_text(policy, source, 64),
+        },
+        "reason": bounded_text(policy, record.reason_label, 64),
+        "view_health": {
+            "unavailable": record.unavailable,
+            "readback_recovered": record.readback_recovered,
+            "settled_unknown": record.settled_unknown,
+            "live_muse_hosts": record.live_muse_hosts,
+            "turn_age_ms": record.turn_age_ms,
+            "harness_rss_bytes": record.harness_rss_bytes,
+        },
+    });
+    let mut bytes = serde_json::to_vec(&value).ok()?;
+    if bytes.len() >= RECORD_BYTES {
+        return None;
+    }
+    bytes.push(b'\n');
+    Some(bytes)
 }
 
 fn bounded_text(policy: &SecretPolicy, text: &str, limit: usize) -> String {
@@ -414,6 +488,75 @@ mod tests {
         .unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(value.get("ids").is_none());
+    }
+
+    #[test]
+    fn view_health_records_carry_bounded_labels_and_typed_context() {
+        let policy = SecretPolicy::new(["log-test-secret"]);
+        for outcome in [
+            ViewHealthOutcome::Unavailable,
+            ViewHealthOutcome::ReadbackRecovered,
+            ViewHealthOutcome::SettledUnknown,
+        ] {
+            let bytes = encode_view_health(
+                &policy,
+                outcome,
+                "a1",
+                2,
+                "stream",
+                &ViewHealthRecord {
+                    unavailable: 3,
+                    readback_recovered: 2,
+                    settled_unknown: 1,
+                    live_muse_hosts: Some(9),
+                    turn_age_ms: Some(42_000),
+                    harness_rss_bytes: Some(400 * 1024 * 1024),
+                    reason_label: "projectionUnavailable",
+                },
+            )
+            .expect("encode view-health record");
+            assert!(bytes.len() < RECORD_BYTES);
+            assert_eq!(bytes.last(), Some(&b'\n'));
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["code"], json!(outcome.log_code()));
+            assert!(value["code"].as_str().unwrap().starts_with("muse."));
+            assert_eq!(value["ids"]["agent_id"], json!("a1"));
+            assert_eq!(value["ids"]["generation"], json!(2));
+            assert_eq!(value["ids"]["source"], json!("stream"));
+            assert_eq!(value["reason"], json!("projectionUnavailable"));
+            assert_eq!(value["view_health"]["unavailable"], json!(3));
+            assert_eq!(value["view_health"]["readback_recovered"], json!(2));
+            assert_eq!(value["view_health"]["settled_unknown"], json!(1));
+            assert_eq!(value["view_health"]["live_muse_hosts"], json!(9));
+            assert_eq!(value["view_health"]["turn_age_ms"], json!(42_000));
+            assert_eq!(
+                value["view_health"]["harness_rss_bytes"],
+                json!(400 * 1024 * 1024)
+            );
+        }
+        // Unknown contexts stay null; secrets in ids are still redacted.
+        let bytes = encode_view_health(
+            &policy,
+            ViewHealthOutcome::Unavailable,
+            "a1log-test-secret",
+            1,
+            "stream",
+            &ViewHealthRecord {
+                unavailable: 1,
+                readback_recovered: 0,
+                settled_unknown: 0,
+                live_muse_hosts: None,
+                turn_age_ms: None,
+                harness_rss_bytes: None,
+                reason_label: "unknown",
+            },
+        )
+        .expect("encode degraded view-health record");
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(!value.to_string().contains("log-test-secret"));
+        assert!(value["view_health"]["live_muse_hosts"].is_null());
+        assert!(value["view_health"]["turn_age_ms"].is_null());
+        assert!(value["view_health"]["harness_rss_bytes"].is_null());
     }
 
     #[test]

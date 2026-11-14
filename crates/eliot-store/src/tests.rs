@@ -9,7 +9,7 @@ use eliot_core::api::{
 use eliot_core::{
     AgentControl, AgentState, CommandState, EventCause, NativeEvent, NativeStoreBinding,
     ProcessIdentity, ProcessRecord, ProcessState, ProviderHoldState, ProviderRestrictionKind,
-    SourceBatch, SourceGap, SubmitCommand, TurnOutcome, TurnState,
+    SourceBatch, SourceGap, SubmitCommand, TurnOutcome, TurnState, ViewHealthOutcome,
 };
 use eliot_core::{
     WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparationInput,
@@ -2851,6 +2851,32 @@ fn project_registration_migration_defaults_legacy_run_authority_to_deny() {
                        repo_common_dir TEXT NOT NULL,
                        profiles TEXT NOT NULL,
                        actions TEXT NOT NULL
+                   );
+                   CREATE TABLE source_state (
+                       agent INTEGER NOT NULL REFERENCES agents(id),
+                       generation INTEGER NOT NULL,
+                       source TEXT NOT NULL,
+                       cursor TEXT,
+                       last_store_seq INTEGER,
+                       last_batch_id TEXT,
+                       last_batch_digest BLOB,
+                       last_batch_first_seq INTEGER,
+                       last_batch_last_seq INTEGER,
+                       state TEXT NOT NULL CHECK(state IN ('open', 'closed')),
+                       health TEXT NOT NULL CHECK(health IN ('ok', 'slow', 'stale', 'error')),
+                       updated_at INTEGER NOT NULL,
+                       gap_id TEXT,
+                       gap_digest BLOB
+                           CHECK(gap_digest IS NULL OR length(gap_digest) = 32),
+                       gap_from TEXT,
+                       gap_to TEXT,
+                       gap_seq INTEGER,
+                       last_handoff_digest BLOB
+                           CHECK(last_handoff_digest IS NULL OR length(last_handoff_digest) = 32),
+                       last_handoff TEXT
+                           CHECK((last_handoff IS NULL) = (last_handoff_digest IS NULL)),
+                       PRIMARY KEY(agent, generation, source),
+                       CHECK(last_batch_digest IS NULL OR length(last_batch_digest) = 32)
                    );
                    INSERT INTO project_registrations(
                        id, checkout, repo_common_dir, profiles, actions
@@ -7098,7 +7124,11 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "DROP TABLE completion_digests;
+            "ALTER TABLE source_state DROP COLUMN view_unavailable;
+             ALTER TABLE source_state DROP COLUMN view_recovered;
+             ALTER TABLE source_state DROP COLUMN view_unknown;
+             DELETE FROM schema_migrations WHERE version = 38;
+             DROP TABLE completion_digests;
              DELETE FROM schema_migrations WHERE version = 37;
              DROP TABLE agent_config;
              ALTER TABLE agents DROP COLUMN profile_inherited;
@@ -13892,5 +13922,173 @@ fn retained_command_and_turn_views_survive_later_revisions() {
             .expect("resolve stop view"),
         None,
         "non-native commands expose no configuration view"
+    );
+}
+
+fn ready_view_health_agent(store: &mut Store, project: &str, harness: &str, now: i64) -> String {
+    let launch_id = Ulid::new().to_string();
+    let admission = store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: launch_id.clone(),
+                target: None,
+                selector: None,
+                verb: "launch".to_owned(),
+                args: json!({"project":project, "workspace":"synthetic-workspace", "harness":harness, "profile":"fake", "profile_snapshot":{}}),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit launch");
+    let agent = admission.command.target.expect("launch target");
+    store.dispatch(&launch_id, now).expect("dispatch launch");
+    install_fixture_sources(store, &agent, &launch_id, 1, now);
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:ready"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: format!("{project}:ready"),
+                    data: json!({"command_id":launch_id}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit session ready");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now)
+        .expect("settle launch");
+    agent
+}
+
+#[test]
+fn view_health_counters_increment_and_surface_per_agent() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_view_health_agent(&mut store, "view-health", "muse", now);
+
+    // Unknown rows never invent counters.
+    let missing = store
+        .record_view_health("a999", 1, "stream", ViewHealthOutcome::Unavailable, now)
+        .unwrap_err();
+    assert_eq!(missing.code, "source_integrity");
+
+    // Fresh rows start at zero and surface zeroed counters.
+    let states = store
+        .list_source_states(&agent, 1)
+        .expect("list source states");
+    let stream = states
+        .iter()
+        .find(|state| state["source"] == "stream")
+        .expect("stream source state");
+    assert_eq!(stream["view_unavailable"], json!(0));
+    assert_eq!(stream["view_readback_recovered"], json!(0));
+    assert_eq!(stream["view_settled_unknown"], json!(0));
+
+    let counts = store
+        .record_view_health(&agent, 1, "stream", ViewHealthOutcome::Unavailable, now)
+        .expect("count unavailable");
+    assert_eq!(counts.unavailable, 1);
+    assert_eq!(counts.readback_recovered, 0);
+    assert_eq!(counts.settled_unknown, 0);
+    let counts = store
+        .record_view_health(
+            &agent,
+            1,
+            "stream",
+            ViewHealthOutcome::ReadbackRecovered,
+            now,
+        )
+        .expect("count recovered");
+    assert_eq!(counts.unavailable, 1);
+    assert_eq!(counts.readback_recovered, 1);
+    assert_eq!(counts.settled_unknown, 0);
+    let counts = store
+        .record_view_health(&agent, 1, "stream", ViewHealthOutcome::SettledUnknown, now)
+        .expect("count unknown");
+    assert_eq!(counts.unavailable, 1);
+    assert_eq!(counts.readback_recovered, 1);
+    assert_eq!(counts.settled_unknown, 1);
+
+    // Both read surfaces carry the counters.
+    let states = store
+        .list_source_states(&agent, 1)
+        .expect("list source states");
+    let stream = states
+        .iter()
+        .find(|state| state["source"] == "stream")
+        .expect("stream source state");
+    assert_eq!(stream["view_unavailable"], json!(1));
+    assert_eq!(stream["view_readback_recovered"], json!(1));
+    assert_eq!(stream["view_settled_unknown"], json!(1));
+    let read = store
+        .read_source_state(&agent, 1, "stream")
+        .expect("read source state");
+    assert_eq!(read["view_unavailable"], json!(1));
+    assert_eq!(read["view_readback_recovered"], json!(1));
+    assert_eq!(read["view_settled_unknown"], json!(1));
+
+    // Concurrency counts live harness agents only.
+    assert_eq!(
+        store.count_live_harness_agents("muse").expect("count muse"),
+        1
+    );
+    assert_eq!(
+        store
+            .count_live_harness_agents("codex")
+            .expect("count codex"),
+        0
+    );
+
+    // No active turn means no turn age and no gap reason yet.
+    assert_eq!(
+        store.active_turn_age_ms(&agent, 1, now).expect("no age"),
+        None
+    );
+    assert_eq!(
+        store
+            .latest_gap_reason(&agent, 1, "stream")
+            .expect("no gap"),
+        None
+    );
+
+    // An active turn gains a measurable age; a recorded gap names its reason.
+    let _turn_id = start_fake_turn(&mut store, &agent, now + 10);
+    assert_eq!(
+        store
+            .active_turn_age_ms(&agent, 1, now + 60)
+            .expect("turn age"),
+        Some(48)
+    );
+    store
+        .record_source_gap(
+            SourceGap {
+                gap_id: "view-health-gap".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                families: vec!["turn".to_owned()],
+                reason: "Muse native view is unavailable (projectionUnavailable)".to_owned(),
+                from: None,
+                to: None,
+            },
+            now + 70,
+        )
+        .expect("record view gap");
+    assert_eq!(
+        store
+            .latest_gap_reason(&agent, 1, "stream")
+            .expect("gap reason"),
+        Some("Muse native view is unavailable (projectionUnavailable)".to_owned())
     );
 }

@@ -2925,6 +2925,9 @@ struct SourceStateRecord {
     gap_seq: Option<i64>,
     last_handoff_digest: Option<Vec<u8>>,
     last_handoff: Option<String>,
+    view_unavailable: i64,
+    view_recovered: i64,
+    view_unknown: i64,
 }
 
 struct CommandInsert<'a> {
@@ -4945,7 +4948,8 @@ fn load_source_state(
         .query_row(
             "SELECT cursor, last_store_seq, last_batch_id, last_batch_digest,
                     last_batch_first_seq, last_batch_last_seq, state, health,
-                    gap_id, gap_digest, gap_from, gap_to, gap_seq, last_handoff_digest, last_handoff
+                    gap_id, gap_digest, gap_from, gap_to, gap_seq, last_handoff_digest, last_handoff,
+                    view_unavailable, view_recovered, view_unknown
              FROM source_state WHERE agent = ?1 AND generation = ?2 AND source = ?3",
             params![agent, generation, source],
             |row| {
@@ -4965,6 +4969,9 @@ fn load_source_state(
                     gap_seq: row.get(12)?,
                     last_handoff_digest: row.get(13)?,
                     last_handoff: row.get(14)?,
+                    view_unavailable: row.get(15)?,
+                    view_recovered: row.get(16)?,
+                    view_unknown: row.get(17)?,
                 })
             },
         )

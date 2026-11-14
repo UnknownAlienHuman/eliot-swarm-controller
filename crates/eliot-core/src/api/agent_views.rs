@@ -813,6 +813,14 @@ pub struct SourceState {
     pub gap_to: Option<String>,
     #[serde(deserialize_with = "nullable")]
     pub gap_seq: Option<i64>,
+    /// Bounded Muse view-health counters for this source. Always present on
+    /// the wire going forward; older readers default them to zero.
+    #[serde(default)]
+    pub view_unavailable: u64,
+    #[serde(default)]
+    pub view_readback_recovered: u64,
+    #[serde(default)]
+    pub view_settled_unknown: u64,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2319,9 +2327,23 @@ mod tests {
         let wire = json!({"agent_id":"a1","generation":1,"source":"workspace_process","families":["workspace_process"],
             "owners":[{"family":"workspace_process","source":"workspace_process","mechanism":"os"}],"state":"open","health":"ok",
             "cursor":null,"last_store_seq":null,"last_batch_id":null,"last_batch_first_seq":null,"last_batch_last_seq":null,
-            "gap_id":null,"gap_from":null,"gap_to":null,"gap_seq":null});
+            "gap_id":null,"gap_from":null,"gap_to":null,"gap_seq":null,
+            "view_unavailable":0,"view_readback_recovered":0,"view_settled_unknown":0});
         let source: SourceState = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(serde_json::to_value(&source).unwrap(), wire);
+        // Pre-counter wire without the view-health keys still reads back as zero.
+        let mut legacy = wire.clone();
+        for key in [
+            "view_unavailable",
+            "view_readback_recovered",
+            "view_settled_unknown",
+        ] {
+            legacy.as_object_mut().unwrap().remove(key);
+        }
+        let legacy_source: SourceState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy_source.view_unavailable, 0);
+        assert_eq!(legacy_source.view_readback_recovered, 0);
+        assert_eq!(legacy_source.view_settled_unknown, 0);
         let mut reply = AgentGetResponse {
             agent: Agent::new("a1", "p", "fake", "fake", 0),
             observation: observation(),

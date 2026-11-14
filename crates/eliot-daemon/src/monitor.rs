@@ -11,7 +11,7 @@ use crate::{
 };
 use eliot_core::{
     Agent, Error, FileChangeHint, GitBaseline, GitHintPage, GitSnapshot, ProcessRecord,
-    ProcessSnapshot, ProcessState, Result, SourceGap, WorkspacePreparation,
+    ProcessSnapshot, ProcessState, Result, SourceGap, ViewHealthCounts, WorkspacePreparation,
     api::{
         FilesystemInvalidationState, FilesystemInvalidationView, GitObservation, GitView,
         LivenessBasis, LivenessView, MonitoringSourceState, ObservationData, ObservationView,
@@ -468,16 +468,15 @@ impl Monitoring {
             .map(|target| target.cache.lock_recover().clone())
             .unwrap_or_default();
         let unavailable = self.inner.unavailable.lock_recover().clone();
-        let (processes, last_model_progress, source_healthy) = {
+        let (processes, last_model_progress, source_healthy, view_health) = {
             let store = self.inner.store.lock().await;
             let processes =
                 store.list_processes(&owner(&agent.id, agent.generation), None, PAGE_LIMIT)?;
             let progress = store.last_model_progress(&agent.id, agent.generation)?;
-            let healthy = store
-                .list_source_states(&agent.id, agent.generation)
-                .ok()
-                .and_then(native_sources_healthy);
-            (processes, progress, healthy)
+            let states = store.list_source_states(&agent.id, agent.generation).ok();
+            let healthy = states.clone().and_then(native_sources_healthy);
+            let view_health = states.and_then(view_health_summary);
+            (processes, progress, healthy, view_health)
         };
         let now = now_ms();
         let model_clock_regressed = last_model_progress.is_some_and(|at| at > now);
@@ -490,6 +489,7 @@ impl Monitoring {
             Err(error) => GitView::error(error.code),
         };
         Ok(ObservationView::Data(Box::new(ObservationData {
+            view_health,
             processes_truncated: processes.len() == PAGE_LIMIT,
             processes,
             stats: stats_view(&cache, unavailable, now),
@@ -1371,6 +1371,21 @@ impl Monitoring {
             .cloned()
     }
 
+    /// Latest cached harness RSS for one agent generation, mirroring the
+    /// `stats_view` fold (complete snapshots only). Best-effort diagnostics
+    /// for the view-health log line: `None` when no fresh sample exists.
+    pub(crate) fn cached_harness_rss(&self, agent: &str, generation: i64) -> Option<u64> {
+        let cache = self.target(agent, generation)?.cache.lock_recover().clone();
+        let snapshot = cache.snapshot.filter(|snapshot| snapshot.complete)?;
+        if snapshot.samples.is_empty() {
+            return None;
+        }
+        snapshot
+            .samples
+            .iter()
+            .try_fold(0_u64, |total, sample| total.checked_add(sample.rss_bytes?))
+    }
+
     async fn sample_all(&self) {
         let targets: Vec<_> = self
             .inner
@@ -1707,6 +1722,32 @@ fn native_sources_healthy(states: Vec<Value>) -> Option<bool> {
     } else {
         None
     }
+}
+
+/// Agent-level Muse view-health rollup over the same source states that feed
+/// `source_healthy`. Sums the per-source counters; `None` when nothing was
+/// ever counted so unaffected agents keep their exact previous shape. A row
+/// that fails to parse voids the rollup, matching `native_sources_healthy`;
+/// only reserved monitor sources are skipped.
+fn view_health_summary(states: Vec<Value>) -> Option<ViewHealthCounts> {
+    let mut total = ViewHealthCounts::default();
+    for state in states {
+        let state: SourceState = serde_json::from_value(state).ok()?;
+        if matches!(
+            state.source.as_str(),
+            "daemon" | "os" | "git" | "workspace_process"
+        ) {
+            continue;
+        }
+        total.unavailable = total.unavailable.saturating_add(state.view_unavailable);
+        total.readback_recovered = total
+            .readback_recovered
+            .saturating_add(state.view_readback_recovered);
+        total.settled_unknown = total
+            .settled_unknown
+            .saturating_add(state.view_settled_unknown);
+    }
+    if total.is_empty() { None } else { Some(total) }
 }
 
 fn age_ms(now: i64, timestamp: i64) -> Option<i64> {
@@ -2214,5 +2255,36 @@ mod tests {
             cache_a.sampled_at.is_some() && cache_a.sampled_at == cache_b.sampled_at,
             "one sampled_at is reused for every target of the sweep"
         );
+    }
+
+    #[test]
+    fn view_health_summary_rolls_up_native_sources_only() {
+        fn state(source: &str, unavailable: u64, recovered: u64, unknown: u64) -> Value {
+            serde_json::json!({
+                "agent_id": "a1", "generation": 1, "source": source,
+                "families": ["turn"],
+                "owners": [{"family": "turn", "source": source, "mechanism": "stream"}],
+                "state": "open", "health": "stale",
+                "cursor": null, "last_store_seq": null,
+                "last_batch_id": null, "last_batch_first_seq": null, "last_batch_last_seq": null,
+                "gap_id": "gap", "gap_from": null, "gap_to": null, "gap_seq": 1,
+                "view_unavailable": unavailable,
+                "view_readback_recovered": recovered,
+                "view_settled_unknown": unknown,
+            })
+        }
+        let summary = view_health_summary(vec![
+            state("stream", 2, 1, 0),
+            state("transcript", 1, 0, 1),
+            state("os", 99, 99, 99),
+        ])
+        .expect("native sources roll up");
+        assert_eq!(summary.unavailable, 3);
+        assert_eq!(summary.readback_recovered, 1);
+        assert_eq!(summary.settled_unknown, 1);
+        // All-zero counters stay absent so unaffected agents keep their shape.
+        assert_eq!(view_health_summary(vec![state("stream", 0, 0, 0)]), None);
+        // An unparseable row voids the rollup instead of summing partially.
+        assert_eq!(view_health_summary(vec![Value::Null]), None);
     }
 }
