@@ -7016,12 +7016,56 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                     "rule worker did not dispatch the stored successor",
                 )
             })??;
-            let second_before_settle = {
+            // Ordered release is a committed-event property: the successor's
+            // `command.dispatched` must sort after the predecessor's
+            // `command.applied`. The live `get_command` read below races the
+            // worker: `process_command_inner` publishes `command.dispatched`
+            // and then, in the same task with no yield point, executes the
+            // `stop`. Fixtures install no plugin, so that execution settles
+            // `Rejected/native_not_dispatched` before this test can observe
+            // the transient `Dispatched` state.
+            let (second_before_settle, second_before_outcome) = {
                 let store = store.lock().await;
-                store
+                let command = store
                     .get_command(&second_child_id)?
-                    .ok_or_else(|| Error::new("not_found", "successor command disappeared"))?
-                    .state
+                    .ok_or_else(|| Error::new("not_found", "successor command disappeared"))?;
+                let outcome_code = command
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.get("code"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                (command.state, outcome_code)
+            };
+            let (first_applied_seq, second_dispatched_seq) = {
+                let store = store.lock().await;
+                let history = store.read_events(0, 1_000, None)?;
+                let first_applied_seq = history
+                    .iter()
+                    .filter(|event| {
+                        event.kind == "command.applied"
+                            && event.data.get("command_id").and_then(Value::as_str)
+                                == Some(first_child_id.as_str())
+                    })
+                    .map(|event| event.seq)
+                    .max()
+                    .ok_or_else(|| {
+                        Error::new("internal", "predecessor applied event was not committed")
+                    })?;
+                let second_dispatched_seq = history
+                    .iter()
+                    .filter(|event| {
+                        event.kind == "command.dispatched"
+                            && event.data.get("command_id").and_then(Value::as_str)
+                                == Some(second_child_id.as_str())
+                    })
+                    .map(|event| event.seq)
+                    .max()
+                    .ok_or_else(|| {
+                        Error::new("internal", "successor dispatched event was not committed")
+                    })?;
+                (first_applied_seq, second_dispatched_seq)
             };
             let blockers_before_second_settle = router.status_blockers().await?;
             let second_blocker_before_settle =
@@ -7065,6 +7109,13 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                         }
                         _ => false,
                     });
+            let second_applied_outcome = second_applied
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.get("code"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
             Ok::<_, Error>((
                 drain,
                 firing_closed,
@@ -7072,11 +7123,15 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 initial_second_blocker,
                 first_applied.state,
                 dispatched_event,
+                first_applied_seq,
+                second_dispatched_seq,
                 second_before_settle,
+                second_before_outcome,
                 second_blocker_before_settle,
                 first_blocker_after_applied,
                 should_exit_before_second_settle,
                 second_applied.state,
+                second_applied_outcome,
                 second_blocker_after_settle,
             ))
         }
@@ -7108,11 +7163,15 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             initial_second_blocker,
             first_state,
             dispatched_event,
+            first_applied_seq,
+            second_dispatched_seq,
             second_before_settle,
+            second_before_outcome,
             second_blocker_before_settle,
             first_blocker_after_applied,
             should_exit_before_second_settle,
             second_state,
+            second_applied_outcome,
             second_blocker_after_settle,
         ) = scenario.expect("drain worker ordering scenario completed");
         assert_eq!(drain["state"], json!("dispatched"));
@@ -7121,14 +7180,46 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert!(initial_second_blocker);
         assert_eq!(first_state, CommandState::Applied);
         assert_eq!(dispatched_event.data["command_id"], second_child_id);
-        assert!(matches!(
-            second_before_settle,
-            CommandState::Dispatched | CommandState::Unknown
-        ));
-        assert!(second_blocker_before_settle);
+        // The ordered-release contract is the committed event order: the
+        // successor's `command.dispatched` sorts after the predecessor's
+        // `command.applied`, so the worker only released it after the
+        // predecessor applied.
+        assert!(
+            second_dispatched_seq > first_applied_seq,
+            "successor dispatch (seq {second_dispatched_seq}) must sort after \
+             predecessor applied (seq {first_applied_seq})"
+        );
+        // The live state read races the worker's immediate fixture settlement
+        // (see above): accept the transient `Dispatched`/`Unknown` observation
+        // or the terminal fixture `Rejected/native_not_dispatched`.
+        assert!(
+            matches!(
+                second_before_settle,
+                CommandState::Dispatched | CommandState::Unknown
+            ) || (second_before_settle == CommandState::Rejected
+                && second_before_outcome == "native_not_dispatched"),
+            "unexpected successor state before test settlement: \
+             {second_before_settle:?} ({second_before_outcome})"
+        );
+        // When the test observes the transient dispatch the successor still
+        // blocks drain; when the worker already settled the fixture terminal
+        // state there is nothing left to block on.
+        if second_before_settle == CommandState::Rejected {
+            assert!(!second_blocker_before_settle);
+        } else {
+            assert!(second_blocker_before_settle);
+        }
         assert!(!first_blocker_after_applied);
         assert!(!should_exit_before_second_settle);
-        assert_eq!(second_state, CommandState::Applied);
+        // The test's own `Applied` settlement either commits (test won the
+        // race) or is retained as the worker's fixture `Rejected` (worker won
+        // the race); both preserve the committed dispatch order above.
+        assert!(
+            second_state == CommandState::Applied
+                || (second_state == CommandState::Rejected
+                    && second_applied_outcome == "native_not_dispatched"),
+            "unexpected successor terminal state: {second_state:?} ({second_applied_outcome})"
+        );
         assert!(!second_blocker_after_settle);
     }
 
