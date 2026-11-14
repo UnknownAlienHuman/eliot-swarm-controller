@@ -1036,6 +1036,10 @@ the opaque coverage object and do not synthesize completeness.
 Unsupported source/paging stays explicit. Observation never resumes a thread to obtain
 history. See the neutral
 `ObservationPage` bounds in [plugin protocol](plugin-protocol.md#host-requests).
+The native subject projection read at attach is retained with the applied attach
+outcome: when the live observer reader has lapsed, `source=native, view=subject` is
+served from that retained metadata bound to the current generation. Turns/items views
+still require the live reader, and a later detach still fences every read.
 Observe detach fences new reads, closes only its reader and records source closure
 after cleanup. It retains unknown native state and never reports native session end.
 
