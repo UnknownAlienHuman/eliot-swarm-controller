@@ -108,6 +108,9 @@ struct StartPlan {
     session_id: String,
     requested_model: String,
     requested_permission_mode: Option<String>,
+    /// Frozen Claude Code `--effort` level (closed CLI vocabulary); absent
+    /// keeps the CLI default.
+    requested_effort: Option<String>,
     requested_mcp_policy: McpPolicy,
     requested_mcp_allow: Vec<String>,
     resume_ref: Option<String>,
@@ -647,6 +650,7 @@ impl ClaudePlugin {
         // unset means the CLI-default posture.
         let requested_permission_mode =
             optional_profile_text(profile, "permission_mode", "Claude")?;
+        let requested_effort = optional_profile_text(profile, "effort", "Claude")?;
         // Frozen worker MCP policy: inherit keeps the normal MCP precedence,
         // minimal is enforced with the installed `--strict-mcp-config` flag.
         let requested_mcp_policy = McpPolicy::parse_snapshot(profile)
@@ -740,6 +744,7 @@ impl ClaudePlugin {
             session_id,
             requested_model,
             requested_permission_mode,
+            requested_effort,
             requested_mcp_policy,
             requested_mcp_allow,
             resume_ref,
@@ -1010,6 +1015,7 @@ impl ClaudePlugin {
             "requested": {
                 "model": plan.requested_model.clone(),
                 "permission_mode": plan.requested_permission_mode.clone(),
+                "effort": plan.requested_effort.clone(),
                 "cwd": plan.workspace.to_string_lossy(),
                 "mcp_policy": plan.requested_mcp_policy.as_str(),
                 "mcp_allow": plan.requested_mcp_allow.clone(),
@@ -2018,6 +2024,10 @@ async fn launch_session(
     if let Some(mode) = plan.requested_permission_mode.as_deref() {
         argv.push(OsString::from("--permission-mode"));
         argv.push(OsString::from(mode));
+    }
+    if let Some(effort) = plan.requested_effort.as_deref() {
+        argv.push(OsString::from("--effort"));
+        argv.push(OsString::from(effort));
     }
     argv.extend(mcp_argv(
         plan.requested_mcp_policy,

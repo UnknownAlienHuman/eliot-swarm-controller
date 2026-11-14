@@ -2284,10 +2284,13 @@ impl Router {
         let id = request.id.as_str();
         let mut command = {
             let store = self.inner.store.lock().await;
-            let command = store
+            let mut command = store
                 .get_command(id)?
                 .ok_or_else(|| Error::new("not_found", format!("command {id} was not found")))?;
             hierarchy::authorize_command_read(&store, principal, &command)?;
+            // Historical configuration from the command's exact retained
+            // generation and revision, never the current overlay.
+            command.config = store.command_config_view(&command)?;
             command
         };
         self.adjust_command_for_read(&mut command);
@@ -2539,29 +2542,37 @@ impl Router {
         };
         // Current model/effort overlay for `swarm show`: the latest
         // retained revision with its effective values plus the original
-        // frozen profile values. Absent when no `configure` applied.
+        // frozen profile values and provenance. `profile` repeats the
+        // retained requested name, `profile_inherited` repeats the
+        // launch-time freeze decision (verbatim parent-snapshot reuse),
+        // and `provenance` distinguishes a direct `configure` from a
+        // `resume` generation's `inherited_from` row. Absent when no
+        // overlay ever applied to this generation.
         let config = {
             let store = self.inner.store.lock().await;
-            store
-                .get_agent_config_current(&agent.id, agent.generation)?
-                .map(|overlay| AgentConfigView {
-                    revision: overlay.revision,
-                    application: overlay.application.clone(),
-                    requested_model: overlay.requested_model.clone(),
-                    requested_effort: overlay.requested_effort.clone(),
-                    model: overlay.model.clone(),
-                    effort: overlay.effort.clone(),
-                    original_model: agent
-                        .profile_snapshot
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                    original_effort: agent
-                        .profile_snapshot
-                        .get("effort")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                })
+            let overlay = store.get_agent_config_current(&agent.id, agent.generation)?;
+            let profile_inherited = agent.profile_inherited;
+            overlay.map(|overlay| AgentConfigView {
+                revision: overlay.revision,
+                application: overlay.application.clone(),
+                provenance: overlay.provenance.clone(),
+                profile: agent.profile.clone(),
+                profile_inherited,
+                requested_model: overlay.requested_model.clone(),
+                requested_effort: overlay.requested_effort.clone(),
+                model: overlay.model.clone(),
+                effort: overlay.effort.clone(),
+                original_model: agent
+                    .profile_snapshot
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                original_effort: agent
+                    .profile_snapshot
+                    .get("effort")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+            })
         };
         serde_json::to_value(AgentGetResponse {
             agent,
@@ -2972,13 +2983,18 @@ impl Router {
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
             let generation = request.generation.unwrap_or(agent.generation);
-            let turns = if let Some(turn_id) = request.turn_id.as_deref() {
+            let mut turns = if let Some(turn_id) = request.turn_id.as_deref() {
                 vec![store.get_turn(id, generation, turn_id)?.ok_or_else(|| {
                     Error::new("not_found", format!("turn {turn_id} was not found"))
                 })?]
             } else {
                 store.list_turns(id, generation, request.limit)?
             };
+            // Historical configuration from each turn's exact retained
+            // revision, never the current overlay.
+            for turn in &mut turns {
+                turn.config = store.turn_config_view(&agent, turn)?;
+            }
             (agent, generation, turns)
         };
         self.mask_unknown_turns(id, generation, &mut turns).await?;
@@ -3000,9 +3016,17 @@ impl Router {
         let mut turn = {
             let store = self.inner.store.lock().await;
             hierarchy::authorize_agent_read(&store, principal, agent, Some(generation))?;
-            store.get_turn(agent, generation, turn_id)?
-        }
-        .ok_or_else(|| Error::new("not_found", format!("turn {turn_id} was not found")))?;
+            let agent_row = store
+                .get_agent(agent)?
+                .ok_or_else(|| Error::new("not_found", format!("Agent {agent} was not found")))?;
+            let mut turn = store
+                .get_turn(agent, generation, turn_id)?
+                .ok_or_else(|| Error::new("not_found", format!("turn {turn_id} was not found")))?;
+            // Historical configuration from the turn's exact retained
+            // generation and revision, never the current overlay.
+            turn.config = store.turn_config_view(&agent_row, &turn)?;
+            turn
+        };
         self.mask_unknown_turns(agent, generation, std::slice::from_mut(&mut turn))
             .await?;
         serde_json::to_value(turn)
@@ -5880,6 +5904,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             probe: false,
+            config_revision: 0,
+            config: None,
         }
     }
 
@@ -10809,6 +10835,8 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             created_at: 0,
             updated_at: 0,
             probe: false,
+            config_revision: 0,
+            config: None,
         };
         validate_project_rule_launch_command(&registration, &command)
             .expect("the frozen existing-checkout launch is permitted");
@@ -12824,6 +12852,8 @@ mod run_authorization_tests {
             created_at: 0,
             updated_at: 0,
             probe: false,
+            config_revision: 0,
+            config: None,
         }
     }
 

@@ -2892,6 +2892,8 @@ fn insert_rule_parent(
             created_at: now,
             updated_at: now,
             probe: false,
+            config_revision: 0,
+            config: None,
         },
         event,
     ))
