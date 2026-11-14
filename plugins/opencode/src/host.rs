@@ -3114,7 +3114,7 @@ fn opencode_manifest() -> PluginManifest {
         name: "opencode".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         protocol: "eliot-plugin/1".to_owned(),
-        harness_version: "2.0.32".to_owned(),
+        harness_version: "2.2.7".to_owned(),
         available: true,
         mode: "per_agent".to_owned(),
         verbs: vec![
@@ -3162,7 +3162,7 @@ mod tests {
         let manifest = opencode_manifest();
         assert_eq!(manifest.name, "opencode");
         assert_eq!(manifest.protocol, "eliot-plugin/1");
-        assert_eq!(manifest.harness_version, "2.0.32");
+        assert_eq!(manifest.harness_version, "2.2.7");
         assert!(manifest.available);
         assert_eq!(manifest.mode, "per_agent");
         assert_eq!(

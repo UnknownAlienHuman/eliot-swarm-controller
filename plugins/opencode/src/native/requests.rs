@@ -6,9 +6,9 @@
 //! `per_...`/`frm_...` id). Replies decide from the currently retained
 //! offer; every staging error becomes a rejected (never applied, never
 //! unknown) reply. Installed shapes come from `GET /openapi.json` of
-//! `opencode serve` v2.0.32 (`Permission.Request`, `Permission.Reply`,
+//! `opencode serve` v2.2.7 (`Permission.Request`, `Permission.Reply`,
 //! `Form.Info`) plus the `permission.ts` / `form.ts` event definitions at
-//! tag `v2.0.32`, verified against a locally started server with no model
+//! tag `v2.2.7`, verified against a locally started server with a live model
 //! call. No I/O: the event processor owns the stream and the HTTP writes.
 
 use eliot_core::requests::{

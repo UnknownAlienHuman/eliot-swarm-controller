@@ -262,6 +262,7 @@ impl MusePlugin {
         let result = match request.method.as_str() {
             "initialize" => self.initialize(&request.params),
             "model.list" => self.model_list(&request.params).await,
+            "quota.read" => self.quota_read(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
             "agent.command" => self.command(&request.params).await,
             "agent.snapshot" => self.snapshot(&request.params).await,
@@ -1945,6 +1946,161 @@ impl MusePlugin {
                 })
                 .collect();
             Ok(json!({"models": models, "default": Value::Null}))
+        }
+        .await;
+        let result = result.map_err(|error| client.diagnostic_error(error));
+        let _ = native.terminate(false, Instant::now() + RPC_TIMEOUT).await;
+        result
+    }
+
+    /// Read-only native subscription usage for `harness.quota`. A dedicated
+    /// reader instance spawns a transient `muse serve`, runs initialize
+    /// plus `usage/read`, then terminates. No session, no turn, no input
+    /// and no inference. Only quota signals are projected into `details`;
+    /// `account/read` is never called, so no email, label or avatar ever
+    /// enters the response, logs or Store.
+    async fn quota_read(&self, raw: &Value) -> Result<Value> {
+        if self.session.is_some() || self.failed_start.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Muse quota.read requires a dedicated reader plugin instance",
+            ));
+        }
+        let profile: Value = decode(raw, "Muse quota.read params are invalid")?;
+        let snapshot = profile.get("profile").unwrap_or(&profile);
+        if snapshot.get("harness").and_then(Value::as_str) != Some("muse") {
+            return Err(Error::new(
+                "profile_error",
+                "Muse quota.read received another harness",
+            ));
+        }
+        let program = snapshot
+            .get("cmd")
+            .and_then(Value::as_str)
+            .filter(|cmd| !cmd.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "profile_error",
+                    "Muse quota.read requires a discovered native cmd",
+                )
+            })?;
+        let cwd = std::env::current_dir()
+            .map_err(|_| Error::new("internal", "Muse quota.read could not read its cwd"))?;
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        let mut native = NativeProcess::spawn(
+            NativeLaunch {
+                program: OsString::from(program),
+                args: vec![OsString::from("serve")],
+                cwd,
+                environment: Vec::new(),
+            },
+            SecretPolicy::new(std::iter::empty::<String>()),
+        )
+        .await?;
+        let client = native.client();
+        let result: Result<Value> = async {
+            use crate::native::types::{
+                NativeClientCapabilities, NativeClientInfo, NativeInitializeParams,
+                NativeInitializeResult, NativeUsageReadParams, NativeUsageReadResult,
+            };
+            let init = NativeInitializeParams {
+                client_info: NativeClientInfo {
+                    name: "eliot_quota".to_owned(),
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                    title: Some("Eliot quota".to_owned()),
+                },
+                capabilities: Some(NativeClientCapabilities {
+                    user_input_dialogs: Some(true),
+                }),
+            };
+            let init_value = serde_json::to_value(init).map_err(|_| {
+                Error::new(
+                    "internal",
+                    "Muse quota.read initialize params could not be encoded",
+                )
+            })?;
+            let _initialized: NativeInitializeResult = serde_json::from_value(
+                client
+                    .call("initialize", init_value, deadline)
+                    .await
+                    .map_err(|error| {
+                        let detail = error.message.clone();
+                        error.with_message(format!("Muse quota.read initialize failed: {detail}"))
+                    })?,
+            )
+            .map_err(|_| {
+                Error::new(
+                    "profile_error",
+                    "Muse quota.read initialize response was invalid",
+                )
+            })?;
+            client
+                .notify("initialized", None, deadline)
+                .await
+                .map_err(|error| {
+                    let detail = error.message.clone();
+                    error.with_message(format!(
+                        "Muse quota.read initialized notify failed: {detail}"
+                    ))
+                })?;
+            let response = client
+                .call(
+                    "usage/read",
+                    serde_json::to_value(NativeUsageReadParams {}).map_err(|_| {
+                        Error::new("internal", "Muse quota.read params could not be encoded")
+                    })?,
+                    deadline,
+                )
+                .await
+                .map_err(|error| {
+                    let detail = error.message.clone();
+                    error.with_message(format!("Muse usage/read did not return quota: {detail}"))
+                })?;
+            let read: NativeUsageReadResult = serde_json::from_value(response).map_err(|_| {
+                Error::new(
+                    "profile_error",
+                    "Muse usage/read result did not match the installed schema",
+                )
+            })?;
+            let details = match read.usage {
+                Some(usage) => {
+                    if usage.tier.trim().is_empty()
+                        || usage.tier.len() > 128
+                        || usage.tier.chars().any(char::is_control)
+                    {
+                        return Err(Error::new(
+                            "profile_error",
+                            "Muse usage/read tier did not match the installed schema",
+                        ));
+                    }
+                    for used in [usage.window.used_percent, usage.weekly.used_percent] {
+                        if !(0..=1000).contains(&used) {
+                            return Err(Error::new(
+                                "profile_error",
+                                "Muse usage/read percent did not match the installed schema",
+                            ));
+                        }
+                    }
+                    if usage.window.window_duration_mins <= 0
+                        || usage.window.resets_at_ms < 0
+                        || usage.weekly.resets_at_ms < 0
+                        || usage.observed_at_ms < 0
+                    {
+                        return Err(Error::new(
+                            "profile_error",
+                            "Muse usage/read stamps did not match the installed schema",
+                        ));
+                    }
+                    serde_json::to_value(&usage).map_err(|_| {
+                        Error::new("internal", "Muse quota.read details could not be encoded")
+                    })?
+                }
+                // Truthful absence: the host observed nothing. Supported
+                // with an empty details object and a naming note; no numbers
+                // are fabricated.
+                None => serde_json::json!({}),
+            };
+            Ok(json!({"details": details}))
         }
         .await;
         let result = result.map_err(|error| client.diagnostic_error(error));

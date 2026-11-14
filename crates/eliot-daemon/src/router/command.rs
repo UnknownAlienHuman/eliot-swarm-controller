@@ -523,13 +523,7 @@ impl Router {
                     break (command, seq, context_items);
                 }
                 Err(error) => {
-                    self.settle_dispatch_error(
-                        id,
-                        &error,
-                        change.1,
-                        launch_binding.is_some() || command.verb == "run",
-                    )
-                    .await;
+                    self.settle_dispatch_error(id, &error, change.1).await;
                     return None;
                 }
             }
@@ -1552,27 +1546,17 @@ impl Router {
 }
 
 impl Router {
-    pub(super) async fn settle_dispatch_error(
-        &self,
-        id: &str,
-        error: &Error,
-        write_faulted: bool,
-        native_binding: bool,
-    ) {
-        // This is only the local Store dispatch result, before any control RPC.
+    pub(super) async fn settle_dispatch_error(&self, id: &str, error: &Error, write_faulted: bool) {
+        // This is only the local Store dispatch result, before any plugin I/O:
+        // the dispatch transaction rolled back, so no generation, source, or
+        // token changed and no plugin was invoked. A persistence fault is the
+        // only uncertain case; every other dispatch refusal proves no native
+        // effect and settles rejected instead of stranding the command.
         // A plugin error with the same code still follows post-I/O C1 handling.
         if write_faulted {
             self.note_unknown_if_uncertain(id, "store_dispatch_outcome_unknown")
                 .await;
-        } else if matches!(
-            error.code.as_str(),
-            "bad_state" | "stale_generation" | "not_found" | "provider_held" | "not_allowed"
-        ) || native_binding
-            && matches!(
-                error.code.as_str(),
-                "source_integrity" | "frame_too_large" | "invalid"
-            )
-        {
+        } else {
             self.reject_undispatched(id, &error.code).await;
         }
         self.signal_progress();
@@ -2161,6 +2145,62 @@ mod tests {
                 CommandState::Unknown
             );
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_fence_refusal_settles_rejected_instead_of_stranding() {
+        use eliot_core::SubmitCommand;
+        let router = super::super::tests::router();
+        let now = crate::common::now_ms();
+        let attach_id = ulid::Ulid::new().to_string();
+        let (agent_id, dispatch_error) = {
+            let mut store = router.inner.store.lock().await;
+            let mut attach = SubmitCommand::new(attach_id.clone(), "attach");
+            attach.args = json!({
+                "mode": "observe", "profile": "codex-fixture", "harness": "codex",
+                "native_scope": "observe-scope", "native_ref": "thread-1",
+                "profile_snapshot": {"harness": "codex", "model": "fixture"},
+            });
+            let admitted = store.submit("owner", attach, now).unwrap();
+            assert_eq!(admitted.command.state, CommandState::Accepted);
+            let agent = admitted
+                .command
+                .target
+                .clone()
+                .expect("attach admits its agent");
+            // Fence the attach dispatch with a still-pending detach: the Store
+            // dispatch refuses `busy` after commit but before any native I/O.
+            let mut detach = SubmitCommand::new(ulid::Ulid::new().to_string(), "detach");
+            detach.target = Some(agent.clone());
+            detach.args = json!({"mode": "observe"});
+            let admitted_detach = store.submit("owner", detach, now).unwrap();
+            assert_eq!(admitted_detach.command.state, CommandState::Accepted);
+            let error = store.dispatch(&attach_id, now).unwrap_err();
+            assert_eq!(error.code, "busy");
+            (agent, error)
+        };
+        router
+            .settle_dispatch_error(&attach_id, &dispatch_error, false)
+            .await;
+        let store = router.inner.store.lock().await;
+        let settled = store.get_command(&attach_id).unwrap().unwrap();
+        assert_eq!(settled.state, CommandState::Rejected);
+        assert_eq!(
+            settled.outcome,
+            Some(json!({"reason": dispatch_error.code}))
+        );
+        // No generation, source, or token changed: the fence fired before any
+        // native effect, and the command no longer blocks drain or re-observe.
+        let agent = store.get_agent(&agent_id).unwrap().unwrap();
+        assert_eq!(agent.generation, 0);
+        assert!(store.list_source_states(&agent_id, 0).unwrap().is_empty());
+        assert!(
+            !store
+                .list_unsettled_commands(100)
+                .unwrap()
+                .iter()
+                .any(|command| command.id == attach_id)
+        );
     }
 
     fn resume_command(agent_id: &str) -> Command {

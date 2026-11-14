@@ -2,7 +2,7 @@ use crate::{
     events::{self, EventConfig, EventHandle, TurnFacts},
     mcp::{
         McpReadback, compute_disables, compute_plugin_disables, merge_status_page,
-        parse_status_page, policy_from_profile, require_minimal_own_server,
+        parse_status_page, policy_from_profile, require_minimal_own_server, synthetic_apps_disable,
     },
     native::{
         NativeClient, NativeLaunch, NativeProcess,
@@ -114,6 +114,13 @@ impl FailedObserverAttach {
 
 fn is_proven_observer_start_failure(error: &Error) -> bool {
     error.code == "native_start_failed"
+}
+
+/// A scope refusal is raised before any pinned reader spawns or thread is
+/// read, after only the read-only store probe ran and was cleaned up, so it
+/// proves the refused attach had no native effect.
+fn is_proven_scope_refusal(error: &Error) -> bool {
+    error.code == "scope_mismatch"
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -319,6 +326,7 @@ impl CodexPlugin {
             "discover" => self.discover(&request.params).await,
             "profile.store" => self.profile_store(&request.params).await,
             "model.list" => self.model_list(&request.params).await,
+            "quota.read" => self.quota_read(&request.params).await,
             "agent.attach" => self.attach(&request.params).await,
             "agent.detach" => self.detach(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
@@ -453,6 +461,37 @@ impl CodexPlugin {
             })
             .collect();
         Ok(json!({"models": models, "default": default}))
+    }
+
+    /// Read-only native account quota for `harness.quota`. A dedicated
+    /// reader plugin instance calls `account/rateLimits/read` (plus
+    /// `account/usage/read` when useful) with no thread, no input and no
+    /// inference. Only quota signals are projected into `details`; account
+    /// identity (including any email) is never read or returned.
+    async fn quota_read(&self, raw: &Value) -> Result<Value> {
+        if self.session.is_some() || self.failed_start.is_some() || self.observer.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Codex quota.read requires a dedicated reader plugin instance",
+            ));
+        }
+        let profile: Value = decode(raw, "Codex quota.read params are invalid")?;
+        let snapshot = profile.get("profile").unwrap_or(&profile);
+        if snapshot.get("harness").and_then(Value::as_str) != Some("codex") {
+            return Err(Error::new(
+                "profile_error",
+                "Codex quota.read received another harness",
+            ));
+        }
+        let (launch, secrets, metadata_secrets) = self.reader_launch(snapshot, &json!({}))?;
+        let details = crate::discovery::read_quota(
+            launch,
+            &metadata_secrets,
+            &secrets,
+            tokio::time::Instant::now() + crate::discovery::READ_TIMEOUT,
+        )
+        .await?;
+        Ok(json!({"details": details}))
     }
 
     fn reader_launch(
@@ -602,6 +641,12 @@ impl CodexPlugin {
             &params,
             observe::failed_attach_result(&params, "native_start_failed"),
         );
+        // A scope refusal proves no native effect: only the read-only store
+        // probe ran. It retains a preparation failure for exact-binding replay.
+        let scope_failure = FailedObserverAttach::new(
+            &params,
+            observe::failed_attach_result(&params, "observer_preparation_failed"),
+        );
         let attach = ObserverSession::attach(
             params,
             launch,
@@ -621,6 +666,15 @@ impl CodexPlugin {
                     .failed_attach
                     .as_ref()
                     .expect("failed attach was just retained")
+                    .outcome
+                    .clone())
+            }
+            Err(error) if is_proven_scope_refusal(&error) => {
+                self.failed_attach = Some(scope_failure);
+                Ok(self
+                    .failed_attach
+                    .as_ref()
+                    .expect("scope refusal was just retained")
                     .outcome
                     .clone())
             }
@@ -845,41 +899,53 @@ impl CodexPlugin {
             .to_string()
             .to_ascii_lowercase();
         let mcp_server_name = format!("eliot_swarm_{start_command}");
-        // Minimal policy: enumerate the worker-visible native servers and
-        // plugins with a short-lived metadata reader, then suppress every
-        // non-allowed one with its own `enabled=false` override. Inherit
-        // keeps the current additive behavior with no extra process.
-        let (mcp_disables, plugin_disables): (Vec<String>, Vec<String>) =
-            if mcp_policy == McpPolicy::Minimal {
-                let probe = NativeLaunch {
-                    program: program.clone(),
-                    args: route.args()?,
-                    cwd: workspace.clone(),
-                    environment: environment.clone(),
-                };
-                let (enumerated_mcp, enumerated_plugins) =
-                    crate::discovery::read_effective_config_tables(
-                        &probe,
-                        &frozen_store,
-                        &metadata_secrets,
-                        &secrets,
-                        Instant::now() + RPC_TIMEOUT,
-                    )
-                    .await
-                    .map_err(|error| {
-                        pre_dispatch_read_error(
-                            error,
-                            "profile_error",
-                            "Codex minimal MCP server enumeration failed before worker spawn",
-                        )
-                    })?;
-                (
-                    compute_disables(&enumerated_mcp, &mcp_allow, &mcp_server_name)?,
-                    compute_plugin_disables(&enumerated_plugins, &mcp_allow)?,
-                )
-            } else {
-                (Vec::new(), Vec::new())
+        // Minimal policy: enumerate the worker-visible native MCP surface
+        // with a short-lived metadata reader, then suppress every
+        // non-allowed server with its own transport-carrying
+        // `enabled=false` overrides. A bare `enabled=false` breaks the
+        // native bootstrap for project/plugin names (verified on 0.167.1),
+        // so each disable re-emits the enumerated `command`/`url`.
+        // Plugin-backed builtin servers never appear in `mcp_servers`, so
+        // each suppressed plugin takes its own `plugins.<id>.enabled=false`
+        // override, and the ChatGPT-backed Apps runtime (likewise absent
+        // from `mcp_servers`) takes a synthetic transport-carrying disable.
+        // Inherit keeps the current additive behavior with no extra process.
+        let (mcp_disables, plugin_disables) = if mcp_policy == McpPolicy::Minimal {
+            let probe = NativeLaunch {
+                program: program.clone(),
+                args: route.args()?,
+                cwd: workspace.clone(),
+                environment: environment.clone(),
             };
+            let surface = crate::discovery::read_effective_mcp_surface(
+                &probe,
+                &frozen_store,
+                &metadata_secrets,
+                &secrets,
+                Instant::now() + RPC_TIMEOUT,
+            )
+            .await
+            .map_err(|error| {
+                pre_dispatch_read_error(
+                    error,
+                    "profile_error",
+                    "Codex minimal MCP server enumeration failed before worker spawn",
+                )
+            })?;
+            let mut disables = compute_disables(
+                &surface.servers,
+                &mcp_allow,
+                &mcp_server_name,
+                &metadata_secrets,
+            )?;
+            if let Some(apps) = synthetic_apps_disable(&mcp_allow) {
+                disables.push(apps);
+            }
+            let plugins = compute_plugin_disables(&surface.plugins, &mcp_allow)?;
+            (disables, plugins)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let launch = NativeLaunch {
             program,
             args: route.args_with_agent_mcp(
@@ -3045,8 +3111,9 @@ mod tests {
     use super::{
         AgentSession, CodexPlugin, CodexRoute, FailedObserverAttach, FailedStart, Initialized,
         NativeLaunch, NativeProcess, SessionPhase, codex_manifest, contextual_error,
-        frozen_store_binding, is_proven_observer_start_failure, pre_dispatch_read_error,
-        target_environment, unconfirmed_pre_dispatch_error, validate_resume_preflight,
+        frozen_store_binding, is_proven_observer_start_failure, is_proven_scope_refusal,
+        pre_dispatch_read_error, target_environment, unconfirmed_pre_dispatch_error,
+        validate_resume_preflight,
     };
     use eliot_core::{Error, SecretPolicy, StderrSnapshot, StderrSource};
     use eliot_plugin::AgentStartParams;
@@ -3092,6 +3159,25 @@ mod tests {
                 "safe test reason"
             )));
         }
+        // A scope refusal happens before any pinned reader spawns or thread
+        // is read, so it is proven preparation failure, never an uncertain
+        // start. Other integrity errors stay uncertain.
+        assert!(is_proven_scope_refusal(&Error::new(
+            "scope_mismatch",
+            "Codex observation scope does not match its proven store"
+        )));
+        for code in ["source_integrity", "unknown", "native_start_failed"] {
+            assert!(!is_proven_scope_refusal(&Error::new(
+                code,
+                "safe test reason"
+            )));
+        }
+        let scope_outcome =
+            crate::observe::failed_attach_result(&params, "observer_preparation_failed");
+        assert_eq!(scope_outcome["state"], "failed");
+        assert_eq!(scope_outcome["reason"], "observer_preparation_failed");
+        let scope_failed = FailedObserverAttach::new(&params, scope_outcome.clone());
+        assert_eq!(scope_failed.replay(&params).unwrap(), scope_outcome);
     }
 
     #[test]
