@@ -858,6 +858,21 @@ impl PluginHost {
         self.state.running.lock_recover().len()
     }
 
+    /// Bounded owners with a live controlled runtime, sorted for drain
+    /// reporting. Test-marked control without a runtime is not a live
+    /// process and is excluded here; stop-idle candidacy still uses
+    /// `controls_generation` so fixtures can exercise the ordinary stop path.
+    pub(crate) fn live_owners(&self, limit: usize) -> Vec<(String, i64)> {
+        let running = self.state.running.lock_recover();
+        let mut owners: Vec<(String, i64)> = running
+            .keys()
+            .map(|key| (key.id.clone(), key.generation))
+            .collect();
+        owners.sort();
+        owners.truncate(limit);
+        owners
+    }
+
     pub(crate) fn controls_generation(&self, agent: &str, generation: i64) -> bool {
         let key = AgentKey {
             id: agent.to_owned(),

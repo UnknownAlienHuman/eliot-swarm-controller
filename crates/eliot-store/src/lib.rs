@@ -296,6 +296,21 @@ impl Store {
         self.write_faulted.get()
     }
 
+    /// Peek at a retained idempotent write without recording a new one. Used
+    /// by drain with stop-idle so a retry with the same mutation id returns
+    /// the retained reply without submitting duplicate stop commands.
+    /// Returns the stored result JSON when the id is bound to a write.
+    pub fn peek_write_result(&self, id: &str) -> Result<Option<Value>> {
+        let row: Option<String> = self
+            .connection
+            .query_row("SELECT result FROM writes WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(sql_error)?;
+        row.map(|raw| decode_json(&raw)).transpose()
+    }
+
     /// Refuse retained-command reads if a failed transaction left the
     /// connection outside autocommit. In that state the same connection could
     /// still observe transaction-local rows.

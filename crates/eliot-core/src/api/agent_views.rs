@@ -572,6 +572,10 @@ impl DaemonStatusRequest {
             || !reply.unknown_commands_truncated
                 && reply.unknown_commands_count != reply.unknown_commands.len()
             || reply.unsettled_commands_count != reply.unsettled_commands.len()
+            || reply
+                .drain
+                .as_ref()
+                .is_some_and(|drain| drain.validate().is_err())
             || reply.workspace_custody.scope != "current_host"
             || reply
                 .cloud_mcp
@@ -825,6 +829,169 @@ pub struct UnsettledCommandSummary {
     pub state: CommandState,
 }
 
+/// One running turn that blocks drain: the Agent's current active turn.
+/// `agent`/`generation` identify the exact live generation; `turn_id` is the
+/// retained turn the native side is still working on. A missing entry never
+/// proves the native effect did not happen; it only means the Store has no
+/// recorded active turn for that generation.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunningTurnSummary {
+    #[serde(deserialize_with = "required_text")]
+    pub agent: String,
+    pub generation: i64,
+    #[serde(deserialize_with = "required_text")]
+    pub turn_id: String,
+}
+
+impl RunningTurnSummary {
+    pub fn validate(&self) -> Result<()> {
+        text(&self.agent)?;
+        if self.generation < 0 {
+            return Err(Error::new("invalid", "running turn generation is invalid"));
+        }
+        text(&self.turn_id)?;
+        Ok(())
+    }
+}
+
+/// Where a live owned process comes from. `plugin` is a controlled native
+/// child for the named Agent generation; `workspace` is an owned workspace
+/// setup/removal child for that generation. Both are owned custody the
+/// daemon must drop before exit; neither proves task success.
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnedProcessKind {
+    Plugin,
+    Workspace,
+}
+
+/// One live owned process that blocks drain, bounded by the drain report cap.
+/// An absent entry never proves no native effect occurred.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedProcessSummary {
+    #[serde(deserialize_with = "required_text")]
+    pub agent: String,
+    pub generation: i64,
+    pub kind: OwnedProcessKind,
+}
+
+impl OwnedProcessSummary {
+    pub fn validate(&self) -> Result<()> {
+        text(&self.agent)?;
+        if self.generation < 0 {
+            return Err(Error::new("invalid", "owned process generation is invalid"));
+        }
+        Ok(())
+    }
+}
+
+/// Bounded drain report reusing the existing shutdown blockers. Every
+/// category carries a count, a bounded list and a truncation flag: the count
+/// is the number returned in this snapshot (or the exact in-memory total for
+/// unknown commands); `truncated` means more may exist beyond the bound.
+/// Unknown stays unknown: an empty report never proves no native effect
+/// occurred, and the daemon never auto-resolves unknown to finish drain.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DrainReport {
+    pub running_turns_count: usize,
+    #[serde(deserialize_with = "objects")]
+    pub running_turns: Vec<RunningTurnSummary>,
+    pub running_turns_truncated: bool,
+    pub unsettled_commands_count: usize,
+    #[serde(deserialize_with = "objects")]
+    pub unsettled_commands: Vec<UnsettledCommandSummary>,
+    pub unsettled_commands_truncated: bool,
+    pub unknown_commands_count: usize,
+    pub unknown_commands: Vec<String>,
+    pub unknown_commands_truncated: bool,
+    pub owned_processes_count: usize,
+    #[serde(deserialize_with = "objects")]
+    pub owned_processes: Vec<OwnedProcessSummary>,
+    pub owned_processes_truncated: bool,
+    pub stopped_idle_count: usize,
+    pub stopped_idle_commands: Vec<String>,
+    pub stopped_idle_truncated: bool,
+}
+
+impl DrainReport {
+    pub fn empty() -> Self {
+        Self {
+            running_turns_count: 0,
+            running_turns: Vec::new(),
+            running_turns_truncated: false,
+            unsettled_commands_count: 0,
+            unsettled_commands: Vec::new(),
+            unsettled_commands_truncated: false,
+            unknown_commands_count: 0,
+            unknown_commands: Vec::new(),
+            unknown_commands_truncated: false,
+            owned_processes_count: 0,
+            owned_processes: Vec::new(),
+            owned_processes_truncated: false,
+            stopped_idle_count: 0,
+            stopped_idle_commands: Vec::new(),
+            stopped_idle_truncated: false,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.running_turns_count < self.running_turns.len()
+            || (!self.running_turns_truncated
+                && self.running_turns_count != self.running_turns.len())
+        {
+            return Err(invalid_response());
+        }
+        if self.unsettled_commands_count < self.unsettled_commands.len()
+            || (!self.unsettled_commands_truncated
+                && self.unsettled_commands_count != self.unsettled_commands.len())
+        {
+            return Err(invalid_response());
+        }
+        if self.unknown_commands_count < self.unknown_commands.len()
+            || (!self.unknown_commands_truncated
+                && self.unknown_commands_count != self.unknown_commands.len())
+        {
+            return Err(invalid_response());
+        }
+        if self.owned_processes_count < self.owned_processes.len()
+            || (!self.owned_processes_truncated
+                && self.owned_processes_count != self.owned_processes.len())
+        {
+            return Err(invalid_response());
+        }
+        if self.stopped_idle_count < self.stopped_idle_commands.len()
+            || (!self.stopped_idle_truncated
+                && self.stopped_idle_count != self.stopped_idle_commands.len())
+        {
+            return Err(invalid_response());
+        }
+        if self
+            .running_turns
+            .iter()
+            .any(|turn| turn.validate().is_err())
+            || self
+                .unsettled_commands
+                .iter()
+                .any(|command| text(&command.id).is_err() || text(&command.verb).is_err())
+            || self.unknown_commands.iter().any(|id| text(id).is_err())
+            || self
+                .owned_processes
+                .iter()
+                .any(|process| process.validate().is_err())
+            || self
+                .stopped_idle_commands
+                .iter()
+                .any(|id| text(id).is_err())
+        {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StatusBlocker {
@@ -836,6 +1003,8 @@ pub enum StatusBlocker {
         agent: String,
         generation: i64,
         state: AgentState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_turn: Option<String>,
     },
     CommandUnsettled {
         command_id: String,
@@ -918,6 +1087,8 @@ pub struct DaemonStatusResponse {
     pub unsettled_commands_truncated: bool,
     #[serde(deserialize_with = "objects")]
     pub blockers: Vec<StatusBlocker>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain: Option<DrainReport>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2002,6 +2173,54 @@ mod tests {
             missing.as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<DaemonStatusResponse>(missing).is_err());
         }
+        // Drain report is optional for backward compatibility but validated
+        // when present; AgentLive keeps its active turn when observed.
+        let mut with_drain = wire.clone();
+        with_drain["drain"] = json!({
+            "running_turns_count":1,
+            "running_turns":[{"agent":"a1","generation":0,"turn_id":"t1"}],
+            "running_turns_truncated":false,
+            "unsettled_commands_count":1,
+            "unsettled_commands":[{"id":"c1","agent":null,"generation":null,"verb":"launch","state":"unknown"}],
+            "unsettled_commands_truncated":false,
+            "unknown_commands_count":1,"unknown_commands":["c1"],"unknown_commands_truncated":false,
+            "owned_processes_count":1,
+            "owned_processes":[{"agent":"a1","generation":0,"kind":"plugin"}],
+            "owned_processes_truncated":false,
+            "stopped_idle_count":1,"stopped_idle_commands":["c3"],"stopped_idle_truncated":false
+        });
+        let reply: DaemonStatusResponse = serde_json::from_value(with_drain.clone()).unwrap();
+        request.validate_response(&reply).unwrap();
+        assert_eq!(serde_json::to_value(&reply).unwrap(), with_drain);
+        let mut live = with_drain.clone();
+        live["blockers"][2] = json!({"kind":"agent_live","agent":"a1","generation":0,"state":"idle","active_turn":"t1"});
+        let reply: DaemonStatusResponse = serde_json::from_value(live.clone()).unwrap();
+        request.validate_response(&reply).unwrap();
+        assert_eq!(serde_json::to_value(&reply).unwrap(), live);
+    }
+
+    #[test]
+    fn drain_report_validates_counts_lists_and_truncation() {
+        let mut report = DrainReport::empty();
+        report.validate().unwrap();
+        let wire = serde_json::to_value(&report).unwrap();
+        let back: DrainReport = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(back, report);
+        assert_eq!(serde_json::to_value(back).unwrap(), wire);
+        // Counts must cover their lists; truncation permits more beyond bound.
+        report.running_turns_count = 1;
+        assert!(report.validate().is_err());
+        report.running_turns.push(RunningTurnSummary {
+            agent: "a1".to_owned(),
+            generation: 0,
+            turn_id: "t1".to_owned(),
+        });
+        report.validate().unwrap();
+        report.running_turns_truncated = true;
+        report.running_turns_count = 0;
+        assert!(report.validate().is_err());
+        report.running_turns_count = 2;
+        report.validate().unwrap();
     }
 
     #[test]

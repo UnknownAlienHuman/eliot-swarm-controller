@@ -1,7 +1,7 @@
 //! Public grammar for the two implemented mutations. Authorization, retained
 //! bindings, hydration and effect settlement remain in the Router and Store.
 
-use super::StatusBlocker;
+use super::{DrainReport, StatusBlocker};
 use crate::{CommandState, Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -123,6 +123,11 @@ pub struct DaemonShutdownRequest {
     #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
     pub mode: ShutdownMode,
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[schemars(
+        description = "Drain-only opt-in: submit ordinary stop commands for idle controlled Agents before capturing the drain report."
+    )]
+    pub stop_idle: bool,
 }
 
 impl DaemonShutdownRequest {
@@ -130,11 +135,19 @@ impl DaemonShutdownRequest {
         Self {
             id: id.into(),
             mode,
+            stop_idle: false,
         }
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_shutdown_id(&self.id)
+        validate_shutdown_id(&self.id)?;
+        if self.stop_idle && self.mode != ShutdownMode::Drain {
+            return Err(Error::new(
+                "invalid",
+                "stop_idle is only valid with drain mode",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -148,6 +161,8 @@ pub struct DaemonShutdownResponse {
         deserialize_with = "present_blockers"
     )]
     pub blockers: Option<Vec<StatusBlocker>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain: Option<DrainReport>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -167,6 +182,10 @@ fn validate_shutdown_id(id: &str) -> Result<()> {
         return Err(Error::new("invalid", "id must be a non-empty string"));
     }
     Ok(())
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn shutdown_id<'de, D: serde::Deserializer<'de>>(
@@ -431,6 +450,18 @@ mod tests {
             );
             assert_eq!(ShutdownMode::parse(mode.as_str()).unwrap(), mode);
         }
+        let mut stop_idle = DaemonShutdownRequest::new("id", ShutdownMode::Drain);
+        stop_idle.stop_idle = true;
+        stop_idle.validate().unwrap();
+        let wire = json!({"id":"id","mode":"drain","stop_idle":true});
+        assert_eq!(serde_json::to_value(&stop_idle).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<DaemonShutdownRequest>(wire).unwrap(),
+            stop_idle
+        );
+        let mut bad = DaemonShutdownRequest::new("id", ShutdownMode::Force);
+        bad.stop_idle = true;
+        assert_eq!(bad.validate().unwrap_err().code, "invalid");
         for bad in ["", "Drain", "draining", "forcing", " force ", "other"] {
             assert_eq!(ShutdownMode::parse(bad).unwrap_err().code, "invalid");
             assert!(
@@ -539,11 +570,22 @@ mod tests {
 
     #[test]
     fn shutdown_result_preserves_drain_force_and_store_fault_shapes() {
+        let empty_drain = json!({
+            "running_turns_count":0,"running_turns":[],"running_turns_truncated":false,
+            "unsettled_commands_count":0,"unsettled_commands":[],"unsettled_commands_truncated":false,
+            "unknown_commands_count":0,"unknown_commands":[],"unknown_commands_truncated":false,
+            "owned_processes_count":0,"owned_processes":[],"owned_processes_truncated":false,
+            "stopped_idle_count":0,"stopped_idle_commands":[],"stopped_idle_truncated":false
+        });
         for wire in [
             json!({"state":"applied","mode":"drain","blockers":[]}),
             json!({"state":"dispatched","mode":"drain","blockers":[{"kind":"agent_live","agent":"a1","generation":0,"state":"created"}]}),
             json!({"state":"dispatched","mode":"force"}),
             json!({"state":"dispatched","mode":"force","store_write_faulted":true}),
+            json!({"state":"applied","mode":"drain","blockers":[],"drain":empty_drain}),
+            json!({"state":"dispatched","mode":"drain",
+                "blockers":[{"kind":"agent_live","agent":"a1","generation":0,"state":"idle","active_turn":"t1"}],
+                "drain":empty_drain}),
         ] {
             let reply: DaemonShutdownResponse = serde_json::from_value(wire.clone()).unwrap();
             assert_eq!(serde_json::to_value(reply).unwrap(), wire);
