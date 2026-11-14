@@ -693,6 +693,13 @@ Failed reply is pruned. This does not extend retention of completed replies or
 change absent-id age validation.
 Once a complete expansion is gone, `command.children` returns `history_gap`.
 
+Prune delivered completion digests under the commands window: one bounded
+batch per pass of rows with `delivered_at` older than the `commands_days`
+window, oldest delivery first. Never prune a pending digest (`delivered_at
+IS NULL`), however old: an undelivered digest is still live coordination.
+A re-registration of a pruned id reads `id_expired` through the write-id age
+rule, never a new row. An unset `commands_days` disables digest pruning.
+
 Prune acknowledged mail only: one bounded batch per pass of rows with
 `read_at` older than the `mail_days` window, oldest acknowledgement first.
 Never prune unread mail, however old. Mail rows always outlive the retry

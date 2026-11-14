@@ -76,7 +76,8 @@ pub(crate) async fn run(
             let rows = report.events_deleted
                 + report.commands_deleted
                 + report.writes_deleted
-                + report.mail_deleted;
+                + report.mail_deleted
+                + report.digests_deleted;
             if rows > 0 {
                 logging::record_counts(
                     &policy,
@@ -87,6 +88,7 @@ pub(crate) async fn run(
                         commands: report.commands_deleted.max(0) as u64,
                         writes: report.writes_deleted.max(0) as u64,
                         mail: report.mail_deleted.max(0) as u64,
+                        digests: report.digests_deleted.max(0) as u64,
                     },
                     None,
                 );
@@ -140,6 +142,7 @@ pub(crate) async fn run_once_with_budgets(
         commands_deleted: 0,
         writes_deleted: 0,
         mail_deleted: 0,
+        digests_deleted: 0,
     };
     loop {
         let pass = {
@@ -156,15 +159,20 @@ pub(crate) async fn run_once_with_budgets(
         total.commands_deleted += pass.commands_deleted;
         total.writes_deleted += pass.writes_deleted;
         total.mail_deleted += pass.mail_deleted;
-        let pass_rows =
-            pass.events_deleted + pass.commands_deleted + pass.writes_deleted + pass.mail_deleted;
+        total.digests_deleted += pass.digests_deleted;
+        let pass_rows = pass.events_deleted
+            + pass.commands_deleted
+            + pass.writes_deleted
+            + pass.mail_deleted
+            + pass.digests_deleted;
         if pass_rows == 0 {
             break;
         }
         let total_rows = total.events_deleted
             + total.commands_deleted
             + total.writes_deleted
-            + total.mail_deleted;
+            + total.mail_deleted
+            + total.digests_deleted;
         if total_rows >= row_budget || start.elapsed() >= time_budget {
             break;
         }
