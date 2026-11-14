@@ -64,11 +64,22 @@ struct Initialized {
     instance_dir: String,
 }
 
+/// How a settled start failure replays: an uncertain failure replays its
+/// error (the daemon settles unknown), while a proven-no-effect failure
+/// replays its failed-state result value (the daemon settles failed).
+/// Only checks before any `session/start|resume` dispatch may settle the
+/// proven variant: nothing bound to this generation can exist yet.
+#[derive(Clone)]
+enum SettledStartFailure {
+    Uncertain(Error),
+    ProvenNoEffect(Value),
+}
+
 struct FailedStart {
     agent_id: String,
     generation: i64,
     command_id: String,
-    error: Error,
+    outcome: SettledStartFailure,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -322,15 +333,41 @@ impl MusePlugin {
     }
 
     /// Retain a failed start exactly once: the same start command replays the
-    /// stored error without new native I/O, and any other start is refused.
+    /// stored outcome without new native I/O, and any other start is refused.
     fn retain_failed_start(&mut self, params: &AgentStartParams, error: Error) -> Error {
         self.failed_start = Some(FailedStart {
             agent_id: params.agent_id.clone(),
             generation: params.generation,
             command_id: params.command_id.clone(),
-            error: error.clone(),
+            outcome: SettledStartFailure::Uncertain(error.clone()),
         });
         error
+    }
+
+    /// Retain a proven-no-effect start failure and build its failed-state
+    /// result: no `session/start|resume` was dispatched and no input was
+    /// sent, so the launch is definitely failed, never unknown. The reason
+    /// names the failed check in short non-secret words; it is persisted in
+    /// the daemon outcome, so it must never carry paths, values, or secrets.
+    fn retain_proven_no_effect_start(
+        &mut self,
+        params: &AgentStartParams,
+        reason: impl Into<String>,
+    ) -> Value {
+        let value = json!({
+            "agent_id": params.agent_id,
+            "generation": params.generation,
+            "command_id": params.command_id,
+            "state": "failed",
+            "reason": reason.into(),
+        });
+        self.failed_start = Some(FailedStart {
+            agent_id: params.agent_id.clone(),
+            generation: params.generation,
+            command_id: params.command_id.clone(),
+            outcome: SettledStartFailure::ProvenNoEffect(value.clone()),
+        });
+        value
     }
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
@@ -371,7 +408,10 @@ impl MusePlugin {
                 && failed.generation == params.generation
                 && failed.command_id == params.command_id
             {
-                return Err(failed.error.clone());
+                return match &failed.outcome {
+                    SettledStartFailure::Uncertain(error) => Err(error.clone()),
+                    SettledStartFailure::ProvenNoEffect(value) => Ok(value.clone()),
+                };
             }
             return Err(Error::new(
                 "bad_state",
@@ -382,6 +422,8 @@ impl MusePlugin {
             .initialized
             .as_ref()
             .ok_or_else(|| not_initialized("Muse"))?;
+        // Profile validation runs before any spawn: zero native I/O exists,
+        // so a refusal here is proven-no-effect (failed, never unknown).
         let start::PreparedStart {
             resume_subject,
             requested_model,
@@ -391,9 +433,26 @@ impl MusePlugin {
             workspace,
             launch,
             secrets,
-        } = start::prepare_profile(&params, initialized)?;
+        } = match start::prepare_profile(&params, initialized) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Ok(self.retain_proven_no_effect_start(&params, error.message));
+            }
+        };
+        // A spawn failure leaves no child behind: still proven-no-effect.
+        // The OS message is not reused as the reason (it may quote paths);
+        // the reason names the check and carries only the safe error code.
         let mut session =
-            start::spawn_owned_session(&params, initialized, launch, secrets, peer).await?;
+            match start::spawn_owned_session(&params, initialized, launch, secrets, peer).await {
+                Ok(session) => session,
+                Err(error) => {
+                    let reason = format!(
+                        "Muse session host process could not be spawned ({})",
+                        error.code
+                    );
+                    return Ok(self.retain_proven_no_effect_start(&params, reason));
+                }
+            };
 
         if let Err(error) = register_native_process(
             peer,
@@ -422,8 +481,10 @@ impl MusePlugin {
                 );
                 return Err(contextual_error(error, "unknown", message));
             }
-            let error = session.native_client.diagnostic_error(error);
-            return Err(self.retain_failed_start(&params, error));
+            // Registration failed but the child is terminated: no session was
+            // dispatched, so this is proven-no-effect. Registration messages
+            // are canned words plus a code, safe to persist as the reason.
+            return Ok(self.retain_proven_no_effect_start(&params, error.message));
         }
 
         let initialized_native = match Self::initialize_native(
@@ -444,7 +505,11 @@ impl MusePlugin {
                     self.session = Some(session);
                     return Err(error.with_code("unknown").with_message(message));
                 }
-                return Err(self.retain_failed_start(&params, error));
+                // Only effect-free queries ran (initialize handshake plus the
+                // model catalogue read) and the child is terminated: no
+                // `session/start|resume` was dispatched and no input was sent,
+                // so this is proven-no-effect (failed, never unknown).
+                return Ok(self.retain_proven_no_effect_start(&params, error.message));
             }
         };
         session.selected_effort = initialized_native.effort.clone();
@@ -468,7 +533,8 @@ impl MusePlugin {
                     self.session = Some(session);
                     return Err(error.with_code("unknown").with_message(message));
                 }
-                return Err(self.retain_failed_start(&params, error));
+                // No `session/resume` was dispatched: proven-no-effect.
+                return Ok(self.retain_proven_no_effect_start(&params, error.message));
             }
             session.session_id = Some(subject.native_ref.clone());
             if let Err(error) = verify_resume_preflight(
@@ -493,38 +559,47 @@ impl MusePlugin {
                     self.session = Some(session);
                     return Err(error.with_code("unknown").with_message(message));
                 }
-                return Err(self.retain_failed_start(&params, error));
+                // Only prerequisite reads ran: proven-no-effect.
+                return Ok(self.retain_proven_no_effect_start(&params, error.message));
             }
         }
 
+        // Params encoding runs before any dispatch: an (unreachable in
+        // practice) encoding failure is still proven-no-effect.
         let (session_method, params_value) = if let Some(subject) = &resume_subject {
-            let params = NativeSessionResumeParams {
+            let native_params = NativeSessionResumeParams {
                 command_id: new_command_id(),
                 session_id: subject.native_ref.clone(),
                 exclude_items: Some(true),
             };
-            (
-                "session/resume",
-                serde_json::to_value(params).map_err(|_| {
-                    Error::new(
-                        "internal",
-                        "Muse session/resume params could not be encoded",
-                    )
-                })?,
-            )
+            let encoded = serde_json::to_value(native_params).map_err(|_| {
+                Error::new(
+                    "internal",
+                    "Muse session/resume params could not be encoded",
+                )
+            });
+            match encoded {
+                Ok(value) => ("session/resume", value),
+                Err(error) => {
+                    return Ok(self.retain_proven_no_effect_start(&params, error.message));
+                }
+            }
         } else {
-            let params = NativeSessionStartParams {
+            let native_params = NativeSessionStartParams {
                 command_id: new_command_id(),
                 model_id: Some(requested_model.clone()),
                 workspace_root: Some(workspace.to_string_lossy().into_owned()),
                 approval_mode: requested_approval.clone(),
             };
-            (
-                "session/start",
-                serde_json::to_value(params).map_err(|_| {
-                    Error::new("internal", "Muse session/start params could not be encoded")
-                })?,
-            )
+            let encoded = serde_json::to_value(native_params).map_err(|_| {
+                Error::new("internal", "Muse session/start params could not be encoded")
+            });
+            match encoded {
+                Ok(value) => ("session/start", value),
+                Err(error) => {
+                    return Ok(self.retain_proven_no_effect_start(&params, error.message));
+                }
+            }
         };
         let response_value = match session
             .native_client
@@ -1691,6 +1766,11 @@ async fn discover_model(
             "Muse model/list result did not match the installed schema",
         )
     })?;
+    let source = catalog
+        .source
+        .clone()
+        .unwrap_or_else(|| "unknown".to_owned());
+    let count = catalog.models.len();
     catalog
         .models
         .into_iter()
@@ -1698,7 +1778,9 @@ async fn discover_model(
         .ok_or_else(|| {
             Error::new(
                 "profile_error",
-                "The exact requested Muse model is unavailable in this account catalogue",
+                format!(
+                    "Muse model catalogue (source {source}, {count} models) does not contain the exact requested model"
+                ),
             )
         })
 }
@@ -2372,8 +2454,8 @@ mod tests {
         validate_resume_preflight,
     };
     use crate::native::types::NativeSession;
-    use eliot_plugin::{Peer, session::validate_source_plan};
-    use serde_json::json;
+    use eliot_plugin::{AgentStartParams, Peer, session::validate_source_plan};
+    use serde_json::{Value, json};
     use std::ffi::OsString;
 
     fn preflight_session(
@@ -2608,11 +2690,46 @@ mod tests {
             },
             "workspace": std::env::current_dir().unwrap().to_str().unwrap()
         });
-        let err = plugin
+        // A pre-spawn refusal is proven-no-effect: the plugin returns a
+        // failed-state result (the daemon settles failed, never unknown)
+        // instead of an error, and the same command replays it.
+        let failed = plugin
             .start(&start_params, &client)
             .await
-            .expect_err("must reject read-only");
-        assert_eq!(err.code, "profile_error");
-        assert!(err.message.contains("permissions"));
+            .expect("pre-spawn refusal must be a failed-state result");
+        assert_eq!(failed.get("state").and_then(Value::as_str), Some("failed"));
+        assert!(
+            failed
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| reason.contains("permissions")),
+            "failed reason must name the refused check: {failed}"
+        );
+        assert_eq!(
+            failed.get("command_id").and_then(Value::as_str),
+            Some("018f0a00-0000-7000-8000-000000000001")
+        );
+        let replayed = plugin
+            .start(&start_params, &client)
+            .await
+            .expect("same command must replay the failed-state result");
+        assert_eq!(replayed, failed);
+    }
+
+    #[test]
+    fn proven_no_effect_start_result_carries_binding_and_reason() {
+        let params = AgentStartParams::new("agent-1", 1, "018f0a00-0000-7000-8000-000000000002");
+        let mut plugin = MusePlugin::default();
+        let value = plugin.retain_proven_no_effect_start(&params, "Muse test check failed");
+        assert_eq!(value.get("state").and_then(Value::as_str), Some("failed"));
+        assert_eq!(
+            value.get("reason").and_then(Value::as_str),
+            Some("Muse test check failed")
+        );
+        assert_eq!(
+            value.get("agent_id").and_then(Value::as_str),
+            Some("agent-1")
+        );
+        assert_eq!(value.get("generation").and_then(Value::as_i64), Some(1));
     }
 }
