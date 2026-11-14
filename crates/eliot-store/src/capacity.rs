@@ -614,7 +614,7 @@ fn has_rejected_dispatched_start_tx(
 }
 
 /// Live release proof: physical exit plus the plugin host's drain record.
-fn has_owned_exit_and_reader_drain_tx(
+pub(super) fn has_owned_exit_and_reader_drain_tx(
     connection: &Connection,
     agent: i64,
     generation: i64,
