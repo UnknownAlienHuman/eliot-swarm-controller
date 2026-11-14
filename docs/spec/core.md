@@ -613,6 +613,25 @@ verbatim native amount with its verbatim native unit (for example
 assumed to be money. There is no history table and no rollup: only the
 latest snapshot reads back, through `agent.get`/`agent.stats`
 `session_usage` in its own session-scope section.
+
+`usage.summary` is the one bounded totals read over one scope: one Agent
+(all retained generations, or one named generation), one project label, or
+one tree (a root Agent and its descendants). It reports known subtotals with
+explicit coverage and never presents a partial sum as complete. Turn
+expenditure sums each `TurnUsage` counter over retained terminal turns that
+supply it, grouped by native scope (`turn`, `main_loop_turn`, `message`,
+`unknown`): scopes never merge into a cross-scope total. The response carries
+`turns_counted`, `turns_without_usage`, and per-counter `turns_missing`
+gaps, plus the retained non-terminal turns the sums skip
+(`turns_unknown_excluded`, `turns_running_excluded`): an unknown turn may
+have spent tokens the readback cannot see. Session facts sum cumulative counters only where every included
+snapshot supplies them (otherwise the subtotal and its gap read back), group
+cost by verbatim unit without converting, and never sum context occupancy.
+`history_complete` is false with its reason when the retained-event
+watermark (`rule_history_coverage.pruned_through`) shows history was pruned;
+scope expansion stops at the hierarchy fanout bound with `truncated` set and
+the Agent count included. No new aggregate table backs this read: it scans
+the retained `turns` and `session_usage` rows on their existing indexes.
 `agents.pending` is the serialized
 pending-request projection; `pending_requests` stores
 indexed request lifecycle rows. These are separate current Store structures, not

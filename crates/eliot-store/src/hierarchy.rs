@@ -80,7 +80,7 @@ pub(super) fn parse_caller(connection: &Connection, principal: &str) -> Result<C
 /// One subtree snapshot: root first, then descendants in Agent-id order.
 /// Reads at most `limit + 1` rows so the caller can detect overflow without
 /// an unbounded page.
-pub(super) fn subtree_member_nums(
+pub(crate) fn subtree_member_nums(
     connection: &Connection,
     root_num: i64,
     limit: i64,
