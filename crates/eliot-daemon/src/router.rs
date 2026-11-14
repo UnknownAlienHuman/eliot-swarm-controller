@@ -2617,7 +2617,13 @@ impl Router {
 
         // This is a private native read. It is deliberately not reduced, stored,
         // published, or used to settle a command or input acknowledgement.
-        let raw = self
+        //
+        // The native subject projection was already read at attach and is
+        // retained with the applied attach outcome. When the live observer
+        // reader has lapsed, `source=native, view=subject` is still served from
+        // that retained metadata; turns/items keep requiring the live reader,
+        // and a later detach still fences every read.
+        let raw = match self
             .inner
             .plugin_host
             .snapshot_observer(
@@ -2626,7 +2632,22 @@ impl Router {
                     Error::new("internal", "observation query could not be encoded")
                 })?,
             )
-            .await?;
+            .await
+        {
+            Ok(raw) => raw,
+            Err(error)
+                if query.source == "native"
+                    && query.view == "subject"
+                    && query.cursor.is_none()
+                    && query.turn_id.is_none() =>
+            {
+                match self.retained_observe_subject_page(&agent).await? {
+                    Some(raw) => raw,
+                    None => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
         let object = raw
             .as_object()
             .ok_or_else(|| Error::new("source_integrity", "observation page is not an object"))?;
@@ -2689,6 +2710,36 @@ impl Router {
             .map_err(|_| Error::new("internal", "observation page could not be encoded"))?;
         self.redact_native_value(&mut value);
         Ok(value)
+    }
+
+    /// Native subject page from the retained applied attach outcome.
+    ///
+    /// Returns `None` when the current generation has no applied attach with
+    /// subject metadata (including after a later detach), so the caller keeps
+    /// the original live-reader error and the detach fence stands.
+    async fn retained_observe_subject_page(&self, agent: &Agent) -> Result<Option<Value>> {
+        let subject = {
+            let store = self.inner.store.lock().await;
+            store.retained_observe_subject(&agent.id, agent.generation)?
+        };
+        let Some(subject) = subject else {
+            return Ok(None);
+        };
+        let page = ObservationPage {
+            agent_id: agent.id.clone(),
+            generation: agent.generation,
+            native_scope: agent.native_scope.clone().unwrap_or_default(),
+            native_ref: agent.native_ref.clone().unwrap_or_default(),
+            source: "native".to_owned(),
+            view: "subject".to_owned(),
+            entries: vec![subject],
+            next_cursor: None,
+            coverage: json!({"kind": "native_metadata", "complete": true, "live": false}),
+        };
+        page.validate()?;
+        serde_json::to_value(page)
+            .map_err(|_| Error::new("internal", "retained observation page could not be encoded"))
+            .map(Some)
     }
 
     async fn agent_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -11766,6 +11817,113 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn retained_native_subject_survives_reader_lapse_but_not_detach() {
+        let router = router();
+        let attach_id = ulid::Ulid::new().to_string();
+        let subject = json!({
+            "native_ref": "fixture-native",
+            "source": "vscode",
+            "state": "unknown",
+            "created_at": 1794654462000i64,
+            "updated_at": 1794654487000i64,
+        });
+        let agent = {
+            let mut store = router.inner.store.lock().await;
+            let agent = store.submit("owner", SubmitCommand {
+                id:attach_id.clone(), target:None, selector:None, verb:"attach".to_owned(),
+                args:json!({"profile":"fixture", "harness":"codex", "mode":"observe",
+                    "native_scope":"fixture-scope", "native_ref":"fixture-native", "profile_snapshot":{}}),
+                expected_generation:Some(0), expected_turn_id:None, request_id:None, probe:false,
+            }, now_ms()).unwrap().command.target.unwrap();
+            store.dispatch(&attach_id, now_ms()).unwrap();
+            store
+                .settle_observe_attach(
+                    &attach_id,
+                    json!({
+                "agent_id":agent, "generation":1, "command_id":attach_id,
+                "native_scope":"fixture-scope", "native_ref":"fixture-native",
+                "state":"attached", "observation_state":"unknown",
+                "metadata":{"subject":subject}, "coverage":{"kind":"native_metadata"}}),
+                    now_ms(),
+                )
+                .unwrap();
+            agent
+        };
+        // No live observer reader exists in this test, yet the native subject
+        // view is served from the retained attach metadata.
+        let page = router
+            .agent_history(
+                &json!({"id":agent, "generation":1, "source":"native", "view":"subject"}),
+                &Principal::Owner,
+            )
+            .await
+            .expect("retained native subject serves without a live reader");
+        assert_eq!(page["entries"], json!([subject]));
+        assert_eq!(
+            page["coverage"],
+            json!({"kind":"native_metadata","complete":true,"live":false})
+        );
+        assert_eq!(page["native_ref"], json!("fixture-native"));
+        assert_eq!(page["native_scope"], json!("fixture-scope"));
+        // Turns still require the live reader.
+        assert_eq!(
+            router
+                .agent_history(
+                    &json!({"id":agent, "generation":1, "source":"native", "view":"turns"}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "unavailable"
+        );
+        // A later detach fences the retained subject too.
+        let detach_id = ulid::Ulid::new().to_string();
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: detach_id.clone(),
+                        target: Some(agent.clone()),
+                        selector: None,
+                        verb: "detach".to_owned(),
+                        args: json!({}),
+                        expected_generation: Some(1),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.dispatch(&detach_id, now_ms()).unwrap();
+            store
+                .settle_observe_detach(
+                    &detach_id,
+                    json!({
+                "agent_id":agent, "generation":2, "command_id":detach_id,
+                "native_scope":"fixture-scope", "native_ref":"fixture-native",
+                "state":"detached", "observation_state":"unknown"}),
+                    now_ms(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            router
+                .agent_history(
+                    &json!({"id":agent, "generation":2, "source":"native", "view":"subject"}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "unavailable"
+        );
     }
 
     #[tokio::test]
