@@ -125,6 +125,22 @@ nonnegative counters project (`input_tokens`, `output_tokens`,
 `cache_read_input_tokens`, `cache_creation_input_tokens`); missing or
 wholly malformed usage stays null so completion proceeds.
 
+## Hook tool diagnostics
+
+Each committed `hook.before_tool` fact carries the exact `turn_id` and opaque
+`consumer_id` plus optional bounded progress diagnostics taken only from the
+native `PreToolUse` input: `tool` (native tool name, 64 chars), `native_tool_id`
+(matched `tool_use_id`, 128 chars), `operation` (closed vocabulary from the tool
+name only: file readers `Read`/`Glob`/`Grep` map to `read`, file writers
+`Edit`/`Write`/`NotebookEdit` to `write`, `Bash` to `exec`; every other tool
+carries no operation), and `path` (one workspace-relative file path, 512 chars).
+Only the top-level `tool_input` leaves `file_path`/`path` are read; commands,
+contents and every other argument are dropped at extraction. Paths use the same
+lexical workspace-relative normalization as native file hints, and an
+out-of-workspace path is dropped. Every kept field is `SecretPolicy`-redacted
+before its cap, and absent native data stays absent, so `on.event` matching is
+unchanged. The wire `HookEvent` request shape is untouched.
+
 ## Source ownership and recovery
 
 The stream-json stdout stream owns supplied session/turn/message/tool/usage facts.

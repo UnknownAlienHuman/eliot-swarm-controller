@@ -1180,7 +1180,7 @@ fn background_startup_releases_capture_before_daemon_exit() {
     let mut starter = Captured::spawn(command);
     assert!(
         starter
-            .wait(Duration::from_secs(5))
+            .wait(Duration::from_secs(40))
             .expect("background starter deadline")
             .success()
     );
@@ -1196,11 +1196,44 @@ fn background_startup_releases_capture_before_daemon_exit() {
         std::thread::sleep(Duration::from_millis(25));
     };
     let held = windows_process::Daemon::open(&fixture.data, &info);
-    assert_eq!(fixture.json(&["status"])["state"], "running");
-    let (stdout, _) = starter.output(Duration::from_secs(5));
+    let status = fixture.json(&["status"]);
+    assert_eq!(status["state"], "running");
     assert_eq!(
-        serde_json::from_str::<Value>(&stdout).unwrap()["state"],
-        "starting"
+        status["data_dir"].as_str().expect("status data_dir"),
+        fixture.data.to_string_lossy(),
+        "status must show the resolved data directory"
+    );
+    let (stdout, _) = starter.output(Duration::from_secs(5));
+    let frames: Vec<Value> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("starter JSON frame"))
+        .collect();
+    assert!(
+        frames.iter().any(|frame| frame["state"] == "starting"),
+        "starter must report starting: {stdout}"
+    );
+    let ready = frames
+        .iter()
+        .find(|frame| frame["state"] == "ready")
+        .expect("starter must report ready after the readiness wait");
+    let ready_dir = ready["data_dir"]
+        .as_str()
+        .expect("ready data_dir")
+        .trim_end_matches(['/', '\\']);
+    let expected_dir = fixture
+        .data
+        .to_string_lossy()
+        .trim_end_matches(['/', '\\'])
+        .to_owned();
+    assert_eq!(
+        ready_dir, expected_dir,
+        "starter ready must carry the resolved data directory"
+    );
+    assert_eq!(
+        ready["boot_id"].as_str().expect("ready boot_id"),
+        info["boot_id"].as_str().expect("daemon boot id"),
+        "starter ready must carry the daemon boot id"
     );
     assert_eq!(
         held.wait(Duration::ZERO).unwrap(),
@@ -1216,6 +1249,91 @@ fn background_startup_releases_capture_before_daemon_exit() {
     );
     assert_eq!(held.wait(Duration::from_secs(15)).unwrap(), Some(0));
     fixture.retain_data = false;
+}
+
+#[test]
+fn status_reports_resolved_data_dir() {
+    let mut fixture = Fixture::new("status data dir");
+    fixture.start();
+    let status = fixture.json(&["status"]);
+    assert_eq!(status["state"], "running");
+    assert_eq!(
+        status["data_dir"].as_str().expect("status data_dir"),
+        fixture.data.to_string_lossy(),
+        "status must show the resolved data directory"
+    );
+    fixture.stop(false);
+}
+
+#[test]
+fn connect_failure_hint_points_at_recorded_failure() {
+    use std::io::Write as _;
+    let mut fixture = Fixture::new("connect hint");
+    fixture.start();
+    fixture.stop(false);
+    let log_path = fixture.data.join("logs").join("daemon.log");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_millis() as u64;
+    let record = serde_json::json!({
+        "ts": now_ms,
+        "code": "daemon.failed",
+        "error_code": "frame_too_large",
+    });
+    let mut log = fs::OpenOptions::new()
+        .append(true)
+        .open(&log_path)
+        .expect("append daemon log");
+    writeln!(log, "{record}").expect("write failure record");
+    drop(log);
+    let owner_token =
+        fs::read_to_string(fixture.data.join("owner.token")).expect("fixture owner token");
+
+    let reply = cli(&fixture.data, &["status"]);
+    assert!(!reply.status.success(), "status without a daemon must fail");
+    assert!(
+        reply.stderr.contains("hint: data_dir="),
+        "connect error must carry a data-dir hint: {}",
+        reply.stderr
+    );
+    assert!(
+        reply.stderr.contains("frame_too_large"),
+        "hint must include the last daemon.failed code: {}",
+        reply.stderr
+    );
+    assert!(
+        reply.stderr.contains("daemon log present"),
+        "hint must say whether the daemon log exists: {}",
+        reply.stderr
+    );
+    assert!(
+        !reply.stderr.contains(&owner_token),
+        "connect hint must never print secrets"
+    );
+    assert!(
+        !reply.stdout.contains(&owner_token),
+        "connect hint must never print secrets on stdout"
+    );
+}
+
+#[test]
+fn resume_wait_rejects_nonpositive_timeout() {
+    let mut fixture = Fixture::new("resume timeout");
+    fixture.start();
+    let reply = cli(
+        &fixture.data,
+        &["resume", "a1", "--wait", "--timeout-seconds", "0"],
+    );
+    assert_eq!(reply.status.code(), Some(2), "stderr: {}", reply.stderr);
+    assert!(
+        reply
+            .stderr
+            .contains("--timeout-seconds must be greater than zero"),
+        "resume --wait must honor --timeout-seconds: {}",
+        reply.stderr
+    );
+    fixture.stop(false);
 }
 
 #[test]

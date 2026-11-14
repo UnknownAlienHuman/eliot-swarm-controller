@@ -253,6 +253,19 @@ the claim stays frozen and is never requeued. A confirmed receipt may reconcile 
 terminal won the race; selection always requires the exact active turn. This adds no second
 source/lifecycle stream, client API method, hook-decision RPC, or policy engine.
 
+A `hook.before_tool` fact may also carry optional bounded progress diagnostics taken
+only from the native hook input: `tool` (bounded native tool name), `native_tool_id`
+(bounded matched invocation id), `operation` (closed vocabulary derived from the tool
+name only: `read`, `write`, `exec`), and `path` (one workspace-relative file path).
+File paths use the same lexical workspace-relative normalization as native file hints;
+an out-of-workspace path is dropped, never persisted. Full command lines, file contents
+and every other argument are dropped at extraction. Each kept field passes through the
+existing `SecretPolicy` redaction before its char cap. Absent native data stays absent,
+so the kind, envelope and `on.event` compatibility of the fact are unchanged: a missing
+field simply does not match an ordinary rule condition. A hook whose payload carries no
+tool metadata (such as Antigravity `PreInvocation`, which is a `before_model` point)
+emits no diagnostics.
+
 ## Durable plugin requests
 
 | Method | Fields / result |
