@@ -43,7 +43,7 @@ use eliot_core::{
 pub use eliot_core::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::{
     cell::Cell,
     collections::{BTreeMap, HashSet},
@@ -83,7 +83,7 @@ const UNSETTLED_COMMANDS_WHERE: &str = "state IN ('accepted', 'queued', 'dispatc
 const LIST_UNSETTLED_COMMANDS_COLUMNS: &str =
     "SELECT id, principal, method, target, expected_generation, generation,
                         expected_turn_id, turn_id, request_id, verb, args, state, outcome,
-                        created_at, updated_at, probe, selector
+                        created_at, updated_at, probe, selector, config_revision
                  FROM commands";
 /// Live Agent rows that can still produce work. Shared by the bounded drain
 /// list and its total for the same honest-truncation reason as unsettled
@@ -1468,7 +1468,7 @@ impl Store {
             .connection
             .prepare(
                 "SELECT agent, generation, turn_id, state, status, outcome, native_status,
-                        final_text, started_at, completed_at, usage
+                        final_text, started_at, completed_at, usage, config_revision
                  FROM turns WHERE agent = ?1 AND generation = ?2
                  ORDER BY COALESCE(started_at, completed_at, 0) DESC, turn_id DESC
                  LIMIT ?3",
@@ -2880,6 +2880,11 @@ struct CommandRecord {
     state: CommandState,
     target: Option<i64>,
     expected_turn_id: Option<String>,
+    /// Configuration revision captured at admission: the latest retained
+    /// `agent_config` revision for the target Agent generation, or 0 when
+    /// none existed (or the command is targetless). Never rewritten: a
+    /// retry or redispatch keeps the original stamp.
+    config_revision: i64,
 }
 
 struct TurnRecord {
@@ -2894,6 +2899,9 @@ struct TurnRecord {
     started_at: Option<i64>,
     completed_at: Option<i64>,
     usage: Option<String>,
+    /// Configuration revision the turn ran under, copied from its bound
+    /// send command at turn creation. 0 when no overlay applied.
+    config_revision: i64,
 }
 
 struct SourceStateRecord {
@@ -3092,6 +3100,7 @@ struct TurnInsert<'a> {
     started_at: Option<i64>,
     completed_at: Option<i64>,
     usage: Option<&'a str>,
+    config_revision: i64,
 }
 
 /// Indexed equality filters for the compact `agent.list` fleet projection.
@@ -3435,6 +3444,7 @@ fn command_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandR
         updated_at: row.get(14)?,
         probe: row.get(15)?,
         selector: row.get(16)?,
+        config_revision: row.get(17)?,
     })
 }
 
@@ -3456,6 +3466,7 @@ struct CommandRecordRaw {
     updated_at: i64,
     probe: bool,
     selector: Option<String>,
+    config_revision: i64,
 }
 
 fn command_from_raw(raw: CommandRecordRaw) -> Result<CommandRecord> {
@@ -3483,6 +3494,7 @@ fn command_from_raw(raw: CommandRecordRaw) -> Result<CommandRecord> {
         state,
         target,
         expected_turn_id: raw.expected_turn_id,
+        config_revision: raw.config_revision,
     })
 }
 
@@ -3491,7 +3503,7 @@ fn load_command_record(connection: &Connection, id: &str) -> Result<Option<Comma
         .query_row(
             "SELECT id, principal, method, target, expected_generation,
                     generation, expected_turn_id, turn_id, request_id, verb, args,
-                    state, outcome, created_at, updated_at, probe, selector
+                    state, outcome, created_at, updated_at, probe, selector, config_revision
              FROM commands WHERE id = ?1",
             [id],
             command_record_from_row,
@@ -4018,9 +4030,9 @@ fn insert_command(
              id, principal, method, payload_digest, target, expected_generation,
              generation, expected_turn_id, parent_command, link_kind, ordinal,
              turn_id, request_id, verb, args, state, outcome, created_at, updated_at, probe, cause,
-             project_binding, selector
+             project_binding, selector, config_revision
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, 0
          )",
         params![
             command.id,
@@ -4049,6 +4061,18 @@ fn insert_command(
         ],
     ));
     Ok(())
+}
+
+/// Latest retained `configure` revision for one Agent generation, or 0 when
+/// no `configure` ever applied. Reads inside the caller's transaction so an
+/// admission stamp and a revision bump stay serialized.
+fn current_config_revision_tx(tx: &Transaction<'_>, agent: i64, generation: i64) -> Result<i64> {
+    tx.query_row(
+        "SELECT COALESCE(MAX(revision), 0) FROM agent_config WHERE agent = ?1 AND generation = ?2",
+        params![agent, generation],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
 }
 
 fn update_command_state(
@@ -4344,6 +4368,7 @@ fn turn_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord>
         started_at: row.get(8)?,
         completed_at: row.get(9)?,
         usage: row.get(10)?,
+        config_revision: row.get(11)?,
     })
 }
 
@@ -4376,6 +4401,7 @@ fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
         started_at: record.started_at,
         completed_at: record.completed_at,
         usage,
+        config_revision: record.config_revision,
     })
 }
 
@@ -4410,6 +4436,306 @@ impl Store {
     }
 }
 
+/// Retained model/effort overlay for one Agent generation: the requested
+/// values from one `configure` command plus the effective values the next
+/// native turn carries. The original profile snapshot is never rewritten;
+/// it stays on the Agent row while these rows accumulate per generation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentConfig {
+    pub agent: String,
+    pub generation: i64,
+    pub revision: i64,
+    pub requested_model: Option<String>,
+    pub requested_effort: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub application: String,
+    pub command_id: String,
+    pub created_at: i64,
+}
+
+fn agent_config_from_row(
+    agent: i64,
+    generation: i64,
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AgentConfig> {
+    let requested: String = row.get(1)?;
+    let effective: String = row.get(2)?;
+    let requested: Value = serde_json::from_str(&requested).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            Box::new(ConfigDecodeError),
+        )
+    })?;
+    let effective: Value = serde_json::from_str(&effective).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(ConfigDecodeError),
+        )
+    })?;
+    Ok(AgentConfig {
+        agent: format_agent_id(agent),
+        generation,
+        revision: row.get(0)?,
+        requested_model: requested
+            .get("model")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        requested_effort: requested
+            .get("effort")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        model: effective
+            .get("model")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        effort: effective
+            .get("effort")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        application: row.get(3)?,
+        command_id: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
+#[derive(Debug)]
+struct ConfigDecodeError;
+
+impl std::fmt::Display for ConfigDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid stored agent_config JSON")
+    }
+}
+
+impl std::error::Error for ConfigDecodeError {}
+
+fn get_agent_config_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    revision: i64,
+) -> Result<Option<AgentConfig>> {
+    tx.query_row(
+        "SELECT revision, requested, effective, application, command_id, created_at
+         FROM agent_config WHERE agent = ?1 AND generation = ?2 AND revision = ?3",
+        params![agent, generation, revision],
+        |row| agent_config_from_row(agent, generation, row),
+    )
+    .optional()
+    .map_err(sql_error)
+}
+
+impl Store {
+    /// Retained `configure` overlay for one exact revision, or `None` when
+    /// the command ran under the frozen snapshot (revision 0). A nonzero
+    /// revision without a retained row is corruption, never a silent
+    /// snapshot fallback.
+    pub fn get_agent_config(
+        &self,
+        agent: &str,
+        generation: i64,
+        revision: i64,
+    ) -> Result<Option<AgentConfig>> {
+        if revision == 0 {
+            return Ok(None);
+        }
+        let agent_num = parse_agent_id(agent)?;
+        self.connection
+            .query_row(
+                "SELECT revision, requested, effective, application, command_id, created_at
+                 FROM agent_config WHERE agent = ?1 AND generation = ?2 AND revision = ?3",
+                params![agent_num, generation, revision],
+                |row| agent_config_from_row(agent_num, generation, row),
+            )
+            .optional()
+            .map_err(sql_error)?
+            .map(|config| {
+                if config.revision != revision {
+                    Err(Error::new(
+                        "source_integrity",
+                        "retained agent_config revision does not match its row",
+                    ))
+                } else {
+                    Ok(config)
+                }
+            })
+            .transpose()
+    }
+
+    /// Latest retained `configure` overlay for one Agent generation, or
+    /// `None` when no `configure` ever applied to it.
+    pub fn get_agent_config_current(
+        &self,
+        agent: &str,
+        generation: i64,
+    ) -> Result<Option<AgentConfig>> {
+        let agent_num = parse_agent_id(agent)?;
+        let revision: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT MAX(revision) FROM agent_config WHERE agent = ?1 AND generation = ?2",
+                params![agent_num, generation],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        revision
+            .map(|revision| {
+                self.get_agent_config(agent, generation, revision)?
+                    .ok_or_else(|| {
+                        Error::new("internal", "newest agent_config revision disappeared")
+                    })
+            })
+            .transpose()
+    }
+
+    /// Effective model/effort for one send command's retained revision, or
+    /// `None` when the send runs under the frozen snapshot. Used by the
+    /// plugin host before native turn construction and by settlement when
+    /// it records what the native request carried.
+    pub fn send_effective_config(&self, command_id: &str) -> Result<Option<AgentConfig>> {
+        let record = load_command_record(&self.connection, command_id)?.ok_or_else(|| {
+            Error::new("not_found", format!("command {command_id} was not found"))
+        })?;
+        if record.command.verb != "send" {
+            return Err(Error::new(
+                "invalid",
+                "effective configuration resolves only for send commands",
+            ));
+        }
+        let Some(target) = record.target else {
+            return Err(Error::new(
+                "source_integrity",
+                "send command has no retained Agent target",
+            ));
+        };
+        let generation = record.command.generation.ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "send command has no retained generation",
+            )
+        })?;
+        let agent = format_agent_id(target);
+        self.get_agent_config(&agent, generation, record.config_revision)
+    }
+
+    /// Commit one dispatched `configure` command's overlay and stamp the
+    /// command with its assigned revision. The revision is `max + 1` within
+    /// the Agent generation, assigned here (not at admission) so concurrent
+    /// admissions stay monotonic; `command_id` is unique so a reprocessed
+    /// dispatch returns the retained row instead of bumping again.
+    /// Settlement to `applied` happens after this returns.
+    pub fn apply_agent_config(&mut self, command_id: &str, now: i64) -> Result<AgentConfig> {
+        self.ensure_writer_healthy()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let record = load_command_record(&tx, command_id)?.ok_or_else(|| {
+            Error::new("not_found", format!("command {command_id} was not found"))
+        })?;
+        if record.command.verb != "configure" {
+            return Err(Error::new(
+                "invalid",
+                "agent configuration applies only to configure commands",
+            ));
+        }
+        if record.state != CommandState::Dispatched {
+            return Err(Error::new(
+                "bad_state",
+                "configure applies only after a committed dispatch",
+            ));
+        }
+        if let Some(existing) = tx
+            .query_row(
+                "SELECT agent, generation, revision FROM agent_config WHERE command_id = ?1",
+                [command_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sql_error)?
+        {
+            let (agent, generation, revision) = existing;
+            let config = get_agent_config_tx(&tx, agent, generation, revision)?
+                .ok_or_else(|| Error::new("internal", "retained agent_config row disappeared"))?;
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(config);
+        }
+        let agent_num = record.target.ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "configure command has no retained Agent target",
+            )
+        })?;
+        let agent = load_agent_by_num(&tx, agent_num)?
+            .ok_or_else(|| Error::new("not_found", "configure Agent was not found"))?;
+        let generation = record.command.generation.ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "configure command has no retained generation",
+            )
+        })?;
+        if generation != agent.generation {
+            return Err(Error::new(
+                "stale_generation",
+                format!(
+                    "configure targets generation {generation}, current is {}",
+                    agent.generation
+                ),
+            ));
+        }
+        if agent.is_terminal()
+            || !matches!(
+                agent.state,
+                AgentState::Idle | AgentState::Busy | AgentState::Waiting
+            )
+        {
+            return Err(Error::new(
+                "bad_state",
+                "configure requires a live Agent generation with a native session",
+            ));
+        }
+        let (requested, effective, application) = admission::resolve_configure(
+            &record.command.args,
+            &agent.harness,
+            &agent.profile_snapshot,
+        )?;
+        let revision = current_config_revision_tx(&tx, agent_num, generation)? + 1;
+        let requested_json = encode_json(&requested)?;
+        let effective_json = encode_json(&effective)?;
+        db!(tx.execute(
+            "INSERT INTO agent_config(agent, generation, revision, requested, effective, application, command_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                agent_num,
+                generation,
+                revision,
+                requested_json,
+                effective_json,
+                application,
+                command_id,
+                now,
+            ],
+        ));
+        db!(tx.execute(
+            "UPDATE commands SET config_revision = ?1 WHERE id = ?2",
+            params![revision, command_id],
+        ));
+        let config = get_agent_config_tx(&tx, agent_num, generation, revision)?
+            .ok_or_else(|| Error::new("internal", "new agent_config row was not visible"))?;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(config)
+    }
+}
+
 fn load_turn(
     connection: &Connection,
     agent: i64,
@@ -4419,7 +4745,7 @@ fn load_turn(
     let record = connection
         .query_row(
             "SELECT agent, generation, turn_id, state, status, outcome, native_status,
-                    final_text, started_at, completed_at, usage
+                    final_text, started_at, completed_at, usage, config_revision
              FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
             params![agent, generation, turn_id],
             turn_record_from_row,
@@ -4449,8 +4775,8 @@ fn load_harness_by_num(connection: &Connection, agent: i64) -> Result<String> {
 fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
     db!(tx.execute(
         "INSERT INTO turns(agent, generation, turn_id, state, status, outcome, native_status,
-                           final_text, started_at, completed_at, usage)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                           final_text, started_at, completed_at, usage, config_revision)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             turn.agent,
             turn.generation,
@@ -4463,6 +4789,7 @@ fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
             turn.started_at,
             turn.completed_at,
             turn.usage,
+            turn.config_revision,
         ],
     ));
     Ok(())
@@ -4783,6 +5110,49 @@ fn earliest_pending_send(
             |row| row.get(0),
         )
         .optional()
+        .map_err(sql_error)
+}
+
+/// Earliest not-yet-terminal `configure` for one Agent generation, in
+/// admission order. A dispatched or unknown configure holds the settings
+/// lane: later configures, and later sends, wait for its exact outcome.
+fn earliest_pending_configure(
+    connection: &Connection,
+    agent_num: i64,
+    generation: i64,
+) -> Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT id FROM commands
+             WHERE target = ?1 AND generation = ?2 AND verb = 'configure'
+               AND state IN ('accepted', 'queued', 'dispatched', 'unknown')
+             ORDER BY created_at, rowid LIMIT 1",
+            params![agent_num, generation],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)
+}
+
+/// Committed but unassociated send input (dispatched or unknown, no turn):
+/// holds the settings lane for a later `configure` until the exact native
+/// turn association lands.
+fn has_unassociated_send_input(
+    connection: &Connection,
+    agent_num: i64,
+    generation: i64,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM commands
+                 WHERE target = ?1 AND generation = ?2 AND verb = 'send'
+                   AND state IN ('dispatched', 'unknown')
+                   AND turn_id IS NULL
+             )",
+            params![agent_num, generation],
+            |row| row.get(0),
+        )
         .map_err(sql_error)
 }
 

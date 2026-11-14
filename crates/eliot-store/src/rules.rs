@@ -940,7 +940,7 @@ impl Store {
             .prepare(
                 "SELECT id, principal, method, target, expected_generation, generation,
                         expected_turn_id, turn_id, request_id, verb, args, state, outcome,
-                        created_at, updated_at, probe, selector
+                        created_at, updated_at, probe, selector, config_revision
                  FROM commands
                  WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL
                    AND (

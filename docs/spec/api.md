@@ -491,6 +491,28 @@ admitted. `CommandSubmitResponse` retains its existing six fields; for this comm
 application point and opaque consumer ([definition](../../crates/eliot-core/src/context.rs)).
 It adds no separate receipt or response field.
 
+`verb:\"configure\"` switches a live Agent's model and/or effort for its next
+turn without touching the frozen profile snapshot. `target` is required and
+`expected_generation` is optional; `selector`, `expected_turn_id`,
+`request_id` and `probe` are `invalid` on this verb. `args` carries only
+`model` and/or `effort` (at least one; JSON `null` means absent). Any other
+field is `unsupported`, while authority-adjacent fields (`permissions`,
+`approval`, `mcp`, `env`, `route`/`route_binding`, `account` and the
+catalog/provider/billing siblings) are rejected outright as `not_allowed`.
+Only the Owner principal may submit it. Codex carries both values as per-turn
+`turn/start` overrides and Muse carries effort the same way; a Muse `model`
+change needs a new native session and returns `unsupported`
+(`restart_required`) storing nothing, as do adapters without a verified
+per-turn mechanism (Claude, OpenCode, Antigravity). The Router stores the
+overlay after dispatch, then settles `applied` with the requested and
+effective values, the monotonically increasing `config_revision` for the
+generation, and `application:\"next_turn\"`. Each send keeps the revision
+current at its own dispatch, each turn records the revision it ran under, and
+the first overlay turn's readback repeats the effective values; a send
+committed before an overlay never runs under newer configuration. A configure
+admitted while send input is still unassociated waits on the settings lane,
+as does later input while a configure is still pending.
+
 Resolve the target and validate principal/capability/state before persisting the command
 binding and events. Each verb checks `expected_generation` at its defined admission or
 dispatch fence; it is not a universal equality check against the current generation at
@@ -1155,7 +1177,8 @@ swarm wait --all|--any --timeout-seconds N ID...
 swarm result A [--generation N] [--turns N]
 swarm turn show|resolve ...
 swarm approve|deny A [--request R] [--choice ID] [--feedback TEXT] | answer ... [--request R]
-swarm configure ... | compact|fork|background ...
+swarm configure A [--model MODEL] [--effort EFFORT] [--generation N]
+swarm compact|fork|background ...
 swarm cmd show|children|cancel|resolve ...
 swarm events [--since SEQ] [--allow-gap]
 swarm msg send ... | msg show ... | msg ack ... | inbox [AGENT] [--wait SECS]

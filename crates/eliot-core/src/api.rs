@@ -23,14 +23,14 @@ mod timers;
 mod waits;
 
 pub use agent_views::{
-    AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse, AgentGitRequest,
-    AgentGitResponse, AgentListRequest, AgentListResponse, AgentListRow, AgentProcessesRequest,
-    AgentProcessesResponse, AgentStatsRequest, AgentStatsResponse, AgentSummary, CloudMcpCustody,
-    CloudMcpHealth, CloudMcpStatus, DaemonStatusRequest, DaemonStatusResponse, DrainReport,
-    GitCredentialHelper, OwnedProcessKind, OwnedProcessSummary, PROCESS_CURSOR_MAX_BYTES,
-    ProcessPageCursor, ProjectGitView, ProjectRegistrationView, RunningTurnSummary, SourceOwner,
-    SourceState, StatusBlocker, UnsettledCommandSummary, WorkerTaskHealth, WorkerTaskStatus,
-    WorkspaceCustodyView,
+    AgentConfigView, AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse,
+    AgentGitRequest, AgentGitResponse, AgentListRequest, AgentListResponse, AgentListRow,
+    AgentProcessesRequest, AgentProcessesResponse, AgentStatsRequest, AgentStatsResponse,
+    AgentSummary, CloudMcpCustody, CloudMcpHealth, CloudMcpStatus, DaemonStatusRequest,
+    DaemonStatusResponse, DrainReport, GitCredentialHelper, OwnedProcessKind, OwnedProcessSummary,
+    PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectGitView, ProjectRegistrationView,
+    RunningTurnSummary, SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary,
+    WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
 };
 pub use coordination::{
     ClaimConflict, ClaimListRequest, ClaimListResponse, ClaimReleaseRequest, ClaimReleaseResponse,

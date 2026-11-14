@@ -665,6 +665,10 @@ impl Router {
                     .await
             }
             "stop" => self.execute_stop_command(&id, &agent, dispatched).await,
+            "configure" => {
+                self.execute_configure_command(&id, &agent).await;
+                true
+            }
             "detach" => {
                 self.execute_detach_command(&id, &agent, dispatched).await;
                 true
@@ -1173,6 +1177,47 @@ impl Router {
             }
         }
         true
+    }
+
+    /// Apply a dispatched `configure`: store the model/effort overlay, then
+    /// settle applied with the requested and effective values, the assigned
+    /// revision and the application point. No native I/O runs here; the
+    /// next send carries the effective values in its native turn request.
+    /// Settlement happens only after the Store commit, so an applied
+    /// configure always has a retained row to read back.
+    async fn execute_configure_command(&self, id: &str, agent: &Agent) {
+        let outcome = {
+            let mut store = self.inner.store.lock().await;
+            store.apply_agent_config(id, now_ms())
+        };
+        match outcome {
+            Ok(config) => {
+                let outcome = json!({
+                    "state": "applied",
+                    "requested": {
+                        "model": config.requested_model,
+                        "effort": config.requested_effort,
+                    },
+                    "effective": {
+                        "model": config.model,
+                        "effort": config.effort,
+                    },
+                    "config_revision": config.revision,
+                    "application": config.application,
+                    "harness": agent.harness,
+                });
+                let _ = self.settle(id, CommandState::Applied, Some(outcome)).await;
+            }
+            Err(error) => {
+                let _ = self
+                    .settle(
+                        id,
+                        CommandState::Rejected,
+                        Some(json!({"reason": error.code})),
+                    )
+                    .await;
+            }
+        }
     }
 
     /// Stop an Agent: a latched preparation cancel settles through the

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 33;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 34;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -801,6 +801,33 @@ impl Store {
                      PRIMARY KEY(agent, generation)
                  );
                  INSERT INTO schema_migrations(version) VALUES (33);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 34 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE agent_config (
+                     agent INTEGER NOT NULL REFERENCES agents(id),
+                     generation INTEGER NOT NULL CHECK(generation > 0),
+                     revision INTEGER NOT NULL CHECK(revision > 0),
+                     requested TEXT NOT NULL,
+                     effective TEXT NOT NULL,
+                     application TEXT NOT NULL CHECK(application = 'next_turn'),
+                     command_id TEXT NOT NULL UNIQUE REFERENCES commands(id),
+                     created_at INTEGER NOT NULL,
+                     PRIMARY KEY(agent, generation, revision)
+                 );
+                 CREATE INDEX agent_config_command ON agent_config(command_id);
+                 ALTER TABLE commands ADD COLUMN config_revision INTEGER NOT NULL DEFAULT 0
+                     CHECK(typeof(config_revision) = 'integer' AND config_revision >= 0);
+                 ALTER TABLE turns ADD COLUMN config_revision INTEGER NOT NULL DEFAULT 0
+                     CHECK(typeof(config_revision) = 'integer' AND config_revision >= 0);
+                 INSERT INTO schema_migrations(version) VALUES (34);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

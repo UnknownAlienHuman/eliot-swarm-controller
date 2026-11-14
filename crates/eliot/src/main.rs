@@ -156,6 +156,8 @@ enum CliCommand {
     Detach(DetachArgs),
     /// Stop an Agent.
     Stop(StopArgs),
+    /// Switch a live Agent's model and/or effort for its next turn.
+    Configure(ConfigureArgs),
     /// Manage an Agent's retained worktree.
     Worktree(WorktreeArgs),
     /// Inspect a command.
@@ -531,6 +533,21 @@ struct StopArgs {
     /// Stop the Agent's whole subtree instead of just the Agent.
     #[arg(long, conflicts_with = "generation")]
     tree: bool,
+    #[command(flatten)]
+    generation: GenerationArgs,
+}
+
+#[derive(Args)]
+struct ConfigureArgs {
+    #[arg(value_name = "AGENT")]
+    agent: String,
+    /// Model id for the next turn (exact vendor id; catalog failures
+    /// never select another model).
+    #[arg(long, value_name = "MODEL")]
+    model: Option<String>,
+    /// Reasoning effort for the next turn.
+    #[arg(long, value_name = "EFFORT")]
+    effort: Option<String>,
     #[command(flatten)]
     generation: GenerationArgs,
 }
@@ -2118,6 +2135,29 @@ async fn dispatch(
             } else {
                 params.expected_generation = generation;
             }
+            submit_and_print(&data_dir, &params, json_output).await
+        }
+        CliCommand::Configure(ConfigureArgs {
+            agent,
+            model,
+            effort,
+            generation: GenerationArgs { generation },
+        }) => {
+            if model.is_none() && effort.is_none() {
+                return Err(Failure::new(
+                    2,
+                    "configure requires --model and/or --effort",
+                ));
+            }
+            let mut args = serde_json::Map::new();
+            if let Some(model) = model {
+                args.insert("model".to_owned(), Value::String(model));
+            }
+            if let Some(effort) = effort {
+                args.insert("effort".to_owned(), Value::String(effort));
+            }
+            let mut params = submit_request(id, Some(agent), "configure", Value::Object(args))?;
+            params.expected_generation = generation;
             submit_and_print(&data_dir, &params, json_output).await
         }
         CliCommand::Worktree(WorktreeArgs { command }) => match command {

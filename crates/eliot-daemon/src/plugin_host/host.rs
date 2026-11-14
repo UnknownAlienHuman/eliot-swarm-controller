@@ -1431,7 +1431,25 @@ async fn run_agent_inner(
                         reply,
                     } => {
                         last_command_id = command.id.clone();
-                        match agent_command_params(&agent, &command, dispatch_seq) {
+                        let config = match resolve_send_config(&state, &command).await {
+                            Ok(config) => config,
+                            Err(error) => {
+                                complete_plugin_command(
+                                    PluginCommandCompletion {
+                                        command,
+                                        reply,
+                                        result: Err(error),
+                                    },
+                                    &agent,
+                                    &stderr,
+                                    &source_credentials,
+                                    pending_failure,
+                                    client.reader_closed(),
+                                );
+                                continue;
+                            }
+                        };
+                        match agent_command_params(&agent, &command, dispatch_seq, config.as_ref()) {
                             Err(error) => complete_plugin_command(
                                 PluginCommandCompletion {
                                     command,
@@ -2634,14 +2652,39 @@ fn plugin_command_args(command: &Command) -> Result<Value> {
     Ok(Value::Object(args))
 }
 
+/// Effective model/effort for one send command's retained configuration
+/// revision, resolved from the Store before native turn construction.
+/// `None` when the send runs under the frozen snapshot (revision 0); the
+/// plugin then uses its session values. A resolution failure aborts before
+/// any native I/O is attempted.
+async fn resolve_send_config(
+    state: &Weak<HostState>,
+    command: &Command,
+) -> Result<Option<eliot_store::AgentConfig>> {
+    if command.verb != "send" {
+        return Ok(None);
+    }
+    let Some(state) = state.upgrade() else {
+        return Err(Error::new(
+            "unknown",
+            "plugin host stopped before command resolution",
+        ));
+    };
+    let store = state.store.lock().await;
+    store.send_effective_config(&command.id)
+}
+
 /// Build the `agent.command` wire params for one dispatched command, relaying
 /// Store-committed FIFO `next_input` items as top-level `context` (omitted
 /// when empty). The reserved `context_items` member is stripped so `args`
-/// stays the original send input.
+/// stays the original send input. A resolved configuration overlay adds the
+/// effective model/effort overrides for `send` only; every other verb keeps
+/// its exact historical params.
 fn agent_command_params(
     agent: &Agent,
     command: &Command,
     dispatch_seq: Option<i64>,
+    config: Option<&eliot_store::AgentConfig>,
 ) -> Result<Value> {
     let mut args = plugin_command_args(command)?;
     let context = args
@@ -2664,6 +2707,15 @@ fn agent_command_params(
     if !context.is_empty() {
         params["context"] = serde_json::to_value(&context)
             .map_err(|_| Error::new("internal", "context items could not be encoded"))?;
+    }
+    if let Some(config) = config.filter(|_| command.verb == "send") {
+        if let Some(model) = config.model.as_deref() {
+            params["model_override"] = Value::String(model.to_owned());
+        }
+        if let Some(effort) = config.effort.as_deref() {
+            params["effort_override"] = Value::String(effort.to_owned());
+        }
+        params["config_revision"] = json!(config.revision);
     }
     Ok(params)
 }
@@ -3545,7 +3597,63 @@ pub(crate) fn forget_revoked_agent_token(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_core::{CommandState, NativeEvent, SubmitCommand};
+    use eliot_core::{AgentState, CommandState, NativeEvent, SubmitCommand};
+
+    #[test]
+    fn send_params_carry_the_resolved_revision_overrides() {
+        let mut agent = Agent::new("a1", "proj", "codex", "fake", 0);
+        agent.generation = 1;
+        agent.state = AgentState::Idle;
+        let command = Command {
+            id: "send-1".to_owned(),
+            principal: "owner".to_owned(),
+            method: "command.submit".to_owned(),
+            verb: "send".to_owned(),
+            target: Some("a1".to_owned()),
+            selector: None,
+            expected_generation: Some(1),
+            generation: Some(1),
+            args: json!({"text": "hi"}),
+            state: CommandState::Dispatched,
+            turn_id: None,
+            request_id: None,
+            outcome: None,
+            created_at: 0,
+            updated_at: 0,
+            probe: false,
+        };
+        let config = eliot_store::AgentConfig {
+            agent: "a1".to_owned(),
+            generation: 1,
+            revision: 2,
+            requested_model: Some("m1".to_owned()),
+            requested_effort: None,
+            model: Some("m1".to_owned()),
+            effort: Some("low".to_owned()),
+            application: "next_turn".to_owned(),
+            command_id: "configure-1".to_owned(),
+            created_at: 0,
+        };
+        let params = agent_command_params(&agent, &command, Some(7), Some(&config)).unwrap();
+        assert_eq!(params["model_override"], json!("m1"));
+        assert_eq!(params["effort_override"], json!("low"));
+        assert_eq!(params["config_revision"], json!(2));
+        assert_eq!(params["dispatch_seq"], json!(7));
+        // Frozen sends keep their exact historical params.
+        let plain = agent_command_params(&agent, &command, None, None).unwrap();
+        assert!(plain.get("model_override").is_none());
+        assert!(plain.get("effort_override").is_none());
+        assert!(plain.get("config_revision").is_none());
+        // Overlays never leak into other verbs.
+        let steer = Command {
+            verb: "steer".to_owned(),
+            turn_id: Some("turn-1".to_owned()),
+            ..command.clone()
+        };
+        let steered = agent_command_params(&agent, &steer, None, Some(&config)).unwrap();
+        assert!(steered.get("model_override").is_none());
+        assert!(steered.get("config_revision").is_none());
+    }
 
     #[test]
     fn resume_source_generation_uses_the_checked_dispatched_predecessor() {

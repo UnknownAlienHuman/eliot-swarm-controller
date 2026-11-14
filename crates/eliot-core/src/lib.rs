@@ -689,6 +689,12 @@ pub struct Turn {
     /// existing positional wire order stays stable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_status: Option<String>,
+    /// Configuration revision the turn ran under: 0 when no `configure`
+    /// command ever applied to the Agent generation, otherwise the exact
+    /// `agent_config` revision whose effective model/effort the native
+    /// turn request carried. Trailing field; absent on old wire payloads.
+    #[serde(default)]
+    pub config_revision: i64,
 }
 
 /// Native token usage attributed to one terminal turn. Every member is

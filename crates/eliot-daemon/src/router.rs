@@ -30,21 +30,21 @@ use eliot_core::{
     SecretPolicy, SubmitCommand, Turn, TurnOutcome, TurnState, WorkspacePhase,
     WorkspacePreparationInput,
     api::{
-        AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
-        AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
-        AgentListResponse, AgentListRow, AgentProcessesRequest, AgentProcessesResponse,
-        AgentResultRequest, AgentResultResponse, AgentStatsRequest, AgentStatsResponse,
-        CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest, CommandSubmitRequest,
-        CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
-        DaemonStatusResponse, DiscoverPage, DrainReport, EmitDefinitionArgs, EventsBoundsRequest,
-        EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
-        EventsSubscribeResponse, GitFetchDefinitionArgs, GitView, MAX_OBSERVATION_PAGE_BYTES,
-        MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, NotifyDefinitionArgs, ObservationPage,
-        ObservationQuery, ObservationView, OwnedProcessKind, OwnedProcessSummary,
-        ProcessPageCursor, ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest,
-        RuleGetRequest, RuleStateView, RunningTurnSummary, ShutdownMode, SourceState,
-        StatusBlocker, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView,
-        TurnGetRequest, UnsettledCommandSummary, WaitEntryResult, WorkerTaskHealth,
+        AgentConfigView, AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse,
+        AgentGetRequest, AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest,
+        AgentListRequest, AgentListResponse, AgentListRow, AgentProcessesRequest,
+        AgentProcessesResponse, AgentResultRequest, AgentResultResponse, AgentStatsRequest,
+        AgentStatsResponse, CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest,
+        CommandSubmitRequest, CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse,
+        DaemonStatusRequest, DaemonStatusResponse, DiscoverPage, DrainReport, EmitDefinitionArgs,
+        EventsBoundsRequest, EventsFilter, EventsReadRequest, EventsReadResponse,
+        EventsSubscribeRequest, EventsSubscribeResponse, GitFetchDefinitionArgs, GitView,
+        MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
+        NotifyDefinitionArgs, ObservationPage, ObservationQuery, ObservationView, OwnedProcessKind,
+        OwnedProcessSummary, ProcessPageCursor, ProjectRegistrationView, ProviderClearHoldRequest,
+        ProviderHoldsRequest, RuleGetRequest, RuleStateView, RunningTurnSummary, ShutdownMode,
+        SourceState, StatusBlocker, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest,
+        TimerStateView, TurnGetRequest, UnsettledCommandSummary, WaitEntryResult, WorkerTaskHealth,
         WorkerTaskStatus, WorkspaceCustodyView,
     },
 };
@@ -2535,11 +2535,38 @@ impl Router {
             let store = self.inner.store.lock().await;
             store.get_session_usage(&agent.id, agent.generation)?
         };
+        // Current model/effort overlay for `swarm show`: the latest
+        // retained revision with its effective values plus the original
+        // frozen profile values. Absent when no `configure` applied.
+        let config = {
+            let store = self.inner.store.lock().await;
+            store
+                .get_agent_config_current(&agent.id, agent.generation)?
+                .map(|overlay| AgentConfigView {
+                    revision: overlay.revision,
+                    application: overlay.application.clone(),
+                    requested_model: overlay.requested_model.clone(),
+                    requested_effort: overlay.requested_effort.clone(),
+                    model: overlay.model.clone(),
+                    effort: overlay.effort.clone(),
+                    original_model: agent
+                        .profile_snapshot
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    original_effort: agent
+                        .profile_snapshot
+                        .get("effort")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                })
+        };
         serde_json::to_value(AgentGetResponse {
             agent,
             observation,
             source_states,
             session_usage,
+            config,
         })
         .map_err(|_| Error::new("internal", "Agent view could not be encoded"))
     }

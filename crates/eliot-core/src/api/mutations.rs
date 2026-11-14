@@ -29,6 +29,17 @@ impl CommandSubmitRequest {
         if !self.args.is_object() {
             return Err(Error::new("invalid", "command args must be a JSON object"));
         }
+        if self.verb == "configure"
+            && (self.selector.is_some()
+                || self.expected_turn_id.is_some()
+                || self.request_id.is_some()
+                || self.probe)
+        {
+            return Err(Error::new(
+                "invalid",
+                "configure takes only a target and an optional generation binding",
+            ));
+        }
         if self.probe && self.verb != "send" {
             return Err(Error::new(
                 "unsupported",

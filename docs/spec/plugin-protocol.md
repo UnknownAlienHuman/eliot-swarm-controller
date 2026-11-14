@@ -142,7 +142,13 @@ rather than allocating a fresh sequence; initial send linked to launch/resume fo
 ordinary send dispatch.
 
 For SEND, the same `agent.command` effect carries the FIFO `next_input` items claimed
-from existing command rows. The adapter prepends those items inside that native send;
+from existing command rows, plus the effective configuration overlay when one
+applies: optional `model_override`/`effort_override` resolved by the daemon
+from the send command's retained revision, with `config_revision` echoing that
+revision. The adapter prefers the overrides over its session values when
+building the native turn request and echoes them in its applied response;
+without an overlay all three stay absent and the frame keeps its exact
+historical shape. The adapter prepends those items inside that native send;
 it does not issue a second send. It reports their application only with the original
 send's exact turn association using `turn.started.data.context_outcomes`, with one
 `ContextOutcome` per claimed item in FIFO order. Store checks the exact claim count and

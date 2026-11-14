@@ -181,9 +181,33 @@ fn persist_turn_associated(
             started_at: Some(now),
             completed_at: None,
             usage: None,
+            config_revision: command.config_revision,
         },
     )?;
-    let outcome = json!({"turn_id": turn_id});
+    // The applied send outcome repeats what the native turn request
+    // carried, so the first turn under an overlay shows its effective
+    // model/effort in its readback. Unchanged without an overlay.
+    let mut outcome = json!({"turn_id": turn_id});
+    if command.config_revision > 0 {
+        let config = get_agent_config_tx(tx, agent_num, generation, command.config_revision)?
+            .ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "send command revision has no retained agent_config",
+                )
+            })?;
+        outcome["config_revision"] = json!(config.revision);
+        outcome["model"] = config
+            .model
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        outcome["effort"] = config
+            .effort
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+    }
     db!(tx.execute(
         "UPDATE commands SET state = 'applied', turn_id = ?1, outcome = ?2,
                              updated_at = ?3 WHERE id = ?4",

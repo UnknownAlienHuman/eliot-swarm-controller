@@ -294,7 +294,7 @@ write. A lost Eliot event acknowledgement follows the common last-batch rule.
 | stop | end this Agent's owned session/process |
 | resume | new Eliot generation/app-server plus `thread/resume` of retained thread; no old input replay |
 | approve/deny/answer | reply to the exact offered native request; public details are the shared ApprovalRequest/QuestionRequest, answers are the universal answers map |
-| configure | unsupported in the current slice |
+| configure | model and effort ride the per-turn `turn/start` fields (`TurnStartParams.model`/`effort`), resolved from the retained revision at send dispatch; the frozen snapshot never changes |
 | fork / native Goal / child control | later optional methods verified against installed schema, not advertised until implemented |
 
 Read effective model/provider/cwd/permissions from documented native fields. When an

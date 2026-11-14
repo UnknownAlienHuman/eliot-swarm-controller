@@ -331,6 +331,15 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
             "Run credentials cannot submit commands",
         ));
     }
+    // Model and effort authority never delegates: only the Owner may
+    // reconfigure a retained Agent. Project rules already fall out above;
+    // this also fences every Agent principal before scoped submit rules.
+    if request.verb == "configure" && !matches!(principal, Principal::Owner) {
+        return Err(Error::new(
+            "not_allowed",
+            "configure requires the Owner principal",
+        ));
+    }
     let Principal::Agent { id, generation } = principal else {
         return Ok(());
     };
