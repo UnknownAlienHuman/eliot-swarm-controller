@@ -1356,8 +1356,11 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
         }
         "turn.unknown" => {
             // Live-host projection loss with failed view recovery: settle only
-            // the active turn unknown, keep the session alive for a later
-            // send/stop. Never a success or failure outcome.
+            // the active turn unknown. The host stays alive for stop/readback
+            // and owner resolution, but the uncertain turn still fences the
+            // next turn: a later send queues behind the unknown-turn gate
+            // until the turn is explicitly resolved. Never a success or
+            // failure outcome.
             require_live_turn(agent, event)?;
             let command_id = required_text(event, "command_id")?;
             let turn_id = required_text(event, "turn_id")?;

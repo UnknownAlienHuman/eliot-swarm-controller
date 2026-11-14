@@ -168,7 +168,9 @@ command/turn binding and the gap reason), never as success or failure. The turn
 binding clears only after that terminal write is acknowledged; a failed write
 keeps the binding and retries on the next opportunity instead of stranding the
 Store turn. The plugin host stays alive and the Agent is not marked lost; the
-session remains for a later send/stop. Later facts for that turn gap instead of
+session remains for stop/readback and owner resolution, while a later send
+queues behind the unknown-turn gate until that turn is explicitly resolved
+(core.md turn/input gates). Later facts for that turn gap instead of
 resurrecting it, and interrupt/stop afterwards behave as for any unknown turn.
 Subscription admission alone, a private page, or a timer never proves native turn
 completion or process/session exit. Live recovery after projection failure remains
