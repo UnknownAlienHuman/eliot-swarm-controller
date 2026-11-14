@@ -1522,9 +1522,9 @@ fn muse_snapshot_from_entry(
 /// required explicit native `cmd` (no PATH default: a resolved wrapper would
 /// orphan the real CLI on stop), the CLI permission modes mapped from
 /// `approval`, and approve/deny replies through the stdio permission
-/// callback. Reasoning effort, collaboration presets, non-default
-/// permissions, and a non-`never` Eliot-side `approval_policy` stay rejected
-/// until their mappings land.
+/// callback, and the CLI `--effort` level (low, medium, high, xhigh, max).
+/// Collaboration presets, non-default permissions, and a non-`never`
+/// Eliot-side `approval_policy` stay rejected until their mappings land.
 fn claude_snapshot_from_entry(
     name: &str,
     entry: &ProfileEntry,
@@ -1547,20 +1547,22 @@ fn claude_snapshot_from_entry(
             )
         })?;
     validate_model(name, model, source, table_offset)?;
-    if entry
-        .effort
-        .as_deref()
-        .is_some_and(|effort| !effort.trim().is_empty())
-    {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "effort",
-            "the Claude slice has no reasoning-effort mapping",
-            "unsupported",
-        ));
-    }
+    // Claude Code 2.1.278 `--effort <level>`: the CLI's closed vocabulary.
+    // Absent effort keeps the CLI default; no value is fabricated.
+    let effort = match entry.effort.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(level @ ("low" | "medium" | "high" | "xhigh" | "max")) => Some(level.to_owned()),
+        Some(_) => {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                "effort",
+                "unknown Claude effort level (low, medium, high, xhigh, or max)",
+                "profile_error",
+            ));
+        }
+    };
     let permission_mode = match entry.approval.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(mode) => match mode {
@@ -1700,6 +1702,9 @@ fn claude_snapshot_from_entry(
     );
     if let Some(mode) = permission_mode {
         snapshot.insert("permission_mode".to_owned(), Value::String(mode));
+    }
+    if let Some(effort) = effort {
+        snapshot.insert("effort".to_owned(), Value::String(effort));
     }
     freeze_mcp_policy(
         &mut snapshot,
@@ -3837,7 +3842,15 @@ permissions = "workspace-write"
         assert_eq!(snapshot["permissions"], "workspace-write");
         assert_eq!(snapshot["approval_policy"], "never");
         assert!(snapshot.get("permission_mode").is_none());
+        assert!(snapshot.get("effort").is_none());
         assert_eq!(snapshot["pass_env"], json!(["EXAMPLE_API_KEY"]));
+
+        // The CLI `--effort` vocabulary freezes verbatim under `effort`.
+        let source = format!(
+            "[profiles.claude]\nharness = \"claude\"\ncmd = '{cmd}'\nmodel = \"claude-opus-4-6\"\neffort = \"xhigh\"\n"
+        );
+        let snapshot = resolve_text_profile(&source, "claude").unwrap();
+        assert_eq!(snapshot["effort"], "xhigh");
 
         // The approval vocabulary is the CLI permission-mode vocabulary and
         // freezes under the CLI-exact key. Both cases use the platform-native
@@ -3856,7 +3869,7 @@ permissions = "workspace-write"
 
         for source in [
             "[profiles.claude]\nharness='claude'\n",
-            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\neffort='high'\n",
+            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\neffort='extreme'\n",
             "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncollaboration_mode='plan'\n",
             "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\npermissions='read-only'\n",
             "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\napproval_policy='on-request'\n",
