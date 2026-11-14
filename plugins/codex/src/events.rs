@@ -306,10 +306,13 @@ impl ChildState {
 }
 
 /// Native subagent threads of the owned thread. Their frames are not this
-/// generation's lifecycle. A child's first frames can precede both its
-/// `thread/started` and the spawn result, so frames of an unannounced thread
-/// are taken only while the owned thread has a `spawnAgent` call in flight;
-/// such a thread must be confirmed before that window closes.
+/// generation's lifecycle. A 0.167.1 child's first frames can precede both
+/// its `thread/started` and the parent's `spawnAgent` announcement, so frames
+/// of an unannounced thread are always taken and held as unconfirmed in the
+/// bounded early buffer; a non-owned thread's frame never routes to the owned
+/// path. Such a thread must still be confirmed (spawn result or
+/// `thread/started` parent link) before the window settles, or the settle
+/// records a source gap.
 #[derive(Default)]
 struct ChildThreads {
     confirmed: HashSet<String>,
@@ -328,17 +331,16 @@ impl ChildThreads {
         if self.unconfirmed.contains_key(thread) {
             return Ok(true);
         }
-        if !self.has_any_window() {
-            return Ok(false);
-        }
+        // No spawn-window gate: a 0.167.1 child's first frames can arrive
+        // before the parent's `spawnAgent` item opens a window. Admit the
+        // thread as unconfirmed so the child path buffers it; confirmation
+        // (spawn result or `thread/started` parent link) or a settle-point gap
+        // decides it later. The owned path never sees this frame.
         if self.unconfirmed.len() >= MAX_CHILD_THREADS && !self.unconfirmed.contains_key(thread) {
             return Err("Codex sent frames from more unannounced threads than are tracked");
         }
         self.unconfirmed.insert(thread.to_owned(), None);
         Ok(true)
-    }
-    fn has_any_window(&self) -> bool {
-        self.has_pending()
     }
     fn has_pending(&self) -> bool {
         self.pending_spawns.values().any(|items| !items.is_empty())
@@ -361,10 +363,10 @@ impl ChildThreads {
     }
     fn settle_all(&mut self) -> std::result::Result<(), &'static str> {
         let producers = self.producers();
-        if producers.is_empty() && self.unconfirmed.is_empty() {
+        if !self.has_pending() && self.unconfirmed.is_empty() {
             return Ok(());
         }
-        if producers.is_empty() {
+        if !self.has_pending() {
             self.unconfirmed.clear();
             return Err("Codex sent frames from a thread no spawn announced");
         }
@@ -884,6 +886,10 @@ impl EventProcessor {
     }
 
     /// Whether this frame is a native-child frame (bounded/unconfirmed/confirmed).
+    /// Any frame naming a present non-owned thread routes to the child path;
+    /// a non-owned thread's frame is never validated as owned. Still-unknown
+    /// threads are held as unconfirmed and buffered; settle points gap them
+    /// only when no spawn ever announces them.
     fn take_child_frame(&mut self, params: &Value) -> bool {
         let Some(thread) = frame_thread_id(params) else {
             return false;
@@ -1889,9 +1895,20 @@ impl EventProcessor {
         if let Some(owned) = self.status.thread_id.clone()
             && owned != thread_id
         {
-            let parent = params.get("thread").and_then(spawned_parent_thread);
-            if parent.is_some_and(|parent| self.children.is_parent(&owned, parent)) {
-                let parent = parent.unwrap().to_owned();
+            let thread = params.get("thread");
+            // Two independent confirmations, both verified against the
+            // installed 0.167.1 v2 schema: the legacy
+            // `source.subAgent.thread_spawn.parent_thread_id` and the new
+            // top-level `thread.parentThreadId` (set only for subagents).
+            // Either names a known parent (the owned thread or a
+            // confirmed child for nesting).
+            let legacy_parent = thread.and_then(spawned_parent_thread);
+            let top_parent = thread.and_then(top_level_parent_thread);
+            let parent = legacy_parent
+                .filter(|parent| self.children.is_parent(&owned, parent))
+                .or_else(|| top_parent.filter(|parent| self.children.is_parent(&owned, parent)));
+            if let Some(parent) = parent {
+                let parent = parent.to_owned();
                 let spawn_item = params
                     .get("thread")
                     .and_then(spawned_item_id)
@@ -2976,8 +2993,9 @@ fn spawned_item_id(thread: &Value) -> Option<&str> {
         .filter(|id| !id.trim().is_empty())
 }
 
-/// The parent of a subagent thread, from the installed 0.161 `Thread.source`
-/// shape `{"subAgent": {"thread_spawn": {"parent_thread_id": ...}}}`.
+/// The parent of a subagent thread, from the installed 0.167.1 v2
+/// `SessionSource` subagent shape
+/// `{"subAgent": {"thread_spawn": {"parent_thread_id": ...}}}`.
 fn spawned_parent_thread(thread: &Value) -> Option<&str> {
     thread
         .get("source")?
@@ -2985,6 +3003,17 @@ fn spawned_parent_thread(thread: &Value) -> Option<&str> {
         .get("thread_spawn")?
         .get("parent_thread_id")?
         .as_str()
+        .filter(|parent| !parent.trim().is_empty())
+}
+
+/// The parent of a subagent thread, from the installed 0.167.1 v2 `Thread`
+/// shape's new top-level `parentThreadId`, which the schema sets only when
+/// the thread is a subagent. Accepted as an additional confirmation path
+/// alongside [`spawned_parent_thread`].
+fn top_level_parent_thread(thread: &Value) -> Option<&str> {
+    thread
+        .get("parentThreadId")
+        .and_then(Value::as_str)
         .filter(|parent| !parent.trim().is_empty())
 }
 
@@ -3284,8 +3313,11 @@ mod tests {
     #[test]
     fn child_threads_confirm_held_frames_and_gap_leftovers() {
         let mut children = ChildThreads::default();
-        // No spawn in flight: an unknown thread is not taken (caller gaps it).
-        assert_eq!(children.take_frame("x"), Ok(false));
+        // No spawn in flight: an unknown thread is still taken and held as
+        // unconfirmed (0.167.1 child frames can precede the spawn window);
+        // the settle below decides it. It never routes to the owned path.
+        assert_eq!(children.take_frame("x"), Ok(true));
+        assert!(children.is_unconfirmed("x"));
 
         children
             .spawn_started("owned", "call-1".to_owned())
@@ -3306,7 +3338,10 @@ mod tests {
             children.spawn_completed("owned", "owned", "call-2", &[]),
             Err("Codex sent frames from a thread no spawn announced")
         );
-        assert_eq!(children.take_frame("child-2"), Ok(false));
+        // The settle cleared it, so a later frame is held as unconfirmed
+        // again rather than routed to the owned path.
+        assert_eq!(children.take_frame("child-2"), Ok(true));
+        assert!(children.is_unconfirmed("child-2"));
         assert!(children.is_parent("owned", "child-1"));
         assert!(!children.is_parent("owned", "child-2"));
     }
@@ -3316,7 +3351,9 @@ mod tests {
         let mut children = ChildThreads::default();
         children.spawn_started("owned", "call".to_owned()).unwrap();
         assert_eq!(children.settle("owned"), Ok(()));
-        assert_eq!(children.take_frame("late"), Ok(false));
+        // Windowless frames are still held as unconfirmed, never owned.
+        assert_eq!(children.take_frame("late"), Ok(true));
+        assert!(children.is_unconfirmed("late"));
 
         children.spawn_started("owned", "call".to_owned()).unwrap();
         assert_eq!(children.take_frame("orphan"), Ok(true));
@@ -5236,7 +5273,7 @@ mod tests {
                 Some("turn-root")
             );
             assert!(processor.children.is_unconfirmed("b"));
-            assert!(!processor.children.has_any_window());
+            assert!(!processor.children.has_pending());
 
             processor
                 .handle_frame(Some(NativeFrame::Notification {
@@ -5322,5 +5359,471 @@ mod tests {
             b_completed,
             "registered child batch must contain B's completion"
         );
+    }
+
+    /// Drives one plausible 0.167.1 frame order for a single native child and
+    /// asserts the child's `turn/started` routes to the child path with no
+    /// parent gap. `order` permutes spawn `item/started` ("s"),
+    /// `item/completed` ("c"), child `thread/started` ("t") and child
+    /// `turn/started` ("u") under the causal constraints T-before-U and
+    /// S-before-C; on 0.167.1 the child frames may precede the spawn window.
+    async fn drive_child_frame_order(order: &[&str]) {
+        use eliot_plugin::RpcRequest;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+
+        let (_native, mut processor, host_io, peer_task) = connected_child_processor("a1").await;
+        processor.status.ready = true;
+        processor.status.thread_id = Some("owned".to_owned());
+        processor.status.active_turn_id = Some("turn-1".to_owned());
+        processor.status.active_command_id = Some("cmd-1".to_owned());
+
+        let spawn_started = json!({
+            "threadId": "owned",
+            "turnId": "turn-1",
+            "item": {
+                "type": "collabAgentToolCall", "id": "call-1", "tool": "spawnAgent",
+                "senderThreadId": "owned", "receiverThreadIds": [],
+                "status": "inProgress", "agentsStates": {},
+            },
+        });
+        let spawn_completed = json!({
+            "threadId": "owned",
+            "turnId": "turn-1",
+            "completedAtMs": 1,
+            "item": {
+                "type": "collabAgentToolCall", "id": "call-1", "tool": "spawnAgent",
+                "senderThreadId": "owned", "receiverThreadIds": ["child-1"],
+                "status": "completed", "agentsStates": {},
+            },
+        });
+        // 0.167.1 confirmation under test: the top-level `parentThreadId`
+        // names the owned thread, with no legacy `source` link at all.
+        let thread_started = json!({"thread": {"id": "child-1", "parentThreadId": "owned"}});
+        let turn_started = json!({"threadId": "child-1", "turn": {"id": "turn-c1"}});
+
+        let fake_host = async {
+            let (host_read, mut host_write) = split(host_io);
+            let mut host_reader = BufReader::new(host_read);
+            let mut requests = Vec::new();
+            let mut last_seq = HashMap::<String, i64>::new();
+            // Exactly one child registration plus four event batches (parent
+            // tool start/complete, child session.ready, child turn.started);
+            // any gap or extra RPC fails the order.
+            for _ in 0..5 {
+                let mut line = String::new();
+                host_reader
+                    .read_line(&mut line)
+                    .await
+                    .expect("read fake-host request");
+                let request: RpcRequest = serde_json::from_str(&line).expect("decode request");
+                requests.push((request.method.clone(), request.params.clone()));
+                let result = match request.method.as_str() {
+                    "child" => {
+                        let registration: eliot_core::ChildRegistration =
+                            serde_json::from_value(request.params["registration"].clone())
+                                .expect("decode child registration");
+                        assert_eq!(registration.native_ref, "child-1");
+                        serde_json::to_value(crate::native_child::tests::test_ack(&registration))
+                            .expect("encode child ACK")
+                    }
+                    "events.put" => {
+                        let agent_id = request.params["agent_id"]
+                            .as_str()
+                            .expect("agent id")
+                            .to_owned();
+                        let count = request.params["events"]
+                            .as_array()
+                            .expect("event batch")
+                            .len() as i64;
+                        let sequence = last_seq.entry(agent_id).or_default();
+                        let first_seq = *sequence + 1;
+                        *sequence = first_seq + count - 1;
+                        json!({
+                            "first_seq": first_seq,
+                            "last_seq": *sequence,
+                            "cursor": Value::Null,
+                        })
+                    }
+                    method => panic!("unexpected fake-host request: {method}"),
+                };
+                let response = json!({"jsonrpc": "2.0", "id": request.id, "result": result});
+                host_write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .expect("send ACK");
+            }
+            requests
+        };
+        let driver = async {
+            for step in order {
+                match *step {
+                    "s" => {
+                        processor
+                            .handle_frame(Some(NativeFrame::Notification {
+                                method: "item/started".to_owned(),
+                                params: spawn_started.clone(),
+                            }))
+                            .await;
+                    }
+                    "c" => {
+                        processor
+                            .handle_frame(Some(NativeFrame::Notification {
+                                method: "item/completed".to_owned(),
+                                params: spawn_completed.clone(),
+                            }))
+                            .await;
+                    }
+                    "t" => {
+                        processor
+                            .handle_frame(Some(NativeFrame::Notification {
+                                method: "thread/started".to_owned(),
+                                params: thread_started.clone(),
+                            }))
+                            .await;
+                    }
+                    "u" => {
+                        assert!(
+                            processor.take_child_frame(&turn_started),
+                            "order {order:?}: child turn/started must route to the child path"
+                        );
+                        processor
+                            .handle_frame(Some(NativeFrame::Notification {
+                                method: "turn/started".to_owned(),
+                                params: turn_started.clone(),
+                            }))
+                            .await;
+                    }
+                    step => panic!("unknown order step: {step}"),
+                }
+            }
+            assert!(
+                !processor.gap_reported,
+                "order {order:?}: no parent gap expected"
+            );
+            assert!(
+                processor.loss_reason.is_none(),
+                "order {order:?}: no deferred loss expected"
+            );
+            assert!(
+                processor.status.failure.is_none(),
+                "order {order:?}: no owned failure expected"
+            );
+            assert!(
+                !processor.status.source_unknown,
+                "order {order:?}: owned source stays known"
+            );
+            assert!(
+                processor.children.is_bound("child-1"),
+                "order {order:?}: child must confirm"
+            );
+            let state = processor
+                .child_states
+                .get("child-1")
+                .expect("order {order:?}: child must register");
+            assert_eq!(
+                state.active_turn_id.as_deref(),
+                Some("turn-c1"),
+                "order {order:?}: child turn must open"
+            );
+        };
+        let (requests, ()) = tokio::join!(fake_host, driver);
+        peer_task.abort();
+
+        assert!(
+            requests.iter().all(|(method, _)| method != "source.gap"),
+            "order {order:?}: no gap RPC expected, saw {requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(method, params)| method == "events.put"
+                    && params["agent_id"] == "a2"
+                    && params["events"].as_array().is_some_and(|events| events
+                        .iter()
+                        .any(|event| event["kind"] == "turn.started"
+                            && event["data"]["turn_id"] == "turn-c1"))),
+            "order {order:?}: child turn.started must commit, saw {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_turn_started_routes_to_child_in_every_plausible_order() {
+        for order in [
+            ["s", "c", "t", "u"],
+            ["s", "t", "c", "u"],
+            ["s", "t", "u", "c"],
+            ["t", "s", "c", "u"],
+            ["t", "s", "u", "c"],
+            ["t", "u", "s", "c"],
+        ] {
+            drive_child_frame_order(&order).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn child_thread_started_accepts_either_parent_link() {
+        use eliot_plugin::RpcRequest;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+
+        for (label, thread) in [
+            (
+                "top-level parentThreadId",
+                json!({"id": "c1", "parentThreadId": "owned"}),
+            ),
+            (
+                "legacy source.subAgent link",
+                json!({"id": "c1", "source": {"subAgent": {"thread_spawn": {
+                    "parent_thread_id": "owned", "depth": 1,
+                }}}}),
+            ),
+        ] {
+            let (_native, mut processor, host_io, peer_task) =
+                connected_child_processor("a1").await;
+            processor.status.thread_id = Some("owned".to_owned());
+            let params = json!({"thread": thread});
+            assert!(
+                processor.take_child_frame(&params),
+                "{label}: thread/started must route to the child path"
+            );
+            let fake_host = async {
+                let (host_read, mut host_write) = split(host_io);
+                let mut host_reader = BufReader::new(host_read);
+                let mut count = 0;
+                for _ in 0..2 {
+                    let mut line = String::new();
+                    host_reader
+                        .read_line(&mut line)
+                        .await
+                        .expect("read fake-host request");
+                    let request: RpcRequest = serde_json::from_str(&line).expect("decode request");
+                    let result = match request.method.as_str() {
+                        "child" => {
+                            let registration: eliot_core::ChildRegistration =
+                                serde_json::from_value(request.params["registration"].clone())
+                                    .expect("decode child registration");
+                            serde_json::to_value(crate::native_child::tests::test_ack(
+                                &registration,
+                            ))
+                            .expect("encode child ACK")
+                        }
+                        "events.put" => json!({
+                            "first_seq": 1, "last_seq": 1, "cursor": Value::Null,
+                        }),
+                        method => panic!("unexpected fake-host request: {method}"),
+                    };
+                    let response = json!({"jsonrpc": "2.0", "id": request.id, "result": result});
+                    host_write
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .expect("send ACK");
+                    count += 1;
+                }
+                count
+            };
+            let driver = async {
+                processor
+                    .handle_frame(Some(NativeFrame::Notification {
+                        method: "thread/started".to_owned(),
+                        params,
+                    }))
+                    .await;
+                assert!(
+                    processor.children.is_bound("c1"),
+                    "{label}: child must confirm"
+                );
+                assert!(
+                    processor.child_states.contains_key("c1"),
+                    "{label}: child must register"
+                );
+                assert!(
+                    !processor.gap_reported && processor.loss_reason.is_none(),
+                    "{label}: no gap expected"
+                );
+            };
+            let (count, ()) = tokio::join!(fake_host, driver);
+            peer_task.abort();
+            assert_eq!(count, 2, "{label}: registration plus session.ready");
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_thread_started_outside_any_window_records_a_gap() {
+        use eliot_plugin::RpcRequest;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+
+        let (_native, mut processor, host_io, peer_task) = connected_child_processor("a1").await;
+        processor.status.thread_id = Some("owned".to_owned());
+        let params = json!({"thread": {"id": "foreign-1", "parentThreadId": "someone-else"}});
+        assert!(
+            processor.take_child_frame(&params),
+            "foreign thread/started still routes to the child path, never owned"
+        );
+        let fake_host = async {
+            let (host_read, mut host_write) = split(host_io);
+            let mut host_reader = BufReader::new(host_read);
+            let mut line = String::new();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("read fake-host gap request");
+            let request: RpcRequest = serde_json::from_str(&line).expect("decode request");
+            assert_eq!(request.method, "source.gap");
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "result": {"gap_id": request.params["gap_id"], "seq": 1},
+            });
+            host_write
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .expect("send gap ACK");
+        };
+        let driver = async {
+            processor
+                .handle_frame(Some(NativeFrame::Notification {
+                    method: "thread/started".to_owned(),
+                    params,
+                }))
+                .await;
+            assert!(processor.gap_reported, "foreign thread must record a gap");
+            assert!(
+                processor
+                    .status
+                    .failure
+                    .as_deref()
+                    .is_some_and(|failure| failure.contains("second thread")),
+                "gap must name the second-thread cause"
+            );
+            assert!(!processor.children.is_bound("foreign-1"));
+            assert!(!processor.child_states.contains_key("foreign-1"));
+        };
+        tokio::join!(fake_host, driver);
+        peer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn foreign_turn_started_outside_any_window_gaps_only_at_settle() {
+        let (_native, mut processor) = child_test_processor().await;
+        processor.status.thread_id = Some("owned".to_owned());
+        processor.status.ready = true;
+        processor.status.active_turn_id = Some("turn-1".to_owned());
+        processor.status.active_command_id = Some("cmd-1".to_owned());
+        let params = json!({"threadId": "foreign-9", "turn": {"id": "turn-x"}});
+        // No window, no parent link, never seen: held as unconfirmed, never
+        // validated as owned, and no gap yet (a later spawn or thread/started
+        // can still adopt it).
+        assert!(processor.take_child_frame(&params));
+        processor
+            .handle_frame(Some(NativeFrame::Notification {
+                method: "turn/started".to_owned(),
+                params: params.clone(),
+            }))
+            .await;
+        assert!(processor.children.is_unconfirmed("foreign-9"));
+        assert_eq!(
+            processor
+                .child_buffers
+                .get("foreign-9")
+                .map(|queue| queue.len()),
+            Some(1)
+        );
+        assert!(!processor.gap_reported);
+        assert!(processor.loss_reason.is_none());
+        assert!(processor.status.failure.is_none());
+        assert!(!processor.status.source_unknown);
+        // No spawn ever announces it: the settle records the source gap.
+        processor.settle_child_tracking();
+        assert!(
+            processor
+                .loss_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no spawn announced")),
+            "settle must gap the unattributable thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_agent_activity_and_new_collab_tools_create_no_gap() {
+        let (_native, mut processor) = child_test_processor().await;
+        processor.status.thread_id = Some("owned".to_owned());
+        processor.status.ready = true;
+        processor.status.active_turn_id = Some("turn-1".to_owned());
+        processor.status.active_command_id = Some("cmd-1".to_owned());
+        // The new 0.167.1 `subAgentActivity` item type is ignored like any
+        // other unsupported item: no tool family fits, so nothing commits
+        // and nothing gaps, on either side of the item lifecycle.
+        for method in ["item/started", "item/completed"] {
+            let mut params = json!({
+                "threadId": "owned",
+                "turnId": "turn-1",
+                "item": {
+                    "type": "subAgentActivity", "id": "sa-1",
+                    "kind": "status", "agentThreadId": "child-1",
+                },
+            });
+            if method == "item/completed" {
+                params["completedAtMs"] = json!(1);
+            }
+            processor
+                .handle_frame(Some(NativeFrame::Notification {
+                    method: method.to_owned(),
+                    params,
+                }))
+                .await;
+        }
+        assert!(!processor.gap_reported);
+        assert!(processor.loss_reason.is_none());
+        assert!(processor.status.failure.is_none());
+        // The new `CollabAgentTool` values ride the existing
+        // `collabAgentToolCall` family, but only `spawnAgent` opens a spawn
+        // window; the rest never create or confirm children.
+        for tool in [
+            "sendMessage",
+            "followupTask",
+            "interruptAgent",
+            "listAgents",
+        ] {
+            let item = json!({
+                "type": "collabAgentToolCall", "id": "call-x", "tool": tool,
+                "senderThreadId": "owned", "receiverThreadIds": [],
+                "status": "inProgress", "agentsStates": {},
+            });
+            assert_eq!(
+                spawn_call(&item),
+                None,
+                "{tool} must not open a spawn window"
+            );
+        }
+        assert!(is_tool_type("collabAgentToolCall"));
+        assert!(!is_tool_type("subAgentActivity"));
+        // A registered child also ignores the new item type without a gap.
+        let registration = build_registration("call-1", "a1", 1, "owned", "codex:test", "child-1");
+        let mut state = ChildState::new(ChildBinding {
+            registration,
+            agent_id: "a2".to_owned(),
+            agent_generation: 1,
+            native_ref: "child-1".to_owned(),
+        });
+        state.ready_committed = true;
+        processor.child_states.insert("child-1".to_owned(), state);
+        processor.children.confirm("owned", "child-1").unwrap();
+        processor
+            .handle_child_notification(
+                "item/completed",
+                json!({
+                    "threadId": "child-1",
+                    "turnId": "turn-c1",
+                    "completedAtMs": 1,
+                    "item": {
+                        "type": "subAgentActivity", "id": "sa-2",
+                        "kind": "status", "agentThreadId": "child-1",
+                    },
+                }),
+            )
+            .await;
+        let state = processor.child_states.get("child-1").expect("child stays");
+        assert!(!state.source_unknown);
+        assert!(state.pending_gap.is_none());
+        assert!(!processor.gap_reported);
     }
 }
