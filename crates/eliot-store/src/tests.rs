@@ -11233,7 +11233,7 @@ fn attention_commit_binds_agent_generation_and_subject_atomically() {
                 id: id.clone(),
                 target: None,
                 selector: None,
-                verb: "emit".to_owned(),
+                verb: "attention.emit".to_owned(),
                 args: json!({"topic": "agent.attention", "data": {"probe": true}}),
                 expected_generation: None,
                 expected_turn_id: None,
@@ -11325,7 +11325,7 @@ fn attention_commit_rejects_stale_evidence_without_a_binding() {
                 id: id.clone(),
                 target: None,
                 selector: None,
-                verb: "emit".to_owned(),
+                verb: "attention.emit".to_owned(),
                 args: json!({"topic": "agent.attention", "data": {"probe": true}}),
                 expected_generation: None,
                 expected_turn_id: None,
@@ -11366,25 +11366,164 @@ fn attention_commit_rejects_stale_evidence_without_a_binding() {
 }
 
 #[test]
+fn public_emit_cannot_use_the_reserved_attention_topic() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_attention_agent(&mut store, "attention-reserved", now);
+    // A public `emit` naming the reserved topic is rejected at admission, so
+    // it can never acquire an authoritative subject binding.
+    let error = store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: Ulid::new().to_string(),
+                target: None,
+                selector: None,
+                verb: "emit".to_owned(),
+                args: json!({"topic": "agent.attention", "data": {"agent_id": agent, "generation": 1}}),
+                expected_generation: None,
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect_err("reserved topic is rejected");
+    assert_eq!(error.code, "invalid");
+    // The internal verb admits only the reserved topic.
+    let error = store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: Ulid::new().to_string(),
+                target: None,
+                selector: None,
+                verb: "attention.emit".to_owned(),
+                args: json!({"topic": "agent.other", "data": {}}),
+                expected_generation: None,
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect_err("internal verb carries only the reserved topic");
+    assert_eq!(error.code, "invalid");
+    // Even a directly admitted public emit can never reach the bound commit:
+    // the bound commit requires the internal verb.
+    let id = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: id.clone(),
+                target: None,
+                selector: None,
+                verb: "emit".to_owned(),
+                args: json!({"topic": "agent.probe", "data": {}}),
+                expected_generation: None,
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit ordinary emit");
+    store.dispatch(&id, now + 1).expect("dispatch emit");
+    let error = store
+        .commit_attention_event_applied(
+            &id,
+            "x.user.agent.attention",
+            json!({"data": {"agent_id": agent, "generation": 1}}),
+            now + 2,
+        )
+        .expect_err("public emit cannot use the bound commit");
+    assert_eq!(error.code, "invalid");
+}
+
+#[test]
 fn startup_lost_agents_returns_bounded_retained_losses() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
     let lost = ready_attention_agent(&mut store, "attention-startup-lost", now);
     store.mark_lost(&lost, 1, now + 1).expect("mark lost");
     let healthy = ready_attention_agent(&mut store, "attention-startup-live", now + 2);
-    let losses = store.startup_lost_agents(8).expect("read startup losses");
+    let losses = store
+        .startup_lost_agents(8, None)
+        .expect("read startup losses");
     assert!(
-        losses
-            .iter()
-            .any(|(agent, generation, seq)| agent == &lost && *generation == 1 && *seq > 0),
+        losses.iter().any(|loss| {
+            loss.agent == lost && loss.generation == 1 && loss.event_seq.is_some_and(|seq| seq > 0)
+        }),
         "retained loss carries its latest agent.lost sequence"
     );
     assert!(
-        losses.iter().all(|(agent, _, _)| agent != &healthy),
+        losses.iter().all(|loss| loss.agent != healthy),
         "live agents are not loss evidence"
     );
     let bounded = store
-        .startup_lost_agents(1)
+        .startup_lost_agents(1, None)
         .expect("bounded startup losses");
     assert_eq!(bounded.len(), 1);
+}
+
+#[test]
+fn startup_lost_agents_pages_beyond_the_first_bound() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let mut lost_agents = Vec::new();
+    for index in 0..5 {
+        let agent =
+            ready_attention_agent(&mut store, &format!("attention-startup-page-{index}"), now);
+        store
+            .mark_lost(&agent, 1, now + 1 + index)
+            .expect("mark lost");
+        lost_agents.push(agent);
+    }
+    let mut drained = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store
+            .startup_lost_agents(2, after)
+            .expect("read startup loss page");
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().map(|loss| (loss.updated_at, loss.agent_num));
+        drained.extend(page.into_iter().map(|loss| loss.agent));
+        assert!(drained.len() <= lost_agents.len() + 2, "pages stay bounded");
+    }
+    for agent in &lost_agents {
+        assert!(
+            drained.iter().any(|drained| drained == agent),
+            "every eligible loss drains through the cursor"
+        );
+    }
+    // Rows without retained evidence are skipped by the caller, never
+    // synthesized: the query surfaces them with no sequence.
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_attention_agent(&mut store, "attention-startup-noseq", now);
+    store.mark_lost(&agent, 1, now + 1).expect("mark lost");
+    let agent_num = eliot_core::parse_agent_id(&agent).expect("valid Agent id");
+    let pruned: i64 = store
+        .connection
+        .query_row(
+            "SELECT seq FROM events WHERE kind = 'agent.lost' AND agent = ?1 AND generation = 1",
+            [agent_num],
+            |row| row.get(0),
+        )
+        .expect("loss event exists");
+    store
+        .connection
+        .execute("DELETE FROM events WHERE seq = ?1", [pruned])
+        .expect("prune loss evidence");
+    let losses = store
+        .startup_lost_agents(8, None)
+        .expect("read pruned losses");
+    assert_eq!(losses.len(), 1);
+    assert_eq!(
+        losses[0].event_seq, None,
+        "missing evidence surfaces as no sequence, never seq 0"
+    );
 }

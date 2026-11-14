@@ -559,8 +559,9 @@ turn changes, mail wakes, manager progress and child fanout do not rearm it. It 
 only after no observed child turn remains open, without recovery mail that would wake
 the manager again. Unknown source health alone never clears open work. This shares
 the existing bounded incident set, reservations and exact-ID delivery retries; no
-per-child incident registry or unbounded report fanout is introduced. Like other
-attention incidents, deduplication is transient across daemon restart.
+per-child incident registry or unbounded report fanout is introduced. Suspicion
+and child-cohort incidents deduplicate transiently across daemon restart; only
+loss-evidence reports reuse durable identity (see below).
 
 Before reporting, capture the Agent generation, active turn, pending requests,
 source owners/health, and model-progress time from Store. Child-cohort reports
@@ -593,16 +594,28 @@ alone does not produce recovery. Superseded-generation incident state retires
 without asserting recovery; any obsolete delivery that cannot be confirmed
 remains explicitly unconfirmed. The bounded transient incident set is in-memory;
 there is no separate status registry. Each incident/phase freezes its report
-and ULID mutation IDs until event and notice delivery settle, so retries reuse
+and mutation IDs until event and notice delivery settle, so retries reuse
 the same facts and command bindings. Inbox/owner notices carry a short bounded
 diagnosis and link to the structured report. Attention does not call a model,
-replay work, or restart a harness.
-At startup attention reconciles one bounded pass of retained loss evidence
-(currently-`lost` Agents with their latest `agent.lost` sequence, most recent
-first, at most 32) through the existing `AgentLost` handling, deduplicated per
-incident; historical lost rows beyond the bound do not become new incidents.
-This covers losses published before attention subscribed as well as a crash
-between the recovery commit and consumer startup.
+replay work, or restart a harness. A public `emit` naming the reserved
+`agent.attention` topic is rejected; only the internal attention producer may
+use the bound commit.
+At startup attention drains retained loss evidence (currently-`lost` Agents
+with their latest `agent.lost` sequence, most recent first) in bounded,
+resumable pages through the existing `AgentLost` handling. Rows whose exact
+`agent.lost` evidence was pruned carry no sequence and are skipped, never
+synthesized. Loss-evidence reports derive their incident id deterministically
+from the loss event sequence and Agent/generation, and their mutation ids
+deterministically from that incident id, phase and the loss event timestamp,
+so a post-restart re-report of the same loss reuses the same ids and the
+existing command/delivery idempotency makes it a no-op without a second
+incident ledger. This covers losses published before attention subscribed as
+well as a crash between the recovery commit and consumer startup.
+Each attention escalation thread wakes its recipient only once per thread
+(recorded durably when the notice is claimed); an unchanged unread incident
+set cannot generate further wakes until new evidence arrives on a new thread.
+Retained pre-fix subject copies (bare attention threads with no bound
+incident event) never wake.
 
 ## Restart reconciliation
 

@@ -347,6 +347,17 @@ impl Store {
             &format!("DELETE FROM messages WHERE delivery_id IN ({PRUNE_MAIL_SELECT})"),
             params![cutoff, MAX_PAGE_ENTRIES as i64],
         ));
+        // A spent attention wake lives only as long as mail on its thread:
+        // once every message on the thread is gone, the bound can go. A new
+        // mail on the same thread (same incident re-mailed) then wakes again.
+        db!(tx.execute(
+            "DELETE FROM attention_wakes WHERE rowid IN (
+                 SELECT w.rowid FROM attention_wakes w
+                 WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.thread = w.thread)
+                 LIMIT 512
+             )",
+            [],
+        ));
         commit_transaction(tx, &self.write_faulted)?;
         Ok(deleted as i64)
     }

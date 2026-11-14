@@ -210,6 +210,18 @@ pub enum ActiveToolCoverage {
     Active { count: usize },
 }
 
+/// One retained loss row for attention startup reconciliation. `event_seq`
+/// is `None` when the exact `agent.lost` evidence was pruned or never
+/// retained; the row must then be skipped, never synthesized.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct StartupLoss {
+    pub agent: String,
+    pub agent_num: i64,
+    pub generation: i64,
+    pub event_seq: Option<i64>,
+    pub updated_at: i64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StoreOpenPhase {
     ConnectionOpened,
@@ -785,24 +797,38 @@ impl Store {
         Ok(agents)
     }
 
-    /// Bounded retained loss evidence for attention startup: currently-`lost`
-    /// Agents with their latest `agent.lost` sequence, most recently updated
-    /// first. One pass only; historical lost rows beyond the bound are not
-    /// promoted to incidents. Callers deduplicate through the existing
+    /// One bounded page of retained loss evidence for attention startup:
+    /// currently-`lost` Agents with their latest `agent.lost` sequence, most
+    /// recently updated first. Callers drain every page through the `after`
+    /// cursor (the last row's `(updated_at, id)`), so eligible evidence is
+    /// never permanently omitted; each step stays bounded. A `None` sequence
+    /// means the exact `agent.lost` evidence was pruned or never retained:
+    /// callers skip that row rather than synthesizing an event identity.
+    /// Callers deduplicate reported incidents through the existing
     /// `AgentLost` handling per incident.
-    pub fn startup_lost_agents(&self, limit: usize) -> Result<Vec<(String, i64, i64)>> {
+    pub fn startup_lost_agents(
+        &self,
+        limit: usize,
+        after: Option<(i64, i64)>,
+    ) -> Result<Vec<StartupLoss>> {
         validate_limit(limit)?;
+        let (updated_at, id) = after.unwrap_or((i64::MAX, i64::MAX));
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, generation FROM agents
+                "SELECT id, generation, updated_at FROM agents
                  WHERE observe_only = 0 AND state = 'lost'
-                 ORDER BY updated_at DESC LIMIT ?1",
+                   AND (updated_at < ?1 OR (updated_at = ?1 AND id < ?2))
+                 ORDER BY updated_at DESC, id DESC LIMIT ?3",
             )
             .map_err(sql_error)?;
         let rows = statement
-            .query_map(params![limit as i64], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            .query_map(params![updated_at, id, limit as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
             })
             .map_err(sql_error)?;
         let mut agents = Vec::new();
@@ -810,7 +836,7 @@ impl Store {
             agents.push(row.map_err(sql_error)?);
         }
         let mut losses = Vec::with_capacity(agents.len());
-        for (num, generation) in agents {
+        for (num, generation, row_updated_at) in agents {
             let seq: Option<i64> = self
                 .connection
                 .query_row(
@@ -822,9 +848,77 @@ impl Store {
                 )
                 .optional()
                 .map_err(sql_error)?;
-            losses.push((format_agent_id(num), generation, seq.unwrap_or(0)));
+            losses.push(StartupLoss {
+                agent: format_agent_id(num),
+                agent_num: num,
+                generation,
+                event_seq: seq,
+                updated_at: row_updated_at,
+            });
         }
+        enforce_page_bytes(&mut losses)?;
         Ok(losses)
+    }
+
+    /// Timestamp of one retained event, for deterministic loss-report
+    /// identity. `None` when the evidence was pruned.
+    pub fn daemon_event_timestamp(&self, seq: i64) -> Result<Option<i64>> {
+        self.connection
+            .query_row(
+                "SELECT ts FROM events WHERE seq = ?1",
+                params![seq],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    /// Whether an attention incident event with this incident id is retained.
+    /// Startup reconciliation uses it to make a post-restart re-report of the
+    /// same loss evidence a no-op without a second incident ledger.
+    pub fn attention_incident_exists(&self, incident_id: &str) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM events
+                     WHERE kind = 'x.user.agent.attention'
+                       AND json_extract(data, '$.data.incident_id') = ?1
+                 )",
+                params![incident_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
+    /// Whether any message (read or unread) on this thread was mailed to this
+    /// recipient. Reconciling a retained incident resends only missing mail.
+    pub fn attention_thread_mailed_to(&self, thread: &str, recipient: &str) -> Result<bool> {
+        let num = parse_agent_id(recipient)?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM messages WHERE thread = ?1 AND recipient = ?2
+                 )",
+                params![thread, num],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
+    /// Whether an owner notice naming this attention incident was committed.
+    /// The notice text names the incident id, which is unique per incident.
+    pub fn attention_owner_notice_exists(&self, incident_id: &str) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM events
+                     WHERE kind = 'x.user.notify'
+                       AND json_extract(data, '$.message') LIKE '%' || ?1 || '%'
+                 )",
+                params![incident_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
     }
 
     /// Return live Agent projections independently of historical-row volume.

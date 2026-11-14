@@ -279,8 +279,14 @@ impl Store {
                 .map_err(sql_error)?;
             let record = load_command_record(&tx, command_id)?
                 .ok_or_else(|| Error::new("not_found", "user-event command was not found"))?;
-            if record.command.verb != "emit" {
-                return Err(Error::new("invalid", "not a local user-event command"));
+            // Only the internal attention producer admits the `attention.emit`
+            // verb, so a public `emit` can never reach this bound commit even
+            // when its topic names the reserved attention topic.
+            if record.command.verb != "attention.emit" {
+                return Err(Error::new(
+                    "invalid",
+                    "not an internal attention user-event command",
+                ));
             }
             if record.target.is_some() || record.command.generation.is_some() {
                 return Err(Error::new(

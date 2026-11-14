@@ -670,7 +670,7 @@ mod tests {
                     target: None,
                     selector: None,
                     verb: "launch".to_owned(),
-                    args: json!({"project":project, "workspace":workspace, "harness":"fake", "profile":"fake", "profile_snapshot":{}}),
+                    args: json!({"project":project, "workspace":workspace, "harness":"codex", "profile":"fake", "profile_snapshot":{}}),
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
@@ -681,6 +681,13 @@ mod tests {
             .expect("admit launch");
         let agent = admission.command.target.expect("launch target");
         store.dispatch(&launch_id, now).expect("dispatch launch");
+        let plan = ["session", "turn", "message"]
+            .into_iter()
+            .map(|family| (family.to_owned(), "stream".to_owned()))
+            .collect();
+        store
+            .install_plugin_sources(&agent, 1, &launch_id, &plan, now)
+            .expect("install plugin sources");
         store
             .put_batch(
                 SourceBatch {
