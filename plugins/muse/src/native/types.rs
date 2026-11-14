@@ -3,7 +3,10 @@
 //! from the installed host's exported stable schema
 //! (`muse schema generate-json-schema`, Muse Code 1.4.0-R4161.1, bundle
 //! fingerprint `sha256:36466f63…0d3d7f`, re-verified for A1, for item
-//! normalization and for the single bounded `item/readOutput` patch fetch).
+//! normalization and for the single bounded `item/readOutput` patch fetch;
+//! re-verified read-only against 1.4.20-R8619.1 on 2026-11-14: every modelled
+//! shape is unchanged or additive-optional, and the 1.4.20 export carries no
+//! bundle fingerprint field).
 //! Only the session-start, session-resume, turn-start, view-event,
 //! stop/close, request/decide/answer, readback, item tool-identity and
 //! stored-patch-reference shapes this path uses are modelled. Unknown fields
@@ -1108,7 +1111,9 @@ pub fn is_approval_mode(value: &str) -> bool {
 /// item. Only the fields the turn-only observer consumes are modelled.
 ///
 /// Installed `WorkflowChild` wire schema (Muse Code 1.4.0, bundle fingerprint
-/// `sha256:36466f63…0d3d7f`, wave3b probe receipt): `attempt`, `childId`,
+/// `sha256:36466f63…0d3d7f`, wave3b probe receipt; re-verified against
+/// 1.4.20-R8619.1, which only adds unmodelled `failureKind`/`failureReason`):
+/// `attempt`, `childId`,
 /// `durationMs`, `label`, `phase`, `resultRef`, `status`, `terminal`, `usage`.
 /// Correlation boundary: keyed strictly by `(childId, attempt)` inside
 /// `Item.children` under `workflowRunId` — no `sessionId` or `turnId` exists
