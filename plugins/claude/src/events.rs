@@ -208,13 +208,14 @@ struct PendingNativeRequest {
 
 /// Canonical outcome for one Claude terminal reason, decided here at the
 /// plugin boundary; the verbatim reason is preserved as `native_status`
-/// next to it. `success` is the only recognized success. `cancelled` and
-/// `interrupted` are interrupts; supported native failures (`error`,
-/// `failed`, `failure` and the `api_error...` family) fail. Anything else
-/// is unknown: an unrecognized reason never defaults to success.
+/// next to it. `success` (2.1.278) and `completed` (live 2.1.321 terminal
+/// frame) are the recognized successes. `cancelled` and `interrupted` are
+/// interrupts; supported native failures (`error`, `failed`, `failure`
+/// and the `api_error...` family) fail. Anything else is unknown: an
+/// unrecognized reason never defaults to success.
 fn claude_outcome(reason: &str) -> &'static str {
     match reason.trim() {
-        "success" => "success",
+        "success" | "completed" => "success",
         "cancelled" | "interrupted" => "interrupted",
         "error" | "failed" | "failure" => "failure",
         reason => {
@@ -3224,6 +3225,7 @@ mod tests {
     #[test]
     fn terminal_reasons_classify_without_defaulting_to_success() {
         assert_eq!(claude_outcome("success"), "success");
+        assert_eq!(claude_outcome("completed"), "success");
         assert_eq!(claude_outcome("cancelled"), "interrupted");
         assert_eq!(claude_outcome("interrupted"), "interrupted");
         for reason in [
@@ -3235,7 +3237,7 @@ mod tests {
         ] {
             assert_eq!(claude_outcome(reason), "failure", "reason={reason}");
         }
-        for reason in ["", "completed", "end_turn", "inProgress", "bogus"] {
+        for reason in ["", "end_turn", "inProgress", "bogus"] {
             assert_eq!(claude_outcome(reason), "unknown", "reason={reason}");
         }
     }
@@ -3255,6 +3257,53 @@ mod tests {
         let (outcome, status) = terminal_outcome_and_status("api_error", &plain);
         assert_eq!(outcome, "failure");
         assert_eq!(status, "api_error");
+    }
+
+    #[test]
+    fn result_terminal_completed_settles_success() {
+        // Live 2.1.321 terminal frame (captured from `claude -p
+        // --input-format stream-json --output-format stream-json --verbose`;
+        // trimmed to the decision-relevant fields plus unknown
+        // forward-compat fields the parser must tolerate). The proven
+        // completion carries `terminal_reason: "completed"`.
+        let record = json!({
+            "type": "result",
+            "subtype": "success",
+            "terminal_reason": "completed",
+            "stop_reason": "end_turn",
+            "is_error": false,
+            "num_turns": 1,
+            "result": "hello",
+            "session_id": "11111111-2222-4333-8444-555555555555",
+            "total_cost_usd": 0.00260901,
+            "usage": {
+                "input_tokens": 2,
+                "output_tokens": 4,
+                "cache_read_input_tokens": 20781,
+                "cache_creation_input_tokens": 11995,
+            },
+            "modelUsage": {},
+            "permission_denials": [],
+            "queued_turn_count": 0,
+            "result_index": 0,
+            "duration_ms": 1442,
+            "duration_api_ms": 1370,
+            "uuid": "6dd2511c-8daf-4c59-ada1-7069ad908df2",
+        });
+        let parsed: ResultRecord =
+            serde_json::from_value(record.clone()).expect("2.1.321 result decodes");
+        assert_eq!(parsed.terminal_reason, "completed");
+        let plain = SecretPolicy::new(Vec::<String>::new());
+        let (outcome, status) = terminal_outcome_and_status(&parsed.terminal_reason, &plain);
+        assert_eq!(outcome, "success");
+        assert_eq!(status, "completed");
+        let usage = result_usage(&record).expect("turn counters map");
+        assert_eq!(usage.input_tokens, Some(2));
+        assert_eq!(usage.output_tokens, Some(4));
+        assert_eq!(usage.cache_read_tokens, Some(20781));
+        assert_eq!(usage.cache_write_tokens, Some(11995));
+        assert_eq!(usage.scope.as_deref(), Some("main_loop_turn"));
+        assert!(result_session_usage(&record).is_some());
     }
 
     #[tokio::test]
