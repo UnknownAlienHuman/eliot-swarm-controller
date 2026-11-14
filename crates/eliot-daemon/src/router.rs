@@ -7279,7 +7279,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         };
         assert!(!faulted);
         router
-            .settle_dispatch_error(&invalid.id, &error, faulted, true)
+            .settle_dispatch_error(&invalid.id, &error, faulted)
             .await;
         let store = router.inner.store.lock().await;
         let rejected = store.get_command(&invalid.id).unwrap().unwrap();
@@ -8820,7 +8820,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 &id,
                 &Error::new("provider_held", "provider scope is held"),
                 false,
-                false,
             )
             .await;
 
@@ -9431,7 +9430,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         };
 
         router
-            .settle_dispatch_error(&resume_id, &dispatch_error, false, false)
+            .settle_dispatch_error(&resume_id, &dispatch_error, false)
             .await;
 
         let store = router.inner.store.lock().await;
@@ -9884,7 +9883,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(dispatch_error.code, "not_allowed");
         assert!(!write_faulted);
         router
-            .settle_dispatch_error(&resume_id, &dispatch_error, write_faulted, false)
+            .settle_dispatch_error(&resume_id, &dispatch_error, write_faulted)
             .await;
 
         let mut store = router.inner.store.lock().await;
@@ -10355,7 +10354,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .await;
             let dispatch_error = Error::new("internal", "injected Store dispatch failure");
             router
-                .settle_dispatch_error(id, &dispatch_error, true, false)
+                .settle_dispatch_error(id, &dispatch_error, true)
                 .await;
             let command: Command = serde_json::from_value(
                 router
@@ -10387,7 +10386,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .await;
         let dispatch_error = Error::new("internal", "injected Store dispatch failure");
         router
-            .settle_dispatch_error(&dispatched_id, &dispatch_error, true, false)
+            .settle_dispatch_error(&dispatched_id, &dispatch_error, true)
             .await;
         let persisted = router
             .inner

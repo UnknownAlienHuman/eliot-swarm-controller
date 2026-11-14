@@ -248,6 +248,8 @@ pub(crate) struct AttachArgs {
     pub(crate) profile: String,
     #[arg(long, value_name = "HARNESS")]
     pub(crate) harness: String,
+    /// Canonical native scope from `discover` (`native_scope`), not a
+    /// subject source label. A scope outside the proven store is refused.
     #[arg(long, value_name = "SCOPE")]
     pub(crate) scope: String,
     #[arg(long = "ref", value_name = "REF")]
