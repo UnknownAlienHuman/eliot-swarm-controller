@@ -193,6 +193,7 @@ pub(crate) async fn wait_for_daemon_ready(
     json_output: bool,
 ) -> Result<u8, Failure> {
     let deadline = Instant::now() + STARTUP_WAIT;
+    let mut last_probe: Option<String>;
     loop {
         if let Some(failure) = eliot_daemon::daemon_failure_since(data_dir, start_ms) {
             return Err(startup_failure(failure, data_dir, log_path));
@@ -206,28 +207,48 @@ pub(crate) async fn wait_for_daemon_ready(
             ),
         )
         .await;
-        if let Ok(Ok(_)) = status {
-            let boot_id = read_daemon_boot_id(data_dir);
-            if json_output {
-                print_value(
-                    &json!({
-                        "state": "ready",
-                        "data_dir": data_dir.to_string_lossy(),
-                        "boot_id": boot_id.unwrap_or_default(),
-                        "log": log_path.to_string_lossy(),
-                    }),
-                    true,
-                );
-            } else if let Some(boot_id) = boot_id {
-                println!(
-                    "daemon ready; data_dir: {}; boot_id: {}",
-                    data_dir.display(),
-                    boot_id
-                );
-            } else {
-                println!("daemon ready; data_dir: {}", data_dir.display());
+        match status {
+            Ok(Ok(_)) => {
+                let boot_id = read_daemon_boot_id(data_dir);
+                if json_output {
+                    print_value(
+                        &json!({
+                            "state": "ready",
+                            "data_dir": data_dir.to_string_lossy(),
+                            "boot_id": boot_id.unwrap_or_default(),
+                            "log": log_path.to_string_lossy(),
+                        }),
+                        true,
+                    );
+                } else if let Some(boot_id) = boot_id {
+                    println!(
+                        "daemon ready; data_dir: {}; boot_id: {}",
+                        data_dir.display(),
+                        boot_id
+                    );
+                } else {
+                    println!("daemon ready; data_dir: {}", data_dir.display());
+                }
+                return Ok(0);
             }
-            return Ok(0);
+            Ok(Err(error)) if probe_rejection_is_final(&error.code) => {
+                return Err(probe_rejection(
+                    &error.code,
+                    &error.message,
+                    data_dir,
+                    log_path,
+                    agent_credentials_inherited(),
+                ));
+            }
+            Ok(Err(error)) => {
+                last_probe = Some(probe_summary(&error.code, &error.message));
+            }
+            Err(_) => {
+                last_probe = Some(format!(
+                    "probe timed out after {}s",
+                    STARTUP_RPC_TIMEOUT.as_secs()
+                ));
+            }
         }
         if Instant::now() >= deadline {
             break;
@@ -240,14 +261,84 @@ pub(crate) async fn wait_for_daemon_ready(
     if let Some(failure) = eliot_daemon::daemon_failure_since(data_dir, start_ms) {
         return Err(startup_failure(failure, data_dir, log_path));
     }
-    Err(Failure::new(
-        1,
-        format!(
-            "daemon did not become ready within 30s; data_dir: {}; diagnostics: {}",
-            data_dir.display(),
-            log_path.display()
-        ),
-    ))
+    Err(readiness_timeout(data_dir, log_path, last_probe.as_deref()))
+}
+
+/// Probe rejections that waiting cannot resolve. `daemon.status` requires an
+/// Owner caller, so an agent-credentialed or malformed probe is rejected
+/// deterministically: retrying it for the full startup window only floods the
+/// daemon log and ends in the same misleading timeout.
+fn probe_rejection_is_final(code: &str) -> bool {
+    matches!(
+        code,
+        "not_allowed" | "stale_generation" | "invalid" | "unsupported"
+    )
+}
+
+/// Whether this process inherited a managed Agent identity. Such calls can
+/// never satisfy the Owner-only readiness probe, no matter how long the wait.
+fn agent_credentials_inherited() -> bool {
+    std::env::var_os("ELIOT_AGENT_ID").is_some()
+        || std::env::var_os("ELIOT_AGENT_GENERATION").is_some()
+        || std::env::var_os("ELIOT_AGENT_TOKEN").is_some()
+}
+
+/// Bounded one-line summary of a readiness probe for timeout diagnostics.
+fn probe_summary(code: &str, message: &str) -> String {
+    const LIMIT: usize = 200;
+    let mut summary = format!("{code}: {}", message.replace('\n', " "));
+    if summary.len() > LIMIT {
+        let mut end = LIMIT;
+        while !summary.is_char_boundary(end) {
+            end -= 1;
+        }
+        summary.truncate(end);
+    }
+    summary
+}
+
+fn probe_rejection(
+    code: &str,
+    message: &str,
+    data_dir: &Path,
+    log_path: &Path,
+    agent_hint: bool,
+) -> Failure {
+    let mut text = format!(
+        "daemon rejected the readiness probe: {}; data_dir: {}; diagnostics: {}",
+        probe_summary(code, message),
+        data_dir.display(),
+        log_path.display()
+    );
+    if let Some(phase) = eliot_daemon::last_daemon_phase(data_dir) {
+        text.push_str("; daemon log phase: ");
+        text.push_str(&phase);
+    }
+    if agent_hint {
+        text.push_str(
+            "; daemon.status requires an Owner caller: unset ELIOT_AGENT_ID, ELIOT_AGENT_GENERATION and ELIOT_AGENT_TOKEN",
+        );
+    }
+    let mut failure = Failure::new(1, text);
+    failure.code = Some(code.to_owned());
+    failure
+}
+
+fn readiness_timeout(data_dir: &Path, log_path: &Path, last_probe: Option<&str>) -> Failure {
+    let mut text = format!(
+        "daemon did not become ready within 30s; data_dir: {}; diagnostics: {}",
+        data_dir.display(),
+        log_path.display()
+    );
+    if let Some(phase) = eliot_daemon::last_daemon_phase(data_dir) {
+        text.push_str("; daemon log phase: ");
+        text.push_str(&phase);
+    }
+    if let Some(probe) = last_probe {
+        text.push_str("; last probe: ");
+        text.push_str(probe);
+    }
+    Failure::new(1, text)
 }
 
 pub(crate) fn read_daemon_boot_id(data_dir: &Path) -> Option<String> {
@@ -297,4 +388,111 @@ pub(crate) async fn shutdown_daemon(
         .validate_response(&response)
         .map_err(|_| Failure::new(4, "daemon.shutdown response is invalid"))?;
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn missing_dir(name: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("eliot readiness probe {name}"));
+        (root.join("data"), root.join("logs").join("daemon.log"))
+    }
+
+    #[test]
+    fn deterministic_probe_rejections_end_the_wait() {
+        for code in ["not_allowed", "stale_generation", "invalid", "unsupported"] {
+            assert!(probe_rejection_is_final(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn transient_probe_failures_keep_polling() {
+        for code in [
+            "unavailable",
+            "unknown",
+            "busy",
+            "platform_io",
+            "data_dir_unavailable",
+            "internal",
+            "not_found",
+        ] {
+            assert!(!probe_rejection_is_final(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn probe_summary_stays_single_line_and_bounded() {
+        let summary = probe_summary("stale_generation", "line one\nline two");
+        assert!(!summary.contains('\n'), "{summary}");
+        let long = "x".repeat(500);
+        let summary = probe_summary("unavailable", &long);
+        assert!(summary.len() <= 200, "{summary}");
+        assert!(summary.starts_with("unavailable: "), "{summary}");
+    }
+
+    #[test]
+    fn probe_rejection_names_code_and_owner_hint() {
+        let (data_dir, log_path) = missing_dir("rejection");
+        let failure = probe_rejection(
+            "stale_generation",
+            "Agent generation has no live plugin owner",
+            &data_dir,
+            &log_path,
+            true,
+        );
+        assert_eq!(failure.exit_code, 1);
+        assert_eq!(failure.code.as_deref(), Some("stale_generation"));
+        assert!(
+            failure.message.starts_with(
+                "daemon rejected the readiness probe: stale_generation: Agent generation has no live plugin owner"
+            ),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("unset ELIOT_AGENT_ID"),
+            "{}",
+            failure.message
+        );
+        let without_hint = probe_rejection(
+            "not_allowed",
+            "owner credential is invalid",
+            &data_dir,
+            &log_path,
+            false,
+        );
+        assert!(
+            !without_hint.message.contains("unset ELIOT_AGENT_ID"),
+            "{}",
+            without_hint.message
+        );
+    }
+
+    #[test]
+    fn readiness_timeout_keeps_legacy_prefix_and_reports_last_probe() {
+        let (data_dir, log_path) = missing_dir("timeout");
+        let bare = readiness_timeout(&data_dir, &log_path, None);
+        assert_eq!(bare.exit_code, 1);
+        assert!(
+            bare.message
+                .starts_with("daemon did not become ready within 30s;"),
+            "{}",
+            bare.message
+        );
+        assert!(!bare.message.contains("last probe"), "{}", bare.message);
+        let with_probe = readiness_timeout(
+            &data_dir,
+            &log_path,
+            Some("unavailable: daemon is not running"),
+        );
+        assert!(
+            with_probe
+                .message
+                .contains("last probe: unavailable: daemon is not running"),
+            "{}",
+            with_probe.message
+        );
+    }
 }

@@ -834,7 +834,16 @@ async fn serve_connection_with_write_timeout(
                             }
                         }
                         Err(error) => {
-                            logging::record(&policy, "rpc.error", &[], Some(&error));
+                            // The method names the calling convention behind a
+                            // rejection burst (for example a readiness wait
+                            // polling the wrong identity), so a flood stays
+                            // attributable without hiding the error itself.
+                            logging::record(
+                                &policy,
+                                "rpc.error",
+                                &[("method", request.method.as_str())],
+                                Some(&error),
+                            );
                             RpcResponse {
                                 jsonrpc: "2.0".to_owned(),
                                 id: request.id,
@@ -1177,9 +1186,21 @@ pub fn daemon_failure_since(data_dir: &Path, since_ms: u128) -> Option<DaemonSta
         .rfind(|failure| failure.ts_ms >= since_ms)
 }
 
-fn read_log_failures(data_dir: &Path) -> Vec<DaemonStartupFailure> {
-    // Only the resolved private data dir is ever read. An unvalidated or
-    // missing root yields no records rather than an error with paths.
+/// Newest `daemon.*` startup phase marker in the bounded log tail, if any. A
+/// readiness timeout names the phase that stalled; a phase of `daemon.ready`
+/// with failing probes means the daemon is up but rejecting the caller.
+pub fn last_daemon_phase(data_dir: &Path) -> Option<String> {
+    read_log_tail(data_dir).into_iter().rev().find_map(|value| {
+        let code = value.get("code")?.as_str()?;
+        code.starts_with("daemon.")
+            .then(|| code.chars().take(64).collect())
+    })
+}
+
+/// Bounded parsed records from the private daemon log tail, oldest first.
+/// Only the resolved private data dir is ever read. An unvalidated or
+/// missing root yields no records rather than an error with paths.
+fn read_log_tail(data_dir: &Path) -> Vec<Value> {
     if DataDir::open_existing(data_dir).is_err() {
         return Vec::new();
     }
@@ -1209,17 +1230,23 @@ fn read_log_failures(data_dir: &Path) -> Vec<DaemonStartupFailure> {
     } else {
         0
     };
-    let mut failures = Vec::new();
     let tail: Vec<&str> = text[start..].lines().rev().take(LOG_TAIL_RECORDS).collect();
+    let mut records = Vec::new();
     for line in tail.into_iter().rev() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let value: Value = match serde_json::from_str(line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            records.push(value);
+        }
+    }
+    records
+}
+
+fn read_log_failures(data_dir: &Path) -> Vec<DaemonStartupFailure> {
+    let mut failures = Vec::new();
+    for value in read_log_tail(data_dir) {
         if value.get("code").and_then(Value::as_str) != Some("daemon.failed") {
             continue;
         }
@@ -1714,5 +1741,39 @@ mod tests {
         }))
         .expect("failure JSON");
         assert!(!serialized.contains(secret));
+    }
+
+    #[test]
+    fn last_daemon_phase_names_the_newest_startup_marker() {
+        let root = std::env::temp_dir().join(format!("eliot daemon phase {}", Ulid::new()));
+        std::fs::create_dir_all(&root).expect("test root");
+        struct Guard(std::path::PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(root.clone());
+        assert!(
+            last_daemon_phase(&root).is_none(),
+            "no log tail before initialization"
+        );
+        let data = DataDir::open(&root).expect("private test data dir");
+        let logs = data.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        std::fs::write(
+            logs.join("daemon.log"),
+            "{\"ts\": 1, \"code\": \"daemon.starting\"}\n{\"ts\": 2, \"code\": \"daemon.recovered\"}\n{\"ts\": 3, \"code\": \"rpc.error\", \"error_code\": \"stale_generation\"}\n",
+        )
+        .expect("write test log");
+        assert_eq!(
+            last_daemon_phase(data.path()).as_deref(),
+            Some("daemon.recovered"),
+            "non-daemon codes never mask the phase"
+        );
+        assert!(
+            last_daemon_phase(&root.join("missing")).is_none(),
+            "missing roots yield no phase"
+        );
     }
 }
