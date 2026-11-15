@@ -241,11 +241,25 @@ facts, not a native history poll. Loss means an explicit gap. Do not
 replay conversation history or infer success from silence/process exit;
 drain buffered stdout first. Unknown input/result is not retried.
 
-## Project MCP consumption
+## Session MCP servers (managed Agents)
 
-A managed Antigravity workspace discovers Eliot Swarm via its native project plugin path:
-`.agents/plugins/eliot-swarm/plugin.json` and `mcp_config.json`. The configuration declares
-a stdio MCP server invoking `swarm --data-dir <PATH> mcp`.
+Every managed ACP session carries the Agent-scoped swarm MCP server on the
+documented session-setup surface: `session/new` — and `session/load` with
+the exact retained session id on resume — sends
+`mcpServers: [{name, command, args, env}]` with one stdio entry,
+`eliot-swarm`, invoking the current Eliot executable as
+`<exe> --data-dir <Agent-bound root> mcp --require-agent`. The entry shape
+follows the official ACP v1 schema (`schema/v1/schema.json`: stdio entries
+carry name, command (absolute path), args and env, all required, and every
+Agent MUST support stdio). `env` stays empty by design: the stdio child
+inherits the ACP server's environment, which already carries the
+Agent-bound `ELIOT_AGENT_*` identity the daemon injected, so no token
+crosses the session params. Identity is per Agent and per run — a start
+without the matching inherited Agent generation identity fails
+`not_allowed` before any native I/O, never falling back to Owner auth —
+and no owner-global config is written. This is the same server command and
+identity injection the Codex route override and the Claude MCP config file
+use, delivered through this harness's own native MCP configuration.
 
 Antigravity invokes the server over stdio via `call_mcp_tool`. The server exposes exactly one
 generic tool, `swarm`, accepting `{ method, params }`. The stdio child inherits caller identity
@@ -254,6 +268,31 @@ which [`eliot_daemon::client_call`](../../crates/eliot-daemon/src/daemon.rs) val
 running daemon. Partial, conflicting, or revoked managed identity fails closed; an unmanaged
 owner caller uses the existing owner credential path. Administrative methods (such as `daemon.status`)
 are rejected with `not_allowed` for managed Agent callers.
+
+Wake and claim notices sent to an Antigravity Agent name the tool it
+actually has (`use the swarm tool (mail.inbox)` / `use the swarm tool
+(who)`) instead of the `swarm` shell CLI other harnesses still rely on.
+
+Readback: ACP exposes no MCP inventory on any checked surface
+(`session/new` / `session/load` results carry no server list;
+`session/update` carries message and tool-call deltas only), so the
+effective readback stays `mcp_servers: null, mcp_servers_verified: false`
+at readiness instead of echoing the requested entry. Proof that the Agent
+reaches swarm is behavioral. Live 2026-11-15 with installed `agy` 1.5.9
+(`gemini-3.8-flash-high`, served as base `gemini-3.8-flash` plus
+`thought_level high`): one Agent received owner mail, read it
+(`mail.inbox`) and acked it (`mail.ack`) through 15 native
+`mcp_eliot-swarm_swarm` tool calls with no shell-CLI fallback, and stored
+the reply (`42`) via `var.set` (`set_by agent:a1:1`, read back by the
+owner). An agent-to-owner `mail.send` is rejected by design (`to` takes
+Agent ids only), which surfaced as one failed tool call, never as an
+inventory record.
+
+## Project MCP consumption (manual)
+
+An unmanaged Antigravity workspace can also discover Eliot Swarm via its native project plugin path:
+`.agents/plugins/eliot-swarm/plugin.json` and `mcp_config.json`. The configuration declares
+a stdio MCP server invoking `swarm --data-dir <PATH> mcp`.
 
 Mutations require caller-supplied ULIDs in `params`; the server adds no auto-generated identifiers,
 automatic retries, defaults, or speculative rollbacks. Output frames and stdio line writes are
