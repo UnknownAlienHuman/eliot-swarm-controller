@@ -47,10 +47,11 @@ use eliot_core::{
         MaintenanceRunRequest, MaintenanceRunResponse, NotifyDefinitionArgs, ObservationPage,
         ObservationQuery, ObservationView, OwnedProcessKind, OwnedProcessSummary,
         ProcessPageCursor, ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest,
-        RuleGetRequest, RuleStateView, RunningTurnSummary, ShutdownMode, SourceState,
-        StatusBlocker, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView,
-        TurnGetRequest, UnsettledCommandSummary, UsageScopeView, UsageSummaryRequest,
-        WaitEntryResult, WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
+        RetainedUnknownSummary, RetentionView, RuleGetRequest, RuleStateView, RunningTurnSummary,
+        ShutdownMode, SourceState, StatusBlocker, SwarmWaitRequest, SwarmWaitResponse,
+        TimerGetRequest, TimerStateView, TurnGetRequest, UnsettledCommandSummary, UsageScopeView,
+        UsageSummaryRequest, WaitEntryResult, WorkerTaskHealth, WorkerTaskStatus,
+        WorkspaceCustodyView,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -84,6 +85,11 @@ const EVENT_RESPONSE_ENTRIES_MAX_BYTES: usize =
     EVENT_RESPONSE_MAX_BYTES - EVENT_RESPONSE_WRAPPER_RESERVE_BYTES;
 const LIVE_WAIT_MAX_MS: u64 = 30_000;
 const STATUS_BLOCKER_MAX: usize = 64;
+/// Durable unknown-candidate scan bound for retained classification: the
+/// Store page limit (and ceiling) for stored-unknown ids examined per
+/// drain computation. Ids beyond the page keep blocking; they are never
+/// silently excused.
+const RETAINED_SCAN_MAX: usize = 1000;
 const RUN_WORKER_FORCE_GRACE: Duration = Duration::from_secs(15);
 
 type StoreHandle = Arc<AsyncMutex<eliot_store::Store>>;
@@ -4044,6 +4050,7 @@ impl Router {
     async fn status(&self) -> Result<Value> {
         let blockers = self.status_blockers().await?;
         let drain = self.drain_report().await?;
+        let retention = Some(self.retention_view().await?);
         let mode = self.mode_name();
         let (agent_count, write_faulted, unsettled_commands, unsettled_total) = {
             let store = self.inner.store.lock().await;
@@ -4104,8 +4111,155 @@ impl Router {
             unsettled_commands_truncated,
             blockers,
             drain: Some(drain),
+            retention,
         })
         .map_err(|_| Error::new("internal", "daemon status could not be encoded"))
+    }
+
+    /// Retention and store-size visibility for `daemon.status`: the configured
+    /// windows (or unbounded when all are unset), the retained-event
+    /// watermark, the main+WAL file sizes, and the unbounded-growth advisory.
+    /// A config load failure falls back to defaults so status stays available
+    /// as the diagnostic surface; the hourly tick logs the rejection
+    /// separately.
+    async fn retention_view(&self) -> Result<RetentionView> {
+        let retention = crate::config::load_daemon_config(&self.inner.data_root)
+            .map(|config| config.retention)
+            .unwrap_or_default();
+        let pruned_through = {
+            let store = self.inner.store.lock().await;
+            store.retention_watermark()?
+        };
+        let (db_bytes, wal_bytes) = crate::maintenance::store_file_sizes(&self.inner.data_root);
+        let unbounded = retention.events_days.is_none()
+            && retention.commands_days.is_none()
+            && retention.mail_days.is_none();
+        let size_advisory = if unbounded
+            && db_bytes.saturating_add(wal_bytes)
+                > crate::config::RETENTION_UNBOUNDED_SIZE_ADVISORY_BYTES
+        {
+            Some("retention is unbounded and the store exceeds 100 MiB; set daemon.retention windows (see configuration.md)".to_owned())
+        } else {
+            None
+        };
+        Ok(RetentionView {
+            events_days: retention.events_days,
+            commands_days: retention.commands_days,
+            mail_days: retention.mail_days,
+            pruned_through,
+            db_bytes,
+            wal_bytes,
+            unbounded,
+            size_advisory,
+        })
+    }
+
+    /// Retained unknowns that no longer block drain: stored `unknown`
+    /// commands with no live process, turn or reader behind them. An open
+    /// source row counts as a reader only while its generation is the
+    /// agent's current live generation; rows on fenced or terminal
+    /// generations are residue. Candidates come from the in-memory unknown
+    /// cache plus a bounded page of stored unknowns, so unknowns the daemon
+    /// never saw dispatched (for example across a restart, where the cache
+    /// starts empty) are still classified. Every other candidate keeps
+    /// blocking, including stored dispatched work with an uncertain
+    /// persistence outcome and any id beyond the durable page. The stored
+    /// outcome stays unknown; only the drain wait is retired, and the drain
+    /// receipt names each one with its resolvability and owner action.
+    async fn retained_unresolved_unknowns(&self) -> Result<Vec<RetainedUnknownSummary>> {
+        let mut candidates: HashSet<String> = self.unknown_ids().into_iter().collect();
+        let (paged, _total) = {
+            let store = self.inner.store.lock().await;
+            store.list_unknown_command_ids_page(RETAINED_SCAN_MAX)?
+        };
+        candidates.extend(paged);
+        let mut candidate_ids: Vec<String> = candidates.into_iter().collect();
+        candidate_ids.sort();
+        let mut retained = Vec::new();
+        for id in candidate_ids {
+            if let Some(summary) = self.retained_unknown(&id).await {
+                retained.push(summary);
+            }
+        }
+        retained.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(retained)
+    }
+
+    async fn retained_unknown(&self, id: &str) -> Option<RetainedUnknownSummary> {
+        let (command, agent, liveness) = {
+            let store = self.inner.store.lock().await;
+            let command = store.get_command(id).ok().flatten()?;
+            if command.state != CommandState::Unknown {
+                return None;
+            }
+            let target = command.target.clone()?;
+            let generation = command.generation?;
+            let agent = store.get_agent(&target).ok().flatten()?;
+            let liveness = store.generation_liveness(&target, generation).ok()?;
+            (command, agent, liveness)
+        };
+        let target = command.target.clone()?;
+        let generation = command.generation?;
+        if liveness.live_process {
+            return None;
+        }
+        // An open source row only evidences a live reader while its
+        // generation is the agent's current live generation. Rows on a fenced
+        // or terminal generation are residue: no new reader can bind them,
+        // and the Host tracks genuinely live readers itself.
+        let terminal = matches!(
+            agent.state,
+            AgentState::Stopped | AgentState::Failed | AgentState::Lost
+        );
+        if !terminal && agent.generation == generation && liveness.open_source {
+            return None;
+        }
+        if self
+            .inner
+            .plugin_host
+            .observes_generation(&target, generation)
+        {
+            return None;
+        }
+        if command.turn_id.is_some() && agent.active_turn == command.turn_id {
+            return None;
+        }
+        if agent.generation == generation && agent.active_turn.is_some() {
+            return None;
+        }
+        let mut reason = command
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.get("reason"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .filter(|reason| !reason.trim().is_empty())
+            .or_else(|| {
+                self.unknown_cause(id)
+                    .filter(|cause| !cause.trim().is_empty())
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
+        if reason.len() > 128 {
+            reason.truncate(128);
+            while !reason.is_char_boundary(reason.len()) {
+                reason.pop();
+            }
+        }
+        let resolvable = !agent.observe_only;
+        let hint = if resolvable {
+            "owner-resolvable with cmd resolve (command) or turn resolve (turn); retained for the record; use --force only for live work".to_owned()
+        } else {
+            "not owner-resolvable (observe-only commands cannot be resolved); retained for the record, no action needed; use --force only for live work".to_owned()
+        };
+        Some(RetainedUnknownSummary {
+            id: id.to_owned(),
+            verb: command.verb.clone(),
+            agent: command.target.clone(),
+            generation: command.generation,
+            reason,
+            resolvable,
+            hint,
+        })
     }
 
     /// Bounded read-side drain report reusing the existing shutdown blockers'
@@ -4117,7 +4271,11 @@ impl Router {
     /// flag that is true whenever any qualifying record was omitted for any
     /// reason: the list bound or the Store page byte bound trimming the page.
     /// Unknown stays unknown: an empty report never proves no native effect
-    /// occurred.
+    /// occurred. Stored unknowns with no live process, turn or reader are
+    /// listed under `retained_unresolved` with their resolvability and owner
+    /// action instead of blocking: the drain wait is retired, never the
+    /// outcome. The unsettled section excludes those same ids so the receipt
+    /// never double-lists them; its count covers the filtered list.
     async fn drain_report(&self) -> Result<DrainReport> {
         self.clear_terminal_unknown_cache().await;
         let (agents, agents_total, unsettled_commands, unsettled_total, custody) = {
@@ -4158,10 +4316,19 @@ impl Router {
         });
         running_turns.truncate(STATUS_BLOCKER_MAX);
         let running_turns_count = running_turns.len();
-        let unsettled_commands_truncated = unsettled_commands.len() < unsettled_total;
-        let unsettled_commands_count = unsettled_commands.len();
+        let mut retained_unresolved: Vec<RetainedUnknownSummary> =
+            self.retained_unresolved_unknowns().await?;
+        let retained_ids: HashSet<String> = retained_unresolved
+            .iter()
+            .map(|summary| summary.id.clone())
+            .collect();
+        // The unsettled section mirrors the blockers: retained entries move
+        // to `retained_unresolved` instead of double-listing here. The count
+        // covers the filtered list and the flag stays true whenever the store
+        // total exceeds it for any reason, including that move.
         let unsettled_details = unsettled_commands
             .iter()
+            .filter(|command| !retained_ids.contains(&command.id))
             .map(|command| UnsettledCommandSummary {
                 id: command.id.clone(),
                 agent: command.target.clone(),
@@ -4170,6 +4337,8 @@ impl Router {
                 state: command.state,
             })
             .collect::<Vec<_>>();
+        let unsettled_commands_count = unsettled_details.len();
+        let unsettled_commands_truncated = unsettled_details.len() < unsettled_total;
         let mut unknown_commands = self.unknown_ids();
         let unknown_commands_count = unknown_commands.len();
         let unknown_commands_truncated = unknown_commands.len() > STATUS_BLOCKER_MAX;
@@ -4196,6 +4365,9 @@ impl Router {
         let owned_processes_truncated = owned_processes.len() < live_total;
         owned_processes.truncate(STATUS_BLOCKER_MAX);
         let owned_processes_count = owned_processes.len();
+        let retained_unresolved_count = retained_unresolved.len();
+        let retained_unresolved_truncated = retained_unresolved.len() > STATUS_BLOCKER_MAX;
+        retained_unresolved.truncate(STATUS_BLOCKER_MAX);
         Ok(DrainReport {
             running_turns_count,
             running_turns,
@@ -4209,6 +4381,9 @@ impl Router {
             owned_processes_count,
             owned_processes,
             owned_processes_truncated,
+            retained_unresolved_count,
+            retained_unresolved,
+            retained_unresolved_truncated,
         })
     }
 
@@ -4264,8 +4439,20 @@ impl Router {
                 active_turn: agent.active_turn.clone(),
             });
         }
+        // Retained unknowns retire the drain wait everywhere: they are
+        // excluded from the unsettled blockers below and from the unknown
+        // blockers after that, and the drain receipt lists them instead.
+        let retained_ids: HashSet<String> = self
+            .retained_unresolved_unknowns()
+            .await?
+            .into_iter()
+            .map(|summary| summary.id)
+            .collect();
         let mut unsettled_ids = HashSet::new();
         for command in unsettled_commands {
+            if retained_ids.contains(&command.id) {
+                continue;
+            }
             unsettled_ids.insert(command.id.clone());
             blockers.push(StatusBlocker::CommandUnsettled {
                 command_id: command.id,
@@ -4275,18 +4462,22 @@ impl Router {
         if write_faulted {
             blockers.push(StatusBlocker::StoreWriteFaulted);
         }
-        let unknown_ids = self.unknown_ids();
-        for id in unknown_ids.iter().take(STATUS_BLOCKER_MAX) {
-            if unsettled_ids.contains(id) {
-                continue;
-            }
+        // Filter retained and already-unsettled ids before the list bound and
+        // the overflow calculation, so retained entries can neither occupy a
+        // blocker slot nor trip the overflow counter.
+        let blocking_unknown: Vec<String> = self
+            .unknown_ids()
+            .into_iter()
+            .filter(|id| !retained_ids.contains(id) && !unsettled_ids.contains(id))
+            .collect();
+        for id in blocking_unknown.iter().take(STATUS_BLOCKER_MAX) {
             blockers.push(StatusBlocker::CommandUnknown {
                 command_id: id.clone(),
             });
         }
-        if unknown_ids.len() > STATUS_BLOCKER_MAX {
+        if blocking_unknown.len() > STATUS_BLOCKER_MAX {
             blockers.push(StatusBlocker::CommandUnknownMore {
-                count: unknown_ids.len() - STATUS_BLOCKER_MAX,
+                count: blocking_unknown.len() - STATUS_BLOCKER_MAX,
             });
         }
         Ok(blockers)
@@ -8345,6 +8536,431 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             CommandState::Dispatched
         );
         assert!(router.unknown_ids().contains(&unsettled_id));
+    }
+
+    #[tokio::test]
+    async fn drain_completes_with_retained_observer_unknown_listed() {
+        let router = router();
+        let now = now_ms();
+        // Reproduce the detach-fence race: attach then immediately detach the
+        // same native subject. The fence marks the dispatched attach unknown
+        // with `observer_detach_fence`, and no owner resolution can retire
+        // it (observe-only commands are refused by design).
+        let (agent, attach_id, detach_id) = {
+            let mut store = router.inner.store.lock().await;
+            let admitted = store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: ulid::Ulid::new().to_string(),
+                        target: None,
+                        selector: None,
+                        verb: "attach".to_owned(),
+                        args: json!({"mode":"observe","profile":"fixture","harness":"codex",
+                            "native_scope":"fixture:scope","native_ref":"fixture-native",
+                            "profile_snapshot":{"harness":"codex"}}),
+                        expected_generation: None,
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now,
+                )
+                .unwrap();
+            let agent = admitted.command.target.unwrap();
+            let attach_id = admitted.command.id.clone();
+            store.dispatch(&attach_id, now).unwrap();
+            let detach_id = ulid::Ulid::new().to_string();
+            store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: detach_id.clone(),
+                        target: Some(agent.clone()),
+                        selector: None,
+                        verb: "detach".to_owned(),
+                        args: json!({"mode":"observe"}),
+                        expected_generation: Some(1),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now + 1,
+                )
+                .unwrap();
+            store.dispatch(&detach_id, now + 1).unwrap();
+            assert_eq!(
+                store.get_command(&attach_id).unwrap().unwrap().state,
+                CommandState::Unknown
+            );
+            // Confirmed plugin cleanup closes the retired observation source;
+            // the detach transition itself stays live until it settles.
+            store
+                .close_native_sources(&agent, 1, now + 1)
+                .expect("close retired observation");
+            (agent, attach_id, detach_id)
+        };
+        router
+            .note_unknown_if_uncertain(&attach_id, "observer_detach_fence")
+            .await;
+        // The detach transition itself still blocks drain while dispatched:
+        // live work keeps `--force` as its only escape.
+        let blocked = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked["state"], json!("dispatched"));
+        assert!(
+            blocked["blockers"]
+                .as_array()
+                .expect("blockers")
+                .iter()
+                .any(|blocker| blocker["kind"] == json!("command_unsettled")
+                    && blocker["command_id"] == json!(detach_id))
+        );
+        // Reader teardown confirms the detach; the attach stays unknown.
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .settle_observe_detach(
+                    &detach_id,
+                    json!({"agent_id":agent,"generation":2,"command_id":detach_id,
+                        "native_scope":"fixture:scope","native_ref":"fixture-native",
+                        "state":"detached","observation_state":"unknown"}),
+                    now + 2,
+                )
+                .unwrap();
+            assert_eq!(
+                store.get_command(&attach_id).unwrap().unwrap().state,
+                CommandState::Unknown
+            );
+        }
+        let drained = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(drained["state"], json!("applied"));
+        assert_eq!(drained["blockers"], json!([]));
+        let drain = drained["drain"].as_object().expect("drain report");
+        let retained = drain["retained_unresolved"]
+            .as_array()
+            .expect("retained unknowns");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0]["id"], json!(attach_id));
+        assert_eq!(retained[0]["verb"], json!("attach"));
+        assert_eq!(retained[0]["agent"], json!(agent));
+        assert_eq!(retained[0]["generation"], json!(1));
+        assert_eq!(retained[0]["reason"], json!("observer_detach_fence"));
+        assert_eq!(retained[0]["resolvable"], json!(false));
+        assert_eq!(drain["retained_unresolved_count"], json!(1));
+        assert_eq!(drain["retained_unresolved_truncated"], json!(false));
+        // Unknown stays unknown: drain retires the wait, never the outcome.
+        let store = router.inner.store.lock().await;
+        assert_eq!(
+            store.get_command(&attach_id).unwrap().unwrap().state,
+            CommandState::Unknown
+        );
+        // Status carries the same receipt plus the retention view.
+        drop(store);
+        let status = router.status().await.unwrap();
+        assert_eq!(status["blockers"], json!([]));
+        assert_eq!(
+            status["drain"]["retained_unresolved"][0]["id"],
+            json!(attach_id)
+        );
+        let retention = status["retention"].as_object().expect("retention view");
+        assert_eq!(retention["unbounded"], json!(true));
+        assert_eq!(retention["db_bytes"], json!(0));
+        assert_eq!(retention["wal_bytes"], json!(0));
+        assert_eq!(retention["size_advisory"], Value::Null);
+    }
+
+    /// Drive the observer detach-fence race at the Store level: attach, then
+    /// detach the same subject before the reader can settle it. Returns
+    /// `(agent, attach_id, detach_id)` with the attach stored `unknown`
+    /// under `observer_detach_fence`. Callers model reader teardown with
+    /// [`close_and_settle_observer_detach`]; without it the live detach
+    /// transition still blocks drain.
+    fn fenced_observer_attach(
+        store: &mut eliot_store::Store,
+        scope: &str,
+        native_ref: &str,
+        now: i64,
+    ) -> (String, String, String) {
+        let admitted = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: ulid::Ulid::new().to_string(),
+                    target: None,
+                    selector: None,
+                    verb: "attach".to_owned(),
+                    args: json!({"mode":"observe","profile":"fixture","harness":"codex",
+                        "native_scope":scope,"native_ref":native_ref,
+                        "profile_snapshot":{"harness":"codex"}}),
+                    expected_generation: None,
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .expect("admit observer attach");
+        let agent = admitted.command.target.expect("attach target");
+        let attach_id = admitted.command.id.clone();
+        store.dispatch(&attach_id, now).expect("dispatch attach");
+        let detach_id = ulid::Ulid::new().to_string();
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: detach_id.clone(),
+                    target: Some(agent.clone()),
+                    selector: None,
+                    verb: "detach".to_owned(),
+                    args: json!({"mode":"observe"}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now + 1,
+            )
+            .expect("admit observer detach");
+        store
+            .dispatch(&detach_id, now + 1)
+            .expect("dispatch detach");
+        assert_eq!(
+            store.get_command(&attach_id).unwrap().unwrap().state,
+            CommandState::Unknown
+        );
+        (agent, attach_id, detach_id)
+    }
+
+    /// Model confirmed reader teardown for a fenced observer generation:
+    /// close the retired observation source, then settle the detach with the
+    /// exact reader-close readback the production path commits. The fenced
+    /// attach stays stored `unknown`.
+    fn close_and_settle_observer_detach(
+        store: &mut eliot_store::Store,
+        agent: &str,
+        detach_id: &str,
+        scope: &str,
+        native_ref: &str,
+        now: i64,
+    ) {
+        store
+            .close_native_sources(agent, 1, now)
+            .expect("close retired observation");
+        store
+            .settle_observe_detach(
+                detach_id,
+                json!({"agent_id":agent,"generation":2,"command_id":detach_id,
+                    "native_scope":scope,"native_ref":native_ref,
+                    "state":"detached","observation_state":"unknown"}),
+                now + 1,
+            )
+            .expect("settle observer detach");
+    }
+
+    #[tokio::test]
+    async fn drain_completes_with_retained_controlled_unknown_and_reconciles_unsettled() {
+        let router = router();
+        let now = now_ms();
+        // A controlled launch goes dispatched, then a restart marks it
+        // unknown and fences its generation as lost: no live process, turn
+        // or reader backs it, and no owner resolution short of the receipt
+        // can retire it.
+        let launch_id = {
+            let mut store = router.inner.store.lock().await;
+            let admitted = store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: ulid::Ulid::new().to_string(),
+                        target: None,
+                        selector: None,
+                        verb: "launch".to_owned(),
+                        args: json!({"project":"retained-controlled","workspace":"synthetic-workspace",
+                            "harness":"codex","profile":"fake","profile_snapshot":{}}),
+                        expected_generation: Some(0),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now,
+                )
+                .expect("admit launch");
+            let agent = admitted.command.target.expect("launch target");
+            let launch_id = admitted.command.id.clone();
+            store.dispatch(&launch_id, now).expect("dispatch launch");
+            store.recover_on_restart(now + 1).expect("restart recovery");
+            assert_eq!(
+                store.get_command(&launch_id).unwrap().unwrap().state,
+                CommandState::Unknown
+            );
+            assert_eq!(
+                store.get_agent(&agent).unwrap().unwrap().state,
+                AgentState::Lost
+            );
+            launch_id
+        };
+        let drained = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(drained["state"], json!("applied"));
+        assert_eq!(drained["blockers"], json!([]));
+        let drain = drained["drain"].as_object().expect("drain report");
+        // The retained id leaves the unsettled section and its count: the
+        // receipt names it once, under retained-unresolved.
+        let unsettled = drain["unsettled_commands"]
+            .as_array()
+            .expect("unsettled commands");
+        assert!(
+            !unsettled
+                .iter()
+                .any(|command| command["id"] == json!(launch_id))
+        );
+        assert_eq!(drain["unsettled_commands_count"], json!(unsettled.len()));
+        let retained = drain["retained_unresolved"]
+            .as_array()
+            .expect("retained unknowns");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0]["id"], json!(launch_id));
+        assert_eq!(retained[0]["verb"], json!("launch"));
+        assert_eq!(retained[0]["resolvable"], json!(true));
+        assert_eq!(retained[0]["reason"], json!("daemon_restart"));
+        // Unknown stays unknown: drain retires the wait, never the outcome.
+        let store = router.inner.store.lock().await;
+        assert_eq!(
+            store.get_command(&launch_id).unwrap().unwrap().state,
+            CommandState::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_unknowns_survive_restart_without_memory_cache() {
+        let root = std::env::temp_dir().join(format!("eliot-drain-restart-{}", ulid::Ulid::new()));
+        std::fs::create_dir(&root).unwrap();
+        let db = root.join("state.sqlite");
+        let (agent, attach_id) = {
+            let mut store = eliot_store::Store::open(&db).unwrap();
+            let (agent, attach_id, detach_id) =
+                fenced_observer_attach(&mut store, "restart-scope", "restart-native", now_ms());
+            close_and_settle_observer_detach(
+                &mut store,
+                &agent,
+                &detach_id,
+                "restart-scope",
+                "restart-native",
+                now_ms(),
+            );
+            assert_eq!(
+                store.get_command(&attach_id).unwrap().unwrap().state,
+                CommandState::Unknown
+            );
+            (agent, attach_id)
+        };
+        // Restart: a fresh Router over the same file with an empty unknown
+        // cache must still classify the durable unknown from the Store page.
+        let store = eliot_store::Store::open(&db).unwrap();
+        let router = Router::new(
+            root.join("reopened"),
+            "owner-credential".to_owned(),
+            Arc::new(AsyncMutex::new(store)),
+            Bus::new(16),
+        );
+        assert!(router.unknown_ids().is_empty());
+        let drained = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(drained["state"], json!("applied"));
+        assert_eq!(drained["blockers"], json!([]));
+        let drain = drained["drain"].as_object().expect("drain report");
+        let retained = drain["retained_unresolved"]
+            .as_array()
+            .expect("retained unknowns");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0]["id"], json!(attach_id));
+        assert_eq!(retained[0]["agent"], json!(agent));
+        assert_eq!(retained[0]["resolvable"], json!(false));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn drain_completes_with_more_retained_unknowns_than_overflow_limit() {
+        let router = router();
+        let now = now_ms();
+        let mut attach_ids = Vec::new();
+        {
+            let mut store = router.inner.store.lock().await;
+            for i in 0..(STATUS_BLOCKER_MAX + 1) {
+                let scope = format!("overflow-scope-{i}");
+                let native_ref = format!("overflow-native-{i}");
+                let (agent, attach_id, detach_id) =
+                    fenced_observer_attach(&mut store, &scope, &native_ref, now);
+                close_and_settle_observer_detach(
+                    &mut store,
+                    &agent,
+                    &detach_id,
+                    &scope,
+                    &native_ref,
+                    now + 2,
+                );
+                attach_ids.push(attach_id);
+            }
+        }
+        // Populate the memory cache the way command.unknown events would in
+        // production: pre-fix code turns these 65 into 64 blockers plus a
+        // permanent overflow blocker.
+        for attach_id in &attach_ids {
+            router
+                .note_unknown_if_uncertain(attach_id, "observer_detach_fence")
+                .await;
+        }
+        assert_eq!(router.unknown_ids().len(), STATUS_BLOCKER_MAX + 1);
+        let drained = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(drained["state"], json!("applied"));
+        assert_eq!(drained["blockers"], json!([]));
+        let drain = drained["drain"].as_object().expect("drain report");
+        // The unknowns are still reported honestly as unknown; they just no
+        // longer block, and the overflow counter never fires for them.
+        assert_eq!(
+            drain["unknown_commands_count"],
+            json!(STATUS_BLOCKER_MAX + 1)
+        );
+        assert_eq!(
+            drain["retained_unresolved_count"],
+            json!(STATUS_BLOCKER_MAX + 1)
+        );
+        assert_eq!(
+            drain["retained_unresolved"]
+                .as_array()
+                .expect("retained unknowns")
+                .len(),
+            STATUS_BLOCKER_MAX
+        );
+        assert_eq!(drain["retained_unresolved_truncated"], json!(true));
     }
 
     #[tokio::test]

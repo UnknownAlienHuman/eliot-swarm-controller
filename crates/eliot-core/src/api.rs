@@ -34,8 +34,9 @@ pub use agent_views::{
     AgentSummary, CloudMcpCustody, CloudMcpHealth, CloudMcpStatus, DaemonStatusRequest,
     DaemonStatusResponse, DrainReport, GitCredentialHelper, OwnedProcessKind, OwnedProcessSummary,
     PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectGitView, ProjectRegistrationView,
-    RunningTurnSummary, SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary,
-    WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
+    RetainedUnknownSummary, RetentionView, RunningTurnSummary, SourceOwner, SourceState,
+    StatusBlocker, UnsettledCommandSummary, WorkerTaskHealth, WorkerTaskStatus,
+    WorkspaceCustodyView,
 };
 pub use config_views::{
     CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,

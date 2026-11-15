@@ -69,7 +69,50 @@ pub(crate) async fn run(
         })
         .await
         .ok();
+        // Unbounded-growth visibility, at most one line per hourly pass:
+        // while every retention window is unset and the store passes the
+        // documented size, say so. Retention semantics never change here;
+        // the exact sizes stay in `daemon.status`.
+        if unbounded_store_over_threshold(
+            &config.retention,
+            &data_root,
+            config::RETENTION_UNBOUNDED_SIZE_ADVISORY_BYTES,
+        ) {
+            logging::record(&policy, "daemon.retention_unbounded_store_large", &[], None);
+        }
     }
+}
+
+/// True when every retention window is unset and the main+WAL store files
+/// pass `threshold_bytes`. Missing files read as zero bytes. Retention
+/// semantics never change here: this only decides whether the unbounded
+/// advisory is due.
+pub(crate) fn unbounded_store_over_threshold(
+    retention: &config::RetentionConfig,
+    data_root: &Path,
+    threshold_bytes: u64,
+) -> bool {
+    if retention.events_days.is_some()
+        || retention.commands_days.is_some()
+        || retention.mail_days.is_some()
+    {
+        return false;
+    }
+    let (db_bytes, wal_bytes) = store_file_sizes(data_root);
+    db_bytes.saturating_add(wal_bytes) > threshold_bytes
+}
+
+/// Main+WAL store file sizes for status and retention visibility. Missing
+/// files read as zero bytes; sizes are informational and never gate reads.
+pub(crate) fn store_file_sizes(data_root: &Path) -> (u64, u64) {
+    let db_path = data_root.join("eliot.db");
+    let db_bytes = std::fs::metadata(&db_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let wal_bytes = std::fs::metadata(db_path.with_extension("db-wal"))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    (db_bytes, wal_bytes)
 }
 
 /// Owner-triggered pass (`maintenance.run`): reload the daemon retention
@@ -278,6 +321,33 @@ mod tests {
             commands_days: Some(30),
             mail_days: None,
         }
+    }
+
+    #[test]
+    fn unbounded_store_advisory_fires_only_without_windows_over_size() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-retention-advisory-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let unbounded = config::RetentionConfig {
+            events_days: None,
+            commands_days: None,
+            mail_days: None,
+        };
+        // Missing files read as zero: no advisory on an empty data dir.
+        assert!(!unbounded_store_over_threshold(&unbounded, &root, 8));
+        assert_eq!(store_file_sizes(&root), (0, 0));
+        std::fs::write(root.join("eliot.db"), vec![0u8; 9]).unwrap();
+        assert!(unbounded_store_over_threshold(&unbounded, &root, 8));
+        assert_eq!(store_file_sizes(&root), (9, 0));
+        std::fs::write(root.join("eliot.db-wal"), vec![0u8; 9]).unwrap();
+        assert_eq!(store_file_sizes(&root), (9, 9));
+        // Any configured window disables the advisory, however large the store.
+        assert!(!unbounded_store_over_threshold(
+            &commands_retention(),
+            &root,
+            8
+        ));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]

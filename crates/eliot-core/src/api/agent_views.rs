@@ -643,6 +643,10 @@ impl DaemonStatusRequest {
                 .drain
                 .as_ref()
                 .is_some_and(|drain| drain.validate().is_err())
+            || reply
+                .retention
+                .as_ref()
+                .is_some_and(|retention| retention.validate().is_err())
             || reply.workspace_custody.scope != "current_host"
             || reply
                 .cloud_mcp
@@ -1045,6 +1049,47 @@ impl OwnedProcessSummary {
     }
 }
 
+/// One retained unknown command that no longer blocks drain. The stored
+/// outcome stays `unknown`: only the drain wait is retired, because no live
+/// process, turn or reader backs it. `reason` is the bounded stored outcome
+/// reason (for example `observer_detach_fence`); `resolvable` reports
+/// whether `cmd resolve` can retire it (false for observe-only commands,
+/// which the Store refuses by design); `hint` is the bounded owner action.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedUnknownSummary {
+    #[serde(deserialize_with = "required_text")]
+    pub id: String,
+    #[serde(deserialize_with = "required_text")]
+    pub verb: String,
+    #[serde(deserialize_with = "nullable")]
+    pub agent: Option<String>,
+    pub generation: Option<i64>,
+    #[serde(deserialize_with = "required_text")]
+    pub reason: String,
+    pub resolvable: bool,
+    #[serde(deserialize_with = "required_text")]
+    pub hint: String,
+}
+
+impl RetainedUnknownSummary {
+    pub fn validate(&self) -> Result<()> {
+        text(&self.id)?;
+        text(&self.verb)?;
+        if let Some(agent) = &self.agent {
+            text(agent)?;
+        }
+        generation(self.generation)?;
+        if self.reason.trim().is_empty() || self.reason.len() > 128 {
+            return Err(invalid_response());
+        }
+        if self.hint.trim().is_empty() || self.hint.len() > 256 {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
+}
+
 /// Bounded drain report reusing the existing shutdown blockers. Every
 /// category carries a count, a bounded list and a truncation flag: the count
 /// is the number returned in this snapshot (or the exact in-memory total for
@@ -1052,7 +1097,9 @@ impl OwnedProcessSummary {
 /// omitted for any reason (the list bound or the Store byte bound trimming
 /// the page). Unknown stays unknown: an empty report never proves no native
 /// effect occurred, and the daemon never auto-resolves unknown to finish
-/// drain.
+/// drain. Retained unknowns with no live process, turn or reader are listed
+/// under `retained_unresolved` instead of blocking: the receipt names each
+/// one with its resolvability and owner action.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DrainReport {
@@ -1071,6 +1118,10 @@ pub struct DrainReport {
     #[serde(deserialize_with = "objects")]
     pub owned_processes: Vec<OwnedProcessSummary>,
     pub owned_processes_truncated: bool,
+    pub retained_unresolved_count: usize,
+    #[serde(deserialize_with = "objects")]
+    pub retained_unresolved: Vec<RetainedUnknownSummary>,
+    pub retained_unresolved_truncated: bool,
 }
 
 impl DrainReport {
@@ -1088,6 +1139,9 @@ impl DrainReport {
             owned_processes_count: 0,
             owned_processes: Vec::new(),
             owned_processes_truncated: false,
+            retained_unresolved_count: 0,
+            retained_unresolved: Vec::new(),
+            retained_unresolved_truncated: false,
         }
     }
 
@@ -1116,6 +1170,12 @@ impl DrainReport {
         {
             return Err(invalid_response());
         }
+        if self.retained_unresolved_count < self.retained_unresolved.len()
+            || (!self.retained_unresolved_truncated
+                && self.retained_unresolved_count != self.retained_unresolved.len())
+        {
+            return Err(invalid_response());
+        }
         if self
             .running_turns
             .iter()
@@ -1129,6 +1189,10 @@ impl DrainReport {
                 .owned_processes
                 .iter()
                 .any(|process| process.validate().is_err())
+            || self
+                .retained_unresolved
+                .iter()
+                .any(|unknown| unknown.validate().is_err())
         {
             return Err(invalid_response());
         }
@@ -1204,6 +1268,54 @@ impl CloudMcpStatus {
     }
 }
 
+/// Retention and store-size visibility for `daemon.status`. The windows are
+/// the configured `daemon.retention` day counts; `None` is an unset window
+/// that disables pruning for that side, and `unbounded` is true only when
+/// all three are unset (a default daemon never prunes). `db_bytes` and
+/// `wal_bytes` are the `eliot.db` main and WAL file sizes;
+/// `pruned_through` is the retained-event watermark. `size_advisory` is
+/// present only when retention is unbounded and the combined size passes the
+/// documented threshold (see `configuration.md` daemon retention).
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionView {
+    pub events_days: Option<i64>,
+    pub commands_days: Option<i64>,
+    pub mail_days: Option<i64>,
+    pub pruned_through: i64,
+    pub db_bytes: u64,
+    pub wal_bytes: u64,
+    pub unbounded: bool,
+    #[serde(deserialize_with = "nullable")]
+    pub size_advisory: Option<String>,
+}
+
+impl RetentionView {
+    pub fn validate(&self) -> Result<()> {
+        for window in [self.events_days, self.commands_days, self.mail_days] {
+            if window.is_some_and(|days| days <= 0) {
+                return Err(invalid_response());
+            }
+        }
+        if self.pruned_through < 0 {
+            return Err(invalid_response());
+        }
+        if self.unbounded
+            != (self.events_days.is_none()
+                && self.commands_days.is_none()
+                && self.mail_days.is_none())
+        {
+            return Err(invalid_response());
+        }
+        if let Some(advisory) = &self.size_advisory
+            && (!self.unbounded || advisory.trim().is_empty() || advisory.len() > 512)
+        {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonStatusResponse {
@@ -1233,6 +1345,8 @@ pub struct DaemonStatusResponse {
     pub blockers: Vec<StatusBlocker>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain: Option<DrainReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionView>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2412,7 +2526,12 @@ mod tests {
             "unknown_commands_count":1,"unknown_commands":["c1"],"unknown_commands_truncated":false,
             "owned_processes_count":1,
             "owned_processes":[{"agent":"a1","generation":0,"kind":"plugin"}],
-            "owned_processes_truncated":false
+            "owned_processes_truncated":false,
+            "retained_unresolved_count":1,
+            "retained_unresolved":[{"id":"c1","verb":"attach","agent":"a1","generation":1,
+                "reason":"observer_detach_fence","resolvable":false,
+                "hint":"not owner-resolvable (observe-only commands cannot be resolved); retained for the record, no action needed; use --force only for live work"}],
+            "retained_unresolved_truncated":false
         });
         let reply: DaemonStatusResponse = serde_json::from_value(with_drain.clone()).unwrap();
         request.validate_response(&reply).unwrap();
@@ -2446,6 +2565,111 @@ mod tests {
         assert!(report.validate().is_err());
         report.running_turns_count = 2;
         report.validate().unwrap();
+    }
+
+    fn retained_unknown() -> RetainedUnknownSummary {
+        RetainedUnknownSummary {
+            id: "c1".to_owned(),
+            verb: "attach".to_owned(),
+            agent: Some("a1".to_owned()),
+            generation: Some(1),
+            reason: "observer_detach_fence".to_owned(),
+            resolvable: false,
+            hint: "not owner-resolvable; retained for the record".to_owned(),
+        }
+    }
+
+    #[test]
+    fn drain_report_retained_unknowns_validate_shape_and_counts() {
+        let mut report = DrainReport::empty();
+        report.retained_unresolved_count = 1;
+        assert!(report.validate().is_err());
+        report.retained_unresolved.push(retained_unknown());
+        report.validate().unwrap();
+        for mut bad in [
+            retained_unknown(),
+            retained_unknown(),
+            retained_unknown(),
+            retained_unknown(),
+        ] {
+            bad.id = " ".to_owned();
+            assert!(bad.validate().is_err());
+            bad = retained_unknown();
+            bad.reason = " ".to_owned();
+            assert!(bad.validate().is_err());
+            bad = retained_unknown();
+            bad.hint = "x".repeat(257);
+            assert!(bad.validate().is_err());
+            bad = retained_unknown();
+            bad.generation = Some(-1);
+            assert!(bad.validate().is_err());
+        }
+        let wire = serde_json::to_value(&report).unwrap();
+        let back: DrainReport = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(back, report);
+        assert_eq!(serde_json::to_value(back).unwrap(), wire);
+    }
+
+    fn retention_view() -> RetentionView {
+        RetentionView {
+            events_days: None,
+            commands_days: None,
+            mail_days: None,
+            pruned_through: 7,
+            db_bytes: 1024,
+            wal_bytes: 0,
+            unbounded: true,
+            size_advisory: None,
+        }
+    }
+
+    #[test]
+    fn retention_view_validates_windows_and_advisory() {
+        retention_view().validate().unwrap();
+        let mut bounded = retention_view();
+        bounded.events_days = Some(30);
+        bounded.unbounded = false;
+        bounded.validate().unwrap();
+        for mut bad in [
+            retention_view(),
+            retention_view(),
+            retention_view(),
+            retention_view(),
+            retention_view(),
+        ] {
+            bad.events_days = Some(0);
+            bad.unbounded = false;
+            assert!(bad.validate().is_err());
+            bad = retention_view();
+            bad.unbounded = false;
+            assert!(bad.validate().is_err());
+            bad = retention_view();
+            bad.pruned_through = -1;
+            assert!(bad.validate().is_err());
+            bad = retention_view();
+            bad.size_advisory = Some("growing".to_owned());
+            assert!(bad.validate().is_ok());
+            bad = retention_view();
+            bad.events_days = Some(30);
+            bad.size_advisory = Some("growing".to_owned());
+            assert!(bad.validate().is_err());
+        }
+        let wire = serde_json::to_value(retention_view()).unwrap();
+        let back: RetentionView = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(back, retention_view());
+        // Retention stays optional for backward compatibility: an older
+        // reply without it still validates.
+        let request = DaemonStatusRequest::default();
+        let mut reply: DaemonStatusResponse = serde_json::from_value(status()).unwrap();
+        request.validate_response(&reply).unwrap();
+        reply.retention = Some(retention_view());
+        request.validate_response(&reply).unwrap();
+        let mut bad = reply.clone();
+        bad.retention = Some(RetentionView {
+            unbounded: false,
+            ..retention_view()
+        });
+        assert!(request.validate_response(&bad).is_err());
     }
 
     #[test]

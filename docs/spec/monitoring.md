@@ -661,3 +661,12 @@ marker; turn-backed usage carries `"turn"`. The fallback is fleet
 visibility, never turn expenditure: per-turn accounting stays on
 `usage.summary`, whose `turns_without_usage` and per-counter coverage name
 exactly what the native stream did not supply.
+
+`daemon.status` also exposes retention and drain honesty in one place. The
+retention view reports the `eliot.db` main and WAL sizes, the configured
+windows (or `unbounded` when all are unset) and `pruned_through`; a bounded
+`size_advisory` appears while an unbounded store passes 100 MiB, and the
+hourly maintenance tick logs one line for the same condition. The drain
+report lists stored unknowns with no live process, turn or reader as
+retained-unresolved — with resolvability and owner action — instead of
+blocking on them; the stored outcome stays `unknown`.

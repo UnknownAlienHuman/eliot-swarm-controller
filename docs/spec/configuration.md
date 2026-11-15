@@ -403,6 +403,17 @@ that margin regardless of `mail_days`, so a removed delivery admitted with a
 skew-bounded write id reads `history_gap` on its own mailbox's read paths;
 a retried ack over it succeeds as already acked.
 
+Retention is visible without changing its semantics. `daemon.status` reports
+a retention view: the `eliot.db` main and WAL file sizes in bytes, the three
+configured windows (`null` is unset, i.e. unbounded for that side), and the
+retained-event watermark `pruned_through`. `unbounded` is true only when all
+three windows are unset — the default daemon never prunes. When retention is
+unbounded and the combined store size passes 100 MiB, the view carries a
+bounded `size_advisory` telling the owner to set `daemon.retention` windows;
+the hourly maintenance tick logs one `daemon.retention_unbounded_store_large`
+line for the same condition. The sizes are informational and never gate reads;
+changing retention windows is out of scope for this advisory.
+
 The automatic attention no-progress suspicion window is optional:
 
 ```toml

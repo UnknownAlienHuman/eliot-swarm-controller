@@ -358,6 +358,17 @@ The rule worker propagates its actual exit reason from its admission-closed
 return sites: an intentional admission/shutdown exit surfaces as `stopped`,
 while any other `Ok(())` surfaces as `failed` (`worker_exited`).
 
+`daemon.status` also reports the retention view: the `eliot.db` main and WAL
+file sizes in bytes, the configured `daemon.retention` windows (`null` is an
+unset window that disables pruning for that side), and the retained-event
+watermark `pruned_through`. `unbounded` is true only when all three windows
+are unset — the default daemon never prunes. When retention is unbounded and
+the combined store size passes the documented threshold, the view carries a
+bounded `size_advisory` naming the remedy; the hourly maintenance tick logs
+one line for the same condition. See
+[configuration](configuration.md) for the windows and the
+threshold, and [monitoring](monitoring.md#views) for the advisory.
+
 `maintenance.run` is owner-only and accepts an empty object. It reloads the
 daemon retention settings and runs the same bounded retention epochs as the
 hourly tick (same row and time budgets, same drain rule), returning the Core
@@ -808,7 +819,9 @@ assertion establishes process closure. A resolution never releases a
 retained reservation is released only by custody closure (restart recovery).
 Known failure can include partial effects; it never implies rollback or automatic retry.
 Observe-only Agents have no resolvable commands or turns; resolving any of
-theirs is refused with `not_allowed`.
+theirs is refused with `not_allowed`. Such unknowns still stop blocking
+drain once no live process, turn or reader backs them: the drain receipt
+lists them as retained-unresolved instead (see the drain section).
 
 `command.resolve {id, command_id, as: applied|failed, reason}` requires the target
 command to be stored `unknown`; dispatched, queued, accepted, and terminal
@@ -1312,11 +1325,30 @@ reply, the fallback still dispatches force and returns `store_write_faulted:true
 the dispatched state; that fallback is not a retained write result. When present,
 `store_write_faulted` is true.
 
+A stored `unknown` command with no live process, turn or reader behind its
+generation is retained-unresolved: it is excluded from the blockers and listed
+in the `drain` report under `retained_unresolved` instead, with its verb,
+Agent, generation, stored outcome reason, resolvability and owner action.
+An open source row counts as a reader only while its generation is the
+agent's current live generation; rows on fenced or terminal generations are
+residue. Retained ids are excluded from the receipt's unsettled section and
+its count as well, so the receipt never double-lists them.
+`resolvable` is false for observe-only commands, which `cmd resolve` refuses
+by design; those entries need no action and stay retained as the honest
+record (retention keeps sets containing `unknown` work). A `true` entry
+names an owner-resolvable command the owner may still retire with
+`cmd resolve` (or its turn with `turn resolve`). Either way the stored
+outcome stays `unknown`: drain retires the wait, never the outcome.
+Unresolved dispatched/queued/accepted commands, live turns, live owned
+processes and live readers still block; `--force` stays their only escape.
+
 `daemon.status` carries the same bounded `drain` report; while draining it is the
 current blockers snapshot, while open it reflects the current fleet.
 `swarm daemon stop --drain` prints the retained `DaemonShutdownResponse` including
 `blockers` and `drain`; `swarm status` prints the typed `DaemonStatusResponse`
-including `blockers`, `unsettled_commands`, `unknown_commands` and `drain`.
+including `blockers`, `unsettled_commands`, `unknown_commands`, `drain` and
+the retention view (store sizes, configured windows or unbounded,
+`pruned_through`, and the unbounded-growth advisory when due).
 
 Drain rejects new turn-producing work and new automation, while continuing pre-admitted
 work and allowing exact stop/interrupt/request replies/cancel/detach/readback. Unknown

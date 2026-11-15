@@ -1827,3 +1827,77 @@ fn turn_readback_command_finds_the_latest_bound_send() {
         None
     );
 }
+
+#[test]
+fn generation_liveness_tracks_observer_reader_across_detach_fence() {
+    let mut store = store();
+    let now = now_ms();
+    let (agent, attach_id) = attach_observer(&mut store, now);
+    // A dispatched attach opens the observation source: still backed.
+    let live = store
+        .generation_liveness(&agent, 1)
+        .expect("liveness of open observation");
+    assert!(live.open_source);
+    assert!(!live.live_process);
+    // The detach fence marks the attach unknown. The source row stays open
+    // while the reader tears down, so the fenced generation stays backed.
+    let detach_id = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: detach_id.clone(),
+                target: Some(agent.clone()),
+                selector: None,
+                verb: "detach".to_owned(),
+                args: json!({"mode":"observe"}),
+                expected_generation: Some(1),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now + 1,
+        )
+        .expect("admit detach");
+    store
+        .dispatch(&detach_id, now + 1)
+        .expect("dispatch detach");
+    assert_eq!(
+        store.get_command(&attach_id).unwrap().unwrap().state,
+        CommandState::Unknown
+    );
+    let tearing_down = store
+        .generation_liveness(&agent, 1)
+        .expect("liveness during teardown");
+    assert!(tearing_down.open_source);
+    assert!(!tearing_down.live_process);
+    // Confirmed plugin cleanup closes the source: the fenced generation
+    // keeps no backing.
+    store
+        .close_native_sources(&agent, 1, now + 2)
+        .expect("close retired observation");
+    let fenced = store
+        .generation_liveness(&agent, 1)
+        .expect("liveness after fence");
+    assert!(!fenced.open_source);
+    assert!(!fenced.live_process);
+    // A newer generation never backs a fenced generation, and a malformed id
+    // is an error the drain path treats as still blocking.
+    assert!(
+        !store
+            .generation_liveness(&agent, 2)
+            .expect("new generation")
+            .open_source
+    );
+    assert!(store.generation_liveness("zzz", 1).is_err());
+    // A live owned process backs its generation.
+    let controlled = ready_agent(&mut store, "liveness-custody-project", now);
+    crate::tests::install_live_custody_observations(&mut store, &controlled, 1, now);
+    assert!(
+        store
+            .generation_liveness(&controlled, 1)
+            .expect("live custody")
+            .live_process
+    );
+    assert_eq!(store.retention_watermark().expect("watermark"), 0);
+}
