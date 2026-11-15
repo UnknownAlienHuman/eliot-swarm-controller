@@ -354,13 +354,16 @@ fn control_rank(control: AgentControl) -> u8 {
     }
 }
 
-/// The single exception to the Store admission guard that a launch
+/// The exception to the Store admission guard that a launch
 /// `profile_snapshot` must not carry a dispatch-derived
 /// `native_store_binding`: an authenticated nonterminal Agent launching its own
-/// controlled child, reusing the parent's frozen snapshot verbatim
-/// (profile, harness, workspace, full snapshot, control narrowed or
-/// equal). The binding still flows through the dispatch-owned path, and
-/// any drift surfaces as `source_integrity` there. Owner, Run, and every
+/// controlled child, either reusing the parent's frozen snapshot verbatim
+/// (same profile, harness, workspace, full snapshot, control narrowed or
+/// equal) or naming a profile from the parent snapshot's captured
+/// `child_profiles` allow-list (same harness and workspace, control narrowed
+/// or equal). The binding still flows through the dispatch-owned path, and
+/// any drift surfaces as `source_integrity` there; the Router freezes and
+/// authorizes the snapshot before Store admission. Owner, Run, and every
 /// other caller keep the existing rejection.
 pub(super) fn admission_allows_carried_parent_binding(
     tx: &Transaction<'_>,
@@ -386,19 +389,36 @@ pub(super) fn admission_allows_carried_parent_binding(
     if control_rank(child_control) > control_rank(parent.control) {
         return Ok(false);
     }
-    Ok(args
-        .get("profile")
+    if !args
+        .get("harness")
         .and_then(Value::as_str)
-        .is_some_and(|name| name == parent.profile)
-        && args
-            .get("harness")
-            .and_then(Value::as_str)
-            .is_some_and(|harness| harness == parent.harness)
-        && args
+        .is_some_and(|harness| harness == parent.harness)
+        || !args
             .get("workspace")
             .and_then(Value::as_str)
             .is_some_and(|workspace| parent.workspace.as_deref() == Some(workspace))
-        && args.get("profile_snapshot") == Some(&parent.profile_snapshot))
+    {
+        return Ok(false);
+    }
+    if args
+        .get("profile")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name == parent.profile)
+        && args.get("profile_snapshot") == Some(&parent.profile_snapshot)
+    {
+        return Ok(true);
+    }
+    Ok(args
+        .get("profile")
+        .and_then(Value::as_str)
+        .is_some_and(|name| {
+            name != parent.profile
+                && parent
+                    .profile_snapshot
+                    .get("child_profiles")
+                    .and_then(Value::as_array)
+                    .is_some_and(|allowed| allowed.iter().any(|entry| entry.as_str() == Some(name)))
+        }))
 }
 
 /// Snapshot one tree selector to its member rows, in member order. Unknown
@@ -905,6 +925,66 @@ mod tests {
                 .profile_inherited,
             "an Agent child on a different profile is not inherited"
         );
+    }
+
+    #[test]
+    fn agent_child_on_allow_list_may_carry_parent_binding() {
+        let mut store = store();
+        let now = now_ms();
+        let launch_id = Ulid::new().to_string();
+        let parent = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: launch_id.clone(),
+                    target: None,
+                    selector: None,
+                    verb: "launch".to_owned(),
+                    args: json!({"project": "binding-allow", "workspace": "synthetic-workspace", "harness": "codex", "profile": "manager", "profile_snapshot": {"control": "tree", "child_profiles": ["worker"]}}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .expect("admit manager")
+            .command
+            .target
+            .expect("manager agent");
+        store.dispatch(&launch_id, now).expect("dispatch manager");
+        let principal = agent_principal(&parent);
+        let mut allowed = launch_request("caller-project-label", Some(&parent));
+        allowed.args["profile"] = json!("worker");
+        allowed.args["profile_snapshot"] = json!({"control": "self", "native_store_binding": {"home": "h", "root": "r", "native_scope": "s"}});
+        let child = store
+            .submit(&principal, allowed, now + 1)
+            .expect("allow-listed child carrying the parent binding admits")
+            .command
+            .target
+            .expect("child agent");
+        assert!(
+            store
+                .get_agent(&child)
+                .unwrap()
+                .expect("child row")
+                .profile_snapshot
+                .get("native_store_binding")
+                .is_some(),
+            "the carried binding is retained on the child row"
+        );
+        // A profile outside the allow-list keeps the rejection.
+        let mut intruder = launch_request("caller-project-label", Some(&parent));
+        intruder.args["profile"] = json!("intruder");
+        intruder.args["profile_snapshot"] = json!({"control": "self", "native_store_binding": {"home": "h", "root": "r", "native_scope": "s"}});
+        let error = store.submit(&principal, intruder, now + 2).unwrap_err();
+        assert_eq!(error.code, "invalid");
+        assert!(
+            error.message.contains("omit profile_snapshot"),
+            "unexpected message: {}",
+            error.message
+        );
+        assert_eq!(agent_count(&store), 2);
     }
 
     #[test]
