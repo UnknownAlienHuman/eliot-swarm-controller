@@ -51,28 +51,31 @@ fn wake_enabled(snapshot: &Value) -> bool {
         .unwrap_or(true)
 }
 
+/// Harnesses whose Agents receive the Agent-scoped `eliot-swarm` MCP server
+/// (OpenCode through its per-Agent `mcp.servers` config, Antigravity through
+/// ACP `session/new` `mcpServers`). Their notices name that tool; every other
+/// harness keeps the `swarm` shell CLI wording it relies on today.
+fn has_swarm_mcp_notice(harness: &str) -> bool {
+    matches!(harness, "opencode" | "antigravity")
+}
+
 /// Notice text naming the coordination surface the recipient actually has.
-/// Antigravity Agents receive the Agent-scoped swarm MCP server on their ACP
-/// session, so their notices name the `swarm` tool and method instead of the
-/// `swarm` shell CLI every other harness still relies on.
-fn notice_text(kind: NoticeKind, count: i64, harness: Option<&str>) -> String {
-    let mcp = harness == Some("antigravity");
+fn notice_text(kind: NoticeKind, count: i64, harness: &str) -> String {
+    let mcp = has_swarm_mcp_notice(harness);
     match kind {
-        NoticeKind::Mail if mcp => {
-            format!(
-                "{count} unread messages; use the swarm tool (mail.inbox), then ack processed delivery IDs"
-            )
-        }
+        NoticeKind::Mail if mcp => format!(
+            "{count} unread messages; use the eliot-swarm MCP swarm tool (method mail.inbox), then ack processed delivery IDs"
+        ),
         NoticeKind::Mail => {
             format!("{count} unread messages; run swarm inbox, then ack processed delivery IDs")
         }
         NoticeKind::Claim if count == 1 && mcp => {
-            "1 overlapping work claim; use the swarm tool (who)".to_owned()
+            "1 overlapping work claim; use the eliot-swarm MCP swarm tool (method who)".to_owned()
         }
         NoticeKind::Claim if count == 1 => "1 overlapping work claim; run swarm who".to_owned(),
-        NoticeKind::Claim if mcp => {
-            format!("{count} overlapping work claims; use the swarm tool (who)")
-        }
+        NoticeKind::Claim if mcp => format!(
+            "{count} overlapping work claims; use the eliot-swarm MCP swarm tool (method who)"
+        ),
         NoticeKind::Claim => format!("{count} overlapping work claims; run swarm who"),
     }
 }
@@ -278,16 +281,12 @@ impl Router {
             NoticeKind::Mail => "mail",
             NoticeKind::Claim => "claim",
         };
-        let harness = agent
-            .profile_snapshot
-            .get("harness")
-            .and_then(Value::as_str);
         let params = json!({
             "id": notice_id,
             "target": recipient,
             "verb": "send",
             "expected_generation": claim.generation,
-            "args": {"text": notice_text(claim.kind, claim.count, harness), "notice_kind": notice_kind},
+            "args": {"text": notice_text(claim.kind, claim.count, &agent.harness), "notice_kind": notice_kind},
         });
         if self.submit(&params, &Principal::Owner).await.is_err() {
             let mut store = self.inner.store.lock().await;
@@ -819,35 +818,34 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_notices_name_the_swarm_tool() {
-        assert_eq!(
-            notice_text(NoticeKind::Mail, 2, Some("antigravity")),
-            "2 unread messages; use the swarm tool (mail.inbox), then ack processed delivery IDs",
-        );
-        assert_eq!(
-            notice_text(NoticeKind::Claim, 1, Some("antigravity")),
-            "1 overlapping work claim; use the swarm tool (who)",
-        );
-        assert_eq!(
-            notice_text(NoticeKind::Claim, 3, Some("antigravity")),
-            "3 overlapping work claims; use the swarm tool (who)",
-        );
-        for harness in [
-            None,
-            Some("codex"),
-            Some("claude"),
-            Some("muse"),
-            Some("opencode"),
-        ] {
+    fn notices_name_the_swarm_surface_each_harness_has() {
+        // OpenCode and Antigravity Agents receive the Agent-scoped
+        // eliot-swarm MCP server; their notices name that tool and method.
+        for harness in ["opencode", "antigravity"] {
+            assert_eq!(
+                notice_text(NoticeKind::Mail, 2, harness),
+                "2 unread messages; use the eliot-swarm MCP swarm tool (method mail.inbox), then ack processed delivery IDs",
+                "{harness} names the MCP tool",
+            );
+            assert_eq!(
+                notice_text(NoticeKind::Claim, 1, harness),
+                "1 overlapping work claim; use the eliot-swarm MCP swarm tool (method who)",
+            );
+            assert_eq!(
+                notice_text(NoticeKind::Claim, 3, harness),
+                "3 overlapping work claims; use the eliot-swarm MCP swarm tool (method who)",
+            );
+        }
+        // Every other harness keeps the swarm CLI wording.
+        for harness in ["codex", "claude", "muse", "unknown-harness"] {
             assert_eq!(
                 notice_text(NoticeKind::Mail, 2, harness),
                 "2 unread messages; run swarm inbox, then ack processed delivery IDs",
-                "harness {harness:?} keeps the CLI text",
+                "harness {harness} keeps the CLI text",
             );
             assert_eq!(
                 notice_text(NoticeKind::Claim, 1, harness),
                 "1 overlapping work claim; run swarm who",
-                "harness {harness:?} keeps the CLI text",
             );
         }
     }

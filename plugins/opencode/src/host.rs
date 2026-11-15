@@ -2,8 +2,8 @@ use crate::{
     events::{EventConfig, EventHandle, EventStatus, InboxRecord, SteerVerdict, TurnFacts},
     native::{
         AuthSetup, BackendKind, HttpOutcome, IntegrationSelector, LocalProvider, OpenCodeHttp,
-        OwnedServer, ServerLaunch, list_providers,
-        types::{InboxUser, ModelRef, SessionInfo},
+        OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch, list_providers,
+        types::{InboxUser, McpServerReadback, ModelRef, SessionInfo},
     },
 };
 use eliot_core::{ContextItem, Error, InjectPoint, Result};
@@ -166,6 +166,8 @@ struct ParsedStart {
     instance_dir: String,
     store_root: String,
     resume: Option<ResumeSubject>,
+    swarm_executable: PathBuf,
+    swarm_data_dir: PathBuf,
 }
 
 /// Outcome of start admission: a replayed start response, or a parsed
@@ -575,6 +577,30 @@ impl OpenCodePlugin {
             "OpenCode",
         )?;
         secrets.push(initialized.credential.clone());
+        // Agent-scoped swarm MCP identity: the Agent's owned Eliot data root
+        // for the MCP `--data-dir` argument (mirrors the Codex
+        // `args_with_agent_mcp` guard), plus the active Swarm executable for
+        // the server command (mirrors the Claude `swarm_binary` readback).
+        // The token itself is never rendered: the MCP child inherits this
+        // environment from the serve process, and `mcp --require-agent`
+        // fails closed without it.
+        let swarm_data_dir = environment
+            .iter()
+            .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("ELIOT_HOME"))
+            .map(|(_, value)| PathBuf::from(value))
+            .filter(|path| path.is_absolute() && path.is_dir())
+            .ok_or_else(|| {
+                Error::new(
+                    "profile_error",
+                    "OpenCode Agent MCP requires an absolute owned Eliot data directory",
+                )
+            })?;
+        let swarm_executable = std::env::current_exe().map_err(|_| {
+            Error::new(
+                "platform_io",
+                "active Swarm executable could not be resolved for the OpenCode Agent MCP",
+            )
+        })?;
         Ok(StartAdmission::New(Box::new(ParsedStart {
             params,
             requested_model,
@@ -590,6 +616,8 @@ impl OpenCodePlugin {
             instance_dir: initialized.instance_dir.clone(),
             store_root: initialized.store_root.clone(),
             resume,
+            swarm_executable,
+            swarm_data_dir,
         })))
     }
 
@@ -694,6 +722,8 @@ impl OpenCodePlugin {
                     reuse_existing: parsed.resume.is_some(),
                 }),
                 local: parsed.local.clone(),
+                swarm_executable: parsed.swarm_executable.clone(),
+                swarm_data_dir: parsed.swarm_data_dir.clone(),
             },
             &parsed.secrets,
             Instant::now() + RPC_TIMEOUT,
@@ -930,6 +960,13 @@ impl OpenCodePlugin {
         if let Some(fragment) = local_fragment {
             effective["local"] = fragment;
         }
+        // Agent-scoped MCP readback after the session exists: names plus
+        // the connected verdict for the `eliot-swarm` entry. Read-only and
+        // best-effort; it never changes the start outcome (see helper).
+        let (mcp_servers, mcp_servers_verified) =
+            observe_mcp_servers(&session.http, Instant::now() + RPC_TIMEOUT).await;
+        effective["mcp_servers"] = mcp_servers;
+        effective["mcp_servers_verified"] = json!(mcp_servers_verified);
         let context_bound =
             bind_context_hooks(&session.http, &created.id, Instant::now() + RPC_TIMEOUT).await;
         let effective = if context_bound {
@@ -1386,6 +1423,12 @@ impl OpenCodePlugin {
                 Err(error) => return Err(error),
             }
         }
+        // Same best-effort MCP readback as the create path: the resumed
+        // server re-spawns the Agent-scoped entry for this generation.
+        let (mcp_servers, mcp_servers_verified) =
+            observe_mcp_servers(&session.http, deadline).await;
+        effective_value["mcp_servers"] = mcp_servers;
+        effective_value["mcp_servers_verified"] = json!(mcp_servers_verified);
         Ok(effective_value)
     }
 
@@ -2660,6 +2703,92 @@ fn normalize_endpoint(value: &str) -> String {
     value.trim().trim_end_matches('/').to_owned()
 }
 
+/// How long the effective MCP readback waits for the installed inventory
+/// to settle on the Agent-scoped server. MCP servers connect
+/// asynchronously after session create (observed up to ~10s on the
+/// installed 2.2.7 server); a single instant query almost always races
+/// them and reports an empty surface. Polling is bounded well under one
+/// RPC budget so neither the create nor the resume path can stall on it.
+const MCP_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const MCP_SETTLE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Best-effort Agent-scoped MCP readback for the effective record:
+/// `GET /api/mcp` (`mcp.list`) after the session exists, re-polled until
+/// the Agent-scoped server reports `connected` (or a terminal
+/// non-connected status, or the settle cap). Names come from the installed
+/// inventory when a query succeeds (`null` when none does, never
+/// fabricated); `mcp_servers_verified` is true only on `connected`. Only
+/// names and the status word are retained — never the failure text, which
+/// can carry local paths. A non-connected or unreadable surface never
+/// fails the start: this harness keeps `inherit` only, so the applied
+/// per-Agent config is the qualified record and this observation is
+/// reported honestly.
+async fn observe_mcp_servers(http: &OpenCodeHttp, deadline: Instant) -> (Value, bool) {
+    let cap =
+        Instant::now() + MCP_SETTLE_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
+    let mut last: Option<Vec<McpServerReadback>> = None;
+    loop {
+        if let Ok(servers) = http.list_mcp_servers(deadline).await {
+            match mcp_settle(&servers) {
+                McpSettle::Connected => return (mcp_names(&servers), true),
+                // A terminal non-connected status settles the observation
+                // early: without a restart the entry cannot become serving.
+                McpSettle::Terminal => return (mcp_names(&servers), false),
+                McpSettle::KeepPolling => {
+                    last = Some(servers);
+                }
+            }
+        }
+        if Instant::now() >= cap {
+            break;
+        }
+        tokio::time::sleep(MCP_SETTLE_POLL).await;
+    }
+    match last {
+        Some(servers) => (mcp_names(&servers), false),
+        None => (Value::Null, false),
+    }
+}
+
+/// Settle decision for one installed-inventory observation: the poll
+/// stops on `Connected` (verified) or `Terminal` (unverified now) and
+/// continues on `KeepPolling` (absent or still connecting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpSettle {
+    Connected,
+    Terminal,
+    KeepPolling,
+}
+
+fn mcp_settle(servers: &[McpServerReadback]) -> McpSettle {
+    if servers
+        .iter()
+        .any(|server| server.is_connected(SWARM_MCP_SERVER_NAME))
+    {
+        return McpSettle::Connected;
+    }
+    if servers.iter().any(|server| {
+        server.name == SWARM_MCP_SERVER_NAME
+            && matches!(
+                server.status.status.as_str(),
+                "failed" | "disabled" | "needs_auth"
+            )
+    }) {
+        return McpSettle::Terminal;
+    }
+    McpSettle::KeepPolling
+}
+
+/// Installed-inventory server names for the effective record.
+fn mcp_names(servers: &[McpServerReadback]) -> Value {
+    json!(
+        servers
+            .iter()
+            .map(|server| server.name.as_str())
+            .collect::<Vec<&str>>()
+    )
+}
+
 /// Resolve the adopted backend key value (runtime-only) from the launch
 /// environment for the passive inventory read. A missing or empty value
 /// yields `None` so the read runs unauthenticated only when the profile
@@ -3143,16 +3272,63 @@ fn opencode_manifest() -> PluginManifest {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendKind, LocalProvider, OpenCodeHttp, OpenCodePlugin, StartAdmission,
-        fetch_backend_inventory, local_key_value, normalize_endpoint, opencode_manifest,
-        opencode_scope, parse_local_provider, split_model, start_auth_selector, start_model_ref,
-        verify_local_effective,
+        BackendKind, LocalProvider, McpSettle, OpenCodeHttp, OpenCodePlugin, SWARM_MCP_SERVER_NAME,
+        StartAdmission, fetch_backend_inventory, local_key_value, mcp_names, mcp_settle,
+        normalize_endpoint, opencode_manifest, opencode_scope, parse_local_provider, split_model,
+        start_auth_selector, start_model_ref, verify_local_effective,
     };
+    use crate::native::types::{McpServerReadback, McpStatusReadback};
     use eliot_core::{AgentStartParams, Result};
     use eliot_plugin::session::{
         ResumeSubject, optional_profile_text, parse_resume_subject, validate_source_plan,
     };
     use serde_json::json;
+
+    fn mcp_fixture(name: &str, status: &str) -> McpServerReadback {
+        McpServerReadback {
+            name: name.to_owned(),
+            status: McpStatusReadback {
+                status: status.to_owned(),
+                error: None,
+            },
+        }
+    }
+
+    #[test]
+    fn mcp_settle_verifies_only_a_connected_agent_server() {
+        // Absent or still-connecting inventory keeps polling; a serving
+        // entry verifies at once; a terminal refusal settles unverified.
+        // Shapes mirror `GET /api/mcp` on installed 2.2.7.
+        assert_eq!(mcp_settle(&[]), McpSettle::KeepPolling);
+        assert_eq!(
+            mcp_settle(&[mcp_fixture(SWARM_MCP_SERVER_NAME, "pending")]),
+            McpSettle::KeepPolling
+        );
+        assert_eq!(
+            mcp_settle(&[mcp_fixture("owner-search", "connected")]),
+            McpSettle::KeepPolling
+        );
+        assert_eq!(
+            mcp_settle(&[mcp_fixture(SWARM_MCP_SERVER_NAME, "failed")]),
+            McpSettle::Terminal
+        );
+        assert_eq!(
+            mcp_settle(&[mcp_fixture(SWARM_MCP_SERVER_NAME, "disabled")]),
+            McpSettle::Terminal
+        );
+        assert_eq!(
+            mcp_settle(&[
+                mcp_fixture("owner-search", "connected"),
+                mcp_fixture(SWARM_MCP_SERVER_NAME, "connected"),
+            ]),
+            McpSettle::Connected
+        );
+        let servers = vec![
+            mcp_fixture("owner-search", "connected"),
+            mcp_fixture(SWARM_MCP_SERVER_NAME, "connected"),
+        ];
+        assert_eq!(mcp_names(&servers), json!(["owner-search", "eliot-swarm"]));
+    }
     use std::path::PathBuf;
 
     const FAMILIES: &[&str] = &["session", "turn", "message", "request"];

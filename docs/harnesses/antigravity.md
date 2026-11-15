@@ -270,7 +270,7 @@ owner caller uses the existing owner credential path. Administrative methods (su
 are rejected with `not_allowed` for managed Agent callers.
 
 Wake and claim notices sent to an Antigravity Agent name the tool it
-actually has (`use the swarm tool (mail.inbox)` / `use the swarm tool
+actually has (`use the eliot-swarm MCP swarm tool (method mail.inbox)` / `use the swarm tool
 (who)`) instead of the `swarm` shell CLI other harnesses still rely on.
 
 Readback: ACP exposes no MCP inventory on any checked surface

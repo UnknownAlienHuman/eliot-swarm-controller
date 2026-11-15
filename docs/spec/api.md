@@ -1209,8 +1209,8 @@ only the resulting value is stored.
 A routed recipient with `wake_on_mail` (profile snapshot, default true) may
 receive one generic coalesced wake per minute with at most one open notice
 command per recipient across mail and claims: `N unread messages; run swarm inbox, then ack processed delivery IDs`.
-An Antigravity recipient instead names the coordination tool it actually
-has: `N unread messages; use the swarm tool (mail.inbox), then ack processed delivery IDs`.
+An OpenCode or Antigravity recipient instead names the coordination tool it actually
+has: `N unread messages; use the eliot-swarm MCP swarm tool (method mail.inbox), then ack processed delivery IDs`.
 The notice never contains
 the body, is sent through the ordinary owner `send` path bound to the
 recipient's current generation, and is skipped — never retried — while a
@@ -1245,8 +1245,8 @@ normalization (segments are compatible when equal or either side carries
 a wildcard, with `**` realigning across directories), in the same project
 — is reported in-band in the `claim.set` response and routes at most one
 coalesced generic notice per holder: `1 overlapping work claim` /
-`N overlapping work claims`, plus `; run swarm who` (an Antigravity holder
-instead gets `; use the swarm tool (who)`). Detection is
+`N overlapping work claims`, plus `; run swarm who` (an OpenCode or Antigravity holder
+instead gets `; use the eliot-swarm MCP swarm tool (method who)`). Detection is
 conservative: a false positive only adds an
 advisory notice. The in-band list holds at most 100 conflicts;
 `truncated` signals the scan or report cap engaged. The notice shares the

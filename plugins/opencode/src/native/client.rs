@@ -21,9 +21,10 @@ use crate::native::{
     sse::{SseFrame, SseParser},
     types::{
         AgentList, ConfigEntry, DataEnvelope, ErrorBody, FormInfo, FormReplyRequest, InboxPage,
-        InboxUser, InterruptResponse, LocationRef, MessagePage, ModelRef, NativeModelEntry,
-        PermissionReplyRequest, PermissionRequest, PromptRequest, ProviderReadback,
-        SessionCreateRequest, SessionInfo, SwitchAgentRequest, SwitchModelRequest,
+        InboxUser, InterruptResponse, LocationRef, McpServerReadback, MessagePage, ModelRef,
+        NativeModelEntry, PermissionReplyRequest, PermissionRequest, PromptRequest,
+        ProviderReadback, SessionCreateRequest, SessionInfo, SwitchAgentRequest,
+        SwitchModelRequest,
     },
 };
 
@@ -585,6 +586,27 @@ impl OpenCodeHttp {
             return Ok(());
         }
         Err(map_write_error("session.switchAgent", &response))
+    }
+
+    /// `GET /api/mcp` (`mcp.list`): installed MCP inventory — configured
+    /// server names with connection status (`connected`, `pending`,
+    /// `disabled`, `failed`, `needs_auth`). Verified live on 2.2.7: an
+    /// Agent-less `swarm mcp --require-agent` entry reports `failed` with
+    /// the refusal text, and the query itself needs no session. A read, so
+    /// any failure is `native_readback`, never `unknown`.
+    pub async fn list_mcp_servers(&self, deadline: Instant) -> Result<Vec<McpServerReadback>> {
+        let response = self
+            .send(reqwest::Method::GET, "/api/mcp", &[], None, deadline)
+            .await
+            .map_err(readback_outcome_as_error)?;
+        if response.status == 200 {
+            let envelope: DataEnvelope<Vec<McpServerReadback>> =
+                serde_json::from_slice(&response.body).map_err(|_| {
+                    Error::new("native_readback", "OpenCode MCP readback was invalid")
+                })?;
+            return Ok(envelope.data);
+        }
+        Err(readback_error("MCP list", &response))
     }
 
     /// `GET /api/agent`: installed agent ids for the membership check
