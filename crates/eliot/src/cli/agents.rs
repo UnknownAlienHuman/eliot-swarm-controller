@@ -615,6 +615,38 @@ pub(crate) async fn run_digest(
     swarm_digest(&data_dir, all, any, to, ids, json_output, id).await
 }
 
+pub(crate) async fn run_reparent(
+    args: super::args::ReparentArgs,
+    data_dir: PathBuf,
+    json_output: bool,
+    id: Option<String>,
+) -> Result<u8, Failure> {
+    let request = eliot_core::api::ReparentRequest {
+        id: mutation_id(id)?,
+        agent: args.agent,
+        children_of: args.children_of,
+        expected_generation: args.generation,
+        parent: args.parent,
+        parent_generation: args.parent_generation,
+    };
+    request
+        .validate()
+        .map_err(|error| Failure::from_core(error, true))?;
+    let response: eliot_core::api::ReparentResponse =
+        eliot_daemon::client_call_typed(&data_dir, "swarm.reparent", &request)
+            .await
+            .map_err(|error| Failure::from_core(error, true))?;
+    if response.id != request.id {
+        return Err(Failure::new(4, "swarm.reparent response id differs"));
+    }
+    print_value(
+        &serde_json::to_value(response)
+            .map_err(|_| Failure::new(4, "invalid reparent response"))?,
+        json_output,
+    );
+    Ok(0)
+}
+
 pub(crate) fn approval_reply_args(choice: Option<String>, feedback: Option<String>) -> Value {
     let mut args = serde_json::Map::new();
     if let Some(choice) = choice {

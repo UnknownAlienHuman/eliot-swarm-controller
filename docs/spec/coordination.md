@@ -13,7 +13,8 @@ current Agent may queue addressed mail to any existing Agent regardless of proje
 label or worktree; mail is communication only and does not grant command control.
 Project rules access project coordination; vars, claims and control remain as defined
 below. Only owner/global automation writes
-global vars. Children cannot widen parental authority. A native child without isolated
+global vars. Agent-launched children cannot widen parental authority. Only the Owner
+may grant a different manager control through [Handoff](#handoff). A native child without isolated
 environment has no independent Eliot principal; calls from its parent environment are
 attributed to that parent and this limitation is shown.
 
@@ -219,7 +220,7 @@ verbatim, and every non-profile capacity scope kept with the same bounds; contro
 is narrowed or equal (never widened). It omits `profile_snapshot` (the daemon
 freezes it) and shares the parent's workspace (an omitted workspace defaults to
 the parent's; a different workspace rejects, so a child never escapes the
-parent's authority) and mints no worktree; owner launches are unrestricted. Fanout limits (`[daemon.limits]`, checked at launch admission)
+parent's authority) and mints no worktree; owner launches are unrestricted. Fanout limits (`[daemon.limits]`, checked at launch and re-parent admission)
 prevent accidental new work but never hide an Agent row that already exists.
 Above-limit children remain visible with no widened identity/control; over-limit
 admission reads `fanout_limit` and persists nothing. Terminal Agents (stopped,
@@ -251,6 +252,131 @@ no native MSP turn identity/child principal/control, and private history
 at the owning daemon dispatch boundary. Child control stays a later increment,
 as do tree forms for mail recipients (non-Agent ids stay `invalid`) and watch filters
 (a tree value matches no events today).
+
+## Handoff
+
+Handoff uses durable commands, generation fences, parent links, advisory claims,
+Goals and ordinary input/mail. It adds no task engine, queue, lease or ownership
+database. The native harness keeps its loop, context and process custody. The
+[L7 lifecycle donor](../reference/donors.md) informs commit-before-ack and exact
+current-state checks: uncertainty preserves the existing binding, never authorizes
+another external effect. Managed-agent thread/orchestration docs likewise keep
+thread context, interruption and completion separate.
+
+### Change the manager (implemented)
+
+`swarm.reparent` is an Owner-only, generation-bound Store transaction. It moves
+one Agent and its whole subtree, or snapshots all direct children of a source
+manager and moves their subtrees together. The source manager itself stays put in
+the latter form. Both forms include terminal historical descendants. An empty child
+set succeeds with an empty result. A same-parent move is harmless but still validated.
+
+A manager cannot transfer its children to another Agent it controls: that grants
+the recipient authority over existing sessions and could bypass frozen launch
+confinement. Owner-only admission makes that grant explicit, including cross-harness
+or unlisted-profile children. The child's profile, control, credentials, native
+identity, workspace, project, generation, turn, commands, Goal and claims do not
+change. `child_profiles` constrains Agent launch, not this Owner grant; no snapshot
+is widened or replaced, and the new manager cannot use the grant to launch an
+otherwise forbidden profile. All moved rows must share the new parent's project.
+
+The destination must be a controlled, nonterminal, non-unknown Agent. Observe-only
+sources or descendants reject the whole move: their parent binding belongs to the
+native harness. Terminal controlled children may move (including back after a stop).
+Active or unknown turns in controlled children do not prevent a link-only edit;
+no native input is delivered or replayed. Exact source and destination generations
+are checked in the transaction. Reject cycles, including a destination within any
+moving subtree. Recompute every affected `root` and `depth` from the destination.
+Enforce maximum depth for every moved row, destination live direct-child/tree
+fanout, and the selector-target bound on the total moved rows. Terminal members
+occupy neither live fanout count; historical rows remain subject to depth and
+expansion bounds. Oversize or invalid moves persist nothing.
+
+The new topology immediately controls `agent.list`, direct reads and subsequent
+`send`/`stop`/`tree:` admissions. Tree control loses or gains the moved subtree;
+self/project scope retains its existing meaning. Already-expanded tree commands
+keep their concrete targets; undispatched Agent commands recheck current scope
+at dispatch and cannot exercise relinquished tree authority. Dispatched or unknown
+effects remain bound to their original command and are never undone or replayed.
+Admission also rechecks scope inside the Store transaction to close a Router-read race.
+Existing `swarm.wait` captures keep their explicit IDs and recheck current visibility,
+so relinquished entries become `not_visible`. Digests keep their frozen recipient,
+entry set and registration visibility mask as documented; re-parenting never
+redirects an already-registered completion. Mail remains in each stable Agent's
+mailbox, with its original sender/recipient-generation binding. New attention
+notifications consult the current parent; already-admitted mail is not rerouted.
+
+Links, per-member `agent.reparented` events and the bounded retained result commit
+together before publication/reply. Retry the same mutation ID and identical payload:
+the original result is returned before live generation/topology/fanout gates, even
+after another move or stop. A different binding rejects `id_conflict`. A lost reply
+is an unknown observation until that readback; there is no native effect to replay.
+
+### Task handoff to an existing Agent (design; not implemented)
+
+`swarm.handoff` is one Owner operation bound to explicit A/B generations, an explicit
+original-task command ID and a bounded ordered set of A's undispatched SEND IDs.
+Refuse rather than implicitly wait while A has an active/unknown turn, pending
+request, dispatched/unknown command, generation transition or running/unknown Goal
+round reservation. B must be controlled, nonterminal, same-project and cleanly idle
+under the existing input/unknown gates. Explicitly retry after quiescence with a new
+operation ID only if the previous operation was definitely rejected before admission.
+
+Only plain `send` commands in `accepted|queued` state are transferable. Never transfer
+in-flight, unknown, turn/request-bound controls or queued context injections; reject
+the requested set atomically if any entry has moved state. Cancel the selected
+originals with a durable no-effect outcome and admit fresh B-generation SENDs in the
+same transaction. Preserve immutable original targets/payloads and retain explicit
+old-command/new-command pairs in the handoff parent's result. Use the existing
+Store-only parent/ordered-child command representation for the brief and successor
+inputs, not a second work queue. Successor IDs and ordinals are frozen at admission;
+their native dispatch uses the ordinary router after commit. Unselected work stays
+on A; stopping A is a separate explicit command.
+
+In that transaction, release A-generation claims and recreate the selected live
+globs/notes on B's generation with their remaining TTL, reporting advisory conflicts.
+Claims never prove ownership or silently reassign work. Transfer only a quiescent
+Eliot Goal when B has none: clear A's Goal and install its definition/budgets/counters
+paused on B's generation with a new revision and no inherited idle/round key. Explicit
+resume is required; reserved/unknown continuations are never copied. Native Goals
+remain `unsupported` until the relevant adapters expose them. Transfer children
+through the same re-parent validation/transaction helper and its limits, not new
+ownership records. Any validation failure rolls back all these Store changes.
+
+The first successor input is one bounded handoff brief, admitted as ordinary `send`
+to B's exact generation. It contains the original task text from the named retained
+command, A's latest retained final output (exact turn binding, or an explicit absence),
+and pointers to A/generation/command/turn retained history. Apply existing known-secret
+filtering/redaction and SEND/frame limits; label any truncated text and history gaps.
+Never copy credentials, raw native context or an inferred successful result. B keeps
+its own native context. The brief precedes the selected successor inputs in FIFO order.
+
+Local admission is atomic; native application is not. The retained parent result names
+each cancellation, claim/Goal/child transfer and admitted successor ID. Ordinary child
+command/turn readback distinguishes pending/applied/failed/unknown delivery. A failed
+or unknown brief blocks subsequent handoff inputs through existing ordered child/input
+gates; never automatically resend an uncertain input. Same-ID retry returns the frozen
+operation and child IDs, including partial native outcomes, and never repeats Store
+transfers or external effects. No compensating automatic stop/relaunch is implied.
+
+### Agent switch (design; not implemented)
+
+`swarm.switch` is one Owner launch-plus-handoff operation, choosing an explicit profile
+or the existing ad-hoc harness/model/effort selectors, including another harness. Reuse
+the normal launch freeze, capacity, workspace and credential checks. Reserve one launch
+child ID before external work; the operation is represented by existing durable
+parent/child commands. Launch only creates B's session; the handoff brief is its first
+input. After proven session readiness, atomically revalidate A/B quiescence and perform
+the handoff above. Failure at this boundary leaves A intact and reports the created B
+explicitly; stopping B or A is an explicit choice. An unknown launch preserves its
+exact Agent/generation/command binding and blocks handoff; retrying the operation never
+creates another Agent or repeats the launch. Interrupted transport is not proof that
+launch failed. The native process is never transplanted between harnesses or Agents.
+
+The next increment must settle the precise DTO selection limits and how the existing
+ordered-child gate holds later successor SENDs on a failed brief; it must also decide
+whether an explicit follow-up mutation can finish a definitely launched but not yet
+handed-off switch. These are unimplemented protocol choices, not hidden recovery paths.
 
 ## Prompt guidance
 

@@ -140,6 +140,8 @@ pub(crate) enum CliCommand {
     Wait(WaitArgs),
     /// Register a durable completion digest delivering one coalesced parent mailbox result.
     Digest(DigestArgs),
+    /// Move one Agent subtree, or all children, to another manager (Owner only).
+    Reparent(ReparentArgs),
     /// Send, read or acknowledge addressed Agent mail.
     Msg(MsgArgs),
     /// Read one page of unread mail for a mailbox.
@@ -613,6 +615,25 @@ pub(crate) struct EventsArgs {
     pub(crate) since: Option<i64>,
     #[command(flatten)]
     pub(crate) page: PageArgs,
+}
+
+#[derive(Args)]
+pub(crate) struct ReparentArgs {
+    #[arg(
+        value_name = "AGENT",
+        required_unless_present = "children_of",
+        conflicts_with = "children_of"
+    )]
+    pub(crate) agent: Option<String>,
+    #[arg(long, value_name = "MANAGER")]
+    pub(crate) children_of: Option<String>,
+    #[arg(long, value_name = "MANAGER")]
+    pub(crate) parent: String,
+    /// Exact source generation (required for safe same-ID retries).
+    #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+    pub(crate) generation: i64,
+    #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+    pub(crate) parent_generation: i64,
 }
 
 #[derive(Args)]

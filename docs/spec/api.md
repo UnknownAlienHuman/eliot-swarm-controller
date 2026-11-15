@@ -249,6 +249,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `agent.discover` | owner-only native metadata discovery, without creating Agents |
 | `agent.history` | owner-only bounded history of an exact observed subject |
 | `mail.send/inbox/read/ack`, `var.set/get` | addressed queued mail with separate acknowledgement, shared variables with CAS |
+| `swarm.reparent` | Owner-only atomic subtree or all-children manager change; generation-bound, no native effect |
 | `who`, `claim.set/list/release` | current-worker file areas plus advisory claims with coalesced conflict notices |
 | `rule.*` except `rule.list/get/catch_up` | later automation; effects remain commands; no rule or timer pause/resume operation exists |
 
@@ -886,6 +887,41 @@ exact-bound terminal probe clears rate-limit/quota holds; failed or interrupted 
 retain them, while unknown probes retain their claim across restart. Auth and ModelRemoved
 holds require owner correction and are not probe-eligible. Provider restriction facts
 are defined in [monitoring](monitoring.md#provider-holds).
+
+## Handoff methods
+
+The owning semantics are [Coordination: Handoff](coordination.md#handoff).
+`swarm.reparent` is implemented; its sole wire DTOs are
+[`ReparentRequest` / `ReparentResponse`](../../crates/eliot-core/src/api/hierarchy.rs).
+Name exactly one of `agent` (whole subtree) or `children_of` (all direct children
+and their subtrees), plus `expected_generation` for that source, `parent`,
+`parent_generation`, and the mutation `id`. Both generations are required; no
+active-Agent fallback or implicit generation refresh on retry. Owner only, same
+project, controlled nonterminal/nonunknown destination. Native-child observation
+bindings cannot move. Result `moved` lists every affected Agent/generation with
+previous/current parent, root and depth, ordered by Agent number; an empty list
+is a valid all-children result. No truncation or partial Store move is permitted.
+Existing selector expansion and live fanout limits apply; encoded replies are
+bounded by the existing retained-write budget. Errors include `invalid` (cycle
+or bad source form), `stale_generation`, `not_found`, `not_allowed`, `bad_state`,
+`fanout_limit`, `frame_too_large`, and mutation binding/age errors. Exact replay
+returns the committed result before current-state checks. MCP discovery describes
+this Owner method and mints a missing ID under the existing mutation rules.
+
+CLI (explicit generations preserve an identical retry payload):
+
+```text
+swarm [--id ULID] reparent AGENT --parent MANAGER --generation N --parent-generation M
+swarm [--id ULID] reparent --children-of MANAGER_A --parent MANAGER_B --generation N --parent-generation M
+```
+
+`swarm.handoff` and `swarm.switch` are reserved design names and return `unsupported`
+today; they have no advertised DTO, CLI or MCP discovery entry. The next increment
+must connect their Owner operation to existing durable commands: explicit A/B
+generations, original-task command and selected undispatched SEND IDs for handoff;
+source generation plus normal profile/ad-hoc launch selectors for switch. The result
+must retain component outcomes and exact child IDs, including partial or unknown
+native delivery. No field catalog is promised before those DTOs are implemented.
 
 ## Waiting
 

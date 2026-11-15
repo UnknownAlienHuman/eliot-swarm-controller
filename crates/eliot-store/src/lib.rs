@@ -131,6 +131,7 @@ mod goals;
 mod hierarchy;
 mod lifecycle;
 mod native_children;
+mod reparent;
 pub use native_children::{
     NATIVE_CHILD_ATTENTION_PAGE_SIZE, NativeChildrenAttention, NativeChildrenAttentionPage,
 };
@@ -284,7 +285,7 @@ impl Store {
 
     /// Install the owner `[daemon.limits]` fanout bounds loaded once at daemon
     /// startup. Until then (and in tests) the coordination-contract defaults
-    /// apply. Limits gate launch/selector admission only, never reads.
+    /// apply. Limits gate launch/selector/re-parent admission, never reads.
     pub fn set_hierarchy_limits(&mut self, limits: core::api::HierarchyLimits) -> Result<()> {
         limits.validate()?;
         self.hierarchy_limits = limits;

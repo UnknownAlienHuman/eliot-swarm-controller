@@ -1473,6 +1473,18 @@ pub(super) fn submit_tx(
     }
     submit_target_guards_tx(tx, &request, &preparation)?;
 
+    // Parent links can change after the Router scope read. Recheck admission
+    // against the same transaction that persists the targeted command.
+    if principal.starts_with("agent:")
+        && request.verb != "launch"
+        && let Some(target) = request.target.as_deref()
+    {
+        let caller = hierarchy::parse_caller(tx, principal)?;
+        let agent = load_agent_by_num(tx, parse_agent_id(target)?)?
+            .ok_or_else(|| Error::new("not_found", "command target was not found"))?;
+        hierarchy::caller_may_command(tx, &caller, &agent)?;
+    }
+
     let mut events = Vec::new();
     let linked = match request.verb.as_str() {
         "attach" | "detach" => {
