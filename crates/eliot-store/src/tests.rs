@@ -8932,7 +8932,15 @@ fn stop_and_source_closure_alone_do_not_release_capacity_or_fail_host_settlement
     let events = store
         .record_owned_control_exit(&agent, 1, now + 9)
         .expect("matching OS, process, and reader facts release capacity");
-    assert!(events.iter().any(|event| event.kind == "capacity.released"));
+    let released = events
+        .iter()
+        .find(|event| event.kind == "capacity.released")
+        .expect("capacity release records custody guarantee");
+    assert_eq!(
+        released.data["custody"],
+        if cfg!(windows) { "exact" } else { "degraded" }
+    );
+    assert_eq!(released.data["orphan_possible"], !cfg!(windows));
     assert_eq!(capacity_generation(&store, &agent), None);
     assert!(numeric_agent > 0);
 }
