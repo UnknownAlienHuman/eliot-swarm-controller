@@ -30,6 +30,9 @@ use tokio::{
 };
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// The daemon gives agent.command 30 s. Share one shorter budget across the
+// input write and association, leaving time to return the actual native cause.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// The actual steer mechanism, reported on every applied steer ack: the
 /// installed CLI has no named steer method, so the exact captured turn is
@@ -80,16 +83,109 @@ struct AgentSession {
     mcp_config: Option<ClaudeMcpConfigFile>,
     native_client: ClaudeClient,
     events: EventHandle,
-    command_inputs: HashMap<String, String>,
-    command_turns: HashMap<String, String>,
-    unknown_commands: HashSet<String>,
-    rejected_commands: HashSet<String>,
+    sends: SendHistory,
     interrupt_applied: HashMap<String, String>,
     interrupted_turns: HashSet<String>,
     unknown_interrupt_turns: HashSet<String>,
     reply_outcomes: HashMap<String, ReplyOutcome>,
     steer_outcomes: HashMap<String, SteerRecord>,
     stop_command_id: Option<String>,
+}
+
+/// A send deadline ends the RPC wait, not the native input. Keep its exact
+/// receiver until the event task commits an association or a definite refusal.
+#[derive(Default)]
+struct SendHistory {
+    inputs: HashMap<String, String>,
+    turns: HashMap<String, String>,
+    outcomes: HashMap<String, Value>,
+    pending: Option<PendingSend>,
+}
+
+struct PendingSend {
+    command_id: String,
+    turn_id: String,
+    outcome: oneshot::Receiver<TurnOutcome>,
+}
+
+impl SendHistory {
+    fn replay(&self, command_id: &str, text: &str) -> Option<Result<Value>> {
+        let previous = self.inputs.get(command_id)?;
+        if previous != text {
+            return Some(Err(Error::new(
+                "source_integrity",
+                "Claude command id was reused with different input",
+            )));
+        }
+        Some(Ok(self.outcomes.get(command_id).cloned().unwrap_or_else(
+            || {
+                unknown_control(
+                    "Claude input has no retained exact outcome; it will not be repeated",
+                )
+            },
+        )))
+    }
+
+    fn finish(&mut self, outcome: TurnOutcome) -> Value {
+        let pending = self
+            .pending
+            .take()
+            .expect("registered send owns its waiter");
+        let result = match outcome {
+            TurnOutcome::Associated => {
+                self.turns
+                    .insert(pending.command_id.clone(), pending.turn_id.clone());
+                json!({"state": "applied", "turn_id": pending.turn_id})
+            }
+            TurnOutcome::Rejected(reason) => rejected_control(&reason),
+            TurnOutcome::Unknown(reason) => {
+                send_unknown("claude_turn_association_unknown", &reason)
+            }
+        };
+        self.outcomes.insert(pending.command_id, result.clone());
+        result
+    }
+
+    fn reconcile(&mut self) {
+        let Some(pending) = self.pending.as_mut() else {
+            return;
+        };
+        match pending.outcome.try_recv() {
+            Ok(outcome) => {
+                self.finish(outcome);
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {}
+            Err(oneshot::error::TryRecvError::Closed) => {
+                let pending = self.pending.take().expect("pending receiver was inspected");
+                self.outcomes.insert(
+                    pending.command_id,
+                    send_unknown(
+                        "claude_turn_association_lost",
+                        "Claude event task closed without settling the input; it will not be repeated",
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn send_unknown(cause: &str, reason: &str) -> Value {
+    json!({"state": "unknown", "cause": cause, "reason": reason})
+}
+
+/// Retain a proven no-write send refusal so a same-id retry replays it
+/// instead of rewriting stdin. Only for `frame_too_large`/`busy`/
+/// pre-write gates that provably wrote nothing.
+fn retain_send_rejection(
+    sends: &mut SendHistory,
+    command_id: String,
+    text: &str,
+    reason: &str,
+) -> Value {
+    let result = rejected_control(reason);
+    sends.inputs.insert(command_id.clone(), text.to_owned());
+    sends.outcomes.insert(command_id, result.clone());
+    result
 }
 
 /// Validated start inputs: the frozen profile, Agent-scoped MCP context, and
@@ -1121,22 +1217,57 @@ impl ClaudePlugin {
             params.generation,
             "Claude",
         )?;
-        if session.phase != SessionPhase::Ready {
-            return Err(Error::new(
-                "unknown",
-                "Claude session or event source outcome is unresolved",
-            ));
-        }
         let context = params.context.clone();
-        let text = send_text(&params)?;
-        if let Some(replay) = replay_send(session, &params.command_id, text) {
+        let text = match send_text(&params) {
+            Ok(text) => text.to_owned(),
+            Err(error) if error.code == "frame_too_large" => {
+                let raw = params
+                    .args
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                session.sends.reconcile();
+                if let Some(replay) = session.sends.replay(&params.command_id, raw) {
+                    return replay;
+                }
+                let result = retain_send_rejection(
+                    &mut session.sends,
+                    params.command_id,
+                    raw,
+                    &error.message,
+                );
+                return Ok(result);
+            }
+            Err(error) => return Err(error),
+        };
+        session.sends.reconcile();
+        if let Some(replay) = session.sends.replay(&params.command_id, &text) {
             return replay;
         }
-        check_send_ready(session)?;
-        let native_content = with_claimed_context(text, &context, "Claude")?;
+        // These are pre-write refusals. Generic `busy`/`unknown` errors after
+        // daemon dispatch would incorrectly turn them into uncertain effects.
+        if let Err(error) = check_send_ready(session) {
+            let result =
+                retain_send_rejection(&mut session.sends, params.command_id, &text, &error.message);
+            return Ok(result);
+        }
+        let native_content = match with_claimed_context(&text, &context, "Claude") {
+            Ok(native_content) => native_content,
+            Err(error) if error.code == "frame_too_large" => {
+                let result = retain_send_rejection(
+                    &mut session.sends,
+                    params.command_id,
+                    &text,
+                    &error.message,
+                );
+                return Ok(result);
+            }
+            Err(error) => return Err(error),
+        };
         session
-            .command_inputs
-            .insert(params.command_id.clone(), text.to_owned());
+            .sends
+            .inputs
+            .insert(params.command_id.clone(), text.clone());
         dispatch_send(session, &params.command_id, native_content, context).await
     }
 
@@ -1643,13 +1774,15 @@ impl ClaudePlugin {
             return Ok(stopped);
         }
         let event_status = session.events.status();
+        session.sends.reconcile();
         let turn_id = match params.turn_id.as_deref() {
             Some(turn_id) => Some(turn_id.to_owned()),
-            None => session.command_turns.get(&params.command_id).cloned(),
+            None => session.sends.turns.get(&params.command_id).cloned(),
         };
         if let Some(requested_turn) = turn_id.as_deref()
             && session
-                .command_turns
+                .sends
+                .turns
                 .get(&params.command_id)
                 .map(String::as_str)
                 != Some(requested_turn)
@@ -1776,7 +1909,7 @@ fn live_session_snapshot(
     else {
         return unknown_snapshot(params, "Claude session identity was not acknowledged");
     };
-    if session.command_inputs.contains_key(&params.command_id) && turn_id.is_none() {
+    if session.sends.inputs.contains_key(&params.command_id) && turn_id.is_none() {
         return unknown_snapshot(
             params,
             "Claude command has no exact native turn association",
@@ -1867,40 +2000,21 @@ fn send_text(params: &AgentCommandParams) -> Result<&str> {
     Ok(text)
 }
 
-/// Replay a known send, or refuse a reused command id with different input.
-/// `None` means this is a fresh send that proceeds to dispatch.
-fn replay_send(session: &AgentSession, command_id: &str, text: &str) -> Option<Result<Value>> {
-    let previous = session.command_inputs.get(command_id)?;
-    if previous != text {
-        return Some(Err(Error::new(
-            "source_integrity",
-            "Claude command id was reused with different input",
-        )));
-    }
-    if let Some(turn_id) = session.command_turns.get(command_id) {
-        return Some(Ok(json!({"state": "applied", "turn_id": turn_id})));
-    }
-    if session.unknown_commands.contains(command_id) {
-        return Some(Err(Error::new(
-            "unknown",
-            "Claude input outcome is unresolved and will not be repeated",
-        )));
-    }
-    if session.rejected_commands.contains(command_id) {
-        return Some(Ok(json!({
-            "state": "rejected",
-            "reason": "Claude input was known not to apply",
-        })));
-    }
-    Some(Err(Error::new(
-        "unknown",
-        "Claude command was already dispatched without a retained exact outcome",
-    )))
-}
-
 /// Pre-dispatch gates for a fresh send: a failed event source and an already
-/// active turn.
+/// active or unassociated input. Every refusal here proves no native write.
 fn check_send_ready(session: &AgentSession) -> Result<()> {
+    if session.phase != SessionPhase::Ready {
+        return Err(Error::new(
+            "bad_state",
+            "Claude session is not ready for input",
+        ));
+    }
+    if session.session_id.is_none() {
+        return Err(Error::new(
+            "bad_state",
+            "Claude session identity is unresolved",
+        ));
+    }
     let event_status = session.events.status();
     if let Some(reason) = event_status.failure {
         return Err(Error::new("unknown", reason));
@@ -1908,18 +2022,26 @@ fn check_send_ready(session: &AgentSession) -> Result<()> {
     if event_status.active_turn_id.is_some() {
         return Err(Error::new("busy", "Claude already has an active turn"));
     }
+    if session.sends.pending.is_some() {
+        return Err(Error::new(
+            "busy",
+            "Claude prior input has no exact native turn association",
+        ));
+    }
     Ok(())
 }
 
 /// Mint the exact turn association before the write and register it with
 /// the event task first: an early lifecycle can never miss its waiter, and
-/// a lost association latches unknown without a rewrite.
+/// a lost association retains its exact waiter without a rewrite or a
+/// session-wide latch. Only later native evidence may retire that waiter.
 async fn dispatch_send(
     session: &mut AgentSession,
     command_id: &str,
     content: String,
     context: Vec<ContextItem>,
 ) -> Result<Value> {
+    let deadline = Instant::now() + SEND_TIMEOUT;
     let turn_id = new_uuid();
     let outcome = match session
         .events
@@ -1927,16 +2049,23 @@ async fn dispatch_send(
         .await
     {
         Ok(outcome) => outcome,
-        Err(error) if error.code == "busy" => {
-            session.command_inputs.remove(command_id);
-            return Err(Error::new("busy", "Claude already has an active turn"));
-        }
         Err(error) => {
-            session.unknown_commands.insert(command_id.to_owned());
-            session.phase = SessionPhase::Unknown;
-            return Err(Error::new("unknown", error.message));
+            // No user record was written, even if registration itself lost
+            // its reply. Withdraw only this never-written registration.
+            session.events.cancel_turn(command_id.to_owned()).await;
+            let result = rejected_control(&error.message);
+            session
+                .sends
+                .outcomes
+                .insert(command_id.to_owned(), result.clone());
+            return Ok(result);
         }
     };
+    session.sends.pending = Some(PendingSend {
+        command_id: command_id.to_owned(),
+        turn_id: turn_id.clone(),
+        outcome,
+    });
     let input = OutboundUserInput {
         kind: "user",
         uuid: turn_id.clone(),
@@ -1950,62 +2079,51 @@ async fn dispatch_send(
             content,
         },
     };
-    if let Err(error) = session
-        .native_client
-        .send_user(input, Instant::now() + RPC_TIMEOUT)
-        .await
-    {
+    if let Err(error) = session.native_client.send_user(input, deadline).await {
         if native_no_write(&error.code) {
             // Proven never dispatched: withdraw the pending turn before
             // answering, or every later send wedges `busy` behind it.
             session.events.cancel_turn(command_id.to_owned()).await;
-            session.rejected_commands.insert(command_id.to_owned());
-            return Ok(json!({
-                "state": "rejected",
-                "reason": "Claude input was not dispatched",
-            }));
-        }
-        session.unknown_commands.insert(command_id.to_owned());
-        session.phase = SessionPhase::Unknown;
-        return Err(Error::new(
-            "unknown",
-            "Claude input may have applied; it will not be repeated",
-        ));
-    }
-    let outcome = tokio::time::timeout(RPC_TIMEOUT, outcome)
-        .await
-        .map_err(|_| {
-            Error::new(
-                "unknown",
-                "Claude turn association was not observed; the input will not be repeated",
-            )
-        })?;
-    let outcome = outcome.map_err(|_| {
-        Error::new(
-            "unknown",
-            "Claude turn association was lost; the input will not be repeated",
-        )
-    })?;
-    match outcome {
-        TurnOutcome::Associated => {
+            session.sends.pending = None;
+            let result = rejected_control(&error.message);
             session
-                .command_turns
-                .insert(command_id.to_owned(), turn_id.clone());
-            Ok(json!({"state": "applied", "turn_id": turn_id}))
+                .sends
+                .outcomes
+                .insert(command_id.to_owned(), result.clone());
+            return Ok(result);
         }
-        TurnOutcome::Rejected(reason) => {
-            session.rejected_commands.insert(command_id.to_owned());
-            Ok(json!({"state": "rejected", "reason": reason}))
-        }
-        TurnOutcome::Unknown => {
-            session.unknown_commands.insert(command_id.to_owned());
-            session.phase = SessionPhase::Unknown;
-            Err(Error::new(
-                "unknown",
-                "Claude input outcome is unresolved and will not be repeated",
-            ))
-        }
+        let result = send_unknown("claude_input_write_unknown", &error.message);
+        session
+            .sends
+            .outcomes
+            .insert(command_id.to_owned(), result.clone());
+        session.sends.reconcile();
+        return Ok(session.sends.outcomes[command_id].clone());
     }
+    let pending = session
+        .sends
+        .pending
+        .as_mut()
+        .expect("send registered its waiter");
+    let result = match tokio::time::timeout_at(deadline, &mut pending.outcome).await {
+        Ok(Ok(outcome)) => return Ok(session.sends.finish(outcome)),
+        Ok(Err(_)) => {
+            session.sends.pending = None;
+            send_unknown(
+                "claude_turn_association_lost",
+                "Claude event task closed without settling the input; it will not be repeated",
+            )
+        }
+        Err(_) => send_unknown(
+            "claude_turn_association_timeout",
+            "Claude turn association was not observed before the deadline; the input will not be repeated",
+        ),
+    };
+    session
+        .sends
+        .outcomes
+        .insert(command_id.to_owned(), result.clone());
+    Ok(result)
 }
 
 /// Spawn the owned CLI and bind the event task: the only start phase that
@@ -2096,10 +2214,7 @@ async fn launch_session(
         mcp_config: Some(mcp_config),
         native_client,
         events,
-        command_inputs: HashMap::new(),
-        command_turns: HashMap::new(),
-        unknown_commands: HashSet::new(),
-        rejected_commands: HashSet::new(),
+        sends: SendHistory::default(),
         interrupt_applied: HashMap::new(),
         interrupted_turns: HashSet::new(),
         unknown_interrupt_turns: HashSet::new(),
@@ -2281,7 +2396,7 @@ fn claude_scope(config_dir: Option<&str>) -> String {
 fn known_command(session: &AgentSession, command_id: &str) -> bool {
     session::known_command(
         &session.start_command_id,
-        &session.command_inputs,
+        &session.sends.inputs,
         &session.stop_command_id,
         command_id,
     ) || session.interrupt_applied.contains_key(command_id)
@@ -2315,9 +2430,10 @@ fn target_environment(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudePlugin, check_mcp_allow_empty, claude_manifest, claude_scope, mcp_argv, new_uuid,
-        setter_error,
+        ClaudePlugin, PendingSend, SendHistory, check_mcp_allow_empty, claude_manifest,
+        claude_scope, mcp_argv, new_uuid, retain_send_rejection, send_unknown, setter_error,
     };
+    use crate::events::TurnOutcome;
     use eliot_core::Error;
     use eliot_core::McpPolicy;
     use eliot_plugin::session::{parse_resume_subject, validate_source_plan};
@@ -2325,6 +2441,146 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
 
     const FAMILIES: &[&str] = &["session", "turn", "message", "request"];
+
+    fn pending_send() -> (SendHistory, tokio::sync::oneshot::Sender<TurnOutcome>) {
+        let (sender, outcome) = tokio::sync::oneshot::channel();
+        let mut sends = SendHistory::default();
+        sends.inputs.insert("cmd-1".to_owned(), "input".to_owned());
+        sends.outcomes.insert(
+            "cmd-1".to_owned(),
+            send_unknown(
+                "claude_input_write_unknown",
+                "native write deadline elapsed",
+            ),
+        );
+        sends.pending = Some(PendingSend {
+            command_id: "cmd-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            outcome,
+        });
+        (sends, sender)
+    }
+
+    #[tokio::test]
+    async fn send_deadline_preserves_waiter_until_exact_late_evidence() {
+        let (mut sends, sender) = pending_send();
+        let pending = sends.pending.as_mut().unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, &mut pending.outcome)
+                .await
+                .is_err()
+        );
+        sends.reconcile();
+        assert!(
+            sends.pending.is_some(),
+            "silence never frees an uncertain input"
+        );
+        assert_eq!(
+            sends.replay("cmd-1", "input").unwrap().unwrap()["state"],
+            "unknown"
+        );
+        assert!(sender.send(TurnOutcome::Associated).is_ok());
+        sends.reconcile();
+        assert!(
+            sends.pending.is_none(),
+            "exact committed association frees the waiter"
+        );
+        assert_eq!(sends.turns["cmd-1"], "turn-1");
+        assert_eq!(
+            sends.replay("cmd-1", "input").unwrap().unwrap(),
+            json!({"state":"applied", "turn_id":"turn-1"})
+        );
+        assert!(sends.replay("cmd-2", "next input").is_none());
+        assert_eq!(
+            sends
+                .replay("cmd-1", "changed input")
+                .unwrap()
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
+    }
+
+    #[test]
+    fn late_native_refusal_retires_only_the_pending_send() {
+        let (mut sends, sender) = pending_send();
+        assert!(
+            sender
+                .send(TurnOutcome::Rejected(
+                    "native cancelled this input".to_owned()
+                ))
+                .is_ok()
+        );
+        sends.reconcile();
+        assert!(sends.pending.is_none());
+        assert!(sends.turns.is_empty());
+        assert_eq!(
+            sends.replay("cmd-1", "input").unwrap().unwrap(),
+            json!({"state":"rejected", "reason":"native cancelled this input"})
+        );
+    }
+
+    #[test]
+    fn uncertain_send_replay_preserves_the_actual_cause() {
+        let (mut sends, sender) = pending_send();
+        assert!(
+            sender
+                .send(TurnOutcome::Unknown(
+                    "turn.started commit acknowledgement lost".to_owned()
+                ))
+                .is_ok()
+        );
+        sends.reconcile();
+        let replay = sends.replay("cmd-1", "input").unwrap().unwrap();
+        assert_eq!(replay["state"], "unknown");
+        assert_eq!(replay["reason"], "turn.started commit acknowledgement lost");
+        assert!(sends.turns.is_empty());
+    }
+
+    #[test]
+    fn closed_send_waiter_never_invents_an_association() {
+        let (mut sends, sender) = pending_send();
+        drop(sender);
+        sends.reconcile();
+        assert!(sends.pending.is_none());
+        assert!(sends.turns.is_empty());
+        assert_eq!(
+            sends.replay("cmd-1", "input").unwrap().unwrap()["cause"],
+            "claude_turn_association_lost"
+        );
+    }
+
+    #[test]
+    fn oversize_send_refusal_is_retained_for_same_id_replay() {
+        use eliot_plugin::MAX_TEXT_BYTES;
+        use eliot_plugin::session::with_claimed_context;
+
+        let oversize = "x".repeat(MAX_TEXT_BYTES + 1);
+        let error = with_claimed_context(&oversize, &[], "Claude").unwrap_err();
+        assert_eq!(error.code, "frame_too_large");
+        let mut sends = SendHistory::default();
+        let retained = retain_send_rejection(
+            &mut sends,
+            "cmd-oversize".to_owned(),
+            &oversize,
+            &error.message,
+        );
+        assert_eq!(retained["state"], "rejected");
+        assert!(sends.pending.is_none());
+        assert!(sends.turns.is_empty());
+        assert_eq!(
+            sends.replay("cmd-oversize", &oversize).unwrap().unwrap(),
+            retained
+        );
+        assert_eq!(
+            sends
+                .replay("cmd-oversize", "different input")
+                .unwrap()
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
+    }
 
     #[test]
     fn exited_start_retires_without_response_delivery_and_keeps_exact_replay() {
