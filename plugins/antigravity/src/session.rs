@@ -44,6 +44,20 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// an empty diagnostic snapshot.
 const SEND_TIMEOUT: Duration = Duration::from_secs(25);
 
+async fn wait_for_association(
+    association: oneshot::Receiver<Result<()>>,
+    deadline: Instant,
+    turn: &str,
+) -> Result<Value> {
+    match timeout_at(deadline, association).await {
+        Ok(Ok(Ok(()))) => Ok(json!({"state": "applied", "turn_id": turn})),
+        _ => Err(Error::new(
+            "unknown",
+            "Antigravity input association is unconfirmed; input will not be resent",
+        )),
+    }
+}
+
 struct RetainedCommand {
     seq: i64,
     command_id: String,
@@ -802,11 +816,27 @@ impl Session {
         }
         let combined = with_claimed_context(text, &params.context, "Antigravity")?;
         let turn = format!("agy-{}", ulid::Ulid::new());
-        {
-            let mut state = self.state.lock().await;
-            state.prepare(params.command_id.clone(), turn.clone())?;
+        let deadline = Instant::now() + SEND_TIMEOUT;
+        let prepared = self.client.prepare_fenced(
+            "session/prompt",
+            prompt_params(&self.conversation, &combined),
+            FencedKind::Prompt,
+        )?;
+        let (write, registration) = prepared.split();
+        let association = {
+            let mut state = timeout_at(deadline, self.state.lock()).await.map_err(|_| {
+                Error::new(
+                    "native_not_dispatched",
+                    "Antigravity input preparation timed out",
+                )
+            })?;
+            let association = state.prepare(params.command_id.clone(), turn.clone())?;
             state.attach_context(&params.command_id, params.context.clone())?;
-        }
+            // Transfer the fence before I/O. A slow event commit must not
+            // hold the send RPC open or drop a still-live native call.
+            state.arm_fenced(registration, &turn);
+            association
+        };
         self.highwater_seq = seq;
         let unknown = Err(Error::new(
             "unknown",
@@ -819,79 +849,25 @@ impl Session {
             turn: turn.clone(),
             outcome: unknown.clone(),
         });
-        // The terminal reply is fenced into the ordered frame channel, so
-        // the event task settles this exact turn behind every preceding
-        // update. The dispatch deadline bounds the native write only: the
-        // acknowledgement below never waits for model output.
-        let prompt = prompt_params(&self.conversation, &combined);
-        let deadline = Instant::now() + SEND_TIMEOUT;
-        let dispatched = self
-            .client
-            .call_fenced("session/prompt", prompt, deadline, FencedKind::Prompt)
-            .await;
-        let registration = match dispatched {
-            Ok((_, registration)) => registration,
-            Err(error) => {
-                if native_no_write(&error.code) {
-                    self.state
-                        .lock()
-                        .await
-                        .withdraw_unwritten(&params.command_id)?;
-                    let result = Ok(
-                        json!({"state": "rejected", "reason": "Antigravity input was not dispatched"}),
-                    );
-                    if let Some(retained) = self.retained.as_mut().filter(|r| r.seq == seq) {
-                        retained.outcome = result.clone();
-                    }
-                    return result;
-                }
-                let mut state = self.state.lock().await;
-                state.fail_prompt(error).await;
-                let result = unknown;
-                if let Some(retained) = self.retained.as_mut().filter(|r| r.seq == seq) {
-                    retained.outcome = result.clone();
-                }
-                return result;
-            }
-        };
-        // Exactly one owner for the registration from here on: the event
-        // state, which retires it on settlement, expiry, loss, or drop —
-        // unless this exact turn already settled while the write was in
-        // flight, in which case `arm_fenced` retires it immediately.
-        self.state.lock().await.arm_fenced(registration, &turn);
-        // The send acknowledgement is bound to native admission, not model
-        // output: the prompt write was accepted, so bind the exact turn
-        // now and ack applied. Waiting for the first update would hold the
-        // plugin RPC past the daemon deadline whenever high thought levels
-        // delay the first emission (observed: a native turn starting
-        // minutes after its send settled unknown). A terminal that already
-        // settled in flight proves admission; only its unknown outcome
-        // keeps this send unknown.
-        let result = {
-            let mut state = self.state.lock().await;
-            let settled = state.settlement_for(&turn).map(str::to_owned);
-            if let Some(status) = settled {
-                if status == "unknown" {
-                    unknown
-                } else {
-                    Ok(json!({"state": "applied", "turn_id": turn}))
-                }
-            } else {
-                match state.associate().await {
-                    Ok(()) => Ok(json!({"state": "applied", "turn_id": turn})),
-                    Err(error) if native_no_write(&error.code) => {
-                        drop(state);
-                        self.state
-                            .lock()
-                            .await
-                            .withdraw_unwritten(&params.command_id)?;
-                        Ok(
+        // Native write acceptance is transport delivery only. The event
+        // owner acknowledges after committing correlated native evidence.
+        let dispatched = self.client.dispatch_fenced_write(write, deadline).await;
+        let result = match dispatched {
+            Ok(_) => wait_for_association(association, deadline, &turn).await,
+            Err(error) if native_no_write(&error.code) => {
+                match timeout_at(deadline, self.state.lock()).await {
+                    Ok(mut state) => match state.withdraw_unwritten(&params.command_id) {
+                        Ok(()) => Ok(
                             json!({"state": "rejected", "reason": "Antigravity input was not dispatched"}),
-                        )
-                    }
-                    Err(_) => unknown,
+                        ),
+                        Err(_) => unknown,
+                    },
+                    _ => unknown,
                 }
             }
+            // Retain the pending input and its fence: dispatch may have
+            // happened, and neither this error nor the wait permits replay.
+            Err(_) => unknown,
         };
         if let Some(retained) = self.retained.as_mut().filter(|r| r.seq == seq) {
             retained.outcome = result.clone();
@@ -1167,24 +1143,33 @@ impl Session {
         }
         // Re-check the exact turn under the same lock discipline as send:
         // a turn that ended since the first check was never interrupted.
-        {
-            let state = self.state.lock().await;
+        let dispatched = {
+            let mut state = self.state.lock().await;
             if state.active_turn() != Some(turn_id) {
                 return Err(Error::new(
                     "stale_turn",
                     "turn/interrupt does not match the exact active native turn",
                 ));
             }
-        }
-        self.highwater_seq = seq;
-        let dispatched = self
-            .client
-            .notify(
-                "session/cancel",
-                Some(json!({"sessionId": self.conversation})),
-                Instant::now() + TIMEOUT,
-            )
-            .await;
+            self.highwater_seq = seq;
+            // Hold the event lock across the write and latch: an ask queued
+            // during session/cancel must observe this exact-turn intent.
+            let dispatched = self
+                .client
+                .notify(
+                    "session/cancel",
+                    Some(json!({"sessionId": self.conversation})),
+                    Instant::now() + TIMEOUT,
+                )
+                .await;
+            if !matches!(&dispatched, Err(error) if native_no_write(&error.code)) {
+                state.latch_cancellation(&params.command_id, Some(turn_id));
+                state
+                    .answer_pending_cancelled(&self.client, &params.command_id, Some(turn_id))
+                    .await;
+            }
+            dispatched
+        };
         let result = match dispatched {
             Ok(()) => {
                 // Per the ACP cancellation contract, answer every pending
@@ -1192,12 +1177,6 @@ impl Session {
                 // before waiting: the native cannot reach its cancelled
                 // terminal while an ask is still open. Best-effort per
                 // ask; the terminal below still decides the interrupt.
-                {
-                    let mut state = self.state.lock().await;
-                    state
-                        .answer_pending_cancelled(&self.client, &params.command_id, Some(turn_id))
-                        .await;
-                }
                 // The notification write proves dispatch only, never
                 // cancellation. Wait (bounded, lock-free between polls)
                 // for the prompt task's actual settlement of this exact
@@ -1356,6 +1335,8 @@ impl Session {
         // session teardown below still decides the stop.
         {
             let mut state = self.state.lock().await;
+            state.stopping = true;
+            state.latch_cancellation(&params.command_id, None);
             state
                 .answer_pending_cancelled(&self.client, &params.command_id, None)
                 .await;
@@ -1708,6 +1689,49 @@ fn remove_hook_config(config: &OwnedHookConfig) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn send_wait_requires_committed_native_association() {
+        let (reply, association) = oneshot::channel();
+        let wait = wait_for_association(
+            association,
+            Instant::now() + Duration::from_secs(1),
+            "turn-1",
+        );
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut wait)
+                .await
+                .is_err()
+        );
+        reply.send(Ok(())).unwrap();
+        assert_eq!(
+            wait.await.unwrap(),
+            json!({"state": "applied", "turn_id": "turn-1"})
+        );
+    }
+
+    #[tokio::test]
+    async fn send_admission_deadline_returns_unknown_before_host_deadline() {
+        assert!(SEND_TIMEOUT < TIMEOUT);
+        let (reply, association) = oneshot::channel();
+        let result = wait_for_association(association, Instant::now(), "turn-1").await;
+        assert_eq!(result.unwrap_err().code, "unknown");
+        assert!(reply.is_closed());
+    }
+
+    #[tokio::test]
+    async fn native_exit_without_association_never_acknowledges_applied() {
+        let (reply, association) = oneshot::channel();
+        drop(reply);
+        assert_eq!(
+            wait_for_association(association, Instant::now() + SEND_TIMEOUT, "turn-1")
+                .await
+                .unwrap_err()
+                .code,
+            "unknown"
+        );
+    }
 
     #[test]
     fn command_history_tracking_and_conflicts() {

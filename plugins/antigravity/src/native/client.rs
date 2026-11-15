@@ -92,15 +92,23 @@ pub(crate) struct FencedGuard {
 /// The caller can arm the corresponding event state with `request_id`
 /// before dispatching it.
 pub(crate) struct PreparedFencedCall {
+    write: FencedWrite,
+    registration: FencedGuard,
+}
+
+pub(crate) struct FencedWrite {
     id: String,
     method: String,
     encoded: String,
-    registration: FencedGuard,
 }
 
 impl PreparedFencedCall {
     pub fn request_id(&self) -> &str {
-        &self.id
+        &self.write.id
+    }
+
+    pub fn split(self) -> (FencedWrite, FencedGuard) {
+        (self.write, self.registration)
     }
 }
 
@@ -273,21 +281,6 @@ impl AgyClient {
         self.write_encoded(encoded, deadline).await
     }
 
-    /// Dispatch one request whose reply must be consumed in wire order
-    /// behind preceding stream records. Returns the request id plus the
-    /// RAII registration guard; the reply arrives as the matching
-    /// [`AgyFrame`] variant on the event channel.
-    pub async fn call_fenced(
-        &self,
-        method: &str,
-        params: Value,
-        deadline: Instant,
-        kind: FencedKind,
-    ) -> Result<(String, FencedGuard)> {
-        let prepared = self.prepare_fenced(method, params, kind)?;
-        self.dispatch_fenced(prepared, deadline).await
-    }
-
     /// Reserve the exact request id and its ordered response route without
     /// writing to the native process. Load callers use this to arm the
     /// event-state filter before any `session/load` I/O.
@@ -324,9 +317,11 @@ impl AgyClient {
             id: id.clone(),
         };
         Ok(PreparedFencedCall {
-            id,
-            method: method.to_owned(),
-            encoded,
+            write: FencedWrite {
+                id,
+                method: method.to_owned(),
+                encoded,
+            },
             registration,
         })
     }
@@ -337,16 +332,27 @@ impl AgyClient {
         prepared: PreparedFencedCall,
         deadline: Instant,
     ) -> Result<(String, FencedGuard)> {
-        let PreparedFencedCall {
+        let (write, registration) = prepared.split();
+        self.dispatch_fenced_write(write, deadline)
+            .await
+            .map(|id| (id, registration))
+    }
+
+    /// Dispatch after the event owner has taken the registration, so a
+    /// slow commit cannot delay the send acknowledgement or retire its fence.
+    pub async fn dispatch_fenced_write(
+        &self,
+        write: FencedWrite,
+        deadline: Instant,
+    ) -> Result<String> {
+        let FencedWrite {
             id,
             method,
             encoded,
-            registration,
-        } = prepared;
+        } = write;
         match self.write_encoded(encoded, deadline).await {
-            Ok(()) => Ok((id, registration)),
+            Ok(()) => Ok(id),
             Err(error) => {
-                // `registration` drops here and retires both maps.
                 if error.code == "native_not_dispatched" {
                     return Err(error);
                 }

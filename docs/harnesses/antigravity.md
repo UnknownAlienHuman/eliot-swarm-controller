@@ -73,8 +73,11 @@ silently ignored. The launch-time permission posture remains
 spawned in the workspace), since the session response echoes no cwd.
 
 A `session/request_permission` ask (`{sessionId, toolCall, options}`)
-opens a Swarm approval request bound to the exact generation, turn and
-tool call id, with kind `approval` and the shared `ApprovalRequest`
+opens a Swarm approval request with a distinct bounded local id for each
+native JSON-RPC request, bound to the exact generation and turn. The
+native JSON-RPC id, tool call id and options remain separately retained
+inside the plugin; repeated asks for one tool call stay independently
+answerable. The request has kind `approval` and the shared `ApprovalRequest`
 public details: a redacted plain-text summary (title plus tool
 name/kind and compact raw input, never the native record) and one
 choice per usable offered option, `approve` for `allow_once`/
@@ -90,8 +93,11 @@ and commits `request.resolved`; only a proven no-write keeps the ask
 answerable, anything uncertain latches unknown without a rewrite.
 Nothing is ever auto-approved: an unanswered ask keeps the turn busy
 (and the Agent waiting) until the owner, the manager, or a cancel
-resolves it. An interrupt or stop answers every open ask `cancelled`
-(the ACP cancellation contract) before the terminal settles; asks the
+resolves it. A validated permission ask associates the pending input
+before `request.opened` is committed. Interrupt/stop latches cancellation
+for the exact turn under the event lock and answers both existing and
+subsequently arriving asks `cancelled` once (uncertain writes are never
+repeated). The latch never carries into a new turn. Asks the
 native ends without consuming are closed (`request.closed`) ahead of
 the terminal commit. Verified live 2026-11-15 against installed agy
 1.5.9: a `git log` ask approved (command ran, final answer returned),
@@ -105,10 +111,18 @@ Launch establishes the session before input; send dispatches one
 call: its terminal reply re-enters the ordered frame channel behind every
 preceding `session/update`, so the exact prepared turn settles only
 after those updates have been consumed — never from a direct pending
-route, a sleep, or silence. Send returns `applied` on native admission
-(the accepted prompt write binds the exact turn via `turn.started`),
-never on the first model output: at high thought levels the first
-emission can lag admission by minutes, past the plugin RPC deadline.
+route, a sleep, or silence. A successful stdin flush proves transport
+delivery only. Send returns `applied` only after the event owner commits
+`turn.started` from matching-session native progress, a validated
+permission ask, or the correlated fenced terminal response. A schema-valid
+`usage_update` (both `used` and `size`) is early session progress: when one
+input is outstanding in this uninterrupted process it can establish its
+association without waiting for model text; idle/startup usage creates no
+turn. This uses the [pinned ACP v1 schema](https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/7ec5185c18ca928b48e457d2d8a163800be013c8/schema/v1/schema.json),
+which defines session progress but guarantees neither an admission update
+nor its timing. The supplied ctl6 observation (agy 1.5.9, 2026-11-15,
+`usage_update` immediately before `turn.started`) has not been re-verified
+on this branch: account quota is exhausted for approximately 150 hours.
 The terminal `stopReason` settles the turn through
 the event state, never from the send ack alone. The fenced registration
 is held until that actual in-band terminal reply, an error, a stream
@@ -122,10 +136,12 @@ blocks contribute no text), bounded at 256 KiB, then
 bookkeeping. A normal completion with no assistant text at all keeps its
 native `stopReason` but carries
 `final_text_unavailable:"empty_native_response"` (see Facts and recovery),
-so silence is never presented as a normal answer. Send itself is bounded
-(25 s for the native write; the acknowledgement binds at admission, not
-at the first model output) so the plugin always settles before the
-daemon's 30 s plugin RPC. Tool calls map from `tool_call`/`tool_call_update` with the
+so silence is never presented as a normal answer. Send uses one 25 s
+deadline for preparation, the native write and committed association,
+inside the daemon's 30 s plugin RPC. With no confirmed association by
+that deadline it returns retained `unknown`, never `applied` or an RPC
+timeout. The pending input and terminal fence remain live; neither the
+deadline nor an exact command retry resends input. Tool calls map from `tool_call`/`tool_call_update` with the
 vendor `toolCallId` as the item id. Tool updates are partial deltas:
 title and status merge into the known per-id state before any event is
 derived, so an omitted field inherits the last known value and only a

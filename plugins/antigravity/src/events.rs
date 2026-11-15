@@ -103,9 +103,26 @@ enum NativeReplyState {
 struct PendingNativeRequest {
     turn_id: String,
     native_id: Value,
+    tool_call_id: String,
     options: Vec<PermissionOption>,
     reply_command_id: Option<String>,
     reply_state: NativeReplyState,
+}
+
+impl PendingNativeRequest {
+    fn begin_cancel(&mut self, command_id: &str) -> Option<Value> {
+        if self.reply_state != NativeReplyState::Available {
+            return None;
+        }
+        self.reply_state = NativeReplyState::Writing;
+        self.reply_command_id = Some(command_id.to_owned());
+        Some(self.native_id.clone())
+    }
+}
+
+struct CancellationIntent {
+    turn_id: String,
+    command_id: String,
 }
 
 /// The ACP `cancelled` permission outcome: the prompt turn ended before
@@ -193,10 +210,12 @@ pub(crate) struct State {
     source_health_attempted: bool,
     pub source_health_stale: bool,
     pub source_health_unknown: bool,
-    /// Open native permission asks by tool call id. The ask stays open
+    /// Open native permission asks by distinct local request id. The ask stays open
     /// (and the Agent waiting) until an explicit approve/deny reply, a
     /// cancelling interrupt/stop, or the turn closing it.
     pending_requests: HashMap<String, PendingNativeRequest>,
+    /// Retained until a new input is prepared; never applies to a later turn.
+    cancellation: Option<CancellationIntent>,
     pub failure: Option<String>,
     pub source_unknown: bool,
     pub batch_unknown: bool,
@@ -258,6 +277,7 @@ impl State {
             source_health_stale: false,
             source_health_unknown: false,
             pending_requests: HashMap::new(),
+            cancellation: None,
             failure: None,
             source_unknown: false,
             batch_unknown: false,
@@ -551,6 +571,7 @@ impl State {
             associated: false,
             reply: Some(reply),
         });
+        self.cancellation = None;
         self.tool_emitted.clear();
         self.tools.clear();
         self.clear_fenced();
@@ -611,10 +632,8 @@ impl State {
     }
 
     /// Bind the prepared input to its turn by committing `turn.started`.
-    /// Called at native admission (right after the prompt write is
-    /// accepted); the event task also calls it on the first native update
-    /// or terminal, idempotently, so ordering races never duplicate the
-    /// commit or downgrade an admitted turn.
+    /// Called only by the ordered native event owner on correlated progress,
+    /// a permission ask or the fenced terminal response, never by the writer.
     pub(crate) async fn associate(&mut self) -> Result<()> {
         let pending = self.pending.as_ref().ok_or_else(|| {
             Error::new(
@@ -688,6 +707,20 @@ impl State {
                 )
                 .await;
         }
+        if let Some(entry) = self
+            .pending_requests
+            .values()
+            .find(|entry| entry.native_id == native_id)
+        {
+            return if entry.turn_id == turn_id && entry.tool_call_id == ask.tool_call_id {
+                Ok(())
+            } else {
+                Err(Error::new(
+                    "source_integrity",
+                    "Antigravity native request id changed binding",
+                ))
+            };
+        }
         if self.pending_requests.len() >= MAX_PENDING_REQUESTS {
             return self
                 .stray_permission_request(
@@ -741,12 +774,27 @@ impl State {
         })?;
         let data = json!({
             "command_id": command_id,
-            "request_id": ask.tool_call_id,
             "turn_id": turn_id,
             "kind": "approval",
             "details": details,
         });
-        if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
+        let publication = self
+            .publish_permission_request(
+                data,
+                PendingNativeRequest {
+                    turn_id: turn_id.clone(),
+                    native_id: native_id.clone(),
+                    tool_call_id: ask.tool_call_id.clone(),
+                    options: ask.options.clone(),
+                    reply_command_id: None,
+                    reply_state: NativeReplyState::Available,
+                },
+            )
+            .await;
+        if publication
+            .as_ref()
+            .is_err_and(|error| error.code == "frame_too_large")
+        {
             return self
                 .stray_permission_request(
                     client,
@@ -756,34 +804,66 @@ impl State {
                 )
                 .await;
         }
-        let native_event =
-            match request_event_id(&ask.tool_call_id, "request.opened", "agy", "Antigravity") {
-                Ok(native_event) => native_event,
-                Err(_) => {
-                    return self
-                        .stray_permission_request(
-                            client,
-                            native_id,
-                            Some(&ask),
-                            "Antigravity native request event identity exceeded its bound",
-                        )
-                        .await;
-                }
-            };
+        publication?;
+        if let Some(command_id) = self.cancellation_for_pending().map(str::to_owned) {
+            self.answer_pending_cancelled(client, &command_id, Some(&turn_id))
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn publish_permission_request(
+        &mut self,
+        mut data: Value,
+        entry: PendingNativeRequest,
+    ) -> Result<()> {
+        if self.pending.as_ref().is_none_or(|pending| {
+            pending.turn != entry.turn_id
+                || data["turn_id"] != pending.turn
+                || data["command_id"] != pending.command
+        }) {
+            return Err(Error::new(
+                "source_integrity",
+                "Antigravity permission turn binding changed",
+            ));
+        }
+        let request_id = format!("agy-request-{}", Ulid::new());
+        data["request_id"] = json!(request_id);
+        if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
+            return Err(Error::new(
+                "frame_too_large",
+                "Antigravity normalized request exceeded its bound",
+            ));
+        }
+        let native_event = request_event_id(&request_id, "request.opened", "agy", "Antigravity")?;
+        // The session and pending binding were validated before publication.
+        // A native ask is itself evidence that AGY accepted this input.
+        self.associate().await?;
         self.source()
             .commit_event("request.opened", native_event, data)
             .await?;
-        self.pending_requests.insert(
-            ask.tool_call_id.clone(),
-            PendingNativeRequest {
-                turn_id,
-                native_id,
-                options: ask.options,
-                reply_command_id: None,
-                reply_state: NativeReplyState::Available,
-            },
-        );
+        self.pending_requests.insert(request_id, entry);
         Ok(())
+    }
+
+    pub fn latch_cancellation(&mut self, command_id: &str, turn_id: Option<&str>) {
+        if let Some(pending) = self.pending.as_ref()
+            && turn_id.is_none_or(|turn| turn == pending.turn)
+        {
+            self.cancellation = Some(CancellationIntent {
+                turn_id: pending.turn.clone(),
+                command_id: command_id.to_owned(),
+            });
+        }
+    }
+
+    fn cancellation_for_pending(&self) -> Option<&str> {
+        self.cancellation.as_ref().and_then(|intent| {
+            self.pending
+                .as_ref()
+                .filter(|pending| pending.turn == intent.turn_id)
+                .map(|_| intent.command_id.as_str())
+        })
     }
 
     /// Compose the public approval summary from the decision-relevant
@@ -918,7 +998,11 @@ impl State {
             }
             _ => {}
         }
-        if self.conversation.is_empty() || self.stopped || self.stopping {
+        if self.conversation.is_empty()
+            || self.stopped
+            || self.stopping
+            || self.cancellation_for_pending().is_some()
+        {
             return Ok(rejected_control(
                 "Antigravity request session is no longer writable",
             ));
@@ -1057,18 +1141,13 @@ impl State {
             .map(|(id, _)| id.clone())
             .collect();
         for request_id in ids {
-            let Some(entry) = self.pending_requests.get(&request_id) else {
+            let Some(entry) = self.pending_requests.get_mut(&request_id) else {
                 continue;
             };
-            if !matches!(entry.reply_state, NativeReplyState::Available) {
-                continue;
-            }
             let turn = entry.turn_id.clone();
-            let native_id = entry.native_id.clone();
-            if let Some(entry) = self.pending_requests.get_mut(&request_id) {
-                entry.reply_state = NativeReplyState::Writing;
-                entry.reply_command_id = Some(command_id.to_owned());
-            }
+            let Some(native_id) = entry.begin_cancel(command_id) else {
+                continue;
+            };
             match client
                 .respond_permission(
                     native_id,
@@ -1288,17 +1367,24 @@ impl State {
                 // `session.usage` when accepted, with `observed_at` captured
                 // at acceptance. Session-scoped facts, never per-turn
                 // input/output totals.
-                let Some(merged) = session_usage_from_update(
+                if let Some(merged) = session_usage_from_update(
                     used,
                     size,
                     cost_amount,
                     cost_unit,
                     self.session_usage.as_ref(),
-                ) else {
-                    return Ok(());
-                };
-                self.session_usage = Some(merged.clone());
-                self.commit_session_usage_now(merged).await
+                ) {
+                    self.session_usage = Some(merged.clone());
+                    self.commit_session_usage_now(merged).await?;
+                }
+                // ACP session progress is correlated by the exact session
+                // and its one outstanding input in this uninterrupted process.
+                // Idle/startup usage remains session-only. Require the schema's
+                // two counters; tolerant partial snapshots cannot admit input.
+                if used.is_some() && size.is_some() && self.pending.is_some() {
+                    self.associate().await?;
+                }
+                Ok(())
             }
             AcpUpdate::ToolCall {
                 tool_call_id,
@@ -2013,4 +2099,272 @@ fn hook_ipc_response_fits(output: &HookOutput) -> bool {
     };
     serde_json::to_vec(&response)
         .is_ok_and(|bytes| bytes.len().saturating_add(1) <= MAX_HOOK_FRAME_BYTES)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split},
+        task::JoinHandle,
+        time::{Duration, timeout},
+    };
+
+    type CommitRecord = (Value, oneshot::Sender<()>);
+
+    // Exercise the real commit/ACK path over in-memory plugin I/O, without
+    // launching a native process or claiming vendor/runtime qualification.
+    fn state_with_commits() -> (State, mpsc::Receiver<CommitRecord>, [JoinHandle<()>; 2]) {
+        let (host_io, plugin_io) = duplex(64 * 1024);
+        let (read, write) = split(plugin_io);
+        let mut peer = eliot_plugin::Peer::from_io(read, write);
+        let state = State::new(
+            peer.client(),
+            "credential".into(),
+            "a1".into(),
+            1,
+            SecretPolicy::new(Vec::<String>::new()),
+            "session-1".into(),
+        );
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+        let (tx, rx) = mpsc::channel(8);
+        let host_task = tokio::spawn(async move {
+            let (read, mut write) = split(host_io);
+            let mut reader = BufReader::new(read);
+            let mut seq = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let request: eliot_plugin::RpcRequest = serde_json::from_str(&line).unwrap();
+                assert_eq!(request.method, "events.put");
+                let event = request.params["events"][0].clone();
+                let (ack, acknowledged) = oneshot::channel();
+                tx.send((event, ack)).await.unwrap();
+                acknowledged.await.unwrap();
+                seq += 1;
+                let response = json!({"jsonrpc": "2.0", "id": request.id,
+                    "result": {"first_seq": seq, "last_seq": seq, "cursor": null}});
+                write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        (state, rx, [peer_task, host_task])
+    }
+
+    async fn next_commit(commits: &mut mpsc::Receiver<CommitRecord>, kind: &str) -> CommitRecord {
+        let (event, ack) = timeout(Duration::from_secs(1), commits.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event["kind"], kind);
+        (event, ack)
+    }
+
+    async fn finish(tasks: [JoinHandle<()>; 2]) {
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    fn request_data() -> Value {
+        json!({"command_id": "command-1", "turn_id": "turn-1", "kind": "approval",
+            "details": {"summary": "run tool", "choices": [{"id": "yes", "label": "yes",
+                "decision": "approve", "feedback_allowed": false}], "feedback_allowed": false}})
+    }
+
+    fn request(native_id: Value) -> PendingNativeRequest {
+        PendingNativeRequest {
+            turn_id: "turn-1".into(),
+            native_id,
+            tool_call_id: "same-tool".into(),
+            options: vec![PermissionOption {
+                option_id: "yes".into(),
+                name: "yes".into(),
+                kind: "allow_once".into(),
+            }],
+            reply_command_id: None,
+            reply_state: NativeReplyState::Available,
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_admission_waits_for_commit_and_needs_no_model_output() {
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let mut association = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        assert!(matches!(
+            association.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        let update = json!({"sessionId": "session-1", "update": {
+            "sessionUpdate": "usage_update", "used": 12, "size": 100}});
+        let (result, ()) = tokio::join!(state.update(&update), async {
+            for kind in ["session.usage", "turn.started"] {
+                let (_, ack) = next_commit(&mut commits, kind).await;
+                assert!(matches!(
+                    association.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+                ack.send(()).unwrap();
+            }
+        });
+        result.unwrap();
+        association.await.unwrap().unwrap();
+        assert!(state.text_accum.is_empty());
+        finish(tasks).await;
+    }
+
+    #[tokio::test]
+    async fn idle_partial_and_other_session_usage_cannot_admit_input() {
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let usage = json!({"sessionUpdate": "usage_update", "used": 12, "size": 100});
+        let (result, ()) = tokio::join!(
+            state.apply_update(
+                "session-1".into(),
+                classify_update(&json!({"sessionId": "session-1", "update": usage}))
+                    .unwrap()
+                    .1
+            ),
+            async {
+                next_commit(&mut commits, "session.usage")
+                    .await
+                    .1
+                    .send(())
+                    .unwrap();
+            }
+        );
+        result.unwrap();
+        assert!(state.pending.is_none());
+        let mut association = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        assert!(
+            state
+                .update(&json!({"sessionId": "other", "update": usage}))
+                .await
+                .is_err()
+        );
+        state
+            .update(&json!({"sessionId": "session-1", "update": {
+            "sessionUpdate": "usage_update", "used": 12}}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            association.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        // An unchanged but complete native snapshot still proves progress.
+        let update = json!({"sessionId": "session-1", "update": usage});
+        let (result, ()) = tokio::join!(state.update(&update), async {
+            next_commit(&mut commits, "turn.started")
+                .await
+                .1
+                .send(())
+                .unwrap();
+        });
+        result.unwrap();
+        association.await.unwrap().unwrap();
+        finish(tasks).await;
+    }
+
+    #[tokio::test]
+    async fn early_permission_associates_before_open_and_preserves_distinct_native_rounds() {
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let association = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        let ((), events) = tokio::join!(
+            async {
+                state
+                    .publish_permission_request(request_data(), request(json!("native-1")))
+                    .await
+                    .unwrap();
+                state
+                    .publish_permission_request(request_data(), request(json!(2)))
+                    .await
+                    .unwrap();
+            },
+            async {
+                let mut events = Vec::new();
+                for kind in ["turn.started", "request.opened", "request.opened"] {
+                    let (event, ack) = next_commit(&mut commits, kind).await;
+                    events.push(event);
+                    ack.send(()).unwrap();
+                }
+                events
+            }
+        );
+        association.await.unwrap().unwrap();
+        assert_ne!(events[1]["native_id"], events[2]["native_id"]);
+        let first = events[1]["data"]["request_id"].as_str().unwrap();
+        let second = events[2]["data"]["request_id"].as_str().unwrap();
+        assert_ne!(first, second);
+        assert!(first.len() < 64 && second.len() < 64);
+        assert_eq!(state.pending_requests.len(), 2);
+        assert_eq!(state.pending_requests[first].native_id, "native-1");
+        assert_eq!(state.pending_requests[second].native_id, 2);
+        assert_eq!(state.pending_requests[first].tool_call_id, "same-tool");
+        assert_eq!(state.pending_requests[second].options[0].option_id, "yes");
+        finish(tasks).await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_and_stop_latch_before_late_asks_and_cancel_once() {
+        for stopping in [false, true] {
+            let (mut state, mut commits, tasks) = state_with_commits();
+            let _association = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+            assert!(state.pending_requests.is_empty()); // original snapshot missed the queued ask
+            state.stopping = stopping;
+            state.latch_cancellation("cancel-1", if stopping { None } else { Some("turn-1") });
+            let (result, ()) = tokio::join!(
+                state.publish_permission_request(request_data(), request(json!("late-native"))),
+                async {
+                    for kind in ["turn.started", "request.opened"] {
+                        next_commit(&mut commits, kind).await.1.send(()).unwrap();
+                    }
+                }
+            );
+            result.unwrap();
+            let command = state.cancellation_for_pending().unwrap().to_owned();
+            let entry = state.pending_requests.values_mut().next().unwrap();
+            assert_eq!(entry.begin_cancel(&command), Some(json!("late-native")));
+            assert!(entry.begin_cancel(&command).is_none());
+            entry.reply_state = NativeReplyState::Unknown;
+            assert!(entry.begin_cancel(&command).is_none());
+            assert_eq!(
+                cancelled_permission_outcome(),
+                json!({"outcome": {"outcome": "cancelled"}})
+            );
+            finish(tasks).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_intent_never_binds_a_different_or_new_turn() {
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let _association = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        state.latch_cancellation("wrong", Some("other-turn"));
+        assert!(state.cancellation_for_pending().is_none());
+        state.latch_cancellation("cancel-1", Some("turn-1"));
+        let prompt = PromptResult {
+            stop_reason: "cancelled".into(),
+            usage: None,
+        };
+        let (result, ()) = tokio::join!(state.settle_prompt(&prompt), async {
+            for kind in ["turn.started", "turn.completed"] {
+                next_commit(&mut commits, kind).await.1.send(()).unwrap();
+            }
+        });
+        result.unwrap();
+        let _new_association = state.prepare("command-2".into(), "turn-2".into()).unwrap();
+        assert!(state.cancellation_for_pending().is_none());
+        assert!(
+            state
+                .publish_permission_request(request_data(), request(json!(3)))
+                .await
+                .is_err()
+        );
+        assert!(commits.try_recv().is_err());
+        finish(tasks).await;
+    }
 }
