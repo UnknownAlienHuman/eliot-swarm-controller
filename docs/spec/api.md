@@ -413,7 +413,15 @@ action child. Manual runs do not consume the scheduled slot. See the timer seman
 `agent.get` includes the current generation's source rows and the managed workspace
 target generation's rows when it differs. If persisted state requires a live owner and
 the corresponding source is absent, it returns `unknown` rather than asserting the
-persisted state is current.
+persisted state is current. The Agent `effective` settings are the last
+natively admitted values, never a prediction: the launch `session.ready`
+readback sets them, and a `configure` revision's turn refreshes them when the
+harness proves what its native turn request carried (Codex reports the
+carried model/effort and Muse reports the carried effort through the
+exact-turn association, which acknowledges native admission of those values;
+`effort_verified`/`model_verified` mark that admission). Values no turn
+re-proves stay at their admission readback; no value is ever presented as
+verified without that admission.
 
 Request DTOs reject unknown fields. Required Agent IDs are nonempty after a trim check
 and are kept as supplied. Optional `generation`, `after` and process `scope` members may
@@ -958,9 +966,14 @@ restores revoked control; unknown blocks another takeover.
 per-harness installation facts (installed, resolved `cmd`, `--version`; Claude
 additionally reports every discovered install newest first in `candidates`);
 `harness.models` (`HarnessModelsRequest`/`HarnessModelsResponse`) returns the
-harness's own read-only catalogue (Codex/Muse native `model/list`, the OpenCode
-provider/model list, Antigravity `agy models`; Claude reports aliases plus the
-CLI default). An optional `profile` selects the native route/account
+harness's own read-only catalogue (Codex/Muse native `model/list`, OpenCode
+native `opencode models` provider/model ids verbatim, Antigravity
+`agy models`; Claude reports aliases plus the CLI default). The `catalogue`
+member is `native` for a live read, `aliases` for Claude, `empty` when the
+native read ran but listed no models (ad-hoc Muse on a launcher-marked binary
+with an empty `model/list`: the note names that binary and the `--cmd` /
+profile remedy), or `none` when the harness exposes no catalogue.
+An optional `profile` selects the native route/account
 (the named profile must exist and its frozen harness must match); omitted it
 means ad-hoc daemon defaults. The read is cached per native route/account
 scope with a freshness timestamp (`fetched_at_ms`, `ttl_ms`) and a nonsecret

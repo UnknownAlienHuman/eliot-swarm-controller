@@ -2620,6 +2620,10 @@ impl Router {
                         "live harness catalogue requires a frozen snapshot",
                     ));
                 };
+                let snapshot_cmd = snapshot
+                    .get("cmd")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 let raw = self.inner.plugin_host.models(snapshot).await?;
                 let models = raw
                     .get("models")
@@ -2656,27 +2660,53 @@ impl Router {
                     .and_then(Value::as_str)
                     .filter(|default| !default.trim().is_empty())
                     .map(str::to_owned);
-                let note = if harness == "muse" {
-                    Some(
-                        "Muse model/list names no default marker; the server default applies at launch"
-                            .to_owned(),
+                let (catalogue, note) = if harness == "muse" && entries.is_empty() {
+                    // The launcher-marked Muse binary answered `model/list`
+                    // with an empty catalogue (observed on Muse 1.4.20's
+                    // empty `bundledCatalog`): no server default exists to
+                    // apply, so the read reports `empty` honestly instead of
+                    // the default-marker note. Discovery stays deterministic
+                    // on the launcher mark (no extra native launch beyond
+                    // this read); pass `--cmd` (or a profile pinning `cmd`)
+                    // naming a binary with a live catalogue, e.g. the
+                    // pinned 1.4.0 binary.
+                    let binary = snapshot_cmd.as_deref().unwrap_or("muse");
+                    (
+                        "empty".to_owned(),
+                        Some(format!(
+                            "Muse model/list from {binary} returned an empty catalogue; ad-hoc launch needs an explicit model, or --cmd naming a binary with a live catalogue"
+                        )),
+                    )
+                } else if harness == "muse" {
+                    (
+                        "native".to_owned(),
+                        Some(
+                            "Muse model/list names no default marker; the server default applies at launch"
+                                .to_owned(),
+                        ),
                     )
                 } else if harness == "opencode" {
-                    Some(
-                        "OpenCode lists providers from native auth; the configured model resolves at launch"
-                            .to_owned(),
+                    (
+                        "native".to_owned(),
+                        Some(
+                            "OpenCode catalogue from native `opencode models`; ids are provider/model verbatim, the frozen auth integration applies at launch"
+                                .to_owned(),
+                        ),
                     )
                 } else if harness == "antigravity" {
-                    Some(
-                        "Antigravity catalogue from `agy models`; effort-suffixed ids map to thought_level at launch"
-                            .to_owned(),
+                    (
+                        "native".to_owned(),
+                        Some(
+                            "Antigravity catalogue from `agy models`; effort-suffixed ids map to thought_level at launch"
+                                .to_owned(),
+                        ),
                     )
                 } else {
-                    None
+                    ("native".to_owned(), None)
                 };
                 eliot_core::api::HarnessModelsResponse {
                     harness: harness.clone(),
-                    catalogue: "native".to_owned(),
+                    catalogue,
                     models: entries,
                     default,
                     note,

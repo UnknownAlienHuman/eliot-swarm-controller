@@ -300,7 +300,7 @@ rejected. `cmd` is discovered by following the npm shim to the native
 `<shim-dir>/node_modules/@opencode/cli/bin/opencode.exe`, then the known
 package-local paths under every roaming root including the
 `USERPROFILE`-derived default when `APPDATA` is stripped); `--cmd` pins one
-explicit install instead. `swarm models --harness opencode` lists providers
-from native auth; a launch resolves the full provider/model pair (an omitted
-model leaves the configured native default, read back from the session
-echo).
+explicit install instead. `swarm models --harness opencode` lists the native
+`opencode models` catalogue (`provider/model` ids verbatim; a launch resolves
+the full provider/model pair, an omitted model leaves the configured native
+default, read back from the session echo).

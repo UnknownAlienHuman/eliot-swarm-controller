@@ -652,4 +652,6 @@ discovered from the launcher dir version the launcher marks current
 (`muse.cmd` wrappers are never frozen); `--cmd` pins one explicit binary
 version instead (e.g. the 1.4.0 binary while the launcher marks 1.4.20).
 `swarm models --harness muse` returns the live native catalogue; note it
-carries no default marker.
+carries no default marker. An empty native read reports
+`catalogue: "empty"` with a note naming the binary and the `--cmd` / profile
+remedy.

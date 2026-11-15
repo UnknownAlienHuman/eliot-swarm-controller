@@ -274,7 +274,8 @@ pub(crate) struct LaunchArgs {
     #[arg(long, value_name = "MODEL")]
     pub(crate) model: Option<String>,
     /// Ad-hoc reasoning effort; omitted uses the harness native default.
-    /// Only Codex and Muse map effort; other harnesses reject it.
+    /// Only Codex, Muse and Claude (closed low|medium|high|xhigh|max) map
+    /// effort; other harnesses reject it.
     #[arg(long, value_name = "EFFORT")]
     pub(crate) effort: Option<String>,
     /// Ad-hoc auth integration; OpenCode-only. An explicit selector freezes
