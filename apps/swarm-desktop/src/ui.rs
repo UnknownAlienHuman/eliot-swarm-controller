@@ -1702,6 +1702,14 @@ impl Component for DesktopApp {
                             "Save outcome uncertain; Reload to see the current file (the draft is kept): {error}"
                         );
                     }
+                    Err(error) if error.starts_with("conflict:") => {
+                        // The file changed on disk under this draft: nothing
+                        // was written by this save, and Reload would discard
+                        // the draft, so say both.
+                        self.editor.status = format!(
+                            "Not saved: config.toml changed on disk after this draft was read. Copy what you need from the draft, then Reload to edit the current file. ({error})"
+                        );
+                    }
                     Err(error) => {
                         self.editor.status = format!(
                             "{} The draft is kept and the saved file is unchanged: {error}",
