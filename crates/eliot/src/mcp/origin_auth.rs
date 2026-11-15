@@ -12,7 +12,7 @@ use jsonwebtoken::{
 use rmcp::transport::streamable_http_server::session::{
     SessionManager, local::LocalSessionManager,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::Path,
@@ -27,7 +27,7 @@ const MAX_SESSIONS: usize = 1024;
 const KEY_LIFETIME: Duration = Duration::from_secs(300);
 const REFRESH_BACKOFF: Duration = Duration::from_secs(30);
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Claims {
     iss: String,
     aud: Vec<String>,
@@ -198,8 +198,8 @@ impl OriginAuth {
         data_dir: &Path,
         sdk_sessions: Arc<LocalSessionManager>,
     ) -> Result<Self, String> {
-        let (issuer, audience) =
-            eliot_daemon::load_cloud_access_config(data_dir).map_err(|e| e.code)?;
+        let (issuer, audience) = eliot_daemon::load_cloud_access_config(data_dir)
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
         let client = reqwest::Client::builder()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
@@ -534,5 +534,403 @@ impl OriginAuth {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+
+    const TEST_ISSUER: &str = "https://k47-qa-faketeam.cloudflareaccess.com";
+    const TEST_AUDIENCE: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const TEST_KID: &str = "k47-test-key-1";
+    const TEST_SUBJECT_A: &str = "k47-subject-a";
+    const TEST_SUBJECT_B: &str = "k47-subject-b";
+    const TEST_RSA_N: &str = "2aMvnTpVG7geArR3Js5XB9KUd5iairv2YToTxew9wotoIL4xNT_Y5SWC2a-EUaxBNbutddvZhpULZDi2nrZNgoofRq9veWpwUqHW4WB69QfJKhjeBQsNjzOpAJceR6UVWV5E1QqbaJfQOZ7FtVYQTFS-_WsENfR8hD4IS75Povdqld5AgZorFMqVn2gHkJ8A0s3mtTij5fAjzzf-0S6QSFgT5hqnSnLZ-YoGV9Z-vJiWzi49ftYEMOnxZul7rMVBsAZ3zAAYmfgjn1qPj6vjlH2PW4jcZ8jS_16ADaBUhuKoGvuEYXZwoHl4VozCRXNXTlEdcccHB_zhnhUx3RkVzQ";
+    const TEST_RSA_PKCS1_B64: &str = "MIIEpgIBAAKCAQEA2aMvnTpVG7geArR3Js5XB9KUd5iairv2YToTxew9wotoIL4xNT/Y5SWC2a+EUaxBNbutddvZhpULZDi2nrZNgoofRq9veWpwUqHW4WB69QfJKhjeBQsNjzOpAJceR6UVWV5E1QqbaJfQOZ7FtVYQTFS+/WsENfR8hD4IS75Povdqld5AgZorFMqVn2gHkJ8A0s3mtTij5fAjzzf+0S6QSFgT5hqnSnLZ+YoGV9Z+vJiWzi49ftYEMOnxZul7rMVBsAZ3zAAYmfgjn1qPj6vjlH2PW4jcZ8jS/16ADaBUhuKoGvuEYXZwoHl4VozCRXNXTlEdcccHB/zhnhUx3RkVzQIDAQABAoIBAQDCQxkDHMhPH78Z5v/cEZ45i0uenQaFA1XeXzq7Fi3icxEU+O9vengdwafUqwhO5pSmY8lnREAcEvnCEaVgcZUqCiP0si+sjseH2pG1Rqs6ACMdgmja04zc393gewM6LC6sQKrsBrXFXI0ugXw0aofNum9oQJfXmU1ztPMuuMbYzJ3ucT8CFp0vLDjpXesoCVTKhIFR9dMYwaJbqCaFionr3ZjPkw9oKBoSDltf2AY2G/X2itKva54BtM+oCTqoEk8qSRp7eLmw49ngRW/5lwDRFv+6V6CHNZNdIfmrjg//ulvt5itQhkkOcQ/Cg0m8c+5gj5mIpWuGHsWOALVZsj75AoGBAOFVID/T15oadNKFtw0yoewamv8IKuaWpN+0To/nYvZ54WE4Yh0Araz4G09YBtC8MAjAPFMqekSVWoEMCwNRwisrjZZnquMKfwWPNBt+izYhp7qbjtrXDqEIZUHVIirMHGBu+aphbGhaRd/LrERwkBJeDo+OuvZdtWG2PXPyM33bAoGBAPdB9CFPjOrFIa0OBUvy5EOf3sKAmpIACZmyw67nVwnIjJN603VY1dbmAB8eC3ejvuE+gkFRpND5tybHPOEvvpp+K1SbQgKSB+R/boLYY9wFFtuqzqkFpFQ+s+TcQIfCB1sXqWlhKHCri6T9hT8NL1VEtlt4x5XV4fSOAa+16U93AoGBAMZfiuSmO0kPwYkU7vJPgP267nlXV21pcfz/X6qQqi8TXbeZS8b8sel1A5X2iQl6o08Q7grJepqmYeb6Ezf44lffH+cpnOgEdY8PY3BRF32wY1mFWV6PtfFO0tYCLPJAfzrmeCXnXuj/kERVqnMWJcAFzgvUPARouyYqqi9JKsvBAoGBAOwngAY4tnycn5drpr9tU3sLPHVE41zC0GiOBrwMlGLxuuI5E7ImkMbZkhAmYAl6yZrUWxAL7IDzoGxXKtxg/4kLLFN4nklaNFOXKnOqPWYtLjHMJ+njS5py8NqLSs7fEKt+I/5UH43NKmkBAry/2Q91uz4OU4HWcCNlZlLuSdHtAoGBANUUterI20AU8R3sYv7Ene4UTN6vErydirWSRHeFymmX800PybtJkEKw3TaErFMBL2kGev4yiOaV4D5qv4EGMYbm0n377qRTkBwRGSzzejqoDbRpgHr1tKp6TXMSpOlKjZLNIOo16M7fWCKoJqmu6KM142nxTZNfcy0PpeaesiNb";
+    fn test_jwks() -> JwkSet {
+        serde_json::from_value(serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": TEST_KID,
+                "alg": "RS256",
+                "use": "sig",
+                "n": TEST_RSA_N,
+                "e": "AQAB",
+            }]
+        }))
+        .expect("test JWKS parses")
+    }
+
+    fn test_auth() -> OriginAuth {
+        OriginAuth {
+            issuer: TEST_ISSUER.to_owned(),
+            audience: TEST_AUDIENCE.to_owned(),
+            client: reqwest::Client::builder()
+                .https_only(true)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("test HTTP client builds"),
+            keys: Mutex::new(Keys {
+                set: test_jwks(),
+                valid_until: Instant::now() + KEY_LIFETIME,
+                retry_after: Instant::now() + REFRESH_BACKOFF,
+            }),
+            sessions: Mutex::new(HashMap::new()),
+            slots: Arc::new(Semaphore::new(MAX_SESSIONS)),
+            sdk_sessions: Arc::new(LocalSessionManager::default()),
+        }
+    }
+
+    fn decode_standard_base64(input: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(input.len() / 4 * 3);
+        let mut block = [0u8; 4];
+        let mut have = 0usize;
+        let mut padded = 0usize;
+        for byte in input.bytes() {
+            let sextet = match byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'a'..=b'z' => byte - b'a' + 26,
+                b'0'..=b'9' => byte - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => {
+                    padded += 1;
+                    0
+                }
+                _ => panic!("test key uses standard base64"),
+            };
+            block[have] = sextet;
+            have += 1;
+            if have == 4 {
+                out.push(block[0] << 2 | block[1] >> 4);
+                if padded < 2 {
+                    out.push(block[1] << 4 | block[2] >> 2);
+                }
+                if padded == 0 {
+                    out.push(block[2] << 6 | block[3]);
+                }
+                have = 0;
+                padded = 0;
+            }
+        }
+        assert_eq!(have, 0, "test key length is a base64 block");
+        out
+    }
+
+    fn signing_key() -> EncodingKey {
+        EncodingKey::from_rsa_der(&decode_standard_base64(TEST_RSA_PKCS1_B64))
+    }
+
+    fn mint(subject: &str, kid: &str, issuer: &str, audience: &str, exp: u64, nbf: u64) -> String {
+        let claims = Claims {
+            iss: issuer.to_owned(),
+            aud: vec![audience.to_owned()],
+            sub: subject.to_owned(),
+            exp,
+            nbf,
+            token_type: "app".to_owned(),
+        };
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.to_owned());
+        encode(&header, &claims, &signing_key()).expect("test token mints")
+    }
+
+    fn fresh_token(subject: &str) -> String {
+        let now = now_seconds();
+        mint(
+            subject,
+            TEST_KID,
+            TEST_ISSUER,
+            TEST_AUDIENCE,
+            now + 300,
+            now.saturating_sub(10),
+        )
+    }
+
+    fn post_headers(token: &str, session_id: Option<&str>) -> (HeaderMap, Method) {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cf-access-jwt-assertion",
+            token.parse().expect("token is a header value"),
+        );
+        if let Some(id) = session_id {
+            headers.insert(
+                "mcp-session-id",
+                id.parse().expect("session id is a header value"),
+            );
+        }
+        (headers, Method::POST)
+    }
+
+    async fn session_count(auth: &OriginAuth) -> usize {
+        auth.sessions.lock().await.len()
+    }
+
+    async fn insert_session(auth: &OriginAuth, id: &str, subject: &str, expires_at: u64) {
+        auth.sessions.lock().await.insert(
+            id.to_owned(),
+            Session {
+                identity: RemoteIdentity {
+                    issuer: TEST_ISSUER.to_owned(),
+                    audience: TEST_AUDIENCE.to_owned(),
+                    subject: subject.to_owned(),
+                },
+                connection_id: "k47-test-connection".to_owned(),
+                lease: Arc::new(SessionLease::new(
+                    expires_at,
+                    Instant::now() + Duration::from_secs(300),
+                )),
+                slot: Arc::new(SessionSlot(StdMutex::new(None))),
+            },
+        );
+    }
+    #[tokio::test]
+    async fn valid_token_authenticates_without_session_state() {
+        let auth = test_auth();
+        let token = fresh_token(TEST_SUBJECT_A);
+        let (mut headers, method) = post_headers(&token, None);
+        let verified = auth
+            .authenticate(&mut headers, &method)
+            .await
+            .expect("valid token authenticates");
+        assert_eq!(verified.context.identity.subject, TEST_SUBJECT_A);
+        assert!(verified.context.session_id.is_none());
+        assert_eq!(session_count(&auth).await, 0);
+        assert!(headers.get("cf-access-jwt-assertion").is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_token_rejected() {
+        let auth = test_auth();
+        let now = now_seconds();
+        let token = mint(
+            TEST_SUBJECT_A,
+            TEST_KID,
+            TEST_ISSUER,
+            TEST_AUDIENCE,
+            now - 60,
+            now - 600,
+        );
+        let (mut headers, method) = post_headers(&token, None);
+        let status = auth.authenticate(&mut headers, &method).await.err();
+        assert_eq!(status, Some(StatusCode::UNAUTHORIZED));
+        assert_eq!(session_count(&auth).await, 0);
+    }
+
+    #[tokio::test]
+    async fn not_yet_valid_token_rejected() {
+        let auth = test_auth();
+        let now = now_seconds();
+        let token = mint(
+            TEST_SUBJECT_A,
+            TEST_KID,
+            TEST_ISSUER,
+            TEST_AUDIENCE,
+            now + 600,
+            now + 300,
+        );
+        let (mut headers, method) = post_headers(&token, None);
+        let status = auth.authenticate(&mut headers, &method).await.err();
+        assert_eq!(status, Some(StatusCode::UNAUTHORIZED));
+        assert_eq!(session_count(&auth).await, 0);
+    }
+
+    #[tokio::test]
+    async fn wrong_audience_rejected() {
+        let auth = test_auth();
+        let now = now_seconds();
+        let token = mint(
+            TEST_SUBJECT_A,
+            TEST_KID,
+            TEST_ISSUER,
+            "https://other.example.com/app",
+            now + 300,
+            now - 10,
+        );
+        let (mut headers, method) = post_headers(&token, None);
+        let status = auth.authenticate(&mut headers, &method).await.err();
+        assert_eq!(status, Some(StatusCode::UNAUTHORIZED));
+        assert_eq!(session_count(&auth).await, 0);
+    }
+
+    #[tokio::test]
+    async fn wrong_issuer_rejected() {
+        let auth = test_auth();
+        let now = now_seconds();
+        let token = mint(
+            TEST_SUBJECT_A,
+            TEST_KID,
+            "https://other-team.cloudflareaccess.com",
+            TEST_AUDIENCE,
+            now + 300,
+            now - 10,
+        );
+        let (mut headers, method) = post_headers(&token, None);
+        let status = auth.authenticate(&mut headers, &method).await.err();
+        assert_eq!(status, Some(StatusCode::UNAUTHORIZED));
+        assert_eq!(session_count(&auth).await, 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_kid_rejected_without_network_refresh() {
+        let auth = test_auth();
+        let now = now_seconds();
+        let token = mint(
+            TEST_SUBJECT_A,
+            "k47-unknown-kid",
+            TEST_ISSUER,
+            TEST_AUDIENCE,
+            now + 300,
+            now - 10,
+        );
+        let (mut headers, method) = post_headers(&token, None);
+        let status = auth.authenticate(&mut headers, &method).await.err();
+        assert_eq!(status, Some(StatusCode::UNAUTHORIZED));
+        assert_eq!(session_count(&auth).await, 0);
+    }
+
+    #[tokio::test]
+    async fn missing_assertion_rejected() {
+        let auth = test_auth();
+        let mut headers = HeaderMap::new();
+        let method = Method::POST;
+        let status = auth.authenticate(&mut headers, &method).await.err();
+        assert_eq!(status, Some(StatusCode::UNAUTHORIZED));
+        assert_eq!(session_count(&auth).await, 0);
+    }
+    #[tokio::test]
+    async fn duplicate_assertion_rejected() {
+        let auth = test_auth();
+        let token = fresh_token(TEST_SUBJECT_A);
+        let value: HeaderValue = token.parse().expect("token is a header value");
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-access-jwt-assertion", value.clone());
+        let _ = headers.append("cf-access-jwt-assertion", value);
+        let method = Method::POST;
+        let status = auth.authenticate(&mut headers, &method).await.err();
+        assert_eq!(status, Some(StatusCode::UNAUTHORIZED));
+        assert_eq!(session_count(&auth).await, 0);
+    }
+
+    #[tokio::test]
+    async fn cross_subject_session_reuse_forbidden() {
+        let auth = test_auth();
+        let (sdk_id, _transport) = auth
+            .sdk_sessions
+            .create_session()
+            .await
+            .expect("SDK session starts");
+        let sid = sdk_id.to_string();
+        insert_session(&auth, &sid, TEST_SUBJECT_A, now_seconds() + 300).await;
+        let token = fresh_token(TEST_SUBJECT_B);
+        let (mut headers, method) = post_headers(&token, Some(&sid));
+        let status = auth.authenticate(&mut headers, &method).await.err();
+        assert_eq!(status, Some(StatusCode::FORBIDDEN));
+        assert_eq!(session_count(&auth).await, 1);
+        let sessions = auth.sessions.lock().await;
+        assert_eq!(
+            sessions.get(&sid).map(|s| s.identity.subject.as_str()),
+            Some(TEST_SUBJECT_A)
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_session_id_not_found() {
+        let auth = test_auth();
+        let token = fresh_token(TEST_SUBJECT_A);
+        let (mut headers, method) = post_headers(&token, Some("k47-no-such-session"));
+        let status = auth.authenticate(&mut headers, &method).await.err();
+        assert_eq!(status, Some(StatusCode::NOT_FOUND));
+        assert_eq!(session_count(&auth).await, 0);
+    }
+
+    #[tokio::test]
+    async fn closed_lease_session_not_found() {
+        let auth = test_auth();
+        let (sdk_id, _transport) = auth
+            .sdk_sessions
+            .create_session()
+            .await
+            .expect("SDK session starts");
+        let sid = sdk_id.to_string();
+        insert_session(&auth, &sid, TEST_SUBJECT_A, now_seconds() + 300).await;
+        auth.sessions
+            .lock()
+            .await
+            .get(&sid)
+            .expect("entry present")
+            .lease
+            .close();
+        let token = fresh_token(TEST_SUBJECT_A);
+        let (mut headers, method) = post_headers(&token, Some(&sid));
+        let status = auth.authenticate(&mut headers, &method).await.err();
+        assert_eq!(status, Some(StatusCode::NOT_FOUND));
+        assert_eq!(session_count(&auth).await, 1);
+    }
+
+    #[tokio::test]
+    async fn sdk_closed_session_reaps_entry() {
+        let auth = test_auth();
+        let (sdk_id, _transport) = auth
+            .sdk_sessions
+            .create_session()
+            .await
+            .expect("SDK session starts");
+        let sid = sdk_id.to_string();
+        insert_session(&auth, &sid, TEST_SUBJECT_A, now_seconds() + 300).await;
+        auth.sdk_sessions
+            .close_session(&sdk_id)
+            .await
+            .expect("SDK session closes");
+        let token = fresh_token(TEST_SUBJECT_A);
+        let (mut headers, method) = post_headers(&token, Some(&sid));
+        let status = auth.authenticate(&mut headers, &method).await.err();
+        assert_eq!(status, Some(StatusCode::NOT_FOUND));
+        assert_eq!(session_count(&auth).await, 0);
+    }
+
+    #[tokio::test]
+    async fn rejections_mutate_no_session_state() {
+        let auth = test_auth();
+        let now = now_seconds();
+        let bad = [
+            mint(
+                TEST_SUBJECT_A,
+                TEST_KID,
+                TEST_ISSUER,
+                TEST_AUDIENCE,
+                now - 60,
+                now - 600,
+            ),
+            mint(
+                TEST_SUBJECT_A,
+                TEST_KID,
+                TEST_ISSUER,
+                "https://other.example.com/app",
+                now + 300,
+                now - 10,
+            ),
+            mint(
+                TEST_SUBJECT_A,
+                "k47-unknown-kid",
+                TEST_ISSUER,
+                TEST_AUDIENCE,
+                now + 300,
+                now - 10,
+            ),
+        ];
+        for token in &bad {
+            let (mut headers, method) = post_headers(token, None);
+            let status = auth.authenticate(&mut headers, &method).await.err();
+            assert_eq!(status, Some(StatusCode::UNAUTHORIZED));
+        }
+        let (mut headers, method) =
+            post_headers(&fresh_token(TEST_SUBJECT_A), Some("k47-no-such-session"));
+        let status = auth.authenticate(&mut headers, &method).await.err();
+        assert_eq!(status, Some(StatusCode::NOT_FOUND));
+        assert_eq!(session_count(&auth).await, 0);
     }
 }
