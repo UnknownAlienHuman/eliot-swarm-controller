@@ -6,6 +6,7 @@ pub mod custody;
 pub mod data_dir;
 pub mod ipc;
 mod process_observation;
+pub(crate) mod script_file;
 
 #[cfg(unix)]
 pub(crate) mod unix;

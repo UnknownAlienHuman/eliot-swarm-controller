@@ -487,48 +487,80 @@ fn validate_private_root(path: &Path) -> Result<()> {
 }
 
 /// Atomically replace one private file directly under a private data
-/// directory (used for `config.toml` profile saves): a new private
-/// temporary file is written and synced, then renamed over the target. On
-/// failure the previous file is untouched and the temporary is removed.
+/// directory (used for `config.toml` profile saves). See
+/// [`replace_file_atomically`].
 pub(crate) fn replace_private_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    replace_file_atomically(dir, name, bytes, true)
+}
+
+/// Atomically replace one existing-or-new file directly under `dir`: a new
+/// temporary file in the same directory is written and synced, then renamed
+/// over the target. With `private`, both files must stay current-user-only
+/// (data-directory files); without it the new file takes the directory's
+/// inherited permissions (a registered project checkout). On failure before
+/// the rename the previous file is untouched and the temporary is removed;
+/// a failure after the rename is `unknown`, never "unchanged".
+pub(crate) fn replace_file_atomically(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    private: bool,
+) -> Result<()> {
     validate_text("file name", name, 255)?;
     if name.contains(['/', '\\', ':']) || name.starts_with('.') {
         return Err(Error::new(
             "invalid",
-            "private file name must be a plain file name",
+            "replaced file name must be a plain file name",
         ));
     }
     #[cfg(any(windows, unix))]
     {
         let target = dir.join(name);
         match fs::symlink_metadata(&target) {
-            Ok(_) => ensure_private_file(&target)?,
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(Error::new(
+                    "not_allowed",
+                    "replaced file must not be a link",
+                ));
+            }
+            Ok(_) if private => ensure_private_file(&target)?,
+            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error("inspect private file", error)),
+            Err(error) => return Err(io_error("inspect replaced file", error)),
         }
         let temporary = dir.join(format!(".{name}.{}.tmp", ulid::Ulid::new()));
         let mut temporary_created = false;
         let result = (|| {
-            let mut file = create_new_private_file(&temporary)
-                .map_err(|error| io_error("create private file", error))?;
+            let mut file = if private {
+                create_new_private_file(&temporary)
+            } else {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)
+            }
+            .map_err(|error| io_error("create temporary file", error))?;
             temporary_created = true;
-            ensure_private_file(&temporary)?;
+            if private {
+                ensure_private_file(&temporary)?;
+            }
             file.write_all(bytes)
-                .map_err(|error| io_error("write private file", error))?;
+                .map_err(|error| io_error("write temporary file", error))?;
             file.sync_all()
-                .map_err(|error| io_error("sync private file", error))?;
+                .map_err(|error| io_error("sync temporary file", error))?;
             drop(file);
             replace_file(&temporary, &target)?;
-            // The file is already replaced: a later failure leaves an
-            // uncertain outcome, never "unchanged".
-            ensure_private_file(&target)
-                .and_then(|()| sync_directory(dir))
-                .map_err(|error| {
-                    Error::new(
-                        "unknown",
-                        format!("{name} was replaced, then {}", error.message),
-                    )
-                })
+            let after = if private {
+                ensure_private_file(&target)
+            } else {
+                Ok(())
+            };
+            after.and_then(|()| sync_directory(dir)).map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!("{name} was replaced, then {}", error.message),
+                )
+            })
         })();
         if result.is_err() && temporary_created {
             let _ = fs::remove_file(&temporary);
@@ -537,10 +569,10 @@ pub(crate) fn replace_private_file(dir: &Path, name: &str, bytes: &[u8]) -> Resu
     }
     #[cfg(not(any(windows, unix)))]
     {
-        let _ = (dir, bytes);
+        let _ = (dir, bytes, private);
         Err(Error::new(
             "platform_unsupported",
-            "private files are unsupported on this platform",
+            "atomic file replacement is unsupported on this platform",
         ))
     }
 }

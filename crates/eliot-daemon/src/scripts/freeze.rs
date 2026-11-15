@@ -332,7 +332,9 @@ fn environment_names_equal(left: &str, right: &str) -> bool {
     }
 }
 
-fn project_script_roots(registration: &ProjectRegistrationView) -> Result<(PathBuf, PathBuf)> {
+pub(crate) fn project_script_roots(
+    registration: &ProjectRegistrationView,
+) -> Result<(PathBuf, PathBuf)> {
     let checkout = crate::setup::canonical_directory(Path::new(&registration.checkout))
         .map_err(|_| not_allowed("registered project checkout is unavailable or unsafe"))?;
     let scripts_root = crate::setup::canonical_directory(&checkout.join(".eliot").join("scripts"))
@@ -345,7 +347,7 @@ fn project_script_roots(registration: &ProjectRegistrationView) -> Result<(PathB
     Ok((checkout, scripts_root))
 }
 
-fn global_script_root(data_root: &Path) -> Result<PathBuf> {
+pub(crate) fn global_script_root(data_root: &Path) -> Result<PathBuf> {
     let data_root = crate::setup::canonical_directory(data_root)
         .map_err(|_| not_allowed("global data root is unavailable or unsafe"))?;
     let scripts_root = crate::setup::canonical_directory(&data_root.join("scripts"))

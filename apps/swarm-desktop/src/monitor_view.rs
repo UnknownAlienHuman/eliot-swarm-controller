@@ -62,20 +62,28 @@ fn row_view(row: &MonitorRow) -> View {
     } else {
         title
     };
-    ListViewItem::new().content(
-        StackPanel::new().spacing(2.0).children((
-            title,
-            small(row.operation()).opacity(theme::MUTED_OPACITY),
-            small(format!(
-                "RSS {} · {} · {} · {}",
-                bytes_label(row.obs.rss_bytes()),
-                cpu_time_label(row.obs.cpu_time_ns()),
-                row.obs.freshness(),
-                tokens_label(row)
-            ))
-            .opacity(theme::MUTED_OPACITY),
-        )),
-    )
+    ListViewItem::new()
+        .automation_name(format!(
+            "Agent {}, {}, {}, {}",
+            row.id,
+            state_name(row.state),
+            row.harness,
+            row.operation()
+        ))
+        .content(
+            StackPanel::new().spacing(2.0).children((
+                title,
+                small(row.operation()).opacity(theme::MUTED_OPACITY),
+                small(format!(
+                    "RSS {} · {} · {} · {}",
+                    bytes_label(row.obs.rss_bytes()),
+                    cpu_time_label(row.obs.cpu_time_ns()),
+                    row.obs.freshness(),
+                    tokens_label(row)
+                ))
+                .opacity(theme::MUTED_OPACITY),
+            )),
+        )
 }
 
 /// Native bar sparkline: one `Border` per point, unknown points drawn as a
@@ -215,7 +223,9 @@ pub fn monitor_pane(
     actions: MonitorActions,
 ) -> View {
     // Only highlight a row index that already existed before this refresh,
-    // so the native SelectedIndex never runs ahead of the items it indexes.
+    // so the native SelectedIndex never runs ahead of the items it indexes
+    // (an index past them fails with E_INVALIDARG, which Reactor treats as
+    // fatal: 0xC0000409; see `Message::AgentsLoaded` in `ui`).
     let selected_index = selected
         .and_then(|id| monitor.rows.iter().position(|row| row.id == id))
         .filter(|index| *index < published_rows);
@@ -355,6 +365,7 @@ pub fn monitor_pane(
             StackPanel::new().grid_row(0).spacing(2.0).children((
                 TextBlock::new()
                     .text("Monitor")
+                    .automation_heading_level(AutomationHeadingLevel::Level2)
                     .font_size(theme::type_scale::HEADING)
                     .font_weight(FontWeight::SEMI_BOLD),
                 small(status).opacity(theme::MUTED_OPACITY),

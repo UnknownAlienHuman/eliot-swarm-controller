@@ -240,6 +240,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `project.list/get` | owner-only read of registered project authority |
 | `rule.list/get/catch_up` | owner-only paged rule list (state, timer state, canonical definition), one rule read, and finite committed-history catch-up |
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
+| `script.list/read/save` | Owner-only scripts under approved Run roots: cursor/encoded-byte-bounded list (one root scan per page; continue through empty pages until `next_cursor` is absent), verified-handle bounded read, and serialized revision-guarded replacement. Complete secret-bearing entries are withheld; raw and decoded TOML/JSON keys/values are checked. Saves never execute; external-writer conflict limits and editor environment are specified in [automation](automation.md#script-editing). DTOs/budgets: [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). |
 | `config.profiles.read/save` | owner-only read and validated, revision-guarded replacement of the `[profiles.*]` sections of `config.toml` |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
 | `goal.set/get/pause/clear/resume/round` | owner-only Eliot-mode Goal with explicit and automatic idle rounds plus explicit cadence slot rounds; automatic driving needs `max_turns` or `max_rounds`, native mode and cost limits are `unsupported` |
