@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 39;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 40;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -943,6 +943,27 @@ impl Store {
             ).map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 40 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE inference_clients ADD COLUMN expired_id_through_ms INTEGER NOT NULL DEFAULT -1 CHECK(expired_id_through_ms>=-1);"
+            ).map_err(sql_error)?;
+            // A v39 retention receipt records the clock used for its pruning.
+            // Preserve the greatest surviving observation across an upgrade,
+            // including when the wall clock has already moved backward.
+            tx.execute(
+                "UPDATE inference_clients SET expired_id_through_ms=MAX(-1,COALESCE((
+                    SELECT MAX(created_at) FROM writes
+                    WHERE principal='memory_inference:'||client_id AND method='inference.retention.advance'
+                 ),0)-?1-1)",
+                [RETRY_WINDOW_MS],
+            ).map_err(sql_error)?;
+            db!(tx.execute("INSERT INTO schema_migrations(version) VALUES (40)", []));
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -950,6 +971,58 @@ impl Store {
 #[cfg(test)]
 mod continuity_tests {
     use super::*;
+
+    #[test]
+    fn v39_upgrade_recovers_expiry_from_retention_without_losing_replay() {
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "ALTER TABLE inference_clients DROP COLUMN expired_id_through_ms;
+             DELETE FROM schema_migrations WHERE version=40;",
+            )
+            .unwrap();
+        let client = format!("memory:{}", Ulid::new());
+        let untouched = format!("memory:{}", Ulid::new());
+        for client in [&client, &untouched] {
+            store.connection.execute("INSERT INTO inference_clients(client_id,current_version,current_hash,current_file) VALUES (?1,1,'hash','credential.json')", [client]).unwrap();
+        }
+        let start = 1_800_000_000_000_i64;
+        let receipt = Ulid::from(((start + RETRY_WINDOW_MS + 1) as u128) << 80).to_string();
+        store.connection.execute(
+            "INSERT INTO writes(id,principal,method,payload_digest,result,created_at,inference_seq) VALUES (?1,?2,'inference.retention.advance',?3,?4,?5,1)",
+            params![receipt, format!("memory_inference:{client}"), vec![0_u8;32],
+                json!({"retain_after_seq":0,"write_retain_after_seq":0,"pruned_calls":0,"pruned_writes":0}).to_string(), start + RETRY_WINDOW_MS + 1],
+        ).unwrap();
+        store.migrate().unwrap();
+        let watermark = |client: &str| {
+            store
+                .connection
+                .query_row(
+                    "SELECT expired_id_through_ms FROM inference_clients WHERE client_id=?1",
+                    [client],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(watermark(&client), start);
+        assert_eq!(watermark(&untouched), -1);
+        let absent = Ulid::from((start as u128) << 80).to_string();
+        assert_eq!(
+            store
+                .inference_write_get(&client, &absent, start + RETRY_WINDOW_MS - 1)
+                .unwrap()
+                .status,
+            eliot_core::api::inference::InferenceWriteStatus::HistoryGap
+        );
+        assert_eq!(
+            store
+                .inference_write_get(&client, &receipt, start + RETRY_WINDOW_MS - 1)
+                .unwrap()
+                .status,
+            eliot_core::api::inference::InferenceWriteStatus::Retained
+        );
+    }
 
     #[test]
     fn v38_upgrade_preserves_membership_and_previous_publication() {
@@ -968,7 +1041,8 @@ mod continuity_tests {
              ALTER TABLE inference_clients DROP COLUMN previous_read_call_id;
              ALTER TABLE inference_clients DROP COLUMN previous_release_proven;
              ALTER TABLE inference_clients DROP COLUMN previous_restarted;
-             DELETE FROM schema_migrations WHERE version=39;",
+             ALTER TABLE inference_clients DROP COLUMN expired_id_through_ms;
+             DELETE FROM schema_migrations WHERE version>=39;",
             )
             .unwrap();
         let client = format!("memory:{}", Ulid::new());

@@ -9,8 +9,8 @@ use super::*;
 const INVENTORY_QUERY_VERSION: u32 = INFERENCE_INVENTORY_QUERY_VERSION;
 const RETENTION_METHOD: &str = "inference.retention.advance";
 
-fn inference_id_expired(id: &str, now: i64) -> bool {
-    validate_id_age(id, now).is_err_and(|error| error.code == "id_expired")
+fn inference_id_expired(id: &str, expired_through: i64) -> bool {
+    ulid_timestamp_ms(id).is_some_and(|timestamp| timestamp <= expired_through)
 }
 
 impl Store {
@@ -189,15 +189,19 @@ impl Store {
                 return serde_json::from_value(value).map_err(json_error);
             }
             current(tx, client, version)?;
-            validate_id_age(&request.id, now)?;
-            let (call_hi, call_floor, write_hi, write_floor): (i64, i64, i64, i64) = tx
+            validate_inference_id_age(tx, client, &request.id, now)?;
+            let (call_hi, call_floor, write_hi, write_floor, expired_through): (i64, i64, i64, i64, i64) = tx
                 .query_row(
-                    "SELECT last_admission_seq,retain_after_seq,last_write_seq,write_retain_after_seq
+                    "SELECT last_admission_seq,retain_after_seq,last_write_seq,write_retain_after_seq,expired_id_through_ms
                      FROM inference_clients WHERE client_id=?1",
                     [client],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                 )
                 .map_err(sql_error)?;
+            // Expiry is inclusive at millisecond precision, while admission
+            // permits IDs exactly 24 hours old. Commit this nondecreasing
+            // boundary with pruning so clock rollback cannot revive an ID.
+            let expired_through = expired_through.max(now.saturating_sub(RETRY_WINDOW_MS).saturating_sub(1).max(-1));
             if request.observed_call_high_water_seq > call_hi
                 || request.observed_write_high_water_seq > write_hi
                 || request.retain_after_seq < call_floor
@@ -298,7 +302,7 @@ impl Store {
             };
             let mut new_write_floor = request.write_retain_after_seq;
             for (index, (seq, id, referenced)) in scanned_writes.iter().enumerate() {
-                if *referenced || !inference_id_expired(id, now) {
+                if *referenced || !inference_id_expired(id, expired_through) {
                     new_write_floor = seq.saturating_sub(1);
                     break;
                 }
@@ -309,7 +313,7 @@ impl Store {
             }
             if scanned_writes.len() <= request.limit
                 && scanned_writes.iter().all(|(_, id, referenced)| {
-                    !*referenced && inference_id_expired(id, now)
+                    !*referenced && inference_id_expired(id, expired_through)
                 })
             {
                 new_write_floor = request.write_retain_after_seq;
@@ -337,7 +341,7 @@ impl Store {
             let mut pruned_writes = 0usize;
             for id in write_ids
                 .into_iter()
-                .filter(|id| inference_id_expired(id, now))
+                .filter(|id| inference_id_expired(id, expired_through))
             {
                 pruned_writes += tx
                     .execute(
@@ -347,10 +351,18 @@ impl Store {
                     .map_err(sql_error)?;
             }
 
+            let retention_receipts: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM writes WHERE principal=?1 AND method=?2",
+                params![owner(client), RETENTION_METHOD],
+                |row| row.get(0),
+            ).map_err(sql_error)?;
+            if retention_receipts >= MAX_INFERENCE_RETENTION_RECEIPTS {
+                return Err(Error::new("capacity", "inference retention receipt capacity reached; reconcile release and retention"));
+            }
             db!(tx.execute(
-                "UPDATE inference_clients SET retain_after_seq=?2,write_retain_after_seq=?3
+                "UPDATE inference_clients SET retain_after_seq=?2,write_retain_after_seq=?3,expired_id_through_ms=?4
                  WHERE client_id=?1",
-                params![client, new_call_floor, new_write_floor],
+                params![client, new_call_floor, new_write_floor, expired_through],
             ));
             let result = InferenceRetentionResponse {
                 retain_after_seq: new_call_floor,

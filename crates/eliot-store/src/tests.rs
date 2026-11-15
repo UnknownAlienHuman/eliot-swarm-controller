@@ -7104,7 +7104,7 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
         .execute_batch(
             "DROP INDEX inference_write_inventory;
                      ALTER TABLE writes DROP COLUMN inference_seq;
-                     DELETE FROM schema_migrations WHERE version = 39;
+                     DELETE FROM schema_migrations WHERE version >= 39;
                      DROP TABLE inference_calls;
              DROP TABLE inference_clients;
              DELETE FROM schema_migrations WHERE version = 38;

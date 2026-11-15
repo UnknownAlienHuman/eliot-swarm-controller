@@ -107,7 +107,8 @@ managed hooks or explicit fallback override on the host.
 
 Limits: 32 KiB UTF-8 input, 64 KiB result, 16 KiB byte range, one successful native
 turn, a 1–120 second queue/native-attempt budget after input publication, 16 clients, 1,024 retained calls globally
-and one native inference in flight. At most one cancel and one release binding may
+and one native inference in flight. Each client retains at most 1,024
+`inference.retention.advance` receipts. At most one cancel and one release binding may
 be first-admitted per call; other IDs for that auxiliary operation return
 `already_bound`. Replay the original ID. This bounds retained auxiliary writes
 until released metadata can be pruned. IDs must use uppercase ULID spelling; no
@@ -189,9 +190,17 @@ cleanup-complete calls prune. Open/unknown/unreleased calls remain, regardless o
 Pending/previous credential readback also retains pre-rotation calls until retirement
 completes; rotation requires at least one retained own call to prove the new credential.
 Write receipts prune only after the normal new-ID retry window has expired and no
-retained call references them. Expired absent IDs remain `history_gap`, never live
-absence or permission to re-admit. Ordinary retention continues to exclude inference
-writes. The global retained-call cap counts all remaining calls and rejects admission
+retained call references them. The pruning transaction persists a nondecreasing,
+inclusive expiry timestamp watermark per client (current time minus 24 hours minus
+one millisecond). Absent IDs at or below that watermark read `history_gap` and
+first admission rejects with `id_expired`, even after clock rollback or restart.
+Retained exact replay precedes the watermark and age gates for every mutation.
+Schema v40 initializes the watermark from the greatest retained v39 retention
+receipt's pruning time, or leaves it unset when no such receipt exists.
+After bounded pruning, a first retention operation that would exceed the per-client
+receipt cap returns `capacity` and rolls back the transaction. Exact replay, cancel
+and release remain available at that cap. Ordinary retention continues to exclude
+inference writes. The global retained-call cap counts all remaining calls and rejects admission
 at capacity; pruning never resets either sequence. Embeddings and owner emergency
 erase remain `unsupported`.
 

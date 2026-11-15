@@ -95,6 +95,24 @@ fn current(tx: &Connection, client: &str, version: i64) -> Result<()> {
     Ok(())
 }
 
+fn validate_inference_id_age(tx: &Connection, client: &str, id: &str, now: i64) -> Result<()> {
+    inference_id(id)?;
+    let expired_through: i64 = tx
+        .query_row(
+            "SELECT expired_id_through_ms FROM inference_clients WHERE client_id=?1",
+            [client],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if ulid_timestamp_ms(id).is_some_and(|timestamp| timestamp <= expired_through) {
+        return Err(Error::new(
+            "id_expired",
+            "mutation id is at or below the client's durable expiry watermark",
+        ));
+    }
+    validate_id_age(id, now)
+}
+
 impl Store {
     pub fn inference_controller_id(&self) -> Result<String> {
         self.custody_namespace()
@@ -195,7 +213,7 @@ impl Store {
                 result: Some(serde_json::from_str(&result).map_err(json_error)?),
             });
         }
-        let status = match validate_id_age(id, now) {
+        let status = match validate_inference_id_age(&self.connection, client, id, now) {
             Ok(()) => InferenceWriteStatus::Absent,
             Err(e) if e.code == "id_expired" => InferenceWriteStatus::HistoryGap,
             Err(e) => return Err(e),
@@ -326,7 +344,7 @@ impl Store {
         self.inference_transaction(|tx| {
             if let Some(value)=replay(tx,&request.id,&owner(client),"inference.text",&metadata)? {return Ok((serde_json::from_value(value).map_err(json_error)?,false));}
             current(tx,client,version)?;
-            validate_id_age(&request.id,now)?;
+            validate_inference_id_age(tx,client,&request.id,now)?;
             let count:i64=tx.query_row("SELECT COUNT(*) FROM inference_calls",[],|r|r.get(0)).map_err(sql_error)?;
             if count>=MAX_INFERENCE_CALLS {return Err(Error::new("capacity", "inference call capacity reached; reconcile release and retention"));}
             let seq:i64=tx.query_row("SELECT last_admission_seq FROM inference_clients WHERE client_id=?1",[client],|r|r.get(0)).map_err(sql_error)?;
@@ -421,7 +439,7 @@ impl Store {
                 return Ok(value);
             }
             current(tx, client, version)?;
-            validate_id_age(&request.id, now)?;
+            validate_inference_id_age(tx, client, &request.id, now)?;
             let call = call(tx, client, &request.call_id)?;
             auxiliary_unbound(tx, &request.call_id, true)?;
             let outcome = if call.state == InferenceState::Queued {
@@ -465,7 +483,7 @@ impl Store {
                 db!(tx.execute("UPDATE inference_clients SET previous_release_proven=1 WHERE client_id=?1 AND current_version=?2 AND previous_version IS NOT NULL AND previous_restarted=1 AND previous_read_call_id=?3", params![client,version,request.call_id]));
                 return Ok(value);
             }
-            current(tx,client,version)?; validate_id_age(&request.id,now)?;
+            current(tx,client,version)?; validate_inference_id_age(tx,client,&request.id,now)?;
             if request.dependency()? == InferenceBackupDependency::ControllerDependent {
                 return Err(Error::new("dependency_protected", "Memory backup or unresolved fence still depends on this call"));
             }
@@ -583,6 +601,262 @@ mod tests {
             max_result_bytes: 1024,
             deadline_ms: 30000,
         }
+    }
+
+    fn id_at(timestamp: i64, tag: u128) -> String {
+        Ulid::from(((timestamp as u128) << 80) | tag).to_string()
+    }
+
+    fn retention(store: &Store, client: &str, id: String) -> InferenceRetentionRequest {
+        let high = store.inference_high_water(client).unwrap();
+        InferenceRetentionRequest {
+            id,
+            observed_call_high_water_seq: high.call_high_water_seq,
+            observed_write_high_water_seq: high.write_high_water_seq,
+            safe_retain_after_seq: high.call_high_water_seq,
+            retain_after_seq: high.call_high_water_seq,
+            safe_write_retain_after_seq: high.write_high_water_seq,
+            write_retain_after_seq: high.write_high_water_seq,
+            limit: MAX_INFERENCE_INVENTORY_PAGE,
+        }
+    }
+
+    #[test]
+    fn pruning_expiry_survives_clock_rollback_without_readmission_and_keeps_replay() {
+        let (mut store, client) = setup();
+        let start = now();
+        let mut pruned = text();
+        pruned.id = id_at(start, 1);
+        store
+            .inference_text(&client, 1, &pruned, &Value::Null, start)
+            .unwrap();
+        let release = InferenceReleaseRequest {
+            id: id_at(start, 2),
+            call_id: pruned.id.clone(),
+            disposition: InferenceDisposition::AbandonForErasure,
+            result_sha256: None,
+            no_backup_dependencies: None,
+            backup_dependency: Some(InferenceBackupDependency::NoBackupDependencies),
+        };
+        store
+            .inference_release(&client, 1, &release, start)
+            .unwrap();
+        store
+            .inference_cleanup_complete(&client, &pruned.id)
+            .unwrap();
+        let mut retained = text();
+        retained.id = id_at(start, 3);
+        let original = store
+            .inference_text(&client, 1, &retained, &Value::Null, start)
+            .unwrap()
+            .0;
+        let prune_time = start + RETRY_WINDOW_MS + 1;
+        let request = retention(&store, &client, id_at(prune_time, 4));
+        let result = store
+            .inference_retention_advance(&client, 1, &request, prune_time)
+            .unwrap();
+        assert_eq!(result["pruned_calls"], 1);
+        assert_eq!(result["pruned_writes"], 2);
+
+        let rollback = prune_time - 2;
+        assert!(validate_id_age(&pruned.id, rollback).is_ok());
+        let high = store.inference_high_water(&client).unwrap();
+        for id in [&pruned.id, &release.id, &id_at(start, 5)] {
+            assert_eq!(
+                store
+                    .inference_write_get(&client, id, rollback)
+                    .unwrap()
+                    .status,
+                InferenceWriteStatus::HistoryGap
+            );
+            let mut retry = pruned.clone();
+            retry.id = id.clone();
+            assert_eq!(
+                store
+                    .inference_text(&client, 1, &retry, &Value::Null, rollback)
+                    .unwrap_err()
+                    .code,
+                "id_expired"
+            );
+        }
+        assert_eq!(
+            store
+                .inference_cancel(
+                    &client,
+                    1,
+                    &InferenceCancelRequest {
+                        id: release.id.clone(),
+                        call_id: retained.id.clone()
+                    },
+                    rollback
+                )
+                .unwrap_err()
+                .code,
+            "id_expired"
+        );
+        assert_eq!(
+            store
+                .inference_release(&client, 1, &release, rollback)
+                .unwrap_err()
+                .code,
+            "id_expired"
+        );
+        let expired_retention = retention(&store, &client, id_at(start, 6));
+        assert_eq!(
+            store
+                .inference_retention_advance(&client, 1, &expired_retention, rollback)
+                .unwrap_err()
+                .code,
+            "id_expired"
+        );
+        let replay = store
+            .inference_text(&client, 0, &retained, &Value::Null, rollback)
+            .unwrap();
+        assert_eq!(replay.0.admission_seq, original.admission_seq);
+        assert!(!replay.1);
+        assert_eq!(
+            store
+                .inference_write_get(&client, &retained.id, rollback)
+                .unwrap()
+                .status,
+            InferenceWriteStatus::Retained
+        );
+        assert_eq!(
+            store
+                .inference_retention_advance(&client, 0, &request, rollback)
+                .unwrap(),
+            result
+        );
+        assert_eq!(store.inference_high_water(&client).unwrap(), high);
+        assert_eq!(
+            store.inference_get(&client, &pruned.id).unwrap_err().code,
+            "not_found"
+        );
+        assert_eq!(
+            store
+                .inference_get(&client, &retained.id)
+                .unwrap()
+                .provider_attempts,
+            0
+        );
+
+        // A later successful retention pass with a lower clock cannot lower expiry.
+        let request = retention(&store, &client, id_at(rollback, 7));
+        store
+            .inference_retention_advance(&client, 1, &request, rollback)
+            .unwrap();
+        assert_eq!(
+            store
+                .inference_write_get(&client, &pruned.id, rollback)
+                .unwrap()
+                .status,
+            InferenceWriteStatus::HistoryGap
+        );
+        let mut boundary = text();
+        boundary.id = id_at(start + 1, 8);
+        assert!(
+            store
+                .inference_text(&client, 1, &boundary, &Value::Null, rollback)
+                .unwrap()
+                .1
+        );
+    }
+
+    #[test]
+    fn retention_receipt_capacity_preserves_replay_cancel_release_and_post_prune_admission() {
+        let (mut store, client) = setup();
+        let start = now();
+        let mut call = text();
+        call.id = id_at(start, 3000);
+        store
+            .inference_text(&client, 1, &call, &Value::Null, start)
+            .unwrap();
+        store.inference_claim(&client, &call.id).unwrap();
+        store
+            .inference_finish(&client, &call.id, InferenceState::Unknown, None)
+            .unwrap();
+        // Fill behind a real unresolved call in one transaction; no native work.
+        store
+            .inference_transaction(|tx| {
+                for tag in 1..MAX_INFERENCE_RETENTION_RECEIPTS {
+                    write(
+                        tx,
+                        &id_at(start, tag as u128),
+                        &owner(&client),
+                        "inference.retention.advance",
+                        &json!({}),
+                        &json!({}),
+                        start,
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let last = retention(&store, &client, id_at(start, 2000));
+        let result = store
+            .inference_retention_advance(&client, 1, &last, start)
+            .unwrap();
+        assert_eq!(result["write_retain_after_seq"], 0);
+        let blocked = retention(&store, &client, id_at(start, 2001));
+        let high = store.inference_high_water(&client).unwrap();
+        assert_eq!(
+            store
+                .inference_retention_advance(&client, 1, &blocked, start)
+                .unwrap_err()
+                .code,
+            "capacity"
+        );
+        assert_eq!(store.inference_high_water(&client).unwrap(), high);
+        assert_eq!(
+            store
+                .inference_write_get(&client, &blocked.id, start)
+                .unwrap()
+                .status,
+            InferenceWriteStatus::Absent
+        );
+        assert_eq!(
+            store
+                .inference_retention_advance(&client, 0, &last, start + RETRY_WINDOW_MS + 1)
+                .unwrap(),
+            result
+        );
+        let count: i64 = store.connection.query_row("SELECT COUNT(*) FROM writes WHERE principal=?1 AND method='inference.retention.advance'", [owner(&client)], |row| row.get(0)).unwrap();
+        assert_eq!(count, MAX_INFERENCE_RETENTION_RECEIPTS);
+        let cancel = InferenceCancelRequest {
+            id: id_at(start, 2002),
+            call_id: call.id.clone(),
+        };
+        assert_eq!(
+            store.inference_cancel(&client, 1, &cancel, start).unwrap()["outcome"],
+            "too_late"
+        );
+        let release = InferenceReleaseRequest {
+            id: id_at(start, 2003),
+            call_id: call.id.clone(),
+            disposition: InferenceDisposition::AbandonForErasure,
+            result_sha256: None,
+            no_backup_dependencies: None,
+            backup_dependency: Some(InferenceBackupDependency::NoBackupDependencies),
+        };
+        let released = store
+            .inference_release(&client, 1, &release, start)
+            .unwrap();
+        assert_eq!(
+            store
+                .inference_release(&client, 1, &release, start)
+                .unwrap(),
+            released
+        );
+        store.inference_cleanup_complete(&client, &call.id).unwrap();
+        let later = start + RETRY_WINDOW_MS + 1;
+        let request = retention(&store, &client, id_at(later, 2004));
+        let result = store
+            .inference_retention_advance(&client, 1, &request, later)
+            .unwrap();
+        assert_eq!(result["pruned_calls"], 1);
+        assert_eq!(result["pruned_writes"], MAX_INFERENCE_INVENTORY_PAGE);
+        let count: i64 = store.connection.query_row("SELECT COUNT(*) FROM writes WHERE principal=?1 AND method='inference.retention.advance'", [owner(&client)], |row| row.get(0)).unwrap();
+        assert!(count < MAX_INFERENCE_RETENTION_RECEIPTS);
     }
 
     #[test]
