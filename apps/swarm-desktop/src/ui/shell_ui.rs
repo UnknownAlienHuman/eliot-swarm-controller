@@ -31,8 +31,8 @@ pub(super) enum ShellMsg {
     ExpandToggled(String, bool),
     /// Tree epoch, manager id and its direct-children page.
     BranchLoaded(u64, String, Fallible<AgentPage>),
-    /// The theme choice was written to the settings file (or not).
-    SettingsSaved(Result<(), String>),
+    /// The theme choice written to the settings file (or not).
+    SettingsSaved(ThemeChoice, Result<(), String>),
 }
 
 /// Reactor 0.100.0 reports the window's Light/Dark scheme only, and a High
@@ -96,6 +96,10 @@ pub(super) struct ShellState {
     pub(super) tree_epoch: u64,
     /// The rows on screen (see [`nav::rows`]); `agent_idx` indexes these.
     pub(super) rows: Vec<Row>,
+    /// Row ids as last rendered, and the render count when `rows` was last
+    /// replaced (equal to the current count: not rendered yet).
+    pub(super) published: Vec<String>,
+    pub(super) rows_render: u64,
     pub(super) agent_idx: Option<usize>,
     pub(super) agents_next: Option<String>,
     pub(super) agents_total: usize,
@@ -134,18 +138,14 @@ impl DesktopApp {
                         }
                         self.nav.agents_next = page.next;
                         self.nav.agents_total = page.total;
+                        // A just-launched Agent may not be on this page yet;
+                        // its id is already the selection.
                         if let Some(wanted) = self.nav.pending_select.take()
                             && !self.nav.agents.iter().any(|agent| agent.id == wanted.id)
                         {
-                            self.nav.agents.push(wanted.clone());
-                            self.nav.pending_select = Some(wanted);
+                            self.nav.agents.push(wanted);
                         }
-                        let selected = self
-                            .nav
-                            .pending_select
-                            .take()
-                            .map(|agent| agent.id)
-                            .or_else(|| self.nav.selection.agent.clone());
+                        let selected = self.nav.selection.agent.clone();
                         if let Some(agent) = selected
                             .and_then(|id| self.nav.agents.iter().find(|agent| agent.id == id))
                             .cloned()
@@ -266,10 +266,8 @@ impl DesktopApp {
                 }
             }
             ShellMsg::HighlightAgent(id) => {
-                // The rows are unchanged since the last render, so the index
-                // already exists in the native list.
                 if self.nav.selection.agent.as_deref() == Some(id.as_str()) {
-                    self.nav.agent_idx = self.nav.rows.iter().position(|row| row.agent.id == id);
+                    self.highlight_published(&id, context);
                 }
             }
             ShellMsg::ScreenSelected(screen) => {
@@ -311,16 +309,16 @@ impl DesktopApp {
             }
             ShellMsg::ThemeCycled => {
                 self.appearance.pref = self.appearance.pref.next();
-                let settings = crate::settings::Settings {
-                    theme: self.appearance.pref,
-                };
-                let _task = context.spawn_background(move |_| {
-                    Message::Shell(ShellMsg::SettingsSaved(crate::settings::save(&settings)))
-                });
+                self.save_settings(context);
             }
-            ShellMsg::SettingsSaved(result) => {
+            ShellMsg::SettingsSaved(saved, result) => {
+                self.settings_saving = false;
                 if let Err(error) = result {
                     self.set_status(format!("Theme choice not saved: {error}"));
+                }
+                // A newer choice arrived while this one was written.
+                if saved != self.appearance.pref {
+                    self.save_settings(context);
                 }
             }
             ShellMsg::FieldsPrimed(epoch) => {
@@ -390,6 +388,20 @@ impl DesktopApp {
         })
     }
 
+    /// Write the current theme choice, one write at a time (a newer choice
+    /// is written when the running write reports back).
+    fn save_settings(&mut self, context: &ComponentContext<Self>) {
+        if self.settings_saving {
+            return;
+        }
+        self.settings_saving = true;
+        let theme = self.appearance.pref;
+        let _task = context.spawn_background(move |_| {
+            let saved = crate::settings::save(&crate::settings::Settings { theme });
+            Message::Shell(ShellMsg::SettingsSaved(theme, saved))
+        });
+    }
+
     /// `text` once the editors are primed, empty during the priming render.
     pub(super) fn primed<'a>(&self, text: &'a str) -> &'a str {
         if self.fields_primed { text } else { "" }
@@ -427,19 +439,47 @@ impl DesktopApp {
             group,
             &|label| nav::project_name(label, &registered),
         );
-        let previous = std::mem::replace(&mut self.nav.rows, rows);
+        // Rows replaced earlier in this same message batch never reached
+        // the native list; the published ids are the last rendered ones.
+        if self.renders.get() != self.nav.rows_render {
+            self.nav.published = self
+                .nav
+                .rows
+                .iter()
+                .map(|row| row.agent.id.clone())
+                .collect();
+        }
+        self.nav.rows = rows;
+        self.nav.rows_render = self.renders.get();
         let Some(id) = self.nav.selection.agent.clone() else {
             self.nav.agent_idx = None;
             return;
         };
+        self.highlight_published(&id, context);
+    }
+
+    /// Point the native selection at `id` only where the native list already
+    /// shows it at the same index; otherwise clear it and try again on the
+    /// next tick, after the rows are published.
+    pub(super) fn highlight_published(&mut self, id: &str, context: &ComponentContext<Self>) {
         let index = self.nav.rows.iter().position(|row| row.agent.id == id);
-        let stable =
-            index.is_some_and(|index| previous.get(index).map(|row| &row.agent.id) == Some(&id));
+        let rendered: Vec<&str> = if self.renders.get() == self.nav.rows_render {
+            self.nav.published.iter().map(String::as_str).collect()
+        } else {
+            // A render happened since the rows changed: they are on screen.
+            self.nav
+                .rows
+                .iter()
+                .map(|row| row.agent.id.as_str())
+                .collect()
+        };
+        let stable = index.is_some_and(|index| rendered.get(index) == Some(&id));
         if stable {
             self.nav.agent_idx = index;
         } else {
             self.nav.agent_idx = None;
             if index.is_some() {
+                let id = id.to_owned();
                 let _task =
                     context.spawn_background(move |_| Message::Shell(ShellMsg::HighlightAgent(id)));
             }

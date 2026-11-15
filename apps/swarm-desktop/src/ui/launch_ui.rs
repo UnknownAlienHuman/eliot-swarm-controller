@@ -103,7 +103,12 @@ impl DesktopApp {
             LaunchMsg::LaunchSubmitted(outcome) => {
                 // Keyboard focus goes back to the composer (no-op while it is unbound).
                 let _ = self.chat.composer_ref.request_focus();
-                self.settle_mutation(outcome.is_ok());
+                self.settle_mutation(
+                    outcome
+                        .as_ref()
+                        .err()
+                        .is_none_or(|error| !crate::state::uncertain(error)),
+                );
                 match outcome {
                     Ok(outcome) => {
                         // The first prompt rode the launch admission; it is
@@ -133,11 +138,12 @@ impl DesktopApp {
                         self.nav.selection.select_agent(Some(outcome.agent));
                         self.load_agents(context, None);
                     }
-                    Err(error) => {
+                    Err(error) if crate::state::uncertain(&error) => {
                         self.set_status(format!(
                             "Launch not confirmed (Launch again reuses its id): {error}"
                         ));
                     }
+                    Err(error) => self.set_status(format!("Launch refused: {error}")),
                 }
             }
             LaunchMsg::ProfilesListed(result) => match result {

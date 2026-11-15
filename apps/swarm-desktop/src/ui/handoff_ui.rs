@@ -369,12 +369,16 @@ impl DesktopApp {
                             self.handoff.status = "The switch is still orchestrating; Refresh the result reads it again with the same id.".to_owned();
                         }
                     }
-                    Err(error) if uncertain => {
-                        if settles {
-                            self.handoff.uncertain = true;
-                        }
+                    Err(error) if uncertain && settles => {
+                        self.handoff.uncertain = true;
                         self.handoff.status = format!(
                             "Outcome uncertain; Retry sends the same request with the same id, never a new one: {error}"
+                        );
+                    }
+                    Err(error) if uncertain => {
+                        // A readback that failed changes nothing it had read.
+                        self.handoff.status = format!(
+                            "The readback did not answer; Refresh the result reads it again with the same id: {error}"
                         );
                     }
                     Err(error) => {
@@ -416,7 +420,13 @@ impl DesktopApp {
                         "Write the reason for this Owner assertion first.".to_owned();
                     return;
                 }
-                let key = format!("resolve:{command}:{}", resolution.as_str());
+                // The reason is part of the assertion: another reason is a
+                // new action with a new id.
+                let key = format!(
+                    "resolve:{command}:{}:{:x}",
+                    resolution.as_str(),
+                    crate::chat::text_hash(&reason)
+                );
                 let label = format!("Resolve the brief as {}", resolution.as_str());
                 self.handoff_owner_action(key, label, context, move |data_dir, id| {
                     client::block_on(client::resolve_command(

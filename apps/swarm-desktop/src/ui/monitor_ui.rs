@@ -161,16 +161,10 @@ impl DesktopApp {
                             })
                     });
                 if let Some(agent) = agent {
-                    // The rows are unchanged in this update: the index is
-                    // already published.
-                    self.nav.agent_idx = self
-                        .nav
-                        .rows
-                        .iter()
-                        .position(|row| row.agent.id == agent.id);
                     if self.chat.convo.as_ref().map(Conversation::agent) != Some(&agent.id) {
                         self.open_conversation(&agent, context);
                     }
+                    self.highlight_published(&agent.id, context);
                 }
             }
             MonitorMsg::ForceStopAsked(bound) => self.monitor.confirm_force = Some(bound),

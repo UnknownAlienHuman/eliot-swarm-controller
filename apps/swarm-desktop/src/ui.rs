@@ -191,6 +191,8 @@ struct DesktopApp {
     appearance: shell_ui::Appearance,
     /// The window's client width in DIPs, once observed.
     window_width: Option<f64>,
+    /// A settings write is running (see `save_settings`).
+    settings_saving: bool,
     /// False for the one render after the screen tree is re-created: the
     /// multi-line editors are then created empty (see `reprime_fields`).
     fields_primed: bool,
@@ -407,6 +409,7 @@ impl Component for DesktopApp {
             status: "Connecting to the daemon…".to_owned(),
             appearance: shell_ui::Appearance::new(),
             window_width: None,
+            settings_saving: false,
             fields_primed: true,
             prime_epoch: 0,
             renders: std::cell::Cell::new(0),
@@ -427,6 +430,8 @@ impl Component for DesktopApp {
                 expanded: HashSet::new(),
                 tree_epoch: 0,
                 rows: Vec::new(),
+                published: Vec::new(),
+                rows_render: 0,
                 agent_idx: None,
                 agents_next: None,
                 agents_total: 0,

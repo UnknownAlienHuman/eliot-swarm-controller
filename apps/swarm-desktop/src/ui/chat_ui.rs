@@ -21,7 +21,8 @@ pub(super) enum ChatMsg {
     /// Send, Steer or Resume with the draft, bound when it was clicked.
     DraftRequested(DraftAction),
     SendSubmitted(Fallible<SendOutcome>),
-    InterruptRequested,
+    /// Interrupt the turn shown on the button (Agent, generation, turn).
+    InterruptRequested(BoundAction),
     ApprovalRequested(UiPending, bool),
     AnswerRequested(UiPending),
     ControlSubmitted(String, Fallible<String>),
@@ -391,7 +392,12 @@ impl DesktopApp {
             ChatMsg::SendSubmitted(outcome) => {
                 // Keyboard focus goes back to the composer (no-op while it is unbound).
                 let _ = self.chat.composer_ref.request_focus();
-                self.settle_mutation(outcome.is_ok());
+                self.settle_mutation(
+                    outcome
+                        .as_ref()
+                        .err()
+                        .is_none_or(|error| !crate::state::uncertain(error)),
+                );
                 match outcome {
                     Ok(outcome) => {
                         // Bound to the submitting Agent and draft revision, not
@@ -429,31 +435,23 @@ impl DesktopApp {
                             }
                         ));
                     }
-                    Err(error) => {
+                    Err(error) if crate::state::uncertain(&error) => {
                         self.set_status(format!(
-                            "Not admitted (the same button reuses its id): {error}"
+                            "Outcome uncertain (the same button reuses its id): {error}"
                         ));
                     }
+                    Err(error) => self.set_status(format!("Not admitted: {error}")),
                 }
             }
-            ChatMsg::InterruptRequested => {
+            ChatMsg::InterruptRequested(bound) => {
                 if self.submitting() {
                     return;
                 }
-                let (Ok(data_dir), Some(agent), Some(detail)) = (
-                    self.data_dir.clone(),
-                    self.selected_agent_id(),
-                    self.chat.detail.clone(),
-                ) else {
-                    self.set_status("Select an Agent first.");
+                let Ok(data_dir) = self.data_dir.clone() else {
                     return;
                 };
-                let Some(turn) = detail.active_turn.clone() else {
-                    self.set_status("No active turn to interrupt.");
-                    return;
-                };
-                let bound = BoundAction::turn_control(&agent, detail.generation, &turn);
-                let key = format!("interrupt:{agent}:{}:{turn}", detail.generation);
+                let turn = bound.turn.clone().unwrap_or_default();
+                let key = format!("interrupt:{}:{}:{turn}", bound.agent, bound.generation);
                 let mutation_id = self.ledger.id_for(&key);
                 self.in_flight_key = Some(key);
                 self.set_status(format!("Interrupting turn {turn} ({mutation_id})…"));
@@ -530,10 +528,13 @@ impl DesktopApp {
                         return;
                     }
                 };
+                // The payload is part of the action: edited answers are a new
+                // action with a new id, never a same-id retry with other data.
                 let key = format!(
-                    "answer:{}:{}",
+                    "answer:{}:{}:{:x}",
                     request.binding.agent,
-                    request.binding.request.clone().unwrap_or_default()
+                    request.binding.request.clone().unwrap_or_default(),
+                    crate::chat::text_hash(&answer)
                 );
                 let mutation_id = self.ledger.id_for(&key);
                 self.in_flight_key = Some(key);
@@ -556,12 +557,18 @@ impl DesktopApp {
                 });
             }
             ChatMsg::ControlSubmitted(what, outcome) => {
-                self.settle_mutation(outcome.is_ok());
+                self.settle_mutation(
+                    outcome
+                        .as_ref()
+                        .err()
+                        .is_none_or(|error| !crate::state::uncertain(error)),
+                );
                 match outcome {
                     Ok(state) => self.set_status(format!("{what} admitted: {state}.")),
-                    Err(error) => self.set_status(format!(
-                        "{what} not admitted (retry reuses its id): {error}"
+                    Err(error) if crate::state::uncertain(&error) => self.set_status(format!(
+                        "{what}: outcome uncertain (retry reuses its id): {error}"
                     )),
+                    Err(error) => self.set_status(format!("{what} not admitted: {error}")),
                 }
             }
         }
@@ -1164,29 +1171,32 @@ impl DesktopApp {
                 .content(m3::icon_label(m3::glyph::SEND, "Launch Agent")),
         };
         // Steer and Interrupt exist only while a turn is active.
-        let turn_actions: View = match (agent.as_deref(), detail, active_turn.as_deref()) {
-            (Some(agent), Some(detail), Some(turn)) => {
-                let bound = BoundAction::turn_control(agent, detail.generation, turn);
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::SM)
-                    .children((
-                        m3::tonal(palette)
-                            .is_enabled(!self.submitting())
-                            .automation_name(format!("Interrupt turn {turn}"))
-                            .on_click(context.message(Message::Chat(ChatMsg::InterruptRequested)))
-                            .content(m3::icon_label(m3::glyph::INTERRUPT, "Interrupt")),
-                        m3::tonal(palette)
-                            .is_enabled(!self.submitting() && !draft_blank)
-                            .automation_name(format!("Steer turn {turn} with the message"))
-                            .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
-                                DraftAction::Steer(bound),
-                            ))))
-                            .content(m3::icon_label(m3::glyph::STEER, "Steer")),
-                    ))
-            }
-            _ => View::empty(),
-        };
+        let turn_actions: View =
+            match (agent.as_deref(), detail, active_turn.as_deref()) {
+                (Some(agent), Some(detail), Some(turn)) => {
+                    let bound = BoundAction::turn_control(agent, detail.generation, turn);
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(theme::spacing::SM)
+                        .children((
+                            m3::tonal(palette)
+                                .is_enabled(!self.submitting())
+                                .automation_name(format!("Interrupt turn {turn}"))
+                                .on_click(context.message(Message::Chat(
+                                    ChatMsg::InterruptRequested(bound.clone()),
+                                )))
+                                .content(m3::icon_label(m3::glyph::INTERRUPT, "Interrupt")),
+                            m3::tonal(palette)
+                                .is_enabled(!self.submitting() && !draft_blank)
+                                .automation_name(format!("Steer turn {turn} with the message"))
+                                .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
+                                    DraftAction::Steer(bound),
+                                ))))
+                                .content(m3::icon_label(m3::glyph::STEER, "Steer")),
+                        ))
+                }
+                _ => View::empty(),
+            };
         let composer_card = Border::new()
             .grid_row(4)
             .background(palette.surface_container_high())
