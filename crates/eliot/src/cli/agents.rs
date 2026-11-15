@@ -647,6 +647,48 @@ pub(crate) async fn run_reparent(
     Ok(0)
 }
 
+pub(crate) async fn run_switch(
+    args: super::args::SwitchArgs,
+    data_dir: PathBuf,
+    json_output: bool,
+    id: Option<String>,
+) -> Result<u8, Failure> {
+    let request = eliot_core::api::SwitchRequest {
+        id: mutation_id(id)?,
+        from: args.from,
+        from_generation: args.generation,
+        task_command: args.task_command,
+        commands: args.commands,
+        launch: eliot_core::api::SwitchLaunch {
+            profile: args.profile,
+            harness: args.harness,
+            model: args.model,
+            effort: args.effort,
+            auth: args.auth,
+            cmd: args.cmd,
+            workspace: args.workspace,
+            worktree: args.worktree,
+            base: args.base,
+        },
+    };
+    request
+        .validate()
+        .map_err(|error| Failure::from_core(error, true))?;
+    let response: eliot_core::api::SwitchResponse =
+        eliot_daemon::client_call_typed(&data_dir, "swarm.switch", &request)
+            .await
+            .map_err(|error| Failure::from_core(error, true))?;
+    request
+        .validate_response(&response)
+        .map_err(|_| Failure::new(4, "switch response binding differs"))?;
+    let exit = response_exit_code(response.state);
+    print_value(
+        &serde_json::to_value(response).map_err(|_| Failure::new(4, "invalid switch response"))?,
+        json_output,
+    );
+    Ok(exit)
+}
+
 pub(crate) async fn run_handoff(
     args: super::args::HandoffArgs,
     data_dir: PathBuf,

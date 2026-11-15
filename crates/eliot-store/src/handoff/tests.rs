@@ -85,6 +85,9 @@ fn handoff_cancels_without_effect_links_and_orders_successors() {
         core::NativeEvent {ts:None,kind:"turn.started".into(),native_id:"brief-started".into(),data:json!({"command_id":result.value.brief_command,"turn_id":"brief-turn"})},
         core::NativeEvent {ts:None,kind:"turn.completed".into(),native_id:"brief-completed".into(),data:json!({"command_id":result.value.brief_command,"turn_id":"brief-turn","status":"completed"})},
     ]},now()).unwrap();
+    let readback = s.replay_handoff("owner", &r).unwrap().unwrap();
+    assert_eq!(readback.brief_state, CommandState::Applied);
+    assert_eq!(readback.successor_gate, "released");
     assert_eq!(
         s.dispatch(successor, now()).unwrap().value.state,
         CommandState::Dispatched

@@ -104,7 +104,10 @@ const RECOVER_ACCEPTED_COMMAND_FILTER: &str =
         AND selector IS NULL
         AND NOT EXISTS (SELECT 1 FROM workspaces w
             WHERE w.agent = commands.target AND w.start_command_id = commands.id))
-       OR (link_kind = 'handoff' AND state IN ('accepted','queued')))";
+       OR (link_kind = 'handoff' AND state IN ('accepted','queued'))
+       OR (link_kind = 'switch' AND ordinal = 0 AND verb = 'launch' AND state = 'accepted'
+           AND EXISTS (SELECT 1 FROM commands p WHERE p.id = commands.parent_command AND p.method = 'swarm.switch')
+           AND NOT EXISTS (SELECT 1 FROM workspaces w WHERE w.agent = commands.target AND w.start_command_id = commands.id)))";
 
 const LIST_PROCESSES_FIRST_PAGE_SQL: &str =
     "SELECT host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at
@@ -148,6 +151,7 @@ mod retention;
 mod schema;
 mod source_batches;
 mod source_handoff;
+mod switch;
 pub(crate) mod usage;
 mod workspace;
 
@@ -1718,7 +1722,9 @@ impl Store {
         Self::recover_lost_native_children_tx(&tx, now, &mut events)?;
         for (command_id, target, generation, verb, encoded_outcome) in dispatched_commands {
             let previous_outcome = encoded_outcome.as_deref().map(decode_json).transpose()?;
-            let outcome = if verb == "inject" {
+            let outcome = if verb == "switch" {
+                previous_outcome.unwrap_or_else(|| json!({}))
+            } else if verb == "inject" {
                 context::unknown_claim_outcome(previous_outcome.as_ref(), "daemon_restart")
             } else {
                 json!({"reason": "daemon_restart"})

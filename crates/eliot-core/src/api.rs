@@ -25,6 +25,7 @@ mod resolutions;
 mod rules;
 mod script_edit;
 mod scripts;
+mod switch;
 mod timers;
 mod usage;
 mod waits;
@@ -131,6 +132,7 @@ pub use scripts::{
     ScriptInterpreter, ScriptProcessResult, ScriptRuleContext, ScriptRunApplied,
     ScriptTimerContext, ScriptTimerInvocation, bound_script_outcome_stderr,
 };
+pub use switch::{SwitchAgent, SwitchLaunch, SwitchRequest, SwitchResponse};
 pub use timers::{CatchUp, TimerGetRequest, TimerRunRequest, TimerSchedule, TimerStateView};
 pub use usage::{
     SessionCostTotal, SessionCumulativeTotals, SessionFacts, SessionTokenSubtotal,

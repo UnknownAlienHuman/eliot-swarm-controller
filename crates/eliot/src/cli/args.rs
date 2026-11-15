@@ -144,6 +144,8 @@ pub(crate) enum CliCommand {
     Reparent(ReparentArgs),
     /// Transfer task inputs, claims, paused Goal and children to an existing Agent.
     Handoff(HandoffArgs),
+    /// Launch a new session and hand off task inputs, claims, Goal and children (Owner only).
+    Switch(SwitchArgs),
     /// Send, read or acknowledge addressed Agent mail.
     Msg(MsgArgs),
     /// Read one page of unread mail for a mailbox.
@@ -637,6 +639,36 @@ pub(crate) struct ReparentArgs {
     pub(crate) generation: i64,
     #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
     pub(crate) parent_generation: i64,
+}
+
+#[derive(Args)]
+pub(crate) struct SwitchArgs {
+    pub(crate) from: String,
+    #[arg(long, value_parser=clap::value_parser!(i64).range(1..))]
+    pub(crate) generation: i64,
+    #[arg(long)]
+    pub(crate) task_command: String,
+    /// Ordered undispatched plain SENDs, at most 64.
+    pub(crate) commands: Vec<String>,
+    #[arg(long, conflicts_with = "harness")]
+    pub(crate) profile: Option<String>,
+    #[arg(long)]
+    pub(crate) harness: Option<String>,
+    #[arg(long, requires = "harness")]
+    pub(crate) model: Option<String>,
+    #[arg(long, requires = "harness")]
+    pub(crate) effort: Option<String>,
+    #[arg(long, requires = "harness")]
+    pub(crate) auth: Option<String>,
+    #[arg(long, requires = "harness")]
+    pub(crate) cmd: Option<String>,
+    /// Omitted uses A's retained workspace; normal launch workspace checks apply.
+    #[arg(long)]
+    pub(crate) workspace: Option<String>,
+    #[arg(long)]
+    pub(crate) worktree: Option<String>,
+    #[arg(long, requires = "worktree")]
+    pub(crate) base: Option<String>,
 }
 
 #[derive(Args)]

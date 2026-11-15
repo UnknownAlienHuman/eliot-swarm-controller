@@ -24,31 +24,16 @@ pub struct HandoffRequest {
 
 impl HandoffRequest {
     pub fn validate(&self) -> Result<()> {
-        parse_agent_id(&self.from)?;
+        validate_selection(
+            &self.id,
+            &self.from,
+            self.from_generation,
+            &self.task_command,
+            &self.commands,
+        )?;
         parse_agent_id(&self.to)?;
-        if self.id.trim().is_empty()
-            || self.from == self.to
-            || self.from_generation < 1
-            || self.to_generation < 1
-            || self.task_command.is_empty()
-            || self.task_command.len() > 256
-            || self.commands.len() > MAX_HANDOFF_SENDS
-        {
-            return Err(Error::new(
-                "invalid",
-                "invalid handoff binding or selection",
-            ));
-        }
-        let mut seen = HashSet::new();
-        if self
-            .commands
-            .iter()
-            .any(|id| id.is_empty() || id.len() > 256 || !seen.insert(id))
-        {
-            return Err(Error::new(
-                "invalid",
-                "handoff SEND ids must be distinct and bounded",
-            ));
+        if self.from == self.to || self.to_generation < 1 {
+            return Err(Error::new("invalid", "invalid handoff destination"));
         }
         Ok(())
     }
@@ -78,6 +63,38 @@ impl HandoffRequest {
         }
         Ok(())
     }
+}
+
+pub(super) fn validate_selection(
+    id: &str,
+    from: &str,
+    generation: i64,
+    task: &str,
+    commands: &[String],
+) -> Result<()> {
+    parse_agent_id(from)?;
+    if id.trim().is_empty()
+        || generation < 1
+        || task.is_empty()
+        || task.len() > 256
+        || commands.len() > MAX_HANDOFF_SENDS
+    {
+        return Err(Error::new(
+            "invalid",
+            "invalid transfer source or selection",
+        ));
+    }
+    let mut seen = HashSet::new();
+    if commands
+        .iter()
+        .any(|id| id.is_empty() || id.len() > 256 || !seen.insert(id))
+    {
+        return Err(Error::new(
+            "invalid",
+            "transfer SEND ids must be distinct and bounded",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

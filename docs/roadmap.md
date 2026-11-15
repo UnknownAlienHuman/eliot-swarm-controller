@@ -214,8 +214,14 @@ Read [coordination](spec/coordination.md). Use two Codex Agents initially.
       Qualified 2026-11-15: Codex Sol A to Antigravity Argon B, ordinary brief then
       transferred task, no-effect original cancellation, exact claim expiry preserved,
       same-ID replay without another turn, and active-source refusal.
-- [ ] **H3 Agent switch.** Connect launch-plus-handoff. A definitely created B is
-      finished through ordinary `swarm.handoff`; no special finish mutation.
+- [x] **H3 Agent switch.** Owner launch-plus-handoff through ordinary durable
+      commands, reserved IDs before external preparation, promptless native launch
+      and exact committed readiness before the shared H2 transfer. A definitely
+      created B is finished through ordinary `swarm.handoff`; no finish mutation.
+      Qualified 2026-11-15: Codex Sol low to a new Antigravity Hydrogen low,
+      brief then transferred task completed, no-effect original cancellation,
+      claim expiry preserved, same-ID replay without another Agent/turn,
+      released-gate readback and active-source refusal before launch.
 
 **Result:** two Agents exchange an actual message, share one variable and identify each
 other's file area without a manager relay. Codex/Luna and OpenCode/OpenRouter exchanged queued

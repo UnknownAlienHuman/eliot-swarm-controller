@@ -105,6 +105,19 @@ impl Router {
     }
 
     pub(super) async fn process_command_inner(self, id: String, linked_id: Option<String>) {
+        if self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_command(&id)
+            .ok()
+            .flatten()
+            .is_some_and(|command| command.verb == "switch")
+        {
+            self.process_switch(&id).await;
+            return;
+        }
         let mut receiver = self.inner.bus.subscribe();
         let Some(prepared) = self
             .prepare_command_dispatch(&id, linked_id.is_some())

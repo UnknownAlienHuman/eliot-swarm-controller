@@ -236,6 +236,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `swarm.wait` | bounded wait over a frozen child command/turn set with all/any, timeout and honest per-entry outcomes |
 | `swarm.digest` | durable digest over a frozen child set delivering one coalesced parent mailbox result with the standard mail wake |
 | `command.resolve`, `turn.resolve` | constrained Owner resolution of unknown outcomes; failed handoff brief may be Owner-applied |
+| `swarm.switch` | Owner launch-plus-handoff to a new Agent, using normal launch and the H2 transfer |
 | `swarm.handoff`, `command.cancel` | atomic task transfer to an existing Agent; Owner withdrawal of undispatched handoff input |
 | `command.children` | implemented scoped, paged child readback for a retained expansion |
 | `project.list/get` | owner-only read of registered project authority |
@@ -975,9 +976,36 @@ an unknown brief, or narrowly assert a failed handoff brief applied, without a
 resend. These Owner recovery operations remain available during drain. MCP
 advertises both mutations and mints omitted IDs using its normal rules.
 
-`swarm.switch` remains a reserved design name returning `unsupported`, with no
-CLI or discovery entry. A definitely launched but unfinished switch will use
-ordinary `swarm.handoff` to the created B; no finish mutation is planned.
+`swarm.switch` implements Owner launch-plus-handoff to a new Agent, including a
+cross-harness switch. [`SwitchRequest` / `SwitchResponse`](../../crates/eliot-core/src/api/switch.rs)
+own the wire shape. It binds exact A generation, original-task SEND, selected SENDs
+and profile or ad-hoc launch selectors. Workspace defaults to A's retained workspace;
+workspace/worktree/base overrides still use normal launch validation. The route
+preserves A's project identity. No launch prompt or parent override is accepted.
+
+The immediate reply is the retained reservation, not proof of launch or transfer.
+Use `swarm.wait` on the switch ID or retry that same ID for component readback.
+The independent operation reserves launch/Handoff IDs before external preparation,
+uses normal launch with no input, waits for exact committed session readiness,
+then reuses H2's atomic transfer. The result exposes current parent/launch states,
+created B and generation, Handoff result, error code and explicit `next_action`.
+Applied parent means H2 admission, not native task completion. Failed/unknown brief
+behavior remains H2's queued gate. Same-ID retry only reads retained bindings, even
+during drain; it never launches another B or repeats work. See
+[Coordination](coordination.md#agent-switch-implemented) for crash/boundary semantics.
+
+```text
+swarm [--id ULID] switch A --generation N --task-command TASK_SEND [SEND_ID...] --profile PROFILE
+swarm [--id ULID] switch A --generation N --task-command TASK_SEND [SEND_ID...] --harness HARNESS [--model MODEL] [--effort EFFORT] [--auth INTEGRATION] [--cmd PATH]
+```
+
+Both forms accept optional `--workspace`, `--worktree` and `--base`. An initially
+busy A refuses before B is allocated. If readiness/transfer fails after B is
+created, B remains visible and A's transfer is rolled back. A definitely launched
+but untransferred B is finished with ordinary `swarm.handoff` using B's exact
+identity and a new handoff mutation ID; no finish mutation exists. Stopping either
+Agent is explicit. MCP advertises `swarm.switch` as an Owner mutation and mints an
+omitted ID through its normal rules.
 
 ## Waiting
 

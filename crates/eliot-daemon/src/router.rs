@@ -13,6 +13,7 @@ mod handoff;
 mod hierarchy;
 mod resolution;
 mod rules;
+mod switch;
 
 pub(crate) use attention::run_attention;
 use auth::{authorize_command, authorize_rpc_method};
@@ -308,6 +309,7 @@ impl Router {
             "swarm.digest" => self.swarm_digest(&params, &principal).await,
             "swarm.reparent" => self.swarm_reparent(&params, &principal).await,
             "swarm.handoff" => self.swarm_handoff(&params, &principal).await,
+            "swarm.switch" => self.swarm_switch(&params, &principal).await,
             "command.cancel" => self.command_cancel(&params, &principal).await,
             "project.get" => self.project_get(&params, &principal).await,
             "project.list" => self.project_list(&params, &principal).await,
