@@ -290,6 +290,7 @@ impl Store {
     }
 
     pub fn inference_get(&self, client: &str, id: &str) -> Result<InferenceCall> {
+        self.ensure_committed_reads()?;
         call(&self.connection, client, id)
     }
 
@@ -836,5 +837,25 @@ mod tests {
             InferenceWriteStatus::Absent
         );
         assert!(store.inference_get(&client, &request.id).is_err());
+    }
+
+    #[test]
+    fn call_state_read_refuses_uncommitted_writer_state() {
+        let (mut store, client) = setup();
+        let request = text();
+        store
+            .inference_text(&client, 1, &request, &json!({"native": "private"}), now())
+            .unwrap();
+        // A failed commit whose rollback also fails leaves the connection
+        // outside autocommit with an uncommitted row visible; call state
+        // must not be served from that transaction.
+        store.connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(
+            store.inference_get(&client, &request.id).unwrap_err().code,
+            "unavailable"
+        );
+        store.connection.execute_batch("ROLLBACK").unwrap();
+        let call = store.inference_get(&client, &request.id).unwrap();
+        assert_eq!(call.state, InferenceState::Queued);
     }
 }

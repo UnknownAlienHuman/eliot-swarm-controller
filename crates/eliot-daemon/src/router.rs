@@ -132,6 +132,10 @@ struct RouterInner {
     inference_ops: AsyncMutex<()>,
     inference_runner: AsyncMutex<()>,
     inference_workers: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Memory inference calls whose native process family exit is unproven
+    /// (`Unknown { quiescent: false }`). Cleanup and native dispatch stay
+    /// fenced for these ids; the fence lifts only on daemon restart.
+    inference_unquiescent: Mutex<HashSet<String>>,
     /// Bumped by `goal.set`/`goal.resume` when the Goal ends up active and
     /// idle-keyed. The goal driver sweeps the retained idle subjects on
     /// every change; reads never bump it. Startup performs no sweep: the
@@ -259,6 +263,7 @@ impl Router {
                 inference_ops: AsyncMutex::new(()),
                 inference_runner: AsyncMutex::new(()),
                 inference_workers: Mutex::new(HashMap::new()),
+                inference_unquiescent: Mutex::new(HashSet::new()),
                 goal_reconcile,
             }),
         }

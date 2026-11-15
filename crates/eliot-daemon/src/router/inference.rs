@@ -61,6 +61,19 @@ fn unknown() -> Error {
     )
 }
 
+/// Completed/Failed captures are settled only after owned-custody
+/// quiescence is established (Windows Job / Unix group). Unknown without
+/// quiescence keeps the cleanup/dispatch fence.
+fn inference_quiescent(outcome: &ProcessOutcome) -> bool {
+    !matches!(
+        outcome,
+        ProcessOutcome::Unknown {
+            quiescent: false,
+            ..
+        }
+    )
+}
+
 impl Router {
     fn artifact(&self, id: &str, kind: &str) -> PathBuf {
         self.inner.data_root.join(format!("inference-{id}.{kind}"))
@@ -294,6 +307,10 @@ impl Router {
                     != Some(request.text.as_bytes())
             {
                 store.inference_finish(client, &request.id, InferenceState::Failed, None)?;
+            } else if self.inference_dispatch_fenced() {
+                // Never dispatch native work while a previous process family
+                // exit is unproven; the admitted call stays queued as debt
+                // until restart recovery fails it.
             } else {
                 let router = self.clone();
                 let client = client.to_owned();
@@ -321,35 +338,47 @@ impl Router {
         deadline: tokio::time::Instant,
     ) {
         let single = tokio::time::timeout_at(deadline, self.inner.inference_runner.lock()).await;
-        let result = if let Ok(_single) = single {
-            self.run_inference_inner(&client, &request, route, deadline)
+        // Quiescence is carried through settlement: only a proven process
+        // family exit (Windows Job / Unix group) may release the cleanup
+        // fence below.
+        let quiescent = if let Ok(_single) = single {
+            match self
+                .run_inference_inner(&client, &request, route, deadline)
                 .await
+            {
+                Ok(quiescent) => quiescent,
+                Err(_) => {
+                    let _ = self.inner.store.lock().await.inference_finish(
+                        &client,
+                        &request.id,
+                        InferenceState::Unknown,
+                        None,
+                    );
+                    self.mark_inference_unquiescent(&request.id);
+                    false
+                }
+            }
         } else {
-            self.inner.store.lock().await.inference_finish(
+            let _ = self.inner.store.lock().await.inference_finish(
                 &client,
                 &request.id,
                 InferenceState::Failed,
                 None,
-            )
-        };
-        if result.is_err() {
-            let _ = self.inner.store.lock().await.inference_finish(
-                &client,
-                &request.id,
-                InferenceState::Unknown,
-                None,
             );
-        }
+            true
+        };
         // Released calls may never publish a late result. Cleanup is retriable by
         // the same release id; failures leave explicit debt in the call view.
+        // Cleanup stays fenced until the process family exit is established.
         let _operation = self.inner.inference_ops.lock().await;
-        if self
-            .inner
-            .store
-            .lock()
-            .await
-            .inference_get(&client, &request.id)
-            .is_ok_and(|c| c.state == InferenceState::Released)
+        if quiescent
+            && self
+                .inner
+                .store
+                .lock()
+                .await
+                .inference_get(&client, &request.id)
+                .is_ok_and(|c| c.state == InferenceState::Released)
         {
             let _ = self.cleanup_inference(&client, &request.id).await;
         }
@@ -362,7 +391,7 @@ impl Router {
         request: &InferenceTextRequest,
         route: Route,
         deadline: tokio::time::Instant,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let cancellation = self.inner.run_cancellation.subscribe();
         {
             let _operation = self.inner.inference_ops.lock().await;
@@ -373,7 +402,7 @@ impl Router {
                     InferenceState::Cancelled,
                     None,
                 )?;
-                return Ok(());
+                return Ok(true);
             }
             // Verify exact immutable input before setting the at-most-once fence.
             let input =
@@ -388,7 +417,7 @@ impl Router {
                 .await
                 .inference_claim(client, &request.id)?
             {
-                return Ok(());
+                return Ok(true);
             }
         }
         let cwd = self.inner.data_root.join("inference-work");
@@ -432,6 +461,12 @@ impl Router {
             cancellation.clone(),
         )
         .await;
+        let quiescent = inference_quiescent(&outcome);
+        if quiescent {
+            self.clear_inference_quiescence(&request.id);
+        } else {
+            self.mark_inference_unquiescent(&request.id);
+        }
         let text = match outcome {
             ProcessOutcome::Completed(capture)
                 if capture.status.success() && capture.stdout_complete =>
@@ -451,7 +486,7 @@ impl Router {
             .state
             == InferenceState::Released
         {
-            return Ok(());
+            return Ok(quiescent);
         }
         if let Some(output) = text {
             let text = output.text;
@@ -477,7 +512,7 @@ impl Router {
                 None,
             )?;
         }
-        Ok(())
+        Ok(quiescent)
     }
 
     pub(super) async fn inference_get(
@@ -590,12 +625,40 @@ impl Router {
             .lock_recover()
             .get(&request.call_id)
             .is_some_and(|w| !w.is_finished());
-        if !active {
+        // Cleanup stays fenced until the process family exit is established;
+        // an unproven family keeps its artifacts and cleanup debt.
+        if !active && !self.inference_quiescence_unproven(&request.call_id) {
             let _ = self.cleanup_inference(client, &request.call_id).await;
         }
         Ok(result)
     }
+    fn mark_inference_unquiescent(&self, id: &str) {
+        self.inner
+            .inference_unquiescent
+            .lock_recover()
+            .insert(id.to_owned());
+        crate::logging::record(
+            &self.secret_policy_snapshot(),
+            "daemon.inference_quiescence_unproven",
+            &[("call", id)],
+            None,
+        );
+    }
+    fn clear_inference_quiescence(&self, id: &str) {
+        self.inner.inference_unquiescent.lock_recover().remove(id);
+    }
+    fn inference_quiescence_unproven(&self, id: &str) -> bool {
+        self.inner.inference_unquiescent.lock_recover().contains(id)
+    }
+    fn inference_dispatch_fenced(&self) -> bool {
+        !self.inner.inference_unquiescent.lock_recover().is_empty()
+    }
     async fn cleanup_inference(&self, client: &str, id: &str) -> Result<()> {
+        // Never mark cleanup complete on uncertainty: an unproven process
+        // family may still hold native custody of these artifacts.
+        if self.inference_quiescence_unproven(id) {
+            return Err(unknown());
+        }
         for kind in ["input", "result"] {
             let path = self.artifact(id, kind);
             match std::fs::remove_file(&path) {
@@ -626,5 +689,163 @@ impl Router {
         for (_, worker) in workers {
             let _ = worker.await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        bus::Bus,
+        scripts::process::{ProcessFailure, ProcessUncertainty},
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn process_quiescence_is_carried_not_dropped() {
+        assert!(!inference_quiescent(&ProcessOutcome::Unknown {
+            reason: ProcessUncertainty::Quiescence,
+            quiescent: false,
+        }));
+        assert!(inference_quiescent(&ProcessOutcome::Unknown {
+            reason: ProcessUncertainty::Quiescence,
+            quiescent: true,
+        }));
+        assert!(inference_quiescent(&ProcessOutcome::Failed {
+            reason: ProcessFailure::Timeout,
+            capture: None,
+        }));
+    }
+
+    fn test_router(data_root: PathBuf) -> Router {
+        let store = eliot_store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        Router::new(
+            data_root,
+            "owner-credential".to_owned(),
+            Arc::new(tokio::sync::Mutex::new(store)),
+            Bus::new(16),
+        )
+    }
+
+    #[tokio::test]
+    async fn cleanup_never_completes_on_unproven_quiescence() {
+        let data_root =
+            std::env::temp_dir().join(format!("eliot-inference-quiescence-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&data_root).unwrap();
+        let router = test_router(data_root.clone());
+        let client = format!("memory:{}", ulid::Ulid::new());
+        let now = now_ms();
+        let call_id = ulid::Ulid::new().to_string();
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .inference_credential(
+                    "inference.client.install",
+                    &InferenceCredentialRequest {
+                        id: ulid::Ulid::new().to_string(),
+                        client_id: client.clone(),
+                        expected_version: 0,
+                    },
+                    &inference_sha256(b"quiescence-test-secret"),
+                    &InferenceCredentialResponse {
+                        client_id: client.clone(),
+                        token_version: 1,
+                        credential_file: "private.json".to_owned(),
+                        phase: "active".to_owned(),
+                    },
+                    now,
+                )
+                .unwrap();
+            store
+                .inference_text(
+                    &client,
+                    1,
+                    &InferenceTextRequest {
+                        id: call_id.clone(),
+                        profile: INFERENCE_PROFILE.to_owned(),
+                        origin: "episode:1".to_owned(),
+                        disclosure: InferenceDisclosure::ProviderAllowed,
+                        text: "summarize".to_owned(),
+                        input_sha256: inference_sha256(b"summarize"),
+                        input_bytes: 9,
+                        response_format: InferenceFormat::Text,
+                        max_result_bytes: 1024,
+                        deadline_ms: 30000,
+                    },
+                    &serde_json::json!({}),
+                    now,
+                )
+                .unwrap();
+            store
+                .inference_release(
+                    &client,
+                    1,
+                    &InferenceReleaseRequest {
+                        id: ulid::Ulid::new().to_string(),
+                        call_id: call_id.clone(),
+                        disposition: InferenceDisposition::AbandonForErasure,
+                        result_sha256: None,
+                        no_backup_dependencies: true,
+                    },
+                    now,
+                )
+                .unwrap();
+        }
+        for kind in ["input", "result"] {
+            std::fs::write(
+                data_root.join(format!("inference-{call_id}.{kind}")),
+                b"artifact",
+            )
+            .unwrap();
+        }
+        router.mark_inference_unquiescent(&call_id);
+        assert!(router.inference_dispatch_fenced());
+        assert_eq!(
+            router
+                .cleanup_inference(&client, &call_id)
+                .await
+                .unwrap_err()
+                .code,
+            "unknown"
+        );
+        assert!(
+            data_root
+                .join(format!("inference-{call_id}.input"))
+                .exists()
+        );
+        assert!(
+            !router
+                .inner
+                .store
+                .lock()
+                .await
+                .inference_get(&client, &call_id)
+                .unwrap()
+                .cleanup_complete
+        );
+        router.clear_inference_quiescence(&call_id);
+        assert!(!router.inference_dispatch_fenced());
+        router.cleanup_inference(&client, &call_id).await.unwrap();
+        assert!(
+            !data_root
+                .join(format!("inference-{call_id}.input"))
+                .exists()
+        );
+        assert!(
+            !data_root
+                .join(format!("inference-{call_id}.result"))
+                .exists()
+        );
+        assert!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .inference_get(&client, &call_id)
+                .unwrap()
+                .cleanup_complete
+        );
+        std::fs::remove_dir_all(&data_root).ok();
     }
 }
