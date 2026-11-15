@@ -351,22 +351,17 @@ impl DesktopApp {
     }
 
     fn automation_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        scroll(
-            StackPanel::new()
-                .spacing(theme::spacing::SM)
-                .children((
-                    config_view::automation_screen(
-                        &self.automation.rules,
-                        &self.automation.status,
-                        context.message(Message::Automation(
-                            AutomationMsg::AutomationRefreshRequested,
-                        )),
-                        palette,
-                    ),
-                    self.scripts_view(context, palette),
-                ))
-                .into(),
-        )
+        scroll(StackPanel::new().spacing(theme::spacing::SM).children((
+            config_view::automation_screen(
+                &self.automation.rules,
+                &self.automation.status,
+                context.message(Message::Automation(
+                    AutomationMsg::AutomationRefreshRequested,
+                )),
+                palette,
+            ),
+            self.scripts_view(context, palette),
+        )))
     }
 
     fn advanced_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {

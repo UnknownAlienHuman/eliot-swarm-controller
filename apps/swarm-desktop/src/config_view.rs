@@ -279,7 +279,6 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                 small(data.status.to_owned()),
             )),
         )
-        .into()
 }
 
 fn utc(ms: i64) -> String {
@@ -381,7 +380,6 @@ fn card_heading(title: &str, action: Option<View>) -> View {
                 .grid_column(1)
                 .content(action.unwrap_or_else(View::empty)),
         ))
-        .into()
 }
 
 /// Rules and timers of every namespace, read-only.
@@ -460,7 +458,6 @@ pub fn automation_screen(
                     ),
             )),
         )
-        .into()
 }
 
 /// State the Scripts card renders.
@@ -632,11 +629,9 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
             parts.push(KeyedView::new(key, small(line.to_owned())));
         }
     }
-    crate::m3::card(palette)
-        .content(
-            StackPanel::new()
-                .spacing(theme::spacing::SM)
-                .keyed_children(parts),
-        )
-        .into()
+    crate::m3::card(palette).content(
+        StackPanel::new()
+            .spacing(theme::spacing::SM)
+            .keyed_children(parts),
+    )
 }
