@@ -324,6 +324,43 @@ is still required to confirm effective posture.
 
 ## Worker MCP policy
 
+The installed Muse Code 1.4.0-R4161.1 stable and experimental exports
+(`muse schema generate-json-schema`, verified 2026-11-14) define native per-session
+MCP additions at `session/start.config.mcpServers` and
+`session/resume.config.mcpServers`. Initialization must request `sessionMcp` through
+`capabilities.requestedCapabilities` and check `grantedCapabilities`. A stdio entry
+requires `transport: "stdio"` and `command`, and accepts ordered `args`, runtime
+`env` additions, `framing` (`auto`, `contentLength`, `lineDelimitedJson`) and `mode`
+(`required`, `optional`). Defaults are automatic framing and required startup.
+The intended Eliot server is the current executable with arguments
+`["mcp", "--require-agent", "--data-dir", <Agent data root>]`, matching Codex and
+Claude's Agent-only server. No Codex `-c` override or owner-global config edit is
+needed by this native contract.
+
+Live blocker, 2026-11-14: the pinned host grants `sessionMcp` but rejects
+`session/start` carrying these additions with JSON-RPC `-32603`, message
+`internal error: session MCP base configuration is unavailable`, and reason
+`session_mcp_base_unavailable`, before starting an MCP child. A no-model native
+construction probe with the binary's `MUSE_ENABLE_SESSION_MCP=on` switch, and
+another also using `serve --trust-workspace`, still refuse. Its help exposes no
+base-configuration switch. A branch implementation reproduced an unknown Swarm
+launch and was removed because it would break existing Muse launches. Unknown
+launches were not replayed; ordinary Muse startup is preserved. Agent-scoped MCP,
+mail/reply/ack, var CAS and MCP child identity on resume remain unimplemented and
+unproven on this host pending a supported native base-configuration mechanism.
+
+The installed MSP surface has no `config/read`, `thread/start` or
+`mcpServerStatus/list` method, nor an MCP inventory in the session response.
+Effective MCP inventory therefore remains unknown; schema support, a capability
+grant and accepted configuration would not establish `mcp_servers_verified`.
+The current [vendor MCP guide](https://meta-models.github.io/muse-code-sdk/1.4/guides/extend/mcp-servers/#what-a-stdio-child-receives)
+also documents a cleared child environment whose allowlist excludes Eliot's Agent
+credentials. Any future implementation must explicitly supply the matching Agent
+generation identity through the native runtime `env` additions, register secrets
+for redaction, and keep them out of files, argv and public semantic metadata.
+This guide's published schema fingerprint differs from the installed host's;
+actual child identity and connectivity still need live qualification.
+
 This harness keeps `inherit` only: the frozen profile always records
 `mcp = "inherit"`, and a non-`inherit` policy is rejected as `unsupported`
 at config load. Verified read-only (`muse --help`, `muse mcp --help`): `muse
