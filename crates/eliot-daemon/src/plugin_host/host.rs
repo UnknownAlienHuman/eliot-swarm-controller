@@ -44,6 +44,16 @@ use tokio::{
 use ulid::Ulid;
 
 const RPC_DEADLINE: Duration = Duration::from_secs(30);
+/// Bound for one `agent.start` round trip and its outer absolute wait.
+/// Cold native startup is sequential inside that single RPC: credential
+/// transfer (up to its own 30 s budget) then serve readiness (up to its own
+/// 30 s) then the session phases. Measured on this machine: ~10 s hot-cache
+/// launch-to-ready, ~20 s warm, and a true-cold OpenCode start that exceeded
+/// the old 30 s RPC (`plugin_rpc_timeout`, unknown launch). 90 s covers the
+/// two sequential 30 s cold budgets plus the session chain; every per-phase
+/// inner deadline still fires first on a genuine wedge, so a dead start
+/// still settles unknown instead of pinning the launch.
+const START_TIMEOUT: Duration = Duration::from_secs(90);
 const RPC_GRACE: Duration = Duration::from_secs(2);
 const STOP_GRACE: Duration = Duration::from_secs(5);
 const MAX_PENDING_SNAPSHOT_READS: usize = 1;
@@ -569,7 +579,8 @@ impl PluginHost {
         });
         drop(startup);
 
-        let result = match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, started_rx).await {
+        let result = match timeout_at(Instant::now() + START_TIMEOUT + RPC_GRACE, started_rx).await
+        {
             Ok(Ok(Ok(result))) => Ok(result),
             Ok(Ok(Err(error))) => Err(error),
             Ok(Err(_)) => Err(Error::new(
@@ -1466,7 +1477,7 @@ async fn run_agent_inner(
     let start = match serde_json::to_value(start_params) {
         // PluginClient validates the exact completed RPC frame, including its
         // allocated request ID and newline, before any bytes reach the writer.
-        Ok(params) => client.call("agent.start", params, deadline()).await,
+        Ok(params) => client.call("agent.start", params, start_deadline()).await,
         Err(_) => Err(Error::new(
             "internal",
             "agent.start params could not be encoded",
@@ -3509,6 +3520,10 @@ fn insert_environment(environment: &mut Map<String, Value>, name: &str, value: S
 
 fn deadline() -> Instant {
     Instant::now() + RPC_DEADLINE
+}
+
+fn start_deadline() -> Instant {
+    Instant::now() + START_TIMEOUT
 }
 
 async fn enqueue_stop(

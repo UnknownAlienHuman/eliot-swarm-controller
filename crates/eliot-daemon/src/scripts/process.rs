@@ -1197,6 +1197,22 @@ mod tests {
 
     #[tokio::test]
     async fn stdout_limit_is_a_known_failure_and_never_retains_more_than_one_frame() {
+        // Synchronize on observable process state before the load-sensitive
+        // limit run below: a generous-deadline run of the small fixture must
+        // complete, proving the spawn path is live and hot. The limit run
+        // then measures only the bounded capture, not a cold spawn under
+        // parallel load.
+        let (_sender, receiver) = cancellation();
+        let outcome = run_owned_process(
+            fixture_command("complete"),
+            b"bounded input".to_vec(),
+            Duration::from_secs(30),
+            Arc::new(SecretPolicy::default()),
+            receiver,
+        )
+        .await;
+        assert!(matches!(outcome, ProcessOutcome::Completed(_)));
+
         let (_sender, receiver) = cancellation();
         let outcome = run_owned_process(
             fixture_command("large"),
