@@ -70,6 +70,14 @@ pub(super) fn native_initialize_params() -> NativeInitializeParams {
 }
 const STOP_SETTLEMENT_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
 const STOP_RESPONSE_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Native half of the `agent.stop` RPC budget (`RPC_TIMEOUT` minus the two
+/// reserves above): the bound `BeginStop` must fit native termination and
+/// output drain inside. Recovery applies queued stop controls between native
+/// calls so at most one bounded call overlaps a stop, keeping this budget
+/// for termination (see `events::EventProcessor::recovery_gate`).
+pub(crate) const STOP_NATIVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(
+    RPC_TIMEOUT.as_secs() - STOP_SETTLEMENT_RESERVE.as_secs() - STOP_RESPONSE_RESERVE.as_secs(),
+);
 pub(crate) const VIEW_PAGE_SIZE: i64 = 1000;
 pub(crate) const MAX_VIEW_PAGES: usize = 4;
 

@@ -29,7 +29,7 @@ use self::workflow_child::{
     child_event_id, complete_event_data, is_admission_rejection, is_workflow_item_frame,
     muse_child_key, register_child, should_bypass_parent_buffer, start_event_data,
 };
-use crate::host::{MAX_VIEW_PAGES, VIEW_PAGE_SIZE};
+use crate::host::{MAX_VIEW_PAGES, STOP_NATIVE_BUDGET, VIEW_PAGE_SIZE};
 use crate::native::{
     NativeClient, NativeFrame, StreamState, native_error_code,
     requests::{
@@ -83,11 +83,105 @@ const PATCH_READ_DEADLINE: Duration = Duration::from_secs(10);
 /// fired, and a hung page behind a projection-failed host must not stall the
 /// loop past one bounded wait per page.
 const RECOVERY_PAGE_DEADLINE: Duration = Duration::from_secs(10);
+/// One in-flight recovery call must fit inside the host's native stop
+/// budget: the stop gate (`recovery_gate`) applies a queued `BeginStop`
+/// between calls, so at most one bounded call overlaps a stop and the rest
+/// of the budget stays available for native termination.
+const _: () = assert!(
+    RECOVERY_PAGE_DEADLINE.as_secs() < STOP_NATIVE_BUDGET.as_secs(),
+    "one in-flight recovery page must leave stop budget for native termination"
+);
+/// First retry delay after a projection-gap readback proves nothing (a
+/// failed `session/read` or an idle scan with no durable terminal). Later
+/// delays double from here up to `EVENT_DEADLINE`, per the monitoring
+/// backpressure bound.
+const RECOVERY_RETRY_BASE_SECS: u64 = 5;
+/// Cap on consecutive unproven readbacks before the gapped turn settles
+/// unknown. A proven `running` observation resets the count; only truly
+/// unprovable results exhaust it.
+const MAX_RECOVERY_READBACK_ATTEMPTS: u32 = 5;
 
 struct ViewRecovery {
     head: Option<String>,
     head_seen: bool,
     deadline: Instant,
+    /// Consecutive readbacks that proved nothing since the last exact
+    /// `running` observation. Reset on every proven state, on live recovery
+    /// and on terminal recovery; only the cap settles unknown. A fenced
+    /// unavailable-view terminal replay proves nothing, so it preserves this
+    /// count instead of restarting it.
+    unproven_attempts: u32,
+}
+
+/// Live actor queues, threaded into the bounded recovery readbacks so queued
+/// controls are applied between native calls instead of waiting out the
+/// whole session/read plus page scan. Nested frame contexts (decide pumps,
+/// buffered flushes) pass `None`: they already run inside frame/control
+/// processing and must not re-enter the queues.
+struct ActorQueues<'a> {
+    frames: &'a mut mpsc::Receiver<NativeFrame>,
+    controls: &'a mut mpsc::Receiver<Control>,
+}
+
+/// Stop-aware outcome of one bounded recovery step. `Yielded` means a stop
+/// was requested mid-readback: the armed deadline is already cleared so the
+/// stop keeps its budget for native termination, and the caller must return
+/// to the actor loop without re-arming or settling. `Shutdown` unwinds to
+/// the run loop on `Close`.
+enum RecoveryPoll<T> {
+    Ready(T),
+    Yielded,
+    Shutdown,
+}
+
+/// Whether recovery may spend another bounded native call. A requested stop
+/// owns the remaining stop budget for native termination (the retained stop
+/// id blocks a cooperative retry once that budget expires), so recovery
+/// yields: no new `session/read` or `view/page` once `planned_stop` is set,
+/// and at most the single in-flight call — bounded by
+/// `RECOVERY_PAGE_DEADLINE`, strictly inside the host's native stop budget —
+/// elapses before the queued stop is applied.
+fn recovery_may_spend_native_call(planned_stop: bool) -> bool {
+    !planned_stop
+}
+
+/// Attempt count a fenced unavailable-view terminal carries into its fresh
+/// recovery state: the replay proves nothing, so an existing
+/// consecutive-failure budget survives it instead of restarting at zero.
+fn fenced_recovery_attempts(existing: Option<&ViewRecovery>) -> u32 {
+    existing
+        .map(|recovery| recovery.unproven_attempts)
+        .unwrap_or(0)
+}
+
+/// Error code a recovery drain uses to unwind to the run loop when a queued
+/// `Close` arrives mid-readback. The close handshake already completed
+/// inside the drain; the code only tells frame handling to skip its gap
+/// bookkeeping and exit.
+const RECOVERY_SHUTDOWN_CODE: &str = "event_shutdown";
+
+fn recovery_shutdown() -> Error {
+    Error::new(RECOVERY_SHUTDOWN_CODE, "Muse event actor is shutting down")
+}
+
+/// Delay before the next bounded `session/read` after `failures` consecutive
+/// unproven readbacks (1-based): 5s, 10s, 20s, then the 30s event deadline.
+/// A timer alone never proves anything; each retry still needs a fresh exact
+/// native observation to renew the turn.
+fn recovery_retry_delay(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(3);
+    let secs = RECOVERY_RETRY_BASE_SECS.saturating_mul(1 << shift);
+    Duration::from_secs(secs.min(EVENT_DEADLINE.as_secs()))
+}
+
+/// Unknown reason for an exhausted projection-gap recovery. Keeps the shared
+/// unknown prefix (so the journal count is stable) and the recorded gap
+/// label, then names the exact readback failure and the bounded attempt
+/// count that proved it unprovable.
+fn recovery_unknown_reason(gap_label: &str, detail: &str, attempts: u32) -> String {
+    format!(
+        "{MUSE_VIEW_UNKNOWN_REASON_PREFIX} ({gap_label}; {detail} after {attempts} bounded readbacks)"
+    )
 }
 
 /// Already-applied live view cursors, newest last. A cursor is remembered
@@ -879,7 +973,11 @@ impl EventProcessor {
         }
     }
 
-    async fn handle_frame(&mut self, frame: Option<NativeFrame>) {
+    async fn handle_frame(
+        &mut self,
+        frame: Option<NativeFrame>,
+        queues: &mut Option<ActorQueues<'_>>,
+    ) -> bool {
         match frame {
             Some(NativeFrame::Request { id, method, params }) => {
                 if !self.status.ready || self.status.active_turn_id.is_none() {
@@ -908,7 +1006,10 @@ impl EventProcessor {
                 );
                 if !bypass_buffer && self.should_buffer(&method) {
                     self.buffer_frame(BufferedNativeFrame::Notification { method, params });
-                } else if let Err(error) = self.process_notification(method, params).await {
+                } else if let Err(error) = self.process_notification(method, params, queues).await {
+                    if error.code == RECOVERY_SHUTDOWN_CODE {
+                        return false;
+                    }
                     self.invalidate_view_recovery();
                     self.status.source_unknown = true;
                     if !self.gap_reported && !self.writes_blocked {
@@ -943,6 +1044,7 @@ impl EventProcessor {
                 self.finish_pending_end_stop().await;
             }
         }
+        true
     }
 
     fn defer_gap(&mut self, reason: impl Into<String>) {
@@ -1160,7 +1262,11 @@ impl EventProcessor {
                     .saturating_add(self.buffer.front().map_or(0, |item| item.size));
                 break;
             }
-            self.process_buffered_frame(frame.frame).await?;
+            // Buffered flushes already run inside frame/control processing,
+            // so they must not re-enter the live queues.
+            let mut no_queues: Option<ActorQueues> = None;
+            self.process_buffered_frame(frame.frame, &mut no_queues)
+                .await?;
             if self.writes_blocked {
                 break;
             }
@@ -1185,7 +1291,11 @@ impl EventProcessor {
                 .remove(index)
                 .ok_or_else(|| Error::new("internal", "Muse buffered health frame disappeared"))?;
             self.buffer_bytes = self.buffer_bytes.saturating_sub(frame.size);
-            self.process_buffered_frame(frame.frame).await?;
+            // Buffered flushes already run inside frame/control processing,
+            // so they must not re-enter the live queues.
+            let mut no_queues: Option<ActorQueues> = None;
+            self.process_buffered_frame(frame.frame, &mut no_queues)
+                .await?;
             if self.writes_blocked {
                 break;
             }
@@ -1193,10 +1303,14 @@ impl EventProcessor {
         Ok(())
     }
 
-    async fn process_buffered_frame(&mut self, frame: BufferedNativeFrame) -> Result<()> {
+    async fn process_buffered_frame(
+        &mut self,
+        frame: BufferedNativeFrame,
+        queues: &mut Option<ActorQueues<'_>>,
+    ) -> Result<()> {
         let result = match frame {
             BufferedNativeFrame::Notification { method, params } => {
-                self.process_notification(method, params).await
+                self.process_notification(method, params, queues).await
             }
             BufferedNativeFrame::Request { id, method, params } => {
                 self.process_request(id, method, params).await
@@ -1552,7 +1666,10 @@ impl EventProcessor {
         self.frame_decide_proof = false;
         self.frame_decide_decisive = false;
         self.frame_decide_diag = DecideViewDiag::default();
-        self.handle_frame(Some(frame)).await;
+        // Decide pumps already run inside control processing, so the frame
+        // path must not re-enter the live queues here.
+        let mut no_queues: Option<ActorQueues> = None;
+        let _ = self.handle_frame(Some(frame), &mut no_queues).await;
         self.report_gap_if_queue_empty(frames.is_empty()).await;
         if self.frame_decide_diag.resolved_seen {
             diag.resolved_seen = true;
@@ -2148,7 +2265,12 @@ impl EventProcessor {
         Ok(())
     }
 
-    async fn process_notification(&mut self, method: String, params: Value) -> Result<()> {
+    async fn process_notification(
+        &mut self,
+        method: String,
+        params: Value,
+        queues: &mut Option<ActorQueues<'_>>,
+    ) -> Result<()> {
         let cursor = self
             .status
             .session_id
@@ -2177,7 +2299,7 @@ impl EventProcessor {
             // session/turn binding and conflict checks.
             return Ok(());
         }
-        if let Err(error) = self.apply_notification(method, params).await {
+        if let Err(error) = self.apply_notification(method, params, queues).await {
             self.invalidate_view_recovery();
             return Err(error);
         }
@@ -2214,7 +2336,12 @@ impl EventProcessor {
         Ok(())
     }
 
-    async fn apply_notification(&mut self, method: String, params: Value) -> Result<()> {
+    async fn apply_notification(
+        &mut self,
+        method: String,
+        params: Value,
+        queues: &mut Option<ActorQueues<'_>>,
+    ) -> Result<()> {
         if is_workflow_item_frame(&method, &params) {
             return self.observe_workflow_item(params).await;
         }
@@ -2317,10 +2444,31 @@ impl EventProcessor {
                     if !self.status.view_unavailable {
                         let session_id = self.status.session_id.clone().unwrap_or_default();
                         let turn_id = self.status.active_turn_id.clone().unwrap_or_default();
-                        if self.projection_turn_state(&session_id, &turn_id).await
-                            == ProjectionTurnState::Idle
-                            && self.recover_projection_terminal().await
-                        {
+                        let mut proven = false;
+                        match self.recovery_gate(queues).await {
+                            RecoveryPoll::Shutdown => return Err(recovery_shutdown()),
+                            // A requested stop owns the remaining stop
+                            // budget for native termination: abandon the
+                            // inline prove and fall through to the fence.
+                            RecoveryPoll::Yielded => {}
+                            RecoveryPoll::Ready(()) => {
+                                if self
+                                    .projection_turn_state_checked(&session_id, &turn_id)
+                                    .await
+                                    .0
+                                    == ProjectionTurnState::Idle
+                                {
+                                    match self.recover_projection_terminal(queues).await {
+                                        RecoveryPoll::Shutdown => {
+                                            return Err(recovery_shutdown());
+                                        }
+                                        RecoveryPoll::Yielded => {}
+                                        RecoveryPoll::Ready(ok) => proven = ok,
+                                    }
+                                }
+                            }
+                        }
+                        if proven {
                             return Ok(());
                         }
                         self.view_unavailable(&session_id, NativeHistoryNoneReason::Unknown)
@@ -2328,11 +2476,14 @@ impl EventProcessor {
                     }
                     // Replay from the same unavailable projection needs the
                     // same command-plane fence as private page readback. An
-                    // error also prevents marking this cursor applied.
+                    // error also prevents marking this cursor applied. The
+                    // replay proves nothing, so the consecutive-failure
+                    // budget survives it instead of restarting.
                     self.view_recovery = Some(ViewRecovery {
                         head: None,
                         head_seen: false,
                         deadline: Instant::now(),
+                        unproven_attempts: fenced_recovery_attempts(self.view_recovery.as_ref()),
                     });
                     return Err(Error::new(
                         "native_readback",
@@ -3826,6 +3977,7 @@ impl EventProcessor {
                 } else {
                     Instant::now()
                 },
+                unproven_attempts: 0,
             });
         }
         gap_result
@@ -3863,18 +4015,47 @@ impl EventProcessor {
             } else {
                 Instant::now()
             },
+            unproven_attempts: 0,
         });
     }
 
-    async fn expire_view_recovery(&mut self) {
-        self.view_recovery = None;
-        self.status.source_unknown = true;
-        self.settle_projection_gap_unknown().await;
-        if self.status.failure.is_none() {
-            self.status.failure = Some(
-                "Muse native view recovery did not prove live delivery after the recorded gap"
-                    .to_owned(),
-            );
+    /// Yield point between bounded recovery calls: apply controls queued
+    /// while the last native call was in flight, so a `BeginStop` arriving
+    /// mid-recovery preempts the next page instead of waiting out the whole
+    /// session/read plus page scan (~40 s against a 20 s native stop
+    /// budget). Reports whether recovery may spend another bounded call.
+    async fn recovery_gate(&mut self, queues: &mut Option<ActorQueues<'_>>) -> RecoveryPoll<()> {
+        if let Some(live) = queues.as_mut() {
+            while let Ok(control) = live.controls.try_recv() {
+                // Box the drain: recovery already runs inside frame/control
+                // handling further up the stack, so awaiting the handler
+                // inline would recurse the actor future without indirection.
+                if !Box::pin(self.handle_control(live.frames, control)).await {
+                    self.view_recovery = None;
+                    return RecoveryPoll::Shutdown;
+                }
+            }
+        }
+        if recovery_may_spend_native_call(self.planned_stop) {
+            RecoveryPoll::Ready(())
+        } else {
+            // An in-flight stop owns the remaining stop budget for native
+            // termination (the retained stop id blocks a cooperative retry
+            // once that budget expires), so abandon the readback instead of
+            // spending it on further pages.
+            self.view_recovery = None;
+            RecoveryPoll::Yielded
+        }
+    }
+
+    async fn expire_view_recovery(&mut self, queues: &mut Option<ActorQueues<'_>>) -> bool {
+        match self.recovery_gate(queues).await {
+            RecoveryPoll::Shutdown => false,
+            RecoveryPoll::Yielded => true,
+            RecoveryPoll::Ready(()) => {
+                self.status.source_unknown = true;
+                self.settle_projection_gap_unknown(queues).await
+            }
         }
     }
 
@@ -3911,27 +4092,36 @@ impl EventProcessor {
     /// gone entirely, or an exact-turn record may be undecodable. Never
     /// synthesizes: only records the native view durably holds.
     async fn readback_projection_terminal(
-        &self,
+        &mut self,
         session_id: &str,
         turn_id: &str,
-    ) -> Option<(Value, Option<Value>)> {
+        queues: &mut Option<ActorQueues<'_>>,
+    ) -> RecoveryPoll<Option<(Value, Option<Value>)>> {
         let mut scan = RecoveryScan::default();
         let mut cursor: Option<String> = None;
         let mut seen_cursors = HashSet::new();
         for _ in 0..MAX_VIEW_PAGES {
-            let page = self
-                .read_recovery_page(session_id, cursor.clone())
-                .await
-                .ok()?;
+            // A stop queued while the last page was in flight ends the scan
+            // here, keeping the remaining stop budget for termination.
+            match self.recovery_gate(queues).await {
+                RecoveryPoll::Shutdown => return RecoveryPoll::Shutdown,
+                RecoveryPoll::Yielded => return RecoveryPoll::Yielded,
+                RecoveryPoll::Ready(()) => {}
+            }
+            let page = match self.read_recovery_page(session_id, cursor.clone()).await {
+                Ok(page) => page,
+                Err(_) => return RecoveryPoll::Ready(None),
+            };
             // Backward pages still contain ascending events on the wire.
             for event in page.events.iter().rev() {
                 match fold_recovery_event(&mut scan, event, session_id, turn_id) {
                     RecoveryFold::Complete => {
-                        return scan
-                            .turn_params
-                            .map(|terminal| (terminal, scan.message_params));
+                        return RecoveryPoll::Ready(
+                            scan.turn_params
+                                .map(|terminal| (terminal, scan.message_params)),
+                        );
                     }
-                    RecoveryFold::Unproven => return None,
+                    RecoveryFold::Unproven => return RecoveryPoll::Ready(None),
                     RecoveryFold::Continue => {}
                 }
             }
@@ -3945,8 +4135,10 @@ impl EventProcessor {
                 _ => break,
             }
         }
-        scan.turn_params
-            .map(|terminal| (terminal, scan.message_params))
+        RecoveryPoll::Ready(
+            scan.turn_params
+                .map(|terminal| (terminal, scan.message_params)),
+        )
     }
 
     /// Commit a durably proven terminal for the projection-gapped active
@@ -3959,21 +4151,35 @@ impl EventProcessor {
     /// clear a live-source gap), and later facts for the turn still gap
     /// instead of resurrecting it. Recovered records are marked applied so a
     /// later live replay of the same revision skips normalization instead of
-    /// recommitting the native id. Returns false when nothing was proven or
-    /// the terminal would not persist, so the caller still settles unknown.
-    async fn recover_projection_terminal(&mut self) -> bool {
+    /// recommitting the native id. Yields `Ready(false)` when nothing was
+    /// proven or the terminal would not persist, so the caller still settles
+    /// unknown; yields or shutdown unwind without committing.
+    async fn recover_projection_terminal(
+        &mut self,
+        queues: &mut Option<ActorQueues<'_>>,
+    ) -> RecoveryPoll<bool> {
         let (Some(session_id), Some(turn_id)) = (
             self.status.session_id.clone(),
             self.status.active_turn_id.clone(),
         ) else {
-            return false;
+            return RecoveryPoll::Ready(false);
         };
-        let Some((turn_params, message_params)) = self
-            .readback_projection_terminal(&session_id, &turn_id)
+        let (turn_params, message_params) = match self
+            .readback_projection_terminal(&session_id, &turn_id, queues)
             .await
-        else {
-            return false;
+        {
+            RecoveryPoll::Shutdown => return RecoveryPoll::Shutdown,
+            RecoveryPoll::Yielded => return RecoveryPoll::Yielded,
+            RecoveryPoll::Ready(None) => return RecoveryPoll::Ready(false),
+            RecoveryPoll::Ready(Some(found)) => found,
         };
+        // The commits below are two more bounded calls: re-check for a
+        // queued stop before spending them.
+        match self.recovery_gate(queues).await {
+            RecoveryPoll::Shutdown => return RecoveryPoll::Shutdown,
+            RecoveryPoll::Yielded => return RecoveryPoll::Yielded,
+            RecoveryPoll::Ready(()) => {}
+        }
         if let Some(params) = message_params
             && let Ok(message) =
                 serde_json::from_value::<NativeItemCompletedNotification>(params.clone())
@@ -3984,7 +4190,7 @@ impl EventProcessor {
                 .await
                 .is_err()
             {
-                return false;
+                return RecoveryPoll::Ready(false);
             }
             if let Some(cursor) = params.get("viewCursor").and_then(Value::as_str)
                 && !cursor.trim().is_empty()
@@ -3997,7 +4203,7 @@ impl EventProcessor {
             }
         }
         if self.complete_turn(turn_params.clone(), true).await.is_err() {
-            return false;
+            return RecoveryPoll::Ready(false);
         }
         if let Some(cursor) = turn_params.get("viewCursor").and_then(Value::as_str)
             && !cursor.trim().is_empty()
@@ -4015,63 +4221,148 @@ impl EventProcessor {
                 reason.label()
             ));
         }
-        true
+        RecoveryPoll::Ready(true)
     }
 
     /// Recheck a projection-gapped turn. The command plane can prove it still
-    /// running; only explicit idle permits a fresh terminal scan. An unproven
-    /// state/outcome settles `unknown` through the shared turn-unknown path.
-    /// The plugin host stays alive and the Agent is not marked lost:
-    /// only the active turn is cleared, so a later replayed terminal for the
-    /// same turn gaps instead of resurrecting it, and a later stop settles
-    /// the session normally. Idempotent: with no active turn there is nothing
-    /// to settle. The local binding drops only after the terminal write is
-    /// acknowledged; a failed commit (for example a lost gap ack latching
-    /// `writes_blocked` so `turn.unknown` cannot be submitted) keeps the
-    /// binding and re-arms an expiry so the next opportunity retries instead
-    /// of stranding the Store's running turn while the adapter looks idle.
-    async fn settle_projection_gap_unknown(&mut self) {
+    /// running: an exact `running` observation keeps the Swarm turn active
+    /// with the source stale and resets the readback retry count, so a new
+    /// send can never be delivered into the running native turn. Only
+    /// explicit idle permits a fresh terminal scan. A readback that proves
+    /// nothing (failed `session/read`, an unexpected shape, or an idle scan
+    /// with no durable terminal) re-arms one more bounded read with backoff;
+    /// only the capped attempt settles `unknown` through the shared
+    /// turn-unknown path, naming the exact readback failure. The plugin host
+    /// stays alive and the Agent is not marked lost: only the active turn is
+    /// cleared, so a later replayed terminal for the same turn gaps instead
+    /// of resurrecting it, and a later stop settles the session normally.
+    /// Idempotent: with no active turn there is nothing to settle. The local
+    /// binding drops only after the terminal write is acknowledged; a failed
+    /// commit (for example a lost gap ack latching `writes_blocked` so
+    /// `turn.unknown` cannot be submitted) keeps the binding and re-arms an
+    /// expiry so the next opportunity retries instead of stranding the
+    /// Store's running turn while the adapter looks idle.
+    async fn settle_projection_gap_unknown(
+        &mut self,
+        queues: &mut Option<ActorQueues<'_>>,
+    ) -> bool {
         let (Some(command_id), Some(turn_id)) = (
             self.status.active_command_id.clone(),
             self.status.active_turn_id.clone(),
         ) else {
-            return;
+            self.view_recovery = None;
+            return true;
         };
         let session_id = self.status.session_id.clone().unwrap_or_default();
-        // An unavailable projection can synthesize a failed terminal for an
-        // unfinished source prefix while the native run continues. The owned
-        // host's command plane must prove this exact turn no longer running
-        // before a fresh page can supply terminal evidence.
-        match self.projection_turn_state(&session_id, &turn_id).await {
-            ProjectionTurnState::Running => {
-                self.view_recovery = Some(ViewRecovery {
-                    head: None,
-                    head_seen: false,
-                    deadline: Instant::now() + EVENT_DEADLINE,
-                });
-                return;
-            }
-            ProjectionTurnState::Idle => {
-                if self.recover_projection_terminal().await {
-                    return;
-                }
-            }
-            ProjectionTurnState::Unproven => {}
-        }
-        // Neither the command plane nor a fresh idle-time scan supplied a
-        // proven terminal. Preserve uncertainty instead of a projected verdict.
-        let reason_label = self
+        let prior_attempts = self
+            .view_recovery
+            .as_ref()
+            .map(|recovery| recovery.unproven_attempts)
+            .unwrap_or(0);
+        let gap_label = self
             .status
             .view_unavailable_reason
             .map(|reason| reason.label().to_owned())
             .unwrap_or_else(|| "unknown".to_owned());
-        let reason = format!("{MUSE_VIEW_UNKNOWN_REASON_PREFIX} ({reason_label})");
+        // An unavailable projection can synthesize a failed terminal for an
+        // unfinished source prefix while the native run continues. The owned
+        // host's command plane must prove this exact turn no longer running
+        // before a fresh page can supply terminal evidence.
+        match self
+            .projection_turn_state_checked(&session_id, &turn_id)
+            .await
+        {
+            (ProjectionTurnState::Running, _) => {
+                self.view_recovery = Some(ViewRecovery {
+                    head: None,
+                    head_seen: false,
+                    deadline: Instant::now() + EVENT_DEADLINE,
+                    unproven_attempts: 0,
+                });
+                true
+            }
+            (ProjectionTurnState::Idle, _) => {
+                // The page scan gated itself between pages; a queued stop
+                // unwinds here without re-arming or settling.
+                match self.recover_projection_terminal(queues).await {
+                    RecoveryPoll::Shutdown => return false,
+                    RecoveryPoll::Yielded => return true,
+                    RecoveryPoll::Ready(true) => return true,
+                    RecoveryPoll::Ready(false) => {}
+                }
+                let step = decide_recovery_step(
+                    prior_attempts,
+                    ProjectionTurnState::Idle,
+                    &gap_label,
+                    "idle session/read proved no active turn but the bounded view/page scan held no terminal for the exact turn",
+                );
+                self.retry_or_settle_unknown(&command_id, &turn_id, &session_id, step, queues)
+                    .await
+            }
+            (ProjectionTurnState::Unproven, detail) => {
+                let step = decide_recovery_step(
+                    prior_attempts,
+                    ProjectionTurnState::Unproven,
+                    &gap_label,
+                    detail.as_deref().unwrap_or("session/read proved nothing"),
+                );
+                self.retry_or_settle_unknown(&command_id, &turn_id, &session_id, step, queues)
+                    .await
+            }
+        }
+    }
+
+    /// One more bounded readback after a readback that proved nothing, or the
+    /// terminal `unknown` settlement once the cap exhausts. Retries keep the
+    /// exact turn binding (the Swarm turn stays busy, the Agent never goes
+    /// idle); only the capped attempt settles unknown, with the exact
+    /// readback failure in the reason. A failed `turn.unknown` commit keeps
+    /// the binding at the cap so the next expiry settles instead of
+    /// stranding the Store's running turn.
+    async fn retry_or_settle_unknown(
+        &mut self,
+        command_id: &str,
+        turn_id: &str,
+        session_id: &str,
+        step: RecoveryStep,
+        queues: &mut Option<ActorQueues<'_>>,
+    ) -> bool {
+        // The unknown commit is another bounded call: re-check for a queued
+        // stop first so termination keeps its budget.
+        match self.recovery_gate(queues).await {
+            RecoveryPoll::Shutdown => return false,
+            RecoveryPoll::Yielded => return true,
+            RecoveryPoll::Ready(()) => {}
+        }
+        let (attempts, reason) = match step {
+            RecoveryStep::KeepRunning => {
+                self.view_recovery = Some(ViewRecovery {
+                    head: None,
+                    head_seen: false,
+                    deadline: Instant::now() + EVENT_DEADLINE,
+                    unproven_attempts: 0,
+                });
+                return true;
+            }
+            RecoveryStep::Retry { attempts } => {
+                self.view_recovery = Some(ViewRecovery {
+                    head: None,
+                    head_seen: false,
+                    deadline: Instant::now() + recovery_retry_delay(attempts),
+                    unproven_attempts: attempts,
+                });
+                return true;
+            }
+            RecoveryStep::SettleUnknown { attempts, reason } => (attempts, reason),
+        };
+        // Neither the command plane nor a fresh idle-time scan supplied a
+        // proven terminal. Preserve uncertainty instead of a projected verdict.
         let data = json!({
-            "command_id": command_id.clone(),
-            "turn_id": turn_id.clone(),
+            "command_id": command_id.to_owned(),
+            "turn_id": turn_id.to_owned(),
             "reason": reason.clone(),
         });
-        let acknowledged = match event_id(&session_id, &turn_id, &turn_id, "turn.unknown") {
+        let acknowledged = match event_id(session_id, turn_id, turn_id, "turn.unknown") {
             Ok(native_id) => self
                 .commit_event("turn.unknown", native_id, data)
                 .await
@@ -4087,28 +4378,35 @@ impl EventProcessor {
                 head: None,
                 head_seen: false,
                 deadline: Instant::now() + EVENT_DEADLINE,
+                unproven_attempts: attempts,
             });
-            return;
+            return true;
         }
         self.status.failure = Some(reason);
-        self.clear_projection_gap_turn(&command_id, &turn_id);
+        self.clear_projection_gap_turn(command_id, turn_id);
+        true
     }
 
     /// One bounded, read-only command-plane observation, independent of the
     /// unavailable history envelope. It never supplies a terminal outcome.
-    async fn projection_turn_state(
+    /// The detail names the exact readback failure for the bounded retry
+    /// accounting; `None` means the observation proved its state.
+    async fn projection_turn_state_checked(
         &mut self,
         session_id: &str,
         turn_id: &str,
-    ) -> ProjectionTurnState {
+    ) -> (ProjectionTurnState, Option<String>) {
         let params = NativeSessionReadParams {
             session_id: session_id.to_owned(),
             exclude_items: Some(true),
         };
         let Ok(params) = serde_json::to_value(params) else {
-            return ProjectionTurnState::Unproven;
+            return (
+                ProjectionTurnState::Unproven,
+                Some("session/read params could not be encoded".to_owned()),
+            );
         };
-        let Ok(result) = self
+        let result = match self
             .native
             .call(
                 "session/read",
@@ -4116,18 +4414,36 @@ impl EventProcessor {
                 Instant::now() + RECOVERY_PAGE_DEADLINE,
             )
             .await
-        else {
-            return ProjectionTurnState::Unproven;
+        {
+            Ok(result) => result,
+            Err(error) => {
+                return (
+                    ProjectionTurnState::Unproven,
+                    Some(format!("session/read transport failed ({})", error.code)),
+                );
+            }
         };
         let state = projection_turn_state(&result, session_id, turn_id);
+        if state == ProjectionTurnState::Unproven {
+            return (
+                ProjectionTurnState::Unproven,
+                Some(describe_unproven_session_read(&result, session_id, turn_id)),
+            );
+        }
         if let Ok(readback) = serde_json::from_value::<NativeSessionReadResult>(result)
             && readback.session.session_id == session_id
             && let Some(reason) = readback.history.unavailable_reason()
             && self.view_unavailable(session_id, reason).await.is_err()
         {
-            return ProjectionTurnState::Unproven;
+            return (
+                ProjectionTurnState::Unproven,
+                Some(
+                    "session/read proved the state but re-latching the recorded gap failed"
+                        .to_owned(),
+                ),
+            );
         }
-        state
+        (state, None)
     }
 
     fn clear_projection_gap_turn(&mut self, command_id: &str, turn_id: &str) {
@@ -4272,7 +4588,10 @@ async fn run(
             .map(|recovery| recovery.deadline);
         // Frames win over controls when both are ready: a `CheckTurn`
         // arriving after the queued terminal frame must see the finished
-        // turn, never a still-live one.
+        // turn, never a still-live one. Controls win over the recovery
+        // timer for the same reason: a queued `BeginStop` must be applied
+        // before recovery spends another bounded native call, keeping the
+        // stop budget for native termination.
         tokio::select! {
             biased;
             frame = frames.recv(), if accept_frames => {
@@ -4280,7 +4599,13 @@ async fn run(
                     let current = *stream.borrow_and_update();
                     processor.handle_stream_state(current).await;
                 }
-                processor.handle_frame(frame).await;
+                let mut queues = Some(ActorQueues {
+                    frames: &mut frames,
+                    controls: &mut controls,
+                });
+                if !processor.handle_frame(frame, &mut queues).await {
+                    break;
+                }
                 processor.report_gap_if_queue_empty(frames.is_empty()).await;
             }
             changed = stream.changed(), if accept_frames => {
@@ -4290,9 +4615,6 @@ async fn run(
                 };
                 processor.handle_stream_state(current).await;
                 processor.report_gap_if_queue_empty(frames.is_empty()).await;
-            }
-            _ = tokio::time::sleep_until(recovery_deadline.unwrap_or_else(Instant::now)), if recovery_deadline.is_some() => {
-                processor.expire_view_recovery().await;
             }
             control = controls.recv() => {
                 match control {
@@ -4307,6 +4629,15 @@ async fn run(
                         processor.report_gap_if_queue_empty(frames.is_empty()).await;
                     }
                     None => break,
+                }
+            }
+            _ = tokio::time::sleep_until(recovery_deadline.unwrap_or_else(Instant::now)), if recovery_deadline.is_some() => {
+                let mut queues = Some(ActorQueues {
+                    frames: &mut frames,
+                    controls: &mut controls,
+                });
+                if !processor.expire_view_recovery(&mut queues).await {
+                    break;
                 }
             }
         }
@@ -4331,6 +4662,44 @@ fn validate_session_and_turn(status: &EventStatus, session_id: &str, turn_id: &s
 /// leaves the committed `turn.started` with no settlement deadline.
 fn should_arm_recovery_after_associate(status: &EventStatus, has_recovery: bool) -> bool {
     status.view_unavailable && !has_recovery && status.active_turn_id.is_some()
+}
+
+/// Pure next step after a projection-gap `session/read` that did not prove
+/// the turn still running (an unproven shape, or explicit idle whose bounded
+/// page scan held no durable terminal). Split from the commit path so the
+/// exact running-to-unknown sequence is pinned without a native server: an
+/// exact `running` observation always keeps the turn no matter how many
+/// readbacks already failed, anything unproven retries with backoff, and
+/// only the capped attempt settles unknown with the exact readback failure.
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveryStep {
+    /// Exact native proof the turn still runs: keep the Swarm turn active
+    /// with the source stale and reset the retry count.
+    KeepRunning,
+    /// Nothing proven yet: re-arm one more bounded read after the backoff.
+    Retry { attempts: u32 },
+    /// Cap exhausted: settle unknown with the exact readback failure.
+    SettleUnknown { attempts: u32, reason: String },
+}
+
+fn decide_recovery_step(
+    prior_attempts: u32,
+    state: ProjectionTurnState,
+    gap_label: &str,
+    detail: &str,
+) -> RecoveryStep {
+    if state == ProjectionTurnState::Running {
+        return RecoveryStep::KeepRunning;
+    }
+    let attempts = prior_attempts.saturating_add(1);
+    if attempts < MAX_RECOVERY_READBACK_ATTEMPTS {
+        RecoveryStep::Retry { attempts }
+    } else {
+        RecoveryStep::SettleUnknown {
+            attempts,
+            reason: recovery_unknown_reason(gap_label, detail, attempts),
+        }
+    }
 }
 
 /// Durable terminal proof accumulated across `view/page` records for the
@@ -4380,6 +4749,55 @@ fn projection_turn_state(result: &Value, session_id: &str, turn_id: &str) -> Pro
         ("running", Value::String(active)) if active == turn_id => ProjectionTurnState::Running,
         ("idle", Value::Null) => ProjectionTurnState::Idle,
         _ => ProjectionTurnState::Unproven,
+    }
+}
+
+/// Bound free wire text to `max` bytes without splitting UTF-8:
+/// `String::truncate` panics on a non-char-boundary, which would take down
+/// the event task on a non-ASCII status, so floor to the boundary instead,
+/// mirroring the native-error and stderr-tail bounds.
+fn truncate_to_char_boundary(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
+/// Exact reason a `session/read` result proved nothing about the gapped
+/// turn. Mirrors `projection_turn_state` case by case so the capped
+/// `unknown` settlement names the readback failure instead of the gap alone.
+/// Shapes are described, never quoted verbatim, and the status text is
+/// bounded: the wire status is open for evolution.
+fn describe_unproven_session_read(result: &Value, session_id: &str, turn_id: &str) -> String {
+    let Some(active) = result
+        .get("session")
+        .and_then(|session| session.get("activeTurnId"))
+    else {
+        return "session/read omitted activeTurnId".to_owned();
+    };
+    let Ok(readback) = serde_json::from_value::<NativeSessionReadResult>(result.clone()) else {
+        return "session/read response did not match the 1.4 schema".to_owned();
+    };
+    if readback.session.session_id != session_id {
+        return "session/read named a foreign session".to_owned();
+    }
+    let status = readback.session.status.as_str();
+    match (status, active) {
+        ("running", Value::String(active)) if active != turn_id => {
+            "session/read reported running for another turn".to_owned()
+        }
+        ("running", _) => "session/read reported running with no active turn".to_owned(),
+        ("idle", Value::String(_)) => "session/read reported idle with an active turn".to_owned(),
+        ("idle", _) => "session/read reported idle without a null active turn".to_owned(),
+        ("notLoaded", _) => "session/read reported the session notLoaded".to_owned(),
+        _ => {
+            let short = truncate_to_char_boundary(status.to_owned(), 32);
+            format!("session/read reported status {short}")
+        }
     }
 }
 
@@ -6089,6 +6507,202 @@ mod tests {
             projection_turn_state(&result, "session-1", "turn-1"),
             ProjectionTurnState::Unproven
         );
+    }
+
+    #[test]
+    fn recovery_retry_backs_off_to_the_event_deadline() {
+        assert_eq!(recovery_retry_delay(1), Duration::from_secs(5));
+        assert_eq!(recovery_retry_delay(2), Duration::from_secs(10));
+        assert_eq!(recovery_retry_delay(3), Duration::from_secs(20));
+        assert_eq!(recovery_retry_delay(4), Duration::from_secs(30));
+        assert_eq!(recovery_retry_delay(5), Duration::from_secs(30));
+        assert_eq!(recovery_retry_delay(100), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn recovery_unknown_reason_keeps_the_counted_prefix_with_exact_detail() {
+        let reason = recovery_unknown_reason(
+            "projectionUnavailable",
+            "session/read transport failed (timeout)",
+            5,
+        );
+        assert!(reason.starts_with(MUSE_VIEW_UNKNOWN_REASON_PREFIX));
+        assert!(reason.contains("projectionUnavailable"));
+        assert!(reason.contains("session/read transport failed (timeout)"));
+        assert!(reason.contains("5"));
+    }
+
+    #[test]
+    fn recovery_step_runs_the_native_running_to_idle_sequence() {
+        // Real native `session/read` shapes through the real parser: first the
+        // turn is still running, then the session is idle with no proven
+        // terminal. The step decision must keep the Swarm turn active while
+        // running is proven, retry boundedly, and settle unknown only at the
+        // cap with the exact readback failure.
+        let running = projection_session_read("running", json!("turn-1"));
+        assert_eq!(
+            projection_turn_state(&running, "session-1", "turn-1"),
+            ProjectionTurnState::Running
+        );
+        // An exact running observation always keeps the turn, even after
+        // earlier readback failures: this is the controller a8 case.
+        for prior in [0, 3, 4, 100] {
+            assert_eq!(
+                decide_recovery_step(
+                    prior,
+                    ProjectionTurnState::Running,
+                    "projectionUnavailable",
+                    "session/read transport failed (timeout)",
+                ),
+                RecoveryStep::KeepRunning
+            );
+        }
+        let idle = projection_session_read("idle", Value::Null);
+        assert_eq!(
+            projection_turn_state(&idle, "session-1", "turn-1"),
+            ProjectionTurnState::Idle
+        );
+        let detail = "idle session/read proved no active turn but the bounded view/page scan held no terminal for the exact turn";
+        for (prior, expected) in [(0, 1), (1, 2), (2, 3), (3, 4)] {
+            assert_eq!(
+                decide_recovery_step(
+                    prior,
+                    ProjectionTurnState::Idle,
+                    "projectionUnavailable",
+                    detail
+                ),
+                RecoveryStep::Retry { attempts: expected }
+            );
+        }
+        let RecoveryStep::SettleUnknown { attempts, reason } = decide_recovery_step(
+            4,
+            ProjectionTurnState::Idle,
+            "projectionUnavailable",
+            detail,
+        ) else {
+            panic!("capped idle readback must settle unknown");
+        };
+        assert_eq!(attempts, 5);
+        assert!(reason.starts_with(MUSE_VIEW_UNKNOWN_REASON_PREFIX));
+        assert!(reason.contains("projectionUnavailable"));
+        assert!(reason.contains(detail));
+        // An unproven shape retries the same way and settles with its own
+        // exact failure at the cap.
+        let foreign = projection_session_read("running", json!("other-turn"));
+        assert_eq!(
+            projection_turn_state(&foreign, "session-1", "turn-1"),
+            ProjectionTurnState::Unproven
+        );
+        let foreign_detail = describe_unproven_session_read(&foreign, "session-1", "turn-1");
+        assert_eq!(
+            decide_recovery_step(
+                0,
+                ProjectionTurnState::Unproven,
+                "projectionUnavailable",
+                &foreign_detail
+            ),
+            RecoveryStep::Retry { attempts: 1 }
+        );
+        let RecoveryStep::SettleUnknown { reason, .. } = decide_recovery_step(
+            4,
+            ProjectionTurnState::Unproven,
+            "projectionUnavailable",
+            &foreign_detail,
+        ) else {
+            panic!("capped unproven readback must settle unknown");
+        };
+        assert!(reason.contains("another turn"));
+    }
+
+    #[test]
+    fn unproven_session_read_names_the_exact_failure() {
+        let mut result = projection_session_read("running", json!("other-turn"));
+        assert!(
+            describe_unproven_session_read(&result, "session-1", "turn-1").contains("another turn")
+        );
+        result = projection_session_read("notLoaded", Value::Null);
+        assert!(
+            describe_unproven_session_read(&result, "session-1", "turn-1").contains("notLoaded")
+        );
+        result = projection_session_read("idle", Value::Null);
+        result["session"]["sessionId"] = json!("foreign-session");
+        assert!(
+            describe_unproven_session_read(&result, "session-1", "turn-1")
+                .contains("foreign session")
+        );
+        result = projection_session_read("idle", Value::Null);
+        result["session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("activeTurnId");
+        assert!(
+            describe_unproven_session_read(&result, "session-1", "turn-1")
+                .contains("omitted activeTurnId")
+        );
+    }
+
+    #[test]
+    fn recovery_yields_native_calls_to_an_in_flight_stop() {
+        // A requested stop owns the remaining stop budget for native
+        // termination (the retained stop id blocks a cooperative retry once
+        // it expires), so recovery must not spend another bounded call once
+        // `planned_stop` is set: at most the single in-flight call may still
+        // overlap the stop.
+        assert!(recovery_may_spend_native_call(false));
+        assert!(!recovery_may_spend_native_call(true));
+        // That in-flight call is bounded by one page deadline, strictly
+        // inside the host's native stop budget, so the stop keeps time for
+        // native termination and output drain.
+        assert!(
+            RECOVERY_PAGE_DEADLINE < STOP_NATIVE_BUDGET,
+            "one in-flight page must leave stop budget for termination"
+        );
+    }
+
+    #[test]
+    fn fenced_terminal_replay_preserves_the_failure_budget() {
+        // Four failed readbacks plus one unavailable-view terminal replay
+        // must count the next failure as attempt five, not restart at one:
+        // the replay proves nothing, so only a proven state resets the
+        // consecutive-failure budget.
+        let armed = ViewRecovery {
+            head: None,
+            head_seen: false,
+            deadline: Instant::now(),
+            unproven_attempts: 4,
+        };
+        assert_eq!(fenced_recovery_attempts(Some(&armed)), 4);
+        assert_eq!(fenced_recovery_attempts(None), 0);
+    }
+
+    #[test]
+    fn unproven_status_truncation_respects_char_boundaries() {
+        // 31 ASCII bytes plus one two-byte `Ä`: byte 32 sits inside the
+        // multi-byte char, where `String::truncate(32)` would panic and take
+        // down the event task. The bound floors to the last full char.
+        let status = format!("{}Ä", "a".repeat(31));
+        assert_eq!(status.len(), 33);
+        assert_eq!(
+            truncate_to_char_boundary(status.clone(), 32),
+            "a".repeat(31)
+        );
+        assert_eq!(
+            truncate_to_char_boundary("b".repeat(40), 32),
+            "b".repeat(32)
+        );
+        assert_eq!(truncate_to_char_boundary("short".to_owned(), 32), "short");
+        // A four-byte emoji straddling the bound floors the same way.
+        let bounded = truncate_to_char_boundary(format!("{}💥tail", "c".repeat(30)), 32);
+        assert_eq!(bounded, "c".repeat(30));
+        // The regression through the real path: an unknown non-ASCII status
+        // on the wire must describe the failure, never panic.
+        let result = projection_session_read(&format!("{}Ä", "a".repeat(31)), Value::Null);
+        let detail = describe_unproven_session_read(&result, "session-1", "turn-1");
+        assert!(
+            detail.contains(&"a".repeat(31)),
+            "detail names the bounded status"
+        );
+        assert!(!detail.contains('Ä'), "detail drops the split char");
     }
 
     #[test]
