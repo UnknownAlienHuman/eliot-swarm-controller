@@ -118,6 +118,8 @@ struct RouterInner {
     unknown_causes: Mutex<HashMap<String, String>>,
     rule_definitions: Mutex<HashMap<(String, String), (i64, RuleDefinition)>>,
     catalog_cache: Mutex<catalog::CatalogCache>,
+    var_writes: Mutex<coordination::VarWriteQueue>,
+    var_worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
     plugin_host: PluginHost,
     monitoring: Monitoring,
     workspaces: WorkspaceManager,
@@ -235,6 +237,8 @@ impl Router {
                 unknown_causes: Mutex::new(HashMap::new()),
                 rule_definitions: Mutex::new(HashMap::new()),
                 catalog_cache: Mutex::new(catalog::CatalogCache::default()),
+                var_writes: Mutex::new(coordination::VarWriteQueue::default()),
+                var_worker: AsyncMutex::new(None),
                 plugin_host,
                 monitoring,
                 workspaces,
@@ -4605,6 +4609,7 @@ impl Router {
             }),
         };
         self.inner.plugin_host.close_discovery_admission();
+        self.finish_var_writes().await;
         self.signal_progress();
         serde_json::to_value(response?)
             .map_err(|_| Error::new("internal", "shutdown result could not be encoded"))

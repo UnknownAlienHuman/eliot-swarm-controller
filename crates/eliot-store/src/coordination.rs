@@ -34,6 +34,8 @@ use serde_json::{Value, json};
 const MAIL_SEND_METHOD: &str = "mail.send";
 const MAIL_ACK_METHOD: &str = "mail.ack";
 const VAR_SET_METHOD: &str = "var.set";
+/// Bound lock hold time and rollback work when concurrent writes share a commit.
+pub const MAX_VAR_WRITE_GROUP: usize = 64;
 
 /// Which advisory channel a coalesced notice speaks for. Mail and claims
 /// share one gate — one cooldown, one open notice command per recipient —
@@ -449,10 +451,96 @@ impl Store {
         if let Some(retained) = self.replay_retained_var_set(principal, request, &prepared)? {
             return Ok(retained);
         }
+        self.require_var_write_live(principal)?;
         self.ensure_writer_healthy()?;
         let result = self.var_set_inner(principal, request, &prepared, now);
         self.fault_on_persistence_error(&result);
         result
+    }
+
+    /// Group already ordered variable writes under one FULL-WAL commit. Each
+    /// request retains its own idempotency/CAS outcome; no result or event is
+    /// visible before the outer commit. A persistence error rolls back all new
+    /// writes and faults the writer. Retained retries remain readable when faulted.
+    pub fn var_set_group(
+        &mut self,
+        requests: &[(String, VarSetRequest)],
+        now: i64,
+    ) -> Vec<Result<Change<VarSetResponse>>> {
+        if requests.is_empty() || requests.len() > MAX_VAR_WRITE_GROUP {
+            return requests
+                .iter()
+                .map(|_| Err(Error::new("invalid", "variable write group exceeds bound")))
+                .collect();
+        }
+        let mut replies = Vec::with_capacity(requests.len());
+        let mut pending = Vec::new();
+        for (index, (principal, request)) in requests.iter().enumerate() {
+            let prepared = self
+                .ensure_committed_reads()
+                .and_then(|()| self.prepare_var_set(principal, request));
+            match prepared.and_then(|prepared| {
+                let retained = self.replay_retained_var_set(principal, request, &prepared)?;
+                Ok((prepared, retained))
+            }) {
+                Ok((_, Some(retained))) => replies.push(Some(Ok(retained))),
+                Ok((prepared, None)) => match self.require_var_write_live(principal) {
+                    Ok(()) => {
+                        pending.push((index, prepared));
+                        replies.push(None);
+                    }
+                    Err(error) => replies.push(Some(Err(error))),
+                },
+                Err(error) => replies.push(Some(Err(error))),
+            }
+        }
+        if !pending.is_empty() {
+            let result = (|| {
+                self.ensure_writer_healthy()?;
+                let tx = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(sql_error)?;
+                let mut changes = Vec::with_capacity(pending.len());
+                for (index, prepared) in &pending {
+                    let (principal, request) = &requests[*index];
+                    // A rejected CAS/id binding affects only this caller. Any
+                    // persistence failure instead aborts the entire group.
+                    tx.execute_batch("SAVEPOINT variable_write")
+                        .map_err(sql_error)?;
+                    let change = Self::var_set_tx(&tx, principal, request, prepared, now);
+                    if let Err(error) = &change {
+                        if error.code == "internal" {
+                            return Err(error.clone());
+                        }
+                        tx.execute_batch("ROLLBACK TO variable_write")
+                            .map_err(sql_error)?;
+                    }
+                    tx.execute_batch("RELEASE variable_write")
+                        .map_err(sql_error)?;
+                    changes.push((*index, change));
+                }
+                commit_transaction(tx, &self.write_faulted)?;
+                Ok(changes)
+            })();
+            self.fault_on_persistence_error(&result);
+            match result {
+                Ok(changes) => {
+                    for (index, change) in changes {
+                        replies[index] = Some(change);
+                    }
+                }
+                Err(error) => {
+                    for (index, _) in pending {
+                        replies[index] = Some(Err(error.clone()));
+                    }
+                }
+            }
+        }
+        replies
+            .into_iter()
+            .map(|reply| reply.expect("every grouped request has an outcome"))
+            .collect()
     }
 
     /// Read one variable value with its version and writer.
@@ -755,6 +843,24 @@ impl Store {
         }
     }
 
+    fn require_var_write_live(&self, principal: &str) -> Result<()> {
+        if let Sender::Agent {
+            num, generation, ..
+        } = parse_sender(principal, "variable")?
+        {
+            let current = load_agent_by_num(&self.connection, num)?.ok_or_else(|| {
+                Error::new("stale_generation", "Agent is no longer current and live")
+            })?;
+            if current.generation != generation || current.is_terminal() {
+                return Err(Error::new(
+                    "stale_generation",
+                    "Agent is no longer current and live",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn inbox_page(
         &self,
         mailbox: i64,
@@ -1047,21 +1153,33 @@ impl Store {
         prepared: &PreparedVarSet,
         now: i64,
     ) -> Result<Change<VarSetResponse>> {
-        let payload_digest = &prepared.payload_digest;
-        let encoded_scope = &prepared.encoded_scope;
-        let encoded_value = &prepared.encoded_value;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        if command_binding(&tx, &request.id)?.is_some() {
+        let change = Self::var_set_tx(&tx, principal, request, prepared, now)?;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(change)
+    }
+
+    fn var_set_tx(
+        tx: &Transaction<'_>,
+        principal: &str,
+        request: &VarSetRequest,
+        prepared: &PreparedVarSet,
+        now: i64,
+    ) -> Result<Change<VarSetResponse>> {
+        let payload_digest = &prepared.payload_digest;
+        let encoded_scope = &prepared.encoded_scope;
+        let encoded_value = &prepared.encoded_value;
+        if command_binding(tx, &request.id)?.is_some() {
             return Err(Error::new(
                 "id_conflict",
                 "variable write id is already used by a command",
             ));
         }
         if let Some(retained) = retained_write_binding(
-            &tx,
+            tx,
             principal,
             &request.id,
             VAR_SET_METHOD,
@@ -1071,7 +1189,6 @@ impl Store {
             let value = serde_json::from_value::<VarSetResponse>(decode_json(&retained)?)
                 .map_err(|error| Error::new("internal", error.to_string()))?;
             request.validate_response(&value)?;
-            commit_transaction(tx, &self.write_faulted)?;
             return Ok(Change {
                 value,
                 events: Vec::new(),
@@ -1087,7 +1204,7 @@ impl Store {
             note: request.note.clone(),
         };
         let (value, event) = Self::var_effect_tx(
-            &tx,
+            tx,
             principal,
             encoded_scope,
             &definition,
@@ -1097,7 +1214,7 @@ impl Store {
         )?;
         request.validate_response(&value)?;
         retain_write_tx(
-            &tx,
+            tx,
             &request.id,
             principal,
             VAR_SET_METHOD,
@@ -1106,7 +1223,6 @@ impl Store {
                 .map_err(|error| Error::new("internal", error.to_string()))?,
             now,
         )?;
-        commit_transaction(tx, &self.write_faulted)?;
         Ok(Change {
             value,
             events: vec![event],
@@ -2971,6 +3087,138 @@ mod tests {
             store.var_set(&principal, &rebound, now).unwrap_err().code,
             "id_conflict"
         );
+    }
+
+    #[test]
+    fn grouped_variables_preserve_cas_order_replay_and_rejection_isolation() {
+        let mut store = store();
+        let now = now_ms();
+        let request = |expected| VarSetRequest {
+            id: Ulid::new().to_string(),
+            scope: Some("global".to_owned()),
+            key: "grouped".to_owned(),
+            value: json!(expected),
+            expect_version: Some(expected),
+            note: None,
+        };
+        let first = request(0);
+        let second = request(1);
+        let stale = request(0);
+        let mut rebound = first.clone();
+        rebound.value = json!("conflict");
+        let requests: Vec<_> = [first.clone(), stale, second.clone(), first, rebound]
+            .into_iter()
+            .map(|r| ("owner".to_owned(), r))
+            .collect();
+        let replies = store.var_set_group(&requests, now);
+        assert_eq!(replies[0].as_ref().unwrap().value.version, 1);
+        assert_eq!(replies[1].as_ref().unwrap_err().code, "version_conflict");
+        assert_eq!(replies[2].as_ref().unwrap().value.version, 2);
+        assert!(replies[3].as_ref().unwrap().events.is_empty());
+        assert_eq!(replies[4].as_ref().unwrap_err().code, "id_conflict");
+        assert!(
+            replies[0].as_ref().unwrap().events[0].seq < replies[2].as_ref().unwrap().events[0].seq
+        );
+        store.write_faulted.set(true);
+        let retry = store.var_set_group(
+            &[
+                ("owner".to_owned(), second),
+                ("owner".to_owned(), request(2)),
+            ],
+            now,
+        );
+        assert_eq!(retry[0].as_ref().unwrap().value.version, 2);
+        assert!(retry[0].as_ref().unwrap().events.is_empty());
+        assert_eq!(retry[1].as_ref().unwrap_err().code, "unavailable");
+    }
+
+    #[test]
+    fn grouped_variable_persistence_failure_rolls_back_every_new_binding() {
+        let mut store = store();
+        let now = now_ms();
+        store.connection.execute_batch("CREATE TEMP TRIGGER fail_group BEFORE INSERT ON vars WHEN NEW.key = 'fail' BEGIN SELECT RAISE(ABORT, 'write failed'); END;").unwrap();
+        let requests: Vec<_> = ["first", "fail"]
+            .into_iter()
+            .map(|key| {
+                (
+                    "owner".to_owned(),
+                    VarSetRequest {
+                        id: Ulid::new().to_string(),
+                        scope: Some("global".to_owned()),
+                        key: key.to_owned(),
+                        value: json!(1),
+                        expect_version: None,
+                        note: None,
+                    },
+                )
+            })
+            .collect();
+        let replies = store.var_set_group(&requests, now);
+        assert!(
+            replies
+                .iter()
+                .all(|reply| reply.as_ref().unwrap_err().code == "internal")
+        );
+        assert!(store.is_write_faulted());
+        assert!(store.connection.is_autocommit());
+        for table in ["vars", "writes", "events"] {
+            let count: i64 = store
+                .connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must roll back with the group");
+        }
+    }
+
+    #[test]
+    fn grouped_variable_write_rejects_same_generation_after_agent_stops() {
+        let mut store = store();
+        let now = now_ms();
+        let agent = ready_agent(&mut store, "app", now);
+        let principal = agent_principal(&agent);
+        let retained = VarSetRequest {
+            id: Ulid::new().to_string(),
+            scope: None,
+            key: "retained".to_owned(),
+            value: json!(1),
+            expect_version: None,
+            note: None,
+        };
+        store.var_set(&principal, &retained, now).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET state = 'stopped' WHERE id = ?1",
+                [parse_agent_id(&agent).unwrap()],
+            )
+            .unwrap();
+        let request = VarSetRequest {
+            id: Ulid::new().to_string(),
+            scope: None,
+            key: "stale".to_owned(),
+            value: json!(1),
+            expect_version: None,
+            note: None,
+        };
+        assert_eq!(
+            store.var_set_group(&[(principal.clone(), request.clone())], now)[0]
+                .as_ref()
+                .unwrap_err()
+                .code,
+            "stale_generation"
+        );
+        assert_eq!(
+            store.var_set(&principal, &request, now).unwrap_err().code,
+            "stale_generation"
+        );
+        let retry = store
+            .var_set_group(&[(principal, retained)], now)
+            .remove(0)
+            .unwrap();
+        assert_eq!(retry.value.version, 1);
+        assert!(retry.events.is_empty());
     }
 
     #[test]

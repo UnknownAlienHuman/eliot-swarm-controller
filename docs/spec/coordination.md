@@ -173,6 +173,8 @@ known secrets rejected. Each write increments version; `expect_version` is CAS,
 not last-writer guess: an omitted expectation writes unconditionally, while a
 supplied one must equal the current version, where an absent row reads as 0.
 `set_by` records the current principal. Changes emit `var.changed`.
+Concurrent queued writes use bounded [Store commit grouping](core.md#storage);
+each request still has its own CAS result and retained idempotency binding.
 
 ```sql
 CREATE TABLE vars (
