@@ -66,8 +66,12 @@ sending, succeeded, failed, cancelled, unknown or released. The exact
 [Core DTOs](../../crates/eliot-core/src/api/inference.rs) own types/bounds. Only a
 committed queued-to-sending transition grants one native attempt; unknown is never
 replayed. Release fences publication; cleanup completion is separate readback.
-Ordinary retention excludes inference writes pending the dedicated retention
-increment. The [API](api.md#memory-one-shot-inference-m1-199) owns credentials/release.
+Ordinary retention excludes inference writes. Dedicated inference retention advances
+monotonic call/write cuts under Memory's safe dependency assertion, pruning bounded
+released, cleanup-complete metadata and expired unreferenced write bindings. Inventory
+above each cut is complete; crossing a cut fails with `history_gap`. Neither allocator
+resets on pruning. The [API](api.md#memory-one-shot-inference-m1-199) owns backup cuts,
+restore readback and credentials/release.
 
 ## Agent
 

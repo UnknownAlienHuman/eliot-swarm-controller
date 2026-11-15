@@ -295,9 +295,15 @@ impl Router {
             "inference.client.promote" => {
                 self.inference_credential(method, &params, &principal).await
             }
+            "inference.client.retire" => {
+                self.inference_credential(method, &params, &principal).await
+            }
             "inference.text" => self.inference_text(&params, &principal).await,
             "inference.get" => self.inference_get(&params, &principal).await,
             "inference.write.get" => self.inference_write_get(&params, &principal).await,
+            "inference.high_water" => self.inference_high_water(&params, &principal).await,
+            "inference.list" => self.inference_list(&params, &principal).await,
+            "inference.retention.advance" => self.inference_retention(&params, &principal).await,
             "inference.result.read" => self.inference_result_read(&params, &principal).await,
             "inference.cancel" => self.inference_cancel(&params, &principal).await,
             "inference.release" => self.inference_release(&params, &principal).await,

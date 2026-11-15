@@ -2718,6 +2718,10 @@ fn project_registration_migration_defaults_legacy_run_authority_to_deny() {
                 r#"CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
                    INSERT INTO schema_migrations(version) VALUES
                        (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12),(13),(14);
+                   CREATE TABLE writes (
+                       id TEXT PRIMARY KEY, principal TEXT NOT NULL, method TEXT NOT NULL,
+                       payload_digest BLOB NOT NULL, result TEXT NOT NULL, created_at INTEGER NOT NULL
+                   );
                    CREATE TABLE agents (
                        id INTEGER PRIMARY KEY AUTOINCREMENT,
                        generation INTEGER NOT NULL DEFAULT 0,
@@ -7098,7 +7102,10 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "DROP TABLE inference_calls;
+            "DROP INDEX inference_write_inventory;
+                     ALTER TABLE writes DROP COLUMN inference_seq;
+                     DELETE FROM schema_migrations WHERE version = 39;
+                     DROP TABLE inference_calls;
              DROP TABLE inference_clients;
              DELETE FROM schema_migrations WHERE version = 38;
              DROP TABLE completion_digests;
@@ -8607,6 +8614,10 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
         old.execute_batch(
             "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
              INSERT INTO schema_migrations VALUES (1),(2),(3),(4),(5),(6),(7),(8);
+             CREATE TABLE writes (
+                 id TEXT PRIMARY KEY, principal TEXT NOT NULL, method TEXT NOT NULL,
+                 payload_digest BLOB NOT NULL, result TEXT NOT NULL, created_at INTEGER NOT NULL
+             );
              CREATE TABLE agents(
                  id INTEGER PRIMARY KEY, generation INTEGER NOT NULL,
                  observe_only INTEGER NOT NULL, profile TEXT NOT NULL,
