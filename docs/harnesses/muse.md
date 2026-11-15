@@ -455,6 +455,61 @@ for redaction, and keep them out of files, argv and public semantic metadata.
 This guide's published schema fingerprint differs from the installed host's;
 actual child identity and connectivity still need live qualification.
 
+Trust/HOME follow-up, 2026-11-15, against the same pinned executable and the
+owner's real config (now including the owner-approved static `eliot-swarm`
+entry): eight no-model host probes made sixteen `session/start` calls. All used
+`serve --disable-sandbox`, the same worktree and model selection, the Windows
+plugin environment, and `sessionMcp` negotiation. The settings' `${ELIOT_*}`
+references received noncredential diagnostic values, never a controller Agent's
+token; no authenticated Swarm operation was attempted. Settings and trust state
+were checked unchanged after every probe.
+
+| Config / flags / environment | Ordinary session | Session with native MCP additions |
+| --- | --- | --- |
+| Owner config, no trust flag, `HOME` absent and `USERPROFILE` present | Idle, `providerId="meta"` | `session_mcp_base_unavailable` |
+| Owner config, `--trust-workspace`, same environment | Idle, `providerId="meta"` | Same refusal |
+| Owner config, no trust flag, `HOME=USERPROFILE` | Idle, `providerId="meta"` | Same refusal |
+| Owner config, `--trust-workspace`, `HOME=USERPROFILE` | Idle, `providerId="meta"` | Same refusal |
+| Fresh settings-only copy, no auth/trust copy, no trust flag | Idle, `providerId="muse"` | Accepted, idle |
+| Same private-copy setup, explicitly request `providerId="meta"` | Idle, `providerId="meta"` | Accepted, idle |
+
+The final two probes repeated the first two owner-config cases and inspected
+only their own startup logs: those carried `tool_surface_version` metadata, not
+a documented tool inventory. Both native session responses and `session/read`
+also returned metadata only. The installed stable **and experimental** MSP
+indexes expose no tool-list/MCP-inventory method; a successful construction
+does not establish which tools the model would receive. Consequently the exact
+condition under which settings MCP tools appear remains **unverified** under
+the no-model constraint. The flag did not repair the observed native base
+refusal, missing `HOME` did not cause that refusal with `USERPROFILE` present,
+and the reported provider label alone does not explain it. This is not proof
+about the authenticated Meta model loop's tool surface.
+
+The stored-trust case was **NOT_RUN**: there was no `trust.json` next to the
+owner's settings at the documented location. The public guide states its
+location but does not document its serialized format; no trust file/decision
+was invented or written. This worktree also had no root `.mcp.json`.
+
+Security boundary: the [MCP trust guide](https://meta-models.github.io/muse-code-sdk/1.4/guides/extend/mcp-servers/#trust)
+distinguishes user settings servers (no workspace trust prerequisite) from
+project `.mcp.json` files (trusted workspaces only). It documents trust from the
+nearest repository root through the session directory; a worktree uses its own
+files. Top-level help says `--trust-workspace` does not save trust; `serve` help
+says it loads each session workspace's skills/rules, so the option applies to
+every session/workspace loaded by that host. Per the guide it also admits
+project MCP configuration, which can start programs/open connections; it is a
+broader grant than adding one Agent-scoped server. Saved trust would persist
+across runs. `--yolo` additionally disables approval and sandboxing and is not
+an MCP configuration mechanism.
+
+Do not enable workspace trust automatically as an MCP fix. If a later
+tool-visibility qualification establishes that it is required, the narrow
+plugin design is an explicit Muse profile opt-in, default false, frozen with
+the Agent's workspace and passed only to that Agent's dedicated host. Document
+the project MCP/skills/rules grant, preserve normal approval/sandbox settings,
+never persist an owner trust decision, and do not infer opt-in from full-access
+permissions or `allowAll`. No launch or profile behavior changed here.
+
 This harness keeps `inherit` only: the frozen profile always records
 `mcp = "inherit"`, and a non-`inherit` policy is rejected as `unsupported`
 at config load. Verified read-only (`muse --help`, `muse mcp --help`): `muse
