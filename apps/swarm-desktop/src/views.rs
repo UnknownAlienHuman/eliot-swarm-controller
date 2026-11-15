@@ -420,6 +420,7 @@ pub fn item_view(
     callbacks: &RowCallbacks,
     palette: Palette,
     anchor: Option<&ElementRef<Button>>,
+    width: Option<f64>,
 ) -> View {
     let anchored = anchor.and_then(|_| {
         item.parts.iter().rposition(|part| {
@@ -446,7 +447,11 @@ pub fn item_view(
             )
         })
         .collect();
+    // An ItemsRepeater arranges a turn at its content width, so the turn
+    // takes the reading column's width explicitly: a short turn's bubble
+    // still reaches the right edge.
     StackPanel::new()
+        .width(width)
         .spacing(theme::spacing::SM)
         .margin(Thickness::new(0.0, 0.0, 0.0, theme::spacing::LG))
         .keyed_children(parts)

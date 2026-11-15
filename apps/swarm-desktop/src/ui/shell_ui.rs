@@ -61,6 +61,8 @@ pub(super) enum ShellMsg {
     /// Titles read from first messages (`None`: no retained input).
     TitlesLoaded(Vec<(String, Option<String>)>),
     AlertDismissed,
+    /// Re-read the listed Agents (states, Recents order).
+    ListTick,
 }
 
 /// Reactor 0.100.0 reports the window's Light/Dark scheme only, and a High
@@ -78,6 +80,8 @@ const CHEVRON: f64 = 32.0;
 const RECENTS: usize = 8;
 /// Titles read per background batch.
 const TITLE_BATCH: usize = 24;
+/// The sidebar's states and Recents follow the daemon at this cadence.
+const LIST_REFRESH_MS: u64 = 10_000;
 
 fn window_theme(choice: ThemeChoice) -> WindowTheme {
     match choice {
@@ -307,6 +311,14 @@ impl DesktopApp {
                 self.load_titles(context);
             }
             ShellMsg::AlertDismissed => self.alert = None,
+            ShellMsg::ListTick => {
+                // Only the first page is re-read; pages added with "Show
+                // more" stay until a manual refresh.
+                if !self.nav.agents_loading && self.nav.agents.len() <= AGENT_PAGE {
+                    self.load_agents(context, None);
+                }
+                self.watch_list(context);
+            }
             ShellMsg::FieldsPrimed(epoch) => {
                 if epoch != self.prime_epoch {
                     return;
@@ -472,6 +484,33 @@ impl DesktopApp {
             }
             Message::Shell(ShellMsg::FieldsPrimed(epoch))
         });
+    }
+
+    /// The next sidebar refresh, one cadence from now.
+    pub(super) fn watch_list(&self, context: &ComponentContext<Self>) {
+        let _task = context.spawn_background(|cancel| {
+            let cancelled = || cancel.is_cancelled();
+            let _ = feed::backoff(LIST_REFRESH_MS, &cancelled);
+            Message::Shell(ShellMsg::ListTick)
+        });
+    }
+
+    /// The open Agent's row takes the state its detail just read.
+    pub(super) fn sync_open_agent(&mut self) {
+        let (Some(id), Some(detail)) = (self.selected_agent_id(), self.chat.detail.as_ref()) else {
+            return;
+        };
+        let state = detail.state.clone();
+        for agent in self.nav.agents.iter_mut().filter(|agent| agent.id == id) {
+            agent.state = state.clone();
+        }
+        for branch in self.nav.branches.values_mut() {
+            if let Branch::Loaded { children, .. } = branch {
+                for agent in children.iter_mut().filter(|agent| agent.id == id) {
+                    agent.state = state.clone();
+                }
+            }
+        }
     }
 
     /// The next High Contrast reading, one cadence from now.

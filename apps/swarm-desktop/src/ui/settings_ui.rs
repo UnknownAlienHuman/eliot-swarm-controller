@@ -324,7 +324,7 @@ impl DesktopApp {
                         palette,
                         &project.id,
                         vec![
-                            project.workspace.clone(),
+                            nav::display_path(&project.workspace).to_owned(),
                             format!("Allowed profiles: {profiles}"),
                         ],
                     ),
@@ -366,7 +366,7 @@ impl DesktopApp {
 
     fn advanced_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let data_dir = match &self.data_dir {
-            Ok(path) => path.display().to_string(),
+            Ok(path) => nav::display_path(&path.display().to_string()).to_owned(),
             Err(error) => format!("unavailable: {error}"),
         };
         let prefs = config_client::preferences_path().map_or_else(

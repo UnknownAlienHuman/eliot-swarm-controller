@@ -213,11 +213,14 @@ pub fn menu_items(
         if defaults {
             items.push(MenuItem::item(format!("{prefix}:default"), default));
         }
-        items.extend(
-            values
-                .iter()
-                .map(|value| MenuItem::item(format!("{prefix}:{value}"), value.clone())),
-        );
+        items.extend(values.iter().map(|value| {
+            let label = if prefix == "e" {
+                effort_label(value, models)
+            } else {
+                value.clone()
+            };
+            MenuItem::item(format!("{prefix}:{value}"), label)
+        }));
         if items.is_empty() {
             items.push(MenuItem::disabled(
                 format!("{prefix}:none"),
@@ -240,17 +243,31 @@ pub fn menu_items(
     ]
 }
 
-/// The pick a clicked menu label names. Reactor reports only the label: a
-/// label that is both a model id and an effort name is taken as the model.
+/// An effort's menu label: its name, or "<name> effort" when a model has
+/// the same id (Reactor reports only the clicked label).
+fn effort_label(effort: &str, models: &[String]) -> String {
+    if models.iter().any(|model| model == effort) {
+        format!("{effort} effort")
+    } else {
+        effort.to_owned()
+    }
+}
+
+/// The pick a clicked menu label names (labels are unique by
+/// construction, see [`effort_label`]). Pass an empty list for a field the
+/// daemon refuses, so it can never resolve.
 pub fn resolve(label: &str, models: &[String], efforts: &[String]) -> Option<Pick> {
     if label == DEFAULT_MODEL {
         Some(Pick::Model(None))
     } else if label == DEFAULT_EFFORT {
         Some(Pick::Effort(None))
+    } else if let Some(effort) = efforts
+        .iter()
+        .find(|effort| effort_label(effort, models) == label)
+    {
+        Some(Pick::Effort(Some(effort.clone())))
     } else if models.iter().any(|model| model == label) {
         Some(Pick::Model(Some(label.to_owned())))
-    } else if efforts.iter().any(|effort| effort == label) {
-        Some(Pick::Effort(Some(label.to_owned())))
     } else {
         None
     }
@@ -383,6 +400,27 @@ mod tests {
             Some(Pick::Effort(None))
         );
         assert_eq!(resolve("other", &models, &efforts), None);
+    }
+
+    #[test]
+    fn an_effort_named_like_a_model_gets_its_own_label() {
+        let models = vec!["high".to_owned(), "m1".to_owned()];
+        let efforts = vec!["low".to_owned(), "high".to_owned()];
+        let items = menu_items(&models, &efforts, false, None, None);
+        let MenuItem::Submenu { items: effort, .. } = &items[1] else {
+            panic!("effort submenu");
+        };
+        assert!(matches!(&effort[1], MenuItem::Item { label, .. } if label == "high effort"));
+        assert_eq!(
+            resolve("high effort", &models, &efforts),
+            Some(Pick::Effort(Some("high".to_owned())))
+        );
+        assert_eq!(
+            resolve("high", &models, &efforts),
+            Some(Pick::Model(Some("high".to_owned())))
+        );
+        // A refused model list resolves no model.
+        assert_eq!(resolve("m1", &[], &efforts), None);
     }
 
     #[test]

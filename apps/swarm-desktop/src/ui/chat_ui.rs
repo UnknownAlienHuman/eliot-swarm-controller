@@ -164,6 +164,7 @@ impl DesktopApp {
                         self.chat.failures = 0;
                         self.chat.docs.extend(snapshot.docs);
                         self.chat.detail = Some(detail_from(&snapshot.detail));
+                        self.sync_open_agent();
                         self.ensure_catalog(context);
                         let cursor = snapshot.coverage.cursor;
                         if let Some(convo) = self.chat.convo.as_mut() {
@@ -267,6 +268,7 @@ impl DesktopApp {
                         self.chat.docs.extend(reread.docs);
                         if let Some(detail) = reread.detail.as_ref() {
                             self.chat.detail = Some(detail_from(detail));
+                            self.sync_open_agent();
                             self.ensure_catalog(context);
                         }
                         if let Some(convo) = self.chat.convo.as_mut() {
@@ -1202,24 +1204,30 @@ impl DesktopApp {
                     &callbacks,
                     palette,
                     Some(&self.chat.end_anchor),
+                    column,
                 ),
             )]),
             None => View::empty(),
         };
         let items = Rc::clone(&self.chat.items);
         let keys = Rc::clone(&self.chat.items);
-        // A palette change re-realises the rows in the new colors.
+        // A palette or width change re-realises the rows in the new colors
+        // and at the new column width.
         let palette_code = palette
             .scheme()
             .map_or(0, |scheme| 1 + u64::from(scheme.dark));
+        let width_code = column.map_or(0, |width| width.round() as u64);
         let source = VirtualSource::new(
             self.chat
                 .items_revision
                 .wrapping_mul(3)
-                .wrapping_add(palette_code),
+                .wrapping_add(palette_code)
+                .wrapping_add(width_code.wrapping_mul(0x9E37_79B9)),
             earlier,
             move |index| keys[index].key.clone(),
-            move |index| views::item_view(&items[index], &expanded, &callbacks, palette, None),
+            move |index| {
+                views::item_view(&items[index], &expanded, &callbacks, palette, None, column)
+            },
         );
         ScrollViewer::new()
             .grid_row(1)
@@ -1602,7 +1610,14 @@ impl DesktopApp {
             .as_ref()
             .filter(|catalog| catalog.is_for(agent, generation))?;
         let reply = catalog.reply.as_ref().ok()?;
-        let (models, efforts) = configure::options(reply, detail.settings.next_model());
+        let (mut models, mut efforts) = configure::options(reply, detail.settings.next_model());
+        // A field the daemon refuses never resolves.
+        if reply.configure.model_refusal.is_some() {
+            models.clear();
+        }
+        if reply.configure.effort_refusal.is_some() {
+            efforts.clear();
+        }
         configure::resolve(label, &models, &efforts)
     }
 }

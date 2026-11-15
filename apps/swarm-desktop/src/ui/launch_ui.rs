@@ -154,12 +154,16 @@ impl DesktopApp {
                 } else {
                     Choice::Profile(label)
                 };
-                if let Choice::Harness(harness) = &choice
-                    && self.launch.choice != choice
-                {
-                    self.launch.adhoc_model = None;
-                    self.launch.adhoc_effort = None;
-                    self.read_harness_catalog(harness.clone(), context);
+                if let Choice::Harness(harness) = &choice {
+                    if self.launch.choice != choice {
+                        self.launch.adhoc_model = None;
+                        self.launch.adhoc_effort = None;
+                    }
+                    let held =
+                        matches!(&self.launch.catalog, Some((read, Ok(_))) if read == harness);
+                    if !held {
+                        self.read_harness_catalog(harness.clone(), context);
+                    }
                 }
                 self.nav.selection.profile = match &choice {
                     Choice::Profile(name) => Some(name.clone()),
@@ -180,7 +184,10 @@ impl DesktopApp {
                 }
             }
             LaunchMsg::HarnessCatalogLoaded(harness, reply) => {
-                self.launch.catalog = Some((harness, *reply));
+                // A reply for a harness no longer chosen is dropped.
+                if self.launch.choice == Choice::Harness(harness.clone()) {
+                    self.launch.catalog = Some((harness, *reply));
+                }
             }
             LaunchMsg::LaunchRequested => {
                 if self.submitting() {
@@ -227,10 +234,11 @@ impl DesktopApp {
                         .await
                         .map_err(|error| error.to_string())?;
                         Ok(LaunchOutcome {
-                            agent: reply
-                                .agent
-                                .clone()
-                                .ok_or_else(|| "launch admitted no agent".to_owned())?,
+                            // Admitted without an Agent id: the outcome is
+                            // unknown, so the id is kept for a same-id retry.
+                            agent: reply.agent.clone().ok_or_else(|| {
+                                "unknown: the launch was admitted without an Agent id".to_owned()
+                            })?,
                             generation: reply.generation.unwrap_or_default(),
                             command_id: reply.command_id.clone(),
                             linked_command: reply.linked_command.clone(),

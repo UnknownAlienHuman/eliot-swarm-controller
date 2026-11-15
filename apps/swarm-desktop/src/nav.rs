@@ -70,6 +70,16 @@ pub fn project_name(label: &str, registered: &[(String, String)]) -> String {
         .to_owned()
 }
 
+/// A path as a person reads it: without the `\\?\` verbatim prefix the
+/// daemon keeps on canonical Windows paths (a verbatim UNC path is left as
+/// it is).
+pub fn display_path(path: &str) -> &str {
+    if path.starts_with(r"\\?\UNC\") {
+        return path;
+    }
+    path.strip_prefix(r"\\?\").unwrap_or(path)
+}
+
 /// One project of the sidebar: its name, its checkout (where a new task in
 /// it starts) and its visible rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,7 +130,9 @@ pub fn sections(rows: Vec<Row>, registered: &[(String, String)]) -> Vec<Section>
 pub fn recents(agents: &[UiAgent], limit: usize) -> Vec<&UiAgent> {
     let mut recent: Vec<&UiAgent> = agents.iter().collect();
     recent.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
-    recent.dedup_by(|a, b| a.id == b.id);
+    // An id read on two pages shows once, at its newest time.
+    let mut seen = HashSet::new();
+    recent.retain(|agent| seen.insert(agent.id.as_str()));
     recent.truncate(limit);
     recent
 }
@@ -454,6 +466,16 @@ mod tests {
             .map(|agent| agent.id.as_str())
             .collect();
         assert_eq!(ids, ["a2", "a3"]);
+        let mut repeated = listed.clone();
+        repeated.push(UiAgent {
+            updated_at: 5,
+            ..listed[1].clone()
+        });
+        let ids: Vec<&str> = recents(&repeated, 9)
+            .into_iter()
+            .map(|agent| agent.id.as_str())
+            .collect();
+        assert_eq!(ids, ["a2", "a3", "a1"]);
     }
 
     #[test]
@@ -470,5 +492,13 @@ mod tests {
         assert!(long.starts_with(cut.trim_end_matches('…')));
         let unbroken = "x".repeat(80);
         assert_eq!(title(&unbroken).unwrap().chars().count(), 61);
+    }
+
+    #[test]
+    fn display_paths_drop_only_the_verbatim_drive_prefix() {
+        assert_eq!(display_path(r"\\?\C:\src\app"), r"C:\src\app");
+        assert_eq!(display_path(r"C:\src\app"), r"C:\src\app");
+        assert_eq!(display_path(r"\\?\UNC\host\share"), r"\\?\UNC\host\share");
+        assert_eq!(display_path("/home/me/app"), "/home/me/app");
     }
 }

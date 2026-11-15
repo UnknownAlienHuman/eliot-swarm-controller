@@ -495,6 +495,7 @@ impl Component for DesktopApp {
             });
             app.load_agents(context, None);
             app.watch_high_contrast(context);
+            app.watch_list(context);
             app.load_profile_list(context);
         }
         app
