@@ -341,6 +341,11 @@ fn validate_new_or_raced_directory(path: &Path, created: bool) -> Result<()> {
 
 pub(crate) fn ensure_private_root(path: &Path) -> Result<()> {
     check_no_reparse_components(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => return validate_private_root(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("inspect data directory", error)),
+    }
     create_private_directories(path)?;
     check_no_reparse_components(path)?;
 
@@ -352,8 +357,7 @@ pub(crate) fn ensure_private_root(path: &Path) -> Result<()> {
             "data directory must be a real directory, not a reparse point or file",
         ));
     }
-    ensure_current_owner(path)?;
-    set_current_user_acl(path, true)
+    validate_private_root(path)
 }
 
 pub(crate) fn ensure_private_file(path: &Path) -> Result<()> {

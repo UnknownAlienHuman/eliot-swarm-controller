@@ -38,28 +38,10 @@ pub const MAX_CONCURRENT_READS: usize = 4;
 /// Server-side scan bound per `events.read` call.
 const EVENT_SCAN_ROWS: usize = 1_000;
 
-/// Resolve the daemon data directory exactly like the CLI: explicit override,
-/// then `ELIOT_HOME`, then `%LOCALAPPDATA%\Eliot`, then the home share.
+/// Resolve the daemon data directory with the same environment, saved-selection,
+/// and platform-default precedence as the CLI.
 pub fn data_dir() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("ELIOT_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path));
-    }
-    if let Some(path) = std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path).join("Eliot"));
-    }
-    if let Some(path) = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(PathBuf::from(path)
-            .join(".local")
-            .join("share")
-            .join("eliot"));
-    }
-    Err(Error::new(
-        "invalid",
-        "cannot determine the data directory; set --data-dir or ELIOT_HOME",
-    ))
+    eliot_daemon::resolve_data_dir(None)
 }
 
 /// One fresh mutation id per user action. Callers retain it and pass it back

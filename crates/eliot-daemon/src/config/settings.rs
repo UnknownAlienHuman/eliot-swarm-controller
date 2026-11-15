@@ -70,10 +70,7 @@ fn restart_required(sections: impl IntoIterator<Item = SettingsSection>) -> Vec<
         .filter(|section| {
             matches!(
                 section,
-                SettingsSection::Daemon
-                    | SettingsSection::Automation
-                    | SettingsSection::Mail
-                    | SettingsSection::CloudMcp
+                SettingsSection::Daemon | SettingsSection::Mail | SettingsSection::CloudMcp
             )
         })
         .collect();
@@ -162,8 +159,20 @@ pub(crate) fn save(
     store: &mut Store,
     request: &SettingsSaveRequest,
     policy: &SecretPolicy,
-) -> core::Result<SettingsSaveResponse> {
-    save_internal(
+    projects: Option<&ResolvedProjects>,
+) -> core::Result<(SettingsSaveResponse, Vec<core::Event>)> {
+    let _guard = SETTINGS_SAVE_LOCK
+        .lock()
+        .map_err(|_| core::Error::new("internal", "settings save lock poisoned"))?;
+    if request.sections.contains_key(&SettingsSection::Projects)
+        && projects.is_none_or(|projects| projects.source_revision != request.expected_revision)
+    {
+        return Err(core::Error::new(
+            "conflict",
+            "resolved projects do not match the settings source revision",
+        ));
+    }
+    let reply = save_internal_locked(
         data_root,
         store,
         request.expected_revision.as_deref(),
@@ -171,7 +180,29 @@ pub(crate) fn save(
         SettingsAuthor::Owner(request.client),
         request.dry_run,
         policy,
-    )
+    )?;
+    let mut events = Vec::new();
+    if reply.saved && reply.changed_sections.contains(&SettingsSection::Projects) {
+        let projects = projects.expect("project settings were resolved before publication");
+        if reply.revision.as_deref() != Some(projects.candidate_revision.as_str())
+            || current_revision(data_root).map_err(|_| core::Error::new("unknown", "project settings were published but their current revision could not be verified; read settings before retrying"))? != reply.revision
+        {
+            return Err(core::Error::new(
+                "unknown",
+                "project settings source changed before registration reconciliation; read settings before retrying",
+            ));
+        }
+        let change = store.reconcile_project_registrations("owner", &projects.inputs, crate::common::now_ms())
+            .map_err(|_| core::Error::new("unknown", "project settings were saved but Store registration reconciliation is uncertain; read settings and projects before retrying"))?;
+        events = change.events;
+    }
+    Ok((reply, events))
+}
+
+pub(crate) struct ResolvedProjects {
+    pub source_revision: Option<String>,
+    pub candidate_revision: String,
+    pub inputs: Vec<eliot_store::ProjectRegistrationInput>,
 }
 
 /// Internal writer used by authenticated Owner RPCs and machine bootstrap.
@@ -188,41 +219,42 @@ pub(crate) fn save_internal(
     let _guard = SETTINGS_SAVE_LOCK
         .lock()
         .map_err(|_| core::Error::new("internal", "settings save lock poisoned"))?;
-    let original_file = read_config_source(data_root)?;
-    let original = original_file.clone().unwrap_or_default();
+    save_internal_locked(
+        data_root,
+        store,
+        expected_revision,
+        sections,
+        author,
+        dry_run,
+        policy,
+    )
+}
+
+fn save_internal_locked(
+    data_root: &Path,
+    store: &mut Store,
+    expected_revision: Option<&str>,
+    sections: &BTreeMap<SettingsSection, JsonValue>,
+    author: SettingsAuthor,
+    dry_run: bool,
+    policy: &SecretPolicy,
+) -> core::Result<SettingsSaveResponse> {
+    let (original_file, candidate) =
+        prepare_candidate(data_root, expected_revision, sections, policy)?;
+    let original = original_file.as_deref().unwrap_or_default();
     let current_revision = original_file.as_deref().map(profiles_edit::revision_of);
-    if expected_revision != current_revision.as_deref() {
-        return Err(core::Error::new(
-            "conflict",
-            "config.toml changed since settings were read; reload and reapply the edit",
-        ));
-    }
-    if sections.is_empty() || sections.len() > 16 {
-        return Err(core::Error::new(
-            "invalid",
-            "settings save section count is invalid",
-        ));
-    }
     store.reconcile_settings_history(current_revision.as_deref())?;
-    let replacements = replacements(sections, policy)?;
-    let candidate = splice_sections(&original, &replacements);
-    if candidate.len() > MAX_CONFIG_BYTES {
-        return Err(core::Error::new(
-            "profile_error",
-            "config.toml: file would exceed the 128 KiB bound",
-        ));
-    }
-    validate_unselected_sections(&original, &candidate, sections.keys().copied())?;
-    validate_candidate(&candidate)?;
     let changed_sections = sections
         .keys()
         .copied()
         .filter(|section| {
-            section_json(&original, section_name(*section)).ok()
+            section_json(original, section_name(*section)).ok()
                 != section_json(&candidate, section_name(*section)).ok()
+                || (*section == SettingsSection::Desktop
+                    && has_desktop_section(original) != has_desktop_section(&candidate))
         })
         .collect::<Vec<_>>();
-    let restart = restart_required_for_change(&original, &candidate, &changed_sections);
+    let restart = restart_required_for_change(original, &candidate, &changed_sections);
     if dry_run || candidate == original || changed_sections.is_empty() {
         return Ok(SettingsSaveResponse {
             saved: false,
@@ -241,6 +273,54 @@ pub(crate) fn save_internal(
         restart,
         author,
     )
+}
+
+/// Read-only preparation also used before asynchronous Git identity resolution.
+/// The writer repeats this validation and source CAS before publication.
+pub(crate) fn prepare_candidate(
+    data_root: &Path,
+    expected_revision: Option<&str>,
+    sections: &BTreeMap<SettingsSection, JsonValue>,
+    policy: &SecretPolicy,
+) -> core::Result<(Option<String>, String)> {
+    let original_file = read_config_source(data_root)?;
+    let current_revision = original_file.as_deref().map(profiles_edit::revision_of);
+    if expected_revision != current_revision.as_deref() {
+        return Err(core::Error::new(
+            "conflict",
+            "config.toml changed since settings were read; reload and reapply the edit",
+        ));
+    }
+    if sections.is_empty() || sections.len() > 16 {
+        return Err(core::Error::new(
+            "invalid",
+            "settings save section count is invalid",
+        ));
+    }
+    let original = original_file.as_deref().unwrap_or_default();
+    let candidate = splice_sections(
+        original,
+        &replacements(sections, policy, has_desktop_section(original))?,
+    );
+    if candidate.len() > MAX_CONFIG_BYTES {
+        return Err(core::Error::new(
+            "profile_error",
+            "config.toml: file would exceed the 128 KiB bound",
+        ));
+    }
+    validate_unselected_sections(original, &candidate, sections.keys().copied())?;
+    validate_candidate(&candidate)?;
+    Ok((original_file, candidate))
+}
+
+pub(crate) fn project_configs(source: &str) -> core::Result<Vec<ProjectRegistrationConfig>> {
+    project_registrations_in(&parse_config(source)?, source)
+}
+
+fn current_revision(data_root: &Path) -> core::Result<Option<String>> {
+    Ok(read_config_source(data_root)?
+        .as_deref()
+        .map(profiles_edit::revision_of))
 }
 
 /// Shared file publication and history path. Caller holds `SETTINGS_SAVE_LOCK`.
@@ -315,6 +395,7 @@ pub(super) fn commit_candidate_locked(
 fn replacements(
     sections: &BTreeMap<SettingsSection, JsonValue>,
     policy: &SecretPolicy,
+    desktop_present: bool,
 ) -> core::Result<BTreeMap<String, String>> {
     let mut result = BTreeMap::new();
     for (section, value) in sections {
@@ -337,7 +418,10 @@ fn replacements(
             ));
         }
         let name = section_name(*section).to_owned();
-        if is_default_section(*section, value) || value.as_object().is_some_and(JsonMap::is_empty) {
+        if (is_default_section(*section, value)
+            && (*section != SettingsSection::Desktop || !desktop_present))
+            || value.as_object().is_some_and(JsonMap::is_empty)
+        {
             result.insert(name, String::new());
             continue;
         }
@@ -401,6 +485,10 @@ fn is_default_section(section: SettingsSection, value: &JsonValue) -> bool {
     }
 }
 
+fn has_desktop_section(source: &str) -> bool {
+    toml::from_str::<toml::Table>(source).is_ok_and(|table| table.contains_key("desktop"))
+}
+
 fn restart_required_for_change(
     previous: &str,
     current: &str,
@@ -427,9 +515,7 @@ fn restart_required_for_change(
                     needs_restart.push(*section);
                 }
             }
-            SettingsSection::Automation | SettingsSection::Mail | SettingsSection::CloudMcp => {
-                needs_restart.push(*section)
-            }
+            SettingsSection::Mail | SettingsSection::CloudMcp => needs_restart.push(*section),
             _ => {}
         }
     }
@@ -482,6 +568,41 @@ fn splice_sections(source: &str, replacements: &BTreeMap<String, String>) -> Str
 
 fn validate_candidate(source: &str) -> core::Result<()> {
     let config = parse_config(source)?;
+    for (name, proxy) in &config.proxies {
+        let proxy = proxy.get_ref();
+        if is_builtin_codex_provider(name) {
+            return Err(core::Error::new(
+                "profile_error",
+                "proxy name collides with a builtin Codex provider",
+            ));
+        }
+        let route = core::RouteBinding {
+            name: name.clone(),
+            endpoint: proxy.attach.clone(),
+            readiness_path: proxy.health.clone(),
+            provider_base_url: proxy.base_url_for.codex.clone(),
+            client_key_env_name: proxy.api_key_env.clone(),
+        };
+        route
+            .validate()
+            .map_err(|_| core::Error::new("profile_error", "invalid adopted proxy route"))?;
+        core::CapacityScope {
+            scope: format!("proxy:{name}"),
+            max_live: proxy.max_live,
+        }
+        .validate()
+        .map_err(|_| core::Error::new("profile_error", "invalid proxy capacity"))?;
+        if proxy
+            .api_key_env
+            .as_deref()
+            .is_some_and(|name| native_store_selector(name).is_some())
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                "proxy client key cannot use a native store selector",
+            ));
+        }
+    }
     for name in config.profiles.keys() {
         resolve_profile_in(&config, source, name)?;
     }
@@ -659,5 +780,139 @@ mod tests {
             "not_allowed"
         );
         assert!(!root.0.join("config.toml").exists());
+    }
+
+    #[test]
+    fn unreferenced_proxies_are_validated_before_dry_run_or_save() {
+        let root = TestRoot::new();
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let policy = SecretPolicy::new(Vec::<String>::new());
+        for (field, bad) in [
+            ("attach", "http://user:unrecognized-secret@localhost:10300"),
+            (
+                "base_url_for",
+                "http://localhost:10300/v1?key=unrecognized-secret",
+            ),
+            ("health", "https://user:unrecognized-secret@localhost/ready"),
+        ] {
+            let mut proxy = serde_json::json!({
+                "attach":"http://localhost:10300", "health":"/readyz",
+                "base_url_for":{"codex":"http://localhost:10300/v1"}
+            });
+            if field == "base_url_for" {
+                proxy[field]["codex"] = bad.into();
+            } else {
+                proxy[field] = bad.into();
+            }
+            for dry_run in [true, false] {
+                let sections = BTreeMap::from([(
+                    SettingsSection::Proxies,
+                    serde_json::json!({"unused":proxy}),
+                )]);
+                let error = save_internal(
+                    &root.0,
+                    &mut store,
+                    None,
+                    &sections,
+                    SettingsAuthor::Owner(SettingsClientSource::Cli),
+                    dry_run,
+                    &policy,
+                )
+                .unwrap_err();
+                assert_eq!(error.code, "profile_error");
+                assert!(!root.0.join("config.toml").exists());
+                assert!(store.list_settings_history(100).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn automation_save_and_read_report_live_application() {
+        let root = TestRoot::new();
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let policy = SecretPolicy::new(Vec::<String>::new());
+        let sections = BTreeMap::from([(
+            SettingsSection::Automation,
+            serde_json::json!({"max_event_backlog":123,"run":{"interpreters":{},"run_env":[]}}),
+        )]);
+        let saved = save_internal(
+            &root.0,
+            &mut store,
+            None,
+            &sections,
+            SettingsAuthor::Owner(SettingsClientSource::Cli),
+            false,
+            &policy,
+        )
+        .unwrap();
+        assert!(saved.saved);
+        assert!(saved.restart_required.is_empty());
+        let read = read_internal(
+            &root.0,
+            &mut store,
+            Some(&[SettingsSection::Automation]),
+            &policy,
+        )
+        .unwrap();
+        assert!(read.restart_required.is_empty());
+        assert_eq!(
+            load_automation_config(&root.0).unwrap().max_event_backlog,
+            123
+        );
+        assert!(
+            restart_required_for_change(
+                "",
+                "[automation.run]\nrun_env=[]\n",
+                &[SettingsSection::Automation]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn legacy_system_theme_publishes_once_and_default_roundtrip_keeps_table() {
+        let root = TestRoot::new();
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let policy = SecretPolicy::new(Vec::<String>::new());
+        let sections = BTreeMap::from([(
+            SettingsSection::Desktop,
+            serde_json::json!({"theme":"system"}),
+        )]);
+        let saved = save_internal(
+            &root.0,
+            &mut store,
+            None,
+            &sections,
+            SettingsAuthor::Owner(SettingsClientSource::Desktop),
+            false,
+            &policy,
+        )
+        .unwrap();
+        assert!(saved.saved);
+        assert!(has_desktop_section(
+            &std::fs::read_to_string(root.0.join("config.toml")).unwrap()
+        ));
+        let read = read_internal(
+            &root.0,
+            &mut store,
+            Some(&[SettingsSection::Desktop]),
+            &policy,
+        )
+        .unwrap();
+        let roundtrip = save_internal(
+            &root.0,
+            &mut store,
+            read.revision.as_deref(),
+            &read.sections,
+            SettingsAuthor::Owner(SettingsClientSource::Desktop),
+            false,
+            &policy,
+        )
+        .unwrap();
+        assert!(!roundtrip.saved);
+        assert!(has_desktop_section(
+            &std::fs::read_to_string(root.0.join("config.toml")).unwrap()
+        ));
+        assert_eq!(store.list_settings_history(100).unwrap().len(), 1);
     }
 }

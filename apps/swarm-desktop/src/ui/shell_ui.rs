@@ -148,13 +148,23 @@ impl DesktopApp {
                 if let Ok(original) = client::data_dir() {
                     let fresh = original
                         .with_file_name(format!("Eliot-private-{}", client::new_mutation_id()));
-                    self.data_dir = Ok(fresh.clone());
-                    self.startup_error = false;
-                    self.set_status(format!(
-                        "Starting in fresh private directory {}",
-                        fresh.display()
-                    ));
-                    self.start_connection(fresh, context);
+                    match eliot_daemon::bootstrap::ensure_private_data_dir(&fresh).and_then(
+                        |selected| {
+                            eliot_daemon::persist_selected_root(&selected).map(|()| selected)
+                        },
+                    ) {
+                        Ok(selected) => {
+                            self.data_dir = Ok(selected.clone());
+                            self.startup_error = false;
+                            self.set_status(format!(
+                                "Starting in fresh private directory {}",
+                                selected.display()
+                            ));
+                            self.start_connection(selected, context);
+                        }
+                        Err(error) => self
+                            .set_status(format!("Cannot select fresh private directory: {error}")),
+                    }
                 }
             }
             ShellMsg::ProjectsLoaded(projects) => match projects {

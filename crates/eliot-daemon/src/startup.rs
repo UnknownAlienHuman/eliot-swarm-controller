@@ -8,6 +8,13 @@ use eliot_core::{Error, Result};
 /// Start the supplied Swarm executable only when no daemon is reachable.
 /// An authentication or safety failure is returned without changing the root.
 pub async fn ensure_running(data_dir: &Path, swarm_executable: &Path) -> Result<()> {
+    // daemon.status is Owner-only. Use the same target-bound identity parser
+    // as RPC calls so scoped Agent identities remain Agents and malformed role
+    // context fails closed before this preflight.
+    if !crate::daemon::client_is_owner(data_dir)? {
+        return Ok(());
+    }
+
     match crate::client_call_typed::<_, DaemonStatusResponse>(
         data_dir,
         "daemon.status",

@@ -128,26 +128,5 @@ fn report_failure(failure: Failure) -> ExitCode {
 }
 
 fn resolve_data_dir(argument: Option<&Path>) -> Result<PathBuf, Failure> {
-    if let Some(path) = argument {
-        return Ok(path.to_path_buf());
-    }
-    if let Some(path) = env::var_os("ELIOT_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path));
-    }
-    if let Some(path) = env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path).join("Eliot"));
-    }
-    if let Some(path) = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(PathBuf::from(path)
-            .join(".local")
-            .join("share")
-            .join("eliot"));
-    }
-    Err(Failure::new(
-        1,
-        "cannot determine the data directory; set --data-dir or ELIOT_HOME",
-    ))
+    eliot_daemon::resolve_data_dir(argument).map_err(|error| Failure::new(1, error.message))
 }

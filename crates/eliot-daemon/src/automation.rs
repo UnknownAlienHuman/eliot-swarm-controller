@@ -350,9 +350,9 @@ fn project_registration_input(
 /// config.toml for a settings.save reconciliation. Keep this on the same
 /// resolver path used by daemon startup and automation reloads.
 pub(crate) async fn project_registration_inputs(
-    data_root: &Path,
+    configured: Vec<crate::config::ProjectRegistrationConfig>,
 ) -> Result<Vec<eliot_store::ProjectRegistrationInput>> {
-    let registrations = projects::load_registrations(data_root).await?;
+    let registrations = projects::resolve_registrations(configured).await?;
     for registration in &registrations {
         validate_project_git_endpoints(registration.git.as_ref())?;
     }

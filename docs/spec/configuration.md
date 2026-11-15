@@ -16,7 +16,18 @@ check or copy its contents silently. The error offers one explicit command selec
 a fresh private per-user directory; the desktop offers the same remedy. The user must
 choose it. Existing roots and configuration are not overwritten by bootstrap.
 
-The CLI starts its private daemon when needed (`status` remains a read-only probe).
+The desktop's explicitly chosen fresh root is retained in a private per-user pointer:
+`%LOCALAPPDATA%\Eliot-bootstrap\selected-data-dir` on Windows, or
+`$XDG_CONFIG_HOME/eliot-bootstrap/selected-data-dir` (otherwise
+`~/.config/eliot-bootstrap/selected-data-dir`) on Unix. The pointer lives outside the
+possibly unsafe default data root. CLI and desktop share resolution order:
+`--data-dir`, `ELIOT_HOME`, selected-root pointer, then the platform default. The
+pointer and target must pass the private-directory checks; failures never silently
+select another root. Selection creates and validates the fresh root before publication.
+
+Owner CLI callers start their private daemon when needed (`status` remains a read-only
+probe). Agent and Run callers keep their inherited identity and dispatch directly;
+they never probe Owner-only readiness or start a daemon with Owner authority.
 The desktop starts the sibling `swarm.exe` and waits for daemon readiness before
 loading settings. `swarm-desktop --workspace PATH` opens and registers that checkout;
 without the flag it opens the working directory. A later launch in a different
@@ -763,13 +774,22 @@ daemon (including limits and retention), automation, mail, cloud_mcp, desktop,
 accounts and proxies.
 Rules/scripts remain files owned by their existing APIs; settings references and
 automation policy do not create a second executor. Desktop theme/window preferences
-use `[desktop]`; the desktop does not read or write `swarm-desktop.json`.
+use `[desktop]`. If that table is absent, the desktop imports the legacy per-user
+`swarm-desktop.json` preferences through the revision-guarded settings writer once.
+It retires the legacy file only after successful publication; an existing `[desktop]`
+table takes precedence.
 
 The API reuses the profile editor's bounded source, SHA-256 revision, selected-section
 splice, strict parser, secret checks, dry run and atomic private-file replacement.
 Unselected sections keep their bytes and semantic values. A stale revision is
 `conflict`; invalid or secret-bearing drafts never replace the file. Unsupported
 later-layer fields fail validation. Legacy `config.profiles.*` uses this same writer.
+Every proxy is validated independently, including unused routes. Candidate projects
+resolve to canonical Git identities before both dry-run success and publication.
+Resolved registrations carry their source revision, rechecked under the settings
+writer lock; publication and Store reconciliation hold that lock and the Store writer
+without asynchronous Git work between them. A delayed save cannot restore older
+project authority after a newer settings save.
 An uncertain post-replacement failure is `unknown`; read the revision before retrying.
 
 Every actual save records old/new revisions, changed sections, time and authenticated
@@ -786,10 +806,12 @@ never as an unchanged file or permission to repeat a write blindly.
 
 Profiles, projects and routing affect future admissions; running/queued work keeps its
 frozen snapshot. Desktop preferences apply on read/save without daemon restart.
-Retention is reread by maintenance. Daemon worker limits, mail, automation scheduling
-and cloud MCP listener/auth settings require restart in S1: their workers, bounded
+Retention is reread by maintenance. Automation backlog limits reload live and global
+Run grants are reread before effects; automation changes require no daemon restart.
+Daemon worker limits, mail and cloud MCP listener/auth settings require restart in S1: their workers, bounded
 channels and listener ownership are constructed at startup. Save replies identify
-sections requiring restart. Existing admitted effects are never reconfigured silently.
+sections requiring restart. Admitted profile/route snapshots remain frozen; live
+authority checks continue to apply at their owning effect boundaries.
 
 ### Routing policy (S3)
 
@@ -828,7 +850,7 @@ conflicts without discarding the draft.
 Launch admission resolves its profile from `config.toml` at admission (above), so the
 saved file is what the next launch uses and running or queued work keeps its frozen
 snapshot; only a successful `configure` changes a live Agent's next-turn model/effort.
-Daemon settings loaded once at startup (`[daemon]`, `[mail]`, `[automation]`) are not
+Daemon settings loaded once at startup (`[daemon]` worker limits and `[mail]`) are not
 edited through this path.
 
 `config.profiles.read` returns the file revision (lowercase hex SHA-256 of its bytes)
