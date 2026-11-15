@@ -945,8 +945,8 @@ per-harness installation facts (installed, resolved `cmd`, `--version`; Claude
 additionally reports every discovered install newest first in `candidates`);
 `harness.models` (`HarnessModelsRequest`/`HarnessModelsResponse`) returns the
 harness's own read-only catalogue (Codex/Muse native `model/list`, the OpenCode
-provider/model list; Claude reports aliases plus the CLI default, Antigravity
-reports no catalogue). An optional `profile` selects the native route/account
+provider/model list, Antigravity `agy models`; Claude reports aliases plus the
+CLI default). An optional `profile` selects the native route/account
 (the named profile must exist and its frozen harness must match); omitted it
 means ad-hoc daemon defaults. The read is cached per native route/account
 scope with a freshness timestamp (`fetched_at_ms`, `ttl_ms`) and a nonsecret

@@ -174,11 +174,11 @@ impl PluginHost {
         if !profile
             .get("harness")
             .and_then(Value::as_str)
-            .is_some_and(|harness| matches!(harness, "codex" | "muse" | "opencode"))
+            .is_some_and(|harness| matches!(harness, "codex" | "muse" | "opencode" | "antigravity"))
         {
             return Err(Error::new(
                 "unsupported",
-                "harness.models needs a codex, muse or opencode profile",
+                "harness.models needs a codex, muse, opencode or antigravity profile",
             ));
         }
         let environment = Value::Object(build_process_environment(&profile)?);

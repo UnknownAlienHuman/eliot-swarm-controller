@@ -2515,12 +2515,15 @@ impl Router {
 
     /// Resolve the frozen snapshot for a catalogue/quota read. A named
     /// profile must exist and its frozen harness must match; otherwise the
-    /// daemon defaults cover live harnesses (Codex/Muse/OpenCode) while
-    /// static harnesses (Claude, Antigravity) need no snapshot at all.
+    /// daemon defaults cover live harnesses (Codex/Muse/OpenCode, plus
+    /// Antigravity when `live_antigravity` holds for `harness.models`, whose
+    /// `agy models` reader needs a frozen cmd) while static harnesses (Claude,
+    /// and Antigravity for `harness.quota`) need no snapshot at all.
     fn resolve_catalog_snapshot(
         &self,
         harness: &str,
         profile: Option<&str>,
+        live_antigravity: bool,
     ) -> Result<(Option<Value>, String)> {
         if let Some(name) = profile {
             let mut snapshot = crate::config::resolve_profile(&self.inner.data_root, name)?;
@@ -2535,7 +2538,9 @@ impl Router {
             }
             return Ok((Some(snapshot), name.to_owned()));
         }
-        if matches!(harness, "codex" | "muse" | "opencode") {
+        if matches!(harness, "codex" | "muse" | "opencode")
+            || (live_antigravity && harness == "antigravity")
+        {
             let cmd = crate::adhoc::discover_cmd_for_harness(harness)?;
             let mut snapshot = crate::adhoc::adhoc_snapshot(
                 harness,
@@ -2553,11 +2558,11 @@ impl Router {
     }
 
     /// Read-only native model catalogue for a harness: no model turn, no
-    /// inference. Codex/Muse/OpenCode use the harness's own read-only
-    /// method through a dedicated metadata reader, cached per native
+    /// inference. Codex/Muse/OpenCode/Antigravity use the harness's own
+    /// read-only method through a dedicated metadata reader, cached per native
     /// route/account with freshness and credential identity; Claude reports
-    /// aliases plus the CLI default; Antigravity has no catalogue. Native
-    /// model ids are retained verbatim: no fallback model is ever selected.
+    /// aliases plus the CLI default. Native model ids are retained verbatim:
+    /// no fallback model is ever selected.
     async fn harness_models(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
         let request: eliot_core::api::HarnessModelsRequest =
@@ -2571,7 +2576,7 @@ impl Router {
             ));
         }
         let profile = request.profile.as_deref().map(str::trim);
-        let (snapshot, label) = self.resolve_catalog_snapshot(&harness, profile)?;
+        let (snapshot, label) = self.resolve_catalog_snapshot(&harness, profile, true)?;
         let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
         let now = now_ms();
         if let Some(hit) = self
@@ -2599,21 +2604,7 @@ impl Router {
                 ttl_ms: catalog::CATALOG_TTL_MS,
                 credential: credential.clone(),
             },
-            "antigravity" => eliot_core::api::HarnessModelsResponse {
-                harness: harness.clone(),
-                catalogue: "none".to_owned(),
-                models: Vec::new(),
-                default: None,
-                note: Some(
-                    "Antigravity exposes no model catalogue; a profile must name an explicit model"
-                        .to_owned(),
-                ),
-                scope: scope.clone(),
-                fetched_at_ms: now_ms(),
-                ttl_ms: catalog::CATALOG_TTL_MS,
-                credential: credential.clone(),
-            },
-            "codex" | "muse" | "opencode" => {
+            "codex" | "muse" | "opencode" | "antigravity" => {
                 let Some(snapshot) = snapshot else {
                     return Err(Error::new(
                         "internal",
@@ -2664,6 +2655,11 @@ impl Router {
                 } else if harness == "opencode" {
                     Some(
                         "OpenCode lists providers from native auth; the configured model resolves at launch"
+                            .to_owned(),
+                    )
+                } else if harness == "antigravity" {
+                    Some(
+                        "Antigravity catalogue from `agy models`; effort-suffixed ids map to thought_level at launch"
                             .to_owned(),
                     )
                 } else {
@@ -2720,7 +2716,7 @@ impl Router {
             ));
         }
         let profile = request.profile.as_deref().map(str::trim);
-        let (snapshot, label) = self.resolve_catalog_snapshot(&harness, profile)?;
+        let (snapshot, label) = self.resolve_catalog_snapshot(&harness, profile, false)?;
         let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
         let now = now_ms();
         if let Some(hit) = self
@@ -2833,9 +2829,7 @@ impl Router {
                 "Claude accepts model aliases and the CLI default; no live quota surface exists"
                     .to_owned(),
             ),
-            "antigravity" => {
-                Some("Antigravity exposes no model catalogue or quota surface".to_owned())
-            }
+            "antigravity" => Some("Antigravity exposes no read-only quota surface".to_owned()),
             _ => {
                 return Err(Error::new(
                     "unsupported",
@@ -14108,7 +14102,7 @@ mod run_authorization_tests {
     #[tokio::test]
     async fn catalog_quota_reports_unsupported_with_scope_and_caches() {
         let router = router();
-        // Antigravity exposes no catalogue surface: quota reports unsupported
+        // Antigravity exposes no quota surface: quota reports unsupported
         // with scope and freshness, without spawning any native reader.
         let first = router
             .harness_quota(&json!({"harness": "antigravity"}), &Principal::Owner)
