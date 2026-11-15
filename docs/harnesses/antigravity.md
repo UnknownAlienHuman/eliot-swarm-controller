@@ -318,6 +318,28 @@ and the terminal carried no `usage` (turn `usage: null`, `usage --agent`
 `turns_without_usage 1`, `sessions snapshots 0`,
 `generations_without_snapshot 1`). Text length is never used to estimate
 tokens.
+Quota exhaustion has no typed signal at the ACP level and is
+protocol-indistinguishable from a normal answer. Verified live
+2026-11-15 against installed `agy` 1.5.9 (profile `gemini-4-argon-low`,
+served as base `gemini-4-argon` plus `thought_level low`): ten
+consecutive quota-blocked prompts each produced exactly one
+`agent_message_chunk` carrying the warning text (`U+26A0 Individual
+quota reached. ... Resets in ...`) followed by the terminal
+`{"stopReason": "end_turn"}` with no `usage` object and no `_meta`.
+No `session/update` error/refusal kind, no JSON-RPC error object and
+no stderr accompanied any blocked turn, so per
+[monitoring](../spec/monitoring.md#provider-holds) no hold
+may be inferred from the text and the turn completes as `success`. The
+absent `usage` object is not a substitute signal either: usage-free
+normal turns exist (see the 1.5.3 turn above). The 429
+(`RESOURCE_EXHAUSTED`) surfaces only in agy's own CLI log file
+(captured via explicit `--cli_log_file`; observed default app-data
+directory `%USERPROFILE%\.gemini\antigravity-cli`), never on the ACP
+stdio stream, and the CLI exposes no quota/usage query (`agy usage`
+and `agy quota` are not subcommands; only `agy models` reads
+model state). The warning glyph is valid UTF-8 on the wire and in the
+stored event (`U+26A0`, bytes `E2 9A A0`); it only appears garbled when a
+reader decodes the output with a single-byte code page.
 
 There is no replay cursor/history API. Snapshots expose retained stream
 facts, not a native history poll. Loss means an explicit gap. Do not
