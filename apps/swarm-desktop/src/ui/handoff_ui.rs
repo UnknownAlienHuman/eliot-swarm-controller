@@ -429,7 +429,8 @@ impl DesktopApp {
 
     /// Live, non-source Agents of the navigation list.
     fn handoff_targets(&self) -> Vec<&UiAgent> {
-        self.agents
+        self.nav
+            .agents
             .iter()
             .filter(|agent| agent.id != self.handoff.from)
             .filter(|agent| {
@@ -722,6 +723,7 @@ impl DesktopApp {
             heading("Switch to a new Agent from a profile").into(),
         );
         let profiles: Vec<KeyedView> = self
+            .launch
             .profile_summaries
             .iter()
             .map(|profile| {
