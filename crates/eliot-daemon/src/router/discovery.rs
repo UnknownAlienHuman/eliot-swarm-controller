@@ -72,7 +72,7 @@ const METHODS: &[Method] = &[
         "Run the bounded retention pass now and report pruned counts.",
         {}
     ),
-    method!("command.submit", CommandSubmitRequest, CommandSubmitResponse, false, true, "Submit a command using the target's advertised native capabilities.", {"id":EXAMPLE_ID,"verb":"send","target":"a1","args":{"text":"Report current progress."}}),
+    method!("command.submit", CommandSubmitRequest, CommandSubmitResponse, false, true, "Submit a command using the target's advertised native capabilities; launch/send/wait child verbs included.", {"id":EXAMPLE_ID,"verb":"send","target":"a1","args":{"text":"Report current progress."}}),
     method!("command.get", CommandGetRequest, Command, false, false, "Read a retained command in your authorized scope.", {"id":EXAMPLE_ID}),
     method!("command.children", CommandChildrenRequest, CommandChildrenResponse, false, false, "Page the retained children of one command.", {"id":EXAMPLE_ID,"limit":20}),
     method!("command.resolve", CommandResolveRequest, CommandResolveResponse, true, true, "Record an owner resolution of an uncertain command; never replay its effect.", {"id":EXAMPLE_ID,"command_id":"previous-command","as":"failed","reason":"Owner verified failure."}),
@@ -363,7 +363,7 @@ fn method_limits(name: &str) -> &'static str {
             "Metadata/history only; native support and view availability are capability-dependent. History views are subject, turns or items. No Agent is created; hook callbacks are private plugin traffic."
         }
         "command.submit" => {
-            "args is the verb-specific DTO object. Inspect agent.get for the exact target generation's native capabilities; unsupported operations reject. Turn/request-sensitive operations require exact bindings. CLI wait is client-side, not an agent.wait method."
+            "args is the verb-specific DTO object. Inspect agent.get for the exact target generation's native capabilities; unsupported operations reject. Turn/request-sensitive operations require exact bindings. CLI wait is client-side, not an agent.wait method. Agent child launch (verb launch with parent): omit profile_snapshot (the daemon freezes it from the named profile); omit profile to reuse the parent snapshot verbatim or name an approved child_profiles entry (same harness, only model/effort may differ); omit workspace to share the parent workspace (a different workspace rejects); parent defaults to self; project/control/capacity inherited; no worktree."
         }
         "events.read" | "events.subscribe" => {
             "At most 1000 events per page and the encoded event-page byte budget; subscribe waits at most 30000 ms. Agent events remain self-scoped. History gaps do not authorize replay."
@@ -518,6 +518,32 @@ mod tests {
             help["mutation_id"],
             json!("Read-only; no mutation id is required.")
         );
+    }
+
+    #[test]
+    fn command_submit_help_states_agent_child_launch_shape() {
+        assert!(
+            METHODS
+                .iter()
+                .find(|m| m.name == "command.submit")
+                .expect("command.submit described")
+                .summary
+                .contains("launch"),
+            "command.submit must stay discoverable via api.methods query launch"
+        );
+        let limits = method_limits("command.submit");
+        for needle in [
+            "omit profile_snapshot",
+            "child_profiles",
+            "omit workspace",
+            "parent defaults to self",
+            "no worktree",
+        ] {
+            assert!(
+                limits.contains(needle),
+                "command.submit limits must state {needle}"
+            );
+        }
     }
 
     #[test]

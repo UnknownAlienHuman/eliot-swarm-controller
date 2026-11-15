@@ -1526,6 +1526,10 @@ impl Router {
                 workspace = retained_preparation(&request.args)?;
             } else {
                 let frozen = async {
+                    {
+                        let store = self.inner.store.lock().await;
+                        hierarchy::default_agent_child_workspace(&store, &mut request, principal)?;
+                    }
                     normalize_launch(&mut request, principal)?;
                     {
                         let store = self.inner.store.lock().await;
@@ -6098,8 +6102,13 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
     let args = args
         .as_object()
         .ok_or_else(|| Error::new("invalid", "launch args must be an object"))?;
+    if args.contains_key("profile_snapshot") {
+        return Err(Error::new(
+            "invalid",
+            "omit profile_snapshot for launch; the daemon freezes it from the named profile (Agent children reuse the parent snapshot or name a child_profiles entry)",
+        ));
+    }
     for reserved in [
-        "profile_snapshot",
         "source_plan",
         "target_environment",
         "workspace_preparation",
@@ -14677,6 +14686,17 @@ mod run_authorization_tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, "not_allowed");
+    }
+
+    #[test]
+    fn launch_snapshot_rejection_names_the_correct_action() {
+        let error = reject_launch_derived_keys(&json!({"profile_snapshot": {}})).unwrap_err();
+        assert_eq!(error.code, "invalid");
+        assert!(
+            error.message.contains("omit profile_snapshot"),
+            "unexpected message: {}",
+            error.message
+        );
     }
 
     #[tokio::test]

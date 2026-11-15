@@ -63,6 +63,9 @@ commands and report their actual application point. Presented is not read or und
 With `wake_on_mail=true` (read from the recipient's frozen profile snapshot,
 default true), a routed recipient may receive one generic coalesced notice
 per minute, with at most one open notice command: `N unread messages; run swarm inbox, then ack processed delivery IDs`.
+An OpenCode or Antigravity recipient (both receive the Agent-scoped eliot-swarm MCP server) names the coordination tool it actually has instead:
+`N unread messages; use the eliot-swarm MCP swarm tool (method mail.inbox), then ack processed delivery IDs`
+(and `use the eliot-swarm MCP swarm tool (method who)` for claim notices).
 The notice is an ordinary owner `send` bound to the recipient's current
 generation and carrying only the unread count at claim time. It never contains
 the body or marks it read. Unknown notice is not blindly retried;
@@ -213,8 +216,10 @@ parent profile's frozen snapshot, or the freshly frozen snapshot of a same-harne
 profile from the parent snapshot's captured `child_profiles` allow-list, with only
 model and effort differing, the parent's captured credential bindings inherited
 verbatim, and every non-profile capacity scope kept with the same bounds; control
-is narrowed or equal (never widened). It shares the parent's workspace and mints
-no worktree; owner launches are unrestricted. Fanout limits (`[daemon.limits]`, checked at launch admission)
+is narrowed or equal (never widened). It omits `profile_snapshot` (the daemon
+freezes it) and shares the parent's workspace (an omitted workspace defaults to
+the parent's; a different workspace rejects, so a child never escapes the
+parent's authority) and mints no worktree; owner launches are unrestricted. Fanout limits (`[daemon.limits]`, checked at launch admission)
 prevent accidental new work but never hide an Agent row that already exists.
 Above-limit children remain visible with no widened identity/control; over-limit
 admission reads `fanout_limit` and persists nothing. Terminal Agents (stopped,

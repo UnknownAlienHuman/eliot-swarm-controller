@@ -1,5 +1,5 @@
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
 };
 
@@ -25,8 +25,115 @@ pub(crate) struct Plan {
     pub scope: String,
     pub resume: Option<String>,
     pub hook_discovery: PathBuf,
+    pub swarm_mcp: SwarmMcp,
     mode: Option<String>,
     skip_permissions: bool,
+}
+
+/// Agent-scoped swarm MCP server offered to one Antigravity session through
+/// the ACP `session/new` / `session/load` `mcpServers` entries (official ACP
+/// v1 schema `schema/v1/schema.json`: stdio entries carry name, command,
+/// args and env, all required, and every Agent MUST support stdio).
+/// The command is the current Eliot executable with the Agent-bound data
+/// root; `--require-agent` enforces the inherited Agent identity and never
+/// falls back to Owner auth (same server and identity injection as the Codex
+/// `route.rs` override and the Claude `mcp_config.rs` file). `env` stays
+/// empty by design: the stdio child inherits the ACP server's environment,
+/// which already carries the Agent-bound `ELIOT_AGENT_*` identity the daemon
+/// injected, so no token crosses the session params.
+pub(crate) struct SwarmMcp {
+    name: String,
+    command: PathBuf,
+    data_dir: PathBuf,
+}
+
+impl SwarmMcp {
+    pub(crate) const SERVER_NAME: &str = "eliot-swarm";
+
+    fn require(
+        environment: &[(OsString, OsString)],
+        agent_id: &str,
+        generation: i64,
+    ) -> Result<Self> {
+        let expected_generation = generation.to_string();
+        let matches_agent = unique_environment_value(environment, "ELIOT_AGENT_ID")
+            .and_then(OsStr::to_str)
+            == Some(agent_id);
+        let matches_generation = unique_environment_value(environment, "ELIOT_AGENT_GENERATION")
+            .and_then(OsStr::to_str)
+            == Some(expected_generation.as_str());
+        let has_token = matches!(
+            unique_environment_value(environment, "ELIOT_AGENT_TOKEN"),
+            Some(token) if !token.is_empty()
+        );
+        if agent_id.trim().is_empty()
+            || generation <= 0
+            || !matches_agent
+            || !matches_generation
+            || !has_token
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "Antigravity MCP requires the matching inherited Agent generation identity",
+            ));
+        }
+        let data_dir = unique_environment_value(environment, "ELIOT_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute() && path.is_dir())
+            .ok_or_else(|| {
+                Error::new(
+                    "not_allowed",
+                    "Antigravity MCP requires the Agent-bound Eliot data root",
+                )
+            })?;
+        let command = std::env::current_exe().map_err(|_| {
+            Error::new(
+                "platform_io",
+                "could not locate the current Eliot executable for Antigravity MCP",
+            )
+        })?;
+        if !command.is_absolute() || !command.is_file() {
+            return Err(Error::new(
+                "platform_io",
+                "the current Eliot executable for Antigravity MCP is unavailable",
+            ));
+        }
+        Ok(Self {
+            name: Self::SERVER_NAME.to_owned(),
+            command,
+            data_dir,
+        })
+    }
+
+    /// The exact ACP `McpServer` stdio entry for `session/new` / `session/load`.
+    fn entry(&self) -> Result<Value> {
+        let command = self
+            .command
+            .to_str()
+            .ok_or_else(|| Error::new("invalid", "Antigravity MCP executable path is not UTF-8"))?;
+        let data_dir = self
+            .data_dir
+            .to_str()
+            .ok_or_else(|| Error::new("invalid", "Antigravity MCP data-root path is not UTF-8"))?;
+        Ok(json!({
+            "name": self.name,
+            "command": command,
+            "args": ["--data-dir", data_dir, "mcp", "--require-agent"],
+            "env": [],
+        }))
+    }
+}
+
+fn unique_environment_value<'a>(
+    environment: &'a [(OsString, OsString)],
+    name: &str,
+) -> Option<&'a OsStr> {
+    let mut matches = environment
+        .iter()
+        .filter(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_os_str());
+    let value = matches.next()?;
+    matches.next().is_none().then_some(value)
 }
 
 #[cfg(windows)]
@@ -149,6 +256,8 @@ impl Plan {
             prepend_system32_to_path(&mut environment.variables)?;
             environment
         };
+        let swarm_mcp =
+            SwarmMcp::require(&environment.variables, &params.agent_id, params.generation)?;
         let mut secrets = environment.secrets;
         secrets.push(credential.to_owned());
         secrets.push(hook_token.to_owned());
@@ -201,6 +310,7 @@ impl Plan {
             scope,
             resume,
             hook_discovery: hook_discovery_dir.to_owned(),
+            swarm_mcp,
             mode,
             skip_permissions,
         })
@@ -274,6 +384,12 @@ impl Plan {
             }
         }
         let (base_model, thought_level) = translate_model(&self.model);
+        // ACP exposes no MCP inventory on any checked surface (the
+        // `session/new` / `session/load` results and `session/update`
+        // stream carry no server list), so the effective server set stays
+        // unknown (null, unverified) at readiness instead of echoing the
+        // requested entry. Proof that the Agent can reach swarm is
+        // behavioral: its tool calls through the session.
         Ok(json!({
             "model": base_model,
             "requested_model": self.model,
@@ -283,6 +399,8 @@ impl Plan {
             "native_roots": self.native_roots(),
             "session_id": session.session_id,
             "mode": session.modes.as_ref().map(|modes| modes.current_mode_id.clone()),
+            "mcp_servers": null,
+            "mcp_servers_verified": false,
         }))
     }
 
@@ -300,6 +418,12 @@ impl Plan {
 
     pub fn resume(&self) -> Option<&str> {
         self.resume.as_deref()
+    }
+
+    /// The exact ACP `McpServer` stdio entry for this generation's
+    /// `session/new` / `session/load` call.
+    pub fn mcp_server_entry(&self) -> Result<Value> {
+        self.swarm_mcp.entry()
     }
 
     pub fn mode(&self) -> Option<&str> {
@@ -424,13 +548,19 @@ mod tests {
         (base, workspace, hook_root)
     }
 
-    fn start_params(workspace: &Path) -> AgentStartParams {
+    fn start_params(workspace: &Path, data_dir: &Path) -> AgentStartParams {
         let mut params = AgentStartParams::new("agent-1", 1, "cmd-1");
         params.workspace = Some(workspace.to_string_lossy().into_owned());
         params.profile = Some(json!({
             "harness": "antigravity",
             "model": "gemini-3.8-flash-high",
             "cmd": "agy",
+        }));
+        params.target_environment = Some(json!({
+            "ELIOT_AGENT_ID": "agent-1",
+            "ELIOT_AGENT_GENERATION": "1",
+            "ELIOT_AGENT_TOKEN": "test-agent-token",
+            "ELIOT_HOME": data_dir.to_string_lossy(),
         }));
         params.source_plan = Some(json!({
             "session": "stream",
@@ -446,7 +576,13 @@ mod tests {
         let (base, workspace, hook_root) = test_dirs("plan");
         let instance_dir = base.join("instance-1");
         fs::create_dir_all(&instance_dir).unwrap();
-        let plan = Plan::new(&start_params(&workspace), "cred", "hook-token", &hook_root).unwrap();
+        let plan = Plan::new(
+            &start_params(&workspace, &base),
+            "cred",
+            "hook-token",
+            &hook_root,
+        )
+        .unwrap();
         let add_dir = plan
             .launch
             .args
@@ -468,7 +604,13 @@ mod tests {
     #[test]
     fn requested_and_effective_carry_native_roots() {
         let (base, workspace, hook_root) = test_dirs("roots");
-        let plan = Plan::new(&start_params(&workspace), "cred", "hook-token", &hook_root).unwrap();
+        let plan = Plan::new(
+            &start_params(&workspace, &base),
+            "cred",
+            "hook-token",
+            &hook_root,
+        )
+        .unwrap();
         for facts in [
             plan.requested(),
             plan.check_session(
@@ -510,11 +652,126 @@ mod tests {
     fn plan_rejects_a_missing_hook_discovery_dir() {
         let (base, workspace, _) = test_dirs("missing");
         let missing = base.join("no-such-hooks-root");
-        let error = match Plan::new(&start_params(&workspace), "cred", "hook-token", &missing) {
+        let error = match Plan::new(
+            &start_params(&workspace, &base),
+            "cred",
+            "hook-token",
+            &missing,
+        ) {
             Ok(_) => panic!("expected an unavailable hook discovery directory"),
             Err(error) => error,
         };
         assert_eq!(error.code, "invalid");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn swarm_mcp_entry_carries_the_agent_scoped_server() {
+        let (base, workspace, hook_root) = test_dirs("mcp-entry");
+        let plan = Plan::new(
+            &start_params(&workspace, &base),
+            "cred",
+            "hook-token",
+            &hook_root,
+        )
+        .unwrap();
+        let entry = plan.mcp_server_entry().unwrap();
+        assert_eq!(entry["name"], json!(SwarmMcp::SERVER_NAME));
+        let command = entry["command"].as_str().unwrap();
+        assert_eq!(
+            Path::new(command),
+            std::env::current_exe().unwrap().as_path(),
+            "the MCP server is the current Eliot executable",
+        );
+        assert!(Path::new(command).is_absolute());
+        assert_eq!(
+            entry["args"],
+            json!([
+                "--data-dir",
+                base.to_string_lossy(),
+                "mcp",
+                "--require-agent"
+            ]),
+        );
+        assert_eq!(entry["env"], json!([]));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn plan_rejects_identity_mismatch_without_owner_fallback() {
+        let (base, workspace, hook_root) = test_dirs("mcp-identity");
+        for (tag, environment) in [
+            (
+                "foreign-id",
+                json!({
+                    "ELIOT_AGENT_ID": "someone-else",
+                    "ELIOT_AGENT_GENERATION": "1",
+                    "ELIOT_AGENT_TOKEN": "test-agent-token",
+                    "ELIOT_HOME": base.to_string_lossy(),
+                }),
+            ),
+            (
+                "missing-token",
+                json!({
+                    "ELIOT_AGENT_ID": "agent-1",
+                    "ELIOT_AGENT_GENERATION": "1",
+                    "ELIOT_HOME": base.to_string_lossy(),
+                }),
+            ),
+            (
+                "missing-data-root",
+                json!({
+                    "ELIOT_AGENT_ID": "agent-1",
+                    "ELIOT_AGENT_GENERATION": "1",
+                    "ELIOT_AGENT_TOKEN": "test-agent-token",
+                }),
+            ),
+        ] {
+            let mut params = start_params(&workspace, &base);
+            params.target_environment = Some(environment);
+            let error = match Plan::new(&params, "cred", "hook-token", &hook_root) {
+                Ok(_) => panic!("expected {tag} to refuse the Agent MCP identity"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, "not_allowed", "case {tag}");
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn effective_reports_mcp_unknown_at_readiness() {
+        let (base, workspace, hook_root) = test_dirs("mcp-effective");
+        let plan = Plan::new(
+            &start_params(&workspace, &base),
+            "cred",
+            "hook-token",
+            &hook_root,
+        )
+        .unwrap();
+        let effective = plan
+            .check_session(
+                &serde_json::from_value(json!({
+                    "protocolVersion": 1,
+                    "agentCapabilities": {"loadSession": false},
+                }))
+                .unwrap(),
+                &serde_json::from_value(json!({
+                    "sessionId": "sess-1",
+                    "modes": null,
+                    "configOptions": [
+                        {"id": "model", "category": "model", "type": "select",
+                         "currentValue": "x",
+                         "options": [{"value": "gemini-3.8-flash", "name": "Flash"}]},
+                        {"id": "thought_level", "category": "thought_level",
+                         "type": "select", "currentValue": "x",
+                         "options": [{"value": "high", "name": "High"}]},
+                    ],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(effective["mcp_servers"], Value::Null);
+        assert_eq!(effective["mcp_servers_verified"], json!(false));
         let _ = fs::remove_dir_all(&base);
     }
 }

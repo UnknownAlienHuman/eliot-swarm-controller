@@ -431,7 +431,14 @@ silently. The selective structural/scope index (`parent`/`root`/`project`)
 leads when several filters are present. Each summary carries identity, state,
 current turn, progress age, the last terminal outcome with its turn and
 retained usage where available, child activity for native observed children,
-and the last controller-observed write time. A missing outcome or progress
+and the last controller-observed write time. When the newest terminal turn
+carries no native turn usage, the summary `usage` falls back to the
+generation's latest retained `session.usage` snapshot (cumulative
+input/output/cache counters only, never a derived total) with
+`usage_scope: "session"`; turn-backed usage carries `"turn"`. The
+session fallback never presents as turn usage: its inner `usage.scope` is
+`"session"` as well, and per-turn accounting stays on `usage.summary`.
+A missing outcome or progress
 timestamp reads back absent, never zero or success; `updated_at` is freshness
 metadata, not proof of liveness for a detached or restarted source. The
 response carries the required matching `total` ignoring the cursor, the
@@ -451,7 +458,10 @@ response binding failures remain `unknown`; validate the reply before printing
 it or advancing a cursor. `swarm ls` and `swarm top` render these summaries as
 compact tables by default, labeling the active turn separately from the
 last-terminal outcome/usage and reporting observation data availability only;
-`--json` keeps printing the raw response.
+both tables carry a `USAGE` cell with the native total when supplied,
+otherwise the input+output sum as a fleet signal, suffixed `(t)` for
+turn-backed usage and `(s)` for the session fallback; `--json` keeps
+printing the raw response.
 
 For `agent.processes`, omitted generation selects the current Agent generation for
 `scope:"agent"`, or the managed workspace target generation for `scope:"workspace"`.
@@ -653,12 +663,15 @@ With `parent`, the launch creates a child of that Agent: an Agent principal laun
 only its own children (the Router defaults an absent parent to the caller), the child
 inherits the parent's project label and tree root, and the configured fanout limits
 are checked at admission. The parent must be controlled. An Agent-principal child
-may omit `profile` or specify the parent's same profile name, with no `worktree`,
-and reuses the parent's frozen profile snapshot
+never supplies `profile_snapshot`: the daemon freezes it, so a supplied snapshot
+rejects. It may omit `profile` or specify the parent's same profile name, with no
+`worktree`, and reuses the parent's frozen profile snapshot
 verbatim, without resolving a mutable named profile. It may instead name a profile
 from the parent snapshot's captured `child_profiles` allow-list; the daemon resolves
 that configured profile now and freezes its snapshot for the child. Any other name,
-or a cross-harness profile, is rejected before any native effect. The child must
+or a cross-harness profile, is rejected before any native effect. An omitted
+`workspace` defaults to the parent's workspace; an explicit different workspace
+rejects, so a child never escapes the parent's authority. The child must
 use the parent's harness: only model and effort may differ, the child inherits the
 parent's captured credential bindings verbatim, and its capacity scopes keep every
 non-profile scope of the parent with the same bounds. Then the authority check below
@@ -1212,6 +1225,8 @@ only the resulting value is stored.
 A routed recipient with `wake_on_mail` (profile snapshot, default true) may
 receive one generic coalesced wake per minute with at most one open notice
 command per recipient across mail and claims: `N unread messages; run swarm inbox, then ack processed delivery IDs`.
+An OpenCode or Antigravity recipient instead names the coordination tool it actually
+has: `N unread messages; use the eliot-swarm MCP swarm tool (method mail.inbox), then ack processed delivery IDs`.
 The notice never contains
 the body, is sent through the ordinary owner `send` path bound to the
 recipient's current generation, and is skipped — never retried — while a
@@ -1246,7 +1261,8 @@ normalization (segments are compatible when equal or either side carries
 a wildcard, with `**` realigning across directories), in the same project
 — is reported in-band in the `claim.set` response and routes at most one
 coalesced generic notice per holder: `1 overlapping work claim` /
-`N overlapping work claims`, plus `; run swarm who`. Detection is
+`N overlapping work claims`, plus `; run swarm who` (an OpenCode or Antigravity holder
+instead gets `; use the eliot-swarm MCP swarm tool (method who)`). Detection is
 conservative: a false positive only adds an
 advisory notice. The in-band list holds at most 100 conflicts;
 `truncated` signals the scan or report cap engaged. The notice shares the

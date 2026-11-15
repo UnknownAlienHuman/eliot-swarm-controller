@@ -12,4 +12,4 @@ pub(crate) use auth::{
 };
 pub(crate) use backends::BackendKind;
 pub(crate) use client::{HttpOutcome, OpenCodeHttp};
-pub(crate) use server::{LocalProvider, OwnedServer, ServerLaunch};
+pub(crate) use server::{LocalProvider, OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch};

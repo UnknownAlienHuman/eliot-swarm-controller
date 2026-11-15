@@ -869,6 +869,26 @@ impl Store {
         let terminal = self.last_terminal_turn(record.id, record.generation, &record.harness)?;
         let last_progress_at =
             native_children::native_progress(&self.connection, record.id, record.generation)?;
+        // Fleet usage prefers the newest terminal turn's native turn usage.
+        // When the last turn carries none (Muse never sends turn usage), fall
+        // back to the generation's latest retained session snapshot so a
+        // fleet scan never reads heavy session spend as no usage. The
+        // fallback keeps only cumulative input/output/cache counters with the
+        // session scope marker; it never fabricates a turn total.
+        let (last_turn_id, last_outcome, turn_usage) = match terminal {
+            Some((turn_id, outcome, usage)) => (Some(turn_id), outcome, usage),
+            None => (None, None, None),
+        };
+        let (usage, usage_scope) = match turn_usage {
+            Some(usage) => (Some(usage), Some("turn".to_owned())),
+            None => {
+                let fallback = self
+                    .get_session_usage(&id, record.generation)?
+                    .and_then(|snapshot| session_fallback_usage(&snapshot));
+                let scope = fallback.as_ref().map(|_| "session".to_owned());
+                (fallback, scope)
+            }
+        };
         Ok(AgentSummary {
             id,
             generation: record.generation,
@@ -884,8 +904,8 @@ impl Store {
             progress_age_ms: last_progress_at
                 .and_then(|at| now_ms.checked_sub(at))
                 .filter(|age| *age >= 0),
-            last_turn_id: terminal.as_ref().map(|turn| turn.0.clone()),
-            last_outcome: terminal.as_ref().and_then(|turn| turn.1),
+            last_turn_id,
+            last_outcome,
             activity: if record.origin == "native" && record.observe_only {
                 Some(native_children::activity(
                     &self.connection,
@@ -895,7 +915,8 @@ impl Store {
             } else {
                 None
             },
-            usage: terminal.and_then(|turn| turn.2),
+            usage,
+            usage_scope,
             updated_at: record.updated_at,
         })
     }
@@ -4516,6 +4537,36 @@ fn decode_turn_usage(value: &str) -> Result<TurnUsage> {
 fn decode_session_usage(value: &str) -> Result<SessionUsage> {
     serde_json::from_str(value)
         .map_err(|error| Error::new("internal", format!("invalid stored session usage: {error}")))
+}
+
+/// Fleet fallback for generations whose newest terminal turn carries no
+/// native turn usage (Muse never sends any). Projects the latest retained
+/// session snapshot's cumulative input/output/cache counters into a
+/// session-scoped [`TurnUsage`] so `agent.list` never reads heavy session
+/// spend as no usage. Returns `None` when the snapshot carries no cumulative
+/// counters (context occupancy or cost alone is not usage). Never derives a
+/// total and never presents the result as turn expenditure: the inner scope
+/// is always `"session"`, paired with the summary's `"session"` marker.
+fn session_fallback_usage(snapshot: &SessionUsage) -> Option<TurnUsage> {
+    let tokens = snapshot.cumulative_tokens.as_ref()?;
+    if tokens.input_tokens.is_none()
+        && tokens.output_tokens.is_none()
+        && tokens.cache_read_tokens.is_none()
+        && tokens.cache_write_tokens.is_none()
+    {
+        return None;
+    }
+    Some(TurnUsage {
+        scope: Some("session".to_owned()),
+        message_id: None,
+        input_tokens: tokens.input_tokens,
+        output_tokens: tokens.output_tokens,
+        reasoning_tokens: None,
+        thinking_tokens: None,
+        cache_read_tokens: tokens.cache_read_tokens,
+        cache_write_tokens: tokens.cache_write_tokens,
+        total_tokens: None,
+    })
 }
 
 impl Store {
