@@ -462,7 +462,7 @@ terminal.
 
 ## Recovery and later capabilities
 
-Installed Codex 0.161.0 discovery uses `initialize`/`initialized` followed by bounded
+Installed Codex discovery (0.167.1) uses `initialize`/`initialized` followed by bounded
 `thread/list` with `useStateDbOnly=true`, explicit source kinds, updated-time ordering
 and `archived` set only from the explicit caller selection (default `false`).
 Before listing, a probe reads effective configuration and requirements for its actual
