@@ -6,6 +6,7 @@ use super::args::{
 };
 use super::support::read_and_print;
 use super::support::{Failure, PAGE_SIZE, print_value, validate_limit};
+use eliot_core::api::AgentSummary;
 use eliot_core::api::{
     AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse, AgentGitRequest,
     AgentGitResponse, AgentHistoryRequest, AgentListRequest, AgentListResponse,
@@ -616,20 +617,34 @@ pub(crate) async fn read_agent_list(
 
 /// Readable fleet table for `swarm ls` (summaries) and `swarm top` (plus
 /// child activity, last-terminal usage and observation data availability).
-/// `ACT_TURN` is the live active turn; `LAST_OUT`/`LAST_TOK` belong to the
-/// last terminal turn (`last_turn_id`), not the active one. `DATA` reports
-/// observation data availability only, never freshness or liveness. `--json`
-/// keeps printing the raw response; this table never replaces it.
+/// `ACT_TURN` is the live active turn; `LAST_OUT`/`USAGE` belong to the
+/// fleet usage cell (`last_turn_id` turn usage, or the session-snapshot
+/// fallback), not the active turn. The usage cell shows the native total
+/// when supplied, otherwise the input+output sum, with a scope suffix:
+/// `(t)` turn-backed, `(s)` session fallback (fleet signal, never turn
+/// expenditure; full session facts stay on `swarm usage`/`swarm show`).
+/// `DATA` reports observation data availability only, never freshness or
+/// liveness. `--json` keeps printing the raw response; this table never
+/// replaces it.
 pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations: bool) {
     if with_observations {
         println!(
-            "{:<6} {:<4} {:<9} {:<11} {:<12} {:<6} {:<11} {:<8} {:<12}",
-            "ID", "GEN", "STATE", "ACTIVITY", "ACT_TURN", "AGE", "LAST_OUT", "LAST_TOK", "DATA"
+            "{:<6} {:<4} {:<9} {:<11} {:<12} {:<6} {:<11} {:<11} {:<12}",
+            "ID", "GEN", "STATE", "ACTIVITY", "ACT_TURN", "AGE", "LAST_OUT", "USAGE", "DATA"
         );
     } else {
         println!(
-            "{:<6} {:<4} {:<9} {:<14} {:<9} {:<12} {:<6} {:<11} {:<6}",
-            "ID", "GEN", "STATE", "PROJECT", "HARNESS", "ACT_TURN", "AGE", "LAST_OUT", "SEEN"
+            "{:<6} {:<4} {:<9} {:<14} {:<9} {:<12} {:<6} {:<11} {:<11} {:<6}",
+            "ID",
+            "GEN",
+            "STATE",
+            "PROJECT",
+            "HARNESS",
+            "ACT_TURN",
+            "AGE",
+            "LAST_OUT",
+            "USAGE",
+            "SEEN"
         );
     }
     let now_ms = std::time::SystemTime::now()
@@ -650,12 +665,6 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
                 .as_ref()
                 .map(|activity| activity_state_name(activity.state))
                 .unwrap_or("-");
-            let tokens = summary
-                .usage
-                .as_ref()
-                .and_then(|usage| usage.total_tokens)
-                .map(|tokens| tokens.to_string())
-                .unwrap_or_else(|| "-".to_owned());
             let observation = row
                 .observation
                 .as_ref()
@@ -667,7 +676,7 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
                 })
                 .unwrap_or_else(|| "-".to_owned());
             println!(
-                "{:<6} {:<4} {:<9} {:<11} {:<12} {:<6} {:<11} {:<8} {:<12}",
+                "{:<6} {:<4} {:<9} {:<11} {:<12} {:<6} {:<11} {:<11} {:<12}",
                 truncate_cell(&summary.id, 6),
                 summary.generation,
                 state_cell(summary.state),
@@ -675,7 +684,7 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
                 truncate_cell(turn, 12),
                 age,
                 outcome,
-                tokens,
+                fleet_usage_cell(summary),
                 observation,
             );
         } else {
@@ -685,7 +694,7 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
                     .filter(|age| *age >= 0),
             );
             println!(
-                "{:<6} {:<4} {:<9} {:<14} {:<9} {:<12} {:<6} {:<11} {:<6}",
+                "{:<6} {:<4} {:<9} {:<14} {:<9} {:<12} {:<6} {:<11} {:<11} {:<6}",
                 truncate_cell(&summary.id, 6),
                 summary.generation,
                 state_cell(summary.state),
@@ -694,6 +703,7 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
                 truncate_cell(turn, 12),
                 age,
                 outcome,
+                fleet_usage_cell(summary),
                 seen,
             );
         }
@@ -708,6 +718,19 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
         yes_no(response.truncated),
         response.next.as_deref().unwrap_or("-"),
     );
+}
+
+/// Fleet usage cell for `swarm ls`/`swarm top`: the shared
+/// [`AgentSummary::fleet_usage`] count with a scope suffix. `(t)` marks
+/// turn-backed usage; `(s)` marks the session-snapshot fallback, which is
+/// visibility only and never turn expenditure. No usage reads as `-`.
+pub(crate) fn fleet_usage_cell(summary: &AgentSummary) -> String {
+    match summary.fleet_usage() {
+        None => "-".to_owned(),
+        Some((tokens, scope)) => {
+            format!("{tokens}{}", if scope == "session" { "(s)" } else { "(t)" })
+        }
+    }
 }
 
 /// Readable usage summary for `swarm usage`. Turn scopes never merge: each
@@ -904,13 +927,15 @@ pub(crate) fn yes_no(value: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        activity_state_name, age_cell, is_transient_watch_error, list_params, print_usage_table,
-        state_cell, truncate_cell, watch_retry_delay, with_watch_resume_cursor,
+        activity_state_name, age_cell, fleet_usage_cell, is_transient_watch_error, list_params,
+        print_usage_table, state_cell, truncate_cell, watch_retry_delay, with_watch_resume_cursor,
     };
     use crate::cli::args::ListFilterArgs;
     use crate::cli::support::Failure;
-    use eliot_core::api::{TurnCounterMissing, UsageSummaryRequest, UsageSummaryResponse};
-    use eliot_core::{AgentState, Error as CoreError, NativeChildActivityState};
+    use eliot_core::api::{
+        AgentSummary, TurnCounterMissing, UsageSummaryRequest, UsageSummaryResponse,
+    };
+    use eliot_core::{AgentState, Error as CoreError, NativeChildActivityState, TurnUsage};
     use std::time::Duration;
 
     #[test]
@@ -991,6 +1016,61 @@ mod tests {
         assert_eq!(params.state, Some(AgentState::Busy));
         assert!(list_params(None, 10, false, filter(Some("done"))).is_err());
         assert!(list_params(None, 10, false, filter(Some("BUSY"))).is_err());
+    }
+
+    fn fleet_summary(usage: Option<TurnUsage>, usage_scope: Option<&str>) -> AgentSummary {
+        AgentSummary {
+            id: "a1".to_owned(),
+            generation: 0,
+            project: "p".to_owned(),
+            harness: "muse".to_owned(),
+            state: AgentState::Idle,
+            parent: None,
+            root: "a1".to_owned(),
+            active_turn: None,
+            last_progress_at: None,
+            progress_age_ms: None,
+            last_turn_id: None,
+            last_outcome: None,
+            activity: None,
+            usage,
+            usage_scope: usage_scope.map(str::to_owned),
+            updated_at: 7,
+        }
+    }
+
+    fn turn_usage(input: Option<i64>, output: Option<i64>, total: Option<i64>) -> TurnUsage {
+        TurnUsage {
+            scope: Some("turn".to_owned()),
+            message_id: None,
+            input_tokens: input,
+            output_tokens: output,
+            reasoning_tokens: None,
+            thinking_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            total_tokens: total,
+        }
+    }
+
+    #[test]
+    fn fleet_usage_cell_suffixes_the_shared_provenance() {
+        // The count derivation lives on `AgentSummary::fleet_usage` (tested
+        // in eliot-core); the cell only adds the scope suffix.
+        assert_eq!(fleet_usage_cell(&fleet_summary(None, None)), "-");
+        assert_eq!(
+            fleet_usage_cell(&fleet_summary(
+                Some(turn_usage(Some(10), Some(5), Some(15))),
+                Some("turn")
+            )),
+            "15(t)"
+        );
+        let mut session = turn_usage(Some(47_024), Some(207), None);
+        session.scope = Some("session".to_owned());
+        assert_eq!(
+            fleet_usage_cell(&fleet_summary(Some(session), Some("session"))),
+            "47231(s)"
+        );
     }
 
     #[test]
