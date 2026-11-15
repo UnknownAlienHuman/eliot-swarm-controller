@@ -41,7 +41,9 @@ pub(super) enum HandoffMsg {
         agent: String,
         generation: i64,
     },
-    SendsLoaded(u64, Fallible<Vec<SendRow>>),
+    /// Epoch, the rows of the bound generation, and how many older SENDs of
+    /// the Agent were not read (beyond `client::MAX_LISTED_SENDS`).
+    SendsLoaded(u64, Fallible<Vec<SendRow>>, usize),
     Closed,
     TaskPicked(Option<usize>),
     SendToggled(String, bool),
@@ -52,8 +54,9 @@ pub(super) enum HandoffMsg {
     Submit(Target),
     Retry,
     /// Epoch, whether this reply answers a submission (and so settles its
-    /// ledger entry, even after the dialog closed), and the reply.
-    Replied(u64, bool, Box<Fallible<Outcome>>),
+    /// ledger entry, even after the dialog closed), the mutation id it
+    /// answers, and the reply.
+    Replied(u64, bool, String, Box<Fallible<Outcome>>),
     RefreshRequested,
     ChildrenLoaded(u64, Fallible<Vec<Command>>),
     ReasonChanged(String),
@@ -101,9 +104,14 @@ impl DesktopApp {
     pub(super) fn handoff_update(&mut self, msg: HandoffMsg, context: &ComponentContext<Self>) {
         match msg {
             HandoffMsg::Open { agent, generation } => {
-                // An uncertain request stays bound to its id across reopening:
-                // the dialog comes back with it instead of starting over.
-                if self.handoff.uncertain
+                // A request still in flight or left uncertain stays bound to
+                // its id across reopening: the dialog comes back with it
+                // instead of starting over.
+                let pending = self.handoff.submitted.as_ref().is_some_and(|submitted| {
+                    self.handoff.uncertain
+                        || self.in_flight_key.as_deref() == Some(submitted.key().as_str())
+                });
+                if pending
                     && self.handoff.from == agent
                     && self.handoff.from_generation == generation
                 {
@@ -123,26 +131,28 @@ impl DesktopApp {
                     return;
                 };
                 let _task = context.spawn_background(move |_| {
-                    let sends = client::block_on(client::agent_sends(&data_dir, &agent))
-                        .map(|commands| {
-                            commands
-                                .iter()
-                                .filter_map(|command| handoff::send_row(command, generation))
-                                .collect()
-                        })
+                    let read = client::block_on(client::agent_sends(&data_dir, &agent))
                         .map_err(|error| error.to_string());
-                    Message::Handoff(HandoffMsg::SendsLoaded(epoch, sends))
+                    let omitted = read.as_ref().map_or(0, |(_, omitted)| *omitted);
+                    let sends = read.map(|(commands, _)| {
+                        commands
+                            .iter()
+                            .filter_map(|command| handoff::send_row(command, generation))
+                            .collect()
+                    });
+                    Message::Handoff(HandoffMsg::SendsLoaded(epoch, sends, omitted))
                 });
             }
-            HandoffMsg::SendsLoaded(epoch, sends) => {
+            HandoffMsg::SendsLoaded(epoch, sends, omitted) => {
                 if epoch != self.handoff.epoch {
                     return;
                 }
                 self.handoff.status = match &sends {
                     Ok(rows) => format!(
-                        "{} SEND(s) on this generation, {} undispatched.",
+                        "{} SEND(s) on this generation, {} undispatched.{}",
                         rows.len(),
-                        rows.iter().filter(|row| row.transferable()).count()
+                        rows.iter().filter(|row| row.transferable()).count(),
+                        handoff::omitted_note(omitted, client::MAX_LISTED_SENDS)
                     ),
                     Err(error) => format!("SENDs not read: {error}"),
                 };
@@ -270,7 +280,7 @@ impl DesktopApp {
                 self.handoff.prior = self.handoff.submitted.clone();
                 self.handoff_send(submitted, context);
             }
-            HandoffMsg::Replied(epoch, settles, reply) => {
+            HandoffMsg::Replied(epoch, settles, id, reply) => {
                 let reply = *reply;
                 let uncertain = reply
                     .as_ref()
@@ -281,15 +291,30 @@ impl DesktopApp {
                 if settles {
                     self.settle_mutation(!uncertain);
                 }
-                if epoch != self.handoff.epoch {
+                // A reply belongs to the request it answers, not to a dialog
+                // opening: the answer to a submission lands on it even after
+                // the dialog was closed, and a reply for a request no longer
+                // shown (a switch replaced by its finish) changes nothing.
+                let Some(submitted) = self.handoff.submitted.clone() else {
+                    return;
+                };
+                if !handoff::reply_applies(
+                    submitted.id(),
+                    &id,
+                    settles,
+                    epoch == self.handoff.epoch,
+                ) {
                     return;
                 }
                 match reply {
                     Ok(outcome) => {
-                        if settles {
-                            self.handoff.uncertain = false;
-                            self.handoff.prior = None;
+                        // Any definite answer for this id, the submission's or
+                        // a same-id readback's, ends the uncertainty.
+                        if !settles && self.handoff.uncertain {
+                            self.ledger.complete(&submitted.key());
                         }
+                        self.handoff.uncertain = false;
+                        self.handoff.prior = None;
                         self.handoff.status = "Read back from the daemon.".to_owned();
                         let pending = outcome.switch_pending();
                         let handoff_id = outcome.handoff().map(|reply| reply.id.clone());
@@ -297,7 +322,7 @@ impl DesktopApp {
                         if let Some(id) = handoff_id {
                             self.load_handoff_children(&id, context);
                         }
-                        if pending && self.handoff.polls < SWITCH_POLLS {
+                        if pending && self.handoff.open && self.handoff.polls < SWITCH_POLLS {
                             self.handoff.polls += 1;
                             self.handoff_readback(SWITCH_POLL_MS, false, context);
                         } else if pending {
@@ -508,12 +533,14 @@ impl DesktopApp {
             return;
         };
         let epoch = self.handoff.epoch;
+        let id = submitted.id().to_owned();
         let _task = context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
             if delay_ms > 0 && !feed::backoff(delay_ms, &cancelled) {
                 return Message::Handoff(HandoffMsg::Replied(
                     epoch,
                     settles,
+                    id,
                     Box::new(Err("unknown: readback cancelled".to_owned())),
                 ));
             }
@@ -528,7 +555,7 @@ impl DesktopApp {
                 }
             })
             .map_err(|error| error.to_string());
-            Message::Handoff(HandoffMsg::Replied(epoch, settles, Box::new(reply)))
+            Message::Handoff(HandoffMsg::Replied(epoch, settles, id, Box::new(reply)))
         });
     }
 

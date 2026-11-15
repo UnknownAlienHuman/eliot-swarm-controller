@@ -133,6 +133,24 @@ impl Submitted {
     }
 }
 
+/// Whether a reply applies to the dialog: it must answer the request shown
+/// (`shown` is that request's id). The answer to a submission always applies,
+/// even after the dialog was closed and reopened; a readback applies only
+/// within the opening that started it, so closing ends its poll chain.
+pub fn reply_applies(shown: &str, replied: &str, settles: bool, same_opening: bool) -> bool {
+    shown == replied && (settles || same_opening)
+}
+
+/// Status suffix when older SENDs of the Agent were not read: the list is
+/// the newest `limit` only, and the original task may be among the omitted.
+pub fn omitted_note(omitted: usize, limit: usize) -> String {
+    if omitted == 0 {
+        String::new()
+    } else {
+        format!(" Only the newest {limit} SENDs were read; {omitted} older one(s) are not listed.")
+    }
+}
+
 fn launch_key(launch: &SwitchLaunch) -> String {
     format!(
         "{:?}/{:?}/{:?}/{:?}",
@@ -446,5 +464,24 @@ mod tests {
         assert!(check_selection(Some("t"), &[]).is_ok());
         let many: Vec<String> = (0..=MAX_HANDOFF_SENDS).map(|i| format!("s{i}")).collect();
         assert!(check_selection(Some("t"), &many).is_err());
+    }
+
+    #[test]
+    fn replies_apply_to_the_request_they_answer() {
+        // A submission's answer lands even after the dialog was closed.
+        assert!(reply_applies("h1", "h1", true, false));
+        // A readback from an earlier opening ends its poll chain.
+        assert!(!reply_applies("h1", "h1", false, false));
+        assert!(reply_applies("h1", "h1", false, true));
+        // A late switch readback never overwrites the finish that replaced it.
+        assert!(!reply_applies("finish", "switch", false, true));
+        assert!(!reply_applies("finish", "switch", true, true));
+    }
+
+    #[test]
+    fn a_truncated_send_list_says_so() {
+        assert_eq!(omitted_note(0, 200), "");
+        assert!(omitted_note(3, 200).contains("newest 200 SENDs"));
+        assert!(omitted_note(3, 200).contains("3 older"));
     }
 }

@@ -566,11 +566,14 @@ pub async fn command_children(data_dir: &Path, id: &str) -> Result<Vec<Command>>
     Ok(reply.children)
 }
 
+/// Most SENDs one handoff dialog reads for an Agent (newest first kept).
+pub const MAX_LISTED_SENDS: usize = 200;
+
 /// SENDs admitted for `agent`, oldest first, newest `MAX_LISTED_SENDS`,
-/// read from its retained admission events and then `command.get`;
-/// the caller keeps the plain ones of its bound generation.
-pub async fn agent_sends(data_dir: &Path, agent: &str) -> Result<Vec<Command>> {
-    const MAX_LISTED_SENDS: usize = 200;
+/// read from its retained admission events and then `command.get`, plus how
+/// many older ones were not read; the caller keeps the plain ones of its
+/// bound generation.
+pub async fn agent_sends(data_dir: &Path, agent: &str) -> Result<(Vec<Command>, usize)> {
     let filter = EventsFilter {
         agents: vec![agent.to_owned()],
         kinds: crate::handoff::ADMISSION_KINDS.map(str::to_owned).to_vec(),
@@ -579,15 +582,14 @@ pub async fn agent_sends(data_dir: &Path, agent: &str) -> Result<Vec<Command>> {
     let bounds = events_bounds(data_dir, &filter).await?;
     let events = scan_events(data_dir, bounds.pruned_through, bounds.hi, &filter).await?;
     let mut ids = crate::handoff::send_ids(&events, agent);
-    if ids.len() > MAX_LISTED_SENDS {
-        ids.drain(..ids.len() - MAX_LISTED_SENDS);
-    }
+    let omitted = ids.len().saturating_sub(MAX_LISTED_SENDS);
+    ids.drain(..omitted);
     let reads: Vec<Result<Command>> = futures_util::stream::iter(ids)
         .map(|id| async move { read_command(data_dir, &id).await })
         .buffered(MAX_CONCURRENT_READS)
         .collect()
         .await;
-    reads.into_iter().collect()
+    Ok((reads.into_iter().collect::<Result<_>>()?, omitted))
 }
 
 /// Owner task transfer to an existing Agent. The same request (id
