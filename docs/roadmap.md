@@ -408,9 +408,12 @@ of the explicitly selected release scope.
       another provider call, own result/write reads, honest cancel and dependency-free
       release. Qualify on a private Windows daemon; record actual checks/evidence in
       the PR. Owner brought #199 into scope on 2026-11-14.
-- [ ] **M1.2 Memory continuity.** Fixed-window inventory, backup/cut/restore integration,
-      dependency-protected release/retention, safe previous-credential retirement and
-      an actual episode revision consumed later. Keep #199 open until this integration
+- [x] **M1.2 Controller memory continuity.** Fixed-window call/write inventory,
+      controller backup-cut/restore readback, dependency-protected release/retention
+      and safe previous-credential retirement. Qualified on a private Windows daemon
+      with Claude Code 2.1.325 / `claude-haiku-5-5`, including restart and pruning gaps.
+      Memory must still implement its durable mutation/backup owner integration and
+      an actual episode revision consumed later. Keep #199 open until that integration
       and evidence exist. Embeddings remain unsupported.
 
 ## Later

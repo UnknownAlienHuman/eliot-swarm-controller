@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 38;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 40;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -908,6 +908,190 @@ impl Store {
             ).map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 39 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE inference_clients ADD COLUMN last_write_seq INTEGER NOT NULL DEFAULT 0 CHECK(last_write_seq>=0);
+                 ALTER TABLE inference_clients ADD COLUMN retain_after_seq INTEGER NOT NULL DEFAULT 0 CHECK(retain_after_seq>=0);
+                 ALTER TABLE inference_clients ADD COLUMN write_retain_after_seq INTEGER NOT NULL DEFAULT 0 CHECK(write_retain_after_seq>=0);
+                 ALTER TABLE inference_clients ADD COLUMN previous_file TEXT;
+                 ALTER TABLE inference_clients ADD COLUMN previous_retirement_id TEXT;
+                 ALTER TABLE inference_clients ADD COLUMN previous_retirement_complete INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE inference_clients ADD COLUMN previous_read_call_id TEXT;
+                 ALTER TABLE inference_clients ADD COLUMN previous_release_proven INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE inference_clients ADD COLUMN previous_restarted INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE writes ADD COLUMN inference_seq INTEGER CHECK(inference_seq>0);
+                 WITH ranked AS (
+                     SELECT id,ROW_NUMBER() OVER (PARTITION BY principal ORDER BY created_at,id) AS seq
+                     FROM writes WHERE substr(principal,1,17)='memory_inference:'
+                 ) UPDATE writes SET inference_seq=(SELECT seq FROM ranked WHERE ranked.id=writes.id)
+                   WHERE id IN (SELECT id FROM ranked);
+                 UPDATE inference_clients SET last_write_seq=COALESCE((
+                     SELECT MAX(inference_seq) FROM writes WHERE principal='memory_inference:'||client_id),0);
+                 UPDATE inference_clients SET previous_file=(
+                     SELECT json_extract(result,'$.credential_file') FROM writes
+                     WHERE principal='owner' AND method IN ('inference.client.install','inference.client.rotate')
+                       AND json_extract(result,'$.client_id')=inference_clients.client_id
+                       AND json_extract(result,'$.token_version')=inference_clients.previous_version
+                     ORDER BY created_at DESC,id DESC LIMIT 1)
+                   WHERE previous_version IS NOT NULL;
+                 CREATE UNIQUE INDEX inference_write_inventory ON writes(principal,inference_seq) WHERE inference_seq IS NOT NULL;
+                 INSERT INTO schema_migrations(version) VALUES (39);"
+            ).map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 40 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE inference_clients ADD COLUMN expired_id_through_ms INTEGER NOT NULL DEFAULT -1 CHECK(expired_id_through_ms>=-1);"
+            ).map_err(sql_error)?;
+            // A v39 retention receipt records the clock used for its pruning.
+            // Preserve the greatest surviving observation across an upgrade,
+            // including when the wall clock has already moved backward.
+            tx.execute(
+                "UPDATE inference_clients SET expired_id_through_ms=MAX(-1,COALESCE((
+                    SELECT MAX(created_at) FROM writes
+                    WHERE principal='memory_inference:'||client_id AND method='inference.retention.advance'
+                 ),0)-?1-1)",
+                [RETRY_WINDOW_MS],
+            ).map_err(sql_error)?;
+            db!(tx.execute("INSERT INTO schema_migrations(version) VALUES (40)", []));
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod continuity_tests {
+    use super::*;
+
+    #[test]
+    fn v39_upgrade_recovers_expiry_from_retention_without_losing_replay() {
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "ALTER TABLE inference_clients DROP COLUMN expired_id_through_ms;
+             DELETE FROM schema_migrations WHERE version=40;",
+            )
+            .unwrap();
+        let client = format!("memory:{}", Ulid::new());
+        let untouched = format!("memory:{}", Ulid::new());
+        for client in [&client, &untouched] {
+            store.connection.execute("INSERT INTO inference_clients(client_id,current_version,current_hash,current_file) VALUES (?1,1,'hash','credential.json')", [client]).unwrap();
+        }
+        let start = 1_800_000_000_000_i64;
+        let receipt = Ulid::from(((start + RETRY_WINDOW_MS + 1) as u128) << 80).to_string();
+        store.connection.execute(
+            "INSERT INTO writes(id,principal,method,payload_digest,result,created_at,inference_seq) VALUES (?1,?2,'inference.retention.advance',?3,?4,?5,1)",
+            params![receipt, format!("memory_inference:{client}"), vec![0_u8;32],
+                json!({"retain_after_seq":0,"write_retain_after_seq":0,"pruned_calls":0,"pruned_writes":0}).to_string(), start + RETRY_WINDOW_MS + 1],
+        ).unwrap();
+        store.migrate().unwrap();
+        let watermark = |client: &str| {
+            store
+                .connection
+                .query_row(
+                    "SELECT expired_id_through_ms FROM inference_clients WHERE client_id=?1",
+                    [client],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(watermark(&client), start);
+        assert_eq!(watermark(&untouched), -1);
+        let absent = Ulid::from((start as u128) << 80).to_string();
+        assert_eq!(
+            store
+                .inference_write_get(&client, &absent, start + RETRY_WINDOW_MS - 1)
+                .unwrap()
+                .status,
+            eliot_core::api::inference::InferenceWriteStatus::HistoryGap
+        );
+        assert_eq!(
+            store
+                .inference_write_get(&client, &receipt, start + RETRY_WINDOW_MS - 1)
+                .unwrap()
+                .status,
+            eliot_core::api::inference::InferenceWriteStatus::Retained
+        );
+    }
+
+    #[test]
+    fn v38_upgrade_preserves_membership_and_previous_publication() {
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP INDEX inference_write_inventory;
+             ALTER TABLE writes DROP COLUMN inference_seq;
+             ALTER TABLE inference_clients DROP COLUMN last_write_seq;
+             ALTER TABLE inference_clients DROP COLUMN retain_after_seq;
+             ALTER TABLE inference_clients DROP COLUMN write_retain_after_seq;
+             ALTER TABLE inference_clients DROP COLUMN previous_file;
+             ALTER TABLE inference_clients DROP COLUMN previous_retirement_id;
+             ALTER TABLE inference_clients DROP COLUMN previous_retirement_complete;
+             ALTER TABLE inference_clients DROP COLUMN previous_read_call_id;
+             ALTER TABLE inference_clients DROP COLUMN previous_release_proven;
+             ALTER TABLE inference_clients DROP COLUMN previous_restarted;
+             ALTER TABLE inference_clients DROP COLUMN expired_id_through_ms;
+             DELETE FROM schema_migrations WHERE version>=39;",
+            )
+            .unwrap();
+        let client = format!("memory:{}", Ulid::new());
+        let publication = json!({"client_id":client,"token_version":1,"credential_file":"inference-credential-original.json","phase":"active"});
+        store.connection.execute("INSERT INTO inference_clients(client_id,current_version,current_hash,current_file,previous_version,previous_hash,last_admission_seq) VALUES (?1,2,'new-hash','new.json',1,'old-hash',9)", [&client]).unwrap();
+        for (principal, method, result, created) in [
+            (
+                "owner".to_owned(),
+                "inference.client.install",
+                publication,
+                1,
+            ),
+            (
+                format!("memory_inference:{client}"),
+                "inference.text",
+                json!({"call_id":"old","admission_seq":9}),
+                2,
+            ),
+            (
+                format!("memory_inference:{client}"),
+                "inference.cancel",
+                json!({"call_id":"old","outcome":"too_late"}),
+                3,
+            ),
+        ] {
+            store.connection.execute("INSERT INTO writes(id,principal,method,payload_digest,result,created_at) VALUES (?1,?2,?3,?4,?5,?6)", params![Ulid::new().to_string(),principal,method,vec![0u8;32],result.to_string(),created]).unwrap();
+        }
+        store.migrate().unwrap();
+        let high = store.inference_high_water(&client).unwrap();
+        assert_eq!(high.call_high_water_seq, 9);
+        assert_eq!(high.write_high_water_seq, 2);
+        assert_eq!(high.retain_after_seq, 0);
+        let previous: String = store
+            .connection
+            .query_row(
+                "SELECT previous_file FROM inference_clients WHERE client_id=?1",
+                [&client],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(previous, "inference-credential-original.json");
+        let sequences: Vec<i64> = store
+            .connection
+            .prepare("SELECT inference_seq FROM writes WHERE principal=?1 ORDER BY created_at")
+            .unwrap()
+            .query_map([format!("memory_inference:{client}")], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(sequences, vec![1, 2]);
     }
 }

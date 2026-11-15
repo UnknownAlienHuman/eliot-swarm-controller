@@ -16,6 +16,7 @@ pub const MAX_INFERENCE_INPUT: usize = 32 * 1024;
 pub const MAX_INFERENCE_RESULT: usize = 64 * 1024;
 pub const MAX_INFERENCE_RANGE: usize = 16 * 1024;
 pub const MAX_INFERENCE_CALLS: i64 = 1024;
+pub const MAX_INFERENCE_RETENTION_RECEIPTS: i64 = 1024;
 pub const MAX_INFERENCE_CLIENTS: i64 = 16;
 pub const MAX_INFERENCE_DEADLINE_MS: u64 = 120_000;
 
@@ -183,6 +184,162 @@ pub struct InferenceWriteResponse {
 pub enum InferenceWriteResult {
     Receipt(InferenceReceipt),
     Mutation(InferenceMutationResponse),
+    Retention(InferenceRetentionResponse),
+}
+
+// M1.2 fixed-window inventory and retention DTOs.
+pub const INFERENCE_INVENTORY_QUERY_VERSION: u32 = 1;
+pub const MAX_INFERENCE_INVENTORY_PAGE: usize = 100;
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceHighWaterRequest {}
+
+impl InferenceHighWaterRequest {
+    pub fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceHighWaterResponse {
+    pub client_id: String,
+    pub call_high_water_seq: i64,
+    pub retain_after_seq: i64,
+    pub write_high_water_seq: i64,
+    pub write_retain_after_seq: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceInventoryCursor {
+    pub client_id: String,
+    pub call_after_seq: i64,
+    pub call_through_seq: i64,
+    pub write_after_seq: i64,
+    pub write_through_seq: i64,
+    pub limit: usize,
+    pub query_version: u32,
+    pub last_call_seq: i64,
+    pub last_write_seq: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceListRequest {
+    /// Exclusive start of the fixed call interval.
+    pub call_after_seq: i64,
+    /// Inclusive high-water captured by `inference.high_water`.
+    pub call_through_seq: i64,
+    /// Exclusive start of the fixed write interval.
+    pub write_after_seq: i64,
+    /// Inclusive high-water captured by `inference.high_water`.
+    pub write_through_seq: i64,
+    pub limit: usize,
+    pub cursor: Option<InferenceInventoryCursor>,
+}
+
+impl InferenceListRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.call_after_seq < 0
+            || self.call_through_seq < self.call_after_seq
+            || self.write_after_seq < 0
+            || self.write_through_seq < self.write_after_seq
+            || !(1..=MAX_INFERENCE_INVENTORY_PAGE).contains(&self.limit)
+        {
+            return Err(Error::new(
+                "invalid",
+                "invalid inference inventory interval or page limit",
+            ));
+        }
+        if let Some(cursor) = &self.cursor {
+            inference_client(&cursor.client_id)?;
+            if cursor.call_after_seq != self.call_after_seq
+                || cursor.call_through_seq != self.call_through_seq
+                || cursor.write_after_seq != self.write_after_seq
+                || cursor.write_through_seq != self.write_through_seq
+                || cursor.limit != self.limit
+                || cursor.query_version != INFERENCE_INVENTORY_QUERY_VERSION
+                || cursor.last_call_seq < self.call_after_seq
+                || cursor.last_call_seq > self.call_through_seq
+                || cursor.last_write_seq < self.write_after_seq
+                || cursor.last_write_seq > self.write_through_seq
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "inference inventory cursor does not match its fixed interval",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceWriteInventoryItem {
+    pub write_seq: i64,
+    pub id: String,
+    pub method: String,
+    pub payload_sha256: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceListResponse {
+    pub client_id: String,
+    pub calls: Vec<InferenceCall>,
+    pub writes: Vec<InferenceWriteInventoryItem>,
+    pub next: Option<InferenceInventoryCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceRetentionRequest {
+    pub id: String,
+    pub observed_call_high_water_seq: i64,
+    pub observed_write_high_water_seq: i64,
+    /// Memory's backup/fence owner assertion, serialized under its own lock.
+    pub safe_retain_after_seq: i64,
+    pub retain_after_seq: i64,
+    pub safe_write_retain_after_seq: i64,
+    pub write_retain_after_seq: i64,
+    pub limit: usize,
+}
+
+impl InferenceRetentionRequest {
+    pub fn validate(&self) -> Result<()> {
+        inference_id(&self.id)?;
+        if self.observed_call_high_water_seq < 0
+            || self.observed_write_high_water_seq < 0
+            || self.safe_retain_after_seq < 0
+            || self.retain_after_seq < 0
+            || self.safe_write_retain_after_seq < 0
+            || self.write_retain_after_seq < 0
+            || self.safe_retain_after_seq > self.observed_call_high_water_seq
+            || self.retain_after_seq > self.safe_retain_after_seq
+            || self.safe_write_retain_after_seq > self.observed_write_high_water_seq
+            || self.write_retain_after_seq > self.safe_write_retain_after_seq
+            || !(1..=MAX_INFERENCE_INVENTORY_PAGE).contains(&self.limit)
+        {
+            return Err(Error::new(
+                "invalid",
+                "invalid inference retention cut or bound",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceRetentionResponse {
+    pub retain_after_seq: i64,
+    pub write_retain_after_seq: i64,
+    pub pruned_calls: usize,
+    pub pruned_writes: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -238,6 +395,16 @@ pub enum InferenceDisposition {
     AbandonForErasure,
 }
 
+/// Memory supplies this exact-call classification while serializing mutations
+/// with its backup-set owner. The controller never inspects physical backups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceBackupDependency {
+    NoBackupDependencies,
+    ControllerClosed,
+    ControllerDependent,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InferenceReleaseRequest {
@@ -245,9 +412,12 @@ pub struct InferenceReleaseRequest {
     pub call_id: String,
     pub disposition: InferenceDisposition,
     pub result_sha256: Option<String>,
-    /// M1 accepts only a dependency-free installation. Memory owns this assertion
-    /// under its mutation-owner/backup-set lock; controller never opens backups.
-    pub no_backup_dependencies: bool,
+    /// Retain the original M1 spelling so an admitted release can still replay
+    /// its exact semantic binding after upgrade. Supply exactly one assertion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_backup_dependencies: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_dependency: Option<InferenceBackupDependency>,
 }
 impl InferenceReleaseRequest {
     pub fn validate(&self) -> Result<()> {
@@ -256,13 +426,19 @@ impl InferenceReleaseRequest {
         if let Some(digest) = &self.result_sha256 {
             inference_digest(digest)?;
         }
-        if !self.no_backup_dependencies {
-            return Err(Error::new(
-                "unsupported",
-                "backup-aware release is not implemented",
-            ));
-        }
+        self.dependency()?;
         Ok(())
+    }
+
+    pub fn dependency(&self) -> Result<InferenceBackupDependency> {
+        match (self.no_backup_dependencies, self.backup_dependency) {
+            (Some(true), None) => Ok(InferenceBackupDependency::NoBackupDependencies),
+            (None, Some(dependency)) => Ok(dependency),
+            _ => Err(Error::new(
+                "invalid",
+                "supply exactly one exact-call backup dependency assertion",
+            )),
+        }
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

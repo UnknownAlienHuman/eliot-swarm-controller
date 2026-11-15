@@ -80,7 +80,8 @@ Use the existing private NDJSON transport with exactly
 `_payload:<closed request DTO>`. The stable client is `memory:<installation ULID>`.
 Persistent random controller id, stable client id, positive credential version and
 raw bearer are distinct. Only this principal may call `client.identity`,
-`inference.text`, `.get`, `.write.get`, `.result.read`, `.cancel` and `.release`.
+`inference.text`, `.get`, `.write.get`, `.high_water`, `.list`, `.result.read`,
+`.cancel`, `.release` and `.retention.advance`.
 It has no general Agent, command, daemon, config or coordination authority. No
 Owner/Agent/Run/tokenless/other-controller fallback exists. Owner maintains credentials
 but cannot read inference content through these APIs. Reads select only the
@@ -106,10 +107,11 @@ managed hooks or explicit fallback override on the host.
 
 Limits: 32 KiB UTF-8 input, 64 KiB result, 16 KiB byte range, one successful native
 turn, a 1–120 second queue/native-attempt budget after input publication, 16 clients, 1,024 retained calls globally
-and one native inference in flight. At most one cancel and one release binding may
+and one native inference in flight. Each client retains at most 1,024
+`inference.retention.advance` receipts. At most one cancel and one release binding may
 be first-admitted per call; other IDs for that auxiliary operation return
 `already_bound`. Replay the original ID. This bounds retained auxiliary writes
-while retention is unsupported. IDs must use uppercase ULID spelling; no
+until released metadata can be pruned. IDs must use uppercase ULID spelling; no
 normalization occurs. Profile, origin, disclosure, input digest/length,
 response format, result bound and deadline participate in semantic binding. Prompt
 and result text and raw provider diagnostics never enter SQLite, events or logs.
@@ -148,18 +150,63 @@ copies after the owned runner is quiescent. Exact release replay retries cleanup
 `inference.get.cleanup_complete` is separate readback. Late settlement cannot publish
 through the fence. Local cleanup never proves provider deletion/non-execution.
 
-M1 release requires `no_backup_dependencies:true`. Memory asserts this while holding
-its mutation-owner/backup-set serialization; no restorable backup or unresolved fence
-may depend on the call. This slice supports dependency-free installations only.
-Embeddings, inventory (`high_water`/`list`), backup/cut/restore integration, retention
-advancement, metadata pruning and emergency erase are `unsupported`. Ordinary
-retention excludes inference writes, preserving call bindings until a later bounded
-retention increment; the finite call cap then rejects new admission. Memory owns
-backup files/dependency decisions; controller never reads those files.
+Release carries Memory's exact-call `backup_dependency` classification:
+`no_backup_dependencies`, `controller_closed` or `controller_dependent`. The last
+returns `dependency_protected` without admitting a write or fencing publication.
+Supply exactly one assertion. The original `no_backup_dependencies:true` spelling
+remains accepted with the other field absent, preserving exact retained M1.1 release
+digests/retries after upgrade; it cannot express backup-aware release.
+Memory rechecks its current backup-set snapshot under mutation-owner/backup-set
+serialization immediately before send; controller-closed means the backup contains
+every terminal fact/body it needs with no later controller readback/copy/cleanup debt.
+An unresolved fence is a dependency until Memory reconciles it. The controller trusts
+this authenticated assertion; it never opens backup files or stores backup-pin tables.
+
+`inference.high_water` captures the client's monotonic call and write sequences plus
+their retained cuts in one committed read. `inference.list` pages fixed exclusive/
+inclusive intervals for both streams, with a closed cursor bound to client, both
+intervals, page limit and query version. Membership is fixed; call state can settle
+between pages and is read separately with `inference.get`. A request below either
+retained cut returns `history_gap`, including on continuation after concurrent pruning.
+Pages have finite limits defined by the Core DTOs and never include private content.
+
+Memory closes/drains its own mutation owner before a backup cut, dispositions every
+created call/auxiliary ID with `inference.write.get`, captures high-waters, and holds
+admission closed until its final fence publication/readback. It records admitted,
+retired-not-sent and unknown IDs, and classifies admitted calls as controller-closed
+or controller-dependent per Memory Contract 0.19 sections 8-10 and Implementation §8.
+On restore, preserve installation/external-ID state outside rollback roots, capture
+one current high-water and page the fixed post-backup intervals. Never use a mutation
+to probe an old absent ID, adopt post-cut output as restored cognition, or send a
+retired ID. Missing identity/history/copy or unresolved effects keep inference closed.
+
+`inference.retention.advance` binds an idempotent mutation to observed high-waters,
+Memory-asserted safe cuts and bounded work. Cuts are monotonic and cannot exceed the
+observed bounds. Memory's safe call cut is no greater than the minimum high-water of
+published non-retired backups and unresolved fences, or an observed controller
+high-water if none remain; its safe write cut likewise protects needed auxiliary
+readback. Advancing a cut permits gaps at/below it, never above it. Only released,
+cleanup-complete calls prune. Open/unknown/unreleased calls remain, regardless of age.
+Pending/previous credential readback also retains pre-rotation calls until retirement
+completes; rotation requires at least one retained own call to prove the new credential.
+Write receipts prune only after the normal new-ID retry window has expired and no
+retained call references them. The pruning transaction persists a nondecreasing,
+inclusive expiry timestamp watermark per client (current time minus 24 hours minus
+one millisecond). Absent IDs at or below that watermark read `history_gap` and
+first admission rejects with `id_expired`, even after clock rollback or restart.
+Retained exact replay precedes the watermark and age gates for every mutation.
+Schema v40 initializes the watermark from the greatest retained v39 retention
+receipt's pruning time, or leaves it unset when no such receipt exists.
+After bounded pruning, a first retention operation that would exceed the per-client
+receipt cap returns `capacity` and rolls back the transaction. Exact replay, cancel
+and release remain available at that cap. Ordinary retention continues to exclude
+inference writes. The global retained-call cap counts all remaining calls and rejects admission
+at capacity; pruning never resets either sequence. Embeddings and owner emergency
+erase remain `unsupported`.
 
 #### Private credential publication and recovery
 
-Only Owner calls `inference.client.install`, `.rotate` or `.promote` with a retained
+Only Owner calls `inference.client.install`, `.rotate`, `.promote` or `.retire` with a retained
 mutation ID, stable client id and expected current version (zero for install).
 Generate 256 random bearer bits with the existing credential generator; no derivation
 or routing-key hierarchy. Store version/hash and nonsecret publication metadata only.
@@ -179,9 +226,18 @@ Rotation stages one pending version while current remains installed. Pending aut
 may read old own calls but cannot first-admit mutations. After it authenticates and
 reads a pre-rotation call, Owner promotes it with a separate idempotent mutation.
 Keep at most one previous read credential. Only current admits new mutations;
-retained own reads/retries survive overlap. Further rotation and previous retirement
-are unsupported while previous remains: a later increment must prove reconnect,
-old-call release and restart readback first. Lost replies never reset versions.
+retained own reads/retries survive overlap. Previous retirement requires a daemon
+restart after promotion, an exact pre-rotation call read authenticated with the new
+current credential after that restart, and release of that same call with cleanup
+complete. This proves reconnect and old-call/restart readback before revocation.
+Owner's `.retire` binds the current expected version and one retained operation ID.
+Exact old-file/hash readback precedes a committed revocation fence; only then delete
+the fixed private file and confirm absence before committing cleanup completion and
+returning the immutable response. Same-ID retry resumes incomplete cleanup, including
+after restart, without minting a credential or revoking another version. Previous
+auth fails after the fence. Further rotation waits for completed retirement. A retired
+install/rotate publication cannot recreate its deleted secret on replay. Lost replies
+never reset versions. The advertised capability is `0.19-M1.2`.
 
 ### MCP stdio server
 

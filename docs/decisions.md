@@ -45,7 +45,7 @@ owning specs; do not reproduce them in every page. Existing IDs remain stable fo
 | D-37 | Use official `rmcp` 3.9.0 for the stdio server (`server` + `transport-io`). | SDK transport only; management authority and semantics stay in the existing authenticated API. [API](spec/api.md#mcp-stdio-server) |
 
 | D-38 | M1 uses one scoped Memory text profile through fresh tool-free Claude print mode, with native retries disabled. | Owner brought #199 into scope on 2026-11-14. Claude 2.1.325 exposes explicit tool/session/retry controls. The Codex Agent adapter is not an inference adapter. [API](spec/api.md#memory-one-shot-inference-m1-199) |
-| D-39 | Memory credentials use random private files plus Store version/hash, with exact idempotent staged rotation. | Recoverable publication needs no key hierarchy. Stable client owns calls across rotation. Backup-aware release/retention and previous-credential retirement remain later increments. |
+| D-39 | Memory credentials use random private files plus Store version/hash, with exact idempotent staged rotation and retirement. | Recoverable publication needs no key hierarchy. Stable client owns calls across rotation. M1.2 fences old hashes before file cleanup after current-credential old-call read/release and restart; Memory owns backup dependency assertions for bounded release/retention. |
 
 ## Defaults
 

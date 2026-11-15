@@ -61,6 +61,17 @@ fn unknown() -> Error {
     )
 }
 
+fn credential_file_name_is_owned(name: &str) -> bool {
+    let Some(id) = name
+        .strip_prefix("inference-credential-")
+        .and_then(|name| name.strip_suffix(".json"))
+    else {
+        return false;
+    };
+    Path::new(name).file_name().and_then(|value| value.to_str()) == Some(name)
+        && inference_id(id).is_ok()
+}
+
 /// Completed/Failed captures are settled only after owned-custody
 /// quiescence is established (Windows Job / Unix group). Unknown without
 /// quiescence keeps the cleanup/dispatch fence.
@@ -91,7 +102,7 @@ impl Router {
             client_id: client.to_owned(),
             principal: "memory_inference".to_owned(),
             token_version: version,
-            contract_version: "0.19-M1".to_owned(),
+            contract_version: "0.19-M1.2".to_owned(),
         })
     }
 
@@ -107,6 +118,10 @@ impl Router {
         let _operation = self.inner.inference_ops.lock().await;
         let mut store = self.inner.store.lock().await;
         if let Some(value) = store.inference_owner_replay(method, &request)? {
+            if method == "inference.client.retire" {
+                self.reconcile_credential_retirement(&mut store, &request, &value)?;
+                return Ok(value);
+            }
             let result: InferenceCredentialResponse =
                 serde_json::from_value(value.clone()).map_err(|_| unknown())?;
             self.check_credential_file(&store, &result)?;
@@ -117,6 +132,28 @@ impl Router {
         }
         store.inference_credential_preflight(method, &request)?;
         let controller = store.inference_controller_id()?;
+        if method == "inference.client.retire" {
+            let (previous_version, previous_file) = store
+                .inference_previous_credential(&request.client_id, request.expected_version)?;
+            let previous = InferenceCredentialResponse {
+                client_id: request.client_id.clone(),
+                token_version: previous_version,
+                credential_file: previous_file.clone(),
+                phase: "previous".to_owned(),
+            };
+            // Validate and hash-check the old file before committing the durable
+            // fence that removes its hash from the authentication table.
+            self.check_credential_file(&store, &previous)?;
+            let result = InferenceCredentialResponse {
+                client_id: request.client_id.clone(),
+                token_version: request.expected_version,
+                credential_file: previous_file,
+                phase: "retired".to_owned(),
+            };
+            let value = store.inference_credential(method, &request, "", &result, now_ms())?;
+            self.reconcile_credential_retirement(&mut store, &request, &value)?;
+            return Ok(value);
+        }
         let file_name = if method == "inference.client.promote" {
             store.inference_pending_file(&request.client_id)?
         } else {
@@ -185,6 +222,56 @@ impl Router {
         )
     }
 
+    /// Reconcile a committed retirement intent by deleting only its fixed,
+    /// daemon-owned credential basename and recording verified absence.
+    fn reconcile_credential_retirement(
+        &self,
+        store: &mut eliot_store::Store,
+        request: &InferenceCredentialRequest,
+        value: &Value,
+    ) -> Result<()> {
+        let result: InferenceCredentialResponse =
+            serde_json::from_value(value.clone()).map_err(|_| unknown())?;
+        if result.client_id != request.client_id
+            || result.token_version != request.expected_version
+            || result.phase != "retired"
+            || !credential_file_name_is_owned(&result.credential_file)
+        {
+            return Err(unknown());
+        }
+        let retirement_file = store.inference_retirement_file(&request.client_id, &request.id)?;
+        if retirement_file
+            .as_deref()
+            .is_some_and(|file_name| file_name != result.credential_file)
+        {
+            return Err(unknown());
+        }
+        let path = self.inner.data_root.join(&result.credential_file);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                if retirement_file.is_some() {
+                    // Atomically overwrite the bearer with an empty private file
+                    // and sync its parent before unlinking. A crash can then only
+                    // leave an unusable empty marker, never restore the old token.
+                    replace_private_file(&self.inner.data_root, &result.credential_file, &[])
+                        .map_err(|_| unknown())?;
+                }
+                std::fs::remove_file(&path).map_err(|_| unknown())?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(unknown()),
+        }
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if retirement_file.is_some() {
+                    store.inference_retirement_complete(&request.client_id, &request.id)?;
+                }
+                Ok(())
+            }
+            _ => Err(unknown()),
+        }
+    }
+
     fn check_credential_file(
         &self,
         store: &eliot_store::Store,
@@ -205,6 +292,9 @@ impl Router {
         if record.controller_id != store.inference_controller_id()?
             || record.client_id != result.client_id
             || record.token_version != result.token_version
+            || inference_id(&record.operation_id).is_err()
+            || result.credential_file
+                != format!("inference-credential-{}.json", record.operation_id)
             || !store
                 .inference_token_hash(&record.client_id, record.token_version)?
                 .is_some_and(|hash| {
@@ -546,6 +636,50 @@ impl Router {
                 .inference_write_get(client, &request.id, now_ms())?,
         )
     }
+    pub(super) async fn inference_high_water(
+        &self,
+        params: &Value,
+        principal: &Principal,
+    ) -> Result<Value> {
+        let _: InferenceHighWaterRequest = decode_params(params.clone())?;
+        let (client, _) = scope(principal)?;
+        encode(self.inner.store.lock().await.inference_high_water(client)?)
+    }
+
+    pub(super) async fn inference_list(
+        &self,
+        params: &Value,
+        principal: &Principal,
+    ) -> Result<Value> {
+        let request: InferenceListRequest = decode_params(params.clone())?;
+        request.validate()?;
+        let (client, _) = scope(principal)?;
+        encode(
+            self.inner
+                .store
+                .lock()
+                .await
+                .inference_list(client, &request)?,
+        )
+    }
+
+    pub(super) async fn inference_retention(
+        &self,
+        params: &Value,
+        principal: &Principal,
+    ) -> Result<Value> {
+        let request: InferenceRetentionRequest = decode_params(params.clone())?;
+        request.validate()?;
+        let (client, version) = scope(principal)?;
+        let _operation = self.inner.inference_ops.lock().await;
+        self.inner.store.lock().await.inference_retention_advance(
+            client,
+            version,
+            &request,
+            now_ms(),
+        )
+    }
+
     pub(super) async fn inference_result_read(
         &self,
         params: &Value,
@@ -780,6 +914,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retirement_revokes_hash_before_durable_file_cleanup_and_replays() {
+        let data_root =
+            std::env::temp_dir().join(format!("eliot-inference-retire-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&data_root).unwrap();
+        let router = test_router(data_root.clone());
+        let client = format!("memory:{}", ulid::Ulid::new());
+        let call = text_request(&ulid::Ulid::new().to_string());
+        let install_id = ulid::Ulid::new().to_string();
+        let rotate_id = ulid::Ulid::new().to_string();
+        let old_file_name = format!("inference-credential-{install_id}.json");
+        let pending_file_name = format!("inference-credential-{rotate_id}.json");
+        let (controller_id, old_file) = {
+            let mut store = router.inner.store.lock().await;
+            let controller = store.inference_controller_id().unwrap();
+            let old_credential = "old-private-credential";
+            replace_private_file(
+                &data_root,
+                &old_file_name,
+                &serde_json::to_vec(&CredentialFile {
+                    controller_id: controller.clone(),
+                    client_id: client.clone(),
+                    token_version: 1,
+                    credential: old_credential.to_owned(),
+                    operation_id: install_id.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            store
+                .inference_credential(
+                    "inference.client.install",
+                    &InferenceCredentialRequest {
+                        id: install_id.clone(),
+                        client_id: client.clone(),
+                        expected_version: 0,
+                    },
+                    &inference_sha256(old_credential.as_bytes()),
+                    &InferenceCredentialResponse {
+                        client_id: client.clone(),
+                        token_version: 1,
+                        credential_file: old_file_name.clone(),
+                        phase: "active".to_owned(),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store
+                .inference_text(&client, 1, &call, &serde_json::json!({}), now_ms())
+                .unwrap();
+
+            let pending_credential = "pending-private-credential";
+            replace_private_file(
+                &data_root,
+                &pending_file_name,
+                &serde_json::to_vec(&CredentialFile {
+                    controller_id: controller.clone(),
+                    client_id: client.clone(),
+                    token_version: 2,
+                    credential: pending_credential.to_owned(),
+                    operation_id: rotate_id.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            store
+                .inference_credential(
+                    "inference.client.rotate",
+                    &InferenceCredentialRequest {
+                        id: rotate_id.clone(),
+                        client_id: client.clone(),
+                        expected_version: 1,
+                    },
+                    &inference_sha256(pending_credential.as_bytes()),
+                    &InferenceCredentialResponse {
+                        client_id: client.clone(),
+                        token_version: 2,
+                        credential_file: pending_file_name.clone(),
+                        phase: "pending".to_owned(),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.inference_rotation_read(&client, 2, 1).unwrap();
+            store
+                .inference_credential(
+                    "inference.client.promote",
+                    &InferenceCredentialRequest {
+                        id: ulid::Ulid::new().to_string(),
+                        client_id: client.clone(),
+                        expected_version: 1,
+                    },
+                    "",
+                    &InferenceCredentialResponse {
+                        client_id: client.clone(),
+                        token_version: 2,
+                        credential_file: pending_file_name,
+                        phase: "active".to_owned(),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.inference_recover().unwrap();
+            store.inference_rotation_read(&client, 2, 1).unwrap();
+            store
+                .inference_release(
+                    &client,
+                    2,
+                    &InferenceReleaseRequest {
+                        id: ulid::Ulid::new().to_string(),
+                        call_id: call.id.clone(),
+                        disposition: InferenceDisposition::AbandonForErasure,
+                        result_sha256: None,
+                        no_backup_dependencies: None,
+                        backup_dependency: Some(InferenceBackupDependency::NoBackupDependencies),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.inference_cleanup_complete(&client, &call.id).unwrap();
+            (controller, old_file_name)
+        };
+
+        let request = InferenceCredentialRequest {
+            id: ulid::Ulid::new().to_string(),
+            client_id: client.clone(),
+            expected_version: 2,
+        };
+        let result = InferenceCredentialResponse {
+            client_id: client.clone(),
+            token_version: 2,
+            credential_file: old_file.clone(),
+            phase: "retired".to_owned(),
+        };
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .inference_credential_preflight("inference.client.retire", &request)
+                .unwrap();
+            router
+                .check_credential_file(
+                    &store,
+                    &InferenceCredentialResponse {
+                        client_id: client.clone(),
+                        token_version: 1,
+                        credential_file: old_file.clone(),
+                        phase: "previous".to_owned(),
+                    },
+                )
+                .unwrap();
+            // Simulate a process loss immediately after the revocation fence.
+            store
+                .inference_credential("inference.client.retire", &request, "", &result, now_ms())
+                .unwrap();
+        }
+        let params = serde_json::to_value(&request).unwrap();
+        let first = router
+            .inference_credential("inference.client.retire", &params, &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(first["phase"], "retired");
+        assert!(!data_root.join(&old_file).exists());
+        {
+            let store = router.inner.store.lock().await;
+            assert_eq!(store.inference_token_hash(&client, 1).unwrap(), None);
+            assert_eq!(
+                store.inference_token_hash(&client, 2).unwrap(),
+                Some(inference_sha256(b"pending-private-credential"))
+            );
+            assert_eq!(store.inference_controller_id().unwrap(), controller_id);
+        }
+        std::fs::write(data_root.join(&old_file), []).unwrap();
+        let replay = router
+            .inference_credential("inference.client.retire", &params, &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(replay, first);
+        assert!(!data_root.join(&old_file).exists());
+        std::fs::remove_dir_all(&data_root).ok();
+    }
+
+    #[tokio::test]
     async fn cleanup_never_completes_on_unproven_quiescence() {
         let data_root =
             std::env::temp_dir().join(format!("eliot-inference-quiescence-{}", ulid::Ulid::new()));
@@ -837,7 +1152,8 @@ mod tests {
                         call_id: call_id.clone(),
                         disposition: InferenceDisposition::AbandonForErasure,
                         result_sha256: None,
-                        no_backup_dependencies: true,
+                        no_backup_dependencies: None,
+                        backup_dependency: Some(InferenceBackupDependency::NoBackupDependencies),
                     },
                     now,
                 )
