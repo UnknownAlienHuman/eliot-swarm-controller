@@ -2,6 +2,7 @@
 
 pub(crate) mod adhoc;
 pub(crate) mod automation;
+pub mod bootstrap;
 mod bus;
 pub mod cloud_mcp;
 mod common;
@@ -21,6 +22,7 @@ mod restart_capacity;
 mod router;
 pub(crate) mod scripts;
 mod setup;
+pub mod startup;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod workspace_git;

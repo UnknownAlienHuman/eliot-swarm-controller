@@ -99,8 +99,12 @@ pub(super) async fn wait_pipe_available(endpoint: &str, until: tokio::time::Inst
 pub(crate) fn start_background_daemon(data_dir: &Path) -> Result<()> {
     let executable =
         std::env::current_exe().map_err(|error| io_error("locate Eliot executable", error))?;
-    let mut command_line = background_daemon_command_line(&executable, data_dir)?;
-    let application = wide_path(&executable);
+    start_background_daemon_executable(&executable, data_dir)
+}
+
+pub(crate) fn start_background_daemon_executable(executable: &Path, data_dir: &Path) -> Result<()> {
+    let mut command_line = background_daemon_command_line(executable, data_dir)?;
+    let application = wide_path(executable);
     let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         ..STARTUPINFOW::default()

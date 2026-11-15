@@ -32,6 +32,7 @@ use crate::chat::{CHAT_KINDS, InputText, bound_text};
 use crate::live::WAKE_WAIT_MS;
 
 const MAX_TEXT_BYTES: usize = 512 * 1024;
+
 /// Concurrent ordinary reads issued by one worker (the issue's initial cap).
 pub const MAX_CONCURRENT_READS: usize = 4;
 /// Server-side scan bound per `events.read` call.
@@ -431,6 +432,7 @@ pub async fn save_profiles(
     dry_run: bool,
 ) -> Result<ProfilesSaveResponse> {
     let params = ProfilesSaveRequest {
+        client: eliot_core::api::SettingsClientSource::Desktop,
         expected_revision,
         source,
         dry_run,

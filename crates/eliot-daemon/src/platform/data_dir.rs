@@ -37,7 +37,13 @@ impl DataDir {
     /// Open or initialize a private data root and its persistent owner token.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = absolute_path(path.as_ref())?;
-        ensure_private_root(&path)?;
+        ensure_private_root(&path).map_err(|error| {
+            if error.code == "unsafe_data_dir" {
+                unsafe_data_dir_error(&path)
+            } else {
+                error
+            }
+        })?;
         let owner_token = load_or_create_owner_token(&path)?;
         Ok(Self {
             path,
@@ -56,7 +62,13 @@ impl DataDir {
             Err(error) => return Err(io_error("inspect existing data directory", error)),
             Ok(_) => {}
         }
-        validate_private_root(&path)?;
+        validate_private_root(&path).map_err(|error| {
+            if error.code == "unsafe_data_dir" {
+                unsafe_data_dir_error(&path)
+            } else {
+                error
+            }
+        })?;
         Ok(Self {
             path,
             owner_token: None,
@@ -211,6 +223,34 @@ impl DataDir {
         validate_private_root(&directory)?;
         Ok(directory)
     }
+}
+
+fn unsafe_data_dir_error(path: &Path) -> Error {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Eliot");
+    let fresh_path = parent.join(format!("{name}-{}", ulid::Ulid::new()));
+    // PowerShell single-quoted literals double embedded apostrophes.
+    let command_path = fresh_path.to_string_lossy().replace('\'', "''");
+    Error::new(
+        "unsafe_data_dir",
+        format!(
+            "the selected data directory is unsafe and was not changed; create a fresh private directory with `swarm --data-dir '{command_path}' daemon` (the desktop offers the same remedy)"
+        ),
+    )
+}
+
+/// Create or validate a private data directory before an explicit first use.
+///
+/// This is the safe remedy for an unsafe default root: callers must pass the
+/// user's chosen fresh path. It does not repair, inspect, or copy an unsafe
+/// existing root.
+pub(crate) fn ensure_private_data_dir(path: impl AsRef<Path>) -> Result<PathBuf> {
+    let data_dir = DataDir::open(path)?;
+    Ok(data_dir.path().to_path_buf())
 }
 
 /// Creation uses the same TokenUser/protected-DACL path as owner.token on Windows.

@@ -130,6 +130,10 @@ async fn run_owned(
         mail_config,
     );
 
+    let startup_cwd = std::env::current_dir().ok();
+    crate::bootstrap::ensure_hot_start(data_dir.path(), &store, &policy, startup_cwd.as_deref())
+        .await?;
+
     let recovered = {
         let mut store = store.lock().await;
         let events = store.recover_on_restart(now_ms())?;

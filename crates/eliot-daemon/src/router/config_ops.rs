@@ -12,7 +12,7 @@ use eliot_core::{
     api::{
         ProfileListRequest, ProfilesReadRequest, ProfilesSaveRequest, ProjectRegistrationView,
         RuleListEntry, RuleListRequest, RuleListResponse, ScriptListRequest, ScriptReadRequest,
-        ScriptSaveRequest,
+        ScriptSaveRequest, SettingsReadRequest, SettingsSaveRequest,
     },
 };
 use serde_json::Value;
@@ -63,9 +63,75 @@ impl Router {
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let policy = self.secret_policy_snapshot();
-        let reply = crate::config::profiles_edit::save(&self.inner.data_root, &request, &policy)?;
+        let mut store = self.inner.store.lock().await;
+        let reply = crate::config::profiles_edit::save(
+            &self.inner.data_root,
+            &mut store,
+            &request,
+            &policy,
+        )?;
         request.validate_response(&reply)?;
         encode(&reply, "profile save")
+    }
+
+    pub(super) async fn settings_read(
+        &self,
+        params: &Value,
+        principal: &Principal,
+    ) -> Result<Value> {
+        require_owner(principal)?;
+        let request: SettingsReadRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let policy = self.secret_policy_snapshot();
+        let mut store = self.inner.store.lock().await;
+        let reply = crate::config::settings::read_internal(
+            &self.inner.data_root,
+            &mut store,
+            request.sections.as_deref(),
+            &policy,
+        )?;
+        request.validate_response(&reply)?;
+        encode(&reply, "settings read")
+    }
+
+    pub(super) async fn settings_save(
+        &self,
+        params: &Value,
+        principal: &Principal,
+    ) -> Result<Value> {
+        require_owner(principal)?;
+        let request: SettingsSaveRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let policy = self.secret_policy_snapshot();
+        let mut store = self.inner.store.lock().await;
+        let reply =
+            crate::config::settings::save(&self.inner.data_root, &mut store, &request, &policy)?;
+        drop(store);
+        if reply.saved
+            && reply
+                .changed_sections
+                .contains(&eliot_core::api::SettingsSection::Projects)
+        {
+            let reconciliation = async {
+                let inputs =
+                    crate::automation::project_registration_inputs(&self.inner.data_root).await?;
+                self.reconcile_project_registrations(&inputs).await
+            }
+            .await;
+            match reconciliation {
+                Ok(_) => {}
+                Err(_) => {
+                    return Err(Error::new(
+                        "unknown",
+                        "project settings were saved but Store registration reconciliation is uncertain; read settings and projects before retrying",
+                    ));
+                }
+            }
+        }
+        request.validate_response(&reply)?;
+        encode(&reply, "settings save")
     }
 
     pub(super) async fn rule_list(&self, params: &Value, principal: &Principal) -> Result<Value> {

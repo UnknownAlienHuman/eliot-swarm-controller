@@ -59,6 +59,7 @@ mod launch_ui;
 mod monitor_ui;
 mod profiles_ui;
 mod scripts_ui;
+mod settings_ui;
 mod shell_ui;
 
 use automation_ui::AutomationMsg;
@@ -100,6 +101,7 @@ enum Screen {
     Profiles,
     Automation,
     Scripts,
+    Settings,
 }
 
 /// Index 0 of the project picker lists every Agent in scope.
@@ -180,17 +182,23 @@ enum Message {
     Configure(ConfigureMsg),
     Monitor(MonitorMsg),
     Profiles(ProfilesMsg),
+    Settings(settings_ui::SettingsMsg),
     Automation(AutomationMsg),
     Scripts(ScriptsMsg),
     Handoff(handoff_ui::HandoffMsg),
 }
 
 struct DesktopApp {
+    opened_workspace: PathBuf,
     data_dir: Fallible<PathBuf>,
     status: String,
     appearance: shell_ui::Appearance,
     /// The window's client width in DIPs, once observed.
     window_width: Option<f64>,
+    window_size: Option<(u32, u32)>,
+    preferred_window: Option<(u32, u32)>,
+    window_epoch: u64,
+    preferences_loaded: bool,
     /// A settings write is running (see `save_settings`).
     settings_saving: bool,
     /// False for the one render after the screen tree is re-created: the
@@ -208,6 +216,8 @@ struct DesktopApp {
     screen: Screen,
     configure: configure_ui::ConfigureState,
     editor: profiles_ui::ProfilesEditor,
+    unified: settings_ui::SettingsEditor,
+    startup_error: bool,
     scripts: scripts_ui::ScriptsEditor,
     handoff: handoff_ui::DialogState,
     nav: shell_ui::ShellState,
@@ -399,16 +409,21 @@ fn submit_note(reply: &CommandSubmitResponse) -> String {
 }
 
 impl Component for DesktopApp {
-    type Input = ();
+    type Input = PathBuf;
     type Message = Message;
 
-    fn create(_input: &(), context: &ComponentContext<Self>) -> Self {
+    fn create(input: &PathBuf, context: &ComponentContext<Self>) -> Self {
         let data_dir = client::data_dir().map_err(|error| error.to_string());
         let mut app = Self {
+            opened_workspace: input.clone(),
             data_dir,
             status: "Connecting to the daemon…".to_owned(),
             appearance: shell_ui::Appearance::new(),
             window_width: None,
+            window_size: None,
+            preferred_window: None,
+            window_epoch: 0,
+            preferences_loaded: false,
             settings_saving: false,
             fields_primed: true,
             prime_epoch: 0,
@@ -419,6 +434,8 @@ impl Component for DesktopApp {
             screen: Screen::Chat,
             configure: configure_ui::ConfigureState::default(),
             editor: profiles_ui::ProfilesEditor::default(),
+            unified: settings_ui::SettingsEditor::default(),
+            startup_error: false,
             scripts: scripts_ui::ScriptsEditor::default(),
             handoff: handoff_ui::DialogState::default(),
             nav: shell_ui::ShellState {
@@ -443,7 +460,7 @@ impl Component for DesktopApp {
                 profiles: Vec::new(),
                 profile_idx: None,
                 profile_text: String::new(),
-                workspace: String::new(),
+                workspace: input.to_string_lossy().into_owned(),
                 launch_text: String::new(),
                 launch_rev: 0,
                 profile_summaries: Vec::new(),
@@ -499,12 +516,7 @@ impl Component for DesktopApp {
             app.status = format!("WinUI accent resources not applied: {error}");
         }
         if let Ok(data_dir) = app.data_dir.clone() {
-            let _task = context.spawn_background(move |_| {
-                Message::Shell(ShellMsg::ProjectsLoaded(load_projects_blocking(&data_dir)))
-            });
-            app.load_agents(context, None);
-            app.watch_high_contrast(context);
-            app.load_profile_list(context);
+            app.start_connection(data_dir, context);
         }
         app
     }
@@ -517,13 +529,14 @@ impl Component for DesktopApp {
             Message::Configure(msg) => self.configure_update(msg, context),
             Message::Monitor(msg) => self.monitor_update(msg, context),
             Message::Profiles(msg) => self.profiles_update(msg, context),
+            Message::Settings(msg) => self.settings_update(msg, context),
             Message::Automation(msg) => self.automation_update(msg, context),
             Message::Scripts(msg) => self.scripts_update(msg, context),
             Message::Handoff(msg) => self.handoff_update(msg, context),
         }
     }
 
-    fn view(&self, _input: &(), context: &mut ViewContext<Self>) -> View {
+    fn view(&self, _input: &PathBuf, context: &mut ViewContext<Self>) -> View {
         self.renders.set(self.renders.get() + 1);
         self.shell_view(context)
     }
@@ -531,6 +544,6 @@ impl Component for DesktopApp {
 
 /// Run the single desktop window. Blocks while the WinUI message loop runs;
 /// closing the window disconnects the UI, never the Agent.
-pub fn run() -> Result<(), String> {
-    App::run_component::<DesktopApp>(()).map_err(|error| error.to_string())
+pub fn run(workspace: PathBuf) -> Result<(), String> {
+    App::run_component::<DesktopApp>(workspace).map_err(|error| error.to_string())
 }

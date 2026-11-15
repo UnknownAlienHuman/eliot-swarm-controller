@@ -13,6 +13,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+clap.workspace = true
 eliot-core.workspace = true
 eliot-daemon.workspace = true
 futures-util.workspace = true

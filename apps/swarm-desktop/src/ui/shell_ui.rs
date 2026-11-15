@@ -8,6 +8,8 @@ use crate::theme::winui::Palette;
 
 #[derive(Clone, Debug)]
 pub(super) enum ShellMsg {
+    DaemonReady(Fallible<eliot_core::api::SettingsReadResponse>),
+    UseFreshDirectory,
     ProjectsLoaded(Fallible<Vec<UiProject>>),
     AgentsLoaded(u64, bool, Fallible<AgentPage>),
     ProjectSelected(Option<usize>),
@@ -21,6 +23,7 @@ pub(super) enum ShellMsg {
     SchemeObserved(ColorScheme),
     /// The window's client size (Reactor `on_window_size`).
     WindowResized(WindowSize),
+    SaveWindow(u64),
     /// System → Light → Dark → System.
     ThemeCycled,
     /// The re-created editors of this re-prime exist: give them their text.
@@ -32,7 +35,7 @@ pub(super) enum ShellMsg {
     /// Tree epoch, manager id and its direct-children page.
     BranchLoaded(u64, String, Fallible<AgentPage>),
     /// The theme choice written to the settings file (or not).
-    SettingsSaved(ThemeChoice, Result<(), String>),
+    SettingsSaved(ThemeChoice, Option<(u32, u32)>, Result<(), String>),
 }
 
 /// Reactor 0.100.0 reports the window's Light/Dark scheme only, and a High
@@ -70,7 +73,7 @@ fn theme_glyph(choice: ThemeChoice) -> &'static str {
 /// Theme choice (persisted per user), the scheme the window actually shows,
 /// and High Contrast.
 pub(super) struct Appearance {
-    pref: ThemeChoice,
+    pub(super) pref: ThemeChoice,
     dark: bool,
     high_contrast: bool,
 }
@@ -78,7 +81,7 @@ pub(super) struct Appearance {
 impl Appearance {
     pub(super) fn new() -> Self {
         Self {
-            pref: crate::settings::load().theme,
+            pref: ThemeChoice::System,
             dark: false,
             high_contrast: crate::accessibility::high_contrast_on(),
         }
@@ -119,6 +122,41 @@ pub(super) struct ShellState {
 impl DesktopApp {
     pub(super) fn shell_update(&mut self, msg: ShellMsg, context: &ComponentContext<Self>) {
         match msg {
+            ShellMsg::DaemonReady(result) => match result {
+                Ok(read) => {
+                    self.startup_error = false;
+                    self.appearance.pref = crate::settings::theme(&read);
+                    self.preferred_window = crate::settings::window(&read);
+                    self.preferences_loaded = true;
+                    self.load_agents(context, None);
+                    self.load_profile_list(context);
+                    self.watch_high_contrast(context);
+                    if let Ok(data_dir) = self.data_dir.clone() {
+                        let _task = context.spawn_background(move |_| {
+                            Message::Shell(ShellMsg::ProjectsLoaded(load_projects_blocking(
+                                &data_dir,
+                            )))
+                        });
+                    }
+                }
+                Err(error) => {
+                    self.startup_error = true;
+                    self.set_status(format!("Cannot start Swarm: {error}"));
+                }
+            },
+            ShellMsg::UseFreshDirectory => {
+                if let Ok(original) = client::data_dir() {
+                    let fresh = original
+                        .with_file_name(format!("Eliot-private-{}", client::new_mutation_id()));
+                    self.data_dir = Ok(fresh.clone());
+                    self.startup_error = false;
+                    self.set_status(format!(
+                        "Starting in fresh private directory {}",
+                        fresh.display()
+                    ));
+                    self.start_connection(fresh, context);
+                }
+            }
             ShellMsg::ProjectsLoaded(projects) => match projects {
                 Ok(projects) => {
                     let count = projects.len();
@@ -287,6 +325,9 @@ impl DesktopApp {
                         self.load_profile_source(context);
                         self.load_profile_list(context);
                     }
+                    Screen::Settings if !self.unified.loaded && !self.unified.busy => {
+                        self.load_settings(context)
+                    }
                     Screen::Automation => self.load_rules(context),
                     Screen::Scripts => {
                         if !self.scripts.listed {
@@ -306,7 +347,28 @@ impl DesktopApp {
                     self.reprime_fields(context);
                 }
             }
-            ShellMsg::WindowResized(size) => self.window_width = Some(size.width),
+            ShellMsg::WindowResized(size) => {
+                self.window_width = Some(size.width);
+                if size.width >= 640.0 && size.height >= 480.0 {
+                    let window = (size.width as u32, size.height as u32);
+                    if self.window_size != Some(window) {
+                        self.window_size = Some(window);
+                        if self.preferences_loaded {
+                            self.window_epoch += 1;
+                            let epoch = self.window_epoch;
+                            let _task = context.spawn_background(move |cancel| {
+                                let _ = feed::backoff(500, &|| cancel.is_cancelled());
+                                Message::Shell(ShellMsg::SaveWindow(epoch))
+                            });
+                        }
+                    }
+                }
+            }
+            ShellMsg::SaveWindow(epoch) => {
+                if epoch == self.window_epoch {
+                    self.save_settings(context);
+                }
+            }
             ShellMsg::HighContrastRead(on) => {
                 if on != self.appearance.high_contrast {
                     self.appearance.high_contrast = on;
@@ -318,13 +380,13 @@ impl DesktopApp {
                 self.appearance.pref = self.appearance.pref.next();
                 self.save_settings(context);
             }
-            ShellMsg::SettingsSaved(saved, result) => {
+            ShellMsg::SettingsSaved(saved, window, result) => {
                 self.settings_saving = false;
                 if let Err(error) = result {
                     self.set_status(format!("Theme choice not saved: {error}"));
                 }
                 // A newer choice arrived while this one was written.
-                if saved != self.appearance.pref {
+                if saved != self.appearance.pref || window != self.window_size {
                     self.save_settings(context);
                 }
             }
@@ -403,9 +465,41 @@ impl DesktopApp {
         }
         self.settings_saving = true;
         let theme = self.appearance.pref;
+        let window = self.window_size;
+        let Ok(data_dir) = self.data_dir.clone() else {
+            self.settings_saving = false;
+            return;
+        };
         let _task = context.spawn_background(move |_| {
-            let saved = crate::settings::save(&crate::settings::Settings { theme });
-            Message::Shell(ShellMsg::SettingsSaved(theme, saved))
+            let saved =
+                client::block_on(crate::settings::save_preferences(&data_dir, theme, window))
+                    .map_err(|e| e.to_string());
+            Message::Shell(ShellMsg::SettingsSaved(theme, window, saved))
+        });
+    }
+
+    pub(super) fn start_connection(&self, data_dir: PathBuf, context: &ComponentContext<Self>) {
+        let workspace = self.opened_workspace.clone();
+        let _task = context.spawn_background(move |_| {
+            let result = client::block_on(async {
+                let executable = std::env::current_exe()
+                    .map_err(|_| {
+                        eliot_core::Error::new("platform_io", "cannot locate desktop executable")
+                    })?
+                    .with_file_name("swarm.exe");
+                eliot_daemon::startup::ensure_running(&data_dir, &executable).await?;
+                let request = eliot_core::api::ProjectDiscoverRequest {
+                    workspace: workspace.to_string_lossy().into_owned(),
+                };
+                request.validate()?;
+                let reply: eliot_core::api::ProjectDiscoverResponse =
+                    eliot_daemon::client_call_typed(&data_dir, "project.discover", &request)
+                        .await?;
+                request.validate_response(&reply)?;
+                crate::settings::read(&data_dir).await
+            })
+            .map_err(|e| e.to_string());
+            Message::Shell(ShellMsg::DaemonReady(result))
         });
     }
 
@@ -554,7 +648,12 @@ impl DesktopApp {
         // title-bar theme.
         context.window_visuals(
             WindowVisuals::new()
-                .client_size(theme::layout::WINDOW_WIDTH, theme::layout::WINDOW_HEIGHT)
+                .client_size(
+                    self.preferred_window
+                        .map_or(theme::layout::WINDOW_WIDTH, |w| f64::from(w.0)),
+                    self.preferred_window
+                        .map_or(theme::layout::WINDOW_HEIGHT, |w| f64::from(w.1)),
+                )
                 .theme(window_theme(self.appearance.pref)),
         );
         context.on_color_scheme(
@@ -581,6 +680,7 @@ impl DesktopApp {
                         .content(self.chat_view(context, palette)),
                 )),
             Screen::Profiles => m3::pane(palette).content(self.profiles_view(context, palette)),
+            Screen::Settings => m3::pane(palette).content(self.settings_view(context, palette)),
             Screen::Automation => m3::pane(palette).content(config_view::automation_screen(
                 &self.automation.rules,
                 &self.automation.status,
@@ -599,6 +699,16 @@ impl DesktopApp {
                 .content(self.monitor_view(context, palette))
         } else {
             View::empty()
+        };
+        let screen = if self.startup_error {
+            StackPanel::new().spacing(theme::spacing::MD).children((
+                TextBlock::new().text("Swarm could not open this data directory. Existing settings have not been moved.").text_wrapping(TextWrapping::Wrap),
+                Button::new().automation_name("Use fresh private directory")
+                    .on_click(context.message(Message::Shell(ShellMsg::UseFreshDirectory)))
+                    .content(TextBlock::new().text("Use a fresh private directory")),
+            ))
+        } else {
+            screen
         };
         let content = Grid::new()
             .grid_column(1)
@@ -656,6 +766,14 @@ impl DesktopApp {
             "Profiles",
             "Profiles screen",
             context.message(Message::Shell(ShellMsg::ScreenSelected(Screen::Profiles))),
+        );
+        let settings = self.rail_item(
+            palette,
+            self.screen == Screen::Settings,
+            m3::glyph::PROFILES,
+            "Settings",
+            "Settings screen",
+            context.message(Message::Shell(ShellMsg::ScreenSelected(Screen::Settings))),
         );
         let automation = self.rail_item(
             palette,
@@ -724,7 +842,7 @@ impl DesktopApp {
                 StackPanel::new()
                     .grid_row(1)
                     .spacing(theme::spacing::MD)
-                    .children((chat, profiles, automation, scripts)),
+                    .children((chat, settings, profiles, automation, scripts)),
                 StackPanel::new()
                     .grid_row(3)
                     .spacing(theme::spacing::SM)

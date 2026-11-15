@@ -941,6 +941,44 @@ pub struct ProjectRegistrationView {
     pub revision: i64,
 }
 
+/// Discover and register the current user's Git checkout through the daemon's
+/// internal project-discovery settings author. A non-Git directory is a no-op.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectDiscoverRequest {
+    #[serde(deserialize_with = "required_text")]
+    pub workspace: String,
+}
+
+impl ProjectDiscoverRequest {
+    pub fn validate(&self) -> Result<()> {
+        text(&self.workspace)?;
+        if self.workspace.len() > 4_096 || !std::path::Path::new(&self.workspace).is_absolute() {
+            return Err(Error::new(
+                "invalid",
+                "project discovery workspace must be an absolute path of at most 4096 bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_response(&self, reply: &ProjectDiscoverResponse) -> Result<()> {
+        self.validate()?;
+        if let Some(project) = &reply.project {
+            project.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Result of project discovery; `None` means the path is not a Git checkout.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectDiscoverResponse {
+    #[serde(default)]
+    pub project: Option<ProjectRegistrationView>,
+}
+
 impl ProjectRegistrationView {
     /// Pure readback grammar. Store/daemon own canonical repository identity and
     /// the authority checks for the explicit profile/action allowsets.

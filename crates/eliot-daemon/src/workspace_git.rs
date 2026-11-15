@@ -74,6 +74,39 @@ impl WorkspaceGit {
         ))
     }
 
+    /// Discover the canonical checkout containing an Owner-opened directory.
+    /// Unlike `repository_identity`, this accepts a path below the Git root.
+    pub(crate) async fn discover_repository_identity(
+        &self,
+        path: &str,
+    ) -> Result<(String, String)> {
+        let requested = canonical_root(path)?;
+        let deadline = Instant::now() + READ_TIME;
+        let bytes = self
+            .read(
+                &requested,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--show-toplevel",
+                    "--absolute-git-dir",
+                    "--git-common-dir",
+                ],
+                deadline,
+            )
+            .await?;
+        let (top, _git_dir, common_dir) = identity_lines(&bytes)?;
+        let checkout = canonical_root(&top)?;
+        if !requested.starts_with(&checkout) {
+            return Err(problem(
+                "source_integrity",
+                "Git checkout does not contain the requested workspace",
+            ));
+        }
+        let common_dir = canonical_root(&common_dir)?;
+        Ok((path_text(&checkout)?, path_text(&common_dir)?))
+    }
+
     pub(crate) async fn freeze(
         &self,
         repo_path: &str,

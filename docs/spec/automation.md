@@ -411,6 +411,20 @@ Cause-depth suppression is silent and does not emit an endlessly retriggerable r
 
 ### Targetless launch
 
+S4 extends this existing action with a routing role when a literal profile is omitted;
+explicit profiles remain supported. Candidate selection and its recorded reason follow
+the configuration routing contract at first admission. Project/child authority is
+intersected before selection; retries retain the original choice. Until S4 this action
+continues to require a literal profile.
+
+Queue assignment uses settings-managed rules/timers and the existing bounded `run`
+action to read one brief and emit an ordinary launch. A configured concurrency bound
+counts unresolved launches and live Agents; an unknown command holds its slot. Advance
+the brief cursor only with its durable admitted command identity, never infer completion
+from process liveness or replay an uncertain launch. This is an automation increment,
+not a Task/Issue/acceptance engine. S4 supplies only missing routing/admission plumbing
+after S3; the external backlog runner is retired when that connected path is proven.
+
 The `launch` action submits the existing ordinary launch command with flat fields:
 
 ```toml
