@@ -145,6 +145,11 @@ pub(crate) struct EventStatus {
     pub active_command_id: Option<String>,
     pub active_turn_id: Option<String>,
     pub last_turn: Option<TurnFacts>,
+    /// Confirmed native endpoint exit observed after the last event drain:
+    /// exit code plus bounded stderr tail. Endpoint-scoped, never a turn
+    /// verdict: an unknown turn next to a recorded exit names the crash
+    /// that ended observation instead of proving nothing.
+    pub native_exit: Option<String>,
     pub failure: Option<String>,
     pub batch_unknown: bool,
     pub source_unknown: bool,
@@ -165,6 +170,8 @@ pub(crate) struct TurnFacts {
     pub turn_id: String,
     pub status: Option<String>,
     pub final_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_error: Option<String>,
     pub terminal: bool,
 }
 
@@ -222,6 +229,10 @@ enum Control {
     },
     EndStop {
         reply: oneshot::Sender<Result<()>>,
+    },
+    RecordNativeExit {
+        text: String,
+        reply: oneshot::Sender<()>,
     },
     Close {
         reply: oneshot::Sender<()>,
@@ -583,6 +594,21 @@ impl EventHandle {
             .await
     }
 
+    /// Retain one confirmed native endpoint exit for the readback. Only the
+    /// first death wins; terminality is never manufactured here. Best effort:
+    /// a closing queue drops the record instead of failing the shutdown.
+    pub async fn record_native_exit(&self, text: String) {
+        let (reply, response) = oneshot::channel();
+        if self
+            .control
+            .send(Control::RecordNativeExit { text, reply })
+            .await
+            .is_ok()
+        {
+            let _ = timeout_at(Instant::now() + EVENT_DEADLINE, response).await;
+        }
+    }
+
     pub fn status(&self) -> EventStatus {
         self.status.borrow().clone()
     }
@@ -765,6 +791,16 @@ impl EventProcessor {
                 } else {
                     self.pending_end_stop = Some(reply);
                 }
+                true
+            }
+            Control::RecordNativeExit { text, reply } => {
+                // Endpoint-scoped only: the active turn keeps whatever
+                // terminality the drained frames proved, and the snapshot
+                // pairs it with this exit instead of proving nothing.
+                if self.status.native_exit.is_none() {
+                    self.status.native_exit = Some(text);
+                }
+                let _ = reply.send(());
                 true
             }
             Control::Close { reply } => {
@@ -2743,14 +2779,10 @@ impl EventProcessor {
                 &secrets,
             );
         }
-        attach_native_error(
-            &mut data,
-            notification
-                .error
-                .as_ref()
-                .map(|error| error.message.as_str()),
-            &secrets,
-        );
+        // The durable terminal record keeps the structured error message,
+        // falling back to the terminal reason the readback used to drop.
+        let native_error = turn_native_error(&notification, &notification.terminal, &secrets);
+        attach_native_error(&mut data, native_error.as_deref(), &secrets);
         if readback_recovery {
             mark_readback_recovery(&mut data);
         }
@@ -2771,6 +2803,7 @@ impl EventProcessor {
             turn_id: notification.turn_id,
             status: Some(status_text.to_owned()),
             final_text: self.final_text.take(),
+            native_error,
             terminal: true,
         });
         self.status.active_turn_id = None;
@@ -3159,6 +3192,7 @@ impl EventProcessor {
                 turn_id,
                 status: None,
                 final_text: None,
+                native_error: None,
                 terminal: false,
             });
         }
@@ -3991,6 +4025,7 @@ impl EventProcessor {
             turn_id: turn_id.to_owned(),
             status: None,
             final_text: None,
+            native_error: None,
             terminal: false,
         });
         self.status.active_turn_id = None;
@@ -4704,6 +4739,40 @@ pub(crate) fn native_terminal(terminal: &NativeTurnTerminal) -> Option<&'static 
     }
 }
 
+/// Native failure text for one terminal `turn/completed`: the structured
+/// error message first, the terminal reason when a failed turn carried no
+/// error. A vendor reason on a completed or cancelled turn never surfaces
+/// as a native error. Redacted and bounded for the turn readback; turns
+/// with no native text (successes, silent cancels) stay `None` so the
+/// readback keeps proving nothing it was not told.
+pub(crate) fn turn_native_error(
+    notification: &NativeTurnCompletedNotification,
+    terminal: &NativeTurnTerminal,
+    policy: &SecretPolicy,
+) -> Option<String> {
+    let message = match notification.error.as_ref() {
+        Some(error) => Some(error.message.as_str()),
+        None if matches!(terminal, NativeTurnTerminal::Failed) => notification.reason.as_deref(),
+        None => None,
+    }?;
+    if message.trim().is_empty() {
+        return None;
+    }
+    let redacted = policy.redact_text(message);
+    if redacted.trim().is_empty() {
+        return None;
+    }
+    const MAX_NATIVE_ERROR_BYTES: usize = 4 * 1024;
+    if redacted.len() <= MAX_NATIVE_ERROR_BYTES {
+        return Some(redacted);
+    }
+    let mut end = MAX_NATIVE_ERROR_BYTES;
+    while !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(redacted[..end].to_owned())
+}
+
 fn terminal_provider_restriction(
     status: &EventStatus,
     notification: &NativeTurnCompletedNotification,
@@ -5354,6 +5423,129 @@ mod tests {
         let mut completed = notification.clone();
         completed.terminal = NativeTurnTerminal::Completed;
         assert_eq!(terminal_provider_restriction(&status, &completed), None);
+    }
+
+    fn failed_notification() -> NativeTurnCompletedNotification {
+        NativeTurnCompletedNotification {
+            session_id: "session-1".to_owned(),
+            terminal: NativeTurnTerminal::Failed,
+            turn_id: "turn-1".to_owned(),
+            view_cursor: "cursor-1".to_owned(),
+            error: Some(NativeTurnError {
+                kind: "internal".to_owned(),
+                message: "native turn failed".to_owned(),
+                retryable: false,
+            }),
+            reason: Some("terminal reason".to_owned()),
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn turn_native_error_prefers_the_structured_error_message() {
+        let notification = failed_notification();
+        assert_eq!(
+            turn_native_error(
+                &notification,
+                &NativeTurnTerminal::Failed,
+                &SecretPolicy::default()
+            ),
+            Some("native turn failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn turn_native_error_falls_back_to_the_terminal_reason() {
+        let mut notification = failed_notification();
+        notification.error = None;
+        assert_eq!(
+            turn_native_error(
+                &notification,
+                &NativeTurnTerminal::Failed,
+                &SecretPolicy::default()
+            ),
+            Some("terminal reason".to_owned())
+        );
+    }
+
+    #[test]
+    fn turn_native_error_ignores_vendor_reasons_off_failed_terminals() {
+        let policy = SecretPolicy::default();
+        for terminal in [NativeTurnTerminal::Completed, NativeTurnTerminal::Cancelled] {
+            let mut notification = failed_notification();
+            notification.terminal = terminal;
+            notification.error = None;
+            assert_eq!(
+                turn_native_error(&notification, &notification.terminal, &policy),
+                None
+            );
+            // A structured error still surfaces wherever the native put one.
+            notification.error = Some(NativeTurnError {
+                kind: "internal".to_owned(),
+                message: "native turn failed".to_owned(),
+                retryable: false,
+            });
+            assert_eq!(
+                turn_native_error(&notification, &notification.terminal, &policy),
+                Some("native turn failed".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn turn_native_error_stays_absent_without_native_text() {
+        let policy = SecretPolicy::default();
+        let mut notification = failed_notification();
+        notification.error = None;
+        notification.reason = None;
+        assert_eq!(
+            turn_native_error(&notification, &NativeTurnTerminal::Failed, &policy),
+            None
+        );
+        notification.reason = Some("   ".to_owned());
+        assert_eq!(
+            turn_native_error(&notification, &NativeTurnTerminal::Failed, &policy),
+            None
+        );
+        notification.error = Some(NativeTurnError {
+            kind: "internal".to_owned(),
+            message: "  ".to_owned(),
+            retryable: false,
+        });
+        notification.reason = None;
+        assert_eq!(
+            turn_native_error(&notification, &NativeTurnTerminal::Failed, &policy),
+            None
+        );
+    }
+
+    #[test]
+    fn turn_native_error_redacts_and_bounds() {
+        let mut notification = failed_notification();
+        notification.error = Some(NativeTurnError {
+            kind: "internal".to_owned(),
+            message: "failure with hunter2 inside".to_owned(),
+            retryable: false,
+        });
+        notification.reason = None;
+        let policy = SecretPolicy::new(["hunter2".to_owned()]);
+        let text = turn_native_error(&notification, &NativeTurnTerminal::Failed, &policy)
+            .expect("redacted native error must still be present");
+        assert!(!text.contains("hunter2"));
+
+        notification.error = Some(NativeTurnError {
+            kind: "internal".to_owned(),
+            message: "é".repeat(8 * 1024),
+            retryable: false,
+        });
+        let text = turn_native_error(
+            &notification,
+            &NativeTurnTerminal::Failed,
+            &SecretPolicy::default(),
+        )
+        .expect("oversize native error must truncate, not vanish");
+        assert!(text.len() <= 4 * 1024);
+        assert!(text.len() >= 4 * 1024 - 4);
     }
 
     #[test]

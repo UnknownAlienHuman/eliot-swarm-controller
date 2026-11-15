@@ -80,7 +80,14 @@ using that service.
 - an Agent generation's Job has a name derived from the Store custody namespace, so a
   replacement daemon can prove it closed ([restart recovery](configuration.md#accounts-and-configured-capacity));
 - services that must survive daemon restart use separate service custody;
-- force-stop waits for the Job to become empty and verifies recorded process identities.
+- force-stop waits for the Job to become empty and verifies recorded process identities;
+  a force-stop that finds no live runtime entry additionally terminates the
+  generation's named Job when it is still open, so a fenced or stuck actor
+  cannot keep tool descendants alive past the stop.
+- only processes created inside the Job are contained: the Store records PIDs
+  verified inside Agent custody, and a process spawned outside the Job by a
+  broker or service (or attributed to the wrong owner) is invisible to the
+  Store and cannot be terminated safely by PID alone.
 
 ### Unix degraded
 

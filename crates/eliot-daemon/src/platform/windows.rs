@@ -761,6 +761,57 @@ impl Drop for Job {
     }
 }
 
+/// Terminate the named generation Job when its runtime entry is already gone.
+/// A removed routing entry does not imply a closed Job: the actor task can
+/// still own it while draining or stuck, keeping tool descendants alive
+/// after a stop that reports `not_found`. Opening by name never adopts
+/// custody: a missing name means the generation already closed and there is
+/// nothing to terminate. Returns whether a live Job was terminated and
+/// observed empty within a bounded wait.
+pub(crate) fn terminate_named_generation_job(name: &str) -> Result<bool> {
+    let wide: Vec<u16> = OsStr::new(name).encode_wide().chain(Some(0)).collect();
+    // JOB_OBJECT_TERMINATE (0x0008) plus the query-only rights from
+    // Job::observer; neither is exported by windows-sys 0.61.2.
+    const TERMINATE_AND_QUERY: u32 = 0x0008 | 0x0004;
+    // SAFETY: `wide` is a NUL-terminated name that outlives the call.
+    let handle = unsafe { OpenJobObjectW(TERMINATE_AND_QUERY, 0, wide.as_ptr()) };
+    if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
+            Ok(false)
+        } else {
+            Err(io_error("open recorded custody Job Object", error))
+        };
+    }
+    // SAFETY: handle was opened above and is not shared.
+    let terminated = unsafe { TerminateJobObject(handle, 1) } != 0;
+    let terminated_error = std::io::Error::last_os_error();
+    // Members die asynchronously after termination; confirm emptiness on a
+    // bounded wait before reporting, the same way the owned stop path does.
+    let mut empty = false;
+    if terminated {
+        for _ in 0..20 {
+            match job_members(handle) {
+                Ok((pids, complete)) if complete && pids.is_empty() => {
+                    empty = true;
+                    break;
+                }
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Err(_) => break,
+            }
+        }
+    }
+    // SAFETY: handle was opened above and is not shared.
+    unsafe { CloseHandle(handle) };
+    if !terminated {
+        return Err(io_error(
+            "terminate recorded custody Job Object",
+            terminated_error,
+        ));
+    }
+    Ok(empty)
+}
+
 /// Whether a named kill-on-close custody Job has been closed. The name leaves
 /// the namespace when the last handle closes; for this Job that close has
 /// already told the kernel to terminate every member (no breakaway), but a

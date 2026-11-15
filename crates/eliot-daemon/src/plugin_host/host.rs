@@ -662,15 +662,29 @@ impl PluginHost {
             id: agent.id.clone(),
             generation: agent.generation,
         };
-        let (sender, stderr, credentials) = self.sender(&key, "stop").map_err(|error| {
-            if error.code == "not_found" {
-                // This exact-generation lookup happens before enqueue, so no
-                // native stop was dispatched for the missing runtime.
-                error.with_code("native_not_dispatched")
-            } else {
-                error
+        let (sender, stderr, credentials) = match self.sender(&key, "stop") {
+            Ok(found) => found,
+            Err(error) => {
+                if force && error.code == "not_found" {
+                    // No live runtime entry, but a fenced or stuck actor task
+                    // can still hold the generation Job open with tool
+                    // descendants alive. Terminate the named Job explicitly
+                    // so a forced stop leaves no owned family behind even
+                    // when there is no actor left to terminate. Best effort
+                    // and outcome-neutral: the original error still
+                    // describes the stop.
+                    self.terminate_orphaned_generation_job(agent, &command)
+                        .await;
+                }
+                return Err(if error.code == "not_found" {
+                    // This exact-generation lookup happens before enqueue, so no
+                    // native stop was dispatched for the missing runtime.
+                    error.with_code("native_not_dispatched")
+                } else {
+                    error
+                });
             }
-        })?;
+        };
         let (reply, response) = oneshot::channel();
         let deadlines = StopDeadlines::new(Instant::now());
         enqueue_stop(
@@ -1052,6 +1066,147 @@ impl PluginHost {
 
     fn remove_plugin_secret(&self, credential: &str) {
         self.state.secrets.lock_recover().remove(credential);
+    }
+
+    /// Best-effort named-Job termination for a force-stop that found no live
+    /// runtime entry. A removed routing entry does not imply a closed Job: the
+    /// actor task can still own it while draining or stuck, keeping tool
+    /// descendants alive after the stop reports not_found. Missing name means
+    /// the generation already closed; anything else is swallowed so the
+    /// original stop outcome stands. A concurrent respawn creates the
+    /// generation Job before registering its running-map entry, so the kill
+    /// is skipped while the Store still shows a live driver for the exact
+    /// generation; the re-check afterwards only reports a race that already
+    /// happened. One bounded log line always names the agent, generation,
+    /// and outcome.
+    async fn terminate_orphaned_generation_job(&self, agent: &Agent, command: &Command) {
+        let generation = agent.generation.to_string();
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut ids = vec![
+            ("agent", agent.id.as_str()),
+            ("generation", generation.as_str()),
+        ];
+        #[cfg(windows)]
+        {
+            if self
+                .generation_driver_live(agent, command)
+                .await
+                .unwrap_or(false)
+            {
+                crate::logging::record(
+                    &SecretPolicy::default(),
+                    "orphaned_generation_job_skipped",
+                    &ids,
+                    None,
+                );
+                return;
+            }
+            let namespace = match self.state.store.lock().await.custody_namespace() {
+                Ok(namespace) => namespace,
+                Err(error) => {
+                    crate::logging::record(
+                        &SecretPolicy::default(),
+                        "orphaned_generation_job_skipped",
+                        &ids,
+                        Some(&error),
+                    );
+                    return;
+                }
+            };
+            let name = crate::platform::custody::agent_custody_name(
+                &namespace,
+                &agent.id,
+                agent.generation,
+            );
+            let kill = tokio::task::spawn_blocking(move || {
+                crate::platform::windows::terminate_named_generation_job(&name)
+            })
+            .await;
+            match kill {
+                Ok(Ok(true)) => {
+                    if self.controls_generation(&agent.id, agent.generation) {
+                        ids.push(("respawn_detected", "true"));
+                    }
+                    crate::logging::record(
+                        &SecretPolicy::default(),
+                        "orphaned_generation_job_terminated",
+                        &ids,
+                        None,
+                    );
+                }
+                Ok(Ok(false)) => {
+                    crate::logging::record(
+                        &SecretPolicy::default(),
+                        "orphaned_generation_job_absent",
+                        &ids,
+                        None,
+                    );
+                }
+                Ok(Err(error)) => {
+                    crate::logging::record(
+                        &SecretPolicy::default(),
+                        "orphaned_generation_job_kill_unknown",
+                        &ids,
+                        Some(&error),
+                    );
+                }
+                Err(join) => {
+                    crate::logging::record(
+                        &SecretPolicy::default(),
+                        "orphaned_generation_job_kill_unknown",
+                        &ids,
+                        Some(&Error::new("unknown", format!("orphan kill join: {join}"))),
+                    );
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (agent, command, ids);
+        }
+    }
+
+    /// True when the Store still shows a live driver for the exact
+    /// generation: an unsettled command naming this agent and generation,
+    /// other than this stop itself and other stops (which create no
+    /// family). A concurrent respawn dispatches before it creates the
+    /// generation Job, so a live driver means the named Job may be fresh
+    /// and the name-kill must wait for the live path. Truncation fails
+    /// safe toward skipping; a store error fails open here and is
+    /// re-decided at the namespace lookup below.
+    #[cfg(windows)]
+    async fn generation_driver_live(&self, agent: &Agent, command: &Command) -> Result<bool> {
+        const LIMIT: usize = 1000;
+        let store = self.state.store.lock().await;
+        let total = store.count_unsettled_commands()?;
+        let commands = store.list_unsettled_commands(LIMIT)?;
+        drop(store);
+        Ok(Self::generation_has_live_driver(
+            &commands, total, agent, command,
+        ))
+    }
+
+    /// Pure live-driver predicate: an unsettled command naming this agent
+    /// and generation, other than this stop itself and other stops (which
+    /// create no family). Unknown commands prove nothing live. A truncated
+    /// unsettled list cannot prove absence, so truncation counts as live.
+    #[cfg(any(windows, test))]
+    fn generation_has_live_driver(
+        commands: &[Command],
+        total_unsettled: i64,
+        agent: &Agent,
+        command: &Command,
+    ) -> bool {
+        if total_unsettled > commands.len() as i64 {
+            return true;
+        }
+        commands.iter().any(|other| {
+            other.id != command.id
+                && other.verb != "stop"
+                && other.state != eliot_core::CommandState::Unknown
+                && other.target.as_deref() == Some(agent.id.as_str())
+                && other.generation == Some(agent.generation)
+        })
     }
 
     async fn mark_reader_unavailable(&self, key: &AgentKey) {
@@ -3775,6 +3930,91 @@ mod tests {
         let steered = agent_command_params(&agent, &steer, None, Some(&config)).unwrap();
         assert!(steered.get("model_override").is_none());
         assert!(steered.get("config_revision").is_none());
+    }
+
+    #[test]
+    fn orphan_kill_skips_generations_with_a_live_driver() {
+        let mut agent = Agent::new("a9", "proj", "muse", "fake", 0);
+        agent.generation = 7;
+        let stop = Command {
+            id: "stop-1".to_owned(),
+            principal: "owner".to_owned(),
+            method: "command.submit".to_owned(),
+            verb: "stop".to_owned(),
+            target: Some("a9".to_owned()),
+            selector: None,
+            expected_generation: Some(7),
+            generation: Some(7),
+            args: json!({}),
+            state: CommandState::Dispatched,
+            turn_id: None,
+            request_id: None,
+            outcome: None,
+            created_at: 0,
+            updated_at: 0,
+            probe: false,
+            config_revision: 0,
+            config: None,
+        };
+        // Only our own stop unsettled: no driver, the name-kill proceeds.
+        assert!(!PluginHost::generation_has_live_driver(
+            std::slice::from_ref(&stop),
+            1,
+            &agent,
+            &stop
+        ));
+        // A concurrent resume for the exact generation may be creating the
+        // family right now: skip the name-kill.
+        let resume = Command {
+            id: "resume-1".to_owned(),
+            verb: "resume".to_owned(),
+            ..stop.clone()
+        };
+        assert!(PluginHost::generation_has_live_driver(
+            &[stop.clone(), resume.clone()],
+            2,
+            &agent,
+            &stop
+        ));
+        // Other generations, other agents, other stops, and unknown states
+        // prove no live driver.
+        let other_generation = Command {
+            generation: Some(6),
+            ..resume.clone()
+        };
+        let other_agent = Command {
+            target: Some("a4".to_owned()),
+            ..resume.clone()
+        };
+        let other_stop = Command {
+            id: "stop-2".to_owned(),
+            ..stop.clone()
+        };
+        let unknown = Command {
+            id: "resume-2".to_owned(),
+            state: CommandState::Unknown,
+            ..resume.clone()
+        };
+        for commands in [
+            vec![stop.clone(), other_generation],
+            vec![stop.clone(), other_agent],
+            vec![stop.clone(), other_stop],
+            vec![stop.clone(), unknown],
+            vec![stop.clone()],
+        ] {
+            let total = commands.len() as i64;
+            assert!(
+                !PluginHost::generation_has_live_driver(&commands, total, &agent, &stop),
+                "stale or foreign commands must not block the orphan kill"
+            );
+        }
+        // A truncated unsettled list cannot prove absence: fail safe.
+        assert!(PluginHost::generation_has_live_driver(
+            std::slice::from_ref(&stop),
+            2,
+            &agent,
+            &stop
+        ));
     }
 
     #[test]
