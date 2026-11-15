@@ -118,9 +118,9 @@ Private readback cannot clear a live-source gap or replay history. It can,
 however, commit the exact active turn's durable terminal: when a bounded
 `view/page` scan proves the native view durably holds that turn's
 `turn/completed` (plus its final `agentMessage` when present), the adapter
-commits `message.completed` and `turn.completed` with the real final message
-rather than settling unknown. A later healthy read does not establish
-live-edge recovery.
+commits any unacknowledged `message.completed` and then `turn.completed` with
+the real final message rather than settling unknown. A later healthy read
+does not establish live-edge recovery.
 
 Every unavailable-view episode and its outcome is exactly countable from
 `events.read`: unavailable views are `source.gap` events whose reason starts
@@ -194,10 +194,14 @@ of the retained view backward (at most four `view/page` reads of up to 1000
 events, reversed within each ascending wire page) for the exact active
 turn's durable terminal and final `agentMessage`. A proven terminal commits
 through the exact live shapes (`message.completed` with the real final
-message, then `turn.completed`), marks those records applied so a later live
-replay of the same revision skips instead of recommitting, retires the
-recovery deadline, and keeps the recorded gap and stale health latched. Only
-when the command-plane observation is unproven or no fresh idle-time page
+message, then `turn.completed`). Successfully acknowledged message identities
+are retained for the active turn independently of intervening usage batches
+and bounded cursor history. Recovery skips an already acknowledged message
+and reuses the latest committed final text; unknown writes never populate
+that identity state or replace the text. Recovery marks those records applied
+so a later live replay of the same revision skips instead of recommitting,
+retires the recovery deadline, and keeps the recorded gap and stale health
+latched. Only when the command-plane observation is unproven or no fresh idle-time page
 proves the terminal does the adapter settle the active
 turn `unknown` with the recorded gap through the shared turn-unknown path
 (`turn.unknown` with the exact command/turn binding and the gap reason),
