@@ -410,6 +410,44 @@ pub struct ConfigInfo {
     pub model: Option<ConfigModel>,
 }
 
+// ---------------------------------------------------------------------------
+// MCP inventory (`mcp.list`)
+// ---------------------------------------------------------------------------
+
+/// `GET /api/mcp` (`mcp.list`) entry: one configured MCP server with its
+/// connection status. Only the name, status word and failure text decode;
+/// `title`/`integrationID` and future status variants are ignored. A
+/// missing status decodes as empty (never `connected`), so an unreadable
+/// inventory reports unavailable instead of verified.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerReadback {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub status: McpStatusReadback,
+}
+
+/// `Mcp.Status.*` union subset: the installed 2.2.7 words are `connected`,
+/// `pending`, `disabled`, `failed` and `needs_auth`; `failed` and
+/// `needs_auth` carry an `error` string. Unknown words decode as-is and
+/// never count as connected.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpStatusReadback {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl McpServerReadback {
+    /// Whether this entry proves the Agent-scoped server is serving.
+    pub fn is_connected(&self, server_name: &str) -> bool {
+        self.name == server_name && self.status.status == "connected"
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigModel {
@@ -1016,6 +1054,57 @@ mod tests {
         let bare: NativeModelEntry =
             serde_json::from_value(serde_json::json!({"id": "m"})).expect("sparse entry decodes");
         assert!(bare.limit.is_none());
+    }
+
+    #[test]
+    fn mcp_inventory_decodes_live_failed_shape() {
+        // Observed shape: `GET /api/mcp` on installed 2.2.7 with an
+        // Agent-less `swarm mcp --require-agent` entry reports the name
+        // with `failed` plus the server's refusal text.
+        let entries: Vec<McpServerReadback> = serde_json::from_value(serde_json::json!([
+            {"name": "eliot-swarm",
+             "status": {"status": "failed",
+                        "error": "Connection closed: MCP server process exited with code 1: error: not_allowed: a complete Agent identity is required; Owner and Run contexts are rejected"},
+             "title": "eliot-swarm"},
+        ]))
+        .expect("installed MCP shape decodes");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "eliot-swarm");
+        assert_eq!(entries[0].status.status, "failed");
+        assert!(
+            entries[0]
+                .status
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not_allowed"))
+        );
+        assert!(
+            !entries[0].is_connected("eliot-swarm"),
+            "a failed server is never verified"
+        );
+    }
+
+    #[test]
+    fn mcp_inventory_connected_verifies_only_the_agent_server() {
+        let entries: Vec<McpServerReadback> = serde_json::from_value(serde_json::json!([
+            {"name": "eliot-swarm", "status": {"status": "connected"}},
+            {"name": "owner-search", "status": {"status": "connected"}},
+            {"name": "half-seen", "status": {"status": "pending"}},
+            {"name": "no-status"},
+            {"name": "other-word", "status": {"status": "hypothetical-future"}},
+        ]))
+        .expect("installed MCP shape decodes");
+        let connected: Vec<&str> = entries
+            .iter()
+            .filter(|entry| entry.status.status == "connected")
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(connected, ["eliot-swarm", "owner-search"]);
+        assert!(entries[0].is_connected("eliot-swarm"));
+        assert!(!entries[1].is_connected("eliot-swarm"));
+        assert!(!entries[2].is_connected("eliot-swarm"));
+        assert!(!entries[3].is_connected("eliot-swarm"));
+        assert!(!entries[4].is_connected("eliot-swarm"));
     }
 
     #[test]

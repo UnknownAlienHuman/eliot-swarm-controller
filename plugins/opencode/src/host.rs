@@ -2,7 +2,7 @@ use crate::{
     events::{EventConfig, EventHandle, EventStatus, InboxRecord, SteerVerdict, TurnFacts},
     native::{
         AuthSetup, BackendKind, HttpOutcome, IntegrationSelector, LocalProvider, OpenCodeHttp,
-        OwnedServer, ServerLaunch, list_providers,
+        OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch, list_providers,
         types::{InboxUser, ModelRef, SessionInfo},
     },
 };
@@ -166,6 +166,8 @@ struct ParsedStart {
     instance_dir: String,
     store_root: String,
     resume: Option<ResumeSubject>,
+    swarm_executable: PathBuf,
+    swarm_data_dir: PathBuf,
 }
 
 /// Outcome of start admission: a replayed start response, or a parsed
@@ -575,6 +577,30 @@ impl OpenCodePlugin {
             "OpenCode",
         )?;
         secrets.push(initialized.credential.clone());
+        // Agent-scoped swarm MCP identity: the Agent's owned Eliot data root
+        // for the MCP `--data-dir` argument (mirrors the Codex
+        // `args_with_agent_mcp` guard), plus the active Swarm executable for
+        // the server command (mirrors the Claude `swarm_binary` readback).
+        // The token itself is never rendered: the MCP child inherits this
+        // environment from the serve process, and `mcp --require-agent`
+        // fails closed without it.
+        let swarm_data_dir = environment
+            .iter()
+            .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("ELIOT_HOME"))
+            .map(|(_, value)| PathBuf::from(value))
+            .filter(|path| path.is_absolute() && path.is_dir())
+            .ok_or_else(|| {
+                Error::new(
+                    "profile_error",
+                    "OpenCode Agent MCP requires an absolute owned Eliot data directory",
+                )
+            })?;
+        let swarm_executable = std::env::current_exe().map_err(|_| {
+            Error::new(
+                "platform_io",
+                "active Swarm executable could not be resolved for the OpenCode Agent MCP",
+            )
+        })?;
         Ok(StartAdmission::New(Box::new(ParsedStart {
             params,
             requested_model,
@@ -590,6 +616,8 @@ impl OpenCodePlugin {
             instance_dir: initialized.instance_dir.clone(),
             store_root: initialized.store_root.clone(),
             resume,
+            swarm_executable,
+            swarm_data_dir,
         })))
     }
 
@@ -694,6 +722,8 @@ impl OpenCodePlugin {
                     reuse_existing: parsed.resume.is_some(),
                 }),
                 local: parsed.local.clone(),
+                swarm_executable: parsed.swarm_executable.clone(),
+                swarm_data_dir: parsed.swarm_data_dir.clone(),
             },
             &parsed.secrets,
             Instant::now() + RPC_TIMEOUT,
@@ -930,6 +960,13 @@ impl OpenCodePlugin {
         if let Some(fragment) = local_fragment {
             effective["local"] = fragment;
         }
+        // Agent-scoped MCP readback after the session exists: names plus
+        // the connected verdict for the `eliot-swarm` entry. Read-only and
+        // best-effort; it never changes the start outcome (see helper).
+        let (mcp_servers, mcp_servers_verified) =
+            observe_mcp_servers(&session.http, Instant::now() + RPC_TIMEOUT).await;
+        effective["mcp_servers"] = mcp_servers;
+        effective["mcp_servers_verified"] = json!(mcp_servers_verified);
         let context_bound =
             bind_context_hooks(&session.http, &created.id, Instant::now() + RPC_TIMEOUT).await;
         let effective = if context_bound {
@@ -1386,6 +1423,12 @@ impl OpenCodePlugin {
                 Err(error) => return Err(error),
             }
         }
+        // Same best-effort MCP readback as the create path: the resumed
+        // server re-spawns the Agent-scoped entry for this generation.
+        let (mcp_servers, mcp_servers_verified) =
+            observe_mcp_servers(&session.http, deadline).await;
+        effective_value["mcp_servers"] = mcp_servers;
+        effective_value["mcp_servers_verified"] = json!(mcp_servers_verified);
         Ok(effective_value)
     }
 
@@ -2658,6 +2701,28 @@ fn parse_local_provider(
 /// retarget the base URL are a profile mismatch, never silently adopted.
 fn normalize_endpoint(value: &str) -> String {
     value.trim().trim_end_matches('/').to_owned()
+}
+
+/// Best-effort Agent-scoped MCP readback for the effective record: one
+/// `GET /api/mcp` (`mcp.list`) after the session exists. Names come from
+/// the installed inventory when the query succeeds (`null` when it does
+/// not, never fabricated); `mcp_servers_verified` is true only when the
+/// Agent-scoped server reports `connected`. Only names and the status word
+/// are retained — never the failure text, which can carry local paths. A
+/// non-connected or unreadable surface never fails the start: this harness
+/// keeps `inherit` only, so the applied per-Agent config is the qualified
+/// record and this observation is reported honestly.
+async fn observe_mcp_servers(http: &OpenCodeHttp, deadline: Instant) -> (Value, bool) {
+    match http.list_mcp_servers(deadline).await {
+        Ok(servers) => {
+            let verified = servers
+                .iter()
+                .any(|server| server.is_connected(SWARM_MCP_SERVER_NAME));
+            let names: Vec<&str> = servers.iter().map(|server| server.name.as_str()).collect();
+            (json!(names), verified)
+        }
+        Err(_) => (Value::Null, false),
+    }
 }
 
 /// Resolve the adopted backend key value (runtime-only) from the launch

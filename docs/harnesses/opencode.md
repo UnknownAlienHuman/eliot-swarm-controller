@@ -234,13 +234,52 @@ these backends stay `unsupported`: readiness, catalog/context, history and
 exact tool formats are resolved separately before any Codex route is
 advertised as supported.
 
+## Eliot MCP bridge
+
+Each owned generation's per-Agent `opencode.jsonc` carries one
+`mcp.servers.eliot-swarm` entry: a local stdio server running the active
+Swarm executable with the Agent's owned Eliot data directory and
+`mcp --require-agent` arguments. Its only tool is `swarm`, with the
+installed schema `{ method: string, params: object }`. Use the advertised
+Eliot method and its existing params DTO for Eliot status, control, or
+coordination. Authentication is inherited by the server from the serve
+process environment (the Agent's own identity) and must not appear in tool
+arguments or in the config document: the file carries only the public
+command, and `--require-agent` fails closed without the inherited
+identity. Use normal OpenCode tools for workspace work.
+
+Verified against installed OpenCode 2.2.7: `mcp add` writes
+`mcp.servers.<name> = {type: "local", command: [...], environment?}`
+(`environment` merges over the inherited process env, so no key is
+needed); `GET /api/config` echoes the per-Agent document (proving the
+server honors the isolated `XDG_CONFIG_HOME`); `GET /api/mcp`
+(`mcp.list`) reports configured names with `connected` / `pending` /
+`disabled` / `failed` / `needs_auth` status. A server started without the
+Agent identity reports `failed` with the swarm refusal text instead of
+serving as Owner. The owner's global config is never edited.
+
+Mail wake text names this tool: an OpenCode Agent is told to use the
+`eliot-swarm` MCP `swarm` tool (`mail.inbox`, then ack), not the shell
+CLI.
+
+Requested vs observed: `requested` carries `mcp_policy` (`inherit`
+always); `effective` carries `mcp_servers` (installed-inventory names, or
+`null` when the `GET /api/mcp` read fails) and `mcp_servers_verified`
+(true only when the `eliot-swarm` entry reports `connected`). Only names
+and the status word are retained — never the failure text. The requested
+set is never echoed as observed. The applied per-Agent config document is
+the qualified record; the inventory observation is best-effort and never
+fails a start.
+
 ## Worker MCP policy
 
 This harness keeps `inherit` only: the frozen profile always records
 `mcp = "inherit"`, and a non-`inherit` policy is rejected as `unsupported`
-at config load. No verified native MCP isolation mechanism was established
-for the installed server (the plugin owns no MCP surface of its own), so no
-`minimal` mechanism is implemented.
+at config load. `inherit` is additive: the worker receives Eliot's
+Agent-scoped `eliot-swarm` server from the generated per-Agent config in
+addition to the owner's native MCP surface. No verified native MCP
+isolation mechanism was established for the installed server, so no
+`minimal` suppression mechanism is implemented.
 
 ## Ad-hoc launch
 

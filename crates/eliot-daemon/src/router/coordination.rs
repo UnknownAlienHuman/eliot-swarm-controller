@@ -51,13 +51,24 @@ fn wake_enabled(snapshot: &Value) -> bool {
         .unwrap_or(true)
 }
 
-fn notice_text(kind: NoticeKind, count: i64) -> String {
+fn notice_text(kind: NoticeKind, count: i64, harness: &str) -> String {
     match kind {
-        NoticeKind::Mail => {
-            format!("{count} unread messages; run swarm inbox, then ack processed delivery IDs")
-        }
+        NoticeKind::Mail => mail_notice_text(count, harness),
         NoticeKind::Claim if count == 1 => "1 overlapping work claim; run swarm who".to_owned(),
         NoticeKind::Claim => format!("{count} overlapping work claims; run swarm who"),
+    }
+}
+
+/// Mail wake text for the harness that routes the recipient: an Agent with
+/// the Agent-scoped swarm MCP server reaches mail through that tool, while
+/// every other harness keeps the `swarm` CLI wording.
+fn mail_notice_text(count: i64, harness: &str) -> String {
+    if harness == "opencode" {
+        format!(
+            "{count} unread messages; use the eliot-swarm MCP swarm tool (method mail.inbox), then ack processed delivery IDs"
+        )
+    } else {
+        format!("{count} unread messages; run swarm inbox, then ack processed delivery IDs")
     }
 }
 
@@ -267,7 +278,7 @@ impl Router {
             "target": recipient,
             "verb": "send",
             "expected_generation": claim.generation,
-            "args": {"text": notice_text(claim.kind, claim.count), "notice_kind": notice_kind},
+            "args": {"text": notice_text(claim.kind, claim.count, &agent.harness), "notice_kind": notice_kind},
         });
         if self.submit(&params, &Principal::Owner).await.is_err() {
             let mut store = self.inner.store.lock().await;
@@ -426,6 +437,30 @@ mod tests {
             id: agent.to_owned(),
             generation: 1,
         }
+    }
+
+    #[test]
+    fn mail_notice_names_the_swarm_tool_the_harness_has() {
+        // OpenCode Agents reach mail through the Agent-scoped MCP server;
+        // every other harness keeps the `swarm` CLI wording.
+        let mcp = mail_notice_text(2, "opencode");
+        assert!(mcp.contains("eliot-swarm"), "MCP server named: {mcp}");
+        assert!(mcp.contains("mail.inbox"), "method named: {mcp}");
+        assert!(
+            !mcp.contains("run swarm inbox"),
+            "no CLI wording for MCP agents: {mcp}"
+        );
+        for harness in ["codex", "claude", "muse", "antigravity", "unknown-harness"] {
+            let cli = mail_notice_text(1, harness);
+            assert_eq!(
+                cli, "1 unread messages; run swarm inbox, then ack processed delivery IDs",
+                "CLI wording kept for {harness}"
+            );
+        }
+        assert_eq!(
+            notice_text(NoticeKind::Mail, 3, "opencode"),
+            mail_notice_text(3, "opencode")
+        );
     }
 
     fn router_with_config(root: &std::path::Path, source: &str) -> Router {
