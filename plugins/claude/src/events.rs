@@ -1036,6 +1036,15 @@ async fn dispatch_control(
         Control::Close { reply } => {
             processor.closed = true;
             processor.cancel_all_hook_callbacks();
+            if let Some(pending) = processor.pending_turn.take() {
+                processor.settle_pending(
+                    pending,
+                    TurnOutcome::Unknown(
+                        "Claude event task closed before the input association was observed"
+                            .to_owned(),
+                    ),
+                );
+            }
             processor.fail_pending_steer(SteerOutcome::Rejected(
                 "Claude event task closed before PreToolUse confirmed steer".to_owned(),
             ));
@@ -3586,6 +3595,39 @@ mod tests {
         processor
             .register_turn("cmd-2".to_owned(), "turn-2".to_owned(), outcome_tx)
             .expect("registration works after the cancel");
+    }
+
+    #[tokio::test]
+    async fn close_settles_pending_turn_as_unknown() {
+        let mut processor = ready_processor();
+        let (status_tx, _status_rx) = watch::channel(EventStatus::default());
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+        processor
+            .register_turn("cmd-1".to_owned(), "turn-1".to_owned(), outcome_tx)
+            .expect("registration holds the waiter");
+        let (reply_tx, reply_rx) = oneshot::channel();
+        assert!(
+            dispatch_control(
+                &mut processor,
+                &status_tx,
+                Control::Close { reply: reply_tx }
+            )
+            .await
+        );
+        assert!(reply_rx.await.is_ok());
+        assert!(
+            processor.pending_turn.is_none(),
+            "close retires the exact waiter"
+        );
+        match outcome_rx.await.expect("close settles the waiter") {
+            TurnOutcome::Unknown(reason) => assert_eq!(
+                reason,
+                "Claude event task closed before the input association was observed"
+            ),
+            TurnOutcome::Associated | TurnOutcome::Rejected(_) => {
+                panic!("close must not invent an association or refusal")
+            }
+        }
     }
 
     fn hook_workspace() -> PathBuf {

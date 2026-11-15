@@ -173,6 +173,21 @@ fn send_unknown(cause: &str, reason: &str) -> Value {
     json!({"state": "unknown", "cause": cause, "reason": reason})
 }
 
+/// Retain a proven no-write send refusal so a same-id retry replays it
+/// instead of rewriting stdin. Only for `frame_too_large`/`busy`/
+/// pre-write gates that provably wrote nothing.
+fn retain_send_rejection(
+    sends: &mut SendHistory,
+    command_id: String,
+    text: &str,
+    reason: &str,
+) -> Value {
+    let result = rejected_control(reason);
+    sends.inputs.insert(command_id.clone(), text.to_owned());
+    sends.outcomes.insert(command_id, result.clone());
+    result
+}
+
 /// Validated start inputs: the frozen profile, Agent-scoped MCP context, and
 /// minted session id. Built before any spawn; every later start phase reads
 /// from it.
@@ -1203,30 +1218,56 @@ impl ClaudePlugin {
             "Claude",
         )?;
         let context = params.context.clone();
-        let text = send_text(&params)?;
+        let text = match send_text(&params) {
+            Ok(text) => text.to_owned(),
+            Err(error) if error.code == "frame_too_large" => {
+                let raw = params
+                    .args
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                session.sends.reconcile();
+                if let Some(replay) = session.sends.replay(&params.command_id, raw) {
+                    return replay;
+                }
+                let result = retain_send_rejection(
+                    &mut session.sends,
+                    params.command_id,
+                    raw,
+                    &error.message,
+                );
+                return Ok(result);
+            }
+            Err(error) => return Err(error),
+        };
         session.sends.reconcile();
-        if let Some(replay) = session.sends.replay(&params.command_id, text) {
+        if let Some(replay) = session.sends.replay(&params.command_id, &text) {
             return replay;
         }
         // These are pre-write refusals. Generic `busy`/`unknown` errors after
         // daemon dispatch would incorrectly turn them into uncertain effects.
         if let Err(error) = check_send_ready(session) {
-            let result = rejected_control(&error.message);
-            session
-                .sends
-                .inputs
-                .insert(params.command_id.clone(), text.to_owned());
-            session
-                .sends
-                .outcomes
-                .insert(params.command_id, result.clone());
+            let result =
+                retain_send_rejection(&mut session.sends, params.command_id, &text, &error.message);
             return Ok(result);
         }
-        let native_content = with_claimed_context(text, &context, "Claude")?;
+        let native_content = match with_claimed_context(&text, &context, "Claude") {
+            Ok(native_content) => native_content,
+            Err(error) if error.code == "frame_too_large" => {
+                let result = retain_send_rejection(
+                    &mut session.sends,
+                    params.command_id,
+                    &text,
+                    &error.message,
+                );
+                return Ok(result);
+            }
+            Err(error) => return Err(error),
+        };
         session
             .sends
             .inputs
-            .insert(params.command_id.clone(), text.to_owned());
+            .insert(params.command_id.clone(), text.clone());
         dispatch_send(session, &params.command_id, native_content, context).await
     }
 
@@ -2390,7 +2431,7 @@ fn target_environment(
 mod tests {
     use super::{
         ClaudePlugin, PendingSend, SendHistory, check_mcp_allow_empty, claude_manifest,
-        claude_scope, mcp_argv, new_uuid, send_unknown, setter_error,
+        claude_scope, mcp_argv, new_uuid, retain_send_rejection, send_unknown, setter_error,
     };
     use crate::events::TurnOutcome;
     use eliot_core::Error;
@@ -2506,6 +2547,38 @@ mod tests {
         assert_eq!(
             sends.replay("cmd-1", "input").unwrap().unwrap()["cause"],
             "claude_turn_association_lost"
+        );
+    }
+
+    #[test]
+    fn oversize_send_refusal_is_retained_for_same_id_replay() {
+        use eliot_plugin::MAX_TEXT_BYTES;
+        use eliot_plugin::session::with_claimed_context;
+
+        let oversize = "x".repeat(MAX_TEXT_BYTES + 1);
+        let error = with_claimed_context(&oversize, &[], "Claude").unwrap_err();
+        assert_eq!(error.code, "frame_too_large");
+        let mut sends = SendHistory::default();
+        let retained = retain_send_rejection(
+            &mut sends,
+            "cmd-oversize".to_owned(),
+            &oversize,
+            &error.message,
+        );
+        assert_eq!(retained["state"], "rejected");
+        assert!(sends.pending.is_none());
+        assert!(sends.turns.is_empty());
+        assert_eq!(
+            sends.replay("cmd-oversize", &oversize).unwrap().unwrap(),
+            retained
+        );
+        assert_eq!(
+            sends
+                .replay("cmd-oversize", "different input")
+                .unwrap()
+                .unwrap_err()
+                .code,
+            "source_integrity"
         );
     }
 
