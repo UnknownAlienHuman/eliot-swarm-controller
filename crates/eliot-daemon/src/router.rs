@@ -7,10 +7,11 @@ mod config_ops;
 mod context;
 mod coordination;
 mod digests;
-mod discovery;
+pub(crate) mod discovery;
 mod goals;
 mod handoff;
 mod hierarchy;
+mod inference;
 mod resolution;
 mod rules;
 mod switch;
@@ -118,6 +119,8 @@ struct RouterInner {
     unknown_causes: Mutex<HashMap<String, String>>,
     rule_definitions: Mutex<HashMap<(String, String), (i64, RuleDefinition)>>,
     catalog_cache: Mutex<catalog::CatalogCache>,
+    var_writes: Mutex<coordination::VarWriteQueue>,
+    var_worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
     plugin_host: PluginHost,
     monitoring: Monitoring,
     workspaces: WorkspaceManager,
@@ -128,6 +131,13 @@ struct RouterInner {
     progress: watch::Sender<u64>,
     run_cancellation: watch::Sender<bool>,
     run_workers: Mutex<HashMap<String, RunWorkerHandle>>,
+    inference_ops: AsyncMutex<()>,
+    inference_runner: AsyncMutex<()>,
+    inference_workers: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Memory inference calls whose native process family exit is unproven
+    /// (`Unknown { quiescent: false }`). Cleanup and native dispatch stay
+    /// fenced for these ids; the fence lifts only on daemon restart.
+    inference_unquiescent: Mutex<HashSet<String>>,
     /// Bumped by `goal.set`/`goal.resume` when the Goal ends up active and
     /// idle-keyed. The goal driver sweeps the retained idle subjects on
     /// every change; reads never bump it. Startup performs no sweep: the
@@ -143,6 +153,10 @@ struct RunWorkerHandle {
 #[derive(Clone)]
 enum Principal {
     Owner,
+    MemoryInference {
+        client_id: String,
+        token_version: i64,
+    },
     Agent {
         id: String,
         generation: i64,
@@ -235,6 +249,8 @@ impl Router {
                 unknown_causes: Mutex::new(HashMap::new()),
                 rule_definitions: Mutex::new(HashMap::new()),
                 catalog_cache: Mutex::new(catalog::CatalogCache::default()),
+                var_writes: Mutex::new(coordination::VarWriteQueue::default()),
+                var_worker: AsyncMutex::new(None),
                 plugin_host,
                 monitoring,
                 workspaces,
@@ -248,6 +264,10 @@ impl Router {
                 progress,
                 run_cancellation,
                 run_workers: Mutex::new(HashMap::new()),
+                inference_ops: AsyncMutex::new(()),
+                inference_runner: AsyncMutex::new(()),
+                inference_workers: Mutex::new(HashMap::new()),
+                inference_unquiescent: Mutex::new(HashSet::new()),
                 goal_reconcile,
             }),
         }
@@ -265,6 +285,22 @@ impl Router {
             .map_err(|_| Error::new("not_allowed", "invalid remote context"))?;
         authorize_rpc_method(&principal, method)?;
         let result = match method {
+            "client.identity" => self.inference_identity(&params, &principal).await,
+            "inference.client.install" => {
+                self.inference_credential(method, &params, &principal).await
+            }
+            "inference.client.rotate" => {
+                self.inference_credential(method, &params, &principal).await
+            }
+            "inference.client.promote" => {
+                self.inference_credential(method, &params, &principal).await
+            }
+            "inference.text" => self.inference_text(&params, &principal).await,
+            "inference.get" => self.inference_get(&params, &principal).await,
+            "inference.write.get" => self.inference_write_get(&params, &principal).await,
+            "inference.result.read" => self.inference_result_read(&params, &principal).await,
+            "inference.cancel" => self.inference_cancel(&params, &principal).await,
+            "inference.release" => self.inference_release(&params, &principal).await,
             "api.methods" => self.methods(&params, &principal).await,
             "api.help" => self.method_help(&params, &principal).await,
             "api.identity" => self.caller_identity(&params, &principal).await,
@@ -404,7 +440,7 @@ impl Router {
         match self.inner.mode.load(Ordering::SeqCst) {
             MODE_FORCE => Ok(self.inner.shutdown_ready.load(Ordering::SeqCst)),
             MODE_DRAIN if self.inner.shutdown_ready.load(Ordering::SeqCst) => {
-                Ok(self.status_blockers().await?.is_empty())
+                Ok(self.status_blockers().await?.is_empty() && !self.inference_workers_active())
             }
             MODE_DRAIN => Ok(false),
             _ => Ok(false),
@@ -412,6 +448,7 @@ impl Router {
     }
 
     pub(crate) async fn force_owned_processes(&self) {
+        self.stop_inference_workers().await;
         let workers = {
             let _store = self.inner.store.lock().await;
             let mut workers = self.inner.run_workers.lock_recover();
@@ -3443,7 +3480,9 @@ impl Router {
                         (pairs, agents.len())
                     }
                 }
-                Principal::Run { .. } | Principal::ProjectRule { .. } => {
+                Principal::Run { .. }
+                | Principal::ProjectRule { .. }
+                | Principal::MemoryInference { .. } => {
                     return Err(Error::new(
                         "not_allowed",
                         "usage summary needs the owner or an Agent principal",
@@ -3503,7 +3542,7 @@ impl Router {
                         now_ms(),
                     )?
                 }
-                Principal::Run { .. } => {
+                Principal::Run { .. } | Principal::MemoryInference { .. } => {
                     return Err(Error::new(
                         "not_allowed",
                         "Run credentials cannot list Agents",
@@ -3766,7 +3805,7 @@ impl Router {
         request.validate()?;
         match principal {
             Principal::Owner | Principal::Agent { .. } => {}
-            Principal::Run { .. } => {
+            Principal::Run { .. } | Principal::MemoryInference { .. } => {
                 return Err(Error::new(
                     "not_allowed",
                     "Run credentials may call only command.get",
@@ -4605,6 +4644,7 @@ impl Router {
             }),
         };
         self.inner.plugin_host.close_discovery_admission();
+        self.finish_var_writes().await;
         self.signal_progress();
         serde_json::to_value(response?)
             .map_err(|_| Error::new("internal", "shutdown result could not be encoded"))
@@ -6235,6 +6275,7 @@ fn require_owner(principal: &Principal) -> Result<()> {
 fn principal_name(principal: &Principal) -> String {
     match principal {
         Principal::Owner => "owner".to_owned(),
+        Principal::MemoryInference { client_id, .. } => format!("memory_inference:{client_id}"),
         Principal::Agent { id, generation } => format!("agent:{id}:{generation}"),
         Principal::ProjectRule { registration } => format!("project:{}", registration.id),
         Principal::Run { run_command_id, .. } => format!("run:{run_command_id}"),

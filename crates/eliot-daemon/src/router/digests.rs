@@ -107,7 +107,7 @@ impl Router {
         request.validate()?;
         match principal {
             Principal::Owner | Principal::Agent { .. } => {}
-            Principal::Run { .. } => {
+            Principal::Run { .. } | Principal::MemoryInference { .. } => {
                 return Err(Error::new(
                     "not_allowed",
                     "Run credentials may call only command.get",

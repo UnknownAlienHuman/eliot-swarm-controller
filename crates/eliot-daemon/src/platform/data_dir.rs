@@ -429,7 +429,7 @@ fn open_or_create_daemon_lock(path: &Path) -> Result<File> {
     }
 }
 
-fn ensure_private_root(path: &Path) -> Result<()> {
+pub(crate) fn ensure_private_root(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         super::windows::ensure_private_root(path)
@@ -448,7 +448,7 @@ fn ensure_private_root(path: &Path) -> Result<()> {
     }
 }
 
-fn ensure_private_file(path: &Path) -> Result<()> {
+pub(crate) fn ensure_private_file(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         super::windows::ensure_private_file(path)
@@ -594,6 +594,49 @@ fn validate_private_file(path: &Path) -> Result<()> {
             "private file validation is unsupported on this platform",
         ))
     }
+}
+
+/// Small private immutable inference artifacts. Callers supply only daemon-owned
+/// names; existing links, nonregular files and oversized content fail closed.
+pub(crate) fn read_private_bytes(path: &Path, max: usize) -> Result<Vec<u8>> {
+    use std::io::Read;
+    validate_private_file(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+        options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| io_error("open private inference file", e))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| io_error("inspect private inference file", e))?;
+    if !metadata.is_file() || super::is_reparse_point(&metadata) || metadata.len() > max as u64 {
+        return Err(Error::new(
+            "source_integrity",
+            "invalid private inference artifact",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(max as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| io_error("read private inference file", e))?;
+    if bytes.len() > max {
+        return Err(Error::new(
+            "source_integrity",
+            "private inference artifact exceeds bound",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn replace_file(source: &Path, target: &Path) -> Result<()> {

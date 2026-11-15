@@ -5,7 +5,12 @@ and advisory claims reuse the existing API/router/Store; no second scheduler.
 
 ## Authority
 
-Principals are owner, current `agent:<id>#<generation>` and scoped automation. Missing/
+Principals are owner, current `agent:<id>#<generation>`, scoped automation and
+`memory_inference:<stable-client-id>`. Memory has only the
+[M1 inference surface](api.md#memory-one-shot-inference-m1-199), no Agent/control/
+coordination/config authority and no Owner/tokenless fallback. Only its current
+credential admits new mutations; exact own reads/retries survive bounded rotation
+overlap. Missing/
 revoked identity rejects. An Agent's frozen profile `control` (self/tree/project,
 default self) governs its commands and reads: self reaches only itself, tree reaches
 its own subtree, project reaches its project label; the owner is unrestricted. A
@@ -173,6 +178,8 @@ known secrets rejected. Each write increments version; `expect_version` is CAS,
 not last-writer guess: an omitted expectation writes unconditionally, while a
 supplied one must equal the current version, where an absent row reads as 0.
 `set_by` records the current principal. Changes emit `var.changed`.
+Concurrent queued writes use bounded [Store commit grouping](core.md#storage);
+each request still has its own CAS result and retained idempotency binding.
 
 ```sql
 CREATE TABLE vars (

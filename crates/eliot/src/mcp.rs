@@ -290,38 +290,12 @@ impl ServerHandler for EliotMcpHandler {
     }
 }
 
-/// Mutation methods whose DTO carries a caller-retained `id`. Mirrors the
-/// daemon discovery `mutation` flags; keep the two lists in sync.
-const MUTATION_ID_METHODS: &[&str] = &[
-    "daemon.shutdown",
-    "command.submit",
-    "swarm.reparent",
-    "swarm.handoff",
-    "swarm.switch",
-    "command.cancel",
-    "command.resolve",
-    "turn.resolve",
-    "rule.catch_up",
-    "timer.run",
-    "provider.clear_hold",
-    "goal.set",
-    "goal.pause",
-    "goal.clear",
-    "goal.resume",
-    "goal.round",
-    "mail.send",
-    "mail.ack",
-    "var.set",
-    "claim.set",
-    "claim.release",
-];
-
 /// Mint one fresh ULID into `params` when a mutation call omits `id`
 /// (absent or null). Returns the minted id so the caller can retain it for
 /// exact retry. An explicit id is never touched; non-mutation methods and
 /// unknown methods pass through unchanged.
 fn mint_missing_mutation_id(method: &str, params: &mut Map<String, Value>) -> Option<String> {
-    if !MUTATION_ID_METHODS.contains(&method) {
+    if !eliot_daemon::is_mutation_id_method(method) {
         return None;
     }
     if !matches!(params.get("id"), None | Some(Value::Null)) {
@@ -925,5 +899,28 @@ mod tests {
         assert_eq!(http["result"], value);
         assert_eq!(http["remote_call"], json!({"kind": "x"}));
         assert_eq!(http["id"], json!("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    }
+
+    #[test]
+    fn mutation_ids_are_minted_for_every_id_carrying_discovery_mutation() {
+        for method in eliot_daemon::mutation_id_methods() {
+            let mut params = Map::new();
+            let minted = mint_missing_mutation_id(method, &mut params);
+            let id = minted.expect("discovery mutation with id mints");
+            assert_eq!(params.get("id").and_then(Value::as_str), Some(id.as_str()));
+            assert!(id.parse::<ulid::Ulid>().is_ok());
+        }
+        // Regression: swarm.digest drifted out of the hand list.
+        assert!(eliot_daemon::is_mutation_id_method("swarm.digest"));
+        // Mutations whose DTO carries no id stay untouched, as do reads and
+        // unknown methods.
+        for method in ["config.profiles.save", "script.save"] {
+            let mut params = Map::new();
+            assert!(mint_missing_mutation_id(method, &mut params).is_none());
+        }
+        for method in ["var.get", "api.methods", "no.such.method"] {
+            let mut params = Map::new();
+            assert!(mint_missing_mutation_id(method, &mut params).is_none());
+        }
     }
 }

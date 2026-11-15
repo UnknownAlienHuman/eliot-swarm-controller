@@ -56,6 +56,19 @@ Commands store this directly; other writes use the API's small `writes` table. O
 writer checks both namespaces. Derived ids identify linked inputs, selector children,
 rule actions and Goal rounds. There is no universal receipt/floor subsystem.
 
+### Memory physical calls
+
+M1 adds stable inference clients and physical calls beside `writes` through the
+same writer. The client owns a persistent monotonic signed-64 admission sequence;
+rotation does not change ownership/reset it. One admission transaction binds receipt,
+sequence and call. Private content stays outside SQLite/events. State is queued,
+sending, succeeded, failed, cancelled, unknown or released. The exact
+[Core DTOs](../../crates/eliot-core/src/api/inference.rs) own types/bounds. Only a
+committed queued-to-sending transition grants one native attempt; unknown is never
+replayed. Release fences publication; cleanup completion is separate readback.
+Ordinary retention excludes inference writes pending the dedicated retention
+increment. The [API](api.md#memory-one-shot-inference-m1-199) owns credentials/release.
+
 ## Agent
 
 ```text
@@ -477,6 +490,21 @@ Use bundled SQLite, WAL, synchronous FULL, one writer and bounded read queries. 
 failure blocks new writes/dispatch and never repeats the external cause. The SQL below
 is a compact view of current table shapes, not a migration script or a requirement to
 create unused subsystems. Exact schema evolution lives in numbered migrations.
+
+Already queued `var.set` writes may share one bounded Store transaction (see
+`MAX_VAR_WRITE_GROUP` in Store coordination). They execute in queue order with
+individual authority/generation, idempotency and CAS checks. A domain rejection
+rolls back only that request's savepoint; a persistence failure rolls back the
+new writes together and faults the writer. Publish ordered events and acknowledge
+each successful request only after the shared FULL-WAL commit. Exact retained
+retries remain readable after a writer fault. Grouping adds no wait timer and
+never groups native effects or changes source-batch cursor/ACK boundaries.
+The bounded queue has one owned consumer. Shutdown closes its admission and joins
+all admitted writes before replying or releasing daemon ownership. Queued Agent
+writes recheck current generation at the Store boundary; new effects also require
+nonterminal state. A retained exact retry may still return its earlier result after
+a same-generation stop. An unexpected consumer exit closes admission and reports
+undelivered outcomes as unknown, never replaying them.
 
 Public numeric ids use `INTEGER PRIMARY KEY AUTOINCREMENT`. Ordinary `INTEGER PRIMARY
 KEY` can reuse a deleted high rowid and break replay cursors. Never reset sqlite_sequence

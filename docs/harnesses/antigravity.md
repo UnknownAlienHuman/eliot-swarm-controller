@@ -14,8 +14,9 @@ Subject: `(canonical auth/config scope, exact ACP sessionId)`.
 agy acp --stdio --dangerously-skip-permissions=false|true --add-dir <hook-discovery-root>
 ```
 
-Installed CLI surface (observed 2026-11-13, read-only `--version`/`--help`):
-`agy.exe` reports version 1.5.3. `agy acp` accepts `--add-dir` (repeatable),
+Installed CLI surface (observed 2026-11-15, read-only `--version`/`--help`;
+1.5.3 on 2026-11-13):
+`agy.exe` reports version 1.5.9. `agy acp` accepts `--add-dir` (repeatable),
 `--agent`, `--app-data-dir`, `--cli_dir_name`, `--cli_log_file`/`--log-file`,
 `--cloud_code_endpoint`, `--dangerously-skip-permissions`, `--disable-telemetry`,
 `--gemini-dir`, `--ide-mcp-port`, `--include-default-customizations`,
@@ -176,8 +177,10 @@ directory (`<instance>-hooks/.agents/hooks.json`, a sibling of the private
 instance directory holding nothing else: no tokens, logs, state, or sockets)
 and passes that directory as the only `--add-dir` root, for both fresh starts
 and resumed sessions; hook delivery itself is unchanged. The root is a
-plain absolute path: agy 1.5.3 builds `file://` URLs from its workspace
-roots and rejects the escaped `?` of a Windows verbatim (`\\?\`) path,
+plain absolute path: agy builds `file://` URLs from its workspace
+roots and rejects the escaped `?` of a Windows verbatim (`\\?\`) path
+(observed against agy 1.5.3; installed CLI is now 1.5.9 and the plugin
+still stages the root without that prefix),
 dropping the whole root and its hooks without firing, so the staged root
 is stored without that prefix (it names the identical directory). The real
 workspace remains the ACP cwd, and the private instance directory is never a native
@@ -358,8 +361,8 @@ An unmanaged Antigravity workspace can also discover Eliot Swarm via its native 
 `.agents/plugins/eliot-swarm/plugin.json` and `mcp_config.json`. The configuration declares
 a stdio MCP server invoking `swarm --data-dir <PATH> mcp`.
 
-Mutations require caller-supplied ULIDs in `params`; the server adds no auto-generated identifiers,
-automatic retries, defaults, or speculative rollbacks. Output frames and stdio line writes are
+Mutations carry a caller-retained ULID in `params.id`; MCP callers may omit it and the server mints a ULID
+and returns it in the reply for exact retry. The server adds no automatic retries, defaults, or speculative rollbacks. Output frames and stdio line writes are
 strictly bounded to [`MAX_RPC_FRAME_BYTES`](../../crates/eliot-daemon/src/daemon.rs) (4 MiB) via
 [`BoundedLineWriter`](../../crates/eliot/src/mcp/bounded_io.rs).
 
@@ -367,9 +370,9 @@ strictly bounded to [`MAX_RPC_FRAME_BYTES`](../../crates/eliot-daemon/src/daemon
 
 This harness keeps `inherit` only: the frozen profile always records
 `mcp = "inherit"`, and a non-`inherit` policy is rejected as `unsupported`
-at config load. Verified read-only (`agy acp --help`): the ACP server flags
-expose no MCP isolation mechanism (no strict/ignore-MCP flag; `--settings`
-is an unverified session-settings surface, not a verified isolation
+at config load. Verified read-only (`agy acp --help`, installed 1.5.9): the ACP server flags
+expose no MCP isolation mechanism (no strict/ignore-MCP flag; the documented
+top-level `--settings` is a session-only settings surface, not a verified isolation
 mechanism), so no `minimal` mechanism is implemented.
 
 ## Permissions and final checks

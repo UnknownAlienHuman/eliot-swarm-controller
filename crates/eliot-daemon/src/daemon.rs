@@ -13,7 +13,7 @@ use eliot_core::{
 };
 use eliot_plugin::{RpcError, RpcRequest, RpcResponse};
 use futures_util::{SinkExt, StreamExt};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
     fs::File,
@@ -32,6 +32,41 @@ use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 pub const MAX_RPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
+/// Nonsemantic IPC timings. Handler time includes authentication, lock waits and
+/// Store work; the remaining round trip includes framing/serialization and I/O.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CallTimings {
+    pub connect_ns: u64,
+    pub round_trip_ns: u64,
+    pub decode_ns: u64,
+    pub handle_ns: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HandleTiming {
+    handle_ns: u64,
+}
+
+fn nanos(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+/// Measure the same authenticated client path, with no retry after uncertain
+/// delivery. Timings are diagnostic metadata, never part of a durable result.
+pub async fn client_call_measured(
+    path: &Path,
+    method: &str,
+    params: Value,
+) -> Result<(Value, CallTimings)> {
+    validate_client_call(method, &params)?;
+    let identity = caller_identity_for_target(path)?;
+    let mut timings = CallTimings::default();
+    let value =
+        client_call_with_identity_measured(path, method, params, identity, Some(&mut timings))
+            .await?;
+    Ok((value, timings))
+}
 const MAX_CLIENTS: usize = 128;
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(35);
 const OVERLOAD_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -98,6 +133,7 @@ async fn run_owned(
     let recovered = {
         let mut store = store.lock().await;
         let events = store.recover_on_restart(now_ms())?;
+        store.inference_recover()?;
         bus.publish(&events);
         events
     };
@@ -440,6 +476,7 @@ async fn run_owned(
     if outcome.is_err() {
         router.request_force().await;
     }
+    router.finish_var_writes().await;
     cloud_mcp_shutdown.cancel();
     while let Some(joined) = cloud_mcp_tasks.join_next().await {
         match joined {
@@ -588,6 +625,16 @@ async fn client_call_with_identity(
     params: Value,
     identity: ClientIdentity,
 ) -> Result<Value> {
+    client_call_with_identity_measured(path, method, params, identity, None).await
+}
+
+async fn client_call_with_identity_measured(
+    path: &Path,
+    method: &str,
+    params: Value,
+    identity: ClientIdentity,
+    timings: Option<&mut CallTimings>,
+) -> Result<Value> {
     let data_dir = DataDir::open_existing(path).map_err(|error| with_connect_hint(path, error))?;
     let info = data_dir
         .read_daemon_info()
@@ -624,7 +671,7 @@ async fn client_call_with_identity(
     };
     let credential = auth["credential"].as_str().unwrap_or("");
     let policy = SecretPolicy::new([credential]);
-    raw_client_call(&info.endpoint, method, params, auth, &policy)
+    raw_client_call_measured(&info.endpoint, method, params, auth, &policy, timings)
         .await
         .map_err(|error| with_connect_hint(path, error))
 }
@@ -715,6 +762,17 @@ async fn raw_client_call(
     auth: Value,
     policy: &SecretPolicy,
 ) -> Result<Value> {
+    raw_client_call_measured(endpoint, method, params, auth, policy, None).await
+}
+
+async fn raw_client_call_measured(
+    endpoint: &str,
+    method: &str,
+    params: Value,
+    auth: Value,
+    policy: &SecretPolicy,
+    mut timings: Option<&mut CallTimings>,
+) -> Result<Value> {
     let mut envelope = serde_json::Map::new();
     let id = auth
         .get("remote_call")
@@ -723,6 +781,9 @@ async fn raw_client_call(
         .unwrap_or_else(|| Value::String(Ulid::new().to_string()));
     envelope.insert("_auth".to_owned(), auth);
     envelope.insert("_payload".to_owned(), params.clone());
+    if timings.is_some() {
+        envelope.insert("_timing".to_owned(), Value::Bool(true));
+    }
 
     let request = RpcRequest {
         jsonrpc: "2.0".to_owned(),
@@ -739,6 +800,7 @@ async fn raw_client_call(
     // Connect first, on its own: the handshake writes no request bytes, so a
     // connect timeout or refusal positively establishes zero bytes written
     // and stays a retryable `unavailable` — nothing was admitted.
+    let connect_started = Instant::now();
     let stream = timeout_at(deadline, IpcStream::connect(endpoint, deadline))
         .await
         .map_err(|_| {
@@ -747,6 +809,9 @@ async fn raw_client_call(
                 "daemon IPC connect deadline elapsed before any request was sent",
             )
         })??;
+    if let Some(timing) = timings.as_deref_mut() {
+        timing.connect_ns = nanos(connect_started.elapsed());
+    }
     let mut framed = Framed::new(
         stream,
         LinesCodec::new_with_max_length(MAX_RPC_FRAME_BYTES.saturating_sub(1)),
@@ -755,6 +820,7 @@ async fn raw_client_call(
     // send can no longer prove non-execution: `LinesCodec::decode_eof` yields
     // a trailing unterminated line, so the daemon may admit a request the
     // client never sees answered. Send-phase failures are `unknown`.
+    let round_trip_started = Instant::now();
     timeout_at(deadline, framed.send(frame))
         .await
         .map_err(|_| Error::new("unknown", "daemon RPC exceeded its absolute deadline"))?
@@ -766,14 +832,43 @@ async fn raw_client_call(
         .map_err(|_| Error::new("unknown", "daemon RPC exceeded its absolute deadline"))?
         .ok_or_else(|| Error::new("unknown", "daemon closed the RPC connection"))?
         .map_err(|_| Error::new("unknown", "daemon response frame is invalid"))?;
+    if let Some(timing) = timings.as_deref_mut() {
+        timing.round_trip_ns = nanos(round_trip_started.elapsed());
+    }
     if line.len().saturating_add(1) > MAX_RPC_FRAME_BYTES {
         return Err(Error::new(
             "unknown",
             "daemon response exceeds the 4 MiB frame limit",
         ));
     }
-    let response: RpcResponse = serde_json::from_str(&line)
-        .map_err(|_| Error::new("unknown", "daemon response is malformed"))?;
+    let decode_started = Instant::now();
+    #[derive(Deserialize)]
+    struct TimedResponse {
+        #[serde(flatten)]
+        response: RpcResponse,
+        #[serde(default)]
+        _timing: Option<Value>,
+    }
+    let (response, handle_ns) = if timings.is_some() {
+        let decoded: TimedResponse = serde_json::from_str(&line)
+            .map_err(|_| Error::new("unknown", "daemon response is malformed"))?;
+        (
+            decoded.response,
+            decoded
+                ._timing
+                .and_then(|timing| timing.get("handle_ns").and_then(Value::as_u64)),
+        )
+    } else {
+        (
+            serde_json::from_str::<RpcResponse>(&line)
+                .map_err(|_| Error::new("unknown", "daemon response is malformed"))?,
+            None,
+        )
+    };
+    if let Some(timing) = timings {
+        timing.decode_ns = nanos(decode_started.elapsed());
+        timing.handle_ns = handle_ns;
+    }
     if response.jsonrpc != "2.0" || response.id != id {
         return Err(Error::new(
             "unknown",
@@ -896,10 +991,13 @@ async fn serve_connection_with_write_timeout(
     );
     let mut arm_shutdown = false;
     let incoming = timeout_at(Instant::now() + DEFAULT_CALL_TIMEOUT, framed.next()).await;
+    let handle_started = Instant::now();
+    let mut measured = false;
     let response = match incoming {
         Ok(Some(Ok(line))) if line.len().saturating_add(1) <= MAX_RPC_FRAME_BYTES => {
             match decode_request(&line) {
                 Ok(request) => {
+                    measured = request.params.get("_timing") == Some(&Value::Bool(true));
                     let is_shutdown = request.method == "daemon.shutdown";
                     match router.handle_rpc(&request).await {
                         Ok(result) => {
@@ -952,7 +1050,30 @@ async fn serve_connection_with_write_timeout(
         Ok(None) | Err(_) => return,
     };
 
-    let wrote_response = match serde_json::to_string(&response) {
+    let handle_ns = nanos(handle_started.elapsed());
+    let mut encoded = if measured {
+        #[derive(Serialize)]
+        struct TimedResponse<'a> {
+            #[serde(flatten)]
+            response: &'a RpcResponse,
+            _timing: HandleTiming,
+        }
+        serde_json::to_string(&TimedResponse {
+            response: &response,
+            _timing: HandleTiming { handle_ns },
+        })
+    } else {
+        serde_json::to_string(&response)
+    };
+    if measured
+        && encoded
+            .as_ref()
+            .is_ok_and(|frame| frame.len().saturating_add(1) > MAX_RPC_FRAME_BYTES)
+    {
+        // Optional diagnostics never displace a semantic result that fits.
+        encoded = serde_json::to_string(&response);
+    }
+    let wrote_response = match encoded {
         Ok(frame) if frame.len().saturating_add(1) <= MAX_RPC_FRAME_BYTES => {
             send_response_frame(&mut framed, frame, write_timeout).await
         }
@@ -2033,6 +2154,49 @@ mod tests {
             Arc::new(Mutex::new(store)),
             crate::bus::Bus::new(16),
         )
+    }
+
+    #[tokio::test]
+    async fn timing_metadata_is_opt_in_and_does_not_bypass_authentication() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        for (option, credential, success) in [
+            (None, "owner-credential", true),
+            (Some(json!(true)), "owner-credential", true),
+            (Some(json!(true)), "wrong", false),
+            (Some(json!(1)), "owner-credential", false),
+        ] {
+            let (mut peer, server) = tokio::io::duplex(8192);
+            let mut params =
+                json!({"_auth":{"kind":"owner", "credential":credential}, "_payload":{}});
+            if let Some(option) = &option {
+                params["_timing"] = option.clone();
+            }
+            let frame = json!({"jsonrpc":"2.0", "id":"measured", "method":"events.bounds", "params":params});
+            peer.write_all(format!("{frame}\n").as_bytes())
+                .await
+                .unwrap();
+            let task = tokio::spawn(serve_connection(
+                IpcStream::from_test_stream(server),
+                test_router(),
+                Arc::new(SecretPolicy::new(["owner-credential"])),
+            ));
+            let mut line = String::new();
+            tokio::io::BufReader::new(peer)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            let response: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response["id"], "measured");
+            assert_eq!(response.get("result").is_some(), success);
+            assert_eq!(
+                response.get("_timing").is_some(),
+                option == Some(json!(true))
+            );
+            if success {
+                assert_eq!(response["result"], json!({"hi":0, "pruned_through":0}));
+            }
+            task.await.unwrap();
+        }
     }
 
     #[tokio::test]

@@ -44,8 +44,11 @@ owning specs; do not reproduce them in every page. Existing IDs remain stable fo
 
 | D-37 | Use official `rmcp` 3.9.0 for the stdio server (`server` + `transport-io`). | SDK transport only; management authority and semantics stay in the existing authenticated API. [API](spec/api.md#mcp-stdio-server) |
 
+| D-38 | M1 uses one scoped Memory text profile through fresh tool-free Claude print mode, with native retries disabled. | Owner brought #199 into scope on 2026-11-14. Claude 2.1.325 exposes explicit tool/session/retry controls. The Codex Agent adapter is not an inference adapter. [API](spec/api.md#memory-one-shot-inference-m1-199) |
+| D-39 | Memory credentials use random private files plus Store version/hash, with exact idempotent staged rotation. | Recoverable publication needs no key hierarchy. Stable client owns calls across rotation. Backup-aware release/retention and previous-credential retirement remain later increments. |
+
 ## Defaults
 
 Direct Codex first; configured native model only. Optional vendors do not block the
 selected release. Git identity is per Agent unless `git_identity="inherit"`. Native
-children without isolated environment have no independent CLI principal. Owner cloud MCP is current L6.7; multi-host service continuity, GUI and Memory OS remain later.
+children without isolated environment have no independent CLI principal. Owner cloud MCP is current L6.7; Memory one-shot inference is the bounded M1 increment. Multi-host service continuity remains later; the optional desktop companion is tracked in the roadmap.

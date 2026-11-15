@@ -888,7 +888,7 @@ quota. A held scope blocks new launch/send and queued dispatch without native ef
 plain resume, reads, request replies, interrupt and stop remain available. Resume with
 new text is gated as a linked send. Rate/quota probe and auth/model-removal correction rules are in
 [monitoring](monitoring.md#provider-holds). Holds never trigger automatic route, model
-or account fallback. Billing and usage discovery remain unsupported.
+or account fallback. Billing discovery remains unsupported; provider quota reads back through `harness.quota` and usage totals through `usage.summary`.
 
 ## Plugins
 

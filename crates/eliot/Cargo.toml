@@ -12,6 +12,9 @@ workspace = true
 name = "swarm"
 path = "src/main.rs"
 
+[dev-dependencies]
+jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
 

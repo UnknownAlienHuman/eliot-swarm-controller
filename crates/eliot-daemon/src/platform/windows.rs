@@ -47,7 +47,7 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Pipes::{
     CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
-    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
@@ -56,6 +56,45 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SYNCHRONIZE, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
+
+/// Availability is only a connect hint: another client may win the instance.
+/// This writes no request bytes and keeps the caller's original deadline.
+/// https://learn.microsoft.com/windows/win32/api/namedpipeapi/nf-namedpipeapi-waitnamedpipew
+pub(super) async fn wait_pipe_available(endpoint: &str, until: tokio::time::Instant) -> Result<()> {
+    let endpoint = endpoint.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::new(
+                "unavailable",
+                "daemon IPC connect deadline elapsed before any request was sent",
+            ));
+        }
+        // Zero selects the server default and MAX waits forever; use neither.
+        let milliseconds = remaining.as_millis().clamp(1, u32::MAX as u128 - 1) as u32;
+        let wide: Vec<u16> = endpoint.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: wide is NUL-terminated and lives through the bounded call.
+        if unsafe { WaitNamedPipeW(wide.as_ptr(), milliseconds) } != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_SEM_TIMEOUT as i32) {
+            Err(Error::new(
+                "unavailable",
+                "daemon IPC connect deadline elapsed before any request was sent",
+            ))
+        } else {
+            Err(io_error("wait for daemon named pipe", error))
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            "unavailable",
+            "daemon IPC availability wait failed before any request was sent",
+        )
+    })?
+}
 
 pub(crate) fn start_background_daemon(data_dir: &Path) -> Result<()> {
     let executable =
