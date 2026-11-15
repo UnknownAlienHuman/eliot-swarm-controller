@@ -8,7 +8,8 @@ use eliot_plugin::{
     AgentStartParams,
     native_transport::NativeLaunch,
     session::{
-        optional_profile_text, parse_resume_subject, target_environment, validate_source_plan,
+        TargetEnvironment, optional_profile_text, parse_resume_subject, target_environment,
+        validate_source_plan,
     },
 };
 use serde_json::{Value, json};
@@ -137,7 +138,7 @@ fn unique_environment_value<'a>(
 }
 
 #[cfg(windows)]
-fn prepend_system32_to_path(environment: &mut Vec<(OsString, OsString)>) -> Result<()> {
+pub(crate) fn prepend_system32_to_path(environment: &mut Vec<(OsString, OsString)>) -> Result<()> {
     let system_root = std::env::var_os("SystemRoot")
         .or_else(|| std::env::var_os("WINDIR"))
         .ok_or_else(|| {
@@ -495,11 +496,12 @@ fn config_scope(environment: &[(OsString, OsString)]) -> Result<String> {
 /// Translate a requested CLI model id into the ACP session vocabulary.
 /// The ACP `model` selector carries base family ids only (observed:
 /// `gemini-3.8-flash`, `gemini-4-argon`, …); the effort suffix lives in
-/// the separate `thought_level` selector (`low|medium|high`). Only those
-/// three suffixes translate; any other suffix stays part of the base id
-/// and will be rejected by the server instead of guessed at.
+/// the separate `thought_level` selector (`low|medium|high|xhigh`, the
+/// documented `agy models` suffixes of agy 1.5.9). Only those four suffixes
+/// translate; any other suffix stays part of the base id and will be
+/// rejected by the server instead of guessed at.
 pub(crate) fn translate_model(model: &str) -> (String, Option<String>) {
-    for level in ["low", "medium", "high"] {
+    for level in ["low", "medium", "high", "xhigh"] {
         if let Some(base) = model.strip_suffix(&format!("-{level}"))
             && !base.is_empty()
         {
@@ -507,6 +509,48 @@ pub(crate) fn translate_model(model: &str) -> (String, Option<String>) {
         }
     }
     (model.to_owned(), None)
+}
+
+/// Build the child environment for the read-only `model.list` catalogue
+/// probe: the same construction as the launch path (`target_environment`
+/// over the frozen `pass_env` names plus the Windows `System32` prepend),
+/// resolved from the plugin's own minimal process environment. Agent
+/// identity is never added here: discovery carries no Agent credentials, and
+/// a frozen `pass_env` naming an `ELIOT_AGENT_` variable is refused rather
+/// than leaked into the child.
+pub(crate) fn reader_environment(snapshot: &Value) -> Result<TargetEnvironment> {
+    let mut object = serde_json::Map::new();
+    if let Some(names) = snapshot.get("pass_env").and_then(Value::as_array) {
+        for name in names.iter().filter_map(Value::as_str) {
+            if name
+                .get(..12)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ELIOT_AGENT_"))
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "discovery cannot receive Agent identity or tokens",
+                ));
+            }
+            if let Some(value) = std::env::var_os(name) {
+                let value = value.into_string().map_err(|_| {
+                    Error::new(
+                        "invalid",
+                        "Antigravity model.list environment is not valid Unicode",
+                    )
+                })?;
+                object.insert(name.to_owned(), Value::String(value));
+            }
+        }
+    }
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut environment = target_environment(
+        Some(&Value::Object(object)),
+        snapshot.get("pass_env"),
+        "Antigravity",
+    )?;
+    #[cfg(windows)]
+    prepend_system32_to_path(&mut environment.variables)?;
+    Ok(environment)
 }
 
 fn native_args(
@@ -569,6 +613,54 @@ mod tests {
             "tool": "stream",
         }));
         params
+    }
+
+    #[test]
+    fn translate_model_maps_the_documented_effort_suffixes() {
+        // The documented `agy models` suffixes (agy 1.5.9); `-high` already
+        // mapped to `thought_level`, so `-xhigh` maps too. Anything else
+        // stays a verbatim base id for the server to verify, never guessed.
+        for (model, base, level) in [
+            ("gemini-4-argon-low", "gemini-4-argon", "low"),
+            ("gemini-3.8-flash-medium", "gemini-3.8-flash", "medium"),
+            ("gemini-3.8-flash-high", "gemini-3.8-flash", "high"),
+            ("gemini-4-hydrogen-xhigh", "gemini-4-hydrogen", "xhigh"),
+        ] {
+            assert_eq!(
+                translate_model(model),
+                (base.to_owned(), Some(level.to_owned())),
+                "{model}"
+            );
+        }
+        for model in [
+            "gemini-pro-orchestrator-g1-pro",
+            "gpt-oss-120b-medium-evil",
+            "gpt-oss-120b-max",
+            "-xhigh",
+            "xhigh",
+        ] {
+            assert_eq!(translate_model(model), (model.to_owned(), None), "{model}");
+        }
+    }
+
+    #[test]
+    fn reader_environment_maps_pass_env_without_agent_identity() {
+        let env =
+            reader_environment(&json!({"harness": "antigravity", "cmd": "agy", "pass_env": []}))
+                .expect("empty pass_env maps");
+        assert!(
+            env.variables
+                .iter()
+                .any(|(name, _)| name == "PATH" || name == "Path"),
+            "the Windows child keeps a PATH entry (System32 first)"
+        );
+        let error = match reader_environment(
+            &json!({"harness": "antigravity", "cmd": "agy", "pass_env": ["ELIOT_AGENT_TOKEN"]}),
+        ) {
+            Ok(_) => panic!("Agent identity must not reach discovery"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "not_allowed");
     }
 
     #[test]

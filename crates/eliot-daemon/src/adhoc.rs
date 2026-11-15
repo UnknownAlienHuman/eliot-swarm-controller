@@ -147,6 +147,10 @@ pub(crate) fn adhoc_snapshot(
         .filter(|value| !value.trim().is_empty())
         .map(|value| validate_adhoc_effort(&harness, value))
         .transpose()?;
+    // Catalogue snapshots (`AdhocAuth::Skip`) freeze no model: the `agy
+    // models` reader needs only the frozen cmd. Launches still require an
+    // explicit model.
+    let catalogue_only = matches!(auth, AdhocAuth::Skip);
     let auth = match auth {
         AdhocAuth::Skip => None,
         AdhocAuth::Resolve(explicit) => Some(
@@ -156,7 +160,7 @@ pub(crate) fn adhoc_snapshot(
                 .transpose()?,
         ),
     };
-    if harness == "antigravity" && model.is_none() {
+    if harness == "antigravity" && model.is_none() && !catalogue_only {
         return Err(core::Error::new(
             "profile_error",
             "ad-hoc antigravity launch requires an explicit model",
@@ -786,7 +790,18 @@ fn discover_muse_cmd(launcher_dir: &Path) -> core::Result<String> {
 }
 
 fn discover_antigravity_cmd() -> core::Result<String> {
-    let mut searched: Vec<String> = Vec::new();
+    // The `agy` CLI serves both `acp` (launch) and `models` (catalogue);
+    // prefer it over the Electron app path, which boots the IDE and serves
+    // neither (observed 2026-11-15: `Antigravity.exe --version` starts the
+    // app instead of printing a version, while `agy --version` prints 1.5.9
+    // and `agy models` lists the catalogue).
+    if let Some(found) = find_on_path("agy.exe").or_else(|| find_on_path("agy")) {
+        let path = found.to_string_lossy().into_owned();
+        if !is_script_wrapper(&path) && Path::new(&path).is_absolute() {
+            return Ok(path);
+        }
+    }
+    let mut searched: Vec<String> = vec!["agy.exe on PATH".to_owned()];
     for local in local_roots() {
         let native = local
             .join("Programs")
@@ -797,15 +812,6 @@ fn discover_antigravity_cmd() -> core::Result<String> {
             return Ok(native.to_string_lossy().into_owned());
         }
     }
-    // The harness page speaks ACP through `agy`; if only that binary is
-    // present the Electron app path above cannot serve it.
-    if find_on_path("agy.exe").is_some() || find_on_path("agy").is_some() {
-        return Err(core::Error::new(
-            "unsupported",
-            "antigravity harness needs its ACP binary (agy); the installed Antigravity.exe app path does not serve ACP",
-        ));
-    }
-    searched.push("agy.exe on PATH (ACP binary probe)".to_owned());
     Err(core::Error::new(
         "unsupported",
         format!(
@@ -1143,6 +1149,23 @@ mod tests {
             validate_adhoc_auth("codex", "openrouter").unwrap_err().code,
             "unsupported"
         );
+    }
+
+    #[test]
+    fn adhoc_catalog_snapshot_freezes_antigravity_cmd_without_model() {
+        // The `agy models` reader needs only the frozen cmd: a catalogue
+        // snapshot freezes no model, while launches still require one.
+        let snapshot = adhoc_snapshot(
+            "antigravity",
+            None,
+            None,
+            Some(r"C:\bin\agy.exe".to_owned()),
+            AdhocAuth::Skip,
+        )
+        .unwrap();
+        assert_eq!(snapshot["harness"], json!("antigravity"));
+        assert_eq!(snapshot["cmd"], json!(r"C:\bin\agy.exe"));
+        assert!(snapshot.get("model").is_none());
     }
 
     #[test]

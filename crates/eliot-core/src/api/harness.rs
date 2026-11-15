@@ -3,9 +3,9 @@
 //! `harness.list` reports per-harness installation facts without starting a
 //! model turn and without inference. `harness.models` returns the harness's
 //! own read-only catalogue (Codex/Muse native `model/list`, the OpenCode
-//! provider/model list; Claude exposes aliases plus the CLI default, and
-//! Antigravity has no catalogue), cached per native route/account with a
-//! freshness timestamp and a nonsecret credential identity. `harness.quota`
+//! provider/model list, Antigravity `agy models`; Claude exposes aliases plus
+//! the CLI default), cached per native route/account with a freshness
+//! timestamp and a nonsecret credential identity. `harness.quota`
 //! reports provider-supported account quota readback with timestamp, scope,
 //! an explicit supported/unsupported/unknown status and provider-verbatim
 //! `details` when supported (Codex `account/rateLimits/read` plus

@@ -239,6 +239,10 @@ impl Plugin {
                 "unsupported",
                 "Antigravity exposes no verified metadata-only native-store readback",
             )),
+            "model.list" => self
+                .model_list(&request.params)
+                .await
+                .map(DispatchOutcome::Immediate),
             "agent.start" => self
                 .start(&request.params, peer)
                 .await
@@ -318,6 +322,53 @@ impl Plugin {
             .as_mut()
             .ok_or_else(|| Error::new("unknown", "Antigravity session is no longer retained"))?
             .settle_steer(seq, generation, command_id, turn_id, outcome)
+    }
+
+    /// Read-only native model catalogue for `harness.models`. A dedicated
+    /// reader instance runs the frozen snapshot `cmd` with exact argv
+    /// `models`, bounded by [`crate::native::MODELS_TIMEOUT`] and the output
+    /// cap, with the same environment construction as the launch path. No
+    /// session, no turn, no input and no inference. Ids are returned verbatim;
+    /// `agy models` names no default, so `default` stays null.
+    async fn model_list(&self, raw: &Value) -> Result<Value> {
+        if self.session.is_some() || self.start.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Antigravity model.list requires a dedicated reader plugin instance",
+            ));
+        }
+        let profile: Value = decode(raw, "Antigravity model.list params are invalid")?;
+        let snapshot = profile.get("profile").unwrap_or(&profile);
+        if snapshot.get("harness").and_then(Value::as_str) != Some("antigravity") {
+            return Err(Error::new(
+                "profile_error",
+                "Antigravity model.list received another harness",
+            ));
+        }
+        let program = snapshot
+            .get("cmd")
+            .and_then(Value::as_str)
+            .filter(|cmd| !cmd.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "profile_error",
+                    "Antigravity model.list requires a frozen native cmd",
+                )
+            })?;
+        let environment = crate::profile::reader_environment(snapshot)?;
+        // The catalogue errors are static typed strings (stderr is discarded,
+        // like every other helper), so there is no native text to redact.
+        let ids = crate::native::run_models(
+            std::ffi::OsStr::new(program),
+            &environment.variables,
+            Instant::now() + crate::native::MODELS_TIMEOUT,
+        )
+        .await?;
+        let models: Vec<Value> = ids
+            .into_iter()
+            .map(|id| json!({"id": id, "default": false}))
+            .collect();
+        Ok(json!({"models": models, "default": Value::Null}))
     }
 
     fn bound(&mut self, agent: &str, generation: i64) -> Result<&mut Session> {
