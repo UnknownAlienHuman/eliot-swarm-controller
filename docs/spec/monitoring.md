@@ -652,3 +652,12 @@ active/unknown turn/input/transition gate, source owner/cursor/gap, custody
 capability/orphans, provider hold, workspace phase, requested/effective route and
 Git/edit facts. A stale or unknown value is shown explicitly, never hidden or converted
 to zero.
+
+Fleet usage cells (`agent.list`, `swarm ls`, `swarm top`) prefer the newest
+terminal turn's native turn usage. When the last turn carries none, they fall
+back to the generation's latest retained `session.usage` snapshot (cumulative
+counters only, never a derived total) with the `usage_scope: "session"`
+marker; turn-backed usage carries `"turn"`. The fallback is fleet
+visibility, never turn expenditure: per-turn accounting stays on
+`usage.summary`, whose `turns_without_usage` and per-counter coverage name
+exactly what the native stream did not supply.

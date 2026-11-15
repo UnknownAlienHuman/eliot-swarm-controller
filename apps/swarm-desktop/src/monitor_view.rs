@@ -10,7 +10,7 @@ use windows_reactor::*;
 
 use crate::monitor::{
     self, DetailRead, GRAPH_BARS, Monitor, MonitorRow, Point, bytes_label, cpu_time_label,
-    state_name,
+    state_name, tokens_label,
 };
 use crate::theme;
 
@@ -78,11 +78,13 @@ fn row_view(row: &MonitorRow) -> View {
                     "RSS {} · {} · {}",
                     bytes_label(row.obs.rss_bytes()),
                     cpu_time_label(row.obs.cpu_time_ns()),
-                    row.obs.freshness()
+                    row.obs.freshness(),
+                    tokens_label(row)
                 ))
                 .opacity(theme::MUTED_OPACITY),
             )),
         )
+
 }
 
 /// Native bar sparkline: one `Border` per point, unknown points drawn as a

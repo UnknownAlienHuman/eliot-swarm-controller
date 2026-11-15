@@ -127,13 +127,32 @@ separate verb above with its own exact-turn queue and mechanism. Neither is
 Terminal `result.usage` covers only the current user turn's main loop
 (subagents excluded) and maps to `TurnUsage` at `main_loop_turn` scope with
 `message_id` null; `result.modelUsage` and `total_cost_usd` are
-cumulative/estimated and are never turn expenditure. `total_cost_usd`
-maps to the retained `SessionUsage` snapshot committed as `session.usage`
-(source `claude:result`) with unit `usd_estimate`, never converted;
-`result.modelUsage` stays unmapped. Only genuinely supplied
-nonnegative counters project (`input_tokens`, `output_tokens`,
-`cache_read_input_tokens`, `cache_creation_input_tokens`); missing or
-wholly malformed usage stays null so completion proceeds.
+cumulative/estimated and are never turn expenditure. `result.modelUsage`
+sums per model into the retained `SessionUsage` snapshot's
+`cumulative_tokens` (`inputTokens`, `outputTokens`, `cacheReadInputTokens`,
+`cacheCreationInputTokens`; per-model `costUSD` is ignored because the
+session cost authority is `total_cost_usd` below) and `total_cost_usd` maps
+to its `cumulative_cost` with unit `usd_estimate`, never converted; both
+commit as `session.usage` (source `claude:result`). Only genuinely supplied
+nonnegative counters project; missing or wholly malformed usage stays null
+so completion proceeds.
+
+Native tool calls arrive as `assistant` message `tool_use` content blocks
+(`id` plus tool `name`) with the matching outcome in `user` message
+`tool_result` blocks (`tool_use_id` plus the frame's own `is_error`
+verdict). The adapter commits `tool.started` per `tool_use` block and
+`tool.completed` per matching `tool_result` block, bound to the exact
+turn and generation with the native `tool_use.id` as the item id
+(`status` `completed`, or `error` when `is_error` is true). Only
+main-thread blocks map: subagent-forwarded blocks carrying
+`parent_tool_use_id` stay out, exactly like subagent text. A `tool_result`
+with no known `tool_use` on the turn, or a `tool_use` with no name, is a
+coverage gap, never a guessed tool. Verified against the stream-json
+record shapes the installed CLI emits (`--help` stream-json
+`--output-format`/`--input-format` surface; shapes per the Agent SDK
+`ModelUsage` and message `content[]` `tool_use`/`tool_result` docs,
+checked against installed 2.1.325; result-frame capture in
+`plugins/claude/src/events.rs` `result_terminal_completed_settles_success`).
 
 ## Hook tool diagnostics
 
@@ -154,15 +173,20 @@ unchanged. The wire `HookEvent` request shape is untouched.
 ## Source ownership and recovery
 
 The stream-json stdout stream owns supplied session/turn/message/tool/usage facts.
+Main-thread `assistant` `tool_use` blocks commit `tool.started` and the
+matching main-thread `user` `tool_result` blocks commit `tool.completed`,
+each bound to the exact active turn with the native `tool_use.id` as the
+item id (see Native mapping).
 A terminal `result` record's `usage` is mapped, when genuinely supplied as
 nonnegative counters, into `turn.completed` `data.usage` at `main_loop_turn`
 scope with `message_id` null: with persistent streaming input it covers only
 the current user turn's main loop (subagents excluded). Cumulative/estimated
-`modelUsage` is never a turn total and is not persisted; `total_cost_usd`
+`modelUsage` is never a turn total: it sums per model into the
+session-scoped `cumulative_tokens` in `session.usage`; `total_cost_usd`
 is persisted only as the session-scoped `cumulative_cost` in `session.usage`,
 never as usage or billing; unavailable/malformed individual counters stay null
 (other valid counters are retained), and no valid native counters means
-`data.usage` is omitted — never blocks or gaps the terminal.
+the corresponding fact is omitted — never blocks or gaps the terminal.
 Callbacks own missing permission/question decisions; hooks never mirror the same
 lifecycle. Assistant messages remain individually bounded. Aggregate terminal text
 and retained `last_turn` use the shared `MAX_EVENT_BYTES` budget: overflow drops
