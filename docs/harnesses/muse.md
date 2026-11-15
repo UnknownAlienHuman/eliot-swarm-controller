@@ -360,6 +360,230 @@ is still required to confirm effective posture.
 
 ## Worker MCP policy
 
+The installed Muse Code 1.4.0-R4161.1 stable and experimental exports
+(`muse schema generate-json-schema`, verified 2026-11-14) define native per-session
+MCP additions at `session/start.config.mcpServers` and
+`session/resume.config.mcpServers`. Initialization must request `sessionMcp` through
+`capabilities.requestedCapabilities` and check `grantedCapabilities`. A stdio entry
+requires `transport: "stdio"` and `command`, and accepts ordered `args`, runtime
+`env` additions, `framing` (`auto`, `contentLength`, `lineDelimitedJson`) and `mode`
+(`required`, `optional`). Defaults are automatic framing and required startup.
+The intended Eliot server is the current executable with arguments
+`["mcp", "--require-agent", "--data-dir", <Agent data root>]`, matching Codex and
+Claude's Agent-only server. No Codex `-c` override or owner-global config edit is
+needed by this native contract.
+
+The earlier `-32603 / session_mcp_base_unavailable` observation is not a
+documented configuration prerequisite or proof that this host cannot construct
+session MCP servers. Follow-up on 2026-11-14 tested the documented
+[settings directory](https://meta-models.github.io/muse-code-sdk/1.4/guides/extend/mcp-servers/)
+in fresh private directories, without changing the owner's config or creating a
+workspace `.mcp.json`. Exact construction sequence: set `XDG_CONFIG_HOME=<private
+config root>`; run `muse-bin-1.4.0-R4161.1.exe serve --disable-sandbox`; call
+`initialize` with `capabilities.requestedCapabilities=["sessionMcp"]`; send
+`initialized`; then call `session/start` with a fresh UUIDv7 `commandId`,
+`modelId="muse-spark-1.3-contributor"`, `workspaceRoot=<workspace>` and
+`approvalMode="allowAll"`. `HOME`, `USERPROFILE` and `XDG_DATA_HOME` were unchanged;
+no feature switch, login, credential copy or model turn was used.
+
+- **Empty settings plus session additions:** write
+  `<private config root>/muse/settings.json` as
+  `{"schema_version":1,"mcpServers":{}}`. Add
+  `config.mcpServers.eliot_swarm` to `session/start`, containing
+  `transport="stdio"`, the current swarm executable and arguments shown above,
+  `framing="lineDelimitedJson"`, and `mode="required"`.
+  Result: `sessionMcp` granted and session returned `status="idle"`, with no
+  native error. A fresh private config root with no settings file also accepted
+  the same construction, so a missing file alone does not explain the old error.
+- **Server declared in settings:** write the following instead, and omit
+  `session/start.config`. Result: the session again returned `status="idle"`,
+  with no native error. The same results held without a preceding `model/list`.
+
+  ```json
+  {
+    "schema_version": 1,
+    "mcpServers": {
+      "eliot-swarm": {
+        "type": "stdio",
+        "command": "<current swarm.exe>",
+        "args": ["mcp", "--require-agent", "--data-dir", "<private Eliot root>"],
+        "env": {
+          "ELIOT_AGENT_ID": "${ELIOT_AGENT_ID}",
+          "ELIOT_AGENT_GENERATION": "${ELIOT_AGENT_GENERATION}",
+          "ELIOT_AGENT_TOKEN": "${ELIOT_AGENT_TOKEN}",
+          "ELIOT_AGENT_DATA_DIR": "${ELIOT_AGENT_DATA_DIR}"
+        },
+        "required": true,
+        "startup_timeout_sec": 5
+      }
+    }
+  }
+  ```
+
+The settings-only copy follow-up (2026-11-14) copied the owner's actual
+`settings.json` byte-for-byte into a fresh private config root, retaining its
+`schema_version`, `model`, `reasoning_effort`, `tui` and both original
+`mcpServers` entries. Neither `auth.json` nor `trust.json` was copied. The first
+probe used Eliot's Windows
+[`BASE_ENVIRONMENT_NAMES`](../../crates/eliot-daemon/src/plugin_host/host.rs)
+when present, plus the private `XDG_CONFIG_HOME`; it preserved `PATH` and
+`USERPROFILE` and injected no provider credentials. All four probes used the
+same binary, workspace and `serve --disable-sandbox` arguments, negotiated
+`sessionMcp`, sent `initialized`, read `model/list`, then submitted the same
+`session/start` shape above with a fresh command id. Results:
+
+| Config root / environment | Session MCP additions | Native result |
+| --- | --- | --- |
+| Unchanged settings-only copy / plugin minimum | Present | Accepted, idle; `providerId="muse"` |
+| Unchanged settings-only copy / additional noncredential ambient variables | Present | Accepted, idle; `providerId="muse"` |
+| Normal config root / plugin minimum | Present | `-32603`, reason `session_mcp_base_unavailable` |
+| Normal config root / plugin minimum | Omitted | Accepted, idle; `providerId="meta"` |
+
+The complete copy was accepted, so the conditional entry-removal/transport
+bisection was not triggered: neither original server was removed or normalized.
+`codebase_memory.command` is an existing absolute executable, with no arguments;
+its explicit `CBM_CACHE_DIR` setting has no variable references. The original
+`context7` transport spelling and URL were retained. No missing plugin `PATH` or
+`USERPROFILE` defect was demonstrated. Owner settings bytes were unchanged
+before/after every probe; private roots contained only `settings.json`, and all
+owned hosts and observed descendants exited. No model turns were run.
+
+This localizes the refusal to the normal config/auth/runtime context; it does
+**not** establish an exact offending server entry, field, or native internal
+cause. In particular, copied settings can select the unauthenticated `muse`
+runtime while the normal root selects `meta`, so acceptance in the former does
+not prove those entries work in the latter. No owner-config normalization or
+plugin environment change is justified by this comparison alone. Native MCP
+startup/readiness still has no readback here, and constructor acceptance is not
+tool connectivity proof.
+
+Construction success does not qualify login or authenticated tools. On this
+Windows installation, `XDG_CONFIG_HOME` relocates `settings.json`, `auth.json` and
+`trust.json`; the normal login is in the owner's config root. It does not move
+`museHome`, sessions or the plugin cache: those remain under the data root
+(`XDG_DATA_HOME/muse`, default `~/.local/share/muse`; `MUSE_SESSIONS` can override
+the session store). This split agrees with the installed binary's embedded docs
+and [host operations](https://meta-models.github.io/muse-code-sdk/1.4/guides/host-operations/).
+Both config roots returned the same seven-model `providerCatalog`; the shared
+data root contains the cached catalogue, so that is not login proof.
+
+A real Swarm Agent using the private declared-server settings, the normal `HOME`
+and data root, and no copied credentials launched successfully but its first
+turn failed with `not logged in: run /login to add an API key`, classified as an
+`auth` provider restriction. The private Muse config still contained only
+`settings.json`. A second Agent in the same private daemon, with no
+`XDG_CONFIG_HOME` pass-through, completed its real model turn with
+`LOGIN_BASELINE_OK`. Thus relocating config admits native construction but fails
+the required reuse of the owner's normal login without copying credentials. No
+supported auth-file reference was established. Launches remain unchanged;
+Agent-scoped MCP mail/reply/ack, var CAS and MCP child identity on resume remain
+unimplemented and unproven. The earlier unknown launches were never replayed.
+
+The installed MSP surface has no `config/read`, `thread/start` or
+`mcpServerStatus/list` method, nor an MCP inventory in the session response.
+Effective MCP inventory therefore remains unknown; schema support, a capability
+grant and accepted configuration would not establish `mcp_servers_verified`.
+The current [vendor MCP guide](https://meta-models.github.io/muse-code-sdk/1.4/guides/extend/mcp-servers/#what-a-stdio-child-receives)
+also documents a cleared child environment whose allowlist excludes Eliot's Agent
+credentials. Any future implementation must explicitly supply the matching Agent
+generation identity through the native runtime `env` additions, register secrets
+for redaction, and keep them out of files, argv and public semantic metadata.
+This guide's published schema fingerprint differs from the installed host's;
+actual child identity and connectivity still need live qualification.
+
+Trust/HOME follow-up, 2026-11-15, against the same pinned executable and the
+owner's real config (now including the owner-approved static `eliot-swarm`
+entry): eight no-model host probes made sixteen `session/start` calls. All used
+`serve --disable-sandbox`, the same worktree and model selection, the Windows
+plugin environment, and `sessionMcp` negotiation. The settings' `${ELIOT_*}`
+references received noncredential diagnostic values, never a controller Agent's
+token; no authenticated Swarm operation was attempted. Settings and trust state
+were checked unchanged after every probe.
+
+| Config / flags / environment | Ordinary session | Session with native MCP additions |
+| --- | --- | --- |
+| Owner config, no trust flag, `HOME` absent and `USERPROFILE` present | Idle, `providerId="meta"` | `session_mcp_base_unavailable` |
+| Owner config, `--trust-workspace`, same environment | Idle, `providerId="meta"` | Same refusal |
+| Owner config, no trust flag, `HOME=USERPROFILE` | Idle, `providerId="meta"` | Same refusal |
+| Owner config, `--trust-workspace`, `HOME=USERPROFILE` | Idle, `providerId="meta"` | Same refusal |
+| Fresh settings-only copy, no auth/trust copy, no trust flag | Idle, `providerId="muse"` | Accepted, idle |
+| Same private-copy setup, explicitly request `providerId="meta"` | Idle, `providerId="meta"` | Accepted, idle |
+
+The final two probes repeated the first two owner-config cases and inspected
+only their own startup logs: those carried `tool_surface_version` metadata, not
+a documented tool inventory. Both native session responses and `session/read`
+also returned metadata only. The installed stable **and experimental** MSP
+indexes expose no tool-list/MCP-inventory method; a successful construction
+does not establish which tools the model would receive. Consequently the exact
+condition under which settings MCP tools appear was **unverified** under
+the no-model constraint. The flag did not repair the observed native base
+refusal, missing `HOME` did not cause that refusal with `USERPROFILE` present,
+and the reported provider label alone does not explain it. This is not proof
+about the authenticated Meta model loop's tool surface.
+
+The stored-trust case was **NOT_RUN**: there was no `trust.json` next to the
+owner's settings at the documented location. The public guide states its
+location but does not document its serialized format; no trust file/decision
+was invented or written. This worktree also had no root `.mcp.json`.
+
+Security boundary: the [MCP trust guide](https://meta-models.github.io/muse-code-sdk/1.4/guides/extend/mcp-servers/#trust)
+distinguishes user settings servers (no workspace trust prerequisite) from
+project `.mcp.json` files (trusted workspaces only). It documents trust from the
+nearest repository root through the session directory; a worktree uses its own
+files. Top-level help says `--trust-workspace` does not save trust; `serve` help
+says it loads each session workspace's skills/rules, so the option applies to
+every session/workspace loaded by that host. Per the guide it also admits
+project MCP configuration, which can start programs/open connections; it is a
+broader grant than adding one Agent-scoped server. Saved trust would persist
+across runs. `--yolo` additionally disables approval and sandboxing and is not
+an MCP configuration mechanism.
+
+Do not enable workspace trust automatically as an MCP fix. If a later
+tool-visibility qualification establishes that it is required, the narrow
+plugin design is an explicit Muse profile opt-in, default false, frozen with
+the Agent's workspace and passed only to that Agent's dedicated host. Document
+the project MCP/skills/rules grant, preserve normal approval/sandbox settings,
+never persist an owner trust decision, and do not infer opt-in from full-access
+permissions or `allowAll`. No launch or profile behavior changed here.
+
+The authorized two-turn model comparison on 2026-11-15 then tested the owner's
+real settings/login directly, using separate native hosts (not Eliot):
+`muse-bin-1.4.0-R4161.1.exe serve` and
+`muse-bin-1.4.0-R4161.1.exe serve --trust-workspace`. No sandbox-disabling or
+approval override was added. Both selected `muse-spark-1.3-contributor` on
+provider `meta`, submitted exactly one `turn/start` with
+`reasoningEffort="low"`, and used this exact prompt:
+
+> List the names of every tool available to you, grouped by MCP server. Reply only with the list.
+
+| Host | Model-reported `codebase_memory` tools | Model-reported `context7` tools | Model-reported built-ins |
+| --- | --- | --- | --- |
+| `serve` | None | None | 25 tools, grouped under `muse` |
+| `serve --trust-workspace` | None | None | 31 tools, grouped under `muse` |
+
+Both replies omitted `eliot-swarm`; its availability was **not qualified**.
+No real Agent identity was borrowed or synthesized. The referenced Eliot
+environment variables were defined as empty strings to avoid unresolved
+`${VAR}` references while leaving `--require-agent` without credentials. That
+optional server was excluded from the comparison; the two existing servers
+were the qualification subjects. `HOME` and `XDG_CONFIG_HOME` were absent,
+`USERPROFILE` was present, and both hosts used this same worktree.
+
+The trusted reply contained the same 25 built-in names plus exactly
+`subagent_cancel`, `subagent_read_result`, `subagent_send_message`,
+`subagent_spawn`, `subagent_status`, and `subagent_wait`. Thus the flag broadened
+the model-reported native delegation surface but was **not sufficient** to
+make the two existing settings MCP servers visible in this tested config.
+Do not add it automatically as an MCP repair. These are model-reported names,
+not an MCP inventory API or proof of successful tool invocation; the underlying
+settings-loading/startup cause remains unresolved.
+
+Both turns reached matching native `turn/completed` with `terminal="completed"`
+and returned final `agentMessage` items. There were exactly two submitted
+turns, no retries, no tool calls and no approval requests. Both owned hosts and
+their observed descendants exited; owner settings and trust state were
+unchanged. Existing Eliot launch behavior remains unchanged.
+
 This harness keeps `inherit` only: the frozen profile always records
 `mcp = "inherit"`, and a non-`inherit` policy is rejected as `unsupported`
 at config load. Verified read-only (`muse --help`, `muse mcp --help`): `muse
