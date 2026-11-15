@@ -29,7 +29,7 @@ use crate::{
     },
     native::{
         AcpUpdate, AgyClient, AgyFrame, FencedGuard, PromptResult, classify_update,
-        session_usage_from_update,
+        prompt_turn_usage, session_usage_from_update,
     },
 };
 use ulid::Ulid;
@@ -609,7 +609,7 @@ impl State {
             AgyFrame::PromptResponse(result) => match result {
                 Ok(value) => match serde_json::from_value::<PromptResult>(value) {
                     Ok(prompt) => {
-                        self.complete_prompt(&prompt.stop_reason).await;
+                        self.complete_prompt(&prompt).await;
                         Ok(())
                     }
                     Err(_) => {
@@ -845,14 +845,11 @@ impl State {
     /// Settle the prepared turn from the terminal `session/prompt`
     /// response. Only the actual stop reason settles the turn: `cancelled`
     /// is the interrupt settlement and is never inferred from silence.
-    pub async fn complete_prompt(&mut self, stop_reason: &str) {
+    pub async fn complete_prompt(&mut self, prompt: &PromptResult) {
         if self.failure.is_some() {
             return;
         }
-        let result = PromptResult {
-            stop_reason: stop_reason.to_owned(),
-        };
-        match self.settle_prompt(&result).await {
+        match self.settle_prompt(prompt).await {
             Ok(()) => {}
             Err(error) => self.lose(&error.message).await,
         }
@@ -900,6 +897,19 @@ impl State {
         }
         if truncated {
             data["final_text_unavailable"] = json!("event_budget");
+        } else if status == "completed" && text.is_empty() {
+            // The native ended the turn normally but supplied no assistant
+            // text at all: keep the native `end_turn` fact, but mark the
+            // missing final message honestly instead of presenting a
+            // normal answer. Consumers distinguish this from a real reply
+            // by the absent `message.completed` plus this marker.
+            data["final_text_unavailable"] = json!("empty_native_response");
+        }
+        // Installed agy 1.5.9 reports the turn's model usage on the
+        // terminal response (older servers send none): attach it when
+        // usable, never block completion on it.
+        if let Some(usage) = prompt_turn_usage(result) {
+            data["usage"] = json!(usage);
         }
         if failed && data.get("final_text").is_none() && !text.is_empty() && !truncated {
             attach_final_text(&mut data, &text, true, &self.policy);

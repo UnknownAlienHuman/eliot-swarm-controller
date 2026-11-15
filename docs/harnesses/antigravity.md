@@ -82,9 +82,15 @@ fault, stop, or drop — stream silence is not staleness and no
 model-turn timer expires admitted work. `end_turn`/`max_tokens`/`max_turn_requests` complete the
 turn, `cancelled` settles an interrupt, `refusal` fails it, and any other
 stop reason is a native protocol gap. Assistant text is accumulated from
-`agent_message_chunk` updates (bounded at 256 KiB, then
-`final_text_unavailable:"event_budget"`); thought and user chunks are
-bookkeeping. Tool calls map from `tool_call`/`tool_call_update` with the
+`agent_message_chunk` updates carrying text blocks only (other content
+blocks contribute no text), bounded at 256 KiB, then
+`final_text_unavailable:"event_budget"`; thought and user chunks are
+bookkeeping. A normal completion with no assistant text at all keeps its
+native `stopReason` but carries
+`final_text_unavailable:"empty_native_response"` (see Facts and recovery),
+so silence is never presented as a normal answer. Send itself is bounded
+(25 s for the native write plus the first association) so the plugin
+always settles before the daemon's 30 s plugin RPC. Tool calls map from `tool_call`/`tool_call_update` with the
 vendor `toolCallId` as the item id. Tool updates are partial deltas:
 title and status merge into the known per-id state before any event is
 derived, so an omitted field inherits the last known value and only a
@@ -213,11 +219,20 @@ The terminal `session/prompt` response (`stopReason`) is authoritative
 for turn completion, correlated with the single outstanding prompt
 prepared before dispatch in the same uninterrupted process. A soft-denied
 tool remains visible as a failed `tool_call_update` even under a
-successful final turn. ACP `session/prompt` results carry only
-`stopReason`: no per-turn usage object and no `_meta` usage was observed,
-so terminal facts carry no usage counters and turn scope stays null;
-requested, verified and served model are separate facts and one never
-stands in for another. ACP v1 `usage_update` carries context occupancy
+successful final turn. The pinned ACP schema names only `stopReason` on
+`session/prompt` results, but installed `agy` 1.5.9 extends the response
+with a per-turn `usage` object (`inputTokens`, `outputTokens`,
+`cachedReadTokens`, `cachedWriteTokens`, `thoughtTokens`, `totalTokens`;
+observed 2026-11-15, `gemini-4-argon-high`). The terminal attaches it as
+turn-scoped `TurnUsage` (`scope: "turn"`) when usable; a missing or
+malformed extension leaves turn usage null and never blocks completion.
+Requested, verified and served model are separate facts and one never
+stands in for another. When a normal stop reason (`end_turn`,
+`max_tokens`, `max_turn_requests`) arrives with no assistant text at all,
+the turn still completes with its native `stopReason`, but the terminal
+carries `final_text_unavailable: "empty_native_response"` and no
+`message.completed` precedes it, so the missing answer is never presented
+as a normal reply. ACP v1 `usage_update` carries context occupancy
 (`used` tokens currently in context, `size` context-window capacity) and
 optional cumulative session `cost` with its currency/unit: session-scoped
 facts, not per-turn input/output totals. The adapter ignores them for turn
@@ -227,10 +242,11 @@ retained `SessionUsage` snapshot and commits it as `session.usage` when
 accepted (source `antigravity:usage_update`), with `observed_at` captured at
 acceptance: `used`/`size` replace the retained context
 counters and a supplied cost replaces the retained cumulative cost with
-its verbatim unit. No cumulative input/output/cache counters exist on this
-route (`cumulative_tokens` stays null), and occupancy/cost are never mapped
-to `TurnUsage`: per-turn token usage is unavailable (`unsupported`) on the
-checked native surfaces below. Live 2026-11-14 with installed `agy` 1.5.3
+its verbatim unit. No cumulative input/output/cache counters exist on the `usage_update`
+surface (`cumulative_tokens` stays null), and occupancy/cost are never
+mapped to `TurnUsage`: the session stream alone cannot supply per-turn
+usage. Per-turn usage arrives only on the terminal prompt response above.
+Live 2026-11-14 with installed `agy` 1.5.3
 (`gemini-3.8-flash-high`, served as base `gemini-3.8-flash` plus
 `thought_level high`): one Agent, one short task (read `task.txt`, reply
 `42`), `end_turn` success with final text `42`. The checked surfaces

@@ -37,6 +37,12 @@ use crate::{
 /// Best-effort deadline for the graceful `session/close` on terminate.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bound for one send's native write plus first-association wait. The daemon
+/// settles `plugin_rpc_timeout` at 30 s, so the plugin must settle first
+/// with its own cause instead of racing to a joint timeout that reports
+/// an empty diagnostic snapshot.
+const SEND_TIMEOUT: Duration = Duration::from_secs(25);
+
 struct RetainedCommand {
     seq: i64,
     command_id: String,
@@ -726,15 +732,14 @@ impl Session {
         // update. This send only waits for the first association, as
         // before; a slow first update keeps the retained `unknown`
         // outcome while the fenced reply still settles the turn in order.
+        // One shared deadline bounds the write plus the wait: the total
+        // must stay under the daemon's 30 s plugin RPC or the command
+        // settles `plugin_rpc_timeout` with no plugin cause.
         let prompt = prompt_params(&self.conversation, &combined);
+        let deadline = Instant::now() + SEND_TIMEOUT;
         let dispatched = self
             .client
-            .call_fenced(
-                "session/prompt",
-                prompt,
-                Instant::now() + TIMEOUT,
-                FencedKind::Prompt,
-            )
+            .call_fenced("session/prompt", prompt, deadline, FencedKind::Prompt)
             .await;
         let registration = match dispatched {
             Ok((_, registration)) => registration,
@@ -766,7 +771,7 @@ impl Session {
         // unless this exact turn already settled while the write was in
         // flight, in which case `arm_fenced` retires it immediately.
         self.state.lock().await.arm_fenced(registration, &turn);
-        let result = match timeout_at(Instant::now() + TIMEOUT, associated).await {
+        let result = match timeout_at(deadline, associated).await {
             Ok(Ok(Ok(()))) => Ok(json!({"state": "applied", "turn_id": turn})),
             Ok(Ok(Err(error))) if native_no_write(&error.code) => {
                 self.state

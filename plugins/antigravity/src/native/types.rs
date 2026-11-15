@@ -13,7 +13,7 @@
 //! such `x-method`); the later hook-callback increment will add its own
 //! binding. This module stays strictly inside the pinned ACP surface.
 
-use eliot_core::{SessionCost, SessionUsage};
+use eliot_core::{SessionCost, SessionUsage, TurnUsage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -131,10 +131,62 @@ pub(crate) struct SetConfigOptionResult {
 }
 
 /// `session/prompt` result: the terminal turn fact.
+///
+/// The pinned ACP schema carries only `stopReason` here, but installed
+/// `agy` 1.5.9 extends the response with a per-turn `usage` object
+/// (`inputTokens`, `outputTokens`, `cachedReadTokens`,
+/// `cachedWriteTokens`, `thoughtTokens`, `totalTokens`; observed
+/// 2026-11-15 against `gemini-4-argon-high`). It stays `Option<Value>` so
+/// a missing or malformed extension never breaks completion: usable
+/// counters are extracted tolerantly by [`prompt_turn_usage`].
 #[derive(Debug, Deserialize)]
 pub(crate) struct PromptResult {
     #[serde(rename = "stopReason")]
     pub stop_reason: String,
+    #[serde(default)]
+    pub usage: Option<Value>,
+}
+
+/// Extract per-turn model usage from a `session/prompt` response's agy
+/// `usage` extension. Only genuinely supplied nonnegative integer counters
+/// are mapped; missing or malformed values stay null (never zero, never a
+/// sum), and an absent or wholly unusable object yields no usage at all so
+/// completion proceeds. Scope is `turn`: the response covers the whole
+/// prompt call's model usage, not just the final message.
+pub(crate) fn prompt_turn_usage(result: &PromptResult) -> Option<TurnUsage> {
+    let usage = result.usage.as_ref()?.as_object()?;
+    let counter = |key: &str| {
+        usage
+            .get(key)
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0)
+    };
+    let input_tokens = counter("inputTokens");
+    let output_tokens = counter("outputTokens");
+    let cache_read_tokens = counter("cachedReadTokens");
+    let cache_write_tokens = counter("cachedWriteTokens");
+    let thinking_tokens = counter("thoughtTokens");
+    let total_tokens = counter("totalTokens");
+    if input_tokens.is_none()
+        && output_tokens.is_none()
+        && cache_read_tokens.is_none()
+        && cache_write_tokens.is_none()
+        && thinking_tokens.is_none()
+        && total_tokens.is_none()
+    {
+        return None;
+    }
+    Some(TurnUsage {
+        scope: Some("turn".to_owned()),
+        message_id: None,
+        input_tokens,
+        output_tokens,
+        reasoning_tokens: None,
+        thinking_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        total_tokens,
+    })
 }
 
 impl PromptResult {
@@ -238,8 +290,22 @@ pub(crate) fn classify_update(params: &Value) -> Option<(String, AcpUpdate)> {
     let content_text = || {
         update
             .get("content")
-            .and_then(|content| content.get("text"))
-            .and_then(Value::as_str)
+            .and_then(|content| {
+                let block = content.as_object()?;
+                // Only verbatim text blocks contribute assistant text. Older
+                // servers omit the discriminator; newer ones send
+                // `type: "text"`. Any other block (`image`, `audio`,
+                // `resource_link`, `resource`) carries no text and must not
+                // read as an empty answer.
+                if block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind != "text")
+                {
+                    return None;
+                }
+                block.get("text").and_then(Value::as_str)
+            })
             .unwrap_or_default()
             .to_owned()
     };
@@ -365,6 +431,90 @@ mod tests {
     fn update(update: Value) -> (String, AcpUpdate) {
         classify_update(&json!({"sessionId": "session-1", "update": update}))
             .expect("update classifies")
+    }
+
+    #[test]
+    fn prompt_response_usage_parses_the_agy_159_extension() {
+        // Recorded `session/prompt` result (agy 1.5.9, gemini-4-argon-high,
+        // 2026-11-15): the pinned schema names only `stopReason`, but the
+        // server also reports per-turn model usage. It must attach as turn
+        // scope, never as session occupancy, and never block completion.
+        let prompt: PromptResult = serde_json::from_value(json!({
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 237441,
+                "outputTokens": 7276,
+                "cachedReadTokens": 392638,
+                "cachedWriteTokens": 0,
+                "thoughtTokens": 4121,
+                "totalTokens": 637355,
+            },
+        }))
+        .expect("prompt result with usage parses");
+        let usage = prompt_turn_usage(&prompt).expect("usage maps");
+        assert_eq!(usage.scope.as_deref(), Some("turn"));
+        assert_eq!(usage.input_tokens, Some(237441));
+        assert_eq!(usage.output_tokens, Some(7276));
+        assert_eq!(usage.cache_read_tokens, Some(392638));
+        assert_eq!(usage.cache_write_tokens, Some(0));
+        assert_eq!(usage.thinking_tokens, Some(4121));
+        assert_eq!(usage.total_tokens, Some(637355));
+        assert_eq!(usage.reasoning_tokens, None);
+
+        // Absent, null, negative and wrong-typed extensions yield no
+        // usage at all, never a zeroed or partial guess.
+        for usage in [
+            json!(null),
+            json!({"inputTokens": -1}),
+            json!({"inputTokens": "many"}),
+            json!({"unrelated": true}),
+        ] {
+            let prompt: PromptResult = serde_json::from_value(json!({
+                "stopReason": "end_turn",
+                "usage": usage,
+            }))
+            .expect("tolerant prompt result parses");
+            assert_eq!(prompt_turn_usage(&prompt), None, "usage={usage}");
+        }
+        let bare: PromptResult = serde_json::from_value(json!({"stopReason": "end_turn"}))
+            .expect("bare prompt result parses");
+        assert_eq!(prompt_turn_usage(&bare), None);
+    }
+
+    #[test]
+    fn message_chunk_takes_text_only_from_text_blocks() {
+        // Discriminated text blocks (agy 1.5.9) and the older bare shape
+        // both contribute assistant text.
+        for content in [
+            json!({"type": "text", "text": "READY-42"}),
+            json!({"text": "42"}),
+        ] {
+            let (_, parsed) = update(json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": content,
+            }));
+            assert!(
+                matches!(parsed, AcpUpdate::MessageChunk { text } if text == "READY-42" || text == "42"),
+                "text block contributes text"
+            );
+        }
+        // Non-text blocks and non-object content never read as an answer:
+        // they contribute no text instead of an empty success string.
+        for content in [
+            json!({"type": "image", "data": "aGVsbG8="}),
+            json!({"type": "resource_link", "uri": "file:///x"}),
+            json!([{"type": "text", "text": "array-is-not-a-block"}]),
+            json!(null),
+        ] {
+            let (_, parsed) = update(json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": content,
+            }));
+            assert!(
+                matches!(parsed, AcpUpdate::MessageChunk { text } if text.is_empty()),
+                "non-text content contributes no text"
+            );
+        }
     }
 
     #[test]
