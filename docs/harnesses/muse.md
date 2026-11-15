@@ -337,17 +337,74 @@ The intended Eliot server is the current executable with arguments
 Claude's Agent-only server. No Codex `-c` override or owner-global config edit is
 needed by this native contract.
 
-Live blocker, 2026-11-14: the pinned host grants `sessionMcp` but rejects
-`session/start` carrying these additions with JSON-RPC `-32603`, message
-`internal error: session MCP base configuration is unavailable`, and reason
-`session_mcp_base_unavailable`, before starting an MCP child. A no-model native
-construction probe with the binary's `MUSE_ENABLE_SESSION_MCP=on` switch, and
-another also using `serve --trust-workspace`, still refuse. Its help exposes no
-base-configuration switch. A branch implementation reproduced an unknown Swarm
-launch and was removed because it would break existing Muse launches. Unknown
-launches were not replayed; ordinary Muse startup is preserved. Agent-scoped MCP,
-mail/reply/ack, var CAS and MCP child identity on resume remain unimplemented and
-unproven on this host pending a supported native base-configuration mechanism.
+The earlier `-32603 / session_mcp_base_unavailable` observation is not a
+documented configuration prerequisite or proof that this host cannot construct
+session MCP servers. Follow-up on 2026-11-14 tested the documented
+[settings directory](https://meta-models.github.io/muse-code-sdk/1.4/guides/extend/mcp-servers/)
+in fresh private directories, without changing the owner's config or creating a
+workspace `.mcp.json`. Exact construction sequence: set `XDG_CONFIG_HOME=<private
+config root>`; run `muse-bin-1.4.0-R4161.1.exe serve --disable-sandbox`; call
+`initialize` with `capabilities.requestedCapabilities=["sessionMcp"]`; send
+`initialized`; then call `session/start` with a fresh UUIDv7 `commandId`,
+`modelId="muse-spark-1.3-contributor"`, `workspaceRoot=<workspace>` and
+`approvalMode="allowAll"`. `HOME`, `USERPROFILE` and `XDG_DATA_HOME` were unchanged;
+no feature switch, login, credential copy or model turn was used.
+
+- **Empty settings plus session additions:** write
+  `<private config root>/muse/settings.json` as
+  `{"schema_version":1,"mcpServers":{}}`. Add
+  `config.mcpServers.eliot_swarm` to `session/start`, containing
+  `transport="stdio"`, the current swarm executable and arguments shown above,
+  `framing="lineDelimitedJson"`, and `mode="required"`.
+  Result: `sessionMcp` granted and session returned `status="idle"`, with no
+  native error. A fresh private config root with no settings file also accepted
+  the same construction, so a missing file alone does not explain the old error.
+- **Server declared in settings:** write the following instead, and omit
+  `session/start.config`. Result: the session again returned `status="idle"`,
+  with no native error. The same results held without a preceding `model/list`.
+
+  ```json
+  {
+    "schema_version": 1,
+    "mcpServers": {
+      "eliot-swarm": {
+        "type": "stdio",
+        "command": "<current swarm.exe>",
+        "args": ["mcp", "--require-agent", "--data-dir", "<private Eliot root>"],
+        "env": {
+          "ELIOT_AGENT_ID": "${ELIOT_AGENT_ID}",
+          "ELIOT_AGENT_GENERATION": "${ELIOT_AGENT_GENERATION}",
+          "ELIOT_AGENT_TOKEN": "${ELIOT_AGENT_TOKEN}",
+          "ELIOT_AGENT_DATA_DIR": "${ELIOT_AGENT_DATA_DIR}"
+        },
+        "required": true,
+        "startup_timeout_sec": 5
+      }
+    }
+  }
+  ```
+
+Construction success does not qualify login or authenticated tools. On this
+Windows installation, `XDG_CONFIG_HOME` relocates `settings.json`, `auth.json` and
+`trust.json`; the normal login is in the owner's config root. It does not move
+`museHome`, sessions or the plugin cache: those remain under the data root
+(`XDG_DATA_HOME/muse`, default `~/.local/share/muse`; `MUSE_SESSIONS` can override
+the session store). This split agrees with the installed binary's embedded docs
+and [host operations](https://meta-models.github.io/muse-code-sdk/1.4/guides/host-operations/).
+Both config roots returned the same seven-model `providerCatalog`; the shared
+data root contains the cached catalogue, so that is not login proof.
+
+A real Swarm Agent using the private declared-server settings, the normal `HOME`
+and data root, and no copied credentials launched successfully but its first
+turn failed with `not logged in: run /login to add an API key`, classified as an
+`auth` provider restriction. The private Muse config still contained only
+`settings.json`. A second Agent in the same private daemon, with no
+`XDG_CONFIG_HOME` pass-through, completed its real model turn with
+`LOGIN_BASELINE_OK`. Thus relocating config admits native construction but fails
+the required reuse of the owner's normal login without copying credentials. No
+supported auth-file reference was established. Launches remain unchanged;
+Agent-scoped MCP mail/reply/ack, var CAS and MCP child identity on resume remain
+unimplemented and unproven. The earlier unknown launches were never replayed.
 
 The installed MSP surface has no `config/read`, `thread/start` or
 `mcpServerStatus/list` method, nor an MCP inventory in the session response.
