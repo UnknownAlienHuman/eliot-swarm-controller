@@ -218,6 +218,12 @@ fn default_max_event_backlog() -> i64 {
     100_000
 }
 
+/// Store-size threshold for the unbounded-retention advisory: `daemon.status`
+/// reports `size_advisory` and the hourly maintenance tick logs one line
+/// while the main+WAL store files pass this size with every retention window
+/// unset. Documented in docs/spec/configuration.md (daemon retention).
+pub(crate) const RETENTION_UNBOUNDED_SIZE_ADVISORY_BYTES: u64 = 100 * 1024 * 1024;
+
 /// Physical retention windows consumed by daemon maintenance. See
 /// docs/spec/configuration.md: daemon retention. An unset window disables
 /// pruning for that side: no deletion without an owner window.

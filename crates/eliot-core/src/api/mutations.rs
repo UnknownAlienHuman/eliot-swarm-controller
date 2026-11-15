@@ -557,7 +557,8 @@ mod tests {
             "running_turns_count":0,"running_turns":[],"running_turns_truncated":false,
             "unsettled_commands_count":0,"unsettled_commands":[],"unsettled_commands_truncated":false,
             "unknown_commands_count":0,"unknown_commands":[],"unknown_commands_truncated":false,
-            "owned_processes_count":0,"owned_processes":[],"owned_processes_truncated":false
+            "owned_processes_count":0,"owned_processes":[],"owned_processes_truncated":false,
+            "retained_unresolved_count":0,"retained_unresolved":[],"retained_unresolved_truncated":false
         });
         for wire in [
             json!({"state":"applied","mode":"drain","blockers":[]}),

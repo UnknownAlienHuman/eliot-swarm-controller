@@ -652,3 +652,12 @@ active/unknown turn/input/transition gate, source owner/cursor/gap, custody
 capability/orphans, provider hold, workspace phase, requested/effective route and
 Git/edit facts. A stale or unknown value is shown explicitly, never hidden or converted
 to zero.
+
+`daemon.status` also exposes retention and drain honesty in one place. The
+retention view reports the `eliot.db` main and WAL sizes, the configured
+windows (or `unbounded` when all are unset) and `pruned_through`; a bounded
+`size_advisory` appears while an unbounded store passes 100 MiB, and the
+hourly maintenance tick logs one line for the same condition. The drain
+report lists stored unknowns with no live process, turn or reader as
+retained-unresolved — with resolvability and owner action — instead of
+blocking on them; the stored outcome stays `unknown`.

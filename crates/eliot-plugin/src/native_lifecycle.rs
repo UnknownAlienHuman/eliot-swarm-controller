@@ -40,6 +40,14 @@ pub fn run_plugin_entry<F: Future>(entry: F) -> Result<F::Output> {
 
 /// Subscribe to the existing child waiter. A reader fault or an unconfirmed
 /// wait error is not process-death evidence. Cancellation never kills the child.
+///
+/// Production-retirement note: this helper has no production caller. Every
+/// production retirement path goes through `drain_native_exit`, which waits
+/// under `EVENT_DEADLINE` and settles `unknown` (never a fabricated
+/// terminal) when the native tail does not settle in time. The fallthrough
+/// below never resolves on its own, so any future caller must bound this
+/// helper with an explicit timeout and settle unknown on expiry instead of
+/// awaiting it directly.
 pub async fn wait_for_native_exit(child: Option<&mut NativeChild>) {
     if let Some(child) = child
         && child.wait_for_process_exit().await.is_ok()
