@@ -1018,7 +1018,10 @@ command.submit {id, target:AGENT, verb:"detach", expected_generation?, args:{}}
 
 Require an explicit profile. Resolve the same mutation id before rereading mutable
 configuration; retained retries keep their original subject/profile. Attachment reuses
-the canonical scope/reference row. A controlled row or an active observer returns
+the canonical scope/reference row. The requested `native_scope` is the discovery
+page's store scope, never a subject `source` label: the proven store refuses any
+other scope before native I/O, settling the attach `failed` (never `unknown`).
+A controlled row or an active observer returns
 `busy`; this increment does not convert control or grant a second identity. Attach
 commits its generation/source fence before reader I/O and installs no Agent token.
 All native control verbs reject observe-only targets, including an owner-issued

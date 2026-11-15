@@ -12238,7 +12238,8 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         // view is served from the retained attach metadata.
         let page = router
             .agent_history(
-                &json!({"id":agent, "generation":1, "source":"native", "view":"subject"}),
+                // Load-loop shape: subject view with an explicit small limit.
+                &json!({"id":agent, "generation":1, "source":"native", "view":"subject", "limit":5}),
                 &Principal::Owner,
             )
             .await
