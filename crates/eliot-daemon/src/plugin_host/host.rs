@@ -161,12 +161,17 @@ impl Drop for ForceStopGuard {
         // Clear synchronously even when the enclosing future is cancelled.
         // Only this attempt owns the entry; actor cleanup must not remove it.
         state.planned_stops.lock_recover().remove(&self.key);
-        if !self.committed && self.deferred_loss.load(Ordering::Acquire) {
+        if !self.committed
+            && self.deferred_loss.load(Ordering::Acquire)
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
             let key = self.key.clone();
-            tokio::spawn(async move {
+            runtime.spawn(async move {
                 mark_lost_state(&Arc::downgrade(&state), &key).await;
             });
         }
+        // Without a runtime, the persisted exit/drain facts remain available
+        // to restart reconciliation; Drop must not panic trying to spawn.
     }
 }
 
@@ -5451,6 +5456,24 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn force_guard_drop_outside_runtime_does_not_panic() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let (host, key, _) = source_exit_fixture("codex");
+        let guard = {
+            let _store = host.state.store.try_lock().unwrap();
+            ForceStopGuard::new(&host.state, key.clone()).unwrap()
+        };
+        guard.deferred_loss.store(true, Ordering::Release);
+        let deferred_loss = Arc::clone(&guard.deferred_loss);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guard)));
+
+        assert!(result.is_ok(), "dropping without a runtime must not panic");
+        assert!(!host.state.planned_stops.lock_recover().contains_key(&key));
+        assert!(deferred_loss.load(Ordering::Acquire));
     }
 
     #[tokio::test]
