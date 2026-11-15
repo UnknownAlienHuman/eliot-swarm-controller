@@ -7,7 +7,7 @@ mod config_ops;
 mod context;
 mod coordination;
 mod digests;
-mod discovery;
+pub(crate) mod discovery;
 mod goals;
 mod handoff;
 mod hierarchy;
