@@ -2,9 +2,9 @@
 //!
 //! `harness.list` reports per-harness installation facts without starting a
 //! model turn and without inference. `harness.models` returns the harness's
-//! own read-only catalogue (Codex/Muse native `model/list`, the OpenCode
-//! provider/model list, Antigravity `agy models`; Claude exposes aliases plus
-//! the CLI default), cached per native route/account with a freshness
+//! own read-only catalogue (Codex/Muse native `model/list`, OpenCode
+//! `opencode models` provider/model ids, Antigravity `agy models`; Claude
+//! exposes aliases plus the CLI default), cached per native route/account with a freshness
 //! timestamp and a nonsecret credential identity. `harness.quota`
 //! reports provider-supported account quota readback with timestamp, scope,
 //! an explicit supported/unsupported/unknown status and provider-verbatim
@@ -232,8 +232,9 @@ pub struct HarnessModelEntry {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessModelsResponse {
     pub harness: String,
-    /// `native` (live catalogue), `aliases` (Claude, no catalogue), or
-    /// `none` (no catalogue; details in `note`).
+    /// `native` (live catalogue), `aliases` (Claude, no catalogue),
+    /// `empty` (the native read ran but listed no models; details in
+    /// `note`), or `none` (no catalogue; details in `note`).
     pub catalogue: String,
     pub models: Vec<HarnessModelEntry>,
     /// Native default model id, when the harness names one.

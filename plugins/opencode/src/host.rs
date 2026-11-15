@@ -2,7 +2,8 @@ use crate::{
     events::{EventConfig, EventHandle, EventStatus, InboxRecord, SteerVerdict, TurnFacts},
     native::{
         AuthSetup, BackendKind, HttpOutcome, IntegrationSelector, LocalProvider, OpenCodeHttp,
-        OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch, list_providers,
+        OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch,
+        models::run_models,
         types::{InboxUser, McpServerReadback, ModelRef, NativeModelEntry, SessionInfo},
     },
 };
@@ -430,11 +431,11 @@ impl OpenCodePlugin {
         error
     }
 
-    /// Read-only provider list for `harness.models`: canonical `auth list`
-    /// metadata (provider IDs). No server, no session, no model turn and no
-    /// inference. Provider entries carry no model catalogue: the configured
-    /// native default model resolves at launch and is read back from the
-    /// session.
+    /// Read-only model list for `harness.models`: the native `opencode
+    /// models` catalogue (`provider/model` ids verbatim). No server, no
+    /// session, no model turn and no inference. An omitted model still
+    /// leaves the configured native default, read back from the session at
+    /// launch.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
         if self.session.is_some() || self.failed_start.is_some() {
             return Err(Error::new(
@@ -460,15 +461,13 @@ impl OpenCodePlugin {
                     "OpenCode model.list requires a discovered native cmd",
                 )
             })?;
-        let providers =
-            list_providers(std::ffi::OsStr::new(program), Instant::now() + RPC_TIMEOUT).await?;
-        let models: Vec<Value> = providers
+        let ids = run_models(std::ffi::OsStr::new(program), Instant::now() + RPC_TIMEOUT).await?;
+        let models: Vec<Value> = ids
             .into_iter()
-            .map(|(provider, connections)| {
+            .map(|id| {
                 json!({
-                    "id": provider,
+                    "id": id,
                     "default": false,
-                    "connections": connections,
                 })
             })
             .collect();
@@ -1397,37 +1396,44 @@ impl OpenCodePlugin {
                 "model",
             )?;
         }
-        let effective = session
-            .http
-            .get_session(session_id, deadline)
-            .await
-            .map_err(|error| {
-                Error::new(
-                    "unknown",
-                    format!(
-                        "OpenCode resume configure readback is unresolved ({})",
-                        error.message
-                    ),
+        // The single shared echo verification proves the session runs
+        // the realignment target (overlay or frozen), never a reverted
+        // value. An omitted request keeps the server default and only
+        // re-reads.
+        let effective = match target_model {
+            Some(target) => {
+                Self::readback_session_model(
+                    &session.http,
+                    session_id,
+                    target,
+                    deadline,
+                    "resume configure",
                 )
-            })?;
-        // Verified against the realignment target (overlay or frozen),
-        // never against a reverted value: the native session must run
-        // what this generation was retained to run.
-        let model_verified = target_model.is_none_or(|target| {
-            effective
-                .model
-                .as_ref()
-                .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()))
-                == Some(target.to_owned())
-        });
+                .await?
+            }
+            None => session
+                .http
+                .get_session(session_id, deadline)
+                .await
+                .map_err(|error| {
+                    Error::new(
+                        "unknown",
+                        format!(
+                            "OpenCode resume configure readback is unresolved ({})",
+                            error.message
+                        ),
+                    )
+                })?,
+        };
+        let model_verified = true;
         let agent_verified = parsed
             .requested_agent
             .as_ref()
             .is_none_or(|agent| effective.agent.as_ref() == Some(agent));
-        if !model_verified || !agent_verified {
+        if !agent_verified {
             return Err(Error::new(
                 "unknown",
-                "OpenCode effective model or agent contradicts the applied configuration",
+                "OpenCode effective agent contradicts the applied configuration",
             ));
         }
         let mut effective_value = json!({
@@ -1457,6 +1463,48 @@ impl OpenCodePlugin {
         effective_value["mcp_servers"] = mcp_servers;
         effective_value["mcp_servers_verified"] = json!(mcp_servers_verified);
         Ok(effective_value)
+    }
+
+    /// Re-read the session and prove it runs `target`: the single echo
+    /// verification behind every verified model switch. Resume realign
+    /// and mid-run configure share it, so exactly one place turns a switch
+    /// into verified effective state; a lost readback or an echo that
+    /// contradicts the target is `unknown` (the switch may have applied
+    /// without echoing). `context` names the caller (`resume configure`,
+    /// `configure`). The switch dispatch itself stays per-caller: resume
+    /// maps every write failure to `unknown` (an earlier setter in the
+    /// same realign may have applied), while configure maps a proven
+    /// no-effect refusal to its `rejected` value.
+    async fn readback_session_model(
+        http: &OpenCodeHttp,
+        session_id: &str,
+        target: &str,
+        deadline: Instant,
+        context: &str,
+    ) -> Result<SessionInfo> {
+        let echoed = http
+            .get_session(session_id, deadline)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "OpenCode {context} readback is unresolved ({})",
+                        error.message
+                    ),
+                )
+            })?;
+        let echoed_model = echoed
+            .model
+            .as_ref()
+            .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()));
+        if echoed_model.as_deref() != Some(target) {
+            return Err(Error::new(
+                "unknown",
+                format!("OpenCode {context} model contradicts the applied configuration"),
+            ));
+        }
+        Ok(echoed)
     }
 
     /// One resume setter: only its 204 applies. The session existed
@@ -1683,29 +1731,16 @@ impl OpenCodePlugin {
                 }
             }
         }
-        let echoed = session
-            .http
-            .get_session(&session_id, deadline)
-            .await
-            .map_err(|error| {
-                Error::new(
-                    "unknown",
-                    format!(
-                        "OpenCode configure readback is unresolved ({})",
-                        error.message
-                    ),
-                )
-            })?;
-        let echoed_model = echoed
-            .model
-            .as_ref()
-            .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()));
-        if echoed_model.as_deref() != Some(requested.as_str()) {
-            return Err(Error::new(
-                "unknown",
-                "OpenCode effective model contradicts the applied configuration",
-            ));
-        }
+        // The single shared echo verification: only a readback that
+        // names the requested model proves the switch.
+        Self::readback_session_model(
+            &session.http,
+            &session_id,
+            &requested,
+            deadline,
+            "configure",
+        )
+        .await?;
         Ok(json!({
             "state": "applied",
             "model": requested,

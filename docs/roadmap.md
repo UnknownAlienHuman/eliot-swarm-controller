@@ -203,6 +203,14 @@ Read [coordination](spec/coordination.md). Use two Codex Agents initially.
 - [x] **L5.3 Hierarchy.** Controller-launched children and tree selectors, then native
       child discovery/control where supported. An existing child is never hidden by a
       fanout limit. Parent completion is not child completion.
+- [x] **H1 Manager change.** Owner-only atomic subtree/all-children re-parent through
+      Store, router, CLI and MCP; preserve frozen native identities and snapshots.
+      Codex Sol manager to Antigravity Argon manager, exact next-turn wait, scoped
+      tree stop, old-manager rejection and individual return moves qualified on
+      2026-11-15. [Handoff](spec/coordination.md#handoff) also designs task/Agent switch.
+- [ ] **H2 Task handoff and Agent switch.** Connect the designed quiescent queued-input,
+      claim/Goal/child transfer and launch-plus-handoff operations through ordinary
+      commands; resolve the remaining protocol choices in the owning Handoff section.
 
 **Result:** two Agents exchange an actual message, share one variable and identify each
 other's file area without a manager relay. Codex/Luna and OpenCode/OpenRouter exchanged queued

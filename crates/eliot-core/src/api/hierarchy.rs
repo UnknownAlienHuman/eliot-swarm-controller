@@ -1,11 +1,12 @@
 //! Controller-launched hierarchy: fanout limits and tree selectors (L5.3 part 1).
 //!
-//! Limits gate launch admission only; they never hide an Agent row that
+//! Limits gate launch, selector and re-parent admission; they never hide an Agent row that
 //! already exists. A tree selector names the subtree of one Agent
 //! (`tree:<agent-id>`, root first, then descendants in Agent-id order) and
 //! is snapshotted to concrete members once at admission.
 
 use crate::{Error, Result, parse_agent_id};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Default maximum depth of a controller-launched tree (root is depth 0).
@@ -81,6 +82,64 @@ pub fn parse_tree_selector(selector: &str) -> Result<i64> {
 /// `<write-id>/<recipient-agent>` deliveries.
 pub fn selector_child_id(parent_id: &str, agent_id: &str) -> String {
     format!("{parent_id}/{agent_id}")
+}
+
+/// Owner-only atomic hierarchy edit; exactly one source form is required.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReparentRequest {
+    pub id: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub children_of: Option<String>,
+    /// Generation of `agent`, or of the manager named by `children_of`.
+    pub expected_generation: i64,
+    pub parent: String,
+    pub parent_generation: i64,
+}
+
+impl ReparentRequest {
+    pub fn source(&self) -> Result<&str> {
+        match (&self.agent, &self.children_of) {
+            (Some(agent), None) | (None, Some(agent)) => Ok(agent),
+            _ => Err(Error::new(
+                "invalid",
+                "name exactly one of agent or children_of",
+            )),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.id.trim().is_empty() {
+            return Err(Error::new("invalid", "reparent id must be non-empty"));
+        }
+        parse_agent_id(self.source()?)?;
+        parse_agent_id(&self.parent)?;
+        if self.expected_generation < 0 || self.parent_generation < 0 {
+            return Err(Error::new("invalid", "generations must be nonnegative"));
+        }
+        Ok(())
+    }
+}
+
+/// Every affected row, including descendants and terminal historical rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReparentedAgent {
+    pub agent: String,
+    pub generation: i64,
+    pub previous_parent: Option<String>,
+    pub parent: Option<String>,
+    pub root: String,
+    pub depth: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReparentResponse {
+    pub id: String,
+    pub moved: Vec<ReparentedAgent>,
 }
 
 #[cfg(test)]

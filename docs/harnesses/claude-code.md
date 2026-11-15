@@ -88,7 +88,10 @@ server, verified live on installed 2.1.321); the plugin retains that
 observed set (names and statuses only, secret-redacted and bounded) and
 attaches it to the turn terminal, where the reducer merges it into the
 effective set with `mcp_servers_verified` true. An absent or malformed init
-inventory leaves the effective set unknown.
+inventory leaves the effective set unknown. `effective.effort` carries the
+pushed `--effort` level (null when omitted, never fabricated): the idle
+readback proves the native accepted the start carrying it, so it reads back
+`effort_verified` true; an unknown level fails admission before any spawn.
 
 Resolve Windows executables explicitly; never insert an unrequested shell wrapper.
 Avoid modes that disable required hooks/instructions.
@@ -222,11 +225,13 @@ proxy/native billing in L7. Common generation/ack/custody rules remain in the pl
 
 ## Ad-hoc launch
 
-`swarm launch --harness claude [--model M] [--cmd PATH] --workspace W "prompt"`
+`swarm launch --harness claude [--model M] [--effort E] [--cmd PATH] --workspace W "prompt"`
 is Owner-only and freezes a profile-equivalent snapshot from safe defaults
 (`workspace-write`, `never`, MCP `inherit`) plus flags. An omitted `--model`
 omits `--model` so the CLI default applies; the effective model is read back
-from initialize/stream. `--effort` has no mapping and is rejected. `cmd` is
+from initialize/stream. `--effort` maps to the CLI `--effort` flag in the
+closed vocabulary `low|medium|high|xhigh|max` (validated at the same boundary
+profiles use); an omitted effort keeps the CLI default. `cmd` is
 discovered deterministically by preferring the newest install by `--version`
 (`claude.exe` on `PATH`, the standard user install locations, and the
 desktop-app bundles under `%APPDATA%\Claude\claude-code\<version>\<hash>`;

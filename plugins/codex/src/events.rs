@@ -100,6 +100,7 @@ enum Control {
         command_id: String,
         turn_id: String,
         context: Vec<ContextItem>,
+        model: Option<String>,
         effort: Option<String>,
         reply: oneshot::Sender<Result<()>>,
     },
@@ -532,12 +533,14 @@ impl EventHandle {
         command_id: String,
         turn_id: String,
         context: Vec<ContextItem>,
+        model: Option<String>,
         effort: Option<String>,
     ) -> Result<()> {
         self.send(|reply| Control::AssociateTurn {
             command_id,
             turn_id,
             context,
+            model,
             effort,
             reply,
         })
@@ -675,11 +678,12 @@ impl EventProcessor {
                 command_id,
                 turn_id,
                 context,
+                model,
                 effort,
                 reply,
             } => {
                 let result = self
-                    .associate_turn(command_id, turn_id, context, effort)
+                    .associate_turn(command_id, turn_id, context, model, effort)
                     .await;
                 let _ = reply.send(result);
                 true
@@ -1172,6 +1176,7 @@ impl EventProcessor {
         command_id: String,
         turn_id: String,
         context: Vec<ContextItem>,
+        model: Option<String>,
         effort: Option<String>,
     ) -> Result<()> {
         if !self.status.ready
@@ -1203,9 +1208,13 @@ impl EventProcessor {
         let thread_id = self.status.thread_id.as_deref().unwrap_or_default();
         let native_id = event_id(thread_id, &turn_id, &turn_id, "turn.started")?;
         let mut data = json!({"command_id": command_id, "turn_id": turn_id});
-        // Report the effort the native turn request actually carried, so the
-        // Store readback shows the resolved value instead of the overlay's
-        // absent override. Omitted when unknown: nothing is invented.
+        // Report the model/effort the native turn request actually carried,
+        // so the Store readback shows the carried values instead of the
+        // overlay's absent overrides. Omitted when unknown: nothing is
+        // invented.
+        if let Some(model) = model.as_deref().filter(|model| !model.trim().is_empty()) {
+            data["model"] = json!(model);
+        }
         if let Some(effort) = effort.as_deref().filter(|effort| !effort.trim().is_empty()) {
             data["effort"] = json!(effort);
         }

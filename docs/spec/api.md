@@ -249,6 +249,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `agent.discover` | owner-only native metadata discovery, without creating Agents |
 | `agent.history` | owner-only bounded history of an exact observed subject |
 | `mail.send/inbox/read/ack`, `var.set/get` | addressed queued mail with separate acknowledgement, shared variables with CAS |
+| `swarm.reparent` | Owner-only atomic subtree or all-children manager change; generation-bound, no native effect |
 | `who`, `claim.set/list/release` | current-worker file areas plus advisory claims with coalesced conflict notices |
 | `rule.*` except `rule.list/get/catch_up` | later automation; effects remain commands; no rule or timer pause/resume operation exists |
 
@@ -413,7 +414,15 @@ action child. Manual runs do not consume the scheduled slot. See the timer seman
 `agent.get` includes the current generation's source rows and the managed workspace
 target generation's rows when it differs. If persisted state requires a live owner and
 the corresponding source is absent, it returns `unknown` rather than asserting the
-persisted state is current.
+persisted state is current. The Agent `effective` settings are the last
+natively admitted values, never a prediction: the launch `session.ready`
+readback sets them, and a `configure` revision's turn refreshes them when the
+harness proves what its native turn request carried (Codex reports the
+carried model/effort and Muse reports the carried effort through the
+exact-turn association, which acknowledges native admission of those values;
+`effort_verified`/`model_verified` mark that admission). Values no turn
+re-proves stay at their admission readback; no value is ever presented as
+verified without that admission.
 
 Request DTOs reject unknown fields. Required Agent IDs are nonempty after a trim check
 and are kept as supplied. Optional `generation`, `after` and process `scope` members may
@@ -558,8 +567,12 @@ the generation, `application:\"next_turn\"`, provenance `\"configure\"`,
 and the native `model_verified` (plus `effort_verified` on Antigravity)
 flags, each set only from the native echo or `GET`. A refused or unproven
 switch stores nothing and never claims `applied`; it never selects another
-model on failure. Settlement happens only after the Store commit, so an
-applied configure always has a retained row to read back.
+model on failure. A validation failure before the first native write
+(malformed args, an unknown model, an unadvertised value) settles
+`rejected` and holds nothing; only an ambiguous outcome at or after a
+write settles `unknown` and holds the settings lane. Settlement happens
+only after the Store commit, so an applied configure always has a
+retained row to read back.
 Each admitted native command (`launch`, `resume`, `send`) records the
 configuration it runs under as the retained profile-snapshot identity plus
 its stamped `config_revision`; each turn records the revision it ran under.
@@ -898,6 +911,41 @@ retain them, while unknown probes retain their claim across restart. Auth and Mo
 holds require owner correction and are not probe-eligible. Provider restriction facts
 are defined in [monitoring](monitoring.md#provider-holds).
 
+## Handoff methods
+
+The owning semantics are [Coordination: Handoff](coordination.md#handoff).
+`swarm.reparent` is implemented; its sole wire DTOs are
+[`ReparentRequest` / `ReparentResponse`](../../crates/eliot-core/src/api/hierarchy.rs).
+Name exactly one of `agent` (whole subtree) or `children_of` (all direct children
+and their subtrees), plus `expected_generation` for that source, `parent`,
+`parent_generation`, and the mutation `id`. Both generations are required; no
+active-Agent fallback or implicit generation refresh on retry. Owner only, same
+project, controlled nonterminal/nonunknown destination. Native-child observation
+bindings cannot move. Result `moved` lists every affected Agent/generation with
+previous/current parent, root and depth, ordered by Agent number; an empty list
+is a valid all-children result. No truncation or partial Store move is permitted.
+Existing selector expansion and live fanout limits apply; encoded replies are
+bounded by the existing retained-write budget. Errors include `invalid` (cycle
+or bad source form), `stale_generation`, `not_found`, `not_allowed`, `bad_state`,
+`fanout_limit`, `frame_too_large`, and mutation binding/age errors. Exact replay
+returns the committed result before current-state checks. MCP discovery describes
+this Owner method and mints a missing ID under the existing mutation rules.
+
+CLI (explicit generations preserve an identical retry payload):
+
+```text
+swarm [--id ULID] reparent AGENT --parent MANAGER --generation N --parent-generation M
+swarm [--id ULID] reparent --children-of MANAGER_A --parent MANAGER_B --generation N --parent-generation M
+```
+
+`swarm.handoff` and `swarm.switch` are reserved design names and return `unsupported`
+today; they have no advertised DTO, CLI or MCP discovery entry. The next increment
+must connect their Owner operation to existing durable commands: explicit A/B
+generations, original-task command and selected undispatched SEND IDs for handoff;
+source generation plus normal profile/ad-hoc launch selectors for switch. The result
+must retain component outcomes and exact child IDs, including partial or unknown
+native delivery. No field catalog is promised before those DTOs are implemented.
+
 ## Waiting
 
 `swarm.wait` is the implemented bounded completion wait over an explicitly captured
@@ -969,9 +1017,14 @@ restores revoked control; unknown blocks another takeover.
 per-harness installation facts (installed, resolved `cmd`, `--version`; Claude
 additionally reports every discovered install newest first in `candidates`);
 `harness.models` (`HarnessModelsRequest`/`HarnessModelsResponse`) returns the
-harness's own read-only catalogue (Codex/Muse native `model/list`, the OpenCode
-provider/model list, Antigravity `agy models`; Claude reports aliases plus the
-CLI default). An optional `profile` selects the native route/account
+harness's own read-only catalogue (Codex/Muse native `model/list`, OpenCode
+native `opencode models` provider/model ids verbatim, Antigravity
+`agy models`; Claude reports aliases plus the CLI default). The `catalogue`
+member is `native` for a live read, `aliases` for Claude, `empty` when the
+native read ran but listed no models (ad-hoc Muse on a launcher-marked binary
+with an empty `model/list`: the note names that binary and the `--cmd` /
+profile remedy), or `none` when the harness exposes no catalogue.
+An optional `profile` selects the native route/account
 (the named profile must exist and its frozen harness must match); omitted it
 means ad-hoc daemon defaults. The read is cached per native route/account
 scope with a freshness timestamp (`fetched_at_ms`, `ttl_ms`) and a nonsecret

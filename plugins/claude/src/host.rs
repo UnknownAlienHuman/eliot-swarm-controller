@@ -972,9 +972,17 @@ impl ClaudePlugin {
         // retains that observed set and attaches it to the turn terminal, so
         // the reducer merges it into the effective set with verified true.
         // An absent or malformed init inventory stays unknown.
+        // Effort travels on the native `--effort` argv; the CLI never reads
+        // it back, so the effective value is the pushed level (or null for
+        // the CLI default, never fabricated). The idle-session readback
+        // proves the native accepted the start carrying it, which marks it
+        // verified; an unknown level fails admission before any spawn.
+        let effort_verified = plan.requested_effort.is_some();
         let effective = with_context_points(
             json!({
                 "model": null,
+                "effort": plan.requested_effort.clone(),
+                "effort_verified": effort_verified,
                 "permission_mode": effective_mode,
                 "session_state": readback.session_state,
                 "pid": readback.pid,

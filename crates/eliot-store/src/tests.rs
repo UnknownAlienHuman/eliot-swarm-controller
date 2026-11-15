@@ -13243,6 +13243,176 @@ fn sends_run_under_their_dispatch_revision_and_turns_inherit_it() {
 }
 
 #[test]
+fn overlay_turn_carries_refresh_agent_effective_as_verified() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    // Launch with an admission readback: low effort, verified.
+    let launch_id = Ulid::new().to_string();
+    let admission = store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: launch_id.clone(),
+                target: None,
+                selector: None,
+                verb: "launch".to_owned(),
+                args: json!({"project":"configure-refresh", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":json!({"model":"m0","effort":"low"})}),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit launch");
+    let agent = admission.command.target.expect("launch target");
+    store.dispatch(&launch_id, now).expect("dispatch launch");
+    install_fixture_sources(&mut store, &agent, &launch_id, 1, now);
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "configure-refresh:ready".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: "configure-refresh:ready".to_owned(),
+                    data: json!({"command_id":launch_id, "effective":{"model":"m0","effort":"low","effort_verified":true,"model_verified":true}}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit session ready");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now)
+        .expect("settle launch");
+
+    // A plain snapshot turn carrying no model/effort leaves the admission
+    // readback untouched.
+    let plain = send_request(&agent, 1, "plain input");
+    let plain_id = plain.id.clone();
+    store
+        .submit("owner", plain, now + 1)
+        .expect("admit plain send");
+    store
+        .dispatch(&plain_id, now + 2)
+        .expect("dispatch plain send");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "configure-refresh:plain".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: "configure-refresh:plain:started".to_owned(),
+                    data: json!({"command_id": plain_id, "turn_id": "plain-turn"}),
+                }],
+                cursor: None,
+            },
+            now + 3,
+        )
+        .expect("associate plain turn");
+    let before = store
+        .get_agent(&agent)
+        .expect("load agent")
+        .expect("agent exists");
+    assert_eq!(
+        before
+            .effective
+            .as_ref()
+            .and_then(|effective| effective.get("effort")),
+        Some(&json!("low")),
+        "plain turn invents no effective values"
+    );
+
+    // Apply an overlay, then associate its turn carrying the native request
+    // values: the Agent readback refreshes to the verified new effort.
+    let configure = configure_request(&agent, 1, json!({"model": "m1", "effort": "high"}));
+    let configure_id = configure.id.clone();
+    store
+        .submit("owner", configure, now + 4)
+        .expect("admit configure");
+    store
+        .dispatch(&configure_id, now + 5)
+        .expect("dispatch configure");
+    store
+        .apply_agent_config(&configure_id, now + 6)
+        .expect("apply configure");
+    store
+        .settle(&configure_id, CommandState::Applied, None, now + 6)
+        .expect("settle configure");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "configure-refresh:plain-done".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![
+                    NativeEvent {
+                        ts: None,
+                        kind: "message.completed".to_owned(),
+                        native_id: "configure-refresh:plain:message".to_owned(),
+                        data: json!({"command_id": plain_id, "turn_id": "plain-turn", "text": "plain reply"}),
+                    },
+                    NativeEvent {
+                        ts: None,
+                        kind: "turn.completed".to_owned(),
+                        native_id: "configure-refresh:plain:completed".to_owned(),
+                        data: json!({"command_id": plain_id, "turn_id": "plain-turn", "status": "completed"}),
+                    },
+                ],
+                cursor: None,
+            },
+            now + 7,
+        )
+        .expect("complete plain turn");
+    let overlay_send = send_request(&agent, 1, "overlay input");
+    let overlay_id = overlay_send.id.clone();
+    store
+        .submit("owner", overlay_send, now + 8)
+        .expect("admit overlay send");
+    store
+        .dispatch(&overlay_id, now + 9)
+        .expect("dispatch overlay send");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "configure-refresh:overlay".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: "configure-refresh:overlay:started".to_owned(),
+                    data: json!({"command_id": overlay_id, "turn_id": "overlay-turn", "model": "m1", "effort": "high"}),
+                }],
+                cursor: None,
+            },
+            now + 10,
+        )
+        .expect("associate overlay turn");
+    let after = store
+        .get_agent(&agent)
+        .expect("load agent")
+        .expect("agent exists");
+    let effective = after
+        .effective
+        .expect("effective survives the overlay turn");
+    assert_eq!(effective["model"], json!("m1"));
+    assert_eq!(effective["effort"], json!("high"));
+    assert_eq!(effective["model_verified"], json!(true));
+    assert_eq!(effective["effort_verified"], json!(true));
+}
+
+#[test]
 fn configure_and_send_share_one_admission_order() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");

@@ -462,6 +462,26 @@ pub(super) fn authorize_agent_read(
 }
 
 impl Router {
+    pub(super) async fn swarm_reparent(
+        &self,
+        params: &Value,
+        principal: &Principal,
+    ) -> Result<Value> {
+        require_owner(principal)?;
+        let request: eliot_core::api::ReparentRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let mut store = self.inner.store.lock().await;
+        let change = store.reparent(
+            &principal_name(principal),
+            &request,
+            crate::common::now_ms(),
+        )?;
+        self.publish_locked(&change.events);
+        serde_json::to_value(change.value)
+            .map_err(|_| Error::new("internal", "cannot encode reparent response"))
+    }
+
     /// Post-admission scheduling: a selector parent schedules its admitted
     /// children; any other new command schedules itself plus its linked input.
     pub(super) fn schedule_admission(&self, admission: &eliot_store::Admission) {
