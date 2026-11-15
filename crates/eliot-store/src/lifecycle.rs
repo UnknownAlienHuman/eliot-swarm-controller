@@ -1273,6 +1273,9 @@ pub(super) fn transition_lost_tx(
         )?);
     }
     for command_id in pending_command_ids(tx, agent_num, generation)? {
+        if super::handoff::held_successor_tx(tx, &command_id)? {
+            continue;
+        }
         cancel_pending_command_tx(
             tx,
             agent_num,

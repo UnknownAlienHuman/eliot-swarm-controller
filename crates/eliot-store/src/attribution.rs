@@ -579,6 +579,107 @@ impl Store {
     }
 }
 
+/// Move all live exact-generation claims without renewing TTL or overwriting B.
+pub(super) fn transfer_claims_tx(
+    tx: &Transaction<'_>,
+    from: &eliot_core::Agent,
+    to: &eliot_core::Agent,
+    policy: &eliot_core::SecretPolicy,
+    now: i64,
+    events: &mut Vec<eliot_core::Event>,
+) -> Result<(Vec<String>, Vec<ClaimConflict>, bool)> {
+    purge_expired_claims_tx(tx, now)?;
+    let from_num = parse_agent_id(&from.id)?;
+    let to_num = parse_agent_id(&to.id)?;
+    let claims = Store::live_claims(
+        tx,
+        Some(&from.project),
+        Some(from_num),
+        now,
+        MAX_CLAIMS_PER_AGENT as i64 + 1,
+    )?;
+    let destination = Store::live_claims(
+        tx,
+        Some(&to.project),
+        Some(to_num),
+        now,
+        MAX_CLAIMS_PER_AGENT as i64 + 1,
+    )?;
+    if claims.len() + destination.len() > MAX_CLAIMS_PER_AGENT {
+        return Err(Error::new(
+            "claim_limit",
+            "handoff exceeds destination claim limit",
+        ));
+    }
+    let mut moved = Vec::new();
+    for claim in claims {
+        if destination
+            .iter()
+            .any(|existing| existing.glob == claim.glob)
+        {
+            return Err(Error::new(
+                "bad_state",
+                "destination already holds this exact claim",
+            ));
+        }
+        if policy.contains_text(&claim.glob) {
+            return Err(Error::new(
+                "secret_in_payload",
+                "claim identity contains a known secret",
+            ));
+        }
+        tx.execute(
+            "DELETE FROM claims WHERE agent=?1 AND generation=?2 AND glob=?3",
+            params![from_num, from.generation, claim.glob],
+        )
+        .map_err(sql_error)?;
+        // Expired destination rows with this primary key do not own a live claim.
+        tx.execute(
+            "DELETE FROM claims WHERE agent=?1 AND generation=?2 AND glob=?3 AND expires_at<=?4",
+            params![to_num, to.generation, claim.glob, now],
+        )
+        .map_err(sql_error)?;
+        tx.execute("INSERT INTO claims(agent,generation,glob,note,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![to_num,to.generation,claim.glob,claim.note.as_deref().map(|s|policy.redact_text(s)),claim.expires_at,claim.created_at]).map_err(sql_error)?;
+        for (num, generation, live) in [
+            (from_num, from.generation, false),
+            (to_num, to.generation, true),
+        ] {
+            events.push(insert_daemon_event(
+                tx,
+                now,
+                "claim.changed",
+                "coordination",
+                Some(num),
+                Some(generation),
+                json!({"glob":claim.glob,"live":live,"handoff_from":from.id,"handoff_to":to.id}),
+            )?);
+        }
+        moved.push(claim.glob);
+    }
+    let mut conflicts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut truncated = false;
+    for glob in &moved {
+        let (found, capped) = Store::scan_claim_conflicts(tx, &to.project, &to.id, glob, now)?;
+        truncated |= capped;
+        for conflict in found {
+            if seen.insert((
+                conflict.agent.clone(),
+                conflict.generation,
+                conflict.glob.clone(),
+            )) {
+                if conflicts.len() < MAX_WHO_WORKERS {
+                    conflicts.push(conflict);
+                } else {
+                    truncated = true;
+                }
+            }
+        }
+    }
+    Ok((moved, conflicts, truncated))
+}
+
 /// Load one Agent row and prove the caller's generation is still
 /// current; a missing row or a moved generation reads stale.
 fn load_current_claim_agent(

@@ -877,6 +877,12 @@ driving needs a bound: `set` refuses a Goal without a cadence unless `max_turns`
 or `max_rounds` is set. Cadenced Goals round only on explicit slots and need
 none; explicit manual rounds never need one either.
 
+[Task handoff](coordination.md#handoff) transfers only a quiescent Eliot Goal,
+clears A and installs B paused at a new revision. Round markers and continuation
+identities never transfer. A private additive turn baseline preserves all consumed
+turns while charging B's subsequent turns immediately; resetting a definition resets
+that baseline. Explicit resume is required. Cadence re-anchors at transfer time.
+
 Goal set, pause, clear and resume each take a required external mutation id
 (see Mutation ids in api.md); the DTO link in Core api/goals.rs is the only
 field catalog. The CLI supplies the global --id to all four. Each applies its

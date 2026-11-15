@@ -21,6 +21,7 @@ pub use goals::{
     GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundClaim, GoalRoundCommit,
     GoalRoundCommitResult, GoalRoundKey, GoalRoundProbe,
 };
+pub use handoff::HandoffAdmission;
 pub use projects::ProjectRegistrationInput;
 pub use resolution::TurnInactiveProof;
 pub use retention::RetentionReport;
@@ -98,11 +99,13 @@ const LIST_NONTERMINAL_AGENTS_COLUMNS: &str = "SELECT id, generation, name, proj
                         parent, root, depth, control, profile_inherited
                  FROM agents";
 const RECOVER_ACCEPTED_COMMAND_FILTER: &str =
-    "state IN ('accepted', 'queued', 'dispatched', 'unknown')
-       AND state = 'accepted' AND principal = 'owner' AND parent_command IS NULL
-       AND selector IS NULL
-       AND NOT EXISTS (SELECT 1 FROM workspaces w
-           WHERE w.agent = commands.target AND w.start_command_id = commands.id)";
+    "state IN ('accepted', 'queued', 'dispatched', 'unknown') AND (
+       (state = 'accepted' AND principal = 'owner' AND parent_command IS NULL
+        AND selector IS NULL
+        AND NOT EXISTS (SELECT 1 FROM workspaces w
+            WHERE w.agent = commands.target AND w.start_command_id = commands.id))
+       OR (link_kind = 'handoff' AND state IN ('accepted','queued')))";
+
 const LIST_PROCESSES_FIRST_PAGE_SQL: &str =
     "SELECT host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at
              FROM processes WHERE owner = ?1
@@ -128,6 +131,7 @@ mod digests;
 mod dispatch;
 mod git;
 mod goals;
+mod handoff;
 mod hierarchy;
 mod lifecycle;
 mod native_children;
@@ -1224,7 +1228,7 @@ impl Store {
         let (created_at, rowid) = after.unwrap_or((i64::MIN, i64::MIN));
         let sql = format!(
             "SELECT id, created_at, rowid FROM commands
-             WHERE {RECOVER_ACCEPTED_COMMAND_FILTER}
+             WHERE ({RECOVER_ACCEPTED_COMMAND_FILTER})
                AND (created_at, rowid) > (?1, ?2)
              ORDER BY created_at, rowid LIMIT ?3"
         );
@@ -1247,7 +1251,7 @@ impl Store {
             .query_row(
                 &format!(
                     "SELECT EXISTS(SELECT 1 FROM commands
-                     WHERE id = ?1 AND {RECOVER_ACCEPTED_COMMAND_FILTER})"
+                     WHERE id = ?1 AND ({RECOVER_ACCEPTED_COMMAND_FILTER}))"
                 ),
                 [id],
                 |row| row.get::<_, bool>(0),
@@ -4157,7 +4161,7 @@ fn write_command_state(
          WHERE id = ?5",
         params![command_state_name(state), outcome, generation, now, id],
     ));
-    Ok(())
+    handoff::refresh_parent_tx(tx, id, now)
 }
 
 fn insert_daemon_event(
@@ -5913,6 +5917,9 @@ fn terminalize_generation_commands(
         update_command_state(tx, &id, CommandState::Unknown, Some(&outcome), None, now)?;
     }
     for id in pending_command_ids(tx, agent, generation)? {
+        if handoff::held_successor_tx(tx, &id)? {
+            continue;
+        }
         let outcome = json!({"reason": reason});
         update_command_state(tx, &id, CommandState::Cancelled, Some(&outcome), None, now)?;
     }

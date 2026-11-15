@@ -104,6 +104,9 @@ not duplicated Agent columns. No managed row means these projections are absent.
 An open stop/transition is a command beside the observed state, not another state
 machine. Generation transition blocks ordinary turn work. Terminal settlement cancels
 undispatched work, revokes token/own identity, releases claims and pauses Goals atomically.
+The handoff brief gate preserves withheld successor SENDs across automatic native loss
+and restart until Owner resolution or cancellation; explicit lifecycle cancellation
+retains its ordinary no-effect behavior (see [Handoff](coordination.md#handoff)).
 If a running turn has no terminal evidence, retain it as `unknown` before clearing the
 active-turn pointer; do not erase or fabricate its result. Dispatched/unknown commands
 remain historical and are never reissued.
@@ -360,6 +363,10 @@ and returns `rejected`.
 Generic transport, Store or RPC errors never become `failed`. A separately validated,
 authoritative plugin result state follows its explicit result path, not this error-code
 classifier.
+
+The separate pure `handoff_brief_resolution_allowed` predicate permits an Owner
+assertion of `failed -> applied` only after Store proves the exact handoff brief.
+Ordinary settlement does not acquire this edge; no native receipt or replay results.
 
 Workspace preparation is the narrow pre-native exception: an exact command-bound
 workspace marker permits `accepted|queued -> failed|unknown` without advancing the

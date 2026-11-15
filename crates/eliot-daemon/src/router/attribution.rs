@@ -18,9 +18,8 @@ use crate::common::now_ms;
 use eliot_core::{
     Agent, Error, GitPathStatus, Result,
     api::{
-        ClaimListRequest, ClaimListResponse, ClaimReleaseRequest, ClaimSetRequest,
-        ClaimSetResponse, ClaimView, GitView, MAX_WHO_PATHS, WhoRequest, WhoResponse,
-        WhoSharedWorkspace, WhoWorker,
+        ClaimListRequest, ClaimListResponse, ClaimReleaseRequest, ClaimSetRequest, ClaimView,
+        GitView, MAX_WHO_PATHS, WhoRequest, WhoResponse, WhoSharedWorkspace, WhoWorker,
     },
 };
 use eliot_store::{NoticePending, WhoWorkerRow};
@@ -72,7 +71,7 @@ impl Router {
         // fresh admission notifies holders; a replay carries no events and
         // must not re-notify.
         if !change.events.is_empty() {
-            self.notify_conflict_holders(&change.value).await;
+            self.notify_claim_conflicts(&change.value.conflicts).await;
         }
         serde_json::to_value(change.value)
             .map_err(|_| Error::new("internal", "claim could not be encoded"))
@@ -229,9 +228,12 @@ impl Router {
         })
     }
 
-    async fn notify_conflict_holders(&self, response: &ClaimSetResponse) {
+    pub(super) async fn notify_claim_conflicts(
+        &self,
+        conflicts: &[eliot_core::api::ClaimConflict],
+    ) {
         let mut holders: BTreeMap<&str, i64> = BTreeMap::new();
-        for conflict in &response.conflicts {
+        for conflict in conflicts {
             *holders.entry(conflict.agent.as_str()).or_insert(0) += 1;
         }
         for (holder, overlapping) in holders {

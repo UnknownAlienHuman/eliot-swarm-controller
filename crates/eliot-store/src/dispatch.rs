@@ -889,6 +889,12 @@ impl Store {
                 events,
             });
         }
+        if handoff::gate_tx(&tx, &command, now, &mut events)? {
+            let value = load_command(&tx, id)?
+                .ok_or_else(|| Error::new("source_integrity", "handoff child missing"))?;
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(Change { value, events });
+        }
         let (agent_num, agent, command_generation) = dispatch_target_tx(&tx, &command)?;
         if let Some(value) = dispatch_rule_hold_tx(&tx, id, now, &mut events)? {
             commit_transaction(tx, &self.write_faulted)?;

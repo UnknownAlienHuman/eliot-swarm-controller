@@ -647,6 +647,38 @@ pub(crate) async fn run_reparent(
     Ok(0)
 }
 
+pub(crate) async fn run_handoff(
+    args: super::args::HandoffArgs,
+    data_dir: PathBuf,
+    json_output: bool,
+    id: Option<String>,
+) -> Result<u8, Failure> {
+    let request = eliot_core::api::HandoffRequest {
+        id: mutation_id(id)?,
+        from: args.from,
+        from_generation: args.generation,
+        to: args.to,
+        to_generation: args.to_generation,
+        task_command: args.task_command,
+        commands: args.commands,
+    };
+    request
+        .validate()
+        .map_err(|error| Failure::from_core(error, true))?;
+    let response: eliot_core::api::HandoffResponse =
+        eliot_daemon::client_call_typed(&data_dir, "swarm.handoff", &request)
+            .await
+            .map_err(|error| Failure::from_core(error, true))?;
+    request
+        .validate_response(&response)
+        .map_err(|_| Failure::new(4, "handoff response binding differs"))?;
+    print_value(
+        &serde_json::to_value(response).map_err(|_| Failure::new(4, "invalid handoff response"))?,
+        json_output,
+    );
+    Ok(0)
+}
+
 pub(crate) fn approval_reply_args(choice: Option<String>, feedback: Option<String>) -> Value {
     let mut args = serde_json::Map::new();
     if let Some(choice) = choice {

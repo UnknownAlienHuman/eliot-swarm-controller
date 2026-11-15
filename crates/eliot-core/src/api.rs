@@ -8,6 +8,7 @@ mod digests;
 pub mod discovery;
 mod git;
 mod goals;
+mod handoff;
 pub mod harness;
 mod hierarchy;
 mod maintenance;
@@ -70,6 +71,10 @@ pub use goals::{
     GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalSetRequest,
     GoalStatus, GoalView, MAX_GOAL_CADENCE_MS, MAX_GOAL_LIMIT, MAX_GOAL_OBSERVATION_BYTES,
     MIN_GOAL_CADENCE_MS,
+};
+pub use handoff::{
+    CommandCancelRequest, CommandCancelResponse, HandoffRequest, HandoffResponse,
+    MAX_HANDOFF_SENDS, SendTransfer,
 };
 pub use harness::{
     HARNESS_QUOTA_SUPPORTED, HARNESS_QUOTA_UNKNOWN, HARNESS_QUOTA_UNSUPPORTED, HARNESS_READ_TTL_MS,

@@ -129,7 +129,10 @@ impl Store {
                 "observe-only Agents have no resolvable commands",
             ));
         }
-        if record.state != CommandState::Unknown {
+        let failed_brief = record.state == CommandState::Failed
+            && request.resolution == CommandResolution::Applied
+            && super::handoff::is_brief_tx(&tx, &request.command_id)?;
+        if record.state != CommandState::Unknown && !failed_brief {
             return Err(Error::new(
                 "bad_state",
                 if record.state.is_terminal() {
@@ -417,7 +420,19 @@ fn resolve_command_tx(
             "resolution outcome exceeds 64 KiB",
         ));
     }
-    update_command_state(tx, command_id, state, Some(&outcome), None, now)?;
+    if record.state == CommandState::Failed {
+        if !super::handoff::is_brief_tx(tx, command_id)?
+            || !eliot_core::handoff_brief_resolution_allowed(record.state, state)
+        {
+            return Err(Error::new(
+                "bad_state",
+                "only a failed handoff brief may be owner-applied",
+            ));
+        }
+        super::write_command_state(tx, command_id, state, Some(&outcome), None, now)?;
+    } else {
+        update_command_state(tx, command_id, state, Some(&outcome), None, now)?;
+    }
     insert_daemon_command_event(
         tx,
         now,
