@@ -1081,6 +1081,7 @@ impl PluginHost {
     /// and outcome.
     async fn terminate_orphaned_generation_job(&self, agent: &Agent, command: &Command) {
         let generation = agent.generation.to_string();
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut ids = vec![
             ("agent", agent.id.as_str()),
             ("generation", generation.as_str()),
@@ -1173,6 +1174,7 @@ impl PluginHost {
     /// and the name-kill must wait for the live path. Truncation fails
     /// safe toward skipping; a store error fails open here and is
     /// re-decided at the namespace lookup below.
+    #[cfg(windows)]
     async fn generation_driver_live(&self, agent: &Agent, command: &Command) -> Result<bool> {
         const LIMIT: usize = 1000;
         let store = self.state.store.lock().await;
@@ -1188,6 +1190,7 @@ impl PluginHost {
     /// and generation, other than this stop itself and other stops (which
     /// create no family). Unknown commands prove nothing live. A truncated
     /// unsettled list cannot prove absence, so truncation counts as live.
+    #[cfg(any(windows, test))]
     fn generation_has_live_driver(
         commands: &[Command],
         total_unsettled: i64,
