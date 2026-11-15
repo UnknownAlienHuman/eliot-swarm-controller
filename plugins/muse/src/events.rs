@@ -145,6 +145,11 @@ pub(crate) struct EventStatus {
     pub active_command_id: Option<String>,
     pub active_turn_id: Option<String>,
     pub last_turn: Option<TurnFacts>,
+    /// Confirmed native endpoint exit observed after the last event drain:
+    /// exit code plus bounded stderr tail. Endpoint-scoped, never a turn
+    /// verdict: an unknown turn next to a recorded exit names the crash
+    /// that ended observation instead of proving nothing.
+    pub native_exit: Option<String>,
     pub failure: Option<String>,
     pub batch_unknown: bool,
     pub source_unknown: bool,
@@ -224,6 +229,10 @@ enum Control {
     },
     EndStop {
         reply: oneshot::Sender<Result<()>>,
+    },
+    RecordNativeExit {
+        text: String,
+        reply: oneshot::Sender<()>,
     },
     Close {
         reply: oneshot::Sender<()>,
@@ -585,6 +594,21 @@ impl EventHandle {
             .await
     }
 
+    /// Retain one confirmed native endpoint exit for the readback. Only the
+    /// first death wins; terminality is never manufactured here. Best effort:
+    /// a closing queue drops the record instead of failing the shutdown.
+    pub async fn record_native_exit(&self, text: String) {
+        let (reply, response) = oneshot::channel();
+        if self
+            .control
+            .send(Control::RecordNativeExit { text, reply })
+            .await
+            .is_ok()
+        {
+            let _ = timeout_at(Instant::now() + EVENT_DEADLINE, response).await;
+        }
+    }
+
     pub fn status(&self) -> EventStatus {
         self.status.borrow().clone()
     }
@@ -767,6 +791,16 @@ impl EventProcessor {
                 } else {
                     self.pending_end_stop = Some(reply);
                 }
+                true
+            }
+            Control::RecordNativeExit { text, reply } => {
+                // Endpoint-scoped only: the active turn keeps whatever
+                // terminality the drained frames proved, and the snapshot
+                // pairs it with this exit instead of proving nothing.
+                if self.status.native_exit.is_none() {
+                    self.status.native_exit = Some(text);
+                }
+                let _ = reply.send(());
                 true
             }
             Control::Close { reply } => {

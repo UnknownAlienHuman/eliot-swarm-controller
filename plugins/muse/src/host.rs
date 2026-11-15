@@ -19,7 +19,9 @@ use crate::{
         },
     },
 };
-use eliot_core::{ContextOutcome, Error, InjectArgs, InjectPoint, Result, SecretPolicy};
+use eliot_core::{
+    ContextOutcome, Error, InjectArgs, InjectPoint, Result, SecretPolicy, StderrSnapshot,
+};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -165,10 +167,21 @@ pub(crate) async fn run() -> Result<()> {
         match event {
             HostLoopEvent::NativeExit => {
                 if let Some(session) = plugin.session.as_mut() {
+                    // Confirmed exit only: an unconfirmed wait error records
+                    // nothing. Capture before the drain borrows the transport
+                    // so the exit rides the event queue ahead of close.
+                    let exit = session.native.transport.wait_for_process_exit().await;
+                    let stderr = session.native.transport.stderr_snapshot();
+                    let native_exit = exit
+                        .ok()
+                        .map(|status| native_exit_text(&status, &stderr, &session.secrets));
                     native_retirement = eliot_plugin::native_lifecycle::drain_native_exit(
                         &mut session.native.transport,
                         async {
                             session.events.drain_native().await?;
+                            if let Some(text) = native_exit {
+                                session.events.record_native_exit(text).await;
+                            }
                             session.events.close().await;
                             Ok(())
                         },
@@ -1714,6 +1727,36 @@ impl MusePlugin {
     }
 }
 
+/// Endpoint-scoped native exit text for the snapshot readback: the confirmed
+/// exit code plus the bounded redacted harness stderr tail when it says
+/// anything. Never a turn verdict; an unknown turn next to this text names
+/// the crash that ended observation.
+fn native_exit_text(
+    status: &std::process::ExitStatus,
+    stderr: &StderrSnapshot,
+    secrets: &[String],
+) -> String {
+    const MAX_TAIL_BYTES: usize = 2 * 1024;
+    let mut text = match status.code() {
+        Some(code) => format!("Muse native exited (code {code})"),
+        None => "Muse native exited (code unknown)".to_owned(),
+    };
+    let policy = SecretPolicy::new(secrets.iter().cloned());
+    let tail = policy.redact_text(stderr.text.trim());
+    if !tail.is_empty() {
+        let mut end = tail.len().min(MAX_TAIL_BYTES);
+        while !tail.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.push_str("; stderr tail: ");
+        text.push_str(&tail[..end]);
+        if tail.len() > MAX_TAIL_BYTES || stderr.truncated {
+            text.push('\u{2026}');
+        }
+    }
+    text
+}
+
 async fn terminate_session(
     session: &mut AgentSession,
     force: bool,
@@ -2220,7 +2263,8 @@ async fn read_live_snapshot(
         "command_id": params.command_id, "state": session_state(&readback.session),
         "native_scope": session.native_scope, "native_ref": session_id,
         "active_turn": last_turn.as_ref().filter(|turn| !turn.terminal).map(|turn| turn.turn_id.clone()),
-        "last_turn": last_turn, "batch_unknown": event_status.batch_unknown,
+        "last_turn": last_turn, "native_exit": event_status.native_exit,
+        "batch_unknown": event_status.batch_unknown,
         "source_unknown": event_status.source_unknown, "result_known": result_known,
     }))
 }
@@ -2234,6 +2278,7 @@ fn view_unknown_snapshot(
     snapshot["native_scope"] = json!(session.native_scope);
     snapshot["native_ref"] = json!(session.session_id);
     snapshot["active_turn"] = json!(session.events.status().active_turn_id);
+    snapshot["native_exit"] = json!(session.events.status().native_exit);
     snapshot["batch_unknown"] = json!(session.events.status().batch_unknown);
     Ok(snapshot)
 }
@@ -2867,6 +2912,52 @@ mod tests {
             );
         }
         assert_ne!(new_command_id(), new_command_id());
+    }
+
+    #[cfg(windows)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code as u32)
+    }
+
+    #[cfg(windows)]
+    fn stderr_snapshot(text: &str) -> eliot_core::StderrSnapshot {
+        eliot_core::StderrSnapshot {
+            text: text.to_owned(),
+            truncated: false,
+            eof: true,
+            read_error: false,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_exit_names_the_code_and_the_bounded_tail() {
+        let text = super::native_exit_text(
+            &exit_status(3),
+            &stderr_snapshot("boom\ntraceback line 2"),
+            &[],
+        );
+        assert!(text.contains("(code 3)"), "{text}");
+        assert!(text.contains("boom"), "{text}");
+
+        let silent = super::native_exit_text(&exit_status(1), &stderr_snapshot("   \n "), &[]);
+        assert_eq!(silent, "Muse native exited (code 1)");
+
+        let secret = super::native_exit_text(
+            &exit_status(1),
+            &stderr_snapshot("denied for hunter2"),
+            &["hunter2".to_owned()],
+        );
+        assert!(!secret.contains("hunter2"), "{secret}");
+
+        let oversize = super::native_exit_text(
+            &exit_status(1),
+            &stderr_snapshot(&"é".repeat(8 * 1024)),
+            &[],
+        );
+        assert!(oversize.contains("(code 1)"), "{oversize}");
+        assert!(oversize.len() <= 128 + 2 * 1024, "{oversize}");
     }
 
     #[test]
