@@ -383,6 +383,15 @@ pub mod winui {
             self.role(|s| s.error, ThemeBrush::SystemCritical)
         }
 
+        /// A destructive confirmation's surface (the Force stop banner).
+        pub fn error_container(self) -> Brush {
+            self.role(|s| s.error_container, ThemeBrush::SystemCriticalBackground)
+        }
+
+        pub fn on_error_container(self) -> Brush {
+            self.role(|s| s.on_error_container, ThemeBrush::PrimaryText)
+        }
+
         /// The status dot of a tone; `None` for tones that need no mark in
         /// a list (ready, ended), so a calm fleet shows no dots at all.
         pub fn dot(self, tone: StatusTone) -> Option<Brush> {
@@ -457,6 +466,11 @@ pub mod winui {
             self.with(|s| family(s, None, s.on_surface_variant))
         }
 
+        /// The confirmed destructive action (Force stop): filled in error.
+        pub fn danger(self) -> ResourceOverrides {
+            self.with(|s| family(s, Some(s.error), s.on_error))
+        }
+
         fn with(self, build: impl FnOnce(&Scheme) -> ResourceOverrides) -> ResourceOverrides {
             match self.scheme {
                 Some(scheme) => build(scheme),
@@ -515,6 +529,7 @@ pub mod winui {
                 palette.row(true),
                 palette.card_button(),
                 palette.chip(),
+                palette.danger(),
             ] {
                 assert_eq!(overrides, ResourceOverrides::new());
             }

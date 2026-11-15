@@ -384,7 +384,7 @@ of the explicitly selected release scope.
       and deduplicated; CPU and memory are bar charts with the latest value and a
       labelled scale. Only the actions that apply are offered, bound at click time
       to the Agent, generation and turn shown: Interrupt, Stop, Force stop
-      (confirmed in a dialog), Resume and, for observe-only Agents, Detach.
+      (confirmed inline), Resume and, for observe-only Agents, Detach.
       (Refs #407)
 - [x] **D4 Launch context, profiles and automation settings.** A new task
       picks Auto, a profile from the daemon's sanitized `profile.list` summaries,

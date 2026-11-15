@@ -34,8 +34,8 @@ pub(super) enum ChatMsg {
     ControlSubmitted(String, Fallible<String>),
     /// A "…" menu entry (its label).
     AgentMenu(String),
-    /// The Force stop confirmation closed (Primary confirms).
-    ForceStopClosed(ContentDialogResult),
+    /// The Force stop banner's answer: true confirms the bound action.
+    ForceStopAnswered(bool),
 }
 
 /// The Agent and generation a "…" entry acts on: the header shown when the
@@ -607,11 +607,11 @@ impl DesktopApp {
                     self.agent_menu(&label, binding, context);
                 }
             }
-            ChatMsg::ForceStopClosed(result) => {
+            ChatMsg::ForceStopAnswered(confirmed) => {
                 let Some((bound, _)) = self.chat.confirm_force.take() else {
                     return;
                 };
-                if result != ContentDialogResult::Primary {
+                if !confirmed {
                     return;
                 }
                 let key = format!("stop:{}:{}:true", bound.agent, bound.generation);
@@ -982,8 +982,11 @@ impl DesktopApp {
             View::empty()
         };
         let pending = self.pending_view(column, context, palette);
-        let alert: View = match &self.alert {
-            Some(text) => Border::new()
+        let alert: View = match (&self.chat.confirm_force, &self.alert) {
+            (Some((bound, title)), _) => {
+                self.force_stop_banner(bound, title, column, context, palette)
+            }
+            (None, Some(text)) => Border::new()
                 .grid_row(4)
                 .width(column)
                 .max_width(theme::layout::READING_WIDTH)
@@ -1013,7 +1016,7 @@ impl DesktopApp {
                                 .content(m3::icon(m3::glyph::CLOSE)),
                         )),
                 ),
-            None => View::empty(),
+            (None, None) => View::empty(),
         };
         let composer = self.composer_view(column, context, palette);
 
@@ -1034,7 +1037,6 @@ impl DesktopApp {
                 alert,
                 composer,
                 self.handoff_dialog(context),
-                self.force_stop_dialog(context),
             ))
     }
 
@@ -1578,26 +1580,75 @@ impl DesktopApp {
             .children((turn_actions, primary))
     }
 
-    /// The Force stop question, bound to the Agent and generation of its
-    /// menu click.
-    fn force_stop_dialog(&self, context: &mut ViewContext<Self>) -> View {
-        let Some((bound, title)) = &self.chat.confirm_force else {
-            // Reactor hides an open dialog only through is_open(false).
-            return ContentDialog::new().is_open(false).content(View::empty());
-        };
-        ContentDialog::new()
-            .is_open(true)
-            .title(format!("Force stop {title}?"))
-            .primary_button_text("Force stop")
-            .close_button_text("Cancel")
-            .on_closed(context.callback(|result| Message::Chat(ChatMsg::ForceStopClosed(result))))
+    /// The Force stop question above the composer, bound to the Agent and
+    /// generation of its menu click. In the window (not a ContentDialog),
+    /// so it always takes the window's theme.
+    fn force_stop_banner(
+        &self,
+        bound: &BoundAction,
+        title: &str,
+        column: Option<f64>,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        Border::new()
+            .grid_row(4)
+            .width(column)
+            .max_width(theme::layout::READING_WIDTH)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .margin(Thickness::new(0.0, theme::spacing::SM, 0.0, 0.0))
+            .background(palette.error_container())
+            .corner_radius(theme::shape::MD)
+            .padding(Thickness::uniform(theme::spacing::MD))
             .content(
-                TextBlock::new()
-                    .text(format!(
-                        "This ends Agent {} (generation {}) at once instead of a clean stop; an active turn is cut off.",
-                        bound.agent, bound.generation
-                    ))
-                    .text_wrapping(TextWrapping::Wrap),
+                Grid::new()
+                    .columns([GridLength::STAR, GridLength::Auto])
+                    .column_spacing(theme::spacing::MD)
+                    .children((
+                        StackPanel::new()
+                            .spacing(2.0)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .children((
+                                m3::text(
+                                    format!("Force stop {title}?"),
+                                    theme::type_scale::TITLE_SMALL,
+                                )
+                                .foreground(palette.on_error_container())
+                                .text_trimming(TextTrimming::CharacterEllipsis),
+                                m3::text(
+                                    format!(
+                                        "Ends Agent {} (generation {}) at once instead of a clean stop; an active turn is cut off.",
+                                        bound.agent, bound.generation
+                                    ),
+                                    theme::type_scale::BODY_SMALL,
+                                )
+                                .foreground(palette.on_error_container())
+                                .text_wrapping(TextWrapping::Wrap),
+                            )),
+                        StackPanel::new()
+                            .grid_column(1)
+                            .orientation(Orientation::Horizontal)
+                            .spacing(theme::spacing::SM)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .children((
+                                m3::text_button(palette)
+                                    .automation_name("Cancel force stop")
+                                    .on_click(context.message(Message::Chat(
+                                        ChatMsg::ForceStopAnswered(false),
+                                    )))
+                                    .content(TextBlock::new().text("Cancel")),
+                                m3::danger(palette)
+                                    .is_enabled(!self.submitting())
+                                    .automation_name(format!(
+                                        "Force stop {} generation {}",
+                                        bound.agent, bound.generation
+                                    ))
+                                    .on_click(context.message(Message::Chat(
+                                        ChatMsg::ForceStopAnswered(true),
+                                    )))
+                                    .content(TextBlock::new().text("Force stop")),
+                            )),
+                    )),
             )
     }
 

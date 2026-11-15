@@ -126,6 +126,13 @@ pub fn filled(palette: Palette) -> Button {
         .height(layout::CONTROL_HEIGHT)
 }
 
+/// Danger: the confirmed destructive action (Force stop).
+pub fn danger(palette: Palette) -> Button {
+    Button::new()
+        .resource_overrides(palette.danger())
+        .height(layout::CONTROL_HEIGHT)
+}
+
 /// Tonal: secondary actions that still read as buttons.
 pub fn tonal(palette: Palette) -> Button {
     Button::new()
