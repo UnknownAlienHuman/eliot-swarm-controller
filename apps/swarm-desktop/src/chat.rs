@@ -790,7 +790,22 @@ impl Conversation {
                 Vec::new(),
             )),
         }
-        for entry in &turn.activity {
+        let final_text = turn.final_text.clone().or_else(|| turn.event_final.clone());
+        // The last progress message is often the answer itself (Muse reports
+        // both); once the final exists it is shown once, as the final.
+        let echoed = final_text.as_deref().and_then(|answer| {
+            turn.activity
+                .iter()
+                .rposition(|entry| matches!(entry, Activity::Message { .. }))
+                .filter(|&index| {
+                    matches!(&turn.activity[index],
+                        Activity::Message { text, .. } if text.trim() == answer.trim())
+                })
+        });
+        for (index, entry) in turn.activity.iter().enumerate() {
+            if Some(index) == echoed {
+                continue;
+            }
             parts.push(match entry {
                 Activity::Message { key, text } => Part::new(
                     key.clone(),
@@ -854,7 +869,6 @@ impl Conversation {
             ));
         }
         let final_key = format!("final:{}", turn.turn_id);
-        let final_text = turn.final_text.clone().or_else(|| turn.event_final.clone());
         let label = match &turn.status {
             TurnStatus::Completed(Some(TurnOutcome::Success)) | TurnStatus::Completed(None) => {
                 "Assistant".to_owned()
@@ -1051,6 +1065,51 @@ mod tests {
             before[0].parts[1], after[0].parts[1],
             "unchanged part keeps its revision"
         );
+    }
+
+    #[test]
+    fn a_last_progress_message_equal_to_the_final_is_shown_once() {
+        let events = vec![
+            event(1, "agent.created", json!({})),
+            event(
+                2,
+                "turn.started",
+                json!({"turn_id": "t1", "command_id": "c1"}),
+            ),
+            event(
+                3,
+                "message.completed",
+                json!({"turn_id": "t1", "phase": "commentary", "text": "looking"}),
+            ),
+            event(
+                4,
+                "message.completed",
+                json!({"turn_id": "t1", "phase": "commentary", "text": "the answer\n"}),
+            ),
+            event(5, "turn.completed", json!({"turn_id": "t1"})),
+        ];
+        let mut chat = Conversation::new("a1");
+        chat.reset(coverage(), &[], &events);
+        // Before the final exists both progress messages are shown.
+        let keys = |chat: &Conversation| -> Vec<String> {
+            chat.items()[0]
+                .parts
+                .iter()
+                .map(|part| part.key.clone())
+                .collect()
+        };
+        assert!(keys(&chat).contains(&"n4".to_owned()));
+        chat.apply_turns(&[turn("t1", TurnState::Completed, Some("the answer"))]);
+        let shown = keys(&chat);
+        assert!(
+            shown.contains(&"n3".to_owned()),
+            "earlier progress stays: {shown:?}"
+        );
+        assert!(
+            !shown.contains(&"n4".to_owned()),
+            "echo of the final hidden: {shown:?}"
+        );
+        assert_eq!(chat.items()[0].parts.last().unwrap().text, "the answer");
     }
 
     #[test]

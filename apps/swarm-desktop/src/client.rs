@@ -712,6 +712,72 @@ pub async fn submit_send(
     .await
 }
 
+/// Steer exactly the active turn and generation captured at click time with
+/// `text`: supported steering of that turn, not a renamed SEND. A harness
+/// without native steering refuses it (`unsupported`).
+pub async fn submit_steer(
+    data_dir: &Path,
+    mutation_id: String,
+    agent: &str,
+    generation: i64,
+    turn_id: String,
+    text: &str,
+) -> Result<CommandSubmitResponse> {
+    check_text(text)?;
+    let mut request = submit_request(
+        mutation_id,
+        Some(agent.to_owned()),
+        "steer",
+        serde_json::json!({ "text": text }),
+    )?;
+    request.expected_generation = Some(generation);
+    request.expected_turn_id = Some(turn_id);
+    submit(data_dir, &request).await
+}
+
+/// Resume the retained Agent at the generation captured at click time. With
+/// nonblank `text` the daemon admits the linked `<id>/send` in the same
+/// transaction; the prompt is never sent again after admission.
+pub async fn submit_resume(
+    data_dir: &Path,
+    mutation_id: String,
+    agent: &str,
+    generation: i64,
+    text: Option<&str>,
+) -> Result<CommandSubmitResponse> {
+    let mut args = serde_json::Map::new();
+    if let Some(text) = text {
+        check_text(text)?;
+        args.insert("text".to_owned(), Value::String(text.to_owned()));
+    }
+    let mut request = submit_request(
+        mutation_id,
+        Some(agent.to_owned()),
+        "resume",
+        Value::Object(args),
+    )?;
+    request.expected_generation = Some(generation);
+    submit(data_dir, &request).await
+}
+
+/// Detach an observed Agent at the generation captured at click time: the
+/// observation ends; nobody's process is stopped.
+pub async fn submit_detach(
+    data_dir: &Path,
+    mutation_id: String,
+    agent: &str,
+    generation: i64,
+) -> Result<CommandSubmitResponse> {
+    let mut request = submit_request(
+        mutation_id,
+        Some(agent.to_owned()),
+        "detach",
+        serde_json::json!({}),
+    )?;
+    request.expected_generation = Some(generation);
+    submit(data_dir, &request).await
+}
+
 /// Interrupt exactly the turn and generation captured at click time; the
 /// binding is never re-read, so a later turn cannot be interrupted instead.
 pub async fn submit_interrupt(

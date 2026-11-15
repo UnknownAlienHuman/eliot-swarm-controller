@@ -343,11 +343,18 @@ of the explicitly selected release scope.
 ## Desktop companion (optional WinUI 3 client)
 
 - [x] **D1 Styled real chat.** One optional Windows package (`apps/swarm-desktop`,
-      binary `swarm-desktop`) on WinUI 3 through `windows-reactor`: native window and
-      a small Material 3 Expressive-inspired theme; project/Agent/profile selection;
+      binary `swarm-desktop`) on WinUI 3 through `windows-reactor`: native window with
+      a navigation rail and Material 3 roles generated from one seed (tonal palettes
+      through `material-colors`, also applied to WinUI's accent and list-selection
+      resources at the application root; system colors under High Contrast; a
+      System/Light/Dark switch saved per user); project/profile selection and an
+      Agent list grouped by project with children under their manager (branches
+      read through `agent.list` `parent`);
       `launch(text)` with its linked command; send to an existing Agent; the real
-      final output from result/turn readback; pending requests with exact bindings
-      and interrupt bound to the current generation and turn. First input is
+      final output from result/turn readback; pending requests with exact bindings;
+      interrupt and steer bound to the current generation and turn, and resume of a
+      stopped, failed or lost Agent at its generation (with optional linked text).
+      First input is
       submitted once (one ULID per user action, retries reuse it); a late reply
       cannot erase a newer draft and switching conversations cannot retarget
       controls; reopening stops or duplicates nothing. Headless and non-Windows
@@ -374,9 +381,11 @@ of the explicitly selected release scope.
       sample age and TTL, coverage and clock regression. CPU is core-equivalent
       and differenced only between samples of matching process identities; a
       changed set is marked partial. RSS is shown, the UI-only history is capped
-      and deduplicated, and two native bar sparklines are drawn. Stop, Force stop
-      and Interrupt are bound at click time to the Agent, generation and turn
-      shown, and are not offered for observe-only Agents. (Refs #407)
+      and deduplicated; CPU and memory are bar charts with the latest value and a
+      labelled scale. Only the actions that apply are offered, bound at click time
+      to the Agent, generation and turn shown: Interrupt, Stop, Force stop (error
+      role, confirmed inline), Resume and, for observe-only Agents, Detach.
+      (Refs #407)
 - [x] **D4 Launch picker, Profiles and Automation screens.** The launch picker
       lists the daemon's sanitized `profile.list` summaries (requested settings,
       with native defaults named when a field is unset) and an Owner ad-hoc

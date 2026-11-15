@@ -9,11 +9,17 @@
 //! default workspace build and Ubuntu CI stay green.
 
 #[cfg(windows)]
+mod accessibility;
+#[cfg(windows)]
+mod app_resources;
+#[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
 mod config_view;
 #[cfg(windows)]
 mod configure;
+#[cfg(windows)]
+mod m3;
 #[cfg(windows)]
 mod monitor_view;
 #[cfg(windows)]
@@ -38,9 +44,13 @@ mod markdown;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod monitor;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod nav;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod profiles;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod scripts;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod settings;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod state;
 #[cfg_attr(not(windows), allow(dead_code))]

@@ -11,12 +11,13 @@ use windows_reactor::*;
 
 use crate::profiles::{self, FORM_FIELDS};
 use crate::theme;
+use crate::theme::winui::Palette;
 use eliot_core::api::{ProfileSummary, RuleListEntry, TimerSchedule};
 
 fn small(text: impl Into<String>) -> TextBlock {
     TextBlock::new()
         .text(text.into())
-        .font_size(theme::type_scale::LABEL)
+        .font_size(theme::type_scale::LABEL_MEDIUM.size)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }
@@ -85,7 +86,7 @@ pub struct ProfilesActions {
     pub reload: Callback<()>,
 }
 
-pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View {
+pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette: Palette) -> View {
     let names = profiles::profile_names(data.draft);
     let selected_index = data
         .selected
@@ -140,7 +141,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View
                 ),
             };
             let callback = actions.field_changed.get(index).cloned();
-            let mut field = TextBox::new()
+            let mut field = crate::m3::field(palette)
                 .text(value)
                 .placeholder_text(hint)
                 .automation_name(format!("Profile {key}"))
@@ -153,7 +154,12 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .spacing(theme::spacing::SM)
-                    .children((small(*key).width(120.0), field.width(320.0))),
+                    .children((
+                        small(*key)
+                            .width(120.0)
+                            .vertical_alignment(VerticalAlignment::Center),
+                        field.width(320.0),
+                    )),
             ));
         }
         fields.push(KeyedView::new(
@@ -162,13 +168,13 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View
                 .orientation(Orientation::Horizontal)
                 .spacing(theme::spacing::SM)
                 .children((
-                    TextBox::new()
+                    crate::m3::field(palette)
                         .text(data.duplicate_name.to_owned())
                         .placeholder_text("new profile name")
                         .automation_name("Duplicate as")
                         .width(220.0)
                         .on_text_changed(actions.duplicate_name_changed),
-                    Button::new()
+                    crate::m3::tonal(palette)
                         .is_enabled(!data.busy)
                         .automation_name("Duplicate profile")
                         .on_click(actions.duplicate)
@@ -177,7 +183,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View
         ));
     }
 
-    let source = TextBox::new()
+    let source = crate::m3::field(palette)
         .grid_row(5)
         .text(data.view.to_owned())
         .accepts_return(true)
@@ -200,11 +206,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View
         .row_spacing(theme::spacing::SM)
         .children((
             StackPanel::new().grid_row(0).spacing(2.0).children((
-                TextBlock::new()
-                    .text("Profiles")
-                    .automation_heading_level(AutomationHeadingLevel::Level2)
-                    .font_size(theme::type_scale::HEADING)
-                    .font_weight(FontWeight::SEMI_BOLD),
+                crate::m3::title("Profiles", theme::type_scale::TITLE_LARGE),
                 small(saved),
                 small(active).opacity(theme::MUTED_OPACITY),
             )),
@@ -213,7 +215,9 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View
                 .orientation(Orientation::Horizontal)
                 .spacing(theme::spacing::SM)
                 .children((
-                    small("Profile").width(60.0),
+                    small("Profile")
+                        .width(60.0)
+                        .vertical_alignment(VerticalAlignment::Center),
                     ComboBox::new()
                         .items_source(names)
                         .selected_index(selected_index)
@@ -231,16 +235,15 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View
                 .orientation(Orientation::Horizontal)
                 .spacing(theme::spacing::SM)
                 .children((
-                    Button::new()
+                    crate::m3::tonal(palette)
                         .is_enabled(data.editable && !data.busy)
                         .on_click(actions.validate)
                         .content(TextBlock::new().text("Validate")),
-                    Button::new()
-                        .resource_overrides(theme::winui::primary_button(false))
+                    crate::m3::filled(palette)
                         .is_enabled(data.editable && data.dirty && !data.busy)
                         .on_click(actions.save)
                         .content(TextBlock::new().text("Save")),
-                    Button::new()
+                    crate::m3::tonal(palette)
                         .is_enabled(!data.busy)
                         .automation_name("Reload saved profiles")
                         .on_click(actions.reload)
@@ -342,6 +345,7 @@ pub fn automation_screen(
     namespaces: &[RuleNamespace],
     status: &str,
     refresh: Callback<()>,
+    palette: Palette,
 ) -> View {
     let mut rows: Vec<KeyedView> = Vec::new();
     for namespace in namespaces {
@@ -362,10 +366,10 @@ pub fn automation_screen(
                     rows.push(KeyedView::new(
                         format!("{}/{}", namespace.label, entry.state.id),
                         Border::new()
-                            .background(theme::winui::surface())
-                            .border_brush(theme::winui::stroke())
+                            .background(palette.surface_container())
+                            .border_brush(palette.outline_variant())
                             .border_thickness(1.0)
-                            .corner_radius(theme::radius::SM)
+                            .corner_radius(theme::shape::SM)
                             .padding(Thickness::uniform(theme::spacing::SM))
                             .content(small(lines.join("\n"))),
                     ));
@@ -379,8 +383,7 @@ pub fn automation_screen(
             }
             Err(error) => rows.push(KeyedView::new(
                 format!("error-{}", namespace.label),
-                small(format!("rule.list failed: {error}"))
-                    .foreground(theme::winui::text_critical()),
+                small(format!("rule.list failed: {error}")).foreground(palette.error()),
             )),
         }
     }
@@ -390,17 +393,13 @@ pub fn automation_screen(
         .row_spacing(theme::spacing::SM)
         .children((
             StackPanel::new().grid_row(0).spacing(2.0).children((
-                TextBlock::new()
-                    .text("Automation")
-                    .automation_heading_level(AutomationHeadingLevel::Level2)
-                    .font_size(theme::type_scale::HEADING)
-                    .font_weight(FontWeight::SEMI_BOLD),
+                crate::m3::title("Automation", theme::type_scale::TITLE_LARGE),
                 small("Read-only. No daemon operation pauses or resumes a rule or timer: `enabled` comes from the rule file, and `paused` is set by the daemon (backlog). Edit rules in <data_dir>/rules/*.toml; the watcher keeps the last valid definition on a bad edit.").opacity(theme::MUTED_OPACITY),
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .spacing(theme::spacing::SM)
                     .children((
-                        Button::new()
+                        crate::m3::tonal(palette)
                             .on_click(refresh)
                             .content(TextBlock::new().text("Refresh")),
                         small(status.to_owned()),
@@ -453,7 +452,7 @@ pub struct ScriptsActions {
     pub run: Vec<Callback<()>>,
 }
 
-pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions) -> View {
+pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: Palette) -> View {
     let selected = data.selected.is_some();
     let meta = match (data.display_path, data.revision) {
         (Some(path), Some(revision)) => format!(
@@ -485,7 +484,7 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions) -> View {
     for (index, (timer, callback)) in data.timers.iter().zip(actions.run).enumerate() {
         runs.push(KeyedView::new(
             format!("run-{index}"),
-            Button::new()
+            crate::m3::tonal(palette)
                 .is_enabled(!data.run_busy && !data.dirty)
                 .automation_name(format!("Run via timer {timer}"))
                 .on_click(callback)
@@ -517,11 +516,7 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions) -> View {
         .row_spacing(theme::spacing::SM)
         .children((
             StackPanel::new().grid_row(0).spacing(2.0).children((
-                TextBlock::new()
-                    .text("Scripts")
-                    .automation_heading_level(AutomationHeadingLevel::Level2)
-                    .font_size(theme::type_scale::HEADING)
-                    .font_weight(FontWeight::SEMI_BOLD),
+                crate::m3::title("Scripts", theme::type_scale::TITLE_LARGE),
                 small("Existing entries under <data_dir>/scripts/ and registered .eliot/scripts/. Save replaces the file only when its revision still matches; Run goes through a timer's run action, with the daemon's custody, timeout and unknown-outcome rules.").opacity(theme::MUTED_OPACITY),
                 small(unavailable).opacity(theme::MUTED_OPACITY),
             )),
@@ -536,7 +531,7 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions) -> View {
                         .placeholder_text("Script entry")
                         .automation_name("Script entry")
                         .on_selection_changed(actions.select),
-                    Button::new()
+                    crate::m3::tonal(palette)
                         .automation_name("Refresh script list")
                         .on_click(actions.refresh)
                         .content(TextBlock::new().text("Refresh")),
@@ -547,29 +542,28 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions) -> View {
                 .orientation(Orientation::Horizontal)
                 .spacing(theme::spacing::SM)
                 .children((
-                    Button::new()
+                    crate::m3::tonal(palette)
                         .is_enabled(data.editable && !data.busy)
                         .automation_name("Validate script")
                         .on_click(actions.validate)
                         .content(TextBlock::new().text("Validate")),
-                    Button::new()
-                        .resource_overrides(theme::winui::primary_button(false))
+                    crate::m3::filled(palette)
                         .is_enabled(data.editable && data.dirty && !data.busy)
                         .automation_name("Save script")
                         .on_click(actions.save)
                         .content(TextBlock::new().text("Save")),
-                    Button::new()
+                    crate::m3::tonal(palette)
                         .is_enabled(selected && !data.busy)
                         .automation_name("Reload script")
                         .on_click(actions.reload)
                         .content(TextBlock::new().text("Reload (discard draft)")),
-                    TextBox::new()
+                    crate::m3::field(palette)
                         .text(data.editor_exe.to_owned())
                         .placeholder_text("Editor .exe (absolute path)")
                         .automation_name("Editor executable")
                         .width(260.0)
                         .on_text_changed(actions.editor_changed),
-                    Button::new()
+                    crate::m3::tonal(palette)
                         .is_enabled(selected && data.display_path.is_some())
                         .automation_name("Open in editor")
                         .on_click(actions.open_editor)
@@ -579,7 +573,7 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions) -> View {
                 .grid_row(4)
                 .spacing(theme::spacing::XS)
                 .keyed_children(runs),
-            TextBox::new()
+            crate::m3::field(palette)
                 .grid_row(5)
                 .text(data.view.to_owned())
                 .accepts_return(true)

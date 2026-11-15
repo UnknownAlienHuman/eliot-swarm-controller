@@ -21,6 +21,8 @@ pub struct SendRow {
     pub id: String,
     pub state: CommandState,
     pub preview: String,
+    /// Admission time (ms since the Unix epoch).
+    pub created_at: i64,
 }
 
 impl SendRow {
@@ -29,14 +31,48 @@ impl SendRow {
         matches!(self.state, CommandState::Accepted | CommandState::Queued)
     }
 
-    pub fn label(&self) -> String {
+    /// What the owner recognises: the text, how long ago, and where it is.
+    /// The id stays out of the label (it is bound in the request).
+    pub fn label(&self, now_ms: i64) -> String {
         format!(
-            "{} · {} · {}",
-            self.id,
-            state_name(self.state),
-            self.preview
+            "\u{201c}{}\u{201d} · {} · {}",
+            self.preview,
+            age(now_ms, self.created_at),
+            match self.state {
+                CommandState::Accepted | CommandState::Queued => "waiting".to_owned(),
+                state => state_name(state),
+            }
         )
     }
+}
+
+/// A one-line preview of a message text: whitespace collapsed, at most
+/// `max` characters.
+pub fn preview(text: &str, max: usize) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > max {
+        format!("{}…", flat.chars().take(max).collect::<String>())
+    } else {
+        flat
+    }
+}
+
+/// A coarse relative age: "just now", "4 min ago", "3 h ago", "2 d ago".
+pub fn age(now_ms: i64, at_ms: i64) -> String {
+    let seconds = (now_ms - at_ms).max(0) / 1000;
+    match seconds {
+        0..60 => "just now".to_owned(),
+        60..3_600 => format!("{} min ago", seconds / 60),
+        3_600..86_400 => format!("{} h ago", seconds / 3_600),
+        _ => format!("{} d ago", seconds / 86_400),
+    }
+}
+
+/// The current wall clock in ms since the Unix epoch (0 if unavailable).
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64)
 }
 
 pub fn state_name(state: CommandState) -> String {
@@ -81,14 +117,11 @@ pub fn send_row(command: &Command, generation: i64) -> Option<SendRow> {
         .get("text")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let mut preview: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if preview.chars().count() > 80 {
-        preview = format!("{}…", preview.chars().take(80).collect::<String>());
-    }
     Some(SendRow {
         id: command.id.clone(),
         state: command.state,
-        preview,
+        preview: preview(text, 80),
+        created_at: command.created_at,
     })
 }
 
@@ -192,6 +225,43 @@ impl Outcome {
             }
             _ => None,
         }
+    }
+}
+
+/// One plain sentence for a definite reply; the facts with ids follow in
+/// the readback details.
+pub fn outcome_summary(outcome: &Outcome) -> String {
+    let handoff = |reply: &HandoffResponse| {
+        let brief = state_name(reply.brief_state);
+        match reply.transfers.len() {
+            0 => format!(
+                "Handed off to {}: the brief is {brief}; no waiting SENDs moved.",
+                reply.to
+            ),
+            count => format!(
+                "Handed off to {}: the brief is {brief} and {count} waiting SEND(s) moved; {}.",
+                reply.to,
+                gate_meaning(&reply.successor_gate)
+            ),
+        }
+    };
+    match outcome {
+        Outcome::Handoff(reply) => handoff(reply),
+        Outcome::Switch(reply) => match (&reply.handoff, &reply.created, &reply.error) {
+            (Some(done), _, _) => format!("Switched. {}", handoff(done)),
+            (None, _, Some(error)) => format!("The switch stopped: {error}"),
+            (None, Some(created), None) => format!(
+                "Started {} (generation {}); next: {}.",
+                created.agent,
+                created.generation,
+                reply.next_action.replace('_', " ")
+            ),
+            (None, None, None) => format!(
+                "The switch is {}; next: {}.",
+                state_name(reply.state),
+                reply.next_action.replace('_', " ")
+            ),
+        },
     }
 }
 
@@ -483,5 +553,36 @@ mod tests {
         assert_eq!(omitted_note(0, 200), "");
         assert!(omitted_note(3, 200).contains("newest 200 SENDs"));
         assert!(omitted_note(3, 200).contains("3 older"));
+    }
+
+    #[test]
+    fn send_labels_show_text_age_and_place_but_no_id() {
+        let row = SendRow {
+            id: "01ABCDEF/send".to_owned(),
+            state: CommandState::Queued,
+            preview: "do the thing".to_owned(),
+            created_at: 1_000,
+        };
+        let label = row.label(1_000 + 5 * 60_000);
+        assert_eq!(label, "\u{201c}do the thing\u{201d} · 5 min ago · waiting");
+        assert!(!label.contains("01ABCDEF"));
+        let applied = SendRow {
+            state: CommandState::Applied,
+            ..row
+        };
+        assert!(applied.label(1_000).ends_with("just now · applied"));
+    }
+
+    #[test]
+    fn ages_and_previews_stay_short() {
+        assert_eq!(age(0, 0), "just now");
+        assert_eq!(age(59_999, 0), "just now");
+        assert_eq!(age(60_000, 0), "1 min ago");
+        assert_eq!(age(3 * 3_600_000, 0), "3 h ago");
+        assert_eq!(age(2 * 86_400_000, 0), "2 d ago");
+        // A clock behind the record never shows a negative age.
+        assert_eq!(age(0, 10_000), "just now");
+        assert_eq!(preview("  a\n b\tc  ", 10), "a b c");
+        assert_eq!(preview("abcdef", 3), "abc…");
     }
 }
