@@ -471,7 +471,7 @@ fn submit_head_tx(
     {
         return Err(Error::new(
             "invalid",
-            "native store binding is derived at launch dispatch",
+            "omit profile_snapshot with native_store_binding; the daemon freezes it at launch dispatch (Agent child launches omit profile_snapshot and name a parent or child_profiles profile)",
         ));
     }
     // The internal attention verb carries deterministic mutation ids derived

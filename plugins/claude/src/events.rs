@@ -31,8 +31,9 @@ use crate::native::{
     types::{
         CanUseToolBody, CommandLifecycle, ControlCancelRequest, HookCallbackBody,
         HookCallbackResponse, InitMcpServer, OutboundControlResponse, OutboundControlResponseBody,
-        PermissionResult, ResultRecord, assistant_model, assistant_text, assistant_tool_use_ids,
-        attach_mcp_readback, init_mcp_servers, result_session_usage, result_usage,
+        PermissionResult, ResultRecord, assistant_model, assistant_text, assistant_tool_use_count,
+        assistant_tool_use_ids, assistant_tool_uses, attach_mcp_readback, init_mcp_servers,
+        result_session_usage, result_usage, user_tool_results,
     },
 };
 
@@ -554,6 +555,14 @@ struct EventProcessor {
     cancelled_hook_requests: HashSet<String>,
     tool_use_turns: HashMap<String, ToolUseBinding>,
     tool_use_tracking_fenced: bool,
+    /// Native tool names by invocation id for the exact active turn, taken
+    /// from the assistant `tool_use` blocks. The matching `user`
+    /// `tool_result` blocks carry no name, so completions read it back here.
+    tool_names: HashMap<String, String>,
+    /// Invocations with a committed `tool.started` in this turn.
+    tools_started: HashSet<String>,
+    /// Invocations with a committed `tool.completed` in this turn.
+    tools_completed: HashSet<String>,
     deny_uncertain: HashSet<String>,
     permission_admission_fenced: bool,
     message_seq: u64,
@@ -1056,6 +1065,9 @@ impl EventProcessor {
             cancelled_hook_requests: HashSet::new(),
             tool_use_turns: HashMap::new(),
             tool_use_tracking_fenced: false,
+            tool_names: HashMap::new(),
+            tools_started: HashSet::new(),
+            tools_completed: HashSet::new(),
             deny_uncertain: HashSet::new(),
             permission_admission_fenced: false,
             message_seq: 0,
@@ -1375,7 +1387,7 @@ impl EventProcessor {
     /// outside the exact active turn). Everything else is processed inline.
     fn should_buffer(&self, record: &Value) -> bool {
         let kind = record.get("type").and_then(Value::as_str);
-        if kind == Some("assistant") {
+        if kind == Some("assistant") || kind == Some("user") {
             return !self.status.ready
                 || (self.status.active_turn_id.is_none() && self.pending_turn.is_some());
         }
@@ -1421,7 +1433,7 @@ impl EventProcessor {
             "command_lifecycle" => self.observe_lifecycle(&record).await,
             "assistant" => self.observe_assistant(&record).await,
             "result" => self.complete_turn(&record).await,
-            "user" => Ok(()),
+            "user" => self.observe_user(&record).await,
             "control_request" => self.observe_control_request(&record).await,
             "control_cancel_request" => {
                 self.cancel_hook_callback(&record);
@@ -1630,6 +1642,7 @@ impl EventProcessor {
         };
         if is_main_thread_assistant(record) {
             self.bind_tool_uses(record, &turn_id);
+            self.observe_tool_uses(record).await?;
         }
         let text = assistant_text(record);
         if text.is_empty() {
@@ -1659,6 +1672,128 @@ impl EventProcessor {
         self.accumulate_final_text(&text);
         self.commit_event("message.completed", native_id, data)
             .await
+    }
+
+    /// Commit `tool.started` for the main-thread `tool_use` blocks of one
+    /// `assistant` record, bound to the exact active turn and generation
+    /// with the native `tool_use.id` as the item id. Runs only while the
+    /// id binding is unfenced; a fenced turn keeps the hook-routed facts
+    /// only, never a misbound tool record. Nameless invocations cannot
+    /// label a tool record and are reported as one coverage gap.
+    async fn observe_tool_uses(&mut self, record: &Value) -> Result<()> {
+        if assistant_tool_use_count(record) > assistant_tool_uses(record).len() {
+            self.record_gap("Claude tool use omitted its tool name or id")
+                .await?;
+        }
+        if self.tool_use_tracking_fenced {
+            return Ok(());
+        }
+        let (Some(command_id), Some(turn_id)) = (
+            self.status.active_command_id.clone(),
+            self.status.active_turn_id.clone(),
+        ) else {
+            return Ok(());
+        };
+        for tool_use in assistant_tool_uses(record) {
+            self.tool_names
+                .entry(tool_use.id.clone())
+                .or_insert_with(|| tool_use.name.clone());
+            if !self.tools_started.insert(tool_use.id.clone()) {
+                continue;
+            }
+            let data = json!({
+                "command_id": command_id,
+                "turn_id": turn_id,
+                "item_id": tool_use.id,
+                "tool": tool_use.name,
+            });
+            if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
+                return self
+                    .record_gap("Claude tool start exceeded the persisted-event bound")
+                    .await;
+            }
+            let session_id = self.status.session_id.as_deref().unwrap_or_default();
+            let native_id = format!("claude:{session_id}:{turn_id}:tool.started:{}", tool_use.id);
+            self.commit_event("tool.started", native_id, data).await?;
+        }
+        Ok(())
+    }
+
+    /// Commit `tool.completed` for the main-thread `tool_result` blocks of
+    /// one `user` record, bound to the exact active turn and generation
+    /// with the native `tool_use.id` as the item id. The result blocks
+    /// carry no tool name, so the completion reads it back from the
+    /// matching `tool_use` block seen on this turn; a result with no known
+    /// invocation is a coverage gap, never a guessed tool. The native
+    /// status is the frame's own verdict: `error` when `is_error` is true,
+    /// `completed` otherwise.
+    async fn observe_user(&mut self, record: &Value) -> Result<()> {
+        let results = user_tool_results(record);
+        if results.is_empty() {
+            return Ok(());
+        }
+        if let Some(session_id) = record.get("session_id").and_then(Value::as_str) {
+            self.check_session(session_id)?;
+        }
+        let Some(turn_id) = self.status.active_turn_id.clone() else {
+            if self.pending_turn.is_some() || !self.status.ready {
+                self.buffer_record(record.clone());
+                return Ok(());
+            }
+            return self
+                .record_gap("Claude tool result arrived outside the exact active turn")
+                .await;
+        };
+        if !is_main_thread_user(record) {
+            return Ok(());
+        }
+        let Some(command_id) = self.status.active_command_id.clone() else {
+            return self
+                .record_gap("Claude tool result has no exact Eliot command")
+                .await;
+        };
+        let mut unknown = false;
+        for result in results {
+            let Some(tool) = self.tool_names.get(&result.tool_use_id).cloned() else {
+                unknown = true;
+                continue;
+            };
+            if !self.tools_completed.insert(result.tool_use_id.clone()) {
+                continue;
+            }
+            let data = json!({
+                "command_id": command_id,
+                "turn_id": turn_id,
+                "item_id": result.tool_use_id,
+                "tool": tool,
+                "status": tool_result_status(result.is_error),
+            });
+            if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
+                return self
+                    .record_gap("Claude tool completion exceeded the persisted-event bound")
+                    .await;
+            }
+            let session_id = self.status.session_id.as_deref().unwrap_or_default();
+            let native_id = format!(
+                "claude:{session_id}:{turn_id}:tool.completed:{}",
+                result.tool_use_id
+            );
+            self.commit_event("tool.completed", native_id, data).await?;
+        }
+        if unknown {
+            self.record_gap("Claude tool result did not match a known tool use")
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Drop this turn's tool-name and tool-record tracking. Runs wherever
+    /// the id binding clears so a later turn never reuses an earlier
+    /// invocation's name or suppresses its own records as duplicates.
+    fn clear_tool_tracking(&mut self) {
+        self.tool_names.clear();
+        self.tools_started.clear();
+        self.tools_completed.clear();
     }
 
     fn accumulate_final_text(&mut self, text: &str) {
@@ -1705,6 +1840,7 @@ impl EventProcessor {
                 );
                 if existing.turn_id != turn_id || prompt_conflict {
                     self.tool_use_turns.clear();
+                    self.clear_tool_tracking();
                     self.tool_use_tracking_fenced = true;
                     return;
                 }
@@ -1718,6 +1854,7 @@ impl EventProcessor {
             }
             if self.tool_use_turns.len() >= MAX_TOOL_USE_BINDINGS {
                 self.tool_use_turns.clear();
+                self.clear_tool_tracking();
                 self.tool_use_tracking_fenced = true;
                 return;
             }
@@ -2927,9 +3064,11 @@ impl EventProcessor {
         // carries the readback into the effective set. Unobserved stays
         // unattached and the effective set stays unknown.
         attach_mcp_readback(&mut data, self.init_mcp_servers.as_deref());
-        // Optional cumulative session cost from `total_cost_usd`, held for the
+        // Optional session-scoped fact from the terminal record
+        // (`modelUsage` token counters plus `total_cost_usd`), held for the
         // session fact that commits after the accepted terminal. Absent or
-        // unusable cost simply commits no session fact.
+        // unusable halves simply contribute nothing; with neither half there
+        // is no session fact.
         let session_usage = result_session_usage(record);
         let final_text = self.final_text.take();
         if self.final_text_unavailable {
@@ -2967,12 +3106,13 @@ impl EventProcessor {
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
         self.tool_use_turns.clear();
+        self.clear_tool_tracking();
         self.tool_use_tracking_fenced = false;
         self.publish_now();
         self.commit_event("turn.completed", native_id, data).await?;
-        // Session-scoped cost commits as its own `session.usage` fact after
-        // the accepted terminal, so session scope and turn scope can never be
-        // confused.
+        // Session-scoped tokens/cost commit as their own `session.usage`
+        // fact after the accepted terminal, so session scope and turn scope
+        // can never be confused.
         if let Some(session_usage) = session_usage {
             let session_id = self.status.session_id.as_deref().unwrap_or_default();
             let native_id = format!("claude:{session_id}:{session_turn_id}:session.usage");
@@ -3191,6 +3331,17 @@ impl EventProcessor {
 }
 
 fn is_main_thread_assistant(record: &Value) -> bool {
+    is_main_thread(record)
+}
+
+/// Main-thread `user` records carry this turn's tool results. Subagent
+/// text forwarded with `parent_tool_use_id` (see `--forward-subagent-text`)
+/// stays out of this turn's tool records, exactly like assistant text.
+fn is_main_thread_user(record: &Value) -> bool {
+    is_main_thread(record)
+}
+
+fn is_main_thread(record: &Value) -> bool {
     let message = record.get("message");
     [
         record.get("parent_tool_use_id"),
@@ -3200,6 +3351,18 @@ fn is_main_thread_assistant(record: &Value) -> bool {
     ]
     .into_iter()
     .all(|field| field.is_none_or(Value::is_null))
+}
+
+/// Native verdict for one `tool_result` block: the frame's own `is_error`
+/// flag, with an unreported verdict reading as completion. The flag is the
+/// only status the stream-json `user` record carries; there is no second
+/// native status to preserve.
+fn tool_result_status(is_error: Option<bool>) -> &'static str {
+    if is_error == Some(true) {
+        "error"
+    } else {
+        "completed"
+    }
 }
 
 fn assistant_prompt_id(record: &Value) -> Option<String> {
@@ -3298,6 +3461,32 @@ mod tests {
         let (outcome, status) = terminal_outcome_and_status("api_error", &plain);
         assert_eq!(outcome, "failure");
         assert_eq!(status, "api_error");
+    }
+
+    #[test]
+    fn tool_result_status_uses_only_the_native_verdict() {
+        assert_eq!(tool_result_status(Some(true)), "error");
+        assert_eq!(tool_result_status(Some(false)), "completed");
+        assert_eq!(tool_result_status(None), "completed");
+    }
+
+    #[test]
+    fn tool_records_stay_on_the_main_thread() {
+        assert!(is_main_thread_user(&json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu-1"},
+            ]},
+        })));
+        for forwarded in [
+            json!({"type": "user", "parent_tool_use_id": "toolu-0"}),
+            json!({"type": "user", "message": {
+                "content": [{"type": "tool_result", "tool_use_id": "toolu-1"}],
+                "parent_tool_use_id": "toolu-0",
+            }}),
+        ] {
+            assert!(!is_main_thread_user(&forwarded));
+        }
     }
 
     #[test]

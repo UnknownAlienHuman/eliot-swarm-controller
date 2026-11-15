@@ -289,7 +289,7 @@ impl Session {
             // bare RPC return, which can overtake queued history.
             let prepared: PreparedFencedCall = self.client.prepare_fenced(
                 "session/load",
-                json!({"cwd": plan.launch.cwd, "mcpServers": [], "sessionId": resume}),
+                json!({"cwd": plan.launch.cwd, "mcpServers": [plan.mcp_server_entry()?], "sessionId": resume}),
                 FencedKind::Load,
             )?;
             let request_id = prepared.request_id().to_owned();
@@ -355,11 +355,15 @@ impl Session {
                 config_options: loaded.config_options,
             }
         } else {
+            // The Agent-scoped swarm MCP server rides the documented ACP
+            // session-setup surface, per run and per Agent: no owner-global
+            // config is touched, and the Agent authenticates with its own
+            // inherited identity, never the owner token.
             let created = self
                 .client
                 .call(
                     "session/new",
-                    json!({"cwd": plan.launch.cwd, "mcpServers": []}),
+                    json!({"cwd": plan.launch.cwd, "mcpServers": [plan.mcp_server_entry()?]}),
                     deadline,
                 )
                 .await?;

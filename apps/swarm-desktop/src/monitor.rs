@@ -208,13 +208,37 @@ pub struct MonitorRow {
     pub activity: Option<String>,
     pub progress_age_ms: Option<i64>,
     pub last_outcome: Option<String>,
+    /// Fleet token count from the shared [`AgentSummary::fleet_usage`]
+    /// derivation: the native total when supplied, otherwise the
+    /// input+output fleet signal. `None` when the summary carries no usage.
     pub tokens: Option<i64>,
+    /// Provenance of [`MonitorRow::tokens`]: `"turn"` or `"session"`,
+    /// matching the summary `usage_scope`. `None` exactly when `tokens`
+    /// is `None`; a session count never renders without its marker.
+    pub tokens_scope: Option<String>,
     pub obs: Obs,
+}
+
+/// Fleet token label for one monitor row: the count with its `(t)`/`(s)`
+/// provenance suffix, or an em dash when the summary carries no usage.
+/// The suffix is what stops a session fallback from passing as turn usage.
+pub fn tokens_label(row: &MonitorRow) -> String {
+    match (row.tokens, row.tokens_scope.as_deref()) {
+        (Some(tokens), Some(scope)) => format!(
+            "{tokens} tokens ({})",
+            if scope == "session" { "s" } else { "t" }
+        ),
+        _ => "—".to_owned(),
+    }
 }
 
 impl MonitorRow {
     fn from_list(row: &AgentListRow) -> Self {
         let summary = &row.summary;
+        let (tokens, tokens_scope) = match summary.fleet_usage() {
+            Some((tokens, scope)) => (Some(tokens), Some(scope.to_owned())),
+            None => (None, None),
+        };
         Self {
             id: summary.id.clone(),
             generation: summary.generation,
@@ -229,7 +253,8 @@ impl MonitorRow {
             last_outcome: summary
                 .last_outcome
                 .map(|outcome| outcome.as_str().to_owned()),
-            tokens: summary.usage.as_ref().and_then(|usage| usage.total_tokens),
+            tokens,
+            tokens_scope,
             obs: Obs::from_view(row.observation.as_ref()),
         }
     }
@@ -768,6 +793,7 @@ mod tests {
                 last_outcome: None,
                 activity: None,
                 usage: None,
+                usage_scope: None,
                 updated_at: 0,
             },
             observation: None,
@@ -790,6 +816,72 @@ mod tests {
         });
         assert_eq!(monitor.rows.len(), 1);
         assert_eq!(monitor.rows[0].state, AgentState::Waiting);
+    }
+
+    #[test]
+    fn monitor_row_marks_session_fallback_provenance() {
+        use eliot_core::TurnUsage;
+        use eliot_core::api::AgentSummary;
+        let summary = |usage: Option<TurnUsage>, usage_scope: Option<&str>| AgentSummary {
+            id: "a7".to_owned(),
+            generation: 1,
+            project: "p".to_owned(),
+            harness: "muse".to_owned(),
+            state: AgentState::Idle,
+            parent: None,
+            root: "a7".to_owned(),
+            active_turn: None,
+            last_progress_at: None,
+            progress_age_ms: None,
+            last_turn_id: None,
+            last_outcome: None,
+            activity: None,
+            usage,
+            usage_scope: usage_scope.map(str::to_owned),
+            updated_at: 0,
+        };
+        let make_row = |usage: Option<TurnUsage>, usage_scope: Option<&str>| {
+            MonitorRow::from_list(&AgentListRow {
+                summary: summary(usage, usage_scope),
+                observation: None,
+            })
+        };
+        let turn = TurnUsage {
+            scope: Some("turn".to_owned()),
+            message_id: None,
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            reasoning_tokens: None,
+            thinking_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            total_tokens: Some(15),
+        };
+        let row = make_row(Some(turn), Some("turn"));
+        assert_eq!(row.tokens, Some(15));
+        assert_eq!(row.tokens_scope.as_deref(), Some("turn"));
+        assert_eq!(tokens_label(&row), "15 tokens (t)");
+        // A Muse-style session fallback (no native total) still reads its
+        // count, and the row carries the session marker with it.
+        let session = TurnUsage {
+            scope: Some("session".to_owned()),
+            message_id: None,
+            input_tokens: Some(47_024),
+            output_tokens: Some(248),
+            reasoning_tokens: None,
+            thinking_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            total_tokens: None,
+        };
+        let row = make_row(Some(session), Some("session"));
+        assert_eq!(row.tokens, Some(47_272));
+        assert_eq!(row.tokens_scope.as_deref(), Some("session"));
+        assert_eq!(tokens_label(&row), "47272 tokens (s)");
+        let row = make_row(None, None);
+        assert_eq!(row.tokens, None);
+        assert_eq!(row.tokens_scope, None);
+        assert_eq!(tokens_label(&row), "—");
     }
 
     #[test]

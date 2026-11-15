@@ -70,9 +70,14 @@ pub struct LocalProvider {
     pub package: String,
 }
 
+/// Name of the Agent-scoped swarm MCP server in the per-Agent config.
+/// Fixed per generation: the config document itself is per generation, so
+/// no ULID suffix is needed (unlike the Codex per-run override name).
+pub const SWARM_MCP_SERVER_NAME: &str = "eliot-swarm";
+
 /// The generated per-Agent config: the frozen profile model when one was
 /// requested, otherwise no `model` key so the configured native default
-/// applies. An explicitly empty MCP set. On the cloud path there are no
+/// applies. The Agent-scoped swarm MCP server (below). On the cloud path there are no
 /// providers or credentials in this document: the Agent runs the server
 /// defaults, and the selected native credential arrives through the pre-serve
 /// auth transfer into the isolated store, never through this document. On the
@@ -83,11 +88,41 @@ pub struct LocalProvider {
 /// never an empty string. A local-backend profile always carries an explicit
 /// model (the eliot-local segment): absent model with a local provider is a
 /// profile error raised by the caller, never rendered here.
-fn agent_config_json(model: Option<&str>, local: Option<&LocalProvider>) -> String {
+///
+/// `swarm_executable` and `swarm_data_dir` are the absolute active Swarm
+/// executable and the Agent's owned Eliot data root, validated by the
+/// caller (host start admission mirrors the Codex `args_with_agent_mcp`
+/// guards). They render as public `command` arguments only: Agent
+/// authentication stays in the inherited server environment and is never
+/// copied into this file (the Claude `mcp_config.rs` model), and
+/// `mcp --require-agent` fails closed without it. Shape verified against
+/// the installed 2.2.7 server: `mcp add` writes
+/// `mcp.servers.<name> = {type: "local", command: [...], environment?}`,
+/// and `GET /api/config` echoes the document while `GET /api/mcp`
+/// (`mcp.list`) reports the servers with connection status.
+fn agent_config_json(
+    model: Option<&str>,
+    local: Option<&LocalProvider>,
+    swarm_executable: &str,
+    swarm_data_dir: &str,
+) -> String {
+    let mut servers = serde_json::Map::new();
+    servers.insert(
+        SWARM_MCP_SERVER_NAME.to_owned(),
+        serde_json::json!({
+            "type": "local",
+            "command": [swarm_executable, "--data-dir", swarm_data_dir, "mcp", "--require-agent"],
+        }),
+    );
+    let mcp = serde_json::Value::Object({
+        let mut mcp = serde_json::Map::new();
+        mcp.insert("servers".to_owned(), serde_json::Value::Object(servers));
+        mcp
+    });
     let mut document = match local {
         None => serde_json::json!({
             "$schema": "https://opencode.ai/config.json",
-            "mcp": {},
+            "mcp": mcp,
         }),
         Some(provider) => {
             let mut settings = serde_json::Map::new();
@@ -122,7 +157,7 @@ fn agent_config_json(model: Option<&str>, local: Option<&LocalProvider>) -> Stri
                         "models": models,
                     },
                 },
-                "mcp": {},
+                "mcp": mcp,
             })
         }
     };
@@ -142,6 +177,12 @@ pub struct ServerLaunch {
     pub model: Option<String>,
     pub auth: Option<AuthSetup>,
     pub local: Option<LocalProvider>,
+    /// Active Swarm executable for the Agent-scoped MCP server command.
+    /// Absolute; start admission resolves it from the running executable.
+    pub swarm_executable: PathBuf,
+    /// The Agent's owned Eliot data root for the MCP `--data-dir` argument.
+    /// Absolute; start admission resolves it from the launch environment.
+    pub swarm_data_dir: PathBuf,
 }
 
 /// A running owned server: its child, HTTP client, and addresses.
@@ -206,9 +247,29 @@ impl OwnedServer {
                 "OpenCode local backend requires an explicit model with the dedicated eliot-local provider segment",
             ));
         }
+        // The MCP server command carries only public arguments; absolute
+        // paths are re-checked here so a malformed launch can never render
+        // a relative executable or data root into the per-Agent document.
+        if !launch.swarm_executable.is_absolute() || !launch.swarm_data_dir.is_absolute() {
+            return Err(Error::new(
+                "invalid",
+                "OpenCode Agent MCP requires the absolute Swarm executable and data directory",
+            ));
+        }
+        let swarm_executable = launch.swarm_executable.to_str().ok_or_else(|| {
+            Error::new("invalid", "OpenCode Agent MCP executable path is not UTF-8")
+        })?;
+        let swarm_data_dir = launch.swarm_data_dir.to_str().ok_or_else(|| {
+            Error::new("invalid", "OpenCode Agent MCP data-root path is not UTF-8")
+        })?;
         std::fs::write(
             &config_path,
-            agent_config_json(launch.model.as_deref(), launch.local.as_ref()),
+            agent_config_json(
+                launch.model.as_deref(),
+                launch.local.as_ref(),
+                swarm_executable,
+                swarm_data_dir,
+            ),
         )
         .map_err(|error| {
             Error::new(
@@ -570,18 +631,73 @@ fn serves_our_config(config_dir: &Path, documents: &[crate::native::types::Confi
 mod tests {
     use super::*;
 
+    /// Absolute render inputs for the Agent-scoped MCP server entry. The
+    /// values never touch the filesystem here; they only shape the JSON.
+    fn swarm_fixture() -> (&'static str, &'static str) {
+        ("C:\\eliot\\swarm.exe", "C:\\eliot\\data")
+    }
+
+    /// The per-Agent document always carries exactly the Agent-scoped swarm
+    /// MCP server: `{type: "local", command: [...]}` under
+    /// `mcp.servers.eliot-swarm`, with public arguments only.
+    fn assert_swarm_mcp(parsed: &serde_json::Value, executable: &str, data_dir: &str) {
+        assert_eq!(
+            parsed["mcp"]["servers"][SWARM_MCP_SERVER_NAME],
+            serde_json::json!({
+                "type": "local",
+                "command": [executable, "--data-dir", data_dir, "mcp", "--require-agent"],
+            }),
+            "Agent-scoped swarm MCP entry"
+        );
+        assert_eq!(
+            parsed["mcp"]["servers"].as_object().expect("object").len(),
+            1,
+            "no other MCP servers: {parsed}"
+        );
+    }
+
     #[test]
-    fn generated_config_pins_model_and_empty_mcp() {
-        let parsed: serde_json::Value =
-            serde_json::from_str(&agent_config_json(Some("opencode/big-pickle"), None))
-                .expect("valid JSON");
+    fn generated_config_pins_model_and_swarm_mcp() {
+        let (executable, data_dir) = swarm_fixture();
+        let parsed: serde_json::Value = serde_json::from_str(&agent_config_json(
+            Some("opencode/big-pickle"),
+            None,
+            executable,
+            data_dir,
+        ))
+        .expect("valid JSON");
         assert_eq!(parsed["model"], "opencode/big-pickle");
-        assert_eq!(parsed["mcp"], serde_json::json!({}));
+        assert_swarm_mcp(&parsed, executable, data_dir);
         assert_eq!(
             parsed.as_object().expect("object").len(),
             3,
             "no other keys: {parsed}"
         );
+    }
+
+    #[test]
+    fn generated_config_carries_no_agent_credential() {
+        // Agent authentication stays in the inherited server environment
+        // (the `mcp --require-agent` model): the document must never name
+        // an identity variable or carry a token, even textually.
+        let (executable, data_dir) = swarm_fixture();
+        let rendered = agent_config_json(None, None, executable, data_dir);
+        assert_swarm_mcp(
+            &serde_json::from_str(&rendered).expect("valid JSON"),
+            executable,
+            data_dir,
+        );
+        for leak in [
+            "ELIOT_AGENT_ID",
+            "ELIOT_AGENT_GENERATION",
+            "ELIOT_AGENT_TOKEN",
+            "token",
+        ] {
+            assert!(
+                !rendered.contains(leak),
+                "credential leak in generated config: {leak}"
+            );
+        }
     }
 
     fn local_provider_fixture(api_key_env: Option<&str>) -> LocalProvider {
@@ -599,13 +715,16 @@ mod tests {
 
     #[test]
     fn local_config_renders_provider_package_settings_limits_and_env_key_reference() {
+        let (executable, data_dir) = swarm_fixture();
         let parsed: serde_json::Value = serde_json::from_str(&agent_config_json(
             Some("eliot-local/qwen3-8b"),
             Some(&local_provider_fixture(Some("LOCAL_LLM_KEY"))),
+            executable,
+            data_dir,
         ))
         .expect("valid JSON");
         assert_eq!(parsed["model"], "eliot-local/qwen3-8b");
-        assert_eq!(parsed["mcp"], serde_json::json!({}));
+        assert_swarm_mcp(&parsed, executable, data_dir);
         let provider = &parsed["providers"]["eliot-local"];
         assert_eq!(
             provider["package"],
@@ -626,9 +745,12 @@ mod tests {
     fn local_no_auth_config_carries_no_key_not_an_empty_string() {
         // Missing key must never become no-auth mode with an empty string:
         // no-auth mode omits the key entirely.
+        let (executable, data_dir) = swarm_fixture();
         let rendered = agent_config_json(
             Some("eliot-local/qwen3-8b"),
             Some(&local_provider_fixture(None)),
+            executable,
+            data_dir,
         );
         let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
         let settings = &parsed["providers"]["eliot-local"]["settings"];
@@ -646,26 +768,32 @@ mod tests {
     fn absent_model_omits_the_key_for_the_native_default() {
         // Requested-absent: no `model` key, so the configured native default
         // applies; the effective value is read back from the session.
+        let (executable, data_dir) = swarm_fixture();
         let parsed: serde_json::Value =
-            serde_json::from_str(&agent_config_json(None, None)).expect("valid JSON");
+            serde_json::from_str(&agent_config_json(None, None, executable, data_dir))
+                .expect("valid JSON");
         assert!(parsed.get("model").is_none(), "native default applies");
-        assert_eq!(parsed["mcp"], serde_json::json!({}));
+        assert_swarm_mcp(&parsed, executable, data_dir);
     }
 
     #[test]
     fn config_covers_absent_cloud_model_and_explicit_local_model() {
         // Ad-hoc cloud launch without a model: no `model` key and no
         // providers block, so the configured native default applies.
+        let (executable, data_dir) = swarm_fixture();
         let cloud: serde_json::Value =
-            serde_json::from_str(&agent_config_json(None, None)).expect("valid JSON");
+            serde_json::from_str(&agent_config_json(None, None, executable, data_dir))
+                .expect("valid JSON");
         assert!(cloud.get("model").is_none());
         assert!(cloud.get("providers").is_none());
-        assert_eq!(cloud["mcp"], serde_json::json!({}));
+        assert_swarm_mcp(&cloud, executable, data_dir);
         // Adopted local-backend profile: the explicit eliot-local model plus
         // the frozen provider document.
         let local: serde_json::Value = serde_json::from_str(&agent_config_json(
             Some("eliot-local/qwen3-8b"),
             Some(&local_provider_fixture(Some("LOCAL_LLM_KEY"))),
+            executable,
+            data_dir,
         ))
         .expect("valid JSON");
         assert_eq!(local["model"], "eliot-local/qwen3-8b");
@@ -673,7 +801,7 @@ mod tests {
             local["providers"]["eliot-local"]["settings"]["baseURL"],
             "http://127.0.0.1:1234/v1"
         );
-        assert_eq!(local["mcp"], serde_json::json!({}));
+        assert_swarm_mcp(&local, executable, data_dir);
     }
 
     #[test]

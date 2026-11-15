@@ -118,9 +118,9 @@ Private readback cannot clear a live-source gap or replay history. It can,
 however, commit the exact active turn's durable terminal: when a bounded
 `view/page` scan proves the native view durably holds that turn's
 `turn/completed` (plus its final `agentMessage` when present), the adapter
-commits `message.completed` and `turn.completed` with the real final message
-rather than settling unknown. A later healthy read does not establish
-live-edge recovery.
+commits any unacknowledged `message.completed` and then `turn.completed` with
+the real final message rather than settling unknown. A later healthy read
+does not establish live-edge recovery.
 
 Every unavailable-view episode and its outcome is exactly countable from
 `events.read`: unavailable views are `source.gap` events whose reason starts
@@ -170,18 +170,39 @@ exact session/turn/command binding as live delivery; a replayed cursor that was
 already applied skips normalization instead of committing twice. Only a
 successfully processed cursor after the observed subscription head, followed by
 acknowledged `ok` source health, can restore live observation; the historical
-gap stays visible. An actual replayed terminal can complete the exact turn while
-source health remains stale. An interrupt refused during the gap names the
+gap stays visible. A terminal replayed while the view remains unavailable
+requires the same command-plane fence and fresh scan described below. An
+interrupt refused during the gap names the
 unavailable-view reason explicitly.
+An exact failed terminal without a structured native error requires the same
+fence even if the best-effort health push is missing. Such synthesized
+host-death/prefix failures do not prove the run stopped. Their free-text
+reason is display-only; the adapter never branches on `incomplete` text.
+An idle, healthy readback can confirm a genuine errorless failure without
+recording a gap. Unavailable readback history, a contradictory running turn,
+or an unproven outcome retains explicit degraded coverage.
 When the recovery window expires without live proof (or recovery cannot be
-attempted), the adapter first pages the retained view backward (at most four
-`view/page` reads of up to 1000 events, newest first) for the exact active
+attempted), one bounded `session/read` first checks the owned host's command
+plane, independently of its unavailable history. An exact-session `running`
+response naming the exact active turn preserves that binding and schedules
+another bounded read after the recovery interval. A view reconstructed from
+an unfinished source prefix can contain a synthetic failed terminal while
+the native run continues; it is not sufficient terminal proof. Each retry
+requires a new exact running observation; a timer alone never renews it.
+Only explicit `idle` with a present-null `activeTurnId` permits a fresh scan
+of the retained view backward (at most four `view/page` reads of up to 1000
+events, reversed within each ascending wire page) for the exact active
 turn's durable terminal and final `agentMessage`. A proven terminal commits
 through the exact live shapes (`message.completed` with the real final
-message, then `turn.completed`), marks those records applied so a later live
-replay of the same revision skips instead of recommitting, retires the
-recovery deadline, and keeps the recorded gap and stale health latched. Only
-when no bounded page proves the terminal does the adapter settle the active
+message, then `turn.completed`). Successfully acknowledged message identities
+are retained for the active turn independently of intervening usage batches
+and bounded cursor history. Recovery skips an already acknowledged message
+and reuses the latest committed final text; unknown writes never populate
+that identity state or replace the text. Recovery marks those records applied
+so a later live replay of the same revision skips instead of recommitting,
+retires the recovery deadline, and keeps the recorded gap and stale health
+latched. Only when the command-plane observation is unproven or no fresh idle-time page
+proves the terminal does the adapter settle the active
 turn `unknown` with the recorded gap through the shared turn-unknown path
 (`turn.unknown` with the exact command/turn binding and the gap reason),
 never as success or failure. The turn binding clears only after that terminal
@@ -195,6 +216,21 @@ admission alone, or a timer, never proves native turn completion or
 process/session exit; a bounded durable page proving the exact terminal does.
 Live recovery after projection failure remains unqualified until exercised
 through Swarm by the controller.
+After a proven terminal, a fresh send checks the event actor before any
+`turn/start` write. If observation is still unavailable or its check fails,
+that send is rejected as not dispatched; the previous turn's native verdict
+and source gap remain intact. Retained uncertain sends remain unknown and
+are never replayed. A failure after a native
+write retains the numeric native error and bounded stderr diagnostics instead
+of replacing them with an empty generic unknown error.
+The installed 1.4.0 schema and the vendor's
+[backpressure guide](https://meta-models.github.io/muse-code-sdk/1.4/guides/msp-wire/backpressure/)
+distinguish slow-subscriber delivery (`view/gap`, durable log untouched) from
+materialized-projection failure (`projectionUnavailable`). Neither documents
+the internal projection-failure trigger or establishes that projection failure
+causes a native `failed` terminal with reason `incomplete`. An unavailable-view
+episode alone therefore does not justify changing consumer bounds or claiming
+that batching repairs the native failure.
 PR #422's shared native-exit lifecycle helper still applies only after actual
 endpoint exit; projection unavailability alone cannot invoke that exit path.
 The projection path reuses the turn-unknown settlement without retiring the
