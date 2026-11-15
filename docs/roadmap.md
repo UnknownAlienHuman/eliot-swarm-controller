@@ -344,7 +344,7 @@ of the explicitly selected release scope.
 
 - [x] **D1 Styled real chat.** One optional Windows package (`apps/swarm-desktop`,
       binary `swarm-desktop`) on WinUI 3 through `windows-reactor`: native window with
-      a navigation rail and Material 3 roles generated from one seed (tonal palettes
+      one shell (see D7) and Material 3 roles generated from one seed (tonal palettes
       through `material-colors`, also applied to WinUI's accent and list-selection
       resources at the application root; system colors under High Contrast; a
       System/Light/Dark switch saved per user); project/profile selection and an
@@ -373,7 +373,7 @@ of the explicitly selected release scope.
       rereads it; transport failures back off and resnapshot. Jump to latest is
       explicit. Reactor 0.100.0 has no scroll offset API, so the view does not
       auto-follow the bottom. (Refs #407)
-- [x] **D3 Swarm monitor.** An openable monitor pane uses one demand-driven
+- [x] **D3 Swarm monitor.** An openable monitor panel uses one demand-driven
       refresh chain, active only while open. Each refresh reads `agent.list` per
       attention state with observations (with `total` as the exact counter), then
       `agent.get` and `usage.summary` for the selected Agent only. At most four
@@ -383,24 +383,23 @@ of the explicitly selected release scope.
       changed set is marked partial. RSS is shown, the UI-only history is capped
       and deduplicated; CPU and memory are bar charts with the latest value and a
       labelled scale. Only the actions that apply are offered, bound at click time
-      to the Agent, generation and turn shown: Interrupt, Stop, Force stop (error
-      role, confirmed inline), Resume and, for observe-only Agents, Detach.
+      to the Agent, generation and turn shown: Interrupt, Stop, Force stop
+      (confirmed in a dialog), Resume and, for observe-only Agents, Detach.
       (Refs #407)
-- [x] **D4 Launch picker, Profiles and Automation screens.** The launch picker
-      lists the daemon's sanitized `profile.list` summaries (requested settings,
-      with native defaults named when a field is unset) and an Owner ad-hoc
-      harness mode that shows the harness catalogue defaults. The Agent detail
-      shows requested settings beside the effective native readback. The
-      Profiles screen keeps one draft of the `[profiles.*]` source: form fields
-      and the source view both edit it. Validate and Save go through
+- [x] **D4 Launch context, profiles and automation settings.** A new task
+      picks Auto, a profile from the daemon's sanitized `profile.list` summaries,
+      or an Owner ad-hoc harness with its catalogue's models and efforts. The
+      Agent details show requested settings beside the effective native
+      readback. Settings › Models and profiles keeps one draft of the
+      `[profiles.*]` source: form fields and the source view both edit it. Validate and Save go through
       `config.profiles.save`, which uses the daemon parser and launch resolution,
       a revision guard and a temporary-file rename. An invalid draft is never
-      written and stays in the editor. The screen states that running Agents
-      keep their frozen settings. The Automation screen lists rules and timers
-      read-only through `rule.list`; no pause or resume operation exists.
-      (Refs #407)
+      written and stays in the editor. The section states that running Agents
+      keep their frozen settings. Settings › Automation and scripts lists rules
+      and timers read-only through `rule.list`; no pause or resume operation
+      exists. (Refs #407)
 
-- [x] **D5 Scripts screen.** Existing script entries under the approved Run roots
+- [x] **D5 Scripts.** Existing script entries under the approved Run roots
       (`<data_dir>/scripts/`, registered `.eliot/scripts/`) open in a native
       multiline editor. Edits go through `script.list/read/save`: Run's own
       capture rules, a revision guard and temporary-file replacement, with the BOM
@@ -408,19 +407,34 @@ of the explicitly selected release scope.
       `timer.run` of a timer whose `run` action names the entry, with the daemon's
       custody, timeout and unknown-outcome rules. "Open in editor" starts a
       user-selected `.exe` with literal argv and no Eliot credentials. (Refs #407)
-- [x] **D6 Coordination actions.** The Agent detail configures model and effort
-      from `harness.models` read under that Agent's frozen route (`agent`), with
-      the daemon's per-field `configure` refusals, then shows requested, next-turn
-      (revision, application point) and effective values with their turn-proven
-      verified marks. The monitor moves an Agent, or all of a manager's children,
-      to another manager through `swarm.reparent`, each move a button bound to the
-      generations shown. A Hand off / Switch dialog selects the original task SEND
+- [x] **D6 Coordination actions.** The composer's model chip configures model and
+      effort from `harness.models` read under that Agent's frozen route (`agent`),
+      with the daemon's per-field `configure` refusals; the details show
+      requested, next-turn (revision, application point) and effective values with
+      their turn-proven verified marks. Change manager moves an Agent, or all of a
+      manager's children, to another manager through `swarm.reparent`, each move
+      a button bound to the generations shown. A Hand off / Switch dialog selects the original task SEND
       and up to 64 undispatched SENDs, then hands off to an existing Agent
       (`swarm.handoff`) or switches to a new profile or ad-hoc Agent
       (`swarm.switch`, cross-harness). It shows cancellations, successors, brief
       state, claim/Goal/child transfer and the successor gate, reads results back
       only with the same id, and offers Owner `command.resolve`/`command.cancel`
       for a held or failed brief and an ordinary handoff to finish a switch.
+- [x] **D7 One shell.** The rail of separate screens is replaced by one shell
+      (owner review 2026-11-15, the Codex app as reference). A sidebar holds New
+      task, projects with their Agents nested (manager, then workers, collapsed),
+      Recents (titles from each Agent's first message), a fleet status line that
+      opens the monitor, and Settings. The conversation has a one-line header
+      (title, status dot, details toggle, a "…" menu for Hand off/Switch, Change
+      manager, Resume, Detach, Stop and Force stop); coverage, ids and readback
+      live in the details panel. One composer carries the project and
+      Auto/profile/harness chips, the model-and-effort and access chips, Send,
+      and Interrupt/Steer only while a turn runs. Auto launches the Settings
+      default profile until daemon routing (k55) lands. Settings has General,
+      Models and profiles, Routing, Projects, Automation and scripts, Cloud MCP
+      and Advanced, all through one client module (`config_client`) that the
+      unified settings API replaces. One component system: one row, one chip,
+      filled/tonal/text buttons, an 8-point grid and three radii. (Refs #407)
 
 ## M1 — Memory one-shot inference (#199)
 

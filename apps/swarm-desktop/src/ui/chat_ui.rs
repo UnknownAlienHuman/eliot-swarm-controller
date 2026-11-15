@@ -1370,9 +1370,10 @@ impl DesktopApp {
             ),
             (Some(_), None) => (View::empty(), View::empty()),
         };
-        let placeholder = match agent.as_deref() {
-            Some(agent) => format!("Message {}", self.agent_title(agent)),
-            None => "Do anything".to_owned(),
+        let placeholder = if agent.is_some() {
+            "Send a follow-up"
+        } else {
+            "Do anything"
         };
         let field = TextBox::new()
             .grid_row(1)
