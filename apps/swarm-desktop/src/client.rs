@@ -553,11 +553,17 @@ pub async fn command_children(data_dir: &Path, id: &str) -> Result<Vec<Command>>
     Ok(reply.children)
 }
 
-/// The harness catalogue with its default model/effort.
-pub async fn harness_models(data_dir: &Path, harness: &str) -> Result<HarnessModelsResponse> {
+/// The harness catalogue with its default model/effort and `configure`
+/// support: under ad-hoc defaults, or under one Agent's frozen route.
+pub async fn harness_models(
+    data_dir: &Path,
+    harness: &str,
+    agent: Option<&str>,
+) -> Result<HarnessModelsResponse> {
     let params = HarnessModelsRequest {
         harness: harness.to_owned(),
         profile: None,
+        agent: agent.map(str::to_owned),
     };
     params.validate()?;
     let reply: HarnessModelsResponse =

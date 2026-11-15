@@ -13,6 +13,8 @@ mod clipboard;
 #[cfg(windows)]
 mod config_view;
 #[cfg(windows)]
+mod configure;
+#[cfg(windows)]
 mod monitor_view;
 #[cfg(windows)]
 mod ui;

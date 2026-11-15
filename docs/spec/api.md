@@ -1272,7 +1272,14 @@ with an empty `model/list`: the note names that binary and the `--cmd` /
 profile remedy), or `none` when the harness exposes no catalogue.
 An optional `profile` selects the native route/account
 (the named profile must exist and its frozen harness must match); omitted it
-means ad-hoc daemon defaults. The read is cached per native route/account
+means ad-hoc daemon defaults. An optional `agent` (exclusive with `profile`)
+reads under that controlled Agent's frozen launch snapshot instead, the route
+its `configure` draws from, never the current profile file; the Agent's
+harness must match and observed Agents are `not_allowed`. Every response
+carries `configure`, the harness's mid-session `configure` support from the
+same table `configure` admission uses: `model_refusal`/`effort_refusal` are
+absent when the field has a verified mechanism and otherwise hold the exact
+`unsupported` refusal admission returns. The read is cached per native route/account
 scope with a freshness timestamp (`fetched_at_ms`, `ttl_ms`) and a nonsecret
 credential identity (a name, never a value); every response carries its
 `scope`, `fetched_at_ms`, `ttl_ms` and `credential`. Native model ids are

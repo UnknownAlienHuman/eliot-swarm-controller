@@ -54,6 +54,7 @@ use windows_reactor::*;
 use crate::chat::{Conversation, Invalidation};
 use crate::client::{self, LaunchTarget};
 use crate::config_view::{self, ProfilesActions, ProfilesData, RuleNamespace};
+use crate::configure;
 use crate::feed::{self, Delivery, Depth, Reread, Snapshot};
 use crate::live::{self, LiveStatus, Next};
 use crate::markdown::Doc;
@@ -169,8 +170,22 @@ struct UiDetail {
     pending: Vec<UiPending>,
     profile: String,
     harness: String,
-    effective: String,
+    settings: configure::Settings,
     state: String,
+}
+
+/// Model/effort section of the Agent detail: the catalogue of the exact
+/// Agent generation, the picks (index 0 keeps the field) and the last
+/// `configure` outcome.
+#[derive(Clone, Debug, Default)]
+struct ConfigureState {
+    catalog: Option<configure::Catalog>,
+    /// Agent and generation whose catalogue read is in flight.
+    loading: Option<(String, i64)>,
+    model_pick: Option<usize>,
+    effort_pick: Option<usize>,
+    status: String,
+    expanded: bool,
 }
 
 /// Admission of one send: bound Agent, draft revision and submitted text.
@@ -241,9 +256,14 @@ enum Message {
     AdhocEffortChanged(String),
     HarnessModelsRequested,
     HarnessModelsLoaded(String, Fallible<String>),
-    ConfigureModelChanged(String),
-    ConfigureEffortChanged(String),
+    CatalogLoaded(configure::Catalog),
+    CatalogRefreshRequested,
+    ConfigureModelPicked(Option<usize>),
+    ConfigureEffortPicked(Option<usize>),
+    ConfigureExpanded(bool),
     ConfigureRequested,
+    /// Outer error: the submission itself; inner: the settled command read.
+    ConfigureSettled(Result<Fallible<Command>, String>),
     ProfilesSourceLoaded(Fallible<ProfilesReadResponse>),
     ProfilesDraftChanged(String),
     ProfileEditSelected(Option<usize>),
@@ -340,8 +360,7 @@ struct DesktopApp {
     adhoc_model: String,
     adhoc_effort: String,
     harness_hint: String,
-    configure_model: String,
-    configure_effort: String,
+    configure: ConfigureState,
     editor: ProfilesEditor,
     rules: Vec<RuleNamespace>,
     rules_status: String,
@@ -743,9 +762,11 @@ impl DesktopApp {
 
     fn open_conversation(&mut self, agent: &UiAgent, context: &ComponentContext<Self>) {
         self.selection.select_agent(Some(agent.id.clone()));
-        // Configure values typed for one Agent never carry over to another.
-        self.configure_model.clear();
-        self.configure_effort.clear();
+        // Configure picks and catalogue for one Agent never carry over.
+        self.configure = ConfigureState {
+            expanded: self.configure.expanded,
+            ..ConfigureState::default()
+        };
         self.convo = Some(Conversation::new(&agent.id));
         self.detail = None;
         self.depth = Depth::default();
@@ -791,6 +812,54 @@ impl DesktopApp {
             let snapshot = client::block_on(monitor::refresh(&data_dir, selected, &cancelled));
             Message::MonitorLoaded(epoch, snapshot.map(Box::new))
         }));
+    }
+
+    /// Read the catalogue for the selected Agent's exact generation and
+    /// route once, while the section is open.
+    fn ensure_catalog(&mut self, context: &ComponentContext<Self>) {
+        let (Some(agent), Some(detail), Ok(data_dir)) = (
+            self.selected_agent_id(),
+            self.detail.as_ref(),
+            self.data_dir.clone(),
+        ) else {
+            return;
+        };
+        let key = (agent, detail.generation);
+        let current = self
+            .configure
+            .catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.is_for(&key.0, key.1));
+        if !self.configure.expanded || current || self.configure.loading.as_ref() == Some(&key) {
+            return;
+        }
+        self.configure.loading = Some(key.clone());
+        let harness = detail.harness.clone();
+        let _task = context.spawn_background(move |_| {
+            let reply = client::block_on(client::harness_models(&data_dir, &harness, Some(&key.0)))
+                .map_err(|error| error.to_string());
+            Message::CatalogLoaded(configure::Catalog {
+                agent: key.0,
+                generation: key.1,
+                reply,
+            })
+        });
+    }
+
+    /// The picked values that would change something; refused fields never
+    /// submit.
+    fn configure_picks(
+        &self,
+        catalog: &configure::Catalog,
+        detail: &UiDetail,
+    ) -> (Option<String>, Option<String>) {
+        let models = catalog.models();
+        let model = configure::picked(&models, self.configure.model_pick)
+            .filter(|_| catalog.model_refusal().is_none());
+        let efforts = catalog.efforts(model.as_deref().or(detail.settings.next_model()));
+        let effort = configure::picked(&efforts, self.configure.effort_pick)
+            .filter(|_| catalog.effort_refusal().is_none());
+        (model, effort)
     }
 
     fn submit_control(
@@ -901,7 +970,7 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
         pending,
         profile: reply.agent.profile.clone(),
         harness: reply.agent.harness.clone(),
-        effective: effective_summary(reply),
+        settings: configure::Settings::from_reply(reply),
         state: format!("{:?}", reply.agent.state).to_lowercase(),
     }
 }
@@ -915,34 +984,36 @@ fn request_summary(details: &serde_json::Value) -> String {
     }
 }
 
-/// Requested settings (the frozen profile snapshot, or a configure
-/// overlay) next to the effective native readback, kept apart: the request
-/// is not proof of what the harness runs.
-fn effective_summary(reply: &AgentGetResponse) -> String {
-    let read = |value: Option<&serde_json::Value>, key: &str| {
-        value
-            .and_then(|value| value.get(key))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    };
-    let snapshot = Some(&reply.agent.profile_snapshot);
-    let effective = reply.agent.effective.as_ref();
-    let requested_model = read(snapshot, "model").unwrap_or_else(|| "native default".to_owned());
-    let requested_effort = read(snapshot, "effort").unwrap_or_else(|| "native default".to_owned());
-    let model = read(effective, "model").unwrap_or_else(|| "not read back".to_owned());
-    let effort = read(effective, "effort").unwrap_or_else(|| "not read back".to_owned());
-    let mut summary =
-        format!("requested {requested_model}/{requested_effort} · effective {model}/{effort}");
-    if let Some(config) = reply.config.as_ref() {
-        summary.push_str(&format!(
-            " · configure rev {} ({}) requests {}/{} for the next turn",
-            config.revision,
-            config.provenance,
-            config.requested_model.as_deref().unwrap_or("unchanged"),
-            config.requested_effort.as_deref().unwrap_or("unchanged"),
-        ));
+/// Poll one retained command (bounded, cancellable) until it is terminal.
+/// The outcome stays the daemon's; this only reads it.
+fn settle_command(
+    data_dir: &Path,
+    id: &str,
+    max_polls: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Fallible<Command> {
+    const POLL_MS: u64 = 1_000;
+    let mut command =
+        client::block_on(client::read_command(data_dir, id)).map_err(|error| error.to_string())?;
+    for _ in 0..max_polls {
+        if scripts::is_terminal(command.state) {
+            return Ok(command);
+        }
+        if !feed::backoff(POLL_MS, cancelled) {
+            return Err(format!(
+                "stopped waiting; command {id} continues in the daemon"
+            ));
+        }
+        command = client::block_on(client::read_command(data_dir, id))
+            .map_err(|error| error.to_string())?;
     }
-    summary
+    if scripts::is_terminal(command.state) {
+        return Ok(command);
+    }
+    Err(format!(
+        "command {id} still {} after {max_polls}s; its outcome stays with the daemon",
+        format!("{:?}", command.state).to_lowercase()
+    ))
 }
 
 /// Follow a `timer.run` command to its Run child and wait (bounded,
@@ -1053,8 +1124,7 @@ impl Component for DesktopApp {
             adhoc_model: String::new(),
             adhoc_effort: String::new(),
             harness_hint: String::new(),
-            configure_model: String::new(),
-            configure_effort: String::new(),
+            configure: ConfigureState::default(),
             editor: ProfilesEditor::default(),
             rules: Vec::new(),
             rules_status: String::new(),
@@ -1235,6 +1305,7 @@ impl Component for DesktopApp {
                         self.failures = 0;
                         self.docs.extend(snapshot.docs);
                         self.detail = Some(detail_from(&snapshot.detail));
+                        self.ensure_catalog(context);
                         let cursor = snapshot.coverage.cursor;
                         if let Some(convo) = self.convo.as_mut() {
                             let missing =
@@ -1332,6 +1403,7 @@ impl Component for DesktopApp {
                         self.docs.extend(reread.docs);
                         if let Some(detail) = reread.detail.as_ref() {
                             self.detail = Some(detail_from(detail));
+                            self.ensure_catalog(context);
                         }
                         if let Some(convo) = self.convo.as_mut() {
                             if let Some(turns) = reread.turns.as_deref() {
@@ -1749,7 +1821,7 @@ impl Component for DesktopApp {
                 self.harness_hint = format!("Reading the {harness} catalogue…");
                 let _task = context.spawn_background(move |_| {
                     let hint = client::block_on(async {
-                        client::harness_models(&data_dir, &harness)
+                        client::harness_models(&data_dir, &harness, None)
                             .await
                             .map(|reply| {
                                 let default = reply
@@ -1794,35 +1866,113 @@ impl Component for DesktopApp {
                     Err(error) => format!("{harness} catalogue unavailable: {error}"),
                 };
             }
-            Message::ConfigureModelChanged(text) => self.configure_model = text,
-            Message::ConfigureEffortChanged(text) => self.configure_effort = text,
+            Message::CatalogLoaded(catalog) => {
+                let loaded = (catalog.agent.clone(), catalog.generation);
+                if self.configure.loading.as_ref() == Some(&loaded) {
+                    self.configure.loading = None;
+                }
+                let current = self
+                    .selected_agent_id()
+                    .zip(self.detail.as_ref().map(|detail| detail.generation));
+                if current == Some(loaded) {
+                    self.configure.catalog = Some(catalog);
+                    self.configure.model_pick = Some(0);
+                    self.configure.effort_pick = Some(0);
+                }
+            }
+            Message::CatalogRefreshRequested => {
+                self.configure.catalog = None;
+                self.configure.loading = None;
+                self.ensure_catalog(context);
+            }
+            Message::ConfigureModelPicked(index) => {
+                if index.is_some() && index != self.configure.model_pick {
+                    self.configure.model_pick = index;
+                    // Efforts belong to the picked model.
+                    self.configure.effort_pick = Some(0);
+                }
+            }
+            Message::ConfigureEffortPicked(index) => {
+                if index.is_some() {
+                    self.configure.effort_pick = index;
+                }
+            }
+            Message::ConfigureExpanded(open) => {
+                self.configure.expanded = open;
+                if open {
+                    self.ensure_catalog(context);
+                }
+            }
             Message::ConfigureRequested => {
-                let (Some(agent), Some(detail)) = (self.selected_agent_id(), self.detail.clone())
-                else {
-                    self.set_status("Select an Agent first.");
+                let (Some(agent), Some(detail), Some(catalog)) = (
+                    self.selected_agent_id(),
+                    self.detail.clone(),
+                    self.configure.catalog.clone(),
+                ) else {
+                    self.configure.status =
+                        "Select an Agent and wait for its catalogue.".to_owned();
                     return;
                 };
-                let model = Some(self.configure_model.trim().to_owned()).filter(|v| !v.is_empty());
-                let effort =
-                    Some(self.configure_effort.trim().to_owned()).filter(|v| !v.is_empty());
+                let (model, effort) = self.configure_picks(&catalog, &detail);
                 if model.is_none() && effort.is_none() {
-                    self.set_status("Configure needs a model or an effort.");
+                    self.configure.status = "Pick a model or an effort to change.".to_owned();
                     return;
                 }
+                if self.submitting() {
+                    return;
+                }
+                let Ok(data_dir) = self.data_dir.clone() else {
+                    return;
+                };
+                // Bound at click time: exact Agent generation and values, one
+                // ULID per action, reused only when the reply was uncertain.
                 let generation = detail.generation;
                 let key = format!("configure:{agent}:{generation}:{model:?}:{effort:?}");
-                self.submit_control(context, "Configure", key, move |data_dir, mutation_id| {
-                    client::block_on(client::submit_configure(
-                        data_dir,
-                        mutation_id,
-                        &agent,
-                        generation,
-                        model,
-                        effort,
-                    ))
-                    .map(|reply| submit_note(&reply))
-                    .map_err(|error| error.to_string())
-                });
+                let mutation_id = self.ledger.id_for(&key);
+                self.in_flight_key = Some(key);
+                self.configure.status = format!("Configure {mutation_id}…");
+                let _task =
+                    context.spawn_background(move |cancel| {
+                        let cancelled = || cancel.is_cancelled();
+                        let submitted = client::block_on(client::submit_configure(
+                            &data_dir,
+                            mutation_id,
+                            &agent,
+                            generation,
+                            model,
+                            effort,
+                        ))
+                        .map_err(|error| error.to_string());
+                        Message::ConfigureSettled(submitted.map(|reply| {
+                            settle_command(&data_dir, &reply.command_id, 90, &cancelled)
+                        }))
+                    });
+            }
+            Message::ConfigureSettled(result) => {
+                let uncertain = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| crate::state::uncertain(error));
+                self.settle_mutation(!uncertain);
+                self.configure.status = match result {
+                    Ok(Ok(command)) => {
+                        self.configure.model_pick = Some(0);
+                        self.configure.effort_pick = Some(0);
+                        configure::outcome_line(&command)
+                    }
+                    Ok(Err(error)) => format!("Configure admitted; outcome not read: {error}"),
+                    Err(error) if uncertain => {
+                        format!("Configure outcome uncertain (Apply again reuses its id): {error}")
+                    }
+                    Err(error) => format!("Configure refused: {error}"),
+                };
+                self.queue_reread(
+                    Invalidation {
+                        detail: true,
+                        ..Invalidation::default()
+                    },
+                    context,
+                );
             }
             Message::ProfilesSourceLoaded(result) => {
                 self.editor.busy = false;
@@ -2147,9 +2297,10 @@ impl Component for DesktopApp {
             Message::ScriptRunSubmitted(result) => {
                 // Only an uncertain reply keeps the key (so a retry reuses the id);
                 // a definite refusal ends that action.
-                let uncertain = result.as_ref().err().is_some_and(|error| {
-                    error.starts_with("unknown:") || error.starts_with("unavailable:")
-                });
+                let uncertain = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| crate::state::uncertain(error));
                 self.settle_mutation(!uncertain);
                 if result.is_err() && !uncertain {
                     self.scripts.run_seq += 1;
@@ -2754,6 +2905,54 @@ impl DesktopApp {
             ))
     }
 
+    /// The Agent detail's model/effort section; empty without a readback.
+    fn configure_view(&self, context: &mut ViewContext<Self>) -> View {
+        let Some(detail) = self
+            .detail
+            .as_ref()
+            .filter(|_| self.selected_agent_id().is_some())
+        else {
+            return View::empty();
+        };
+        let catalog = self.configure.catalog.as_ref();
+        let models = catalog.map(configure::Catalog::models).unwrap_or_default();
+        let model = configure::picked(&models, self.configure.model_pick);
+        let efforts = catalog
+            .map(|catalog| catalog.efforts(model.as_deref().or(detail.settings.next_model())))
+            .unwrap_or_default();
+        let can_apply = catalog.is_some_and(|catalog| {
+            let (model, effort) = self.configure_picks(catalog, detail);
+            model.is_some() || effort.is_some()
+        }) && !self.submitting();
+        let catalog_line = match (catalog, &self.configure.loading) {
+            (Some(catalog), _) => catalog.line(),
+            (None, Some(_)) => format!("Reading the {} catalogue for this Agent…", detail.harness),
+            (None, None) => "Catalogue not read yet.".to_owned(),
+        };
+        configure::panel(
+            configure::ConfigureData {
+                settings: &detail.settings,
+                catalog_line,
+                models,
+                model_pick: self.configure.model_pick,
+                model_refusal: catalog.and_then(configure::Catalog::model_refusal),
+                efforts,
+                effort_pick: self.configure.effort_pick,
+                effort_refusal: catalog.and_then(configure::Catalog::effort_refusal),
+                can_apply,
+                status: &self.configure.status,
+                expanded: self.configure.expanded,
+            },
+            configure::ConfigureActions {
+                model: context.callback(Message::ConfigureModelPicked),
+                effort: context.callback(Message::ConfigureEffortPicked),
+                apply: context.message(Message::ConfigureRequested),
+                refresh: context.message(Message::CatalogRefreshRequested),
+                expanded: context.callback(Message::ConfigureExpanded),
+            },
+        )
+    }
+
     fn chat_view(&self, context: &mut ViewContext<Self>) -> View {
         let detail_text = match (&self.detail, self.selected_agent_id()) {
             (Some(detail), Some(agent)) => format!(
@@ -2762,7 +2961,7 @@ impl DesktopApp {
                 detail.state,
                 detail.harness,
                 detail.profile,
-                detail.effective,
+                detail.settings.summary(),
                 detail.active_turn.as_deref().unwrap_or("none"),
             ),
             (None, Some(agent)) => format!("{agent} · reading…"),
@@ -2964,37 +3163,12 @@ impl DesktopApp {
             } else {
                 "Jump to latest".to_owned()
             }));
-        let configure: View = if has_agent {
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(theme::spacing::XS)
-                .children((
-                    TextBox::new()
-                        .text(self.configure_model.clone())
-                        .placeholder_text("model")
-                        .automation_name("Configure model")
-                        .width(150.0)
-                        .on_text_changed(context.callback(Message::ConfigureModelChanged)),
-                    TextBox::new()
-                        .text(self.configure_effort.clone())
-                        .placeholder_text("effort")
-                        .automation_name("Configure effort")
-                        .width(90.0)
-                        .on_text_changed(context.callback(Message::ConfigureEffortChanged)),
-                    Button::new()
-                        .is_enabled(!self.submitting() && self.detail.is_some())
-                        .automation_name("Configure next turn")
-                        .on_click(context.message(Message::ConfigureRequested))
-                        .content(TextBlock::new().text("Configure next turn")),
-                ))
-        } else {
-            View::empty()
-        };
         let actions = StackPanel::new()
             .grid_row(5)
             .orientation(Orientation::Horizontal)
             .spacing(theme::spacing::SM)
-            .children((primary, interrupt, jump, configure));
+            .children((primary, interrupt, jump));
+        let settings = self.configure_view(context);
 
         Grid::new()
             .grid_column(1)
@@ -3008,11 +3182,16 @@ impl DesktopApp {
             ])
             .row_spacing(theme::spacing::SM)
             .children((
-                TextBlock::new()
-                    .text(detail_text)
-                    .text_wrapping(TextWrapping::Wrap)
-                    .is_text_selection_enabled(true)
-                    .grid_row(0),
+                StackPanel::new()
+                    .grid_row(0)
+                    .spacing(theme::spacing::XS)
+                    .children((
+                        TextBlock::new()
+                            .text(detail_text)
+                            .text_wrapping(TextWrapping::Wrap)
+                            .is_text_selection_enabled(true),
+                        settings,
+                    )),
                 coverage,
                 transcript,
                 pending,
