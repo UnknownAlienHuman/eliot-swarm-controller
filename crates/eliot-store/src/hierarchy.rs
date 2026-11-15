@@ -361,10 +361,11 @@ fn control_rank(control: AgentControl) -> u8 {
 /// (same profile, harness, workspace, full snapshot, control narrowed or
 /// equal) or naming a profile from the parent snapshot's captured
 /// `child_profiles` allow-list (same harness and workspace, control narrowed
-/// or equal). The binding still flows through the dispatch-owned path, and
-/// any drift surfaces as `source_integrity` there; the Router freezes and
-/// authorizes the snapshot before Store admission. Owner, Run, and every
-/// other caller keep the existing rejection.
+/// or equal, carried binding exactly equal to the parent's). The binding
+/// still flows through the dispatch-owned path, and any drift surfaces as
+/// `source_integrity` there; the Router freezes and authorizes the snapshot
+/// before Store admission. Owner, Run, and every other caller keep the
+/// existing rejection.
 pub(super) fn admission_allows_carried_parent_binding(
     tx: &Transaction<'_>,
     principal: &str,
@@ -407,6 +408,16 @@ pub(super) fn admission_allows_carried_parent_binding(
         && args.get("profile_snapshot") == Some(&parent.profile_snapshot)
     {
         return Ok(true);
+    }
+    let Some(child_snapshot) = args.get("profile_snapshot") else {
+        return Ok(false);
+    };
+    // A carried binding can only ever be the parent's own: the Router
+    // inherits it verbatim, so anything else is not a Router-frozen child.
+    if child_snapshot.get("native_store_binding")
+        != parent.profile_snapshot.get("native_store_binding")
+    {
+        return Ok(false);
     }
     Ok(args
         .get("profile")
@@ -952,32 +963,61 @@ mod tests {
             .command
             .target
             .expect("manager agent");
-        store.dispatch(&launch_id, now).expect("dispatch manager");
+        let binding = NativeStoreBinding {
+            home: "parent-home".to_owned(),
+            root: "parent-root".to_owned(),
+            native_scope: "parent-scope".to_owned(),
+        };
+        let expected = store.get_agent(&parent).unwrap().expect("manager row");
+        store
+            .dispatch_with_native_store_binding(&launch_id, now, &expected, &binding)
+            .expect("dispatch manager with its real binding");
+        let parent_binding = store
+            .get_agent(&parent)
+            .unwrap()
+            .expect("manager row")
+            .profile_snapshot["native_store_binding"]
+            .clone();
         let principal = agent_principal(&parent);
+        // Carrying the parent's own binding admits on the allow-listed profile.
         let mut allowed = launch_request("caller-project-label", Some(&parent));
         allowed.args["profile"] = json!("worker");
-        allowed.args["profile_snapshot"] = json!({"control": "self", "native_store_binding": {"home": "h", "root": "r", "native_scope": "s"}});
+        allowed.args["profile_snapshot"] =
+            json!({"control": "self", "native_store_binding": parent_binding});
         let child = store
             .submit(&principal, allowed, now + 1)
             .expect("allow-listed child carrying the parent binding admits")
             .command
             .target
             .expect("child agent");
-        assert!(
+        assert_eq!(
             store
                 .get_agent(&child)
                 .unwrap()
                 .expect("child row")
                 .profile_snapshot
-                .get("native_store_binding")
-                .is_some(),
+                .get("native_store_binding"),
+            Some(&parent_binding),
             "the carried binding is retained on the child row"
+        );
+        // A different binding on the same allow-listed profile is rejected:
+        // a carried binding can only ever be the parent's own.
+        let mut forged = launch_request("caller-project-label", Some(&parent));
+        forged.args["profile"] = json!("worker");
+        forged.args["profile_snapshot"] = json!({"control": "self", "native_store_binding": {"home": "elsewhere-home", "root": "elsewhere-root", "native_scope": "elsewhere-scope"}});
+        let error = store.submit(&principal, forged, now + 2).unwrap_err();
+        assert_eq!(error.code, "invalid");
+        assert!(
+            error.message.contains("omit profile_snapshot"),
+            "unexpected message: {}",
+            error.message
         );
         // A profile outside the allow-list keeps the rejection.
         let mut intruder = launch_request("caller-project-label", Some(&parent));
         intruder.args["profile"] = json!("intruder");
-        intruder.args["profile_snapshot"] = json!({"control": "self", "native_store_binding": {"home": "h", "root": "r", "native_scope": "s"}});
-        let error = store.submit(&principal, intruder, now + 2).unwrap_err();
+        intruder.args["profile_snapshot"] =
+            json!({"control": "self", "native_store_binding": parent_binding});
+        let error = store.submit(&principal, intruder, now + 3).unwrap_err();
         assert_eq!(error.code, "invalid");
         assert!(
             error.message.contains("omit profile_snapshot"),
