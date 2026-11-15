@@ -17,6 +17,8 @@ mod configure;
 #[cfg(windows)]
 mod monitor_view;
 #[cfg(windows)]
+mod reparent;
+#[cfg(windows)]
 mod ui;
 #[cfg(windows)]
 mod views;

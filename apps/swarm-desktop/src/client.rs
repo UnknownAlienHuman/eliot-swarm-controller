@@ -17,10 +17,10 @@ use eliot_core::api::{
     EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
     EventsSubscribeResponse, HarnessModelsRequest, HarnessModelsResponse, ProfileListRequest,
     ProfileListResponse, ProfilesReadRequest, ProfilesReadResponse, ProfilesSaveRequest,
-    ProfilesSaveResponse, ProjectRegistrationView, RuleListEntry, RuleListRequest,
-    RuleListResponse, ScriptListRequest, ScriptListResponse, ScriptReadRequest, ScriptReadResponse,
-    ScriptSaveRequest, ScriptSaveResponse, TimerRunRequest, UsageSummaryRequest,
-    UsageSummaryResponse, discovery::ProjectListRequest,
+    ProfilesSaveResponse, ProjectRegistrationView, ReparentRequest, ReparentResponse,
+    RuleListEntry, RuleListRequest, RuleListResponse, ScriptListRequest, ScriptListResponse,
+    ScriptReadRequest, ScriptReadResponse, ScriptSaveRequest, ScriptSaveResponse, TimerRunRequest,
+    UsageSummaryRequest, UsageSummaryResponse, discovery::ProjectListRequest,
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -551,6 +551,21 @@ pub async fn command_children(data_dir: &Path, id: &str) -> Result<Vec<Command>>
         eliot_daemon::client_call_typed(data_dir, "command.children", &params).await?;
     params.validate_response(&reply)?;
     Ok(reply.children)
+}
+
+/// Owner manager change bound to both exact generations; the daemon
+/// validates topology, limits and state inside one Store transaction.
+pub async fn reparent(data_dir: &Path, request: &ReparentRequest) -> Result<ReparentResponse> {
+    request.validate()?;
+    let reply: ReparentResponse =
+        eliot_daemon::client_call_typed(data_dir, "swarm.reparent", request).await?;
+    if reply.id != request.id {
+        return Err(Error::new(
+            "source_integrity",
+            "reparent reply names another mutation",
+        ));
+    }
+    Ok(reply)
 }
 
 /// The harness catalogue with its default model/effort and `configure`

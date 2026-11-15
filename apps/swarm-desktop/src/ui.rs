@@ -46,8 +46,8 @@ use std::rc::Rc;
 use eliot_core::Command;
 use eliot_core::api::{
     AgentGetResponse, AgentListRequest, CommandSubmitResponse, ProfileListResponse, ProfileSummary,
-    ProfilesReadResponse, ProfilesSaveResponse, RuleListEntry, ScriptListResponse,
-    ScriptReadResponse, ScriptSaveResponse,
+    ProfilesReadResponse, ProfilesSaveResponse, ReparentResponse, RuleListEntry,
+    ScriptListResponse, ScriptReadResponse, ScriptSaveResponse,
 };
 use windows_reactor::*;
 
@@ -61,6 +61,7 @@ use crate::markdown::Doc;
 use crate::monitor::{self, Monitor, MonitorSnapshot};
 use crate::monitor_view::{self, MonitorActions};
 use crate::profiles::{self, FORM_FIELDS};
+use crate::reparent;
 use crate::scripts;
 use crate::state::{BoundAction, DraftStore, MutationLedger, Selection};
 use crate::theme;
@@ -293,6 +294,8 @@ enum Message {
     MonitorToggled(bool),
     MonitorLoaded(u64, Option<Box<MonitorSnapshot>>),
     MonitorSelected(Option<usize>),
+    ReparentRequested(reparent::MoveBinding),
+    ReparentSettled(reparent::MoveBinding, Fallible<ReparentResponse>),
     MonitorOpenConversation(String),
     MonitorStop(BoundAction, bool),
     MonitorInterrupt(BoundAction),
@@ -370,6 +373,7 @@ struct DesktopApp {
     /// Monitor rows published before the latest refresh; the native
     /// selection never points past them (see `monitor_view`).
     monitor_published: usize,
+    reparent_status: String,
 }
 
 impl DesktopApp {
@@ -1116,6 +1120,7 @@ impl Component for DesktopApp {
             monitor_task: None,
             monitor_selected: None,
             monitor_published: 0,
+            reparent_status: String::new(),
             screen: Screen::Chat,
             profile_summaries: Vec::new(),
             profile_list: None,
@@ -2377,6 +2382,42 @@ impl Component for DesktopApp {
                     // The running chain reads the new selection on its next
                     // cycle (within one period): still one refresh in flight.
                     self.monitor_selected = id;
+                    self.reparent_status.clear();
+                }
+            }
+            Message::ReparentRequested(binding) => {
+                if self.submitting() {
+                    return;
+                }
+                let Ok(data_dir) = self.data_dir.clone() else {
+                    return;
+                };
+                let key = binding.key();
+                let mutation_id = self.ledger.id_for(&key);
+                self.in_flight_key = Some(key);
+                self.reparent_status = format!("Moving {} ({mutation_id})…", binding.describe());
+                let request = binding.request(mutation_id);
+                let _task = context.spawn_background(move |_| {
+                    let result = client::block_on(client::reparent(&data_dir, &request))
+                        .map_err(|error| error.to_string());
+                    Message::ReparentSettled(binding, result)
+                });
+            }
+            Message::ReparentSettled(binding, result) => {
+                let uncertain = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| crate::state::uncertain(error));
+                self.settle_mutation(!uncertain);
+                self.reparent_status = match result {
+                    Ok(reply) => reparent::result_lines(&binding, &reply).join("\n"),
+                    Err(error) if uncertain => {
+                        format!("Move outcome uncertain (the same click reuses its id): {error}")
+                    }
+                    Err(error) => reparent::refusal_line(&binding, &error),
+                };
+                if self.monitor_open {
+                    self.spawn_monitor(context, 0);
                 }
             }
             Message::MonitorOpenConversation(id) => {
@@ -2563,6 +2604,35 @@ impl DesktopApp {
             .filter(|read| Some(&read.agent.agent.id) == self.monitor_selected.as_ref())
             .map(|read| &read.agent.agent);
         let controllable = shown.filter(|agent| !agent.observe_only);
+        let selected = self.monitor_selected.as_deref().unwrap_or_default();
+        // Each button is bound now, from what is on screen: the shown source
+        // generation and that row's generation.
+        let rows = reparent::candidates(&self.monitor.rows, selected)
+            .into_iter()
+            .map(|manager| {
+                let bind = |form| {
+                    shown.map(|agent| {
+                        context.message(Message::ReparentRequested(reparent::MoveBinding {
+                            form,
+                            source: agent.id.clone(),
+                            source_generation: agent.generation,
+                            parent: manager.id.clone(),
+                            parent_generation: manager.generation,
+                        }))
+                    })
+                };
+                monitor_view::MoveRow {
+                    id: manager.id.clone(),
+                    label: reparent::candidate_label(manager),
+                    move_agent: bind(reparent::MoveForm::Agent),
+                    move_children: bind(reparent::MoveForm::Children),
+                }
+            })
+            .collect();
+        let reparent_data = monitor_view::ReparentData {
+            rows,
+            status: &self.reparent_status,
+        };
         let actions = MonitorActions {
             select: context.callback(Message::MonitorSelected),
             open: self
@@ -2606,6 +2676,7 @@ impl DesktopApp {
             self.monitor_selected.as_deref(),
             self.monitor_published,
             !self.submitting(),
+            reparent_data,
             actions,
         )
     }
@@ -2920,10 +2991,11 @@ impl DesktopApp {
         let efforts = catalog
             .map(|catalog| catalog.efforts(model.as_deref().or(detail.settings.next_model())))
             .unwrap_or_default();
-        let can_apply = catalog.is_some_and(|catalog| {
-            let (model, effort) = self.configure_picks(catalog, detail);
-            model.is_some() || effort.is_some()
-        }) && !self.submitting();
+        let (picked_model, picked_effort) = catalog
+            .map(|catalog| self.configure_picks(catalog, detail))
+            .unwrap_or_default();
+        let can_apply = (picked_model.is_some() || picked_effort.is_some()) && !self.submitting();
+        let apply_label = configure::apply_label(picked_model.as_deref(), picked_effort.as_deref());
         let catalog_line = match (catalog, &self.configure.loading) {
             (Some(catalog), _) => catalog.line(),
             (None, Some(_)) => format!("Reading the {} catalogue for this Agent…", detail.harness),
@@ -2940,6 +3012,7 @@ impl DesktopApp {
                 effort_pick: self.configure.effort_pick,
                 effort_refusal: catalog.and_then(configure::Catalog::effort_refusal),
                 can_apply,
+                apply_label,
                 status: &self.configure.status,
                 expanded: self.configure.expanded,
             },

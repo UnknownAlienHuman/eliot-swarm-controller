@@ -202,6 +202,8 @@ pub fn cpu_time_label(ns: Option<u64>) -> String {
 pub struct MonitorRow {
     pub id: String,
     pub generation: i64,
+    /// Current manager (durable parent link), if any.
+    pub parent: Option<String>,
     pub state: AgentState,
     pub harness: String,
     pub active_turn: Option<String>,
@@ -242,6 +244,7 @@ impl MonitorRow {
         Self {
             id: summary.id.clone(),
             generation: summary.generation,
+            parent: summary.parent.clone(),
             state: summary.state,
             harness: summary.harness.clone(),
             active_turn: summary.active_turn.clone(),

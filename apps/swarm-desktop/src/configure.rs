@@ -213,6 +213,18 @@ pub fn picked(options: &[String], pick: Option<usize>) -> Option<String> {
         .cloned()
 }
 
+/// The Apply button text for the values that would be submitted.
+pub fn apply_label(model: Option<&str>, effort: Option<&str>) -> String {
+    match (model, effort) {
+        (Some(model), Some(effort)) => {
+            format!("Apply model {model} and effort {effort} for the next turn")
+        }
+        (Some(model), None) => format!("Apply model {model} for the next turn"),
+        (None, Some(effort)) => format!("Apply effort {effort} for the next turn"),
+        (None, None) => "Pick a model or an effort to apply".to_owned(),
+    }
+}
+
 /// Settled `configure` command in one line: state, the daemon's code and
 /// message, and the applied revision when the outcome names one.
 pub fn outcome_line(command: &Command) -> String {
@@ -249,6 +261,8 @@ pub struct ConfigureData<'a> {
     pub effort_pick: Option<usize>,
     pub effort_refusal: Option<&'a str>,
     pub can_apply: bool,
+    /// What Apply submits, e.g. "Apply effort high for the next turn".
+    pub apply_label: String,
     pub status: &'a str,
     pub expanded: bool,
 }
@@ -285,6 +299,10 @@ pub fn panel(data: ConfigureData<'_>, actions: ConfigureActions) -> View {
         .is_enabled(data.model_refusal.is_none())
         .automation_name("Configure model")
         .on_selection_changed(actions.model);
+    // The effort options follow the model. A ComboBox whose items change in
+    // place can report a selection index that differs from the item it
+    // shows, so a new option list gets a new control.
+    let effort_key = format!("effort:{}", data.efforts.join("\u{1f}"));
     let effort_picker = ComboBox::new()
         .items_source(data.efforts)
         .selected_index(data.effort_pick)
@@ -292,24 +310,29 @@ pub fn panel(data: ConfigureData<'_>, actions: ConfigureActions) -> View {
         .automation_name("Configure effort")
         .on_selection_changed(actions.effort);
     let lines = data.settings.lines().join("\n");
+    // The button says exactly what it submits.
+    let apply = Button::new()
+        .is_enabled(data.can_apply)
+        .automation_name(data.apply_label.clone())
+        .on_click(actions.apply)
+        .content(TextBlock::new().text(data.apply_label));
     let content = StackPanel::new().spacing(theme::spacing::XS).children((
         small(lines),
         StackPanel::new()
             .orientation(Orientation::Horizontal)
             .spacing(theme::spacing::XS)
-            .children((
-                model_picker,
-                effort_picker,
-                Button::new()
-                    .is_enabled(data.can_apply)
-                    .automation_name("Apply for the next turn")
-                    .on_click(actions.apply)
-                    .content(TextBlock::new().text("Apply for the next turn")),
-                Button::new()
-                    .automation_name("Reread catalogue")
-                    .on_click(actions.refresh)
-                    .content(TextBlock::new().text("Reread catalogue")),
-            )),
+            .keyed_children(vec![
+                KeyedView::new("model", model_picker),
+                KeyedView::new(effort_key, effort_picker),
+                KeyedView::new("apply", apply),
+                KeyedView::new(
+                    "reread",
+                    Button::new()
+                        .automation_name("Reread catalogue")
+                        .on_click(actions.refresh)
+                        .content(TextBlock::new().text("Reread catalogue")),
+                ),
+            ]),
         refusal(data.model_refusal, "Model"),
         refusal(data.effort_refusal, "Effort"),
         small(data.catalog_line).opacity(theme::MUTED_OPACITY),
@@ -363,6 +386,22 @@ mod tests {
                 configure,
             }),
         }
+    }
+
+    #[test]
+    fn apply_names_exactly_what_it_submits() {
+        assert_eq!(
+            apply_label(None, Some("high")),
+            "Apply effort high for the next turn"
+        );
+        assert_eq!(
+            apply_label(Some("m2"), Some("low")),
+            "Apply model m2 and effort low for the next turn"
+        );
+        assert_eq!(
+            apply_label(None, None),
+            "Pick a model or an effort to apply"
+        );
     }
 
     #[test]
