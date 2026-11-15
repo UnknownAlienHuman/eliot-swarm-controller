@@ -299,6 +299,7 @@ impl Router {
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
             "swarm.wait" => self.swarm_wait(&params, &principal).await,
             "swarm.digest" => self.swarm_digest(&params, &principal).await,
+            "swarm.reparent" => self.swarm_reparent(&params, &principal).await,
             "project.get" => self.project_get(&params, &principal).await,
             "project.list" => self.project_list(&params, &principal).await,
             "profile.list" => self.profile_list(&params, &principal).await,

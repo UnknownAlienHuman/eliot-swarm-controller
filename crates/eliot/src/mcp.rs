@@ -295,6 +295,7 @@ impl ServerHandler for EliotMcpHandler {
 const MUTATION_ID_METHODS: &[&str] = &[
     "daemon.shutdown",
     "command.submit",
+    "swarm.reparent",
     "command.resolve",
     "turn.resolve",
     "rule.catch_up",

@@ -3,7 +3,7 @@
 //! Owning contracts: `docs/spec/coordination.md` (claims and hierarchy,
 //! prompt guidance) and the hierarchy parts of `core.md`/`configuration.md`.
 //! A child inherits its parent's project label and tree root; the parent link
-//! is durable. Fanout limits gate launch admission only and never hide an
+//! is durable. Fanout limits gate launch and re-parent admission and never hide an
 //! Agent row that already exists. A tree selector expands once at admission
 //! to concrete members using the existing Store-only parent plus ordered
 //! children representation (`link_kind = 'selector'`); the parent applied

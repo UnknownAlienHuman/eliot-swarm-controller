@@ -112,6 +112,7 @@ const METHODS: &[Method] = &[
     method!("events.subscribe", EventsSubscribeRequest, EventsSubscribeResponse, false, false, "Long-poll a bounded event page, at most 30 seconds.", {"after":0,"limit":20,"wait_ms":1000}),
     method!("swarm.wait", SwarmWaitRequest, SwarmWaitResponse, false, false, "Wait up to 30 seconds for a frozen set of child commands/turns with all/any semantics.", {"commands":[EXAMPLE_ID],"turns":[],"mode":"all","wait_ms":1000}),
     method!("swarm.digest", SwarmDigestRequest, SwarmDigestResponse, false, true, "Register a durable completion digest delivering one coalesced parent mailbox result with the standard mail wake.", {"id":EXAMPLE_ID,"to":"a1","mode":"all","commands":[EXAMPLE_ID],"turns":[]}),
+    method!("swarm.reparent", ReparentRequest, ReparentResponse, true, true, "Atomically move one Agent subtree or all children to a controlled manager; Owner only, frozen profiles unchanged.", {"id":EXAMPLE_ID,"agent":"a2","expected_generation":1,"parent":"a3","parent_generation":1}),
     method!("project.get", ProjectGetRequest, ProjectRegistrationView, true, false, "Read one approved project registration.", {"id":"project-1"}),
     method!(
         "project.list",
@@ -280,6 +281,7 @@ impl Router {
             "var.get" => &["swarm var get"],
             "swarm.wait" => &["swarm wait"],
             "swarm.digest" => &["swarm digest"],
+            "swarm.reparent" => &["swarm reparent"],
             _ => &[],
         };
         let mut unsupported = vec!["A method listing grants no additional authority. Unsupported native verbs reject; inspect agent.get for the exact target generation's capabilities.".to_owned()];
@@ -347,6 +349,9 @@ fn method_scopes(name: &str, principal: &Principal, identity: &IdentityResponse)
 
 fn method_limits(name: &str) -> &'static str {
     match name {
+        "swarm.reparent" => {
+            "Owner only. Name exactly one of agent or children_of; source and parent generations are required. Same project, controlled nonterminal destination, no observe-only moved rows or cycles. Frozen profiles stay unchanged. Configured hierarchy and encoded retained-result bounds apply atomically. Retry the identical payload with the same id."
+        }
         "mail.send" => {
             "Queue only. At most 100 distinct recipients, 32768 body bytes. Recipient generation is frozen at admission; configured unread mailbox limits may reject the entire fanout. Sender identity is inherited."
         }
