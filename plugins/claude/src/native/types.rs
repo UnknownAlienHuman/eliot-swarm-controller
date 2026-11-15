@@ -7,7 +7,9 @@
 //! stay open: unknown fields are ignored, required fields are checked by the
 //! caller that consumes them.
 
-use eliot_core::{MAX_MCP_SERVER_NAME_LEN, SessionCost, SessionUsage, TurnUsage};
+use eliot_core::{
+    MAX_MCP_SERVER_NAME_LEN, SessionCost, SessionTokenTotals, SessionUsage, TurnUsage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -181,7 +183,9 @@ pub(crate) struct CommandLifecycle {
     pub state: String,
 }
 
-/// One `assistant` content block; only `text` blocks carry reply text.
+/// One `assistant` content block; `text` blocks carry reply text,
+/// `tool_use` blocks carry a native tool invocation (`id` plus the tool
+/// `name`).
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct AssistantContentBlock {
     #[serde(rename = "type", default)]
@@ -190,6 +194,20 @@ pub(crate) struct AssistantContentBlock {
     pub text: Option<String>,
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// One `user` content block; `tool_result` blocks carry a native tool
+/// outcome bound to its invocation via `tool_use_id`.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct UserContentBlock {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    #[serde(default)]
+    pub is_error: Option<bool>,
 }
 
 /// Terminal `result` record. Bound to the exact active turn (single flight);
@@ -241,23 +259,87 @@ pub(crate) fn result_usage(record: &Value) -> Option<TurnUsage> {
     })
 }
 
-/// Extract the cumulative session cost from a terminal `result` record's
-/// `total_cost_usd`. With persistent streaming input the cost is cumulative
-/// for the session (resumed cost included) and estimated, so it maps to a
-/// session-scoped `cumulative_cost` with unit `usd_estimate`, never to turn
-/// expenditure and never converted. `result.modelUsage` is likewise
-/// cumulative and stays unmapped. Only a finite nonnegative number maps;
-/// anything else yields no session fact so completion proceeds.
+/// Extract cumulative session token counters from a terminal `result`
+/// record's `modelUsage`. With persistent streaming input the per-model map
+/// is cumulative for the session (main loop, subagents and internal calls,
+/// per the Agent SDK `ModelUsage` docs), so its sums map to the
+/// session-scoped `cumulative_tokens`, never to turn expenditure and never
+/// derived into a total. Only genuinely supplied nonnegative integer
+/// counters project (`inputTokens`, `outputTokens`, `cacheReadInputTokens`,
+/// `cacheCreationInputTokens`); missing or malformed entries contribute
+/// nothing, and an absent or wholly unusable map yields no tokens. Per-model
+/// `costUSD` is never mapped here: the session cost authority is the
+/// top-level `total_cost_usd` below, and summing per-model costs alongside
+/// it would double-count.
+pub(crate) fn result_session_tokens(record: &Value) -> Option<SessionTokenTotals> {
+    let model_usage = record.get("modelUsage")?.as_object()?;
+    let mut sums = [0i128; 4];
+    let mut supplied = [0usize; 4];
+    for entry in model_usage.values() {
+        let Some(entry) = entry.as_object() else {
+            continue;
+        };
+        let counters = [
+            entry
+                .get("inputTokens")
+                .and_then(Value::as_i64)
+                .filter(|value| *value >= 0),
+            entry
+                .get("outputTokens")
+                .and_then(Value::as_i64)
+                .filter(|value| *value >= 0),
+            entry
+                .get("cacheReadInputTokens")
+                .and_then(Value::as_i64)
+                .filter(|value| *value >= 0),
+            entry
+                .get("cacheCreationInputTokens")
+                .and_then(Value::as_i64)
+                .filter(|value| *value >= 0),
+        ];
+        for (index, counter) in counters.into_iter().enumerate() {
+            if let Some(value) = counter {
+                sums[index] += i128::from(value);
+                supplied[index] += 1;
+            }
+        }
+    }
+    if supplied.iter().all(|count| *count == 0) {
+        return None;
+    }
+    let get = |index: usize| {
+        (supplied[index] > 0).then(|| sums[index].clamp(0, i128::from(i64::MAX)) as i64)
+    };
+    Some(SessionTokenTotals {
+        input_tokens: get(0),
+        output_tokens: get(1),
+        cache_read_tokens: get(2),
+        cache_write_tokens: get(3),
+    })
+}
+
+/// Extract the session-scoped fact from a terminal `result` record:
+/// cumulative token counters from `modelUsage` plus the cumulative cost
+/// from `total_cost_usd`. With persistent streaming input both are
+/// cumulative for the session (resumed cost included) and estimated, so
+/// they map to a session-scoped snapshot with source `claude:result`,
+/// never to turn expenditure and never converted. Either half may be
+/// absent while the other maps; only when both are absent is there no
+/// session fact, so completion proceeds without one.
 pub(crate) fn result_session_usage(record: &Value) -> Option<SessionUsage> {
-    let amount = record.get("total_cost_usd").and_then(Value::as_f64)?;
-    if !(amount.is_finite() && amount >= 0.0) {
+    let cumulative_tokens = result_session_tokens(record);
+    let amount = record
+        .get("total_cost_usd")
+        .and_then(Value::as_f64)
+        .filter(|amount| amount.is_finite() && *amount >= 0.0);
+    if cumulative_tokens.is_none() && amount.is_none() {
         return None;
     }
     Some(SessionUsage {
         context_used_tokens: None,
         context_window_tokens: None,
-        cumulative_tokens: None,
-        cumulative_cost: Some(SessionCost {
+        cumulative_tokens,
+        cumulative_cost: amount.map(|amount| SessionCost {
             amount: Some(amount),
             unit: Some("usd_estimate".to_owned()),
         }),
@@ -377,6 +459,25 @@ pub(crate) fn assistant_text(record: &Value) -> String {
 /// Tool-use ids in one assistant record. The event processor binds these
 /// native invocation ids to the exact turn already associated by the stream.
 pub(crate) fn assistant_tool_use_ids(record: &Value) -> Vec<String> {
+    assistant_tool_uses(record)
+        .into_iter()
+        .map(|tool_use| tool_use.id)
+        .collect()
+}
+
+/// One native tool invocation: the exact `tool_use.id` plus the native
+/// tool name. Both are required: an invocation without an id cannot bind
+/// its result, and one without a name cannot label its tool record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ToolUseBlock {
+    pub id: String,
+    pub name: String,
+}
+
+/// Tool invocations in one assistant record, in wire order. Blocks with a
+/// missing or blank id or name are dropped here; the caller records the
+/// coverage gap so a nameless invocation never reads as a known tool.
+pub(crate) fn assistant_tool_uses(record: &Value) -> Vec<ToolUseBlock> {
     let Some(blocks) = record
         .get("message")
         .and_then(|message| message.get("content"))
@@ -388,8 +489,62 @@ pub(crate) fn assistant_tool_use_ids(record: &Value) -> Vec<String> {
         .iter()
         .filter_map(|block| serde_json::from_value::<AssistantContentBlock>(block.clone()).ok())
         .filter(|block| block.kind == "tool_use")
-        .filter_map(|block| block.id)
-        .filter(|id| !id.trim().is_empty())
+        .filter_map(|block| {
+            let id = block.id.filter(|id| !id.trim().is_empty())?;
+            let name = block.name.filter(|name| !name.trim().is_empty())?;
+            Some(ToolUseBlock { id, name })
+        })
+        .collect()
+}
+
+/// Count of `tool_use` blocks in one assistant record, including blocks
+/// with a missing id or name. The event processor compares this against
+/// [`assistant_tool_uses`] to spot nameless invocations the tool records
+/// cannot label.
+pub(crate) fn assistant_tool_use_count(record: &Value) -> usize {
+    let Some(blocks) = record
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return 0;
+    };
+    blocks
+        .iter()
+        .filter_map(|block| serde_json::from_value::<AssistantContentBlock>(block.clone()).ok())
+        .filter(|block| block.kind == "tool_use")
+        .count()
+}
+
+/// One native tool outcome: the exact `tool_use_id` it answers plus the
+/// verdict the native frame carries (`is_error`, absent when unreported).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ToolResultBlock {
+    pub tool_use_id: String,
+    pub is_error: Option<bool>,
+}
+
+/// Tool outcomes in one `user` record, in wire order. Blocks with a missing
+/// or blank `tool_use_id` cannot bind an invocation and are dropped here.
+pub(crate) fn user_tool_results(record: &Value) -> Vec<ToolResultBlock> {
+    let Some(blocks) = record
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter_map(|block| serde_json::from_value::<UserContentBlock>(block.clone()).ok())
+        .filter(|block| block.kind == "tool_result")
+        .filter_map(|block| {
+            let tool_use_id = block.tool_use_id.filter(|id| !id.trim().is_empty())?;
+            Some(ToolResultBlock {
+                tool_use_id,
+                is_error: block.is_error,
+            })
+        })
         .collect()
 }
 
@@ -488,6 +643,122 @@ mod tests {
             None
         );
         assert_eq!(result_session_usage(&json!({"total_cost_usd": -0.5})), None);
+    }
+
+    #[test]
+    fn model_usage_sums_session_counters_without_a_total() {
+        let record = json!({
+            "total_cost_usd": 0.00260901,
+            "usage": {"input_tokens": 2, "output_tokens": 4},
+            "modelUsage": {
+                "claude-haiku-4-5": {
+                    "inputTokens": 100,
+                    "outputTokens": 20,
+                    "cacheReadInputTokens": 1000,
+                    "cacheCreationInputTokens": 50,
+                    "costUSD": 0.001,
+                    "webSearchRequests": 0,
+                },
+                "claude-sonnet-4-6": {
+                    "inputTokens": 30,
+                    "outputTokens": 5,
+                    "cacheReadInputTokens": 200,
+                    "cacheCreationInputTokens": 10,
+                },
+            },
+        });
+        let tokens = result_session_tokens(&record).expect("session counters map");
+        assert_eq!(tokens.input_tokens, Some(130));
+        assert_eq!(tokens.output_tokens, Some(25));
+        assert_eq!(tokens.cache_read_tokens, Some(1200));
+        assert_eq!(tokens.cache_write_tokens, Some(60));
+        let usage = result_session_usage(&record).expect("tokens plus cost map");
+        let tokens = usage.cumulative_tokens.expect("tokens retained");
+        assert_eq!(tokens.input_tokens, Some(130));
+        assert_eq!(
+            usage.cumulative_cost.as_ref().unwrap().amount,
+            Some(0.00260901)
+        );
+        // Empty, absent and wholly malformed maps yield no tokens, so a
+        // cost-free record with one commits no session fact.
+        assert_eq!(result_session_tokens(&json!({"modelUsage": {}})), None);
+        assert_eq!(result_session_tokens(&json!({})), None);
+        assert_eq!(result_session_tokens(&json!({"modelUsage": []})), None);
+        assert_eq!(
+            result_session_usage(&json!({"modelUsage": {"m": {"inputTokens": "many"}}})),
+            None
+        );
+        // Negative counters never project; usable siblings still sum.
+        let partial = result_session_tokens(&json!({"modelUsage": {
+            "a": {"inputTokens": -1, "outputTokens": 7},
+            "b": "oops",
+        }}))
+        .expect("usable sibling maps");
+        assert_eq!(partial.input_tokens, None);
+        assert_eq!(partial.output_tokens, Some(7));
+    }
+
+    #[test]
+    fn tool_blocks_bind_results_to_exact_invocation_ids() {
+        let assistant = json!({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "text", "text": "reading"},
+                {"type": "tool_use", "id": "toolu-1", "name": "Read",
+                 "input": {"file_path": "note.txt"}},
+                {"type": "tool_use", "id": "toolu-2", "name": "Bash",
+                 "input": {"command": "ls"}},
+                {"type": "tool_use", "id": "toolu-3"},
+                {"type": "tool_use", "id": "  ", "name": "Glob"},
+            ]},
+        });
+        assert_eq!(
+            assistant_tool_uses(&assistant),
+            vec![
+                ToolUseBlock {
+                    id: "toolu-1".to_owned(),
+                    name: "Read".to_owned()
+                },
+                ToolUseBlock {
+                    id: "toolu-2".to_owned(),
+                    name: "Bash".to_owned()
+                },
+            ]
+        );
+        assert_eq!(
+            assistant_tool_use_ids(&assistant),
+            vec!["toolu-1", "toolu-2"]
+        );
+        // The count keeps the nameless blocks the mapping drops, so the
+        // caller can spot the coverage gap.
+        assert_eq!(assistant_tool_use_count(&assistant), 4);
+        assert!(assistant_tool_uses(&json!({"type": "assistant"})).is_empty());
+
+        let user = json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu-1",
+                 "content": "note bytes"},
+                {"type": "tool_result", "tool_use_id": "toolu-2",
+                 "content": "boom", "is_error": true},
+                {"type": "tool_result", "content": "orphan"},
+                {"type": "text", "text": "not a result"},
+            ]},
+        });
+        assert_eq!(
+            user_tool_results(&user),
+            vec![
+                ToolResultBlock {
+                    tool_use_id: "toolu-1".to_owned(),
+                    is_error: None
+                },
+                ToolResultBlock {
+                    tool_use_id: "toolu-2".to_owned(),
+                    is_error: Some(true)
+                },
+            ]
+        );
+        assert!(user_tool_results(&json!({"type": "user"})).is_empty());
     }
 
     #[test]

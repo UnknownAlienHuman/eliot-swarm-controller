@@ -12538,6 +12538,57 @@ fn session_usage_keeps_only_the_latest_snapshot() {
     );
 }
 
+#[test]
+fn session_fallback_projects_cumulative_counters_only() {
+    use eliot_core::{SessionCost, SessionTokenTotals, SessionUsage};
+
+    let snapshot = SessionUsage {
+        context_used_tokens: Some(100),
+        context_window_tokens: Some(200_000),
+        cumulative_tokens: Some(SessionTokenTotals {
+            input_tokens: Some(47_024),
+            output_tokens: Some(207),
+            cache_read_tokens: None,
+            cache_write_tokens: Some(1_000),
+        }),
+        cumulative_cost: Some(SessionCost {
+            amount: Some(0.5),
+            unit: Some("usd_estimate".to_owned()),
+        }),
+        source: Some("muse:session/tokenUsage".to_owned()),
+        observed_at: Some(7),
+    };
+    let usage = crate::session_fallback_usage(&snapshot).expect("cumulative counters project");
+    assert_eq!(usage.scope.as_deref(), Some("session"));
+    assert_eq!(usage.input_tokens, Some(47_024));
+    assert_eq!(usage.output_tokens, Some(207));
+    assert_eq!(usage.cache_write_tokens, Some(1_000));
+    assert_eq!(usage.total_tokens, None);
+
+    // Context occupancy or cost alone is not usage: no fallback.
+    let sparse = SessionUsage {
+        cumulative_tokens: None,
+        cumulative_cost: Some(SessionCost {
+            amount: Some(1.0),
+            unit: Some("usd_estimate".to_owned()),
+        }),
+        source: Some("claude:result".to_owned()),
+        observed_at: Some(8),
+        ..snapshot.clone()
+    };
+    assert!(crate::session_fallback_usage(&sparse).is_none());
+    let empty = SessionUsage {
+        cumulative_tokens: Some(SessionTokenTotals {
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        }),
+        ..snapshot
+    };
+    assert!(crate::session_fallback_usage(&empty).is_none());
+}
+
 /// Idle first-generation Agent with an explicit frozen profile snapshot,
 /// ready for `configure` without a native harness.
 fn ready_configure_agent(
