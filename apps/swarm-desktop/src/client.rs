@@ -12,14 +12,16 @@ use std::path::{Path, PathBuf};
 
 use eliot_core::api::{
     AgentGetRequest, AgentGetResponse, AgentListRequest, AgentListResponse, AgentResultRequest,
-    AgentResultResponse, CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest,
-    CommandSubmitRequest, CommandSubmitResponse, EventsBoundsRequest, EventsBoundsResponse,
-    EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
-    EventsSubscribeResponse, HarnessModelsRequest, HarnessModelsResponse, ProfileListRequest,
-    ProfileListResponse, ProfilesReadRequest, ProfilesReadResponse, ProfilesSaveRequest,
-    ProfilesSaveResponse, ProjectRegistrationView, ReparentRequest, ReparentResponse,
-    RuleListEntry, RuleListRequest, RuleListResponse, ScriptListRequest, ScriptListResponse,
-    ScriptReadRequest, ScriptReadResponse, ScriptSaveRequest, ScriptSaveResponse, TimerRunRequest,
+    AgentResultResponse, CommandCancelRequest, CommandCancelResponse, CommandChildrenRequest,
+    CommandChildrenResponse, CommandGetRequest, CommandResolution, CommandResolveRequest,
+    CommandResolveResponse, CommandSubmitRequest, CommandSubmitResponse, EventsBoundsRequest,
+    EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
+    EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest, HandoffResponse,
+    HarnessModelsRequest, HarnessModelsResponse, ProfileListRequest, ProfileListResponse,
+    ProfilesReadRequest, ProfilesReadResponse, ProfilesSaveRequest, ProfilesSaveResponse,
+    ProjectRegistrationView, ReparentRequest, ReparentResponse, RuleListEntry, RuleListRequest,
+    RuleListResponse, ScriptListRequest, ScriptListResponse, ScriptReadRequest, ScriptReadResponse,
+    ScriptSaveRequest, ScriptSaveResponse, SwitchRequest, SwitchResponse, TimerRunRequest,
     UsageSummaryRequest, UsageSummaryResponse, discovery::ProjectListRequest,
 };
 use eliot_core::{Command, Error, Result};
@@ -551,6 +553,95 @@ pub async fn command_children(data_dir: &Path, id: &str) -> Result<Vec<Command>>
         eliot_daemon::client_call_typed(data_dir, "command.children", &params).await?;
     params.validate_response(&reply)?;
     Ok(reply.children)
+}
+
+/// SENDs admitted for `agent`, oldest first, newest `MAX_LISTED_SENDS`,
+/// read from its retained admission events and then `command.get`;
+/// the caller keeps the plain ones of its bound generation.
+pub async fn agent_sends(data_dir: &Path, agent: &str) -> Result<Vec<Command>> {
+    const MAX_LISTED_SENDS: usize = 200;
+    let filter = EventsFilter {
+        agents: vec![agent.to_owned()],
+        kinds: crate::handoff::ADMISSION_KINDS.map(str::to_owned).to_vec(),
+        sources: Vec::new(),
+    };
+    let bounds = events_bounds(data_dir, &filter).await?;
+    let events = scan_events(data_dir, bounds.pruned_through, bounds.hi, &filter).await?;
+    let mut ids = crate::handoff::send_ids(&events, agent);
+    if ids.len() > MAX_LISTED_SENDS {
+        ids.drain(..ids.len() - MAX_LISTED_SENDS);
+    }
+    let reads: Vec<Result<Command>> = futures_util::stream::iter(ids)
+        .map(|id| async move { read_command(data_dir, &id).await })
+        .buffered(MAX_CONCURRENT_READS)
+        .collect()
+        .await;
+    reads.into_iter().collect()
+}
+
+/// Owner task transfer to an existing Agent. The same request (id
+/// included) is also the readback: the daemon returns the committed result
+/// and the current brief gate, never a second transfer.
+pub async fn handoff(data_dir: &Path, request: &HandoffRequest) -> Result<HandoffResponse> {
+    request.validate()?;
+    let reply: HandoffResponse =
+        eliot_daemon::client_call_typed(data_dir, "swarm.handoff", request).await?;
+    request.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// Owner launch-plus-handoff. The first reply is the reservation; the same
+/// request again reads the components back and never launches another Agent.
+pub async fn switch(data_dir: &Path, request: &SwitchRequest) -> Result<SwitchResponse> {
+    request.validate()?;
+    let reply: SwitchResponse =
+        eliot_daemon::client_call_typed(data_dir, "swarm.switch", request).await?;
+    request.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// Owner assertion over a held handoff brief (`unknown`, or a failed brief
+/// asserted applied). It records the owner as the source and resends nothing.
+pub async fn resolve_command(
+    data_dir: &Path,
+    id: String,
+    command: &str,
+    resolution: CommandResolution,
+    reason: String,
+) -> Result<CommandResolveResponse> {
+    let request = CommandResolveRequest {
+        id,
+        command_id: command.to_owned(),
+        resolution,
+        reason,
+    };
+    request.validate()?;
+    let reply: CommandResolveResponse =
+        eliot_daemon::client_call_typed(data_dir, "command.resolve", &request).await?;
+    request.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// Owner withdrawal of one accepted/queued handoff input (no effect).
+pub async fn cancel_command(
+    data_dir: &Path,
+    id: String,
+    command: &str,
+) -> Result<CommandCancelResponse> {
+    let request = CommandCancelRequest {
+        id,
+        command_id: command.to_owned(),
+    };
+    request.validate()?;
+    let reply: CommandCancelResponse =
+        eliot_daemon::client_call_typed(data_dir, "command.cancel", &request).await?;
+    if reply.command_id != request.command_id {
+        return Err(Error::new(
+            "source_integrity",
+            "cancel reply names another command",
+        ));
+    }
+    Ok(reply)
 }
 
 /// Owner manager change bound to both exact generations; the daemon

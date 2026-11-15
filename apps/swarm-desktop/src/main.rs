@@ -30,6 +30,8 @@ mod client;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod feed;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod handoff;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod live;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod markdown;

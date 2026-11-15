@@ -51,6 +51,8 @@ use eliot_core::api::{
 };
 use windows_reactor::*;
 
+mod handoff_ui;
+
 use crate::chat::{Conversation, Invalidation};
 use crate::client::{self, LaunchTarget};
 use crate::config_view::{self, ProfilesActions, ProfilesData, RuleNamespace};
@@ -295,6 +297,7 @@ enum Message {
     MonitorLoaded(u64, Option<Box<MonitorSnapshot>>),
     MonitorSelected(Option<usize>),
     ReparentRequested(reparent::MoveBinding),
+    Handoff(handoff_ui::HandoffMsg),
     ReparentSettled(reparent::MoveBinding, Fallible<ReparentResponse>),
     MonitorOpenConversation(String),
     MonitorStop(BoundAction, bool),
@@ -374,6 +377,7 @@ struct DesktopApp {
     /// selection never points past them (see `monitor_view`).
     monitor_published: usize,
     reparent_status: String,
+    handoff: handoff_ui::DialogState,
 }
 
 impl DesktopApp {
@@ -1121,6 +1125,7 @@ impl Component for DesktopApp {
             monitor_selected: None,
             monitor_published: 0,
             reparent_status: String::new(),
+            handoff: handoff_ui::DialogState::default(),
             screen: Screen::Chat,
             profile_summaries: Vec::new(),
             profile_list: None,
@@ -2385,6 +2390,7 @@ impl Component for DesktopApp {
                     self.reparent_status.clear();
                 }
             }
+            Message::Handoff(msg) => self.handoff_update(msg, context),
             Message::ReparentRequested(binding) => {
                 if self.submitting() {
                     return;
@@ -3236,11 +3242,28 @@ impl DesktopApp {
             } else {
                 "Jump to latest".to_owned()
             }));
+        // A is bound when the dialog opens: the generation shown now.
+        let open_handoff =
+            self.selected_agent_id()
+                .zip(self.detail.as_ref())
+                .map(|(agent, detail)| {
+                    context.message(Message::Handoff(handoff_ui::HandoffMsg::Open {
+                        agent,
+                        generation: detail.generation,
+                    }))
+                });
+        let hand_off = match open_handoff {
+            Some(open) => Button::new().is_enabled(!self.submitting()).on_click(open),
+            None => Button::new().is_enabled(false),
+        }
+        .automation_name("Hand off or switch")
+        .content(TextBlock::new().text("Hand off or switch…"));
         let actions = StackPanel::new()
             .grid_row(5)
             .orientation(Orientation::Horizontal)
             .spacing(theme::spacing::SM)
-            .children((primary, interrupt, jump));
+            .children((primary, interrupt, jump, hand_off));
+        let dialog = self.handoff_dialog(context);
         let settings = self.configure_view(context);
 
         Grid::new()
@@ -3270,6 +3293,7 @@ impl DesktopApp {
                 pending,
                 composer.max_width(theme::layout::READING_WIDTH).grid_row(4),
                 actions,
+                dialog,
             ))
     }
 }
