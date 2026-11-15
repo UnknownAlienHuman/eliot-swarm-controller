@@ -32,13 +32,14 @@ pub(super) enum ChatMsg {
     ApprovalRequested(UiPending, bool),
     AnswerRequested(UiPending),
     ControlSubmitted(String, Fallible<String>),
-    /// A "…" menu entry, with the Agent as the header showed it.
-    AgentMenu(String, MenuBinding),
+    /// A "…" menu entry (its label).
+    AgentMenu(String),
     /// The Force stop confirmation closed (Primary confirms).
     ForceStopClosed(ContentDialogResult),
 }
 
-/// The Agent a "…" menu was built for: what is clicked is what was shown.
+/// The Agent and generation a "…" entry acts on: the header shown when the
+/// click is handled.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct MenuBinding {
     agent: String,
@@ -592,7 +593,18 @@ impl DesktopApp {
                     );
                 }
             }
-            ChatMsg::AgentMenu(label, binding) => self.agent_menu(&label, binding, context),
+            ChatMsg::AgentMenu(label) => {
+                // Bound now, to the Agent and generation the header shows.
+                let binding = self.selected_agent_id().zip(self.chat.detail.as_ref()).map(
+                    |(agent, detail)| MenuBinding {
+                        agent,
+                        generation: detail.generation,
+                    },
+                );
+                if let Some(binding) = binding {
+                    self.agent_menu(&label, binding, context);
+                }
+            }
             ChatMsg::ForceStopClosed(result) => {
                 let Some((bound, _)) = self.chat.confirm_force.take() else {
                     return;
@@ -1051,10 +1063,6 @@ impl DesktopApp {
         };
         let menu: View = match detail {
             Some(detail) => {
-                let binding = MenuBinding {
-                    agent: agent.to_owned(),
-                    generation: detail.generation,
-                };
                 let ended = matches!(detail.state.as_str(), "stopped" | "failed" | "lost");
                 let controllable = !detail.observe_only;
                 let mut items = vec![
@@ -1083,9 +1091,11 @@ impl DesktopApp {
                     .content(m3::icon(m3::glyph::MORE))
                     .menu(Menu::new(
                         items,
-                        context.callback(move |label: String| {
-                            Message::Chat(ChatMsg::AgentMenu(label, binding.clone()))
-                        }),
+                        // Capture-free, so the callback keeps one identity
+                        // across renders: Reactor 0.100.0 re-sends a menu
+                        // whose callback changed, replacing the native
+                        // MenuFlyout and dropping a click on the open one.
+                        context.callback(|label: String| Message::Chat(ChatMsg::AgentMenu(label))),
                     ))
             }
             None => m3::icon_button(palette)
@@ -1459,7 +1469,6 @@ impl DesktopApp {
             )],
             None => vec![MenuItem::disabled("loading", "Reading the catalogue…")],
         };
-        let generation = detail.generation;
         if self.submitting() {
             return m3::chip_static(m3::glyph::MODEL, &label);
         }
@@ -1468,12 +1477,9 @@ impl DesktopApp {
             .content(m3::icon_label(m3::glyph::MODEL, &label))
             .menu(Menu::new(
                 items,
-                context.callback(move |label: String| {
-                    Message::Configure(configure_ui::ConfigureMsg::Chosen {
-                        agent: agent.clone(),
-                        generation,
-                        label,
-                    })
+                // Capture-free for a stable menu identity (see the "…" menu).
+                context.callback(|label: String| {
+                    Message::Configure(configure_ui::ConfigureMsg::Chosen(label))
                 }),
             ))
     }

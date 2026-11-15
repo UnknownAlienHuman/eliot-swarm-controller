@@ -8,12 +8,9 @@ use crate::configure::Pick;
 #[derive(Clone, Debug)]
 pub(super) enum ConfigureMsg {
     CatalogLoaded(Box<configure::Catalog>),
-    /// A model-chip menu entry for the Agent generation the chip showed.
-    Chosen {
-        agent: String,
-        generation: i64,
-        label: String,
-    },
+    /// A model-chip menu entry (its label), for the Agent generation the
+    /// chip shows when the click is handled.
+    Chosen(String),
     /// The configured Agent; outer error: the submission itself; inner: the
     /// settled command read.
     ConfigureSettled(String, Box<Result<Fallible<Command>, String>>),
@@ -45,11 +42,13 @@ impl DesktopApp {
                     self.configure.catalog = Some(catalog);
                 }
             }
-            ConfigureMsg::Chosen {
-                agent,
-                generation,
-                label,
-            } => {
+            ConfigureMsg::Chosen(label) => {
+                let (Some(agent), Some(generation)) = (
+                    self.selected_agent_id(),
+                    self.chat.detail.as_ref().map(|detail| detail.generation),
+                ) else {
+                    return;
+                };
                 // Only the catalogue read for this exact generation applies.
                 let (model, effort) = match self.configure_pick(&agent, generation, &label) {
                     Some(Pick::Model(Some(model))) => (Some(model), None),

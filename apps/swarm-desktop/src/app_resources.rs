@@ -171,17 +171,6 @@ pub fn entries(s: &Scheme) -> Vec<(&'static str, Value)> {
         // style is applied, before Reactor sets a button's own resource
         // overrides, so it is set here, where WinUI resolves it first.
         ("ControlCornerRadius", Value::Radius(shape::SM as u8)),
-        // Text fields on hover and focus: the raised surface of the
-        // composer (which is transparent at rest), so the composer never
-        // draws a box of its own; the focus indicator stays primary.
-        (
-            "TextControlBackgroundPointerOver",
-            opaque(s.surface_container_high),
-        ),
-        (
-            "TextControlBackgroundFocused",
-            opaque(s.surface_container_high),
-        ),
     ]
 }
 
