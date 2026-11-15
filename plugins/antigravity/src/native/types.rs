@@ -13,7 +13,7 @@
 //! such `x-method`); the later hook-callback increment will add its own
 //! binding. This module stays strictly inside the pinned ACP surface.
 
-use eliot_core::{SessionCost, SessionUsage};
+use eliot_core::{SessionCost, SessionUsage, TurnUsage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -131,10 +131,183 @@ pub(crate) struct SetConfigOptionResult {
 }
 
 /// `session/prompt` result: the terminal turn fact.
+///
+/// The pinned ACP schema carries only `stopReason` here, but installed
+/// `agy` 1.5.9 extends the response with a per-turn `usage` object
+/// (`inputTokens`, `outputTokens`, `cachedReadTokens`,
+/// `cachedWriteTokens`, `thoughtTokens`, `totalTokens`; observed
+/// 2026-11-15 against `gemini-4-argon-high`). It stays `Option<Value>` so
+/// a missing or malformed extension never breaks completion: usable
+/// counters are extracted tolerantly by [`prompt_turn_usage`].
 #[derive(Debug, Deserialize)]
 pub(crate) struct PromptResult {
     #[serde(rename = "stopReason")]
     pub stop_reason: String,
+    #[serde(default)]
+    pub usage: Option<Value>,
+}
+
+/// Extract per-turn model usage from a `session/prompt` response's agy
+/// `usage` extension. Only genuinely supplied nonnegative integer counters
+/// are mapped; missing or malformed values stay null (never zero, never a
+/// sum), and an absent or wholly unusable object yields no usage at all so
+/// completion proceeds. Scope is `turn`: the response covers the whole
+/// prompt call's model usage, not just the final message.
+pub(crate) fn prompt_turn_usage(result: &PromptResult) -> Option<TurnUsage> {
+    let usage = result.usage.as_ref()?.as_object()?;
+    let counter = |key: &str| {
+        usage
+            .get(key)
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0)
+    };
+    let input_tokens = counter("inputTokens");
+    let output_tokens = counter("outputTokens");
+    let cache_read_tokens = counter("cachedReadTokens");
+    let cache_write_tokens = counter("cachedWriteTokens");
+    let thinking_tokens = counter("thoughtTokens");
+    let total_tokens = counter("totalTokens");
+    if input_tokens.is_none()
+        && output_tokens.is_none()
+        && cache_read_tokens.is_none()
+        && cache_write_tokens.is_none()
+        && thinking_tokens.is_none()
+        && total_tokens.is_none()
+    {
+        return None;
+    }
+    Some(TurnUsage {
+        scope: Some("turn".to_owned()),
+        message_id: None,
+        input_tokens,
+        output_tokens,
+        reasoning_tokens: None,
+        thinking_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        total_tokens,
+    })
+}
+
+/// One option the native offers for a `session/request_permission` ask.
+/// `kind` is one of the ACP `PermissionOptionKind` values (`allow_once`,
+/// `allow_always`, `reject_once`, `reject_always`); any other kind is
+/// retained but never maps to a reply decision.
+#[derive(Clone, Debug)]
+pub(crate) struct PermissionOption {
+    pub option_id: String,
+    pub name: String,
+    pub kind: String,
+}
+
+/// A parsed `session/request_permission` ask: the tool call awaiting
+/// authorization plus the exact offered options. `raw_input` stays a
+/// `Value`: it is only ever rendered into a redacted bounded summary,
+/// never persisted verbatim.
+#[derive(Clone, Debug)]
+pub(crate) struct PermissionAsk {
+    pub tool_call_id: String,
+    pub title: String,
+    pub tool_name: Option<String>,
+    pub tool_kind: Option<String>,
+    pub raw_input: Value,
+    pub options: Vec<PermissionOption>,
+}
+
+/// Map an offered option kind to its reply direction: `true` grants
+/// (`allow_once`, `allow_always`), `false` refuses (`reject_once`,
+/// `reject_always`). Unknown kinds map to nothing and can never drive a
+/// reply on their own.
+pub(crate) fn permission_option_grants(kind: &str) -> Option<bool> {
+    match kind {
+        "allow_once" | "allow_always" => Some(true),
+        "reject_once" | "reject_always" => Some(false),
+        _ => None,
+    }
+}
+
+/// Default option for an explicit owner/manager reply verb: the least
+/// persistent matching kind (`allow_once` before `allow_always`,
+/// `reject_once` before `reject_always`). An explicit `choice_id` still
+/// overrides this; the verb alone never invents an option.
+pub(crate) fn default_permission_option(
+    options: &[PermissionOption],
+    approve: bool,
+) -> Option<&PermissionOption> {
+    let kinds: &[&str] = if approve {
+        &["allow_once", "allow_always"]
+    } else {
+        &["reject_once", "reject_always"]
+    };
+    kinds
+        .iter()
+        .filter_map(|kind| options.iter().find(|option| option.kind == *kind))
+        .next()
+}
+
+/// Parse a `session/request_permission` params body. Malformed option
+/// entries are skipped, never fatal: an ask with no usable options is
+/// still returned so the caller can record the gap and answer the safe
+/// fallback instead of hanging the turn.
+pub(crate) fn parse_permission_request(params: &Value) -> Option<PermissionAsk> {
+    let body = params.as_object()?;
+    let tool_call = body.get("toolCall").and_then(Value::as_object)?;
+    let tool_call_id = tool_call
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())?
+        .to_owned();
+    let title = tool_call
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("ACP tool call")
+        .to_owned();
+    let tool_name = tool_call
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned);
+    let tool_kind = tool_call
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.trim().is_empty())
+        .map(str::to_owned);
+    let raw_input = tool_call.get("rawInput").cloned().unwrap_or(Value::Null);
+    let mut options = Vec::new();
+    if let Some(offered) = body.get("options").and_then(Value::as_array) {
+        for option in offered {
+            let entry = option.as_object();
+            let (Some(option_id), Some(name), Some(kind)) = (
+                entry
+                    .and_then(|entry| entry.get("optionId"))
+                    .and_then(Value::as_str),
+                entry
+                    .and_then(|entry| entry.get("name"))
+                    .and_then(Value::as_str),
+                entry
+                    .and_then(|entry| entry.get("kind"))
+                    .and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if option_id.trim().is_empty() {
+                continue;
+            }
+            options.push(PermissionOption {
+                option_id: option_id.to_owned(),
+                name: name.to_owned(),
+                kind: kind.to_owned(),
+            });
+        }
+    }
+    Some(PermissionAsk {
+        tool_call_id,
+        title,
+        tool_name,
+        tool_kind,
+        raw_input,
+        options,
+    })
 }
 
 impl PromptResult {
@@ -238,8 +411,22 @@ pub(crate) fn classify_update(params: &Value) -> Option<(String, AcpUpdate)> {
     let content_text = || {
         update
             .get("content")
-            .and_then(|content| content.get("text"))
-            .and_then(Value::as_str)
+            .and_then(|content| {
+                let block = content.as_object()?;
+                // Only verbatim text blocks contribute assistant text. Older
+                // servers omit the discriminator; newer ones send
+                // `type: "text"`. Any other block (`image`, `audio`,
+                // `resource_link`, `resource`) carries no text and must not
+                // read as an empty answer.
+                if block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind != "text")
+                {
+                    return None;
+                }
+                block.get("text").and_then(Value::as_str)
+            })
             .unwrap_or_default()
             .to_owned()
     };
@@ -365,6 +552,161 @@ mod tests {
     fn update(update: Value) -> (String, AcpUpdate) {
         classify_update(&json!({"sessionId": "session-1", "update": update}))
             .expect("update classifies")
+    }
+
+    #[test]
+    fn prompt_response_usage_parses_the_agy_159_extension() {
+        // Recorded `session/prompt` result (agy 1.5.9, gemini-4-argon-high,
+        // 2026-11-15): the pinned schema names only `stopReason`, but the
+        // server also reports per-turn model usage. It must attach as turn
+        // scope, never as session occupancy, and never block completion.
+        let prompt: PromptResult = serde_json::from_value(json!({
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 237441,
+                "outputTokens": 7276,
+                "cachedReadTokens": 392638,
+                "cachedWriteTokens": 0,
+                "thoughtTokens": 4121,
+                "totalTokens": 637355,
+            },
+        }))
+        .expect("prompt result with usage parses");
+        let usage = prompt_turn_usage(&prompt).expect("usage maps");
+        assert_eq!(usage.scope.as_deref(), Some("turn"));
+        assert_eq!(usage.input_tokens, Some(237441));
+        assert_eq!(usage.output_tokens, Some(7276));
+        assert_eq!(usage.cache_read_tokens, Some(392638));
+        assert_eq!(usage.cache_write_tokens, Some(0));
+        assert_eq!(usage.thinking_tokens, Some(4121));
+        assert_eq!(usage.total_tokens, Some(637355));
+        assert_eq!(usage.reasoning_tokens, None);
+
+        // Absent, null, negative and wrong-typed extensions yield no
+        // usage at all, never a zeroed or partial guess.
+        for usage in [
+            json!(null),
+            json!({"inputTokens": -1}),
+            json!({"inputTokens": "many"}),
+            json!({"unrelated": true}),
+        ] {
+            let prompt: PromptResult = serde_json::from_value(json!({
+                "stopReason": "end_turn",
+                "usage": usage,
+            }))
+            .expect("tolerant prompt result parses");
+            assert_eq!(prompt_turn_usage(&prompt), None, "usage={usage}");
+        }
+        let bare: PromptResult = serde_json::from_value(json!({"stopReason": "end_turn"}))
+            .expect("bare prompt result parses");
+        assert_eq!(prompt_turn_usage(&bare), None);
+    }
+
+    #[test]
+    fn permission_request_parses_tool_call_and_offered_options() {
+        // Per the ACP schema (`RequestPermissionRequest`): the `git log`
+        // ask carries the tool call plus options in the four kinds.
+        let params = json!({
+            "sessionId": "session-1",
+            "toolCall": {
+                "toolCallId": "tool-call_1",
+                "title": "Run git log",
+                "name": "exec",
+                "kind": "execute",
+                "status": "pending",
+                "rawInput": {"command": "git log --oneline -n 100"},
+            },
+            "options": [
+                {"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
+                {"optionId": "allow-always", "name": "Allow always", "kind": "allow_always"},
+                {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
+                {"optionId": "reject-always", "name": "Always reject", "kind": "reject_always"},
+            ],
+        });
+        let ask = parse_permission_request(&params).expect("permission ask parses");
+        assert_eq!(ask.tool_call_id, "tool-call_1");
+        assert_eq!(ask.title, "Run git log");
+        assert_eq!(ask.tool_name.as_deref(), Some("exec"));
+        assert_eq!(ask.tool_kind.as_deref(), Some("execute"));
+        assert_eq!(ask.options.len(), 4);
+
+        // Direction mapping follows the option kinds, never the labels.
+        assert_eq!(permission_option_grants("allow_once"), Some(true));
+        assert_eq!(permission_option_grants("allow_always"), Some(true));
+        assert_eq!(permission_option_grants("reject_once"), Some(false));
+        assert_eq!(permission_option_grants("reject_always"), Some(false));
+        assert_eq!(permission_option_grants("sometimes"), None);
+
+        // Defaults are least-privilege: the one-time kind wins per verb.
+        assert_eq!(
+            default_permission_option(&ask.options, true).map(|option| option.option_id.as_str()),
+            Some("allow-once")
+        );
+        assert_eq!(
+            default_permission_option(&ask.options, false).map(|option| option.option_id.as_str()),
+            Some("reject-once")
+        );
+
+        // Malformed option entries are skipped, never fatal.
+        let sparse = parse_permission_request(&json!({
+            "sessionId": "session-1",
+            "toolCall": {"toolCallId": "tool-call_2"},
+            "options": [
+                {"optionId": "", "name": "Empty", "kind": "allow_once"},
+                {"name": "No id", "kind": "reject_once"},
+                {"optionId": "ok", "name": "Ok", "kind": "reject_once"},
+            ],
+        }))
+        .expect("sparse permission ask parses");
+        assert_eq!(sparse.title, "ACP tool call");
+        assert_eq!(sparse.options.len(), 1);
+        assert_eq!(sparse.options[0].option_id, "ok");
+
+        // Missing tool call identity is not an ask at all.
+        assert!(
+            parse_permission_request(&json!({
+                "sessionId": "session-1",
+                "toolCall": {"title": "No id"},
+                "options": [],
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn message_chunk_takes_text_only_from_text_blocks() {
+        // Discriminated text blocks (agy 1.5.9) and the older bare shape
+        // both contribute assistant text.
+        for content in [
+            json!({"type": "text", "text": "READY-42"}),
+            json!({"text": "42"}),
+        ] {
+            let (_, parsed) = update(json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": content,
+            }));
+            assert!(
+                matches!(parsed, AcpUpdate::MessageChunk { text } if text == "READY-42" || text == "42"),
+                "text block contributes text"
+            );
+        }
+        // Non-text blocks and non-object content never read as an answer:
+        // they contribute no text instead of an empty success string.
+        for content in [
+            json!({"type": "image", "data": "aGVsbG8="}),
+            json!({"type": "resource_link", "uri": "file:///x"}),
+            json!([{"type": "text", "text": "array-is-not-a-block"}]),
+            json!(null),
+        ] {
+            let (_, parsed) = update(json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": content,
+            }));
+            assert!(
+                matches!(parsed, AcpUpdate::MessageChunk { text } if text.is_empty()),
+                "non-text content contributes no text"
+            );
+        }
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -37,12 +38,42 @@ use crate::{
 /// Best-effort deadline for the graceful `session/close` on terminate.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bound for one send's native write plus first-association wait. The daemon
+/// settles `plugin_rpc_timeout` at 30 s, so the plugin must settle first
+/// with its own cause instead of racing to a joint timeout that reports
+/// an empty diagnostic snapshot.
+const SEND_TIMEOUT: Duration = Duration::from_secs(25);
+
+async fn wait_for_association(
+    association: oneshot::Receiver<Result<()>>,
+    deadline: Instant,
+    turn: &str,
+) -> Result<Value> {
+    match timeout_at(deadline, association).await {
+        Ok(Ok(Ok(()))) => Ok(json!({"state": "applied", "turn_id": turn})),
+        _ => Err(Error::new(
+            "unknown",
+            "Antigravity input association is unconfirmed; input will not be resent",
+        )),
+    }
+}
+
 struct RetainedCommand {
     seq: i64,
     command_id: String,
     payload_sha256: [u8; 32],
     turn: String,
     outcome: Result<Value>,
+}
+
+/// Retained approve/deny outcome for exact command-id replay. The stored
+/// verb plus request and turn ids reject a reused command id bound to a
+/// different reply, mirroring the sibling harnesses.
+struct ReplyOutcome {
+    verb: String,
+    request_id: String,
+    turn_id: String,
+    result: Value,
 }
 
 pub(crate) struct OwnedHookConfig {
@@ -157,6 +188,7 @@ pub(crate) struct Session {
     retained: Option<RetainedCommand>,
     interrupt_retained: Option<RetainedCommand>,
     steer_retained: Option<RetainedCommand>,
+    reply_outcomes: HashMap<String, ReplyOutcome>,
     steer_inflight: Option<i64>,
     stop: Option<(String, bool, Result<Value>)>,
     /// Advertised `model` option values from the latest session open
@@ -249,6 +281,7 @@ impl Session {
             retained: None,
             interrupt_retained: None,
             steer_retained: None,
+            reply_outcomes: HashMap::new(),
             steer_inflight: None,
             stop: None,
             advertised_models: Vec::new(),
@@ -486,11 +519,91 @@ impl Session {
                 "Antigravity steer must use the deferred host response path",
             )),
             "interrupt" => self.interrupt(params).await,
+            "approve" | "deny" => self.reply_request(params).await,
             _ => Err(Error::new(
                 "unsupported",
-                "Antigravity supports send, configure, steer and interrupt; inject is unsupported",
+                "Antigravity supports send, configure, steer, interrupt, approve and deny; inject and answer are unsupported",
             )),
         }
+    }
+
+    /// Answer one open native permission ask with the explicit
+    /// owner/manager decision. Replays the retained outcome for the exact
+    /// command id; a reused command id bound to a different reply is a
+    /// source-integrity error, never a second native write.
+    async fn reply_request(&mut self, params: AgentCommandParams) -> Result<Value> {
+        let turn_id = params
+            .turn_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "stale_turn",
+                    "Antigravity request reply needs its captured turn id",
+                )
+            })?;
+        let request_id = params
+            .request_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "not_found",
+                    "Antigravity request reply needs its captured request id",
+                )
+            })?;
+        if let Some(previous) = self.reply_outcomes.get(&params.command_id) {
+            if previous.verb != params.verb
+                || previous.request_id != request_id
+                || previous.turn_id != turn_id
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "Antigravity command id was reused for another request reply",
+                ));
+            }
+            return Ok(previous.result.clone());
+        }
+        // The event task owns no transport client: the native decision
+        // travels on this call, serialized behind queued frames. A dead
+        // native process latches unknown without attempting a write.
+        if self.native.transport.process_exit_observed() {
+            let mut state = self.state.lock().await;
+            state.retain_unknown_reply(request_id, &params.command_id);
+            return Ok(eliot_plugin::session::unknown_control(
+                "Antigravity request reply destination is unavailable; it will not be repeated",
+            ));
+        }
+        let native = self.client.clone();
+        let result = match self
+            .state
+            .lock()
+            .await
+            .reply_request(
+                &params.command_id,
+                request_id,
+                turn_id,
+                &params.verb,
+                &params.args,
+                &native,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => eliot_plugin::session::unknown_control(
+                "Antigravity request reply outcome is unknown",
+            ),
+        };
+        self.reply_outcomes.insert(
+            params.command_id.clone(),
+            ReplyOutcome {
+                verb: params.verb,
+                request_id: request_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                result: result.clone(),
+            },
+        );
+        Ok(result)
     }
 
     /// One verified `session/set_config_option` write: the echoed option
@@ -703,11 +816,26 @@ impl Session {
         }
         let combined = with_claimed_context(text, &params.context, "Antigravity")?;
         let turn = format!("agy-{}", ulid::Ulid::new());
-        let associated = {
-            let mut state = self.state.lock().await;
-            let associated = state.prepare(params.command_id.clone(), turn.clone())?;
+        let deadline = Instant::now() + SEND_TIMEOUT;
+        let prepared = self.client.prepare_fenced(
+            "session/prompt",
+            prompt_params(&self.conversation, &combined),
+            FencedKind::Prompt,
+        )?;
+        let (write, registration) = prepared.split();
+        let association = {
+            let mut state = timeout_at(deadline, self.state.lock()).await.map_err(|_| {
+                Error::new(
+                    "native_not_dispatched",
+                    "Antigravity input preparation timed out",
+                )
+            })?;
+            let association = state.prepare(params.command_id.clone(), turn.clone())?;
             state.attach_context(&params.command_id, params.context.clone())?;
-            associated
+            // Transfer the fence before I/O. A slow event commit must not
+            // hold the send RPC open or drop a still-live native call.
+            state.arm_fenced(registration, &turn);
+            association
         };
         self.highwater_seq = seq;
         let unknown = Err(Error::new(
@@ -721,61 +849,25 @@ impl Session {
             turn: turn.clone(),
             outcome: unknown.clone(),
         });
-        // The terminal reply is fenced into the ordered frame channel, so
-        // the event task settles this exact turn behind every preceding
-        // update. This send only waits for the first association, as
-        // before; a slow first update keeps the retained `unknown`
-        // outcome while the fenced reply still settles the turn in order.
-        let prompt = prompt_params(&self.conversation, &combined);
-        let dispatched = self
-            .client
-            .call_fenced(
-                "session/prompt",
-                prompt,
-                Instant::now() + TIMEOUT,
-                FencedKind::Prompt,
-            )
-            .await;
-        let registration = match dispatched {
-            Ok((_, registration)) => registration,
-            Err(error) => {
-                if native_no_write(&error.code) {
-                    self.state
-                        .lock()
-                        .await
-                        .withdraw_unwritten(&params.command_id)?;
-                    let result = Ok(
-                        json!({"state": "rejected", "reason": "Antigravity input was not dispatched"}),
-                    );
-                    if let Some(retained) = self.retained.as_mut().filter(|r| r.seq == seq) {
-                        retained.outcome = result.clone();
-                    }
-                    return result;
+        // Native write acceptance is transport delivery only. The event
+        // owner acknowledges after committing correlated native evidence.
+        let dispatched = self.client.dispatch_fenced_write(write, deadline).await;
+        let result = match dispatched {
+            Ok(_) => wait_for_association(association, deadline, &turn).await,
+            Err(error) if native_no_write(&error.code) => {
+                match timeout_at(deadline, self.state.lock()).await {
+                    Ok(mut state) => match state.withdraw_unwritten(&params.command_id) {
+                        Ok(()) => Ok(
+                            json!({"state": "rejected", "reason": "Antigravity input was not dispatched"}),
+                        ),
+                        Err(_) => unknown,
+                    },
+                    _ => unknown,
                 }
-                let mut state = self.state.lock().await;
-                state.fail_prompt(error).await;
-                let result = unknown;
-                if let Some(retained) = self.retained.as_mut().filter(|r| r.seq == seq) {
-                    retained.outcome = result.clone();
-                }
-                return result;
             }
-        };
-        // Exactly one owner for the registration from here on: the event
-        // state, which retires it on settlement, expiry, loss, or drop —
-        // unless this exact turn already settled while the write was in
-        // flight, in which case `arm_fenced` retires it immediately.
-        self.state.lock().await.arm_fenced(registration, &turn);
-        let result = match timeout_at(Instant::now() + TIMEOUT, associated).await {
-            Ok(Ok(Ok(()))) => Ok(json!({"state": "applied", "turn_id": turn})),
-            Ok(Ok(Err(error))) if native_no_write(&error.code) => {
-                self.state
-                    .lock()
-                    .await
-                    .withdraw_unwritten(&params.command_id)?;
-                Ok(json!({"state": "rejected", "reason": "Antigravity input was not dispatched"}))
-            }
-            _ => unknown,
+            // Retain the pending input and its fence: dispatch may have
+            // happened, and neither this error nor the wait permits replay.
+            Err(_) => unknown,
         };
         if let Some(retained) = self.retained.as_mut().filter(|r| r.seq == seq) {
             retained.outcome = result.clone();
@@ -1051,26 +1143,40 @@ impl Session {
         }
         // Re-check the exact turn under the same lock discipline as send:
         // a turn that ended since the first check was never interrupted.
-        {
-            let state = self.state.lock().await;
+        let dispatched = {
+            let mut state = self.state.lock().await;
             if state.active_turn() != Some(turn_id) {
                 return Err(Error::new(
                     "stale_turn",
                     "turn/interrupt does not match the exact active native turn",
                 ));
             }
-        }
-        self.highwater_seq = seq;
-        let dispatched = self
-            .client
-            .notify(
-                "session/cancel",
-                Some(json!({"sessionId": self.conversation})),
-                Instant::now() + TIMEOUT,
-            )
-            .await;
+            self.highwater_seq = seq;
+            // Hold the event lock across the write and latch: an ask queued
+            // during session/cancel must observe this exact-turn intent.
+            let dispatched = self
+                .client
+                .notify(
+                    "session/cancel",
+                    Some(json!({"sessionId": self.conversation})),
+                    Instant::now() + TIMEOUT,
+                )
+                .await;
+            if !matches!(&dispatched, Err(error) if native_no_write(&error.code)) {
+                state.latch_cancellation(&params.command_id, Some(turn_id));
+                state
+                    .answer_pending_cancelled(&self.client, &params.command_id, Some(turn_id))
+                    .await;
+            }
+            dispatched
+        };
         let result = match dispatched {
             Ok(()) => {
+                // Per the ACP cancellation contract, answer every pending
+                // permission ask of this exact turn with `cancelled`
+                // before waiting: the native cannot reach its cancelled
+                // terminal while an ask is still open. Best-effort per
+                // ask; the terminal below still decides the interrupt.
                 // The notification write proves dispatch only, never
                 // cancellation. Wait (bounded, lock-free between polls)
                 // for the prompt task's actual settlement of this exact
@@ -1223,6 +1329,19 @@ impl Session {
             params.force,
             Err(Error::new("unknown", "Antigravity stop is unresolved")),
         ));
+        // Answer open permission asks `cancelled` best-effort, then close
+        // whatever remains: the native session is ending, so no ask may
+        // stay open behind it. Commit failures here are ignored; the
+        // session teardown below still decides the stop.
+        {
+            let mut state = self.state.lock().await;
+            state.stopping = true;
+            state.latch_cancellation(&params.command_id, None);
+            state
+                .answer_pending_cancelled(&self.client, &params.command_id, None)
+                .await;
+            let _ = state.close_pending_requests(None).await;
+        }
         let result = self
             .terminate(params.force)
             .await
@@ -1570,6 +1689,49 @@ fn remove_hook_config(config: &OwnedHookConfig) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn send_wait_requires_committed_native_association() {
+        let (reply, association) = oneshot::channel();
+        let wait = wait_for_association(
+            association,
+            Instant::now() + Duration::from_secs(1),
+            "turn-1",
+        );
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut wait)
+                .await
+                .is_err()
+        );
+        reply.send(Ok(())).unwrap();
+        assert_eq!(
+            wait.await.unwrap(),
+            json!({"state": "applied", "turn_id": "turn-1"})
+        );
+    }
+
+    #[tokio::test]
+    async fn send_admission_deadline_returns_unknown_before_host_deadline() {
+        assert!(SEND_TIMEOUT < TIMEOUT);
+        let (reply, association) = oneshot::channel();
+        let result = wait_for_association(association, Instant::now(), "turn-1").await;
+        assert_eq!(result.unwrap_err().code, "unknown");
+        assert!(reply.is_closed());
+    }
+
+    #[tokio::test]
+    async fn native_exit_without_association_never_acknowledges_applied() {
+        let (reply, association) = oneshot::channel();
+        drop(reply);
+        assert_eq!(
+            wait_for_association(association, Instant::now() + SEND_TIMEOUT, "turn-1")
+                .await
+                .unwrap_err()
+                .code,
+            "unknown"
+        );
+    }
 
     #[test]
     fn command_history_tracking_and_conflicts() {

@@ -765,6 +765,7 @@ mod tests {
             "turn": "stream",
             "message": "stream",
             "tool": "stream",
+            "request": "stream",
         }));
         params
     }
