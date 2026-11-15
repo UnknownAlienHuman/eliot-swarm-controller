@@ -165,10 +165,13 @@ impl Outcome {
     /// names that next action.
     pub fn finish_target(&self) -> Option<(String, i64)> {
         match self {
-            Self::Switch(reply) if reply.next_action.ends_with("ordinary_swarm.handoff") => reply
-                .created
-                .as_ref()
-                .map(|created| (created.agent.clone(), created.generation)),
+            // Only the ready form: `inspect_readiness_then_…` is not ready yet.
+            Self::Switch(reply) if reply.next_action == "finish_with_ordinary_swarm.handoff" => {
+                reply
+                    .created
+                    .as_ref()
+                    .map(|created| (created.agent.clone(), created.generation))
+            }
             _ => None,
         }
     }
@@ -429,6 +432,8 @@ mod tests {
             Some(("a3".into(), 1))
         );
         assert!(!Outcome::Switch(reply.clone()).switch_pending());
+        reply.next_action = "inspect_readiness_then_ordinary_swarm.handoff".into();
+        assert_eq!(Outcome::Switch(reply.clone()).finish_target(), None);
         reply.next_action = "inspect_created_agent_stop_separately".into();
         assert_eq!(Outcome::Switch(reply.clone()).finish_target(), None);
         reply.state = CommandState::Dispatched;

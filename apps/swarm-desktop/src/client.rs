@@ -283,8 +283,19 @@ async fn submit(data_dir: &Path, request: &CommandSubmitRequest) -> Result<Comma
     request.validate()?;
     let reply: CommandSubmitResponse =
         eliot_daemon::client_call_typed(data_dir, "command.submit", request).await?;
-    request.validate_response(&reply)?;
+    request.validate_response(&reply).map_err(unverified)?;
     Ok(reply)
+}
+
+/// A mutation reply that arrived but fails its binding check proves
+/// nothing about what the daemon did: report it as an unknown outcome, so
+/// the action keeps its mutation id and a retry reads back instead of
+/// acting again.
+fn unverified(error: Error) -> Error {
+    Error::new(
+        "unknown",
+        format!("the daemon replied, but the reply failed its binding check ({error})"),
+    )
 }
 
 /// One retained command with its admitted args and state.
@@ -586,7 +597,7 @@ pub async fn handoff(data_dir: &Path, request: &HandoffRequest) -> Result<Handof
     request.validate()?;
     let reply: HandoffResponse =
         eliot_daemon::client_call_typed(data_dir, "swarm.handoff", request).await?;
-    request.validate_response(&reply)?;
+    request.validate_response(&reply).map_err(unverified)?;
     Ok(reply)
 }
 
@@ -596,7 +607,7 @@ pub async fn switch(data_dir: &Path, request: &SwitchRequest) -> Result<SwitchRe
     request.validate()?;
     let reply: SwitchResponse =
         eliot_daemon::client_call_typed(data_dir, "swarm.switch", request).await?;
-    request.validate_response(&reply)?;
+    request.validate_response(&reply).map_err(unverified)?;
     Ok(reply)
 }
 
@@ -618,7 +629,7 @@ pub async fn resolve_command(
     request.validate()?;
     let reply: CommandResolveResponse =
         eliot_daemon::client_call_typed(data_dir, "command.resolve", &request).await?;
-    request.validate_response(&reply)?;
+    request.validate_response(&reply).map_err(unverified)?;
     Ok(reply)
 }
 
@@ -636,10 +647,10 @@ pub async fn cancel_command(
     let reply: CommandCancelResponse =
         eliot_daemon::client_call_typed(data_dir, "command.cancel", &request).await?;
     if reply.command_id != request.command_id {
-        return Err(Error::new(
+        return Err(unverified(Error::new(
             "source_integrity",
             "cancel reply names another command",
-        ));
+        )));
     }
     Ok(reply)
 }
@@ -651,10 +662,10 @@ pub async fn reparent(data_dir: &Path, request: &ReparentRequest) -> Result<Repa
     let reply: ReparentResponse =
         eliot_daemon::client_call_typed(data_dir, "swarm.reparent", request).await?;
     if reply.id != request.id {
-        return Err(Error::new(
+        return Err(unverified(Error::new(
             "source_integrity",
             "reparent reply names another mutation",
-        ));
+        )));
     }
     Ok(reply)
 }

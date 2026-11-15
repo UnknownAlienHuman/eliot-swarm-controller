@@ -37,7 +37,10 @@ pub(super) enum Target {
 
 #[derive(Clone, Debug)]
 pub(super) enum HandoffMsg {
-    Open { agent: String, generation: i64 },
+    Open {
+        agent: String,
+        generation: i64,
+    },
     SendsLoaded(u64, Fallible<Vec<SendRow>>),
     Closed,
     TaskPicked(Option<usize>),
@@ -48,14 +51,19 @@ pub(super) enum HandoffMsg {
     EffortPicked(Option<usize>),
     Submit(Target),
     Retry,
-    Replied(u64, Box<Fallible<Outcome>>),
+    /// Epoch, whether this reply answers a submission (and so settles its
+    /// ledger entry, even after the dialog closed), and the reply.
+    Replied(u64, bool, Box<Fallible<Outcome>>),
     RefreshRequested,
     ChildrenLoaded(u64, Fallible<Vec<Command>>),
     ReasonChanged(String),
     ResolveRequested(String, CommandResolution),
     CancelRequested(String),
     OwnerDone(u64, String, Fallible<String>),
-    Finish { agent: String, generation: i64 },
+    Finish {
+        agent: String,
+        generation: i64,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -75,6 +83,12 @@ pub(super) struct DialogState {
     effort: Option<usize>,
     /// The exact request (with its id) last submitted: same-ID readback.
     submitted: Option<Submitted>,
+    /// The last submission's reply was uncertain: only "Retry with the same
+    /// id" is offered until the daemon answers it.
+    uncertain: bool,
+    /// The switch request a "Finish" handoff replaced; restored if the
+    /// daemon definitely refuses the finish.
+    prior: Option<Submitted>,
     outcome: Option<Outcome>,
     polls: u32,
     children: Vec<Command>,
@@ -87,6 +101,15 @@ impl DesktopApp {
     pub(super) fn handoff_update(&mut self, msg: HandoffMsg, context: &ComponentContext<Self>) {
         match msg {
             HandoffMsg::Open { agent, generation } => {
+                // An uncertain request stays bound to its id across reopening:
+                // the dialog comes back with it instead of starting over.
+                if self.handoff.uncertain
+                    && self.handoff.from == agent
+                    && self.handoff.from_generation == generation
+                {
+                    self.handoff.open = true;
+                    return;
+                }
                 let epoch = self.handoff.epoch + 1;
                 self.handoff = DialogState {
                     open: true,
@@ -200,6 +223,7 @@ impl DesktopApp {
             }
             HandoffMsg::Submit(target) => {
                 if self.submitting()
+                    || self.handoff.uncertain
                     || self.handoff.submitted.is_some()
                     || self.handoff.outcome.is_some()
                 {
@@ -213,7 +237,7 @@ impl DesktopApp {
             HandoffMsg::Retry => {
                 // Only an uncertain reply keeps the request: the same id.
                 if let Some(submitted) = self.handoff.submitted.clone()
-                    && self.handoff.outcome.is_none()
+                    && self.handoff.uncertain
                     && !self.submitting()
                 {
                     self.handoff_send(submitted, context);
@@ -226,7 +250,7 @@ impl DesktopApp {
                 let Some(Submitted::Switch(switch)) = self.handoff.submitted.clone() else {
                     return;
                 };
-                if self.submitting() {
+                if self.submitting() || self.handoff.uncertain {
                     return;
                 }
                 let mut submitted = Submitted::Handoff(HandoffRequest {
@@ -242,24 +266,30 @@ impl DesktopApp {
                 if let Submitted::Handoff(request) = &mut submitted {
                     request.id = id;
                 }
-                self.handoff.outcome = None;
-                self.handoff.children.clear();
+                // The switch result stays on screen until the daemon answers.
+                self.handoff.prior = self.handoff.submitted.clone();
                 self.handoff_send(submitted, context);
             }
-            HandoffMsg::Replied(epoch, reply) => {
+            HandoffMsg::Replied(epoch, settles, reply) => {
                 let reply = *reply;
-                if epoch != self.handoff.epoch {
-                    return;
-                }
                 let uncertain = reply
                     .as_ref()
                     .err()
                     .is_some_and(|error| crate::state::uncertain(error));
-                if self.in_flight_key.is_some() {
+                // Only the reply to a submission settles its ledger entry; a
+                // readback never touches another action in flight.
+                if settles {
                     self.settle_mutation(!uncertain);
+                }
+                if epoch != self.handoff.epoch {
+                    return;
                 }
                 match reply {
                     Ok(outcome) => {
+                        if settles {
+                            self.handoff.uncertain = false;
+                            self.handoff.prior = None;
+                        }
                         self.handoff.status = "Read back from the daemon.".to_owned();
                         let pending = outcome.switch_pending();
                         let handoff_id = outcome.handoff().map(|reply| reply.id.clone());
@@ -269,20 +299,29 @@ impl DesktopApp {
                         }
                         if pending && self.handoff.polls < SWITCH_POLLS {
                             self.handoff.polls += 1;
-                            self.handoff_readback(SWITCH_POLL_MS, context);
+                            self.handoff_readback(SWITCH_POLL_MS, false, context);
                         } else if pending {
                             self.handoff.status = "The switch is still orchestrating; Refresh the result reads it again with the same id.".to_owned();
                         }
                     }
                     Err(error) if uncertain => {
+                        if settles {
+                            self.handoff.uncertain = true;
+                        }
                         self.handoff.status = format!(
                             "Outcome uncertain; Retry sends the same request with the same id, never a new one: {error}"
                         );
                     }
                     Err(error) => {
-                        // Definitely refused: a later action gets a new id.
-                        if self.handoff.outcome.is_none() {
-                            self.handoff.submitted = None;
+                        // Definitely refused: a later action gets a new id. A
+                        // refused finish brings the switch back for readback.
+                        if settles {
+                            self.handoff.uncertain = false;
+                            if let Some(prior) = self.handoff.prior.take() {
+                                self.handoff.submitted = Some(prior);
+                            } else if self.handoff.outcome.is_none() {
+                                self.handoff.submitted = None;
+                            }
                         }
                         self.handoff.status = format!("Refused: {error}");
                     }
@@ -290,7 +329,7 @@ impl DesktopApp {
             }
             HandoffMsg::RefreshRequested => {
                 self.handoff.polls = 0;
-                self.handoff_readback(0, context);
+                self.handoff_readback(0, false, context);
             }
             HandoffMsg::ChildrenLoaded(epoch, children) => {
                 if epoch != self.handoff.epoch {
@@ -358,7 +397,7 @@ impl DesktopApp {
                     ),
                     Err(error) => format!("{label} refused: {error}"),
                 };
-                self.handoff_readback(0, context);
+                self.handoff_readback(0, false, context);
             }
         }
     }
@@ -457,12 +496,12 @@ impl DesktopApp {
         self.handoff.status = format!("Submitting {}…", submitted.id());
         self.handoff.submitted = Some(submitted);
         self.handoff.polls = 0;
-        self.handoff_readback(0, context);
+        self.handoff_readback(0, true, context);
     }
 
     /// Send the retained request again with its own id after `delay_ms`:
     /// the daemon returns the committed result and the current gate readback.
-    fn handoff_readback(&mut self, delay_ms: u64, context: &ComponentContext<Self>) {
+    fn handoff_readback(&mut self, delay_ms: u64, settles: bool, context: &ComponentContext<Self>) {
         let (Some(submitted), Ok(data_dir)) =
             (self.handoff.submitted.clone(), self.data_dir.clone())
         else {
@@ -474,6 +513,7 @@ impl DesktopApp {
             if delay_ms > 0 && !feed::backoff(delay_ms, &cancelled) {
                 return Message::Handoff(HandoffMsg::Replied(
                     epoch,
+                    settles,
                     Box::new(Err("unknown: readback cancelled".to_owned())),
                 ));
             }
@@ -488,7 +528,7 @@ impl DesktopApp {
                 }
             })
             .map_err(|error| error.to_string());
-            Message::Handoff(HandoffMsg::Replied(epoch, Box::new(reply)))
+            Message::Handoff(HandoffMsg::Replied(epoch, settles, Box::new(reply)))
         });
     }
 
@@ -543,6 +583,7 @@ impl DesktopApp {
         // New actions only from a clean state: no uncertain request pending,
         // no result shown, nothing in flight.
         let can_act = !self.submitting()
+            && !state.uncertain
             && state.submitted.is_none()
             && state.outcome.is_none()
             && state.task.is_some();
@@ -776,7 +817,7 @@ impl DesktopApp {
             },
         );
         if let Some(submitted) = &state.submitted {
-            let retry = state.outcome.is_none();
+            let retry = state.uncertain;
             push(
                 "readback",
                 StackPanel::new()

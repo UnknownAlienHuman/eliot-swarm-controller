@@ -265,8 +265,9 @@ enum Message {
     ConfigureEffortPicked(Option<usize>),
     ConfigureExpanded(bool),
     ConfigureRequested,
-    /// Outer error: the submission itself; inner: the settled command read.
-    ConfigureSettled(Result<Fallible<Command>, String>),
+    /// The configured Agent; outer error: the submission itself; inner: the
+    /// settled command read.
+    ConfigureSettled(String, Result<Fallible<Command>, String>),
     ProfilesSourceLoaded(Fallible<ProfilesReadResponse>),
     ProfilesDraftChanged(String),
     ProfileEditSelected(Option<usize>),
@@ -1914,11 +1915,19 @@ impl Component for DesktopApp {
                 }
             }
             Message::ConfigureRequested => {
-                let (Some(agent), Some(detail), Some(catalog)) = (
-                    self.selected_agent_id(),
-                    self.detail.clone(),
-                    self.configure.catalog.clone(),
-                ) else {
+                let (Some(agent), Some(detail)) = (self.selected_agent_id(), self.detail.clone())
+                else {
+                    self.configure.status =
+                        "Select an Agent and wait for its catalogue.".to_owned();
+                    return;
+                };
+                // Only the catalogue read for this exact generation applies.
+                let Some(catalog) = self
+                    .configure
+                    .catalog
+                    .clone()
+                    .filter(|catalog| catalog.is_for(&agent, detail.generation))
+                else {
                     self.configure.status =
                         "Select an Agent and wait for its catalogue.".to_owned();
                     return;
@@ -1941,29 +1950,35 @@ impl Component for DesktopApp {
                 let mutation_id = self.ledger.id_for(&key);
                 self.in_flight_key = Some(key);
                 self.configure.status = format!("Configure {mutation_id}…");
-                let _task =
-                    context.spawn_background(move |cancel| {
-                        let cancelled = || cancel.is_cancelled();
-                        let submitted = client::block_on(client::submit_configure(
-                            &data_dir,
-                            mutation_id,
-                            &agent,
-                            generation,
-                            model,
-                            effort,
-                        ))
-                        .map_err(|error| error.to_string());
-                        Message::ConfigureSettled(submitted.map(|reply| {
+                let _task = context.spawn_background(move |cancel| {
+                    let cancelled = || cancel.is_cancelled();
+                    let submitted = client::block_on(client::submit_configure(
+                        &data_dir,
+                        mutation_id,
+                        &agent,
+                        generation,
+                        model,
+                        effort,
+                    ))
+                    .map_err(|error| error.to_string());
+                    Message::ConfigureSettled(
+                        agent.clone(),
+                        submitted.map(|reply| {
                             settle_command(&data_dir, &reply.command_id, 90, &cancelled)
-                        }))
-                    });
+                        }),
+                    )
+                });
             }
-            Message::ConfigureSettled(result) => {
+            Message::ConfigureSettled(agent, result) => {
                 let uncertain = result
                     .as_ref()
                     .err()
                     .is_some_and(|error| crate::state::uncertain(error));
                 self.settle_mutation(!uncertain);
+                // A reply for an Agent no longer shown changes nothing on screen.
+                if self.selected_agent_id().as_deref() != Some(agent.as_str()) {
+                    return;
+                }
                 self.configure.status = match result {
                     Ok(Ok(command)) => {
                         self.configure.model_pick = Some(0);
@@ -2991,7 +3006,10 @@ impl DesktopApp {
         else {
             return View::empty();
         };
-        let catalog = self.configure.catalog.as_ref();
+        let catalog = self.configure.catalog.as_ref().filter(|catalog| {
+            self.selected_agent_id()
+                .is_some_and(|agent| catalog.is_for(&agent, detail.generation))
+        });
         let models = catalog.map(configure::Catalog::models).unwrap_or_default();
         let model = configure::picked(&models, self.configure.model_pick);
         let efforts = catalog

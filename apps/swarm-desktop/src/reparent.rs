@@ -129,6 +129,7 @@ pub fn refusal_line(binding: &MoveBinding, error: &str) -> String {
         "bad_state" => "the new manager must be a controlled, live, non-unknown Agent",
         "not_found" => "an Agent no longer exists",
         "frame_too_large" => "the result would exceed the reply bound",
+        "id_conflict" => "this mutation id was already used for a different move",
         _ => "",
     };
     if meaning.is_empty() {

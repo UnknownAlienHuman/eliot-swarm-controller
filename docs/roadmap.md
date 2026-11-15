@@ -399,7 +399,7 @@ of the explicitly selected release scope.
       `timer.run` of a timer whose `run` action names the entry, with the daemon's
       custody, timeout and unknown-outcome rules. "Open in editor" starts a
       user-selected `.exe` with literal argv and no Eliot credentials. (Refs #407)
-- [ ] **D6 Coordination actions.** The Agent detail configures model and effort
+- [x] **D6 Coordination actions.** The Agent detail configures model and effort
       from `harness.models` read under that Agent's frozen route (`agent`), with
       the daemon's per-field `configure` refusals, then shows requested, next-turn
       (revision, application point) and effective values with their turn-proven
