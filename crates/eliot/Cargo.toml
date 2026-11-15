@@ -35,4 +35,4 @@ tokio-util.workspace = true
 tower-service = "0.3"
 reqwest.workspace = true
 futures-util.workspace = true
-jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }

@@ -548,8 +548,39 @@ mod tests {
     const TEST_KID: &str = "k47-test-key-1";
     const TEST_SUBJECT_A: &str = "k47-subject-a";
     const TEST_SUBJECT_B: &str = "k47-subject-b";
-    const TEST_RSA_N: &str = "2aMvnTpVG7geArR3Js5XB9KUd5iairv2YToTxew9wotoIL4xNT_Y5SWC2a-EUaxBNbutddvZhpULZDi2nrZNgoofRq9veWpwUqHW4WB69QfJKhjeBQsNjzOpAJceR6UVWV5E1QqbaJfQOZ7FtVYQTFS-_WsENfR8hD4IS75Povdqld5AgZorFMqVn2gHkJ8A0s3mtTij5fAjzzf-0S6QSFgT5hqnSnLZ-YoGV9Z-vJiWzi49ftYEMOnxZul7rMVBsAZ3zAAYmfgjn1qPj6vjlH2PW4jcZ8jS_16ADaBUhuKoGvuEYXZwoHl4VozCRXNXTlEdcccHB_zhnhUx3RkVzQ";
-    const TEST_RSA_PKCS1_B64: &str = "MIIEpgIBAAKCAQEA2aMvnTpVG7geArR3Js5XB9KUd5iairv2YToTxew9wotoIL4xNT/Y5SWC2a+EUaxBNbutddvZhpULZDi2nrZNgoofRq9veWpwUqHW4WB69QfJKhjeBQsNjzOpAJceR6UVWV5E1QqbaJfQOZ7FtVYQTFS+/WsENfR8hD4IS75Povdqld5AgZorFMqVn2gHkJ8A0s3mtTij5fAjzzf+0S6QSFgT5hqnSnLZ+YoGV9Z+vJiWzi49ftYEMOnxZul7rMVBsAZ3zAAYmfgjn1qPj6vjlH2PW4jcZ8jS/16ADaBUhuKoGvuEYXZwoHl4VozCRXNXTlEdcccHB/zhnhUx3RkVzQIDAQABAoIBAQDCQxkDHMhPH78Z5v/cEZ45i0uenQaFA1XeXzq7Fi3icxEU+O9vengdwafUqwhO5pSmY8lnREAcEvnCEaVgcZUqCiP0si+sjseH2pG1Rqs6ACMdgmja04zc393gewM6LC6sQKrsBrXFXI0ugXw0aofNum9oQJfXmU1ztPMuuMbYzJ3ucT8CFp0vLDjpXesoCVTKhIFR9dMYwaJbqCaFionr3ZjPkw9oKBoSDltf2AY2G/X2itKva54BtM+oCTqoEk8qSRp7eLmw49ngRW/5lwDRFv+6V6CHNZNdIfmrjg//ulvt5itQhkkOcQ/Cg0m8c+5gj5mIpWuGHsWOALVZsj75AoGBAOFVID/T15oadNKFtw0yoewamv8IKuaWpN+0To/nYvZ54WE4Yh0Araz4G09YBtC8MAjAPFMqekSVWoEMCwNRwisrjZZnquMKfwWPNBt+izYhp7qbjtrXDqEIZUHVIirMHGBu+aphbGhaRd/LrERwkBJeDo+OuvZdtWG2PXPyM33bAoGBAPdB9CFPjOrFIa0OBUvy5EOf3sKAmpIACZmyw67nVwnIjJN603VY1dbmAB8eC3ejvuE+gkFRpND5tybHPOEvvpp+K1SbQgKSB+R/boLYY9wFFtuqzqkFpFQ+s+TcQIfCB1sXqWlhKHCri6T9hT8NL1VEtlt4x5XV4fSOAa+16U93AoGBAMZfiuSmO0kPwYkU7vJPgP267nlXV21pcfz/X6qQqi8TXbeZS8b8sel1A5X2iQl6o08Q7grJepqmYeb6Ezf44lffH+cpnOgEdY8PY3BRF32wY1mFWV6PtfFO0tYCLPJAfzrmeCXnXuj/kERVqnMWJcAFzgvUPARouyYqqi9JKsvBAoGBAOwngAY4tnycn5drpr9tU3sLPHVE41zC0GiOBrwMlGLxuuI5E7ImkMbZkhAmYAl6yZrUWxAL7IDzoGxXKtxg/4kLLFN4nklaNFOXKnOqPWYtLjHMJ+njS5py8NqLSs7fEKt+I/5UH43NKmkBAry/2Q91uz4OU4HWcCNlZlLuSdHtAoGBANUUterI20AU8R3sYv7Ene4UTN6vErydirWSRHeFymmX800PybtJkEKw3TaErFMBL2kGev4yiOaV4D5qv4EGMYbm0n377qRTkBwRGSzzejqoDbRpgHr1tKp6TXMSpOlKjZLNIOo16M7fWCKoJqmu6KM142nxTZNfcy0PpeaesiNb";
+    const TEST_RSA_N: &str = "xKFhuV1yaOfBJrPtZOsg98CdgG-TbgHeK2YlaQ0le4RKMNyx88033DiBa6zpdxNcW4vfQ8pCgFQVENVf1sZmfU5TkOUHmApBwxI-LYpTvp5d5JIpOLXt2hUmTfRMea-bfP5e-DPx9UOoir714Jt3LeN71RbWWidM2O818N36mXC3pDiM8VVo5bvVYFBNDILJVGL8n6esyF7z9eWp--HWREBrMKLisRUVX4XeJc6ooSHIlc4rxB7LQtcUJX7wznu0OOpk6XGIqcDLAp51chvXyDhVMXJreteTIVqjLu7Vf_cbZKzjHRPz7EoRMuvjFlDyBHorVs2F8TatCy5c_XTQ-Q";
+    // Throwaway RSA key generated only for this test module. It protects
+    // nothing and must never leave test code.
+    const TEST_RSA_PEM: &str = concat!(
+        "-----BEGIN PRIVATE KEY-----\n",
+        "MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDEoWG5XXJo58Em\n",
+        "s+1k6yD3wJ2Ab5NuAd4rZiVpDSV7hEow3LHzzTfcOIFrrOl3E1xbi99DykKAVBUQ\n",
+        "1V/WxmZ9TlOQ5QeYCkHDEj4tilO+nl3kkik4te3aFSZN9Ex5r5t8/l74M/H1Q6iK\n",
+        "vvXgm3ct43vVFtZaJ0zY7zXw3fqZcLekOIzxVWjlu9VgUE0MgslUYvyfp6zIXvP1\n",
+        "5an74dZEQGswouKxFRVfhd4lzqihIciVzivEHstC1xQlfvDOe7Q46mTpcYipwMsC\n",
+        "nnVyG9fIOFUxcmt615MhWqMu7tV/9xtkrOMdE/PsShEy6+MWUPIEeitWzYXxNq0L\n",
+        "Llz9dND5AgMBAAECggEBAL7Oi/JAyAEcw8Y226sOsBM7CpvTqhEaJumeWbczVqgh\n",
+        "m40G3HhlMEu3WX+Pb45pbzo25RT3dMjqzvZi2HmmVVZLZ7Q3S8MyUNZnIYc3sERN\n",
+        "kXd4jh/GC2WRGHaVFpEO46fLf4UDg0wpt6fL3vVyZ5hUI5qIasFZWa05k/KEteWm\n",
+        "U4hlRAlOXhzV2yXSlBNA0G3i/eNAiU0IUyL2H8I5xSVfkwXhtigwuMgBklqUilAm\n",
+        "QBYrQi9JHQwGl+uPNxjJnbfSoAZnPSiYRr+94NcnMIl1p5tRORWZO+YoAyUjwy1T\n",
+        "1GVKYT6MOlhSFXOV80CTgw2tmw3idFS5Hi5fdpHEEvECgYEA0uGqeiIw9ms5WlM3\n",
+        "gv4tkHnsX57wSad94Ewu2ixZ5r6UsevN641jbxaaOMZFt1UUcMIXKxl7tVbqEYtl\n",
+        "vmyfjEasKEgIRaDs29Ov0mU/2eWbnnGGZoWUerSMo78F/YQuTCmhFUKbc9fCSw2z\n",
+        "QZIK6fxiHRaCnP8wiUVsCtdxxv8CgYEA7rMomWR1lfAFBEloGSwNjhGIhOv72WOA\n",
+        "UkTdTMIMOrAk3vDb33I+BQ5hrXjBKniiovShFjuFv0IJ8e2Ww0fq2MTJa4fL4tws\n",
+        "F+uf8iMo9XYgZ6eOjDdyVOOeegOpoJsInQVuvQ4/Znnz8A0elUkOg6/7rn8p2Cea\n",
+        "uueQ3nQHoAcCgYEAkaHMhFnWbGayDeHIRUtZlhvNFGAD2ymzMVILTRox37sfnxuU\n",
+        "cqaK063NRYYPoUM9QX2YWGhZ2WqzbPhShEYpjMtFmu/b3pH64Pj4xBiuFsGNTcdi\n",
+        "pKx9VJwZP//smB5PhsN8/dyo1EBdak2EzLSZmutzqljgTKGjGDl8GqSca2sCgYEA\n",
+        "rF4peiMmGiDZro/HoS3DmAynNb0m/4MvnbjmyU/y/spFxcvOKpvXl1UcSeVCMAYv\n",
+        "A1d9n41Z9pOclNwJm3iqaOApxwGnxGlTWe6ncHXdVOt5WQCRGkXLxOsdfGR6sGRj\n",
+        "oufSYKkSNVDpSzZeGFVKKuQA7bAcKl/nBwLDBTBqdS8CgYBHXqW8cGATu3bCmEUI\n",
+        "jpPjKG5HyRRhDoWS8FBq5BUmkzoN/wiFlyo3p7FvX50NKQiJk1+M0aL3YGIpfliT\n",
+        "45mqHTvdOib7wGjXcdbwJavmoLYDF0L1rjSVuylXNEhap13HT91NBczfgmflHlmC\n",
+        "uWp8w4Hp9lfXgiybQiXyrhvmtw==\n",
+        "-----END PRIVATE KEY-----",
+    );
     fn test_jwks() -> JwkSet {
         serde_json::from_value(serde_json::json!({
             "keys": [{
@@ -584,44 +615,8 @@ mod tests {
         }
     }
 
-    fn decode_standard_base64(input: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(input.len() / 4 * 3);
-        let mut block = [0u8; 4];
-        let mut have = 0usize;
-        let mut padded = 0usize;
-        for byte in input.bytes() {
-            let sextet = match byte {
-                b'A'..=b'Z' => byte - b'A',
-                b'a'..=b'z' => byte - b'a' + 26,
-                b'0'..=b'9' => byte - b'0' + 52,
-                b'+' => 62,
-                b'/' => 63,
-                b'=' => {
-                    padded += 1;
-                    0
-                }
-                _ => panic!("test key uses standard base64"),
-            };
-            block[have] = sextet;
-            have += 1;
-            if have == 4 {
-                out.push(block[0] << 2 | block[1] >> 4);
-                if padded < 2 {
-                    out.push(block[1] << 4 | block[2] >> 2);
-                }
-                if padded == 0 {
-                    out.push(block[2] << 6 | block[3]);
-                }
-                have = 0;
-                padded = 0;
-            }
-        }
-        assert_eq!(have, 0, "test key length is a base64 block");
-        out
-    }
-
     fn signing_key() -> EncodingKey {
-        EncodingKey::from_rsa_der(&decode_standard_base64(TEST_RSA_PKCS1_B64))
+        EncodingKey::from_rsa_pem(TEST_RSA_PEM.as_bytes()).expect("test RSA key parses")
     }
 
     fn mint(subject: &str, kid: &str, issuer: &str, audience: &str, exp: u64, nbf: u64) -> String {
