@@ -479,7 +479,7 @@ a documented tool inventory. Both native session responses and `session/read`
 also returned metadata only. The installed stable **and experimental** MSP
 indexes expose no tool-list/MCP-inventory method; a successful construction
 does not establish which tools the model would receive. Consequently the exact
-condition under which settings MCP tools appear remains **unverified** under
+condition under which settings MCP tools appear was **unverified** under
 the no-model constraint. The flag did not repair the observed native base
 refusal, missing `HOME` did not cause that refusal with `USERPROFILE` present,
 and the reported provider label alone does not explain it. This is not proof
@@ -509,6 +509,44 @@ the Agent's workspace and passed only to that Agent's dedicated host. Document
 the project MCP/skills/rules grant, preserve normal approval/sandbox settings,
 never persist an owner trust decision, and do not infer opt-in from full-access
 permissions or `allowAll`. No launch or profile behavior changed here.
+
+The authorized two-turn model comparison on 2026-11-15 then tested the owner's
+real settings/login directly, using separate native hosts (not Eliot):
+`muse-bin-1.4.0-R4161.1.exe serve` and
+`muse-bin-1.4.0-R4161.1.exe serve --trust-workspace`. No sandbox-disabling or
+approval override was added. Both selected `muse-spark-1.3-contributor` on
+provider `meta`, submitted exactly one `turn/start` with
+`reasoningEffort="low"`, and used this exact prompt:
+
+> List the names of every tool available to you, grouped by MCP server. Reply only with the list.
+
+| Host | Model-reported `codebase_memory` tools | Model-reported `context7` tools | Model-reported built-ins |
+| --- | --- | --- | --- |
+| `serve` | None | None | 25 tools, grouped under `muse` |
+| `serve --trust-workspace` | None | None | 31 tools, grouped under `muse` |
+
+Both replies omitted `eliot-swarm`; its availability was **not qualified**.
+No real Agent identity was borrowed or synthesized. The referenced Eliot
+environment variables were defined as empty strings to avoid unresolved
+`${VAR}` references while leaving `--require-agent` without credentials. That
+optional server was excluded from the comparison; the two existing servers
+were the qualification subjects. `HOME` and `XDG_CONFIG_HOME` were absent,
+`USERPROFILE` was present, and both hosts used this same worktree.
+
+The trusted reply contained the same 25 built-in names plus exactly
+`subagent_cancel`, `subagent_read_result`, `subagent_send_message`,
+`subagent_spawn`, `subagent_status`, and `subagent_wait`. Thus the flag broadened
+the model-reported native delegation surface but was **not sufficient** to
+make the two existing settings MCP servers visible in this tested config.
+Do not add it automatically as an MCP repair. These are model-reported names,
+not an MCP inventory API or proof of successful tool invocation; the underlying
+settings-loading/startup cause remains unresolved.
+
+Both turns reached matching native `turn/completed` with `terminal="completed"`
+and returned final `agentMessage` items. There were exactly two submitted
+turns, no retries, no tool calls and no approval requests. Both owned hosts and
+their observed descendants exited; owner settings and trust state were
+unchanged. Existing Eliot launch behavior remains unchanged.
 
 This harness keeps `inherit` only: the frozen profile always records
 `mcp = "inherit"`, and a non-`inherit` policy is rejected as `unsupported`
