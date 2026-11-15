@@ -334,13 +334,12 @@ absent `usage` object is not a substitute signal either: usage-free
 normal turns exist (see the 1.5.3 turn above). The 429
 (`RESOURCE_EXHAUSTED`) surfaces only in agy's own CLI log file
 (captured via explicit `--cli_log_file`; observed default app-data
-directory `C:\Users\kleym\.gemini\antigravity-cli`), never on the ACP
+directory `%USERPROFILE%\.gemini\antigravity-cli`), never on the ACP
 stdio stream, and the CLI exposes no quota/usage query (`agy usage`
 and `agy quota` are not subcommands; only `agy models` reads
-model state). The warning glyph on the wire is valid UTF-8 (`U+26A0`,
-bytes `E2 9A A0`): it parses as JSON under a UTF-8 decode and only
-breaks on single-byte display codecs, so any stored mojibake of that
-glyph is introduced downstream of the ACP frame, not by `agy`.
+model state). The warning glyph is valid UTF-8 on the wire and in the
+stored event (`U+26A0`, bytes `E2 9A A0`); it only appears garbled when a
+reader decodes the output with a single-byte code page.
 
 There is no replay cursor/history API. Snapshots expose retained stream
 facts, not a native history poll. Loss means an explicit gap. Do not
