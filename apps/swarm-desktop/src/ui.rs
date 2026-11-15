@@ -19,6 +19,21 @@
 //! view. There is no font-family property (code is not monospace), no
 //! clipboard (see [`crate::clipboard`]) and no key events on `TextBox`
 //! (Enter cannot send; Ctrl+Enter is a Send accelerator).
+//!
+//! Checked against windows-rs master `f37e2f9046cf9710fe00285436c4d22ad6053d72`
+//! (2026-11-14, unreleased `windows-reactor` 0.101.0, MIT OR Apache-2.0):
+//! it adds `TextBlock::font_family`, `Border::on_preview_key_down` /
+//! `on_key_up` / `on_character_received` (a `RoutedCallback<KeyEventInfo>`
+//! whose `bool` sets `Handled`), and `ElementRef::request_notification`.
+//! It still has no `ScrollViewer`/`ScrollView` view-changed event, offset,
+//! extent or viewport readback, `ChangeView`/`ScrollTo`/`StartBringIntoView`
+//! or `VerticalAnchorRatio`, no `ElementRef` for scroll viewers, no `TextBox`
+//! key events, no Shift `AcceleratorModifiers` variant and no IME
+//! composition events. It is not pinned: conditional bottom-follow stays
+//! impossible there, and a Git pin makes every lockfile resolution
+//! (including both uncached CI jobs) fetch the 1.48 GB windows-rs
+//! repository. Monospace code and Enter-to-send wait for a published
+//! release that carries those two APIs.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
