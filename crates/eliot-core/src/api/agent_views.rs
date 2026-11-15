@@ -215,10 +215,16 @@ impl AgentListRequest {
 /// no progress timestamp exists. `last_outcome` is the newest terminal turn's
 /// canonical outcome (legacy rows classify explicitly, never defaulting to
 /// success) with its `last_turn_id` and retained `usage` where available.
-/// `activity` is present only for native observed children. `updated_at` is
-/// the last controller-observed write: for detached or restarted sources it
-/// is freshness metadata, not proof of liveness. Full records stay available
-/// through `agent.get`.
+/// When the newest terminal turn carries no native turn usage, `usage` falls
+/// back to the generation's latest retained `session.usage` snapshot
+/// (cumulative input/output/cache counters only, never a derived total) with
+/// `usage_scope` set to `"session"`; turn-backed usage carries `"turn"`.
+/// A session fallback is a fleet-visibility signal, never turn expenditure:
+/// the inner `usage.scope` is `"session"` and per-turn accounting stays on
+/// `usage.summary`. `activity` is present only for native observed children.
+/// `updated_at` is the last controller-observed write: for detached or
+/// restarted sources it is freshness metadata, not proof of liveness. Full
+/// records stay available through `agent.get`.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentSummary {
     pub id: String,
@@ -244,6 +250,12 @@ pub struct AgentSummary {
     pub activity: Option<NativeChildActivity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TurnUsage>,
+    /// Provenance of the fleet `usage` cell: `"turn"` for the newest
+    /// terminal turn's native turn usage, `"session"` for the
+    /// session-snapshot fallback. Absent exactly when `usage` is absent;
+    /// never a native attribution scope on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_scope: Option<String>,
     pub updated_at: i64,
 }
 
@@ -289,6 +301,16 @@ impl AgentSummary {
         }
         if let Some(turn) = &self.last_turn_id {
             text(turn)?;
+        }
+        match (&self.usage, &self.usage_scope) {
+            (None, None) => {}
+            (Some(_), Some(scope)) if scope == "turn" || scope == "session" => {}
+            _ => {
+                return Err(Error::new(
+                    "invalid",
+                    "Agent summary usage needs its turn/session scope",
+                ));
+            }
         }
         if self.updated_at < 0 {
             return Err(Error::new(
@@ -1958,7 +1980,52 @@ mod tests {
             last_outcome: None,
             activity: None,
             usage: None,
+            usage_scope: None,
             updated_at: 7,
+        }
+    }
+
+    #[test]
+    fn summary_usage_scope_binds_usage_provenance() {
+        let mut scoped = summary();
+        // Absent usage carries no scope.
+        scoped.validate().unwrap();
+        assert!(
+            serde_json::to_value(&scoped)
+                .unwrap()
+                .get("usage_scope")
+                .is_none()
+        );
+        // Turn-backed usage carries the turn scope.
+        scoped.usage = Some(TurnUsage {
+            scope: Some("turn".to_owned()),
+            message_id: None,
+            input_tokens: Some(10),
+            output_tokens: None,
+            reasoning_tokens: None,
+            thinking_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            total_tokens: None,
+        });
+        scoped.usage_scope = Some("turn".to_owned());
+        scoped.validate().unwrap();
+        // Session fallback carries the session scope, never a turn scope.
+        scoped.usage_scope = Some("session".to_owned());
+        scoped.usage.as_mut().unwrap().scope = Some("session".to_owned());
+        scoped.validate().unwrap();
+        let wire = serde_json::to_value(&scoped).unwrap();
+        assert_eq!(wire["usage_scope"], "session");
+        // Scope without usage, usage without scope, and unknown scopes fail.
+        for (usage, scope) in [
+            (None, Some("turn".to_owned())),
+            (scoped.usage.clone(), None),
+            (scoped.usage.clone(), Some("message".to_owned())),
+        ] {
+            let mut bad = summary();
+            bad.usage = usage;
+            bad.usage_scope = scope;
+            assert!(bad.validate().is_err());
         }
     }
 

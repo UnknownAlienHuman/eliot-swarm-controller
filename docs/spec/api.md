@@ -420,7 +420,14 @@ silently. The selective structural/scope index (`parent`/`root`/`project`)
 leads when several filters are present. Each summary carries identity, state,
 current turn, progress age, the last terminal outcome with its turn and
 retained usage where available, child activity for native observed children,
-and the last controller-observed write time. A missing outcome or progress
+and the last controller-observed write time. When the newest terminal turn
+carries no native turn usage, the summary `usage` falls back to the
+generation's latest retained `session.usage` snapshot (cumulative
+input/output/cache counters only, never a derived total) with
+`usage_scope: "session"`; turn-backed usage carries `"turn"`. The
+session fallback never presents as turn usage: its inner `usage.scope` is
+`"session"` as well, and per-turn accounting stays on `usage.summary`.
+A missing outcome or progress
 timestamp reads back absent, never zero or success; `updated_at` is freshness
 metadata, not proof of liveness for a detached or restarted source. The
 response carries the required matching `total` ignoring the cursor, the
@@ -440,7 +447,10 @@ response binding failures remain `unknown`; validate the reply before printing
 it or advancing a cursor. `swarm ls` and `swarm top` render these summaries as
 compact tables by default, labeling the active turn separately from the
 last-terminal outcome/usage and reporting observation data availability only;
-`--json` keeps printing the raw response.
+both tables carry a `USAGE` cell with the native total when supplied,
+otherwise the input+output sum as a fleet signal, suffixed `(t)` for
+turn-backed usage and `(s)` for the session fallback; `--json` keeps
+printing the raw response.
 
 For `agent.processes`, omitted generation selects the current Agent generation for
 `scope:"agent"`, or the managed workspace target generation for `scope:"workspace"`.
