@@ -36,14 +36,17 @@ use windows_collections::IMap;
 use windows_core::{GUID, HRESULT, HSTRING, IInspectable, IUnknown, Interface, RuntimeName};
 use windows_reference::IReference;
 
-use crate::theme::{Rgb8, Scheme};
+use crate::theme::{Rgb8, Scheme, shape};
 
-/// A theme resource value: a Color resource or a SolidColorBrush.
+/// A theme resource value: a Color resource, a SolidColorBrush or a
+/// uniform CornerRadius.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Value {
     Color(Rgb8),
     /// A brush of `color` at `alpha` (0–255).
     Brush(Rgb8, u8),
+    /// A uniform corner radius in whole DIPs.
+    Radius(u8),
 }
 
 const fn opaque(color: Rgb8) -> Value {
@@ -163,6 +166,22 @@ pub fn entries(s: &Scheme) -> Vec<(&'static str, Value)> {
             "ListViewItemBackgroundPressed",
             Value::Brush(s.on_surface, alpha(0.12)),
         ),
+        // The one control radius (buttons, rows, chips, fields, combo
+        // boxes). A Button's style reads `ControlCornerRadius` when the
+        // style is applied, before Reactor sets a button's own resource
+        // overrides, so it is set here, where WinUI resolves it first.
+        ("ControlCornerRadius", Value::Radius(shape::SM as u8)),
+        // Text fields on hover and focus: the raised surface of the
+        // composer (which is transparent at rest), so the composer never
+        // draws a box of its own; the focus indicator stays primary.
+        (
+            "TextControlBackgroundPointerOver",
+            opaque(s.surface_container_high),
+        ),
+        (
+            "TextControlBackgroundFocused",
+            opaque(s.surface_container_high),
+        ),
     ]
 }
 
@@ -188,6 +207,12 @@ pub fn dictionary_xaml(scheme: &Scheme) -> String {
                 "<SolidColorBrush x:Key=\"{key}\" Color=\"{}\"/>",
                 hex(color, alpha)
             ),
+            Value::Radius(radius) => {
+                write!(
+                    xaml,
+                    "<CornerRadius x:Key=\"{key}\">{radius}</CornerRadius>"
+                )
+            }
         };
     }
     xaml.push_str("</ResourceDictionary>");

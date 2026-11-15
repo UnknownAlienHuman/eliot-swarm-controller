@@ -26,17 +26,15 @@ pub mod spacing {
     pub const LG: f64 = 24.0;
 }
 
-/// The three corner radii (M3 small, medium, large) and the full round of
-/// the 36-DIP controls. Nothing else rounds.
+/// The three corner radii (M3 small, medium, large). Nothing else rounds.
 pub mod shape {
-    /// Rows, chips, code blocks and fields.
+    /// Every control (buttons, rows, chips, fields; set once at the
+    /// application root, see `app_resources`) and code blocks.
     pub const SM: f64 = 8.0;
-    /// Cards and menus.
+    /// Cards.
     pub const MD: f64 = 12.0;
     /// The composer and message bubbles.
     pub const LG: f64 = 16.0;
-    /// Buttons: half the control height.
-    pub const FULL: f64 = 18.0;
 }
 
 /// The one type scale (size in DIPs, weight). Segoe UI Variable is the
@@ -301,9 +299,9 @@ pub mod winui {
     //! (filled) and the selection (the selected row). Status colors appear
     //! only as small dots and on a pending request.
 
-    use windows_reactor::{Brush, Color, CornerRadius, ResourceOverrides, ThemeBrush};
+    use windows_reactor::{Brush, Color, ResourceOverrides, ThemeBrush};
 
-    use super::{Rgb8, Scheme, StatusTone, shape};
+    use super::{Rgb8, Scheme, StatusTone};
 
     pub fn color(value: Rgb8) -> Color {
         Color::rgb(value.r, value.g, value.b)
@@ -423,24 +421,17 @@ pub mod winui {
 
         /// Filled: the one main action of a surface.
         pub fn filled(self) -> ResourceOverrides {
-            self.with(|s| family(s, Some(s.primary), s.on_primary, shape::FULL))
+            self.with(|s| family(s, Some(s.primary), s.on_primary))
         }
 
         /// Tonal: a secondary action that should still read as a button.
         pub fn tonal(self) -> ResourceOverrides {
-            self.with(|s| {
-                family(
-                    s,
-                    Some(s.secondary_container),
-                    s.on_secondary_container,
-                    shape::FULL,
-                )
-            })
+            self.with(|s| family(s, Some(s.secondary_container), s.on_secondary_container))
         }
 
         /// Text: low emphasis, neutral content (icon buttons too).
         pub fn text_button(self) -> ResourceOverrides {
-            self.with(|s| family(s, None, s.on_surface_variant, shape::FULL))
+            self.with(|s| family(s, None, s.on_surface_variant))
         }
 
         /// A list row (sidebar, settings sections, monitor cards): neutral
@@ -448,14 +439,9 @@ pub mod winui {
         pub fn row(self, selected: bool) -> ResourceOverrides {
             self.with(|s| {
                 if selected {
-                    family(
-                        s,
-                        Some(s.secondary_container),
-                        s.on_secondary_container,
-                        shape::SM,
-                    )
+                    family(s, Some(s.secondary_container), s.on_secondary_container)
                 } else {
-                    family(s, None, s.on_surface, shape::SM)
+                    family(s, None, s.on_surface)
                 }
             })
         }
@@ -463,12 +449,12 @@ pub mod winui {
         /// A card that is one button (monitor cards): the card fill with
         /// state layers.
         pub fn card_button(self) -> ResourceOverrides {
-            self.with(|s| family(s, Some(s.surface_container), s.on_surface, shape::MD))
+            self.with(|s| family(s, Some(s.surface_container), s.on_surface))
         }
 
         /// A chip that opens a menu: neutral text, row-shaped.
         pub fn chip(self) -> ResourceOverrides {
-            self.with(|s| family(s, None, s.on_surface_variant, shape::SM))
+            self.with(|s| family(s, None, s.on_surface_variant))
         }
 
         fn with(self, build: impl FnOnce(&Scheme) -> ResourceOverrides) -> ResourceOverrides {
@@ -480,9 +466,10 @@ pub mod winui {
     }
 
     /// One button family on WinUI's default button keys: an optional fill
-    /// with M3 state layers of its content color `on`, no outline, the M3
-    /// disabled treatment (12% / 38% on-surface) and one corner radius.
-    fn family(s: &Scheme, fill: Option<Rgb8>, on: Rgb8, radius: f64) -> ResourceOverrides {
+    /// with M3 state layers of its content color `on`, no outline and the M3
+    /// disabled treatment (12% / 38% on-surface). The corner radius is the
+    /// one control radius set at the application root.
+    fn family(s: &Scheme, fill: Option<Rgb8>, on: Rgb8) -> ResourceOverrides {
         let clear = Color::transparent();
         let (rest, hover, pressed, disabled) = match fill {
             Some(fill) => (
@@ -499,8 +486,7 @@ pub mod winui {
             .set("ButtonBackgroundPressed", pressed)
             .set("ButtonBackgroundDisabled", disabled)
             .set("ButtonForegroundDisabled", layer(s.on_surface, 0.38))
-            .set("ButtonBorderBrushDisabled", clear)
-            .set("ControlCornerRadius", CornerRadius::from(radius));
+            .set("ButtonBorderBrushDisabled", clear);
         for state in ["", "PointerOver", "Pressed"] {
             r = r
                 .set(format!("ButtonForeground{state}"), color(on))

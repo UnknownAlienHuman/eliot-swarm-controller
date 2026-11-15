@@ -51,6 +51,9 @@ pub(super) enum SettingsMsg {
     AutoProfilePicked(Option<usize>),
 }
 
+/// The section list beside the shown section.
+const SECTION_LIST_WIDTH: f64 = 240.0;
+
 /// The Routing picker's first entry.
 const FIRST_ALLOWED: &str = "The first launchable profile the project allows";
 
@@ -107,7 +110,7 @@ impl DesktopApp {
             .map(|section| {
                 let selected = *section == self.settings_section;
                 KeyedView::new(
-                    section.label(),
+                    format!("{}:{selected}", section.label()),
                     m3::row(palette, selected)
                         .automation_name(if selected {
                             format!("{} (shown)", section.label())
@@ -158,11 +161,17 @@ impl DesktopApp {
         };
         // The section's tree is keyed by section, so its editors are new
         // controls (see `reprime_fields`).
+        // One explicit column width, so every section's cards line up
+        // (content-sized until the window size is observed).
+        let width = self.main_width().map(|width| {
+            (width - SECTION_LIST_WIDTH - 2.0 * theme::spacing::LG)
+                .clamp(320.0, theme::layout::READING_WIDTH)
+        });
         let content = Grid::new()
             .grid_column(1)
             .rows([GridLength::Auto, GridLength::STAR])
             .row_spacing(theme::spacing::MD)
-            .max_width(theme::layout::READING_WIDTH + 2.0 * theme::spacing::LG)
+            .width(width)
             .horizontal_alignment(HorizontalAlignment::Left)
             .margin(Thickness::new(
                 theme::spacing::LG,
@@ -181,7 +190,7 @@ impl DesktopApp {
                 ),
             ]);
         Grid::new()
-            .columns([GridLength::Pixel(240.0), GridLength::STAR])
+            .columns([GridLength::Pixel(SECTION_LIST_WIDTH), GridLength::STAR])
             .children((nav, content))
     }
 
@@ -192,7 +201,7 @@ impl DesktopApp {
                 .map(|choice| {
                     let selected = self.prefs.theme == choice;
                     KeyedView::new(
-                        choice.label(),
+                        format!("{}:{selected}", choice.label()),
                         m3::segment(palette, selected)
                             .automation_name(format!(
                                 "Theme {}{}",
@@ -214,7 +223,7 @@ impl DesktopApp {
         .map(|(choice, label)| {
             let selected = self.prefs.startup == choice;
             KeyedView::new(
-                label,
+                format!("{label}:{selected}"),
                 m3::segment(palette, selected)
                     .automation_name(format!(
                         "Open at start: {label}{}",
@@ -342,22 +351,22 @@ impl DesktopApp {
     }
 
     fn automation_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        Grid::new()
-            .rows([GridLength::Pixel(260.0), GridLength::STAR])
-            .row_spacing(theme::spacing::LG)
-            .children((
-                config_view::automation_screen(
-                    &self.automation.rules,
-                    &self.automation.status,
-                    context.message(Message::Automation(
-                        AutomationMsg::AutomationRefreshRequested,
-                    )),
-                    palette,
-                ),
-                Border::new()
-                    .grid_row(1)
-                    .content(self.scripts_view(context, palette)),
-            ))
+        scroll(
+            StackPanel::new()
+                .spacing(theme::spacing::SM)
+                .children((
+                    config_view::automation_screen(
+                        &self.automation.rules,
+                        &self.automation.status,
+                        context.message(Message::Automation(
+                            AutomationMsg::AutomationRefreshRequested,
+                        )),
+                        palette,
+                    ),
+                    self.scripts_view(context, palette),
+                ))
+                .into(),
+        )
     }
 
     fn advanced_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {

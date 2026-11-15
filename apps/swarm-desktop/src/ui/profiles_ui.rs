@@ -15,6 +15,8 @@ pub(super) enum ProfilesMsg {
     ProfilesSaveRequested,
     ProfilesSaved(bool, Fallible<ProfilesSaveResponse>),
     ProfilesReloadRequested,
+    /// Show or hide the TOML source editor.
+    SourceToggled,
 }
 
 /// Profiles screen: one document draft over the daemon's profile source.
@@ -33,6 +35,8 @@ pub(super) struct ProfilesEditor {
     pub(super) status: String,
     pub(super) busy: bool,
     pub(super) loaded: bool,
+    /// The TOML source editor is shown.
+    pub(super) source_open: bool,
 }
 
 impl DesktopApp {
@@ -158,6 +162,11 @@ impl DesktopApp {
                     }
                 }
             }
+            ProfilesMsg::SourceToggled => {
+                self.editor.source_open = !self.editor.source_open;
+                // A new multi-line editor gets its text one render later.
+                self.reprime_fields(context);
+            }
             ProfilesMsg::ProfilesReloadRequested => {
                 self.editor.status = "Reloaded the saved profile sections.".to_owned();
                 self.load_profile_source(context);
@@ -223,6 +232,7 @@ impl DesktopApp {
             status: &self.editor.status,
             busy: self.editor.busy,
             summaries: &self.launch.profile_summaries,
+            source_open: self.editor.source_open,
         };
         let actions = ProfilesActions {
             draft_changed: context
@@ -242,6 +252,7 @@ impl DesktopApp {
             validate: context.message(Message::Profiles(ProfilesMsg::ProfilesValidateRequested)),
             save: context.message(Message::Profiles(ProfilesMsg::ProfilesSaveRequested)),
             reload: context.message(Message::Profiles(ProfilesMsg::ProfilesReloadRequested)),
+            toggle_source: context.message(Message::Profiles(ProfilesMsg::SourceToggled)),
         };
         config_view::profiles_screen(data, actions, palette)
     }

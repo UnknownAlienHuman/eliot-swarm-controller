@@ -71,8 +71,9 @@ const HIGH_CONTRAST_POLL_MS: u64 = 2_000;
 const PRIME_RETRY_MS: u64 = 16;
 /// Indent per tree level in the sidebar.
 const TREE_INDENT: f64 = 16.0;
-/// The expand chevron column of an Agent row.
-const CHEVRON: f64 = 24.0;
+/// The expand chevron column of an Agent row: WinUI's button padding
+/// (11, 5, 11, 6) leaves a whole 10-DIP chevron at 32 x 32.
+const CHEVRON: f64 = 32.0;
 /// Rows in Recents.
 const RECENTS: usize = 8;
 /// Titles read per background batch.
@@ -652,7 +653,7 @@ impl DesktopApp {
                     .on_click(context.message(Message::Shell(ShellMsg::RefreshRequested)))
                     .content(m3::icon(m3::glyph::REFRESH)),
             ));
-        let new_task = m3::row(palette, new_task_selected)
+        let new_task = m3::row(palette, false)
             .grid_row(1)
             .margin(Thickness::xy(gutter, 0.0))
             .automation_name("New task")
@@ -688,9 +689,10 @@ impl DesktopApp {
             ));
         }
         for section in &sections {
+            let selected = new_task_selected && self.launch.workspace == section.checkout;
             items.push(KeyedView::new(
-                format!("project:{}", section.checkout),
-                self.project_row(section, new_task_selected, context, palette),
+                format!("project:{}:{selected}", section.checkout),
+                self.project_row(section, selected, context, palette),
             ));
             if section.rows.is_empty() {
                 items.push(KeyedView::new(
@@ -699,9 +701,11 @@ impl DesktopApp {
                 ));
             }
             for row in &section.rows {
+                let selected = self.main == Main::Conversation
+                    && self.nav.selection.agent.as_deref() == Some(row.agent.id.as_str());
                 items.push(KeyedView::new(
-                    format!("agent:{}", row.agent.id),
-                    self.agent_row(row, context, palette),
+                    format!("agent:{}:{selected}:{}", row.agent.id, row.expanded),
+                    self.agent_row(row, selected, context, palette),
                 ));
             }
         }
@@ -746,17 +750,25 @@ impl DesktopApp {
                     .keyed_children(items),
             );
 
+        let settings_open = self.main == Main::Settings;
+        let monitor_open = self.panel == Panel::Monitor;
         let bottom = StackPanel::new()
             .grid_row(3)
             .spacing(2.0)
             .margin(Thickness::new(gutter, gutter, gutter, theme::spacing::MD))
-            .children((
-                self.fleet_row(context, palette),
-                m3::row(palette, self.main == Main::Settings)
-                    .automation_name("Settings")
-                    .on_click(context.message(Message::Shell(ShellMsg::SettingsOpened)))
-                    .content(m3::icon_label(m3::glyph::SETTINGS, "Settings")),
-            ));
+            .keyed_children(vec![
+                KeyedView::new(
+                    format!("fleet:{monitor_open}"),
+                    self.fleet_row(context, palette),
+                ),
+                KeyedView::new(
+                    format!("settings:{settings_open}"),
+                    m3::row(palette, settings_open)
+                        .automation_name("Settings")
+                        .on_click(context.message(Message::Shell(ShellMsg::SettingsOpened)))
+                        .content(m3::icon_label(m3::glyph::SETTINGS, "Settings")),
+                ),
+            ]);
 
         Grid::new()
             .rows([
@@ -772,11 +784,10 @@ impl DesktopApp {
     fn project_row(
         &self,
         section: &Section,
-        new_task_selected: bool,
+        selected: bool,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let selected = new_task_selected && self.launch.workspace == section.checkout;
         m3::row(palette, selected)
             .automation_name(format!("New task in {}", section.name))
             .on_click(context.message(Message::Shell(ShellMsg::ProjectPicked(
@@ -787,11 +798,15 @@ impl DesktopApp {
 
     /// An Agent row: indent, the expand chevron when it has children, its
     /// title and a status dot when its state needs a look.
-    fn agent_row(&self, row: &Row, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    fn agent_row(
+        &self,
+        row: &Row,
+        selected: bool,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
         let agent = &row.agent;
         let title = self.agent_title(&agent.id);
-        let selected = self.main == Main::Conversation
-            && self.nav.selection.agent.as_deref() == Some(agent.id.as_str());
         let chevron: View = if row.expandable() {
             let (glyph, name) = if row.expanded {
                 (

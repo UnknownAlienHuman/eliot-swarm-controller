@@ -140,15 +140,19 @@ pub fn text_button(palette: Palette) -> Button {
         .height(layout::CONTROL_HEIGHT)
 }
 
-/// A 36 x 36 text button for one glyph (`.content(icon(..))` last). Give
-/// it an accessible name.
+/// WinUI's default Button padding (11, 5, 11, 6), which Reactor 0.100.0
+/// cannot change: a glyph button is this wide so the 16-DIP glyph is whole.
+pub const GLYPH_BUTTON: f64 = 40.0;
+
+/// A text button for one glyph (`.content(icon(..))` last). Give it an
+/// accessible name.
 pub fn icon_button(palette: Palette) -> Button {
-    text_button(palette).width(layout::CONTROL_HEIGHT)
+    text_button(palette).width(GLYPH_BUTTON)
 }
 
-/// The filled round icon button of the composer (Send).
+/// The filled icon button of the composer (Send).
 pub fn filled_icon(palette: Palette) -> Button {
-    filled(palette).width(layout::CONTROL_HEIGHT)
+    filled(palette).width(GLYPH_BUTTON)
 }
 
 /// The one row: full width, content on the left, the selection in

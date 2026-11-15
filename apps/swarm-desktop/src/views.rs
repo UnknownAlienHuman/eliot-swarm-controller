@@ -183,10 +183,15 @@ fn body_text(text: &str, palette: Palette) -> TextBlock {
         .foreground(palette.on_surface())
 }
 
-/// A small icon-only copy button (32 x 32), named for screen readers.
+/// WinUI's left button padding: an inline text button is pulled back by it
+/// so its content lines up with the text around it.
+const INSET: f64 = 11.0;
+
+/// A small icon-only copy button, named for screen readers; 36 wide so the
+/// 14-DIP glyph is whole inside WinUI's (11, 5, 11, 6) button padding.
 fn copy_button(name: &str, palette: Palette, callback: impl Fn() + 'static) -> Button {
     crate::m3::text_button(palette)
-        .width(32.0)
+        .width(36.0)
         .height(32.0)
         .automation_name(name.to_owned())
         .on_click(callback)
@@ -319,6 +324,7 @@ fn part_view(
             // accent. The accessible name carries the state.
             let header = anchored(crate::m3::text_button(palette))
                 .horizontal_alignment(HorizontalAlignment::Left)
+                .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
                 .automation_name(format!(
                     "Tool operations: {} ({})",
                     part.plain,
@@ -385,6 +391,7 @@ fn part_view(
                     .keyed_children(block_views(part, callbacks, palette)),
                 anchored(copy_button("Copy message", palette, copy_message))
                     .horizontal_alignment(HorizontalAlignment::Left)
+                    .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
                     .content(copy_glyph()),
             ))
         }

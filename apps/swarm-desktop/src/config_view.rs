@@ -1,11 +1,12 @@
-//! WinUI views for the Profiles and Automation screens.
+//! WinUI views for the Settings sections Models and profiles, and
+//! Automation and scripts.
 //!
 //! Profiles: one document draft (the `[profiles.*]` source the daemon
 //! returned) shown both as a few common form fields for the selected profile
-//! and as the full source text; both edit the same text. Validate and Save
-//! go to the daemon, which runs its own parser and launch resolution; an
-//! invalid draft stays here. Automation is read-only: no daemon operation
-//! pauses or resumes a rule or timer.
+//! and, on request, as the full source text; both edit the same text.
+//! Validate and Save go to the daemon, which runs its own parser and launch
+//! resolution; an invalid draft stays here. Automation is read-only: no
+//! daemon operation pauses or resumes a rule or timer.
 
 use windows_reactor::*;
 
@@ -29,34 +30,7 @@ fn short(revision: Option<&str>) -> String {
     )
 }
 
-/// One-line summary of a profile for the launch picker: requested values,
-/// with native defaults named when a field is unset.
-pub fn summary_line(profile: &ProfileSummary) -> String {
-    let mut line = format!(
-        "{} · model {} · effort {} · {} · approval {} · control {}",
-        profile.harness,
-        profile.model.as_deref().unwrap_or("native default"),
-        profile.effort.as_deref().unwrap_or("native default"),
-        profile
-            .permissions
-            .as_deref()
-            .unwrap_or("default permissions"),
-        profile.approval_policy.as_deref().unwrap_or("default"),
-        profile.control.as_deref().unwrap_or("self"),
-    );
-    line.push_str(&match (&profile.proxy, &profile.account) {
-        (Some(proxy), Some(account)) => format!(" · route proxy {proxy}, account {account}"),
-        (Some(proxy), None) => format!(" · route proxy {proxy}"),
-        (None, Some(account)) => format!(" · route direct, account {account}"),
-        (None, None) => " · route direct".to_owned(),
-    });
-    if let Some(error) = &profile.error {
-        line.push_str(&format!("\nNot launchable now: {error}"));
-    }
-    line
-}
-
-/// State the Profiles screen renders.
+/// State the Models and profiles section renders.
 pub struct ProfilesData<'a> {
     pub revision: Option<&'a str>,
     pub file_valid: bool,
@@ -72,9 +46,11 @@ pub struct ProfilesData<'a> {
     pub status: &'a str,
     pub busy: bool,
     pub summaries: &'a [ProfileSummary],
+    /// The TOML source editor is shown.
+    pub source_open: bool,
 }
 
-/// Callbacks the Profiles screen emits.
+/// Callbacks the Models and profiles section emits.
 pub struct ProfilesActions {
     pub draft_changed: Callback<String>,
     pub select: Callback<Option<usize>>,
@@ -84,97 +60,142 @@ pub struct ProfilesActions {
     pub validate: Callback<()>,
     pub save: Callback<()>,
     pub reload: Callback<()>,
+    pub toggle_source: Callback<()>,
 }
 
+/// Form labels of [`FORM_FIELDS`].
+fn field_label(key: &str) -> &str {
+    match key {
+        "model" => "Model",
+        "effort" => "Effort",
+        "permissions" => "Permissions",
+        "approval_policy" => "Approval policy",
+        other => other,
+    }
+}
+
+/// Models and profiles: one row per profile, the selected profile's form,
+/// Save / Validate / Discard, and the full TOML source on request. Form
+/// and source edit one draft.
 pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette: Palette) -> View {
     let names = profiles::profile_names(data.draft);
-    let selected_index = data
-        .selected
-        .and_then(|selected| names.iter().position(|name| name == selected));
-    let saved = format!(
-        "Saved file: revision {}{}",
-        short(data.revision),
-        if data.file_valid {
-            " · valid".to_owned()
-        } else {
-            format!(
-                " · INVALID: {}. New launches fail until it is fixed.",
-                data.file_error.unwrap_or("unparseable")
-            )
-        }
-    );
-    let active = "Active: each launch resolves its profile from the saved file at admission, so a saved edit applies to the next launch. Running Agents keep the settings frozen at their launch unless a configure succeeds.";
-    let draft_state = if !data.editable {
-        format!(
-            "Source view unavailable: {}",
-            data.reason.unwrap_or("not editable")
-        )
-    } else if data.dirty {
-        "Draft: modified, not saved.".to_owned()
-    } else {
-        "Draft: same as the saved file.".to_owned()
-    };
+    let mut rows: Vec<KeyedView> = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let selected = data.selected == Some(name.as_str());
+        let summary = data.summaries.iter().find(|profile| &profile.name == name);
+        let detail = match summary {
+            Some(profile) => {
+                let mut line = format!(
+                    "{} · {} · {}",
+                    profile.harness,
+                    profile.model.as_deref().unwrap_or("default model"),
+                    profile.effort.as_deref().unwrap_or("default effort")
+                );
+                if !profile.launchable {
+                    line.push_str(" · cannot launch now");
+                }
+                line
+            }
+            None => "not saved yet".to_owned(),
+        };
+        let select = actions.select.clone();
+        rows.push(KeyedView::new(
+            format!("{name}:{selected}"),
+            crate::m3::row(palette, selected)
+                .height(48.0)
+                .automation_name(format!("Profile {name}: {detail}"))
+                .on_click(move || {
+                    let _ = select.call(Some(index));
+                })
+                .content(
+                    StackPanel::new()
+                        .spacing(0.0)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .children((
+                            crate::m3::text(name.clone(), theme::type_scale::BODY_MEDIUM),
+                            crate::m3::muted(detail, theme::type_scale::BODY_SMALL)
+                                .text_trimming(TextTrimming::CharacterEllipsis),
+                        )),
+                ),
+        ));
+    }
+    if rows.is_empty() {
+        rows.push(KeyedView::new(
+            "none",
+            small(if data.editable {
+                "No profiles yet: add one in the TOML source."
+            } else {
+                "Reading profiles…"
+            })
+            .opacity(theme::MUTED_OPACITY),
+        ));
+    }
 
-    let mut fields: Vec<KeyedView> = Vec::new();
+    let mut form: Vec<KeyedView> = Vec::new();
     if let Some(name) = data.selected.filter(|_| data.editable) {
-        let summary = data.summaries.iter().find(|profile| profile.name == name);
-        if let Some(summary) = summary {
-            fields.push(KeyedView::new(
-                "saved-summary",
-                small(format!("Saved: {}", summary_line(summary))).opacity(theme::MUTED_OPACITY),
+        form.push(KeyedView::new(
+            "name",
+            crate::m3::text(name.to_owned(), theme::type_scale::TITLE_SMALL),
+        ));
+        if let Some(error) = data
+            .summaries
+            .iter()
+            .find(|profile| profile.name == name)
+            .and_then(|profile| profile.error.as_deref())
+        {
+            form.push(KeyedView::new(
+                "error",
+                small(format!("Cannot launch now: {error}")).foreground(palette.error()),
             ));
         }
         for (index, key) in FORM_FIELDS.iter().enumerate() {
             // Only plain strings round-trip through the form; anything else
-            // is edited in the source view so its value cannot change.
+            // is edited in the source so its value cannot change.
             let (value, editable, hint) = match profiles::field(data.draft, name, key) {
-                profiles::Field::Absent => (
-                    String::new(),
-                    true,
-                    format!("{key} (unset: native default)"),
-                ),
+                profiles::Field::Absent => (String::new(), true, "Harness default".to_owned()),
                 profiles::Field::Simple(value) => (value, true, String::new()),
                 profiles::Field::Complex => (
                     String::new(),
                     false,
-                    "complex value: edit it in the source view".to_owned(),
+                    "Complex value: edit it as TOML".to_owned(),
                 ),
             };
             let callback = actions.field_changed.get(index).cloned();
             let mut field = crate::m3::field(palette)
                 .text(value)
                 .placeholder_text(hint)
-                .automation_name(format!("Profile {key}"))
+                .automation_name(format!("Profile {}", field_label(key)))
                 .is_enabled(!data.busy && editable);
             if let Some(callback) = callback.filter(|_| editable) {
                 field = field.on_text_changed(callback);
             }
-            fields.push(KeyedView::new(
+            form.push(KeyedView::new(
                 format!("field-{key}"),
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::SM)
+                Grid::new()
+                    .columns([GridLength::Pixel(140.0), GridLength::STAR])
                     .children((
-                        small(*key)
-                            .width(120.0)
+                        crate::m3::text(field_label(key), theme::type_scale::BODY_MEDIUM)
                             .vertical_alignment(VerticalAlignment::Center),
-                        field.width(320.0),
+                        field.grid_column(1),
                     )),
             ));
         }
-        fields.push(KeyedView::new(
+        form.push(KeyedView::new(
             "duplicate",
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(theme::spacing::SM)
+            Grid::new()
+                .columns([GridLength::Pixel(140.0), GridLength::STAR, GridLength::Auto])
+                .column_spacing(theme::spacing::SM)
                 .children((
+                    crate::m3::text("Duplicate as", theme::type_scale::BODY_MEDIUM)
+                        .vertical_alignment(VerticalAlignment::Center),
                     crate::m3::field(palette)
+                        .grid_column(1)
                         .text(data.duplicate_name.to_owned())
-                        .placeholder_text("new profile name")
+                        .placeholder_text("New profile name")
                         .automation_name("Duplicate as")
-                        .width(220.0)
                         .on_text_changed(actions.duplicate_name_changed),
                     crate::m3::tonal(palette)
+                        .grid_column(2)
                         .is_enabled(!data.busy)
                         .automation_name("Duplicate profile")
                         .on_click(actions.duplicate)
@@ -182,76 +203,83 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                 )),
         ));
     }
-
-    let source = crate::m3::field(palette)
-        .grid_row(5)
-        .text(data.view.to_owned())
-        .accepts_return(true)
-        .text_wrapping(TextWrapping::NoWrap)
-        .is_enabled(data.editable && !data.busy)
-        .automation_name("Profile source")
-        .on_text_changed(actions.draft_changed);
-
-    Grid::new()
-        .grid_column(1)
-        .rows([
-            GridLength::Auto,
-            GridLength::Auto,
-            GridLength::Auto,
-            GridLength::Auto,
-            GridLength::Auto,
-            GridLength::STAR,
-            GridLength::Auto,
-        ])
-        .row_spacing(theme::spacing::SM)
+    let state = if !data.file_valid {
+        format!(
+            "The saved file does not parse: {}. New tasks cannot start until it is fixed.",
+            data.file_error.unwrap_or("unparseable")
+        )
+    } else if !data.editable {
+        format!("Not editable: {}", data.reason.unwrap_or("not editable"))
+    } else if data.dirty {
+        "Unsaved changes. Running Agents keep the settings they started with.".to_owned()
+    } else {
+        format!(
+            "Saved (revision {}). The next task uses these settings.",
+            short(data.revision)
+        )
+    };
+    let actions_row = StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(theme::spacing::SM)
         .children((
-            StackPanel::new().grid_row(0).spacing(2.0).children((
-                crate::m3::title("Profiles", theme::type_scale::TITLE_LARGE),
-                small(saved),
-                small(active).opacity(theme::MUTED_OPACITY),
+            crate::m3::filled(palette)
+                .is_enabled(data.editable && data.dirty && !data.busy)
+                .on_click(actions.save)
+                .content(TextBlock::new().text("Save")),
+            crate::m3::text_button(palette)
+                .is_enabled(data.editable && !data.busy)
+                .on_click(actions.validate)
+                .content(TextBlock::new().text("Validate")),
+            crate::m3::text_button(palette)
+                .is_enabled(data.dirty && !data.busy)
+                .automation_name("Discard changes")
+                .on_click(actions.reload)
+                .content(TextBlock::new().text("Discard changes")),
+            crate::m3::text_button(palette)
+                .automation_name(if data.source_open {
+                    "Hide the TOML source"
+                } else {
+                    "Edit as TOML"
+                })
+                .on_click(actions.toggle_source)
+                .content(TextBlock::new().text(if data.source_open {
+                    "Hide TOML"
+                } else {
+                    "Edit as TOML"
+                })),
+        ));
+    let source: View = if data.source_open {
+        crate::m3::field(palette)
+            .text(data.view.to_owned())
+            .accepts_return(true)
+            .text_wrapping(TextWrapping::NoWrap)
+            .is_enabled(data.editable && !data.busy)
+            .automation_name("Profile source")
+            .min_height(240.0)
+            .on_text_changed(actions.draft_changed)
+            .into()
+    } else {
+        View::empty()
+    };
+    ScrollViewer::new()
+        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+        .content(
+            StackPanel::new().spacing(theme::spacing::SM).children((
+                crate::m3::card(palette)
+                    .padding(Thickness::uniform(theme::spacing::SM))
+                    .content(StackPanel::new().spacing(2.0).keyed_children(rows)),
+                crate::m3::card(palette).content(
+                    StackPanel::new()
+                        .spacing(theme::spacing::SM)
+                        .keyed_children(form),
+                ),
+                small(state).opacity(theme::MUTED_OPACITY),
+                actions_row,
+                source,
+                small(data.status.to_owned()),
             )),
-            StackPanel::new()
-                .grid_row(1)
-                .orientation(Orientation::Horizontal)
-                .spacing(theme::spacing::SM)
-                .children((
-                    small("Profile")
-                        .width(60.0)
-                        .vertical_alignment(VerticalAlignment::Center),
-                    ComboBox::new()
-                        .items_source(names)
-                        .selected_index(selected_index)
-                        .placeholder_text("Select a profile")
-                        .automation_name("Edited profile")
-                        .on_selection_changed(actions.select),
-                )),
-            StackPanel::new()
-                .grid_row(2)
-                .spacing(theme::spacing::XS)
-                .keyed_children(fields),
-            small(draft_state).grid_row(3),
-            StackPanel::new()
-                .grid_row(4)
-                .orientation(Orientation::Horizontal)
-                .spacing(theme::spacing::SM)
-                .children((
-                    crate::m3::tonal(palette)
-                        .is_enabled(data.editable && !data.busy)
-                        .on_click(actions.validate)
-                        .content(TextBlock::new().text("Validate")),
-                    crate::m3::filled(palette)
-                        .is_enabled(data.editable && data.dirty && !data.busy)
-                        .on_click(actions.save)
-                        .content(TextBlock::new().text("Save")),
-                    crate::m3::tonal(palette)
-                        .is_enabled(!data.busy)
-                        .automation_name("Reload saved profiles")
-                        .on_click(actions.reload)
-                        .content(TextBlock::new().text("Reload (discard draft)")),
-                )),
-            source,
-            small(data.status.to_owned()).grid_row(6),
-        ))
+        )
+        .into()
 }
 
 fn utc(ms: i64) -> String {
@@ -341,6 +369,22 @@ pub struct RuleNamespace {
     pub more: bool,
 }
 
+/// A card's heading row: the title and an optional action on the right.
+fn card_heading(title: &str, action: Option<View>) -> View {
+    Grid::new()
+        .columns([GridLength::STAR, GridLength::Auto])
+        .children((
+            crate::m3::text(title, theme::type_scale::TITLE_SMALL)
+                .automation_heading_level(AutomationHeadingLevel::Level3)
+                .vertical_alignment(VerticalAlignment::Center),
+            Border::new()
+                .grid_column(1)
+                .content(action.unwrap_or_else(View::empty)),
+        ))
+        .into()
+}
+
+/// Rules and timers of every namespace, read-only.
 pub fn automation_screen(
     namespaces: &[RuleNamespace],
     status: &str,
@@ -349,29 +393,21 @@ pub fn automation_screen(
 ) -> View {
     let mut rows: Vec<KeyedView> = Vec::new();
     for namespace in namespaces {
-        rows.push(KeyedView::new(
-            format!("ns-{}", namespace.label),
-            TextBlock::new()
-                .text(namespace.label.clone())
-                .font_weight(FontWeight::SEMI_BOLD),
-        ));
         match &namespace.rules {
-            Ok(rules) if rules.is_empty() => rows.push(KeyedView::new(
-                format!("empty-{}", namespace.label),
-                small("No rules or timers in this namespace.").opacity(theme::MUTED_OPACITY),
-            )),
+            Ok(rules) if rules.is_empty() => {}
             Ok(rules) => {
+                rows.push(KeyedView::new(
+                    format!("ns-{}", namespace.label),
+                    crate::m3::muted(namespace.label.clone(), theme::type_scale::LABEL_MEDIUM),
+                ));
                 for entry in rules {
-                    let lines = rule_lines(entry);
                     rows.push(KeyedView::new(
                         format!("{}/{}", namespace.label, entry.state.id),
                         Border::new()
-                            .background(palette.card())
-                            .border_brush(palette.outline_variant())
-                            .border_thickness(1.0)
+                            .background(palette.raised())
                             .corner_radius(theme::shape::SM)
                             .padding(Thickness::uniform(theme::spacing::SM))
-                            .content(small(lines.join("\n"))),
+                            .content(small(rule_lines(entry).join("\n"))),
                     ));
                 }
                 if namespace.more {
@@ -383,43 +419,51 @@ pub fn automation_screen(
             }
             Err(error) => rows.push(KeyedView::new(
                 format!("error-{}", namespace.label),
-                small(format!("rule.list failed: {error}")).foreground(palette.error()),
+                small(format!("{}: not read ({error})", namespace.label))
+                    .foreground(palette.error()),
             )),
         }
     }
-    Grid::new()
-        .grid_column(1)
-        .rows([GridLength::Auto, GridLength::STAR])
-        .row_spacing(theme::spacing::SM)
-        .children((
-            StackPanel::new().grid_row(0).spacing(2.0).children((
-                crate::m3::title("Automation", theme::type_scale::TITLE_LARGE),
-                small("Read-only. No daemon operation pauses or resumes a rule or timer: `enabled` comes from the rule file, and `paused` is set by the daemon (backlog). Edit rules in <data_dir>/rules/*.toml; the watcher keeps the last valid definition on a bad edit.").opacity(theme::MUTED_OPACITY),
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::SM)
-                    .children((
-                        crate::m3::tonal(palette)
+    if rows.is_empty() {
+        rows.push(KeyedView::new(
+            "none",
+            small(if status.is_empty() || status.starts_with("Reading") {
+                "Reading…"
+            } else {
+                "No rules or timers."
+            })
+            .opacity(theme::MUTED_OPACITY),
+        ));
+    }
+    crate::m3::card(palette)
+        .content(
+            StackPanel::new().spacing(theme::spacing::SM).children((
+                card_heading(
+                    "Rules and timers",
+                    Some(
+                        crate::m3::text_button(palette)
+                            .automation_name("Refresh rules")
                             .on_click(refresh)
                             .content(TextBlock::new().text("Refresh")),
-                        small(status.to_owned()),
-                    )),
-            )),
-            ScrollViewer::new()
-                .grid_row(1)
-                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                .automation_name("Rules and timers")
-                .content(
-                    StackPanel::new()
-                        .spacing(theme::spacing::SM)
-                        .max_width(theme::layout::READING_WIDTH)
-                        .horizontal_alignment(HorizontalAlignment::Left)
-                        .keyed_children(rows),
+                    ),
                 ),
-        ))
+                small("Read-only here. Rules live in <data_dir>/rules/*.toml and reload when the file changes.")
+                    .opacity(theme::MUTED_OPACITY),
+                ScrollViewer::new()
+                    .max_height(180.0)
+                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                    .automation_name("Rules and timers")
+                    .content(
+                        StackPanel::new()
+                            .spacing(theme::spacing::SM)
+                            .keyed_children(rows),
+                    ),
+            )),
+        )
+        .into()
 }
 
-/// State the Scripts screen renders.
+/// State the Scripts card renders.
 pub struct ScriptsData<'a> {
     pub labels: Vec<String>,
     pub unavailable: &'a [String],
@@ -439,7 +483,7 @@ pub struct ScriptsData<'a> {
     pub run_busy: bool,
 }
 
-/// Callbacks the Scripts screen emits; `run` has one entry per timer.
+/// Callbacks the Scripts card emits; `run` has one entry per timer.
 pub struct ScriptsActions {
     pub select: Callback<Option<usize>>,
     pub draft_changed: Callback<String>,
@@ -452,135 +496,147 @@ pub struct ScriptsActions {
     pub run: Vec<Callback<()>>,
 }
 
+/// Scripts: pick an entry, edit it (Save replaces the file only while its
+/// revision matches; saving never runs it), open it in an editor, or run
+/// it through a timer that names it.
 pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: Palette) -> View {
     let selected = data.selected.is_some();
-    let meta = match (data.display_path, data.revision) {
-        (Some(path), Some(revision)) => format!(
-            "{path} · revision {}",
-            revision.chars().take(12).collect::<String>()
-        ),
-        _ => "Select a script entry.".to_owned(),
-    };
-    let draft_state = if !selected {
-        String::new()
-    } else if !data.editable {
-        format!(
-            "Not editable here: {}",
-            data.reason.unwrap_or("withheld by the daemon")
-        )
-    } else if data.dirty {
-        "Draft: modified, not saved. Saving never runs the script.".to_owned()
+    let refresh = crate::m3::text_button(palette)
+        .automation_name("Refresh script list")
+        .on_click(actions.refresh)
+        .content(TextBlock::new().text("Refresh"));
+    let mut parts: Vec<KeyedView> = vec![KeyedView::new(
+        "heading",
+        card_heading("Scripts", Some(refresh)),
+    )];
+    let no_entries = data.labels.is_empty();
+    if no_entries {
+        parts.push(KeyedView::new(
+            "none",
+            small(
+                "No scripts. Add files under <data_dir>/scripts/ or a project's .eliot/scripts/.",
+            )
+            .opacity(theme::MUTED_OPACITY),
+        ));
     } else {
-        "Draft: same as the saved file.".to_owned()
-    };
-    let mut runs: Vec<KeyedView> = Vec::new();
-    if selected && data.timers.is_empty() {
-        runs.push(KeyedView::new(
-            "no-timer",
-            small("Run: no timer's run action names this script. Add one to <data_dir>/rules/*.toml (for example a once timer) to run it through the daemon's Run path.")
+        parts.push(KeyedView::new(
+            format!("entries:{}", data.labels.join("\u{1f}")),
+            ComboBox::new()
+                .items_source(data.labels)
+                .selected_index(data.selected)
+                .placeholder_text("Choose a script")
+                .automation_name("Script entry")
+                .min_width(320.0)
+                .on_selection_changed(actions.select),
+        ));
+    }
+    if !data.unavailable.is_empty() {
+        parts.push(KeyedView::new(
+            "unavailable",
+            small(format!("Not readable: {}", data.unavailable.join("; ")))
                 .opacity(theme::MUTED_OPACITY),
         ));
     }
-    for (index, (timer, callback)) in data.timers.iter().zip(actions.run).enumerate() {
-        runs.push(KeyedView::new(
-            format!("run-{index}"),
-            crate::m3::tonal(palette)
-                .is_enabled(!data.run_busy && !data.dirty)
-                .automation_name(format!("Run via timer {timer}"))
-                .on_click(callback)
-                .content(TextBlock::new().text(format!("Run via timer {timer}"))),
+    if selected {
+        let state = match (data.display_path, data.revision) {
+            _ if !data.editable => format!(
+                "Not editable here: {}",
+                data.reason.unwrap_or("withheld by the daemon")
+            ),
+            (Some(path), _) if data.dirty => format!("{path} · unsaved changes"),
+            (Some(path), Some(revision)) => format!(
+                "{path} · saved (revision {})",
+                revision.chars().take(12).collect::<String>()
+            ),
+            _ => String::new(),
+        };
+        parts.push(KeyedView::new(
+            "state",
+            small(state).opacity(theme::MUTED_OPACITY),
         ));
-    }
-    if !data.run_status.is_empty() {
-        runs.push(KeyedView::new(
-            "run-status",
-            small(data.run_status.to_owned()),
-        ));
-    }
-    let unavailable = if data.unavailable.is_empty() {
-        String::new()
-    } else {
-        format!("Unavailable roots: {}", data.unavailable.join("; "))
-    };
-    Grid::new()
-        .grid_column(1)
-        .rows([
-            GridLength::Auto,
-            GridLength::Auto,
-            GridLength::Auto,
-            GridLength::Auto,
-            GridLength::Auto,
-            GridLength::STAR,
-            GridLength::Auto,
-        ])
-        .row_spacing(theme::spacing::SM)
-        .children((
-            StackPanel::new().grid_row(0).spacing(2.0).children((
-                crate::m3::title("Scripts", theme::type_scale::TITLE_LARGE),
-                small("Existing entries under <data_dir>/scripts/ and registered .eliot/scripts/. Save replaces the file only when its revision still matches; Run goes through a timer's run action, with the daemon's custody, timeout and unknown-outcome rules.").opacity(theme::MUTED_OPACITY),
-                small(unavailable).opacity(theme::MUTED_OPACITY),
-            )),
+        parts.push(KeyedView::new(
+            "actions",
             StackPanel::new()
-                .grid_row(1)
                 .orientation(Orientation::Horizontal)
                 .spacing(theme::spacing::SM)
                 .children((
-                    ComboBox::new()
-                        .items_source(data.labels)
-                        .selected_index(data.selected)
-                        .placeholder_text("Script entry")
-                        .automation_name("Script entry")
-                        .on_selection_changed(actions.select),
-                    crate::m3::tonal(palette)
-                        .automation_name("Refresh script list")
-                        .on_click(actions.refresh)
-                        .content(TextBlock::new().text("Refresh")),
-                )),
-            small(format!("{meta}\n{draft_state}")).grid_row(2),
-            StackPanel::new()
-                .grid_row(3)
-                .orientation(Orientation::Horizontal)
-                .spacing(theme::spacing::SM)
-                .children((
-                    crate::m3::tonal(palette)
-                        .is_enabled(data.editable && !data.busy)
-                        .automation_name("Validate script")
-                        .on_click(actions.validate)
-                        .content(TextBlock::new().text("Validate")),
                     crate::m3::filled(palette)
                         .is_enabled(data.editable && data.dirty && !data.busy)
                         .automation_name("Save script")
                         .on_click(actions.save)
                         .content(TextBlock::new().text("Save")),
-                    crate::m3::tonal(palette)
-                        .is_enabled(selected && !data.busy)
-                        .automation_name("Reload script")
+                    crate::m3::text_button(palette)
+                        .is_enabled(data.editable && !data.busy)
+                        .automation_name("Validate script")
+                        .on_click(actions.validate)
+                        .content(TextBlock::new().text("Validate")),
+                    crate::m3::text_button(palette)
+                        .is_enabled(data.dirty && !data.busy)
+                        .automation_name("Discard script changes")
                         .on_click(actions.reload)
-                        .content(TextBlock::new().text("Reload (discard draft)")),
-                    crate::m3::field(palette)
-                        .text(data.editor_exe.to_owned())
-                        .placeholder_text("Editor .exe (absolute path)")
-                        .automation_name("Editor executable")
-                        .width(260.0)
-                        .on_text_changed(actions.editor_changed),
-                    crate::m3::tonal(palette)
-                        .is_enabled(selected && data.display_path.is_some())
-                        .automation_name("Open in editor")
-                        .on_click(actions.open_editor)
-                        .content(TextBlock::new().text("Open in editor")),
+                        .content(TextBlock::new().text("Discard changes")),
                 )),
-            StackPanel::new()
-                .grid_row(4)
-                .spacing(theme::spacing::XS)
-                .keyed_children(runs),
+        ));
+        parts.push(KeyedView::new(
+            "source",
             crate::m3::field(palette)
-                .grid_row(5)
                 .text(data.view.to_owned())
                 .accepts_return(true)
                 .text_wrapping(TextWrapping::NoWrap)
                 .is_enabled(data.editable && !data.busy)
                 .automation_name("Script source")
+                .min_height(200.0)
                 .on_text_changed(actions.draft_changed),
-            small(data.status.to_owned()).grid_row(6),
-        ))
+        ));
+        parts.push(KeyedView::new(
+            "editor",
+            Grid::new()
+                .columns([GridLength::STAR, GridLength::Auto])
+                .column_spacing(theme::spacing::SM)
+                .children((
+                    crate::m3::field(palette)
+                        .text(data.editor_exe.to_owned())
+                        .placeholder_text("Editor .exe (absolute path)")
+                        .automation_name("Editor executable")
+                        .on_text_changed(actions.editor_changed),
+                    crate::m3::text_button(palette)
+                        .grid_column(1)
+                        .is_enabled(data.display_path.is_some())
+                        .automation_name("Open in editor")
+                        .on_click(actions.open_editor)
+                        .content(TextBlock::new().text("Open in editor")),
+                )),
+        ));
+        if data.timers.is_empty() {
+            parts.push(KeyedView::new(
+                "no-timer",
+                small("To run it, add a timer whose run action names it (rules/*.toml).")
+                    .opacity(theme::MUTED_OPACITY),
+            ));
+        }
+        for (index, (timer, callback)) in data.timers.iter().zip(actions.run).enumerate() {
+            parts.push(KeyedView::new(
+                format!("run-{index}"),
+                crate::m3::tonal(palette)
+                    .is_enabled(!data.run_busy && !data.dirty)
+                    .automation_name(format!("Run via timer {timer}"))
+                    .on_click(callback)
+                    .content(TextBlock::new().text(format!("Run via timer {timer}"))),
+            ));
+        }
+    }
+    // With no entries the list status repeats the empty state above.
+    let status = if no_entries { "" } else { data.status };
+    for (key, line) in [("run-status", data.run_status), ("status", status)] {
+        if !line.is_empty() {
+            parts.push(KeyedView::new(key, small(line.to_owned())));
+        }
+    }
+    crate::m3::card(palette)
+        .content(
+            StackPanel::new()
+                .spacing(theme::spacing::SM)
+                .keyed_children(parts),
+        )
+        .into()
 }

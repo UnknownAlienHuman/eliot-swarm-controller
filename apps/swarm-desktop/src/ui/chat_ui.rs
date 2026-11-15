@@ -1340,7 +1340,11 @@ impl DesktopApp {
                         ),
                         m3::chip_static(
                             m3::glyph::PROFILE,
-                            &format!("{} · {}", detail.settings.profile, detail.harness),
+                            &if detail.settings.profile == detail.harness {
+                                detail.harness.clone()
+                            } else {
+                                format!("{} · {}", detail.settings.profile, detail.harness)
+                            },
                         ),
                     )),
                 StackPanel::new()
