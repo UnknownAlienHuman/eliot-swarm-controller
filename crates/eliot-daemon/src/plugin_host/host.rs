@@ -662,15 +662,28 @@ impl PluginHost {
             id: agent.id.clone(),
             generation: agent.generation,
         };
-        let (sender, stderr, credentials) = self.sender(&key, "stop").map_err(|error| {
-            if error.code == "not_found" {
-                // This exact-generation lookup happens before enqueue, so no
-                // native stop was dispatched for the missing runtime.
-                error.with_code("native_not_dispatched")
-            } else {
-                error
+        let (sender, stderr, credentials) = match self.sender(&key, "stop") {
+            Ok(found) => found,
+            Err(error) => {
+                if force && error.code == "not_found" {
+                    // No live runtime entry, but a fenced or stuck actor task
+                    // can still hold the generation Job open with tool
+                    // descendants alive. Terminate the named Job explicitly
+                    // so a forced stop leaves no owned family behind even
+                    // when there is no actor left to terminate. Best effort
+                    // and outcome-neutral: the original error still
+                    // describes the stop.
+                    self.terminate_orphaned_generation_job(agent).await;
+                }
+                return Err(if error.code == "not_found" {
+                    // This exact-generation lookup happens before enqueue, so no
+                    // native stop was dispatched for the missing runtime.
+                    error.with_code("native_not_dispatched")
+                } else {
+                    error
+                });
             }
-        })?;
+        };
         let (reply, response) = oneshot::channel();
         let deadlines = StopDeadlines::new(Instant::now());
         enqueue_stop(
@@ -1052,6 +1065,35 @@ impl PluginHost {
 
     fn remove_plugin_secret(&self, credential: &str) {
         self.state.secrets.lock_recover().remove(credential);
+    }
+
+    /// Best-effort named-Job termination for a force-stop that found no live
+    /// runtime entry. A removed routing entry does not imply a closed Job: the
+    /// actor task can still own it while draining or stuck, keeping tool
+    /// descendants alive after the stop reports not_found. Missing name means
+    /// the generation already closed; anything else is swallowed so the
+    /// original stop outcome stands.
+    async fn terminate_orphaned_generation_job(&self, agent: &Agent) {
+        #[cfg(windows)]
+        {
+            let namespace = match self.state.store.lock().await.custody_namespace() {
+                Ok(namespace) => namespace,
+                Err(_) => return,
+            };
+            let name = crate::platform::custody::agent_custody_name(
+                &namespace,
+                &agent.id,
+                agent.generation,
+            );
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::platform::windows::terminate_named_generation_job(&name)
+            })
+            .await;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = agent;
+        }
     }
 
     async fn mark_reader_unavailable(&self, key: &AgentKey) {

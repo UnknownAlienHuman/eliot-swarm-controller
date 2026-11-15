@@ -1,7 +1,7 @@
 mod start;
 
 use crate::{
-    events::{EventHandle, TurnFacts},
+    events::{EventHandle, TurnFacts, turn_native_error},
     native::{
         NativeClient, NativeLaunch, NativeProcess,
         requests::describe_request,
@@ -2473,16 +2473,19 @@ async fn read_owned_turn(
             turn_id: turn_id.to_owned(),
             status: Some("inProgress".to_owned()),
             final_text: None,
+            native_error: None,
             terminal: false,
         }));
     }
-    // The turn is not the live foreground turn. Prove its terminal state and
-    // final text from the durable-sourced view records, newest first.
+    // The turn is not the live foreground turn. Prove its terminal state,
+    // native failure text and final text from the durable-sourced view
+    // records, newest first.
     let policy = SecretPolicy::new(secrets.iter().cloned());
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
     let mut terminal: Option<String> = None;
     let mut final_text: Option<String> = None;
+    let mut native_error: Option<String> = None;
     for _ in 0..MAX_VIEW_PAGES {
         let response = read_backward_page(client, session_id, cursor.clone()).await?;
         for event in response.events.iter().rev() {
@@ -2493,6 +2496,7 @@ async fn read_owned_turn(
                 &policy,
                 &mut terminal,
                 &mut final_text,
+                &mut native_error,
             )?;
             if terminal.is_some() && final_text.is_some() {
                 break;
@@ -2519,6 +2523,7 @@ async fn read_owned_turn(
         turn_id: turn_id.to_owned(),
         status: Some(status),
         final_text,
+        native_error,
         terminal: true,
     }))
 }
@@ -2533,6 +2538,7 @@ fn observe_view_event(
     policy: &SecretPolicy,
     terminal: &mut Option<String>,
     final_text: &mut Option<String>,
+    native_error: &mut Option<String>,
 ) -> Result<()> {
     match event.method.as_str() {
         "turn/completed" => {
@@ -2558,6 +2564,12 @@ fn observe_view_event(
                         ));
                     }
                 });
+                // The durable view record carries the same failure text the
+                // live terminal commits: keep the first record's text so the
+                // readback surfaces the native reason an empty turn hides.
+                if native_error.is_none() {
+                    *native_error = turn_native_error(&completed, policy);
+                }
             }
         }
         "item/completed" => {

@@ -367,7 +367,7 @@ pub enum RestartCustody {
 }
 
 #[cfg(windows)]
-fn agent_custody_name(namespace: &str, agent: &str, generation: i64) -> String {
+pub(crate) fn agent_custody_name(namespace: &str, agent: &str, generation: i64) -> String {
     // Global, not session-local: a daemon restarted in another logon session
     // must not mistake a still-live Job for a missing one.
     format!("Global\\eliot-{namespace}-{agent}-{generation}")
@@ -596,6 +596,74 @@ mod leaf_tests {
 
 fn io_error(action: &str, error: std::io::Error) -> Error {
     Error::new("platform_io", format!("{action}: {error}"))
+}
+
+#[cfg(all(test, windows))]
+mod named_job_tests {
+    use super::super::windows;
+    use super::{OwnedChild, agent_custody_name};
+    use std::{path::PathBuf, process::Stdio, time::Duration};
+    use tokio::{process::Command, time::timeout};
+
+    fn sleeper() -> Command {
+        let system_root =
+            PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"));
+        let shell = system_root
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        assert!(shell.is_file(), "fixture shell must exist");
+        let mut command = Command::new(&shell);
+        command
+            .arg("-NoProfile")
+            .arg("-Command")
+            .arg("Start-Sleep 30")
+            .env_clear()
+            .env("SystemRoot", &system_root)
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
+
+    // The missing-entry force-stop path terminates the generation family by
+    // its recorded name without holding the OwnedChild handle: a fenced or
+    // stuck actor can keep the named Job open after its routing entry is
+    // gone, and an absent name must report nothing to terminate.
+    #[tokio::test]
+    async fn missing_entry_force_stop_terminates_named_job_family() {
+        let namespace = format!("test-{}", ulid::Ulid::new());
+        let name = agent_custody_name(&namespace, "a9", 7);
+        assert!(
+            windows::named_job_closed(&name).expect("probe absent job"),
+            "fresh test custody name must not exist"
+        );
+        assert!(
+            !windows::terminate_named_generation_job(&name).expect("terminate absent job"),
+            "absent custody name terminates nothing"
+        );
+        let mut child =
+            OwnedChild::spawn_agent(sleeper(), &namespace, "a9", 7).expect("spawn named family");
+        assert!(
+            !windows::named_job_closed(&name).expect("probe live job"),
+            "spawned family must hold its named Job open"
+        );
+        assert!(
+            windows::terminate_named_generation_job(&name).expect("terminate named family"),
+            "live named Job must terminate and drain"
+        );
+        assert!(
+            windows::named_job_closed(&name).expect("probe terminated job"),
+            "terminated family must leave no named Job"
+        );
+        timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("family deadline")
+            .expect("family exit");
+        drop(child);
+    }
 }
 
 #[cfg(all(test, any(windows, target_os = "linux")))]
