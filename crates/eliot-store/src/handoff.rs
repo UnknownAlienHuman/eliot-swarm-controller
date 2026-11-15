@@ -77,225 +77,13 @@ impl Store {
         policy: &core::SecretPolicy,
         now: i64,
     ) -> Result<HandoffAdmission> {
-        request.validate()?;
-        if principal != "owner" {
-            return Err(Error::new("not_allowed", "only Owner may hand off tasks"));
-        }
-        let payload = serde_json::to_value(request)
-            .map_err(|_| Error::new("internal", "cannot encode handoff"))?;
-        let digest = canonical::digest(&payload)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        // Resolve the immutable operation binding before all mutable Agent/history gates.
-        if let Some((old_principal, method, old_digest)) = command_binding(&tx, &request.id)? {
-            if old_principal != principal || method != METHOD || old_digest != digest {
-                return Err(Error::new("id_conflict", "handoff id has another binding"));
-            }
-            let parent = load_command(&tx, &request.id)?
-                .ok_or_else(|| Error::new("source_integrity", "handoff parent missing"))?;
-            let value: HandoffResponse = serde_json::from_value(
-                parent
-                    .outcome
-                    .ok_or_else(|| Error::new("source_integrity", "handoff result missing"))?,
-            )
-            .map_err(|_| Error::new("source_integrity", "handoff result malformed"))?;
-            request.validate_response(&value)?;
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(HandoffAdmission {
-                value,
-                events: Vec::new(),
-                is_new: false,
-            });
-        }
-        if write_exists(&tx, &request.id)? || digest_id_bound(&tx, &request.id)? {
-            return Err(Error::new(
-                "id_conflict",
-                "handoff id is used by another write",
-            ));
-        }
-        validate_id_age(&request.id, now)?;
-        if request.commands.len() as i64 > self.hierarchy_limits.max_selector_targets {
-            return Err(Error::new(
-                "fanout_limit",
-                "handoff selection exceeds configured bound",
-            ));
-        }
-        let from = load_agent_by_num(&tx, parse_agent_id(&request.from)?)?
-            .ok_or_else(|| Error::new("not_found", "source Agent missing"))?;
-        let to = load_agent_by_num(&tx, parse_agent_id(&request.to)?)?
-            .ok_or_else(|| Error::new("not_found", "destination Agent missing"))?;
-        if from.generation != request.from_generation || to.generation != request.to_generation {
-            return Err(Error::new("stale_generation", "handoff generation moved"));
-        }
-        if from.project != to.project {
-            return Err(Error::new(
-                "not_allowed",
-                "handoff must stay in one project",
-            ));
-        }
-        quiescent(&tx, &from, false)?;
-        quiescent(&tx, &to, true)?;
-        let task = load_command(&tx, &request.task_command)?
-            .ok_or_else(|| Error::new("not_found", "original task is not retained"))?;
-        if task.verb != "send"
-            || task.target.as_deref() != Some(&from.id)
-            || task.generation != Some(from.generation)
-        {
-            return Err(Error::new(
-                "invalid",
-                "original task must be a SEND on A's exact generation",
-            ));
-        }
-        let mut originals = Vec::new();
-        for id in &request.commands {
-            let record = load_command_record(&tx, id)?
-                .ok_or_else(|| Error::new("not_found", "selected SEND is not retained"))?;
-            let c = &record.command;
-            if c.verb != "send"
-                || c.target.as_deref() != Some(&from.id)
-                || c.generation != Some(from.generation)
-                || !matches!(c.state, CommandState::Accepted | CommandState::Queued)
-                || c.turn_id.is_some()
-                || record.expected_turn_id.is_some()
-                || c.request_id.is_some()
-                || c.probe
-                || c.selector.is_some()
-                || c.args
-                    .as_object()
-                    .is_none_or(|args| args.len() != 1 || !args.contains_key("text"))
-            {
-                return Err(Error::new(
-                    "bad_state",
-                    "selected work is not an undispatched plain SEND on A",
-                ));
-            }
-            if policy.contains_value(&c.args) {
-                return Err(Error::new(
-                    "secret_in_payload",
-                    "successor input contains a known secret",
-                ));
-            }
-            originals.push(record.command);
-        }
-        let (brief_text, brief_truncated) = brief::build(&tx, request, &task, policy)?;
-        let mut events = Vec::new();
-        let (claims, claim_conflicts, conflicts_truncated) =
-            attribution::transfer_claims_tx(&tx, &from, &to, policy, now, &mut events)?;
-        let goal_revision = goals::transfer_goal_tx(&tx, &from, &to, policy, now, &mut events)?;
-        let moved = reparent::reparent_tx(
-            &tx,
-            &ReparentRequest {
-                id: request.id.clone(),
-                agent: None,
-                children_of: Some(from.id.clone()),
-                expected_generation: from.generation,
-                parent: to.id.clone(),
-                parent_generation: to.generation,
-            },
-            self.hierarchy_limits,
-            now,
-        )?;
-        events.extend(moved.events);
-        let brief_command = Ulid::new().to_string();
-        let transfers: Vec<SendTransfer> = originals
-            .iter()
-            .map(|c| SendTransfer {
-                original: c.id.clone(),
-                successor: Ulid::new().to_string(),
-            })
-            .collect();
-        let children = std::iter::once(brief_command.clone())
-            .chain(transfers.iter().map(|t| t.successor.clone()))
-            .collect::<Vec<_>>();
-        let value = HandoffResponse {
-            id: request.id.clone(),
-            from: from.id.clone(),
-            from_generation: from.generation,
-            to: to.id.clone(),
-            to_generation: to.generation,
-            brief_command: brief_command.clone(),
-            children: children.clone(),
-            transfers: transfers.clone(),
-            claims,
-            claim_conflicts,
-            conflicts_truncated,
-            goal_revision,
-            reparented: moved.value.moved,
-            brief_truncated,
-            brief_state: CommandState::Accepted,
-            successor_gate: "queued_until_brief_applied".into(),
-        };
-        let outcome = serde_json::to_value(&value)
-            .map_err(|_| Error::new("internal", "cannot encode handoff result"))?;
-        if encode_json(&outcome)?.len() > MAX_EVENT_BYTES {
-            return Err(Error::new(
-                "frame_too_large",
-                "handoff result exceeds retained command budget",
-            ));
-        }
-        let mut parent = SubmitCommand::new(request.id.clone(), "handoff");
-        parent.args = payload;
-        events.push(admit_command(
-            &tx,
-            &CommandInsert {
-                method: METHOD,
-                state: CommandState::Applied,
-                outcome: Some(&outcome),
-                ..CommandInsert::targetless_admitted(principal, &parent, &digest, now)
-            },
-            json!({"command_id":request.id,"verb":"handoff"}),
-        )?);
-        for (original, transfer) in originals.iter().zip(&transfers) {
-            cancel_pending_command_tx(
-                &tx,
-                parse_agent_id(&from.id)?,
-                from.generation,
-                &original.id,
-                "handoff_no_effect",
-                now,
-                &mut events,
-            )?;
-            tx.execute("UPDATE commands SET outcome=?1 WHERE id=?2",params![encode_json(&json!({"reason":"handoff_no_effect","no_effect":true,"handoff":request.id,"successor":transfer.successor}))?,original.id]).map_err(sql_error)?;
-        }
-        for (ordinal, id) in children.iter().enumerate() {
-            let mut child = SubmitCommand::new(id.clone(), "send");
-            child.target = Some(to.id.clone());
-            child.expected_generation = Some(to.generation);
-            child.args = if ordinal == 0 {
-                json!({"text":brief_text})
-            } else {
-                originals[ordinal - 1].args.clone()
-            };
-            let child_digest = admission::command_payload_digest(&child)?;
-            admission::admit_send_member(
-                &tx,
-                principal,
-                &child,
-                &child_digest,
-                &to,
-                now,
-                &mut events,
-            )?;
-            tx.execute(
-                "UPDATE commands SET parent_command=?1,link_kind='handoff',ordinal=?2 WHERE id=?3",
-                params![request.id, ordinal as i64, id],
-            )
-            .map_err(sql_error)?;
-        }
-        refresh_parent_tx(&tx, &brief_command, now)?;
-        let parent = load_command(&tx, &request.id)?
-            .ok_or_else(|| Error::new("internal", "handoff parent disappeared"))?;
-        let value = serde_json::from_value(parent.outcome.unwrap())
-            .map_err(|_| Error::new("internal", "handoff result malformed"))?;
-        request.validate_response(&value)?;
+        let change = handoff_tx(&tx, principal, request, policy, now, self.hierarchy_limits)?;
         commit_transaction(tx, &self.write_faulted)?;
-        Ok(HandoffAdmission {
-            value,
-            events,
-            is_new: true,
-        })
+        Ok(change)
     }
 
     /// Owner withdrawal of one undispatched handoff input, never a native cancel.
@@ -394,7 +182,223 @@ impl Store {
     }
 }
 
-fn quiescent(tx: &Transaction<'_>, agent: &Agent, destination: bool) -> Result<()> {
+/// Shared transfer transaction. Caller commits, or rolls back the entire transfer.
+pub(super) fn handoff_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: &HandoffRequest,
+    policy: &core::SecretPolicy,
+    now: i64,
+    limits: core::api::HierarchyLimits,
+) -> Result<HandoffAdmission> {
+    request.validate()?;
+    if principal != "owner" {
+        return Err(Error::new("not_allowed", "only Owner may hand off tasks"));
+    }
+    let payload = serde_json::to_value(request)
+        .map_err(|_| Error::new("internal", "cannot encode handoff"))?;
+    let digest = canonical::digest(&payload)?;
+    // Resolve the immutable operation binding before all mutable Agent/history gates.
+    if let Some((old_principal, method, old_digest)) = command_binding(tx, &request.id)? {
+        if old_principal != principal || method != METHOD || old_digest != digest {
+            return Err(Error::new("id_conflict", "handoff id has another binding"));
+        }
+        let parent = load_command(tx, &request.id)?
+            .ok_or_else(|| Error::new("source_integrity", "handoff parent missing"))?;
+        let value: HandoffResponse = serde_json::from_value(
+            parent
+                .outcome
+                .ok_or_else(|| Error::new("source_integrity", "handoff result missing"))?,
+        )
+        .map_err(|_| Error::new("source_integrity", "handoff result malformed"))?;
+        request.validate_response(&value)?;
+        return Ok(HandoffAdmission {
+            value,
+            events: Vec::new(),
+            is_new: false,
+        });
+    }
+    if write_exists(tx, &request.id)? || digest_id_bound(tx, &request.id)? {
+        return Err(Error::new(
+            "id_conflict",
+            "handoff id is used by another write",
+        ));
+    }
+    validate_id_age(&request.id, now)?;
+    if request.commands.len() as i64 > limits.max_selector_targets {
+        return Err(Error::new(
+            "fanout_limit",
+            "handoff selection exceeds configured bound",
+        ));
+    }
+    let from = load_agent_by_num(tx, parse_agent_id(&request.from)?)?
+        .ok_or_else(|| Error::new("not_found", "source Agent missing"))?;
+    let to = load_agent_by_num(tx, parse_agent_id(&request.to)?)?
+        .ok_or_else(|| Error::new("not_found", "destination Agent missing"))?;
+    if from.generation != request.from_generation || to.generation != request.to_generation {
+        return Err(Error::new("stale_generation", "handoff generation moved"));
+    }
+    if from.project != to.project {
+        return Err(Error::new(
+            "not_allowed",
+            "handoff must stay in one project",
+        ));
+    }
+    quiescent(tx, &from, false)?;
+    quiescent(tx, &to, true)?;
+    let task = load_command(tx, &request.task_command)?
+        .ok_or_else(|| Error::new("not_found", "original task is not retained"))?;
+    if task.verb != "send"
+        || task.target.as_deref() != Some(&from.id)
+        || task.generation != Some(from.generation)
+    {
+        return Err(Error::new(
+            "invalid",
+            "original task must be a SEND on A's exact generation",
+        ));
+    }
+    let mut originals = Vec::new();
+    for id in &request.commands {
+        let record = load_command_record(tx, id)?
+            .ok_or_else(|| Error::new("not_found", "selected SEND is not retained"))?;
+        let c = &record.command;
+        if c.verb != "send"
+            || c.target.as_deref() != Some(&from.id)
+            || c.generation != Some(from.generation)
+            || !matches!(c.state, CommandState::Accepted | CommandState::Queued)
+            || c.turn_id.is_some()
+            || record.expected_turn_id.is_some()
+            || c.request_id.is_some()
+            || c.probe
+            || c.selector.is_some()
+            || c.args
+                .as_object()
+                .is_none_or(|args| args.len() != 1 || !args.contains_key("text"))
+        {
+            return Err(Error::new(
+                "bad_state",
+                "selected work is not an undispatched plain SEND on A",
+            ));
+        }
+        if policy.contains_value(&c.args) {
+            return Err(Error::new(
+                "secret_in_payload",
+                "successor input contains a known secret",
+            ));
+        }
+        originals.push(record.command);
+    }
+    let (brief_text, brief_truncated) = brief::build(tx, request, &task, policy)?;
+    let mut events = Vec::new();
+    let (claims, claim_conflicts, conflicts_truncated) =
+        attribution::transfer_claims_tx(tx, &from, &to, policy, now, &mut events)?;
+    let goal_revision = goals::transfer_goal_tx(tx, &from, &to, policy, now, &mut events)?;
+    let moved = reparent::reparent_tx(
+        tx,
+        &ReparentRequest {
+            id: request.id.clone(),
+            agent: None,
+            children_of: Some(from.id.clone()),
+            expected_generation: from.generation,
+            parent: to.id.clone(),
+            parent_generation: to.generation,
+        },
+        limits,
+        now,
+    )?;
+    events.extend(moved.events);
+    let brief_command = Ulid::new().to_string();
+    let transfers: Vec<SendTransfer> = originals
+        .iter()
+        .map(|c| SendTransfer {
+            original: c.id.clone(),
+            successor: Ulid::new().to_string(),
+        })
+        .collect();
+    let children = std::iter::once(brief_command.clone())
+        .chain(transfers.iter().map(|t| t.successor.clone()))
+        .collect::<Vec<_>>();
+    let value = HandoffResponse {
+        id: request.id.clone(),
+        from: from.id.clone(),
+        from_generation: from.generation,
+        to: to.id.clone(),
+        to_generation: to.generation,
+        brief_command: brief_command.clone(),
+        children: children.clone(),
+        transfers: transfers.clone(),
+        claims,
+        claim_conflicts,
+        conflicts_truncated,
+        goal_revision,
+        reparented: moved.value.moved,
+        brief_truncated,
+        brief_state: CommandState::Accepted,
+        successor_gate: "queued_until_brief_applied".into(),
+    };
+    let outcome = serde_json::to_value(&value)
+        .map_err(|_| Error::new("internal", "cannot encode handoff result"))?;
+    if encode_json(&outcome)?.len() > MAX_EVENT_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "handoff result exceeds retained command budget",
+        ));
+    }
+    let mut parent = SubmitCommand::new(request.id.clone(), "handoff");
+    parent.args = payload;
+    events.push(admit_command(
+        tx,
+        &CommandInsert {
+            method: METHOD,
+            state: CommandState::Applied,
+            outcome: Some(&outcome),
+            ..CommandInsert::targetless_admitted(principal, &parent, &digest, now)
+        },
+        json!({"command_id":request.id,"verb":"handoff"}),
+    )?);
+    for (original, transfer) in originals.iter().zip(&transfers) {
+        cancel_pending_command_tx(
+            tx,
+            parse_agent_id(&from.id)?,
+            from.generation,
+            &original.id,
+            "handoff_no_effect",
+            now,
+            &mut events,
+        )?;
+        tx.execute("UPDATE commands SET outcome=?1 WHERE id=?2",params![encode_json(&json!({"reason":"handoff_no_effect","no_effect":true,"handoff":request.id,"successor":transfer.successor}))?,original.id]).map_err(sql_error)?;
+    }
+    for (ordinal, id) in children.iter().enumerate() {
+        let mut child = SubmitCommand::new(id.clone(), "send");
+        child.target = Some(to.id.clone());
+        child.expected_generation = Some(to.generation);
+        child.args = if ordinal == 0 {
+            json!({"text":brief_text})
+        } else {
+            originals[ordinal - 1].args.clone()
+        };
+        let child_digest = admission::command_payload_digest(&child)?;
+        admission::admit_send_member(tx, principal, &child, &child_digest, &to, now, &mut events)?;
+        tx.execute(
+            "UPDATE commands SET parent_command=?1,link_kind='handoff',ordinal=?2 WHERE id=?3",
+            params![request.id, ordinal as i64, id],
+        )
+        .map_err(sql_error)?;
+    }
+    refresh_parent_tx(tx, &brief_command, now)?;
+    let parent = load_command(tx, &request.id)?
+        .ok_or_else(|| Error::new("internal", "handoff parent disappeared"))?;
+    let value = serde_json::from_value(parent.outcome.unwrap())
+        .map_err(|_| Error::new("internal", "handoff result malformed"))?;
+    request.validate_response(&value)?;
+    Ok(HandoffAdmission {
+        value,
+        events,
+        is_new: true,
+    })
+}
+
+pub(super) fn quiescent(tx: &Transaction<'_>, agent: &Agent, destination: bool) -> Result<()> {
     observer::require_controlled(agent)?;
     let num = parse_agent_id(&agent.id)?;
     if agent.state != AgentState::Idle

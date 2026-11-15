@@ -113,6 +113,7 @@ const METHODS: &[Method] = &[
     method!("swarm.wait", SwarmWaitRequest, SwarmWaitResponse, false, false, "Wait up to 30 seconds for a frozen set of child commands/turns with all/any semantics.", {"commands":[EXAMPLE_ID],"turns":[],"mode":"all","wait_ms":1000}),
     method!("swarm.digest", SwarmDigestRequest, SwarmDigestResponse, false, true, "Register a durable completion digest delivering one coalesced parent mailbox result with the standard mail wake.", {"id":EXAMPLE_ID,"to":"a1","mode":"all","commands":[EXAMPLE_ID],"turns":[]}),
     method!("swarm.reparent", ReparentRequest, ReparentResponse, true, true, "Atomically move one Agent subtree or all children to a controlled manager; Owner only, frozen profiles unchanged.", {"id":EXAMPLE_ID,"agent":"a2","expected_generation":1,"parent":"a3","parent_generation":1}),
+    method!("swarm.switch", SwitchRequest, SwitchResponse, true, true, "Launch a new Agent session then atomically hand off task inputs, claims, paused Goal and children; Owner only.", {"id":EXAMPLE_ID,"from":"a1","from_generation":1,"task_command":"retained-task","commands":[],"launch":{"harness":"antigravity","model":"gemini-4-hydrogen-low"}}),
     method!("swarm.handoff", HandoffRequest, HandoffResponse, true, true, "Transfer selected undispatched task inputs, claims, paused Goal and children to an existing Agent; Owner only.", {"id":EXAMPLE_ID,"from":"a1","from_generation":1,"to":"a2","to_generation":1,"task_command":"retained-task","commands":[]}),
     method!("command.cancel", CommandCancelRequest, CommandCancelResponse, true, true, "Withdraw one undispatched handoff input with no native effect; Owner only.", {"id":EXAMPLE_ID,"command_id":"retained-handoff/send-0"}),
     method!("project.get", ProjectGetRequest, ProjectRegistrationView, true, false, "Read one approved project registration.", {"id":"project-1"}),
@@ -296,6 +297,7 @@ impl Router {
             "swarm.digest" => &["swarm digest"],
             "swarm.reparent" => &["swarm reparent"],
             "swarm.handoff" => &["swarm handoff"],
+            "swarm.switch" => &["swarm switch"],
             "command.cancel" => &["swarm cmd cancel"],
             _ => &[],
         };
@@ -364,6 +366,9 @@ fn method_scopes(name: &str, principal: &Principal, identity: &IdentityResponse)
 
 fn method_limits(name: &str) -> &'static str {
     match name {
+        "swarm.switch" => {
+            "Owner only. Exact source generation; at most 64 selected plain SENDs. Reserve child IDs before launch preparation. Choose profile or ad-hoc harness/model/effort/auth/cmd. No launch prompt. Exact session readiness precedes atomic H2 handoff. Failure retains created B; stop separately. Same-ID replay never launches again. Finish an untransferred ready B with ordinary swarm.handoff."
+        }
         "swarm.handoff" => {
             "Owner only. Distinct existing Agents in the same project; exact generations and retained task SEND required. At most 64 selected plain accepted/queued SENDs and configured selector bound. A quiescent, B cleanly idle. All live claims, a quiescent Goal (paused), and all children transfer atomically. Brief first; failed/unknown brief holds successors queued until Owner resolution or cancellation. No native resend on retry."
         }

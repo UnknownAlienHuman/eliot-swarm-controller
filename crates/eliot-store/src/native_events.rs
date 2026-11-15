@@ -231,6 +231,7 @@ fn persist_turn_associated(
                              updated_at = ?3 WHERE id = ?4",
         params![turn_id, encode_json(&outcome)?, now, command_id],
     ));
+    handoff::refresh_parent_tx(tx, command_id, now)?;
     // Presentation stamps the notice cooldown at native acceptance, so a long
     // queue cannot spend it while waiting. Ordinary sends match no notice row.
     db!(tx.execute(

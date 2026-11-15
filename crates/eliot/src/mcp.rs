@@ -297,6 +297,7 @@ const MUTATION_ID_METHODS: &[&str] = &[
     "command.submit",
     "swarm.reparent",
     "swarm.handoff",
+    "swarm.switch",
     "command.cancel",
     "command.resolve",
     "turn.resolve",

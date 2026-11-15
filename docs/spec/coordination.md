@@ -390,23 +390,61 @@ provides each actual child outcome. Same-ID retry returns those same identities 
 current brief-gate readback, and never repeats Store transfers or external effects.
 No compensating automatic stop/relaunch is implied.
 
-### Agent switch (design; not implemented)
+### Agent switch (implemented)
 
-`swarm.switch` is one Owner launch-plus-handoff operation, choosing an explicit profile
-or the existing ad-hoc harness/model/effort selectors, including another harness. Reuse
-the normal launch freeze, capacity, workspace and credential checks. Reserve one launch
-child ID before external work; the operation is represented by existing durable
-parent/child commands. Launch only creates B's session; the handoff brief is its first
-input. After proven session readiness, atomically revalidate A/B quiescence and perform
-the handoff above. Failure at this boundary leaves A intact and reports the created B
-explicitly; stopping B or A is an explicit choice. An unknown launch preserves its
-exact Agent/generation/command binding and blocks handoff; retrying the operation never
-creates another Agent or repeats the launch. Interrupted transport is not proof that
-launch failed. The native process is never transplanted between harnesses or Agents.
+`swarm.switch` is one Owner launch-plus-handoff operation. Its sole wire DTOs are
+[`SwitchRequest` / `SwitchResponse`](../../crates/eliot-core/src/api/switch.rs).
+Choose an explicit profile or the existing ad-hoc `harness/model/effort/auth/cmd`
+selectors, including another harness. Workspace defaults to A's retained workspace;
+explicit workspace/worktree/base use normal launch canonicalization and Git freeze.
+The route binds B to A's retained project identity, including worktree preparation;
+it does not make B a child of A or rewrite either frozen native profile.
+Normal launch profile/credential checks, provider holds, capacity and workspace
+reservation/dispatch still apply. No native process or context is transplanted.
 
-A definitely launched switch that has not handed off is completed by ordinary
-`swarm.handoff` to that existing B. No special finish mutation is introduced. Agent
-switch itself remains H3; it is not implemented or advertised by H2.
+Before any external preparation, an immediate Store transaction checks A's exact
+generation and quiescence, retains the switch parent and freezes its launch and
+handoff child IDs. A busy source refuses before any B allocation. The parent is
+claimed once, then an independent worker prepares and admits the ordinary launch
+and its parent/ordinal link in one transaction. No launch text is allowed: launch
+only creates B's session. The original task and selected SENDs use H2's grammar and
+bounds; their current eligibility is revalidated by H2, not frozen as ownership.
+
+Only an Applied launch plus the exact generation/command-bound committed
+`session.ready` stream event and Idle B permits transfer. For adapters omitting the
+ready event's command ID, B's unique generation-1 start must be the reserved launch;
+a supplied contradictory command/cause ID refuses. Start reply and ready
+batch can race; the worker waits up to 30 seconds for committed readiness after
+the ordinary launch worker returns. B must have no previous SEND/turn. In one
+immediate transaction a savepoint calls the same H2 handoff implementation,
+revalidates A/B, links the Handoff parent as the switch's second child and records
+completion. A refusal rolls back every attempted H2 change before recording failure.
+B remains explicit in the result; stopping A or B is a separate Owner command.
+
+The switch parent is Accepted at reservation and Dispatched while orchestrating.
+Applied means the H2 Store transfer committed, not that the brief/task succeeded.
+Rejected means preparation/admission refused; Failed means a known launch or
+handoff refusal; Unknown retains an uncertain launch or interrupted orchestration.
+The result keeps both child IDs, created Agent/generation, current launch state,
+Handoff result when admitted, refusal code and `next_action`. `command.children`
+shows the ordinary launch and, when admitted, the Handoff parent; the latter owns
+its brief/successor children and their H2 delivery gate.
+
+Same-ID identical-payload retry is readback before live/config/model/auth checks;
+it never schedules another worker, creates another Agent or repeats launch/transfer.
+A crash before the parent worker is claimed may recover that unattempted parent.
+A claimed orchestration becomes Unknown on restart with its reserved IDs intact;
+it is not automatically resumed. Its exact Accepted, unattempted launch child is
+recoverable through ordinary launch/workspace recovery; no new child ID is minted.
+A subsequently ready B still requires ordinary Owner handoff. Dispatched/Unknown
+launch children retain the normal no-replay rules; uncertainty never becomes a retry
+signal. Owner resolution alone is not session readiness. Interrupted transport proves no
+failure. No automatic stop, relaunch or compensation occurs.
+
+A definitely launched B without a committed handoff is finished by ordinary
+`swarm.handoff` to that exact existing Agent/generation after quiescence. The result
+names this `next_action`; use a new handoff mutation ID. There is no special finish
+mutation, and retrying the switch ID cannot perform this recovery.
 
 ## Prompt guidance
 
