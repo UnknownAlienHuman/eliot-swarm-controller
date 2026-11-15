@@ -7087,7 +7087,7 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
         .dispatch(&launch_id, now + 1)
         .expect("dispatch launch");
     // Return the file to schema 16, as an older binary left it, and upgrade.
-    // Drop the v37 digest, v34 config and v33 session-usage tables first and
+    // Drop the v38 inference, v37 digest, v34 config and v33 session-usage tables first and
     // undo the v36/v35 column adds, so the reopen exercises their migration
     // blocks, then the v32 attention-wake table. Drop the
     // v29/v30 activity artifacts next: the v30 events triggers would
@@ -7098,7 +7098,10 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "DROP TABLE completion_digests;
+            "DROP TABLE inference_calls;
+             DROP TABLE inference_clients;
+             DELETE FROM schema_migrations WHERE version = 38;
+             DROP TABLE completion_digests;
              DELETE FROM schema_migrations WHERE version = 37;
              DROP TABLE agent_config;
              ALTER TABLE agents DROP COLUMN profile_inherited;

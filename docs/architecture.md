@@ -67,6 +67,15 @@ All five native adapters (Codex, Claude, OpenCode, Muse, Antigravity) use the
 same protocol. Create crates as their callers arrive; this table is the eventual map,
 not six empty crates required for `--version`.
 
+## Memory inference boundary
+
+M1 enters the same private authenticated Router and Store writer. One transaction
+binds its existing write receipt, client sequence and physical call. The daemon
+reuses scoped process custody for a fresh native invocation; the Claude plugin
+owns print-mode argv/result translation separately from the Agent adapter. Call-owned
+private content is accessible only through the authenticated client binding. No
+Agent, Task, service-account framework or second mutation ledger is created.
+
 ## First useful slice
 
 Completed history: L1 delivered local CLI → Store/router → temporary fake →

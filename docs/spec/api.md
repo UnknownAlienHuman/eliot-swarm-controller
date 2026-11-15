@@ -54,6 +54,123 @@ Windows starts that independent process without inheriting caller handles, so ca
 CLI stdout/stderr reach EOF while the daemon remains alive. Its own private IPC and
 owned plugin/workspace custody establish subsequent authority.
 
+### Memory one-shot inference (M1, #199)
+
+M1 implements a bounded subset of Memory Contract 0.19 at
+[`c2b7402c`](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/c2b7402c3fedc51ccb3fb881173e028ffcbdac44/docs/v3/INFERENCE-CONTRACT.md).
+PR #5325 is merged; Memory main still has that contract blob (checked 2026-11-15).
+The closed DTOs, syntax checks and finite limits live in
+[`api/inference.rs`](../../crates/eliot-core/src/api/inference.rs), the field catalog.
+This increment is Windows-only.
+
+Use the existing private NDJSON transport with exactly
+`_auth:{kind:"memory_inference",client_id,token_version,credential}` and
+`_payload:<closed request DTO>`. The stable client is `memory:<installation ULID>`.
+Persistent random controller id, stable client id, positive credential version and
+raw bearer are distinct. Only this principal may call `client.identity`,
+`inference.text`, `.get`, `.write.get`, `.result.read`, `.cancel` and `.release`.
+It has no general Agent, command, daemon, config or coordination authority. No
+Owner/Agent/Run/tokenless/other-controller fallback exists. Owner maintains credentials
+but cannot read inference content through these APIs. Reads select only the
+authenticated stable client, never a client argument.
+
+The sole profile `memory-text-v1` maps to fresh Claude Code 2.1.325 print mode with
+`claude-haiku-5-5`. Private `<data-root>/inference.json` contains only the absolute
+`claude_executable`; the owner provisions a private native OAuth login under
+`<data-root>/inference-native`. No API-key helper or vendor routing is inherited.
+The Claude plugin owns fixed argv/result decoding; the daemon owns process custody.
+Use safe mode, empty built-in tools, MCP tools denied, settings sources empty, one
+turn, permission prompts disabled and no session persistence. Prompt goes to stdin.
+Set `CLAUDE_CODE_MAX_RETRIES=0`, `CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES=0` and
+`CLAUDE_CODE_DISABLE_REFUSAL_RETRY=1`, `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1`; do not
+inherit the retry watchdog, fallback model or Eliot credentials. Sources: installed
+CLI help and current [CLI](https://code.claude.com/docs/en/cli-reference),
+[environment](https://code.claude.com/docs/en/env-vars) and
+[headless](https://code.claude.com/docs/en/headless) docs, checked 2026-11-15.
+No alternate adapter, account, model or automatic request retry exists.
+The refusal switches are also confirmed against the installed 2.1.325 predicates.
+Administrator-managed native policy still applies; qualification must establish no
+managed hooks or explicit fallback override on the host.
+
+Limits: 32 KiB UTF-8 input, 64 KiB result, 16 KiB byte range, one successful native
+turn, a 1–120 second queue/native-attempt budget after input publication, 16 clients, 1,024 retained calls globally
+and one native inference in flight. At most one cancel and one release binding may
+be first-admitted per call; other IDs for that auxiliary operation return
+`already_bound`. Replay the original ID. This bounds retained auxiliary writes
+while retention is unsupported. IDs must use uppercase ULID spelling; no
+normalization occurs. Profile, origin, disclosure, input digest/length,
+response format, result bound and deadline participate in semantic binding. Prompt
+and result text and raw provider diagnostics never enter SQLite, events or logs.
+Known credentials in requests are rejected. Ranges return exact bytes; concatenate
+them before UTF-8 decoding.
+
+One Store transaction checks `commands`/`writes` conflicts, current credential,
+capacity and signed-64 exhaustion; advances the monotonic client sequence; inserts
+the immutable write receipt and physical call. Exact retry precedes new-admission,
+config and drain gates and allocates no sequence/native work. Another binding is
+`id_conflict`. Direct-RPC spelling is literal. Existing 24-hour new-ID expiration
+and five-minute future skew apply; retained replay precedes age gates. Never allocate
+another ID to recover uncertain delivery.
+
+Exact private input publication/readback precedes durable `queued → sending` and
+one native invocation. Possible send followed by timeout, cancellation, lost or
+malformed output or persistence loss remains `unknown`, with no provider retry.
+Success requires complete successful native output, private result publication,
+exact digest/length readback and committed state. Restart changes unsent queued calls
+to `failed`, sending to `unknown`, and never invokes the provider. A complete file
+without a committed successful call is not readable. The immutable receipt contains
+only call id and admission sequence; `inference.get` reads mutable state separately.
+
+`inference.write.get` is read-only over `writes`: exact retained own method/digest/
+original result, definite absent live ID, or `history_gap` outside the live window.
+It never admits/adopts a mutation. Foreign principal/command IDs reject. A faulted
+or unavailable Store is an error, never absence proof. Result reads verify the full
+own file against exact digest/length before slicing.
+
+Cancel admits a fresh mutation ID and cancels only queued work; otherwise its
+immutable outcome is `too_late`. Release binds the exact own call and disposition:
+`memory_copy_verified` requires its exact successful result digest;
+`terminal_without_result` requires failed/cancelled state; `abandon_for_erasure`
+fences any state. Commit the publication fence first, then clean private input/result
+copies after the owned runner is quiescent. Exact release replay retries cleanup;
+`inference.get.cleanup_complete` is separate readback. Late settlement cannot publish
+through the fence. Local cleanup never proves provider deletion/non-execution.
+
+M1 release requires `no_backup_dependencies:true`. Memory asserts this while holding
+its mutation-owner/backup-set serialization; no restorable backup or unresolved fence
+may depend on the call. This slice supports dependency-free installations only.
+Embeddings, inventory (`high_water`/`list`), backup/cut/restore integration, retention
+advancement, metadata pruning and emergency erase are `unsupported`. Ordinary
+retention excludes inference writes, preserving call bindings until a later bounded
+retention increment; the finite call cap then rejects new admission. Memory owns
+backup files/dependency decisions; controller never reads those files.
+
+#### Private credential publication and recovery
+
+Only Owner calls `inference.client.install`, `.rotate` or `.promote` with a retained
+mutation ID, stable client id and expected current version (zero for install).
+Generate 256 random bearer bits with the existing credential generator; no derivation
+or routing-key hierarchy. Store version/hash and nonsecret publication metadata only.
+Publish raw secret in a fixed daemon-owned private file
+`inference-credential-<operation-id>.json`; accept no caller path. Its closed record
+contains controller id, client id, token version, operation id and credential.
+Atomic private temporary-file write, file sync, same-directory write-through rename
+and exact readback precede the client/write transaction. No bearer enters RPC,
+semantic data, receipts or logs. The returned private filename is handed to Memory
+through its private local setup boundary.
+
+An interrupted pre-commit publication is reused only for its exact operation/client/
+version/controller binding. Retained install/rotate replay reconciles the same private
+file against the installed hash; missing/corrupt committed publication is explicitly
+unknown, never permission to mint another bearer/version. Keep the file for recovery.
+Rotation stages one pending version while current remains installed. Pending auth
+may read old own calls but cannot first-admit mutations. After it authenticates and
+reads a pre-rotation call, Owner promotes it with a separate idempotent mutation.
+Keep at most one previous read credential. Only current admits new mutations;
+retained own reads/retries survive overlap. Further rotation and previous retirement
+are unsupported while previous remains: a later increment must prove reconnect,
+old-call release and restart readback first. Lost replies never reset versions.
+
 ### MCP stdio server
 
 `swarm mcp` is one local stdio server and never starts the daemon. It exposes exactly one

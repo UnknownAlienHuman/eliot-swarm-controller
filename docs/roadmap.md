@@ -60,7 +60,7 @@ crash/load qualification.
       model; its pre-reset binding allocator/validator design is not an implementation
       dependency. Mark the v1 work in #1, #3, #4, #5, #11, #140, #153 and #159 historical
       or superseded after preserving any still-relevant requirement in its owning spec
-      and current layer. Keep #199 a proposed Later extension. Open issue text must not
+      and current layer. #199 is now the owner-authorized M1 increment below. Open issue text must not
       silently restore the archived runtime or override this build order.
 
 ## L0 — Archive and smallest workspace
@@ -400,9 +400,22 @@ of the explicitly selected release scope.
       custody, timeout and unknown-outcome rules. "Open in editor" starts a
       user-selected `.exe` with literal argv and no Eliot credentials. (Refs #407)
 
+## M1 — Memory one-shot inference (#199)
+
+- [x] **M1.1 Scoped first call.** Closed bounded DTOs, one actual non-agentic native
+      text profile, private `memory_inference` principal, recoverable credential install/
+      staged rotation, atomic write/call/sequence admission, replay/conflict without
+      another provider call, own result/write reads, honest cancel and dependency-free
+      release. Qualify on a private Windows daemon; record actual checks/evidence in
+      the PR. Owner brought #199 into scope on 2026-11-14.
+- [ ] **M1.2 Memory continuity.** Fixed-window inventory, backup/cut/restore integration,
+      dependency-protected release/retention, safe previous-credential retirement and
+      an actual episode revision consumed later. Keep #199 open until this integration
+      and evidence exist. Embeddings remain unsupported.
+
 ## Later
 
-Service continuity across daemon replacement and Memory OS require an actual use
-case. The current contracts are not instructions to build those products in advance.
+Service continuity across daemon replacement requires an actual use case. The
+current contracts are not instructions to build that product in advance.
 The optional desktop companion is tracked above.
 Remote/cloud MCP access is not Later: it is the required L6.7 contour above.

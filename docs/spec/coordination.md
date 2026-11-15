@@ -5,7 +5,12 @@ and advisory claims reuse the existing API/router/Store; no second scheduler.
 
 ## Authority
 
-Principals are owner, current `agent:<id>#<generation>` and scoped automation. Missing/
+Principals are owner, current `agent:<id>#<generation>`, scoped automation and
+`memory_inference:<stable-client-id>`. Memory has only the
+[M1 inference surface](api.md#memory-one-shot-inference-m1-199), no Agent/control/
+coordination/config authority and no Owner/tokenless fallback. Only its current
+credential admits new mutations; exact own reads/retries survive bounded rotation
+overlap. Missing/
 revoked identity rejects. An Agent's frozen profile `control` (self/tree/project,
 default self) governs its commands and reads: self reaches only itself, tree reaches
 its own subtree, project reaches its project label; the owner is unrestricted. A
