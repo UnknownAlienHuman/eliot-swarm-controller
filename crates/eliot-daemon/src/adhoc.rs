@@ -65,8 +65,13 @@ fn validate_adhoc_model(model: &str) -> core::Result<String> {
     Ok(trimmed.to_owned())
 }
 
+/// Closed Claude Code `--effort` vocabulary, mirroring the profile freeze
+/// (`claude_snapshot_from_entry` in config.rs): `claude --help` documents
+/// `--effort <level>` and the frozen profile accepts exactly these levels.
+const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
 fn validate_adhoc_effort(harness: &str, effort: &str) -> core::Result<String> {
-    if !matches!(harness, "codex" | "muse") {
+    if !matches!(harness, "codex" | "muse" | "claude") {
         return Err(core::Error::new(
             "unsupported",
             format!("the {harness} slice has no reasoning-effort mapping"),
@@ -77,6 +82,12 @@ fn validate_adhoc_effort(harness: &str, effort: &str) -> core::Result<String> {
         return Err(core::Error::new(
             "profile_error",
             "ad-hoc effort must be non-empty, at most 128 characters and contain no controls",
+        ));
+    }
+    if harness == "claude" && !CLAUDE_EFFORT_LEVELS.contains(&trimmed) {
+        return Err(core::Error::new(
+            "profile_error",
+            "unknown Claude effort level (low, medium, high, xhigh, or max)",
         ));
     }
     Ok(trimmed.to_owned())
@@ -212,7 +223,11 @@ pub(crate) fn adhoc_snapshot(
             if let Some(model) = model {
                 snapshot.insert("model".to_owned(), Value::String(model));
             }
-            // No effort mapping; validated absent above.
+            // Closed `--effort` vocabulary, validated above; the Claude
+            // plugin pushes it as the CLI `--effort` flag.
+            if let Some(effort) = effort {
+                snapshot.insert("effort".to_owned(), Value::String(effort));
+            }
             snapshot.insert(
                 "permissions".to_owned(),
                 Value::String("workspace-write".to_owned()),
@@ -1076,7 +1091,7 @@ mod tests {
 
     #[test]
     fn adhoc_snapshot_rejects_broader_effort_mappings() {
-        for harness in ["claude", "opencode", "antigravity"] {
+        for harness in ["opencode", "antigravity"] {
             let error = adhoc_snapshot(
                 harness,
                 Some("model"),
@@ -1087,6 +1102,30 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.code, "unsupported", "{harness}");
         }
+    }
+
+    #[test]
+    fn adhoc_claude_freezes_the_closed_effort_vocabulary() {
+        for level in ["low", "medium", "high", "xhigh", "max"] {
+            let snapshot = adhoc_snapshot(
+                "claude",
+                None,
+                Some(level),
+                Some(r"C:\bin\claude.exe".to_owned()),
+                AdhocAuth::Resolve(None),
+            )
+            .unwrap();
+            assert_eq!(snapshot["effort"], json!(level));
+        }
+        let error = adhoc_snapshot(
+            "claude",
+            None,
+            Some("extreme"),
+            Some(r"C:\bin\claude.exe".to_owned()),
+            AdhocAuth::Resolve(None),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "profile_error");
     }
 
     #[test]

@@ -1843,6 +1843,7 @@ impl CodexPlugin {
         // overlay) left effort absent. Reported through the turn association
         // only under a `configure` overlay; plain sends keep their exact
         // event shape.
+        let sent_model = params.config_revision.is_some().then(|| model.clone());
         let sent_effort = params
             .config_revision
             .is_some()
@@ -1916,6 +1917,7 @@ impl CodexPlugin {
                 command_id.clone(),
                 turn_id.clone(),
                 params.context.clone(),
+                sent_model.clone(),
                 sent_effort.clone(),
             )
             .await

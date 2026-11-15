@@ -1104,6 +1104,14 @@ impl MusePlugin {
             .effort_override
             .clone()
             .or_else(|| session.selected_effort.clone());
+        // What the native turn request actually carries, reported through
+        // the turn association only under a `configure` overlay; plain
+        // sends keep their exact event shape.
+        let sent_effort = params
+            .config_revision
+            .is_some()
+            .then(|| effort.clone())
+            .flatten();
         let turn_params = Self::turn_start_params(
             native_command_id.clone(),
             session
@@ -1195,7 +1203,12 @@ impl MusePlugin {
             .insert(command_id.clone(), turn_id.clone());
         if session
             .events
-            .associate_turn(command_id.clone(), turn_id.clone(), params.context.clone())
+            .associate_turn(
+                command_id.clone(),
+                turn_id.clone(),
+                params.context.clone(),
+                sent_effort.clone(),
+            )
             .await
             .is_err()
         {

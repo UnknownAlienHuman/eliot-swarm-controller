@@ -2,7 +2,8 @@ use crate::{
     events::{EventConfig, EventHandle, EventStatus, InboxRecord, SteerVerdict, TurnFacts},
     native::{
         AuthSetup, BackendKind, HttpOutcome, IntegrationSelector, LocalProvider, OpenCodeHttp,
-        OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch, list_providers,
+        OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch,
+        models::run_models,
         types::{InboxUser, McpServerReadback, ModelRef, SessionInfo},
     },
 };
@@ -423,11 +424,11 @@ impl OpenCodePlugin {
         error
     }
 
-    /// Read-only provider list for `harness.models`: canonical `auth list`
-    /// metadata (provider IDs). No server, no session, no model turn and no
-    /// inference. Provider entries carry no model catalogue: the configured
-    /// native default model resolves at launch and is read back from the
-    /// session.
+    /// Read-only model list for `harness.models`: the native `opencode
+    /// models` catalogue (`provider/model` ids verbatim). No server, no
+    /// session, no model turn and no inference. An omitted model still
+    /// leaves the configured native default, read back from the session at
+    /// launch.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
         if self.session.is_some() || self.failed_start.is_some() {
             return Err(Error::new(
@@ -453,15 +454,13 @@ impl OpenCodePlugin {
                     "OpenCode model.list requires a discovered native cmd",
                 )
             })?;
-        let providers =
-            list_providers(std::ffi::OsStr::new(program), Instant::now() + RPC_TIMEOUT).await?;
-        let models: Vec<Value> = providers
+        let ids = run_models(std::ffi::OsStr::new(program), Instant::now() + RPC_TIMEOUT).await?;
+        let models: Vec<Value> = ids
             .into_iter()
-            .map(|(provider, connections)| {
+            .map(|id| {
                 json!({
-                    "id": provider,
+                    "id": id,
                     "default": false,
-                    "connections": connections,
                 })
             })
             .collect();
