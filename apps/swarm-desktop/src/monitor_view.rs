@@ -222,7 +222,9 @@ pub fn monitor_pane(
     actions: MonitorActions,
 ) -> View {
     // Only highlight a row index that already existed before this refresh,
-    // so the native SelectedIndex never runs ahead of the items it indexes.
+    // so the native SelectedIndex never runs ahead of the items it indexes
+    // (an index past them fails with E_INVALIDARG, which Reactor treats as
+    // fatal: 0xC0000409; see `Message::AgentsLoaded` in `ui`).
     let selected_index = selected
         .and_then(|id| monitor.rows.iter().position(|row| row.id == id))
         .filter(|index| *index < published_rows);

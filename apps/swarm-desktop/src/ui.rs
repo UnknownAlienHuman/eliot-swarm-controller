@@ -1134,6 +1134,13 @@ impl Component for DesktopApp {
                         }
                         // Never point the native SelectedIndex at a row this same
                         // render adds: highlight a new row on the next tick.
+                        // Reactor 0.100.0 applies the SelectedIndex before the
+                        // new item reaches the ListView; WinUI rejects it with
+                        // E_INVALIDARG (0x80070057), which Reactor treats as a
+                        // fatal native command failure and the process aborts
+                        // with 0xC0000409. A standalone repro on 2026-11-14
+                        // aborted on the first same-update select and stayed up
+                        // through repeated next-tick selects.
                         match index {
                             Some(index) if index >= published => {
                                 self.agent_idx = None;
