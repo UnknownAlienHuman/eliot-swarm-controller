@@ -12,13 +12,15 @@ use std::path::{Path, PathBuf};
 
 use eliot_core::api::{
     AgentGetRequest, AgentGetResponse, AgentListRequest, AgentListResponse, AgentResultRequest,
-    AgentResultResponse, CommandGetRequest, CommandSubmitRequest, CommandSubmitResponse,
-    EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
-    EventsSubscribeRequest, EventsSubscribeResponse, HarnessModelsRequest, HarnessModelsResponse,
-    ProfileListRequest, ProfileListResponse, ProfilesReadRequest, ProfilesReadResponse,
-    ProfilesSaveRequest, ProfilesSaveResponse, ProjectRegistrationView, RuleListEntry,
-    RuleListRequest, RuleListResponse, UsageSummaryRequest, UsageSummaryResponse,
-    discovery::ProjectListRequest,
+    AgentResultResponse, CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest,
+    CommandSubmitRequest, CommandSubmitResponse, EventsBoundsRequest, EventsBoundsResponse,
+    EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
+    EventsSubscribeResponse, HarnessModelsRequest, HarnessModelsResponse, ProfileListRequest,
+    ProfileListResponse, ProfilesReadRequest, ProfilesReadResponse, ProfilesSaveRequest,
+    ProfilesSaveResponse, ProjectRegistrationView, RuleListEntry, RuleListRequest,
+    RuleListResponse, ScriptListRequest, ScriptListResponse, ScriptReadRequest, ScriptReadResponse,
+    ScriptSaveRequest, ScriptSaveResponse, TimerRunRequest, UsageSummaryRequest,
+    UsageSummaryResponse, discovery::ProjectListRequest,
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -456,6 +458,81 @@ pub async fn list_rules(
         }
     }
     Ok((rules, true))
+}
+
+/// Existing script entries under the approved Run roots.
+pub async fn list_scripts(data_dir: &Path) -> Result<ScriptListResponse> {
+    let params = ScriptListRequest {};
+    params.validate()?;
+    let reply: ScriptListResponse =
+        eliot_daemon::client_call_typed(data_dir, "script.list", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// One script entry's text and revision.
+pub async fn read_script(
+    data_dir: &Path,
+    project: Option<String>,
+    path: String,
+) -> Result<ScriptReadResponse> {
+    let params = ScriptReadRequest { project, path };
+    params.validate()?;
+    let reply: ScriptReadResponse =
+        eliot_daemon::client_call_typed(data_dir, "script.read", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// Validate (dry run) or save one script entry from `expected_revision`.
+pub async fn save_script(
+    data_dir: &Path,
+    project: Option<String>,
+    path: String,
+    expected_revision: String,
+    content: String,
+    dry_run: bool,
+) -> Result<ScriptSaveResponse> {
+    let params = ScriptSaveRequest {
+        project,
+        path,
+        expected_revision,
+        content,
+        dry_run,
+    };
+    params.validate()?;
+    let reply: ScriptSaveResponse =
+        eliot_daemon::client_call_typed(data_dir, "script.save", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// Run one explicit occurrence of a timer (the existing Owner Run path).
+pub async fn run_timer(
+    data_dir: &Path,
+    mutation_id: String,
+    project: Option<String>,
+    rule: &str,
+) -> Result<Command> {
+    let request = TimerRunRequest::new(mutation_id, rule);
+    let request = match project {
+        Some(project) => request.in_project(project),
+        None => request,
+    };
+    request.validate()?;
+    let reply: Command = eliot_daemon::client_call_typed(data_dir, "timer.run", &request).await?;
+    request.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// The first page of a command's retained children.
+pub async fn command_children(data_dir: &Path, id: &str) -> Result<Vec<Command>> {
+    let params = CommandChildrenRequest::new(id);
+    params.validate()?;
+    let reply: CommandChildrenResponse =
+        eliot_daemon::client_call_typed(data_dir, "command.children", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply.children)
 }
 
 /// The harness catalogue with its default model/effort.

@@ -19,6 +19,36 @@ do = [{ action = "send", target = "${event.agent}", expected_generation = "${eve
 limit = { max = 3, per = "agent", window = "1h" }
 ```
 
+### Script editing
+
+Owner-only `script.list`, `script.read` and `script.save`
+([`scripts/edit.rs`](../../crates/eliot-daemon/src/scripts/edit.rs)) edit existing script
+entries for owner screens. They cover only the roots Run resolves: the global
+`<data_dir>/scripts/` directory and each registered project's canonical `.eliot/scripts/`.
+An entry is addressed by its root (`project`, absent = global) and a relative path, and is
+checked with the same capture rules Run freezes with: no `..`, links, reparse points,
+devices or alternate streams, and a canonical regular file inside the root. Listing skips
+links and an interrupted save's temporaries.
+
+`script.read` returns the UTF-8 text without a byte-order mark, the SHA-256 revision of the
+bytes and the canonical display path. The text is withheld with a reason when the entry is
+larger than 256 KiB, not UTF-8, contains NUL, or contains a value the daemon's secret
+policy knows.
+
+`script.save` replaces an existing entry only. It never creates, renames or deletes files,
+and it never executes anything. It rejects:
+
+- a different current revision (`conflict`), rechecked just before the rename;
+- NUL or the redaction marker (`invalid`);
+- a known secret (`not_allowed`).
+
+The file's byte-order mark and CRLF endings are kept. The save writes a temporary file in
+the entry's directory and renames it over the entry; global entries stay private. A
+failure after the rename is `unknown`. A Run admitted before a save fails its digest check
+at dispatch (`source_integrity`) and never runs the new bytes. Running a script stays with
+the existing Owner Run path, `timer.run` of a timer whose `run` action names the entry.
+The Owner still cannot submit a standalone `run`.
+
 `rule.list` reads one namespace's stored rule states, timer states and canonical
 definitions for owner screens. No operation pauses, resumes, enables or disables a rule or
 timer: `enabled` comes from the rule file and `paused_reason` is set only by the daemon

@@ -10,8 +10,9 @@ use super::{PAGE_MAX, Principal, Router, require_owner, rule_principal};
 use eliot_core::{
     Error, Result, SecretPolicy,
     api::{
-        ProfileListRequest, ProfilesReadRequest, ProfilesSaveRequest, RuleListEntry,
-        RuleListRequest, RuleListResponse,
+        ProfileListRequest, ProfilesReadRequest, ProfilesSaveRequest, ProjectRegistrationView,
+        RuleListEntry, RuleListRequest, RuleListResponse, ScriptListRequest, ScriptReadRequest,
+        ScriptSaveRequest,
     },
 };
 use serde_json::Value;
@@ -99,6 +100,49 @@ impl Router {
         let reply = RuleListResponse { rules, next };
         request.validate_response(&reply)?;
         encode(&reply, "rule list")
+    }
+
+    /// Registered projects whose `.eliot/scripts/` roots scripts may live in.
+    async fn script_registrations(&self) -> Result<Vec<ProjectRegistrationView>> {
+        self.inner
+            .store
+            .lock()
+            .await
+            .list_project_registrations("owner", None, PAGE_MAX)
+    }
+
+    pub(super) async fn script_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: ScriptListRequest = eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let registrations = self.script_registrations().await?;
+        let reply = crate::scripts::edit::list(&self.inner.data_root, &registrations);
+        request.validate_response(&reply)?;
+        encode(&reply, "script list")
+    }
+
+    pub(super) async fn script_read(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: ScriptReadRequest = eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let registrations = self.script_registrations().await?;
+        let policy = self.secret_policy_snapshot();
+        let reply =
+            crate::scripts::edit::read(&self.inner.data_root, &registrations, &request, &policy)?;
+        request.validate_response(&reply)?;
+        encode(&reply, "script read")
+    }
+
+    pub(super) async fn script_save(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: ScriptSaveRequest = eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let registrations = self.script_registrations().await?;
+        let policy = self.secret_policy_snapshot();
+        let reply =
+            crate::scripts::edit::save(&self.inner.data_root, &registrations, &request, &policy)?;
+        request.validate_response(&reply)?;
+        encode(&reply, "script save")
     }
 }
 

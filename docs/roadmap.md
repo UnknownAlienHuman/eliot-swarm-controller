@@ -372,6 +372,15 @@ of the explicitly selected release scope.
       read-only through `rule.list`; no pause or resume operation exists.
       (Refs #407)
 
+- [x] **D5 Scripts screen.** Existing script entries under the approved Run roots
+      (`<data_dir>/scripts/`, registered `.eliot/scripts/`) open in a native
+      multiline editor. Edits go through `script.list/read/save`: Run's own
+      capture rules, a revision guard and temporary-file replacement, with the BOM
+      and CRLF kept. Saving never executes. Run is the existing Owner path,
+      `timer.run` of a timer whose `run` action names the entry, with the daemon's
+      custody, timeout and unknown-outcome rules. "Open in editor" starts a
+      user-selected `.exe` with literal argv and no Eliot credentials. (Refs #407)
+
 ## Later
 
 Service continuity across daemon replacement and Memory OS require an actual use

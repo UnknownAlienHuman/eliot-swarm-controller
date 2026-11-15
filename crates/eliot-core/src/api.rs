@@ -22,6 +22,7 @@ mod read_validation;
 mod reads;
 mod resolutions;
 mod rules;
+mod script_edit;
 mod scripts;
 mod timers;
 mod usage;
@@ -112,6 +113,11 @@ pub use resolutions::{
     TurnResolveResponse, TurnResolveStatus,
 };
 pub use rules::{RuleCatchUpRequest, RuleLimit, RuleLimitScope};
+pub use script_edit::{
+    MAX_SCRIPT_EDIT_BYTES, MAX_SCRIPT_ENTRIES, MAX_SCRIPT_PATH_BYTES, ScriptEntryView,
+    ScriptListRequest, ScriptListResponse, ScriptReadRequest, ScriptReadResponse, ScriptRootView,
+    ScriptSaveRequest, ScriptSaveResponse,
+};
 pub use scripts::{
     FrozenScriptContext, FrozenScriptInterpreter, FrozenScriptRun, RunDefinitionArgs,
     ScriptActionRecord, ScriptCommandContext, ScriptCustody, ScriptDirectExit, ScriptInputContext,

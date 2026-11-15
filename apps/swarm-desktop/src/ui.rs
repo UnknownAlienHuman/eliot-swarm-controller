@@ -24,9 +24,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use eliot_core::Command;
 use eliot_core::api::{
     AgentGetResponse, AgentListRequest, CommandSubmitResponse, ProfileListResponse, ProfileSummary,
-    ProfilesReadResponse, ProfilesSaveResponse, RuleListEntry,
+    ProfilesReadResponse, ProfilesSaveResponse, RuleListEntry, ScriptListResponse,
+    ScriptReadResponse, ScriptSaveResponse,
 };
 use windows_reactor::*;
 
@@ -39,6 +41,7 @@ use crate::markdown::Doc;
 use crate::monitor::{self, Monitor, MonitorSnapshot};
 use crate::monitor_view::{self, MonitorActions};
 use crate::profiles::{self, FORM_FIELDS};
+use crate::scripts;
 use crate::state::{BoundAction, DraftStore, MutationLedger, Selection};
 use crate::theme;
 use crate::views::{self, RenderCache, RenderedItem, RowCallbacks};
@@ -54,6 +57,31 @@ enum Screen {
     Chat,
     Profiles,
     Automation,
+    Scripts,
+}
+
+/// Scripts screen: one text draft over the daemon's `script.read`.
+#[derive(Clone, Debug, Default)]
+struct ScriptsEditor {
+    /// Flattened entries: (project, relative path, size).
+    entries: Vec<(Option<String>, String, u64)>,
+    unavailable: Vec<String>,
+    listed: bool,
+    selected: Option<usize>,
+    load_epoch: u64,
+    revision: Option<String>,
+    display_path: Option<String>,
+    base: String,
+    draft: String,
+    editable: bool,
+    reason: Option<String>,
+    status: String,
+    busy: bool,
+    editor_exe: String,
+    run_status: String,
+    run_busy: bool,
+    /// Distinguishes one Run click from the next in the mutation ledger.
+    run_seq: u64,
 }
 
 /// Profiles screen: one document draft over the daemon's profile source.
@@ -201,8 +229,22 @@ enum Message {
     ProfilesSaveRequested,
     ProfilesSaved(bool, Fallible<ProfilesSaveResponse>),
     ProfilesReloadRequested,
-    RulesLoaded(u64, Vec<(String, Fallible<RulePage>)>),
+    RulesLoaded(u64, Vec<(Option<String>, String, Fallible<RulePage>)>),
     AutomationRefreshRequested,
+    ScriptsListed(Fallible<ScriptListResponse>),
+    ScriptsRefreshRequested,
+    ScriptSelected(Option<usize>),
+    ScriptLoaded(u64, Fallible<ScriptReadResponse>),
+    ScriptDraftChanged(String),
+    ScriptValidateRequested,
+    ScriptSaveRequested,
+    ScriptSaved(bool, Fallible<ScriptSaveResponse>),
+    ScriptReloadRequested,
+    EditorPathChanged(String),
+    OpenInEditorRequested,
+    ScriptRunRequested(String),
+    ScriptRunSubmitted(Fallible<Command>),
+    ScriptRunSettled(Fallible<Command>),
     MonitorToggled(bool),
     MonitorLoaded(u64, Option<Box<MonitorSnapshot>>),
     MonitorSelected(Option<usize>),
@@ -278,6 +320,7 @@ struct DesktopApp {
     rules_status: String,
     /// Tags rule loads; an older reply is dropped.
     rules_epoch: u64,
+    scripts: ScriptsEditor,
     /// Monitor rows published before the latest refresh; the native
     /// selection never points past them (see `monitor_view`).
     monitor_published: usize,
@@ -368,6 +411,77 @@ impl DesktopApp {
         });
     }
 
+    fn selected_script(&self) -> Option<(Option<String>, String)> {
+        self.scripts
+            .selected
+            .and_then(|index| self.scripts.entries.get(index))
+            .map(|(project, path, _)| (project.clone(), path.clone()))
+    }
+
+    fn load_scripts(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let _task = context.spawn_background(move |_| {
+            Message::ScriptsListed(client::block_on(async {
+                client::list_scripts(&data_dir)
+                    .await
+                    .map_err(|error| error.to_string())
+            }))
+        });
+    }
+
+    fn load_script(&mut self, context: &ComponentContext<Self>) {
+        let (Ok(data_dir), Some((project, path))) = (self.data_dir.clone(), self.selected_script())
+        else {
+            return;
+        };
+        self.scripts.load_epoch += 1;
+        let epoch = self.scripts.load_epoch;
+        self.scripts.busy = true;
+        let _task = context.spawn_background(move |_| {
+            Message::ScriptLoaded(
+                epoch,
+                client::block_on(async {
+                    client::read_script(&data_dir, project, path)
+                        .await
+                        .map_err(|error| error.to_string())
+                }),
+            )
+        });
+    }
+
+    fn save_script(&mut self, context: &ComponentContext<Self>, dry_run: bool) {
+        let (Ok(data_dir), Some((project, path)), Some(revision)) = (
+            self.data_dir.clone(),
+            self.selected_script(),
+            self.scripts.revision.clone(),
+        ) else {
+            return;
+        };
+        if self.scripts.busy || !self.scripts.editable {
+            return;
+        }
+        self.scripts.busy = true;
+        self.scripts.status = if dry_run {
+            "Validating…"
+        } else {
+            "Saving…"
+        }
+        .to_owned();
+        let draft = self.scripts.draft.clone();
+        let _task = context.spawn_background(move |_| {
+            Message::ScriptSaved(
+                dry_run,
+                client::block_on(async {
+                    client::save_script(&data_dir, project, path, revision, draft, dry_run)
+                        .await
+                        .map_err(|error| error.to_string())
+                }),
+            )
+        });
+    }
+
     fn load_rules(&mut self, context: &ComponentContext<Self>) {
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
@@ -384,6 +498,7 @@ impl DesktopApp {
             let mut namespaces = Vec::new();
             client::block_on(async {
                 namespaces.push((
+                    None,
                     "Global rules".to_owned(),
                     client::list_rules(&data_dir, None)
                         .await
@@ -393,7 +508,7 @@ impl DesktopApp {
                     let page = client::list_rules(&data_dir, Some(project.clone()))
                         .await
                         .map_err(|error| error.to_string());
-                    namespaces.push((format!("Project {project}"), page));
+                    namespaces.push((Some(project.clone()), format!("Project {project}"), page));
                 }
             });
             Message::RulesLoaded(epoch, namespaces)
@@ -790,6 +905,48 @@ fn effective_summary(reply: &AgentGetResponse) -> String {
     summary
 }
 
+/// Follow a `timer.run` command to its Run child and wait (bounded,
+/// cancellable) until that command is terminal. The timeout, custody and
+/// unknown outcome are the daemon's; this only reads them.
+fn settle_run(data_dir: &Path, parent: Command, cancelled: &dyn Fn() -> bool) -> Fallible<Command> {
+    const POLL_MS: u64 = 1_000;
+    const MAX_POLLS: usize = 15 * 60;
+    let mut watched = parent;
+    for _ in 0..MAX_POLLS {
+        if cancelled() {
+            return Err(
+                "stopped waiting (window closed or cancelled); the Run continues in the daemon"
+                    .to_owned(),
+            );
+        }
+        if watched.verb != "run" {
+            let children = client::block_on(client::command_children(data_dir, &watched.id))
+                .map_err(|error| error.to_string())?;
+            if let Some(run) = children.into_iter().find(|child| child.verb == "run") {
+                watched = run;
+                continue;
+            }
+        }
+        if scripts::is_terminal(watched.state) && watched.verb == "run" {
+            return Ok(watched);
+        }
+        if scripts::is_terminal(watched.state) && watched.verb != "run" {
+            // A refused or settled timer occurrence without a Run child.
+            return Ok(watched);
+        }
+        if !feed::backoff(POLL_MS, cancelled) {
+            continue;
+        }
+        watched = client::block_on(client::read_command(data_dir, &watched.id))
+            .map_err(|error| error.to_string())?;
+    }
+    Err(format!(
+        "still {} after 15 minutes; the outcome stays with the daemon (command {})",
+        format!("{:?}", watched.state).to_lowercase(),
+        watched.id
+    ))
+}
+
 fn submit_note(reply: &CommandSubmitResponse) -> String {
     format!("{:?}", reply.state).to_lowercase()
 }
@@ -861,6 +1018,7 @@ impl Component for DesktopApp {
             rules: Vec::new(),
             rules_status: String::new(),
             rules_epoch: 0,
+            scripts: ScriptsEditor::default(),
         };
         if let Ok(data_dir) = app.data_dir.clone() {
             let _task = context.spawn_background(move |_| {
@@ -1490,6 +1648,12 @@ impl Component for DesktopApp {
                         self.load_profile_list(context);
                     }
                     Screen::Automation => self.load_rules(context),
+                    Screen::Scripts => {
+                        if !self.scripts.listed {
+                            self.load_scripts(context);
+                        }
+                        self.load_rules(context);
+                    }
                     _ => {}
                 }
             }
@@ -1729,7 +1893,8 @@ impl Component for DesktopApp {
                 }
                 self.rules = namespaces
                     .into_iter()
-                    .map(|(label, page)| RuleNamespace {
+                    .map(|(project, label, page)| RuleNamespace {
+                        project,
                         label,
                         more: page.as_ref().is_ok_and(|(_, more)| *more),
                         rules: page.map(|(rules, _)| rules),
@@ -1743,6 +1908,210 @@ impl Component for DesktopApp {
                 self.rules_status = format!("{count} rule(s) and timer(s) read.");
             }
             Message::AutomationRefreshRequested => self.load_rules(context),
+            Message::ScriptsRefreshRequested => {
+                self.load_scripts(context);
+                self.load_rules(context);
+            }
+            Message::ScriptsListed(result) => {
+                self.scripts.listed = true;
+                match result {
+                    Ok(list) => {
+                        let previous = self.selected_script();
+                        self.scripts.unavailable = list
+                            .roots
+                            .iter()
+                            .filter_map(|root| {
+                                root.reason.as_ref().map(|reason| {
+                                    format!(
+                                        "{}: {reason}",
+                                        root.project.as_deref().unwrap_or("global")
+                                    )
+                                })
+                            })
+                            .collect();
+                        self.scripts.entries = list
+                            .roots
+                            .into_iter()
+                            .flat_map(|root| {
+                                let project = root.project;
+                                root.entries
+                                    .into_iter()
+                                    .map(move |entry| (project.clone(), entry.path, entry.size))
+                            })
+                            .collect();
+                        // Keep the selection by identity, not by index.
+                        self.scripts.selected = previous.and_then(|(project, path)| {
+                            self.scripts
+                                .entries
+                                .iter()
+                                .position(|(p, e, _)| *p == project && *e == path)
+                        });
+                        self.scripts.status =
+                            format!("{} script entr(ies) listed.", self.scripts.entries.len());
+                    }
+                    Err(error) => self.scripts.status = format!("script.list failed: {error}"),
+                }
+            }
+            Message::ScriptSelected(index) => {
+                if index.is_some() && index != self.scripts.selected {
+                    self.scripts.selected = index;
+                    self.load_script(context);
+                }
+            }
+            Message::ScriptLoaded(epoch, result) => {
+                if epoch != self.scripts.load_epoch {
+                    return;
+                }
+                self.scripts.busy = false;
+                match result {
+                    Ok(read) => {
+                        let text = profiles::normalize_newlines(&read.content.unwrap_or_default());
+                        self.scripts.revision = Some(read.revision);
+                        self.scripts.display_path = Some(read.display_path);
+                        self.scripts.base = text.clone();
+                        self.scripts.draft = text;
+                        self.scripts.editable = read.editable;
+                        self.scripts.reason = read.reason;
+                    }
+                    Err(error) => {
+                        self.scripts.editable = false;
+                        self.scripts.reason = Some(format!("script.read failed: {error}"));
+                    }
+                }
+            }
+            Message::ScriptDraftChanged(text) => {
+                if self.scripts.editable && !self.scripts.busy {
+                    self.scripts.draft = profiles::normalize_newlines(&text);
+                }
+            }
+            Message::ScriptValidateRequested => self.save_script(context, true),
+            Message::ScriptSaveRequested => self.save_script(context, false),
+            Message::ScriptSaved(dry_run, result) => {
+                self.scripts.busy = false;
+                match result {
+                    Ok(_) if dry_run => {
+                        self.scripts.status =
+                            "Valid: the daemon accepts this text for the entry. Not saved yet; nothing ran.".to_owned();
+                    }
+                    Ok(reply) => {
+                        self.scripts.status = format!(
+                            "Saved revision {}; nothing ran. A Run admitted before this save fails its digest check instead of running the new text.",
+                            &reply.revision[..12]
+                        );
+                        self.load_script(context);
+                    }
+                    Err(error) if error.starts_with("conflict:") => {
+                        self.scripts.status = format!(
+                            "Not saved: the script changed on disk after it was read. Copy what you need from the draft, then Reload. ({error})"
+                        );
+                    }
+                    Err(error) if error.starts_with("unknown:") => {
+                        self.scripts.status = format!(
+                            "Save outcome uncertain; Reload to see the current file (the draft is kept): {error}"
+                        );
+                    }
+                    Err(error) => {
+                        self.scripts.status = format!(
+                            "{} The draft is kept and the file is unchanged: {error}",
+                            if dry_run { "Invalid." } else { "Not saved." }
+                        );
+                    }
+                }
+            }
+            Message::ScriptReloadRequested => {
+                self.scripts.status = "Reloaded the saved script.".to_owned();
+                self.load_script(context);
+            }
+            Message::EditorPathChanged(text) => self.scripts.editor_exe = text,
+            Message::OpenInEditorRequested => {
+                let path = self.scripts.display_path.clone();
+                match (scripts::editor_executable(&self.scripts.editor_exe), path) {
+                    (Ok(editor), Some(path)) => {
+                        // Literal argv, no shell and no file association; the
+                        // editor gets no Eliot credentials from this window.
+                        let mut command = std::process::Command::new(&editor);
+                        command.arg(&path);
+                        for name in [
+                            "ELIOT_AGENT_ID",
+                            "ELIOT_AGENT_GENERATION",
+                            "ELIOT_AGENT_TOKEN",
+                            "ELIOT_RUN_COMMAND_ID",
+                            "ELIOT_RUN_TOKEN",
+                            "ELIOT_OWNER_ID",
+                            "ELIOT_OWNER_TOKEN",
+                            "ELIOT_OWNER_CREDENTIAL",
+                        ] {
+                            command.env_remove(name);
+                        }
+                        self.scripts.status = match command.spawn() {
+                            Ok(child) => format!(
+                                "Opened {path} in {} (pid {}). Reload here after saving in the editor.",
+                                editor.display(),
+                                child.id()
+                            ),
+                            Err(error) => format!("The editor did not start: {error}"),
+                        };
+                    }
+                    (Err(error), _) => self.scripts.status = format!("Open in editor: {error}."),
+                    (_, None) => self.scripts.status = "Select a script first.".to_owned(),
+                }
+            }
+            Message::ScriptRunRequested(rule) => {
+                if self.submitting() || self.scripts.run_busy {
+                    return;
+                }
+                let (Ok(data_dir), Some((project, _))) =
+                    (self.data_dir.clone(), self.selected_script())
+                else {
+                    return;
+                };
+                // One ULID per Run click; an uncertain reply keeps the key so
+                // a retry reuses the same id and the daemon deduplicates it.
+                let key = format!("timer.run:{project:?}:{rule}:{}", self.scripts.run_seq);
+                let mutation_id = self.ledger.id_for(&key);
+                self.in_flight_key = Some(key);
+                self.scripts.run_busy = true;
+                self.scripts.run_status = format!("Submitting timer {rule} ({mutation_id})…");
+                let _task = context.spawn_background(move |_| {
+                    Message::ScriptRunSubmitted(client::block_on(async {
+                        client::run_timer(&data_dir, mutation_id, project, &rule)
+                            .await
+                            .map_err(|error| error.to_string())
+                    }))
+                });
+            }
+            Message::ScriptRunSubmitted(result) => {
+                self.settle_mutation(result.is_ok());
+                match result {
+                    Ok(command) => {
+                        self.scripts.run_seq += 1;
+                        self.scripts.run_status = format!(
+                            "Admitted {} ({}); waiting for the daemon's outcome…",
+                            command.id,
+                            format!("{:?}", command.state).to_lowercase()
+                        );
+                        let Ok(data_dir) = self.data_dir.clone() else {
+                            return;
+                        };
+                        let _task = context.spawn_background(move |cancel| {
+                            let cancelled = || cancel.is_cancelled();
+                            Message::ScriptRunSettled(settle_run(&data_dir, command, &cancelled))
+                        });
+                    }
+                    Err(error) => {
+                        self.scripts.run_busy = false;
+                        self.scripts.run_status =
+                            format!("Run not admitted (Run again reuses its id): {error}");
+                    }
+                }
+            }
+            Message::ScriptRunSettled(result) => {
+                self.scripts.run_busy = false;
+                self.scripts.run_status = match result {
+                    Ok(command) => scripts::outcome_line(&command),
+                    Err(error) => format!("Run outcome not read: {error}"),
+                };
+            }
             Message::MonitorToggled(open) => {
                 self.monitor_open = open;
                 if open {
@@ -1888,6 +2257,13 @@ impl Component for DesktopApp {
                     )
                     .content(TextBlock::new().text("Automation")),
                 ToggleButton::new()
+                    .is_checked(self.screen == Screen::Scripts)
+                    .automation_name("Scripts screen")
+                    .on_is_checked_changed(
+                        context.callback(|_: bool| Message::ScreenSelected(Screen::Scripts)),
+                    )
+                    .content(TextBlock::new().text("Scripts")),
+                ToggleButton::new()
                     .is_checked(self.monitor_open)
                     .automation_name("Monitor")
                     .on_is_checked_changed(context.callback(Message::MonitorToggled))
@@ -1935,6 +2311,7 @@ impl Component for DesktopApp {
                         &self.rules_status,
                         context.message(Message::AutomationRefreshRequested),
                     ),
+                    Screen::Scripts => self.scripts_view(context),
                 },
                 monitor_pane,
             ));
@@ -2002,6 +2379,65 @@ impl DesktopApp {
             !self.submitting(),
             actions,
         )
+    }
+
+    /// Timers whose run action names the selected script.
+    fn script_timers(&self) -> Vec<String> {
+        let Some((project, path)) = self.selected_script() else {
+            return Vec::new();
+        };
+        self.rules
+            .iter()
+            .filter(|namespace| namespace.project == project)
+            .filter_map(|namespace| namespace.rules.as_ref().ok())
+            .flat_map(|rules| scripts::running_timers(rules, project.as_deref(), &path))
+            .collect()
+    }
+
+    fn scripts_view(&self, context: &mut ViewContext<Self>) -> View {
+        let timers = self.script_timers();
+        let editor = &self.scripts;
+        let data = config_view::ScriptsData {
+            labels: editor
+                .entries
+                .iter()
+                .map(|(project, path, size)| {
+                    format!(
+                        "{}: {path} ({size} B)",
+                        project.as_deref().unwrap_or("global")
+                    )
+                })
+                .collect(),
+            unavailable: &editor.unavailable,
+            selected: editor.selected,
+            display_path: editor.display_path.as_deref(),
+            revision: editor.revision.as_deref(),
+            editable: editor.editable,
+            reason: editor.reason.as_deref(),
+            draft: &editor.draft,
+            dirty: editor.draft != editor.base,
+            timers: &timers,
+            editor_exe: &editor.editor_exe,
+            status: &editor.status,
+            run_status: &editor.run_status,
+            busy: editor.busy,
+            run_busy: editor.run_busy || self.submitting(),
+        };
+        let actions = config_view::ScriptsActions {
+            select: context.callback(Message::ScriptSelected),
+            draft_changed: context.callback(Message::ScriptDraftChanged),
+            validate: context.message(Message::ScriptValidateRequested),
+            save: context.message(Message::ScriptSaveRequested),
+            reload: context.message(Message::ScriptReloadRequested),
+            refresh: context.message(Message::ScriptsRefreshRequested),
+            editor_changed: context.callback(Message::EditorPathChanged),
+            open_editor: context.message(Message::OpenInEditorRequested),
+            run: timers
+                .iter()
+                .map(|timer| context.message(Message::ScriptRunRequested(timer.clone())))
+                .collect(),
+        };
+        config_view::scripts_screen(data, actions)
     }
 
     fn profiles_view(&self, context: &mut ViewContext<Self>) -> View {

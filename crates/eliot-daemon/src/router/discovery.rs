@@ -144,6 +144,17 @@ const METHODS: &[Method] = &[
 harness = \"codex\"
 model = \"gpt-6-luna\"
 ","dry_run":true}),
+    method!(
+        "script.list",
+        ScriptListRequest,
+        ScriptListResponse,
+        true,
+        false,
+        "List existing script entries under the approved Run roots (global <data_dir>/scripts/ and registered project .eliot/scripts/).",
+        {}
+    ),
+    method!("script.read", ScriptReadRequest, ScriptReadResponse, true, false, "Read one existing script entry's text and SHA-256 revision; content is withheld when binary, oversized or holding a known secret.", {"project":null,"path":"check.ps1"}),
+    method!("script.save", ScriptSaveRequest, ScriptSaveResponse, true, true, "Validate (dry_run) or replace one existing script entry guarded by its revision; never executes.", {"project":null,"path":"check.ps1","expected_revision":"0000000000000000000000000000000000000000000000000000000000000000","content":"Write-Output ok\n","dry_run":true}),
     method!("rule.list", RuleListRequest, RuleListResponse, true, false, "Page one rule namespace's stored states with canonical definitions and timer states.", {"limit":20}),
     method!("rule.get", RuleGetRequest, RuleStateView, true, false, "Read one rule's current and retiring cursors.", {"id":"rule-1"}),
     method!("rule.catch_up", RuleCatchUpRequest, Command, true, true, "Catch up a rule through a finite retained event interval.", {"id":EXAMPLE_ID,"rule":"rule-1","after_seq":0,"through_seq":10}),

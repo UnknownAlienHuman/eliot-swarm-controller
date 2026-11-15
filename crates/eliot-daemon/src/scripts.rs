@@ -1,4 +1,5 @@
 pub(crate) mod auth;
+pub(crate) mod edit;
 pub(crate) mod freeze;
 pub(crate) mod process;
 
