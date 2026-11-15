@@ -305,9 +305,47 @@ pub(super) fn authorize_agent_submit_scope(
     Ok(())
 }
 
+/// Workspace default for an Agent child: an omitted workspace inherits the
+/// parent's workspace verbatim, so the working `{parent, profile, workspace}`
+/// shape needs no guesswork. An explicit workspace must still equal the
+/// parent's (enforced by `check_agent_launch_authority`), so a child never
+/// escapes the parent's authority; Owner launches keep the required explicit
+/// workspace. Runs before `normalize_launch` validates and canonicalizes the
+/// path; a missing parent row or parent workspace defers to the later
+/// `not_found`/`invalid` gates.
+pub(super) fn default_agent_child_workspace(
+    store: &Store,
+    request: &mut SubmitCommand,
+    principal: &Principal,
+) -> Result<()> {
+    if request.verb != "launch" {
+        return Ok(());
+    }
+    if !matches!(principal, Principal::Agent { .. }) {
+        return Ok(());
+    }
+    let Some(parent_id) = request.args.get("parent").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let omitted = matches!(request.args.get("workspace"), None | Some(Value::Null));
+    if !omitted {
+        return Ok(());
+    }
+    let Some(parent) = store.get_agent(parent_id)? else {
+        return Ok(());
+    };
+    let Some(workspace) = parent.workspace.clone() else {
+        return Ok(());
+    };
+    if let Some(args) = request.args.as_object_mut() {
+        args.insert("workspace".to_owned(), Value::String(workspace));
+    }
+    Ok(())
+}
+
 /// Launch project inheritance: a child takes its parent's project label.
-/// Runs after `normalize_launch` set the workspace default and before the
-/// profile freeze and workspace preparation read the project. The Store
+/// Runs after the Agent workspace default and `normalize_launch` and before
+/// the profile freeze and workspace preparation read the project. The Store
 /// re-derives the same label authoritatively at admission.
 pub(super) fn inherit_launch_project(store: &Store, request: &mut SubmitCommand) -> Result<()> {
     if request.verb != "launch" {
@@ -606,6 +644,48 @@ mod tests {
             authorize_command(&caller, &mut resume).unwrap_err().code,
             "not_allowed"
         );
+    }
+
+    #[test]
+    fn agent_child_workspace_defaults_to_parent_and_never_escapes() {
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let now = now_ms();
+        let manager = launch(&mut store, "scoped", None, "tree", now);
+        let principal = agent_principal(&manager, 0);
+        // Omitted workspace inherits the parent workspace verbatim.
+        let mut omitted = CommandSubmitRequest::new(ulid::Ulid::new().to_string(), "launch");
+        omitted.args = json!({"parent": manager, "profile": "fixture"});
+        default_agent_child_workspace(&store, &mut omitted, &principal).unwrap();
+        assert_eq!(
+            omitted.args.get("workspace").and_then(Value::as_str),
+            Some("synthetic-workspace")
+        );
+        // Null counts as omitted too.
+        let mut nulled = CommandSubmitRequest::new(ulid::Ulid::new().to_string(), "launch");
+        nulled.args = json!({"parent": manager, "profile": "fixture", "workspace": Value::Null});
+        default_agent_child_workspace(&store, &mut nulled, &principal).unwrap();
+        assert_eq!(
+            nulled.args.get("workspace").and_then(Value::as_str),
+            Some("synthetic-workspace")
+        );
+        // An explicit workspace is left alone for the authority check.
+        let mut explicit = CommandSubmitRequest::new(ulid::Ulid::new().to_string(), "launch");
+        explicit.args = json!({"parent": manager, "profile": "fixture", "workspace": "/elsewhere"});
+        default_agent_child_workspace(&store, &mut explicit, &principal).unwrap();
+        assert_eq!(
+            explicit.args.get("workspace").and_then(Value::as_str),
+            Some("/elsewhere")
+        );
+        // Owner launches never default.
+        let mut owner = CommandSubmitRequest::new(ulid::Ulid::new().to_string(), "launch");
+        owner.args = json!({"profile": "fixture"});
+        default_agent_child_workspace(&store, &mut owner, &Principal::Owner).unwrap();
+        assert!(owner.args.get("workspace").is_none());
+        // A missing parent defers to the later not_found gate.
+        let mut missing = CommandSubmitRequest::new(ulid::Ulid::new().to_string(), "launch");
+        missing.args = json!({"parent": "a999", "profile": "fixture"});
+        default_agent_child_workspace(&store, &mut missing, &agent_principal("a999", 0)).unwrap();
+        assert!(missing.args.get("workspace").is_none());
     }
 
     #[test]
