@@ -59,6 +59,7 @@ mod launch_ui;
 mod monitor_ui;
 mod profiles_ui;
 mod scripts_ui;
+mod settings_ui;
 mod shell_ui;
 
 use automation_ui::AutomationMsg;
@@ -68,10 +69,12 @@ use launch_ui::LaunchMsg;
 use monitor_ui::MonitorMsg;
 use profiles_ui::ProfilesMsg;
 use scripts_ui::ScriptsMsg;
-use shell_ui::ShellMsg;
+use settings_ui::{SettingsMsg, SettingsSection};
+use shell_ui::{Main, Panel, ShellMsg};
 
 use crate::chat::{Conversation, Invalidation};
 use crate::client::{self, LaunchTarget};
+use crate::config_client;
 use crate::config_view::{self, ProfilesActions, ProfilesData, RuleNamespace};
 use crate::configure;
 use crate::feed::{self, Delivery, Depth, Reread, Snapshot};
@@ -79,7 +82,7 @@ use crate::live::{self, LiveStatus, Next};
 use crate::m3;
 use crate::markdown::Doc;
 use crate::monitor::{self, Monitor, MonitorSnapshot};
-use crate::monitor_view::{self, MonitorActions};
+use crate::monitor_view;
 use crate::nav::{self, UiAgent};
 use crate::profiles::{self, FORM_FIELDS};
 use crate::reparent;
@@ -87,23 +90,12 @@ use crate::scripts;
 use crate::state::{BoundAction, DraftStore, MutationLedger, Selection};
 use crate::theme;
 use crate::views::{self, RenderCache, RenderedItem, RowCallbacks};
+use futures_util::StreamExt;
 
 /// Agent rows per `agent.list` page in the navigation list.
 const AGENT_PAGE: usize = 100;
 /// Harnesses an Owner ad-hoc launch accepts (the daemon validates again).
 const ADHOC_HARNESSES: [&str; 5] = ["codex", "claude", "muse", "opencode", "antigravity"];
-
-/// The three screens of the main column.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Screen {
-    Chat,
-    Profiles,
-    Automation,
-    Scripts,
-}
-
-/// Index 0 of the project picker lists every Agent in scope.
-const ALL_PROJECTS: &str = "All projects (every Agent in scope)";
 
 /// UI copy of one project registration.
 #[derive(Clone, Debug)]
@@ -125,7 +117,6 @@ struct AgentPage {
 #[derive(Clone, Debug)]
 struct UiPending {
     binding: BoundAction,
-    turn_id: String,
     kind: String,
     summary: String,
 }
@@ -139,6 +130,10 @@ struct UiDetail {
     harness: String,
     settings: configure::Settings,
     state: String,
+    /// Observe-only Agents reject native control verbs.
+    observe_only: bool,
+    /// The project label (its checkout).
+    project: String,
 }
 
 /// Admission of one draft submission (Send, Steer or Resume): bound Agent,
@@ -183,16 +178,24 @@ enum Message {
     Automation(AutomationMsg),
     Scripts(ScriptsMsg),
     Handoff(handoff_ui::HandoffMsg),
+    Settings(SettingsMsg),
 }
 
 struct DesktopApp {
     data_dir: Fallible<PathBuf>,
+    /// The latest status, shown in the details panel.
     status: String,
+    /// A notice for the owner above the composer, until dismissed.
+    alert: Option<String>,
     appearance: shell_ui::Appearance,
+    /// Desktop preferences (theme, startup, Auto's profile, last Agent).
+    prefs: crate::settings::Settings,
+    /// A preferences write is running (see `save_preferences`).
+    prefs_saving: bool,
+    /// The startup conversation was considered (once per window).
+    startup_done: bool,
     /// The window's client width in DIPs, once observed.
     window_width: Option<f64>,
-    /// A settings write is running (see `save_settings`).
-    settings_saving: bool,
     /// False for the one render after the screen tree is re-created: the
     /// multi-line editors are then created empty (see `reprime_fields`).
     fields_primed: bool,
@@ -205,7 +208,9 @@ struct DesktopApp {
     ledger: MutationLedger,
     /// Ledger key of the single unresolved submission; blocks duplicates.
     in_flight_key: Option<String>,
-    screen: Screen,
+    main: Main,
+    panel: Panel,
+    settings_section: SettingsSection,
     configure: configure_ui::ConfigureState,
     editor: profiles_ui::ProfilesEditor,
     scripts: scripts_ui::ScriptsEditor,
@@ -246,7 +251,7 @@ impl DesktopApp {
 /// Load project registrations on a worker; decode to picker rows.
 fn load_projects_blocking(data_dir: &Path) -> Fallible<Vec<UiProject>> {
     client::block_on(async {
-        let registrations = client::list_projects(data_dir)
+        let registrations = config_client::list_projects(data_dir)
             .await
             .map_err(|error| error.to_string())?;
         Ok(registrations
@@ -277,6 +282,7 @@ fn load_agents_blocking(data_dir: &Path, request: &AgentListRequest) -> Fallible
                     state: format!("{:?}", row.summary.state).to_lowercase(),
                     project: row.summary.project,
                     parent: row.summary.parent,
+                    updated_at: row.summary.updated_at,
                 })
                 .collect(),
             next: reply.next,
@@ -296,7 +302,6 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
                 reply.agent.generation,
                 &request.id,
             ),
-            turn_id: request.turn_id.clone(),
             kind: request.kind.clone(),
             summary: request_summary(&request.details),
         })
@@ -308,6 +313,8 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
         harness: reply.agent.harness.clone(),
         settings: configure::Settings::from_reply(reply),
         state: format!("{:?}", reply.agent.state).to_lowercase(),
+        observe_only: reply.agent.observe_only,
+        project: reply.agent.project.clone(),
     }
 }
 
@@ -407,16 +414,21 @@ impl Component for DesktopApp {
         let mut app = Self {
             data_dir,
             status: "Connecting to the daemon…".to_owned(),
+            alert: None,
             appearance: shell_ui::Appearance::new(),
+            prefs: config_client::load_preferences(),
+            prefs_saving: false,
+            startup_done: false,
             window_width: None,
-            settings_saving: false,
             fields_primed: true,
             prime_epoch: 0,
             renders: std::cell::Cell::new(0),
             prime_after: 0,
             ledger: MutationLedger::default(),
             in_flight_key: None,
-            screen: Screen::Chat,
+            main: Main::Conversation,
+            panel: Panel::Closed,
+            settings_section: SettingsSection::General,
             configure: configure_ui::ConfigureState::default(),
             editor: profiles_ui::ProfilesEditor::default(),
             scripts: scripts_ui::ScriptsEditor::default(),
@@ -424,36 +436,19 @@ impl Component for DesktopApp {
             nav: shell_ui::ShellState {
                 selection: Selection::default(),
                 projects: Vec::new(),
-                project_idx: Some(0),
                 agents: Vec::new(),
                 branches: HashMap::new(),
                 expanded: HashSet::new(),
                 tree_epoch: 0,
-                rows: Vec::new(),
-                published: Vec::new(),
-                rows_render: 0,
-                agent_idx: None,
                 agents_next: None,
                 agents_total: 0,
                 agents_loading: false,
                 list_epoch: 0,
                 pending_select: None,
+                titles: HashMap::new(),
+                titles_inflight: false,
             },
-            launch: launch_ui::LaunchState {
-                profiles: Vec::new(),
-                profile_idx: None,
-                profile_text: String::new(),
-                workspace: String::new(),
-                launch_text: String::new(),
-                launch_rev: 0,
-                profile_summaries: Vec::new(),
-                profile_list: None,
-                picker_adhoc: false,
-                adhoc_harness_idx: Some(0),
-                adhoc_model: String::new(),
-                adhoc_effort: String::new(),
-                harness_hint: String::new(),
-            },
+            launch: launch_ui::LaunchState::default(),
             chat: chat_ui::ChatState {
                 convo: None,
                 detail: None,
@@ -475,18 +470,14 @@ impl Component for DesktopApp {
                 pending_local: None,
                 drafts: DraftStore::default(),
                 answers: HashMap::new(),
+                confirm_force: None,
             },
             monitor: monitor_ui::MonitorState {
                 data: Monitor::default(),
-                open: false,
                 epoch: 0,
                 task: None,
                 selected: None,
-                published: 0,
                 reparent_status: String::new(),
-                confirm_force: None,
-                on_screen: Vec::new(),
-                applied_at: 0,
             },
             automation: automation_ui::AutomationState {
                 rules: Vec::new(),
@@ -520,6 +511,7 @@ impl Component for DesktopApp {
             Message::Automation(msg) => self.automation_update(msg, context),
             Message::Scripts(msg) => self.scripts_update(msg, context),
             Message::Handoff(msg) => self.handoff_update(msg, context),
+            Message::Settings(msg) => self.settings_update(msg, context),
         }
     }
 

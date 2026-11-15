@@ -1,6 +1,9 @@
-//! Per-user desktop settings, persisted as small JSON (`swarm-desktop.json`).
+//! Per-user desktop preferences, persisted as small JSON (`swarm-desktop.json`).
 //!
-//! Only the owner's theme choice lives here. Loading never fails: a missing,
+//! The theme, what opens at start, the profile Auto launches until daemon
+//! routing lands, and the last conversation. The unified `settings.*` API
+//! (k55) moves these into the daemon's settings store; the settings UI
+//! reaches them only through [`crate::config_client`]. Loading never fails: a missing,
 //! unreadable or invalid file yields the defaults. Unknown fields are ignored
 //! and missing fields take their defaults, so older and newer files both load.
 
@@ -22,15 +25,6 @@ pub enum ThemeChoice {
 }
 
 impl ThemeChoice {
-    /// System → Light → Dark → System.
-    pub fn next(self) -> Self {
-        match self {
-            Self::System => Self::Light,
-            Self::Light => Self::Dark,
-            Self::Dark => Self::System,
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::System => "System",
@@ -40,10 +34,29 @@ impl ThemeChoice {
     }
 }
 
+/// What the window opens at start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Startup {
+    /// The empty new-task view.
+    #[default]
+    NewTask,
+    /// The conversation open when the window last closed.
+    LastConversation,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeChoice,
+    pub startup: Startup,
+    /// The profile "Auto" launches until daemon routing lands; unset means
+    /// the first launchable profile the project allows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
+    /// The Agent of the last opened conversation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_agent: Option<String>,
 }
 
 /// Settings file location: `%APPDATA%`-equivalent roaming folder from the Known
@@ -170,7 +183,12 @@ mod tests {
     fn settings_round_trip_each_choice() {
         let scratch = ScratchDir::new("round-trip");
         for theme in [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark] {
-            let settings = Settings { theme };
+            let settings = Settings {
+                theme,
+                startup: Startup::LastConversation,
+                default_profile: Some("codex-lite".to_owned()),
+                last_agent: Some("a1".to_owned()),
+            };
             save_to(&scratch.file(), &settings).expect("save");
             assert_eq!(load_from(&scratch.file()), settings);
         }
@@ -200,13 +218,25 @@ mod tests {
     }
 
     #[test]
+    fn a_theme_only_file_from_before_startup_still_loads() {
+        let scratch = ScratchDir::new("theme-only");
+        fs::create_dir_all(scratch.file().parent().unwrap()).unwrap();
+        fs::write(scratch.file(), br#"{"theme":"light"}"#).unwrap();
+        let loaded = load_from(&scratch.file());
+        assert_eq!(loaded.theme, ThemeChoice::Light);
+        assert_eq!(loaded.startup, Startup::NewTask);
+        assert_eq!(loaded.default_profile, None);
+    }
+
+    #[test]
     fn settings_serialized_form_is_lowercase_theme_object() {
         let settings = Settings {
             theme: ThemeChoice::Dark,
+            ..Settings::default()
         };
         assert_eq!(
             serde_json::to_value(&settings).unwrap(),
-            serde_json::json!({"theme": "dark"})
+            serde_json::json!({"theme": "dark", "startup": "new_task"})
         );
     }
 }

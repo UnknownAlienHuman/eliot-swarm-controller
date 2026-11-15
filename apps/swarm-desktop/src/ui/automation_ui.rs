@@ -67,12 +67,12 @@ impl DesktopApp {
                 namespaces.push((
                     None,
                     "Global rules".to_owned(),
-                    client::list_rules(&data_dir, None)
+                    config_client::list_rules(&data_dir, None)
                         .await
                         .map_err(|error| error.to_string()),
                 ));
                 for project in projects {
-                    let page = client::list_rules(&data_dir, Some(project.clone()))
+                    let page = config_client::list_rules(&data_dir, Some(project.clone()))
                         .await
                         .map_err(|error| error.to_string());
                     namespaces.push((Some(project.clone()), format!("Project {project}"), page));

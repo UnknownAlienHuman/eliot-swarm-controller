@@ -34,6 +34,8 @@ mod chat;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod client;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod config_client;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod feed;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod handoff;

@@ -173,7 +173,7 @@ impl DesktopApp {
         self.editor.busy = true;
         let _task = context.spawn_background(move |_| {
             Message::Profiles(ProfilesMsg::ProfilesSourceLoaded(client::block_on(async {
-                client::read_profiles_source(&data_dir)
+                config_client::read_profiles_source(&data_dir)
                     .await
                     .map_err(|error| error.to_string())
             })))
@@ -199,7 +199,7 @@ impl DesktopApp {
             Message::Profiles(ProfilesMsg::ProfilesSaved(
                 dry_run,
                 client::block_on(async {
-                    client::save_profiles(&data_dir, revision, draft, dry_run)
+                    config_client::save_profiles(&data_dir, revision, draft, dry_run)
                         .await
                         .map_err(|error| error.to_string())
                 }),

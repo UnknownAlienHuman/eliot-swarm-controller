@@ -220,7 +220,7 @@ impl DesktopApp {
                 let _task = context.spawn_background(move |_| {
                     Message::Scripts(ScriptsMsg::ScriptRunSubmitted(Box::new(client::block_on(
                         async {
-                            client::run_timer(&data_dir, mutation_id, project, &rule)
+                            config_client::run_timer(&data_dir, mutation_id, project, &rule)
                                 .await
                                 .map_err(|error| error.to_string())
                         },
@@ -303,7 +303,7 @@ impl DesktopApp {
         };
         let _task = context.spawn_background(move |_| {
             Message::Scripts(ScriptsMsg::ScriptsListed(client::block_on(async {
-                client::list_scripts(&data_dir)
+                config_client::list_scripts(&data_dir)
                     .await
                     .map_err(|error| error.to_string())
             })))
@@ -322,7 +322,7 @@ impl DesktopApp {
             Message::Scripts(ScriptsMsg::ScriptLoaded(
                 epoch,
                 client::block_on(async {
-                    client::read_script(&data_dir, project, path)
+                    config_client::read_script(&data_dir, project, path)
                         .await
                         .map_err(|error| error.to_string())
                 }),
@@ -355,7 +355,7 @@ impl DesktopApp {
                 epoch,
                 dry_run,
                 client::block_on(async {
-                    client::save_script(&data_dir, project, path, revision, draft, dry_run)
+                    config_client::save_script(&data_dir, project, path, revision, draft, dry_run)
                         .await
                         .map_err(|error| error.to_string())
                 }),

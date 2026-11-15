@@ -23,6 +23,8 @@ pub struct UiAgent {
     pub project: String,
     /// The current manager, if any.
     pub parent: Option<String>,
+    /// Last change of the Agent record (ms since the epoch), for Recents.
+    pub updated_at: i64,
 }
 
 /// The direct-children read of one expanded manager.
@@ -66,6 +68,92 @@ pub fn project_name(label: &str, registered: &[(String, String)]) -> String {
         .find(|part| !part.is_empty())
         .unwrap_or(label)
         .to_owned()
+}
+
+/// One project of the sidebar: its name, its checkout (where a new task in
+/// it starts) and its visible rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Section {
+    pub name: String,
+    pub checkout: String,
+    pub rows: Vec<Row>,
+}
+
+/// The sidebar's projects: registered ones in registration order (with no
+/// rows when they have no Agent yet), then every other project label in
+/// order of first appearance. `rows` come from [`rows`] grouped by project;
+/// `registered` pairs each checkout with its project id.
+pub fn sections(rows: Vec<Row>, registered: &[(String, String)]) -> Vec<Section> {
+    let mut grouped: Vec<Section> = Vec::new();
+    for row in rows {
+        match (&row.group, grouped.last_mut()) {
+            (None, Some(section)) => section.rows.push(row),
+            _ => grouped.push(Section {
+                name: project_name(&row.agent.project, registered),
+                checkout: row.agent.project.clone(),
+                rows: vec![row],
+            }),
+        }
+    }
+    let mut out: Vec<Section> = registered
+        .iter()
+        .map(|(checkout, id)| {
+            let index = grouped
+                .iter()
+                .position(|section| &section.checkout == checkout);
+            match index {
+                Some(index) => grouped.remove(index),
+                None => Section {
+                    name: id.clone(),
+                    checkout: checkout.clone(),
+                    rows: Vec::new(),
+                },
+            }
+        })
+        .collect();
+    out.extend(grouped);
+    out
+}
+
+/// The most recently changed Agents, newest first (ties by id), at most
+/// `limit`.
+pub fn recents(agents: &[UiAgent], limit: usize) -> Vec<&UiAgent> {
+    let mut recent: Vec<&UiAgent> = agents.iter().collect();
+    recent.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
+    recent.dedup_by(|a, b| a.id == b.id);
+    recent.truncate(limit);
+    recent
+}
+
+/// Most characters of a title derived from a first message.
+const TITLE_CHARS: usize = 60;
+
+/// A conversation title from its first message, like a chat title: the
+/// first non-blank line, whitespace collapsed, cut at a word near
+/// [`TITLE_CHARS`] with an ellipsis. `None` for a blank message.
+pub fn title(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let joined = words.join(" ");
+    if joined.chars().count() <= TITLE_CHARS {
+        return Some(joined);
+    }
+    let mut cut = String::new();
+    for word in words {
+        let next = if cut.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{cut} {word}")
+        };
+        if next.chars().count() > TITLE_CHARS {
+            break;
+        }
+        cut = next;
+    }
+    if cut.is_empty() {
+        cut = joined.chars().take(TITLE_CHARS).collect();
+    }
+    Some(format!("{cut}…"))
 }
 
 /// The visible rows for `listed` (main pages, in daemon order), the fetched
@@ -192,6 +280,7 @@ mod tests {
             state: "idle".to_owned(),
             project: project.to_owned(),
             parent: parent.map(str::to_owned),
+            updated_at: 0,
         }
     }
 
@@ -309,5 +398,77 @@ mod tests {
         assert_eq!(project_name(r"\\?\C:\src\app", &registered), "app");
         assert_eq!(project_name(r"\\?\C:\work\other", &registered), "other");
         assert_eq!(project_name("plain", &registered), "plain");
+    }
+
+    #[test]
+    fn sections_list_registered_projects_first_even_without_agents() {
+        let listed = vec![
+            agent("a1", "/x", None),
+            agent("a2", "/p", None),
+            agent("a3", "/p", Some("a2")),
+        ];
+        let registered = vec![
+            ("/p".to_owned(), "pee".to_owned()),
+            ("/q".to_owned(), "queue".to_owned()),
+        ];
+        let all = rows(&listed, &HashMap::new(), &HashSet::new(), true, &|label| {
+            project_name(label, &registered)
+        });
+        let sections = sections(all, &registered);
+        let shape: Vec<(&str, &str, Vec<&str>)> = sections
+            .iter()
+            .map(|section| {
+                (
+                    section.name.as_str(),
+                    section.checkout.as_str(),
+                    section
+                        .rows
+                        .iter()
+                        .map(|row| row.agent.id.as_str())
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("pee", "/p", vec!["a2"]),
+                ("queue", "/q", vec![]),
+                ("x", "/x", vec!["a1"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn recents_are_newest_first_and_bounded() {
+        let mut listed = vec![
+            agent("a1", "p", None),
+            agent("a2", "p", None),
+            agent("a3", "p", None),
+        ];
+        listed[0].updated_at = 10;
+        listed[1].updated_at = 30;
+        listed[2].updated_at = 20;
+        let ids: Vec<&str> = recents(&listed, 2)
+            .into_iter()
+            .map(|agent| agent.id.as_str())
+            .collect();
+        assert_eq!(ids, ["a2", "a3"]);
+    }
+
+    #[test]
+    fn titles_take_the_first_line_and_cut_at_a_word() {
+        assert_eq!(
+            title("\n  Fix   the build \nmore"),
+            Some("Fix the build".to_owned())
+        );
+        assert_eq!(title("   \n "), None);
+        let long = "Read docs/spec/api.md completely and list every method that the desktop does not call yet";
+        let cut = title(long).unwrap();
+        assert!(cut.ends_with('…'), "{cut}");
+        assert!(cut.chars().count() <= 61, "{cut}");
+        assert!(long.starts_with(cut.trim_end_matches('…')));
+        let unbroken = "x".repeat(80);
+        assert_eq!(title(&unbroken).unwrap().chars().count(), 61);
     }
 }

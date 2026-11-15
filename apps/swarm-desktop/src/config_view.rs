@@ -366,7 +366,7 @@ pub fn automation_screen(
                     rows.push(KeyedView::new(
                         format!("{}/{}", namespace.label, entry.state.id),
                         Border::new()
-                            .background(palette.surface_container())
+                            .background(palette.card())
                             .border_brush(palette.outline_variant())
                             .border_thickness(1.0)
                             .corner_radius(theme::shape::SM)

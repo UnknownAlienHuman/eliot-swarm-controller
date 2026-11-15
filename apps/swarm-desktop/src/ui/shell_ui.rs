@@ -1,28 +1,53 @@
-//! Navigation shell: projects, the Agent list, screen selection and the root layout.
+//! The one shell: the sidebar (New task, projects with their Agents nested,
+//! Recents, the fleet status and Settings), the main area (one
+//! conversation or the Settings page) and the optional right panel (the
+//! monitor or the open Agent's details).
 
 use super::*;
-use crate::nav::{Branch, Row};
-use crate::settings::ThemeChoice;
+use crate::nav::{Branch, Row, Section};
+use crate::settings::{Settings, Startup, ThemeChoice};
 use crate::theme::StatusTone;
 use crate::theme::winui::Palette;
+
+/// What the main area shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Main {
+    Conversation,
+    Settings,
+}
+
+/// The optional right panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Panel {
+    Closed,
+    /// Every Agent as a simple card.
+    Monitor,
+    /// The open conversation's Agent: settings, coverage, resources, usage
+    /// and Change manager.
+    Details,
+}
 
 #[derive(Clone, Debug)]
 pub(super) enum ShellMsg {
     ProjectsLoaded(Fallible<Vec<UiProject>>),
     AgentsLoaded(u64, bool, Fallible<AgentPage>),
-    ProjectSelected(Option<usize>),
-    AgentSelected(Option<usize>),
+    /// A sidebar row: open this Agent's conversation.
+    AgentOpened(UiAgent),
+    /// A project row: a new task in this checkout.
+    ProjectPicked(String),
     RefreshRequested,
-    NewConversation,
+    NewTask,
     MoreAgentsRequested,
-    HighlightAgent(String),
-    ScreenSelected(Screen),
+    SettingsOpened,
+    PanelToggled(Panel),
     /// The window's actual Light/Dark scheme (Reactor `on_color_scheme`).
     SchemeObserved(ColorScheme),
     /// The window's client size (Reactor `on_window_size`).
     WindowResized(WindowSize),
-    /// System → Light → Dark → System.
-    ThemeCycled,
+    ThemeChosen(ThemeChoice),
+    StartupChosen(Startup),
+    /// The profile Auto launches until routing lands (None: first allowed).
+    DefaultProfileChosen(Option<String>),
     /// The re-created editors of this re-prime exist: give them their text.
     FieldsPrimed(u64),
     /// The periodic High Contrast reading.
@@ -31,8 +56,11 @@ pub(super) enum ShellMsg {
     ExpandToggled(String, bool),
     /// Tree epoch, manager id and its direct-children page.
     BranchLoaded(u64, String, Fallible<AgentPage>),
-    /// The theme choice written to the settings file (or not).
-    SettingsSaved(ThemeChoice, Result<(), String>),
+    /// The preferences written to the settings file (or not).
+    PreferencesSaved(Settings, Result<(), String>),
+    /// Titles read from first messages (`None`: no retained input).
+    TitlesLoaded(Vec<(String, Option<String>)>),
+    AlertDismissed,
 }
 
 /// Reactor 0.100.0 reports the window's Light/Dark scheme only, and a High
@@ -41,15 +69,14 @@ pub(super) enum ShellMsg {
 const HIGH_CONTRAST_POLL_MS: u64 = 2_000;
 /// Re-check for the empty editor render one frame later.
 const PRIME_RETRY_MS: u64 = 16;
-/// Indent per tree level in the Agent list.
+/// Indent per tree level in the sidebar.
 const TREE_INDENT: f64 = 16.0;
-/// The expand chevron button: FontIcon's 20-DIP glyph inside WinUI's fixed
-/// button padding (11, 5, 11, 6) shows whole at 44 x 32.
-const CHEVRON_BUTTON: (f64, f64) = (44.0, 32.0);
-/// WinUI draws a Button's focus visual 3 DIP outside its bounds
-/// (`FocusVisualMargin` -3), and Reactor 0.100.0 cannot change that, so the
-/// chevron column holds the button plus that margin and 1 DIP on each side.
-const CHEVRON_COLUMN: f64 = CHEVRON_BUTTON.0 + 2.0 * 4.0;
+/// The expand chevron column of an Agent row.
+const CHEVRON: f64 = 24.0;
+/// Rows in Recents.
+const RECENTS: usize = 8;
+/// Titles read per background batch.
+const TITLE_BATCH: usize = 24;
 
 fn window_theme(choice: ThemeChoice) -> WindowTheme {
     match choice {
@@ -59,26 +86,15 @@ fn window_theme(choice: ThemeChoice) -> WindowTheme {
     }
 }
 
-fn theme_glyph(choice: ThemeChoice) -> &'static str {
-    match choice {
-        ThemeChoice::System => m3::glyph::THEME_SYSTEM,
-        ThemeChoice::Light => m3::glyph::THEME_LIGHT,
-        ThemeChoice::Dark => m3::glyph::THEME_DARK,
-    }
-}
-
-/// Theme choice (persisted per user), the scheme the window actually shows,
-/// and High Contrast.
+/// The scheme the window actually shows, and High Contrast.
 pub(super) struct Appearance {
-    pref: ThemeChoice,
-    dark: bool,
-    high_contrast: bool,
+    pub(super) dark: bool,
+    pub(super) high_contrast: bool,
 }
 
 impl Appearance {
     pub(super) fn new() -> Self {
         Self {
-            pref: crate::settings::load().theme,
             dark: false,
             high_contrast: crate::accessibility::high_contrast_on(),
         }
@@ -89,31 +105,26 @@ impl Appearance {
     }
 }
 
-/// Projects, the Agent list pages, expanded branches and the selection.
+/// Projects, the listed Agents, expanded branches, titles and the selection.
 pub(super) struct ShellState {
     pub(super) selection: Selection,
     pub(super) projects: Vec<UiProject>,
-    pub(super) project_idx: Option<usize>,
     /// Listed pages, in daemon order.
     pub(super) agents: Vec<UiAgent>,
     /// Direct-children reads of expanded managers.
     pub(super) branches: HashMap<String, Branch>,
     pub(super) expanded: HashSet<String>,
-    /// Tags branch reads; a reply from before a project switch is dropped.
+    /// Tags branch reads; a reply from before a refresh is dropped.
     pub(super) tree_epoch: u64,
-    /// The rows on screen (see [`nav::rows`]); `agent_idx` indexes these.
-    pub(super) rows: Vec<Row>,
-    /// Row ids as last rendered, and the render count when `rows` was last
-    /// replaced (equal to the current count: not rendered yet).
-    pub(super) published: Vec<String>,
-    pub(super) rows_render: u64,
-    pub(super) agent_idx: Option<usize>,
     pub(super) agents_next: Option<String>,
     pub(super) agents_total: usize,
     pub(super) agents_loading: bool,
     /// Tags agent-list loads; a reply for an older request is dropped.
     pub(super) list_epoch: u64,
     pub(super) pending_select: Option<UiAgent>,
+    /// Titles from first messages; `None` once read without one.
+    pub(super) titles: HashMap<String, Option<String>>,
+    pub(super) titles_inflight: bool,
 }
 
 impl DesktopApp {
@@ -121,15 +132,15 @@ impl DesktopApp {
         match msg {
             ShellMsg::ProjectsLoaded(projects) => match projects {
                 Ok(projects) => {
-                    let count = projects.len();
                     self.nav.projects = projects;
-                    // Group captions name registered projects by id.
-                    self.refresh_rows(context);
-                    self.set_status(format!(
-                        "{count} registered project(s); listing every Agent in scope."
-                    ));
+                    // A new task starts in the first project until one is picked.
+                    if self.launch.workspace.is_empty()
+                        && let Some(first) = self.nav.projects.first().cloned()
+                    {
+                        self.pick_project(&first.workspace);
+                    }
                 }
-                Err(error) => self.set_status(format!("project.list failed: {error}")),
+                Err(error) => self.alert(format!("Projects not read: {error}")),
             },
             ShellMsg::AgentsLoaded(list_epoch, append, page) => {
                 if list_epoch != self.nav.list_epoch {
@@ -160,52 +171,27 @@ impl DesktopApp {
                         {
                             self.open_conversation(&agent, context);
                         }
-                        self.refresh_rows(context);
+                        self.open_startup_conversation(context);
+                        self.load_titles(context);
                     }
-                    Err(error) => self.set_status(format!("agent.list failed: {error}")),
+                    Err(error) => self.alert(format!("Agents not read: {error}")),
                 }
             }
-            ShellMsg::ProjectSelected(index) => {
-                // The owner cannot clear a ComboBox: None only reports
-                // replaced items, and the same index is no change.
-                if index.is_none() || index == self.nav.project_idx {
-                    return;
+            ShellMsg::AgentOpened(agent) => {
+                if self.main != Main::Conversation {
+                    self.main = Main::Conversation;
+                    self.reprime_fields(context);
                 }
-                self.nav.project_idx = index;
-                self.nav.agents.clear();
-                self.nav.branches.clear();
-                self.nav.expanded.clear();
-                self.nav.tree_epoch += 1;
-                self.nav.rows.clear();
-                self.nav.agent_idx = None;
-                self.nav.agents_next = None;
-                self.nav.agents_total = 0;
-                match self.selected_project().cloned() {
-                    Some(project) => {
-                        self.launch.profiles = project.profiles.clone();
-                        self.launch.workspace = project.workspace.clone();
-                        self.nav.selection.project = Some(project.id.clone());
-                    }
-                    None => {
-                        self.launch.profiles.clear();
-                        self.nav.selection.project = None;
-                    }
-                }
-                self.launch.profile_idx = None;
-                self.nav.selection.profile = None;
-                self.load_agents(context, None);
-            }
-            ShellMsg::AgentSelected(index) => {
-                self.nav.agent_idx = index;
-                // A list reload clears the native selection (None); the open
-                // conversation and its feed stay as they are.
-                if let Some(agent) = index
-                    .and_then(|index| self.nav.rows.get(index))
-                    .map(|row| row.agent.clone())
-                    && self.chat.convo.as_ref().map(Conversation::agent) != Some(&agent.id)
-                {
+                if self.chat.convo.as_ref().map(Conversation::agent) != Some(&agent.id) {
                     self.open_conversation(&agent, context);
                 }
+                if self.panel == Panel::Details {
+                    self.show_details(&agent.id, context);
+                }
+            }
+            ShellMsg::ProjectPicked(checkout) => {
+                self.pick_project(&checkout);
+                self.new_task(context);
             }
             ShellMsg::ExpandToggled(id, expand) => {
                 if expand {
@@ -216,7 +202,6 @@ impl DesktopApp {
                 } else {
                     self.nav.expanded.remove(&id);
                 }
-                self.refresh_rows(context);
             }
             ShellMsg::BranchLoaded(epoch, id, page) => {
                 if epoch != self.nav.tree_epoch {
@@ -230,7 +215,7 @@ impl DesktopApp {
                     Err(error) => Branch::Failed(error),
                 };
                 self.nav.branches.insert(id, branch);
-                self.refresh_rows(context);
+                self.load_titles(context);
             }
             ShellMsg::RefreshRequested => {
                 if let Ok(data_dir) = self.data_dir.clone() {
@@ -244,59 +229,38 @@ impl DesktopApp {
                 for id in expanded {
                     self.load_branch(&id, context);
                 }
+                self.load_profile_list(context);
                 if self.chat.convo.is_some() {
                     self.chat.failures = 0;
                     self.start_snapshot(context);
                 }
             }
-            ShellMsg::NewConversation => {
-                // Keyboard focus goes back to the composer (no-op while it is unbound).
-                let _ = self.chat.composer_ref.request_focus();
-                // Leave the conversation locally; the Agent keeps running.
-                self.chat.epoch += 1;
-                if let Some(task) = self.chat.live_task.take() {
-                    task.cancel();
-                }
-                self.nav.selection.select_agent(None);
-                self.nav.agent_idx = None;
-                self.chat.convo = None;
-                self.chat.detail = None;
-                self.chat.live = LiveStatus::Idle;
-                self.chat.items = Rc::new(Vec::new());
-                self.chat.items_revision = 0;
-                self.chat.unseen = 0;
-                self.set_status("New conversation: launch an Agent with its first message.");
-            }
+            ShellMsg::NewTask => self.new_task(context),
             ShellMsg::MoreAgentsRequested => {
                 if let Some(after) = self.nav.agents_next.clone() {
                     self.load_agents(context, Some(after));
                 }
             }
-            ShellMsg::HighlightAgent(id) => {
-                if self.nav.selection.agent.as_deref() == Some(id.as_str()) {
-                    self.highlight_published(&id, context);
-                }
-            }
-            ShellMsg::ScreenSelected(screen) => {
-                if self.screen != screen {
+            ShellMsg::SettingsOpened => {
+                if self.main != Main::Settings {
+                    self.main = Main::Settings;
                     self.reprime_fields(context);
-                }
-                self.screen = screen;
-                match screen {
-                    Screen::Profiles if !self.editor.loaded && !self.editor.busy => {
-                        self.load_profile_source(context);
-                        self.load_profile_list(context);
-                    }
-                    Screen::Automation => self.load_rules(context),
-                    Screen::Scripts => {
-                        if !self.scripts.listed {
-                            self.load_scripts(context);
-                        }
-                        self.load_rules(context);
-                    }
-                    _ => {}
+                    self.settings_entered(context);
                 }
             }
+            ShellMsg::PanelToggled(panel) => match panel {
+                Panel::Details => match self.selected_agent_id() {
+                    Some(agent) if self.panel != Panel::Details => {
+                        self.show_details(&agent, context);
+                    }
+                    _ => self.close_panel(),
+                },
+                Panel::Monitor if self.panel != Panel::Monitor => {
+                    self.panel = Panel::Monitor;
+                    self.start_monitor(context);
+                }
+                _ => self.close_panel(),
+            },
             ShellMsg::SchemeObserved(scheme) => {
                 let before = self.palette();
                 self.appearance.dark = scheme == ColorScheme::Dark;
@@ -314,20 +278,34 @@ impl DesktopApp {
                 }
                 self.watch_high_contrast(context);
             }
-            ShellMsg::ThemeCycled => {
-                self.appearance.pref = self.appearance.pref.next();
-                self.save_settings(context);
+            ShellMsg::ThemeChosen(theme) => {
+                self.prefs.theme = theme;
+                self.save_preferences(context);
             }
-            ShellMsg::SettingsSaved(saved, result) => {
-                self.settings_saving = false;
+            ShellMsg::StartupChosen(startup) => {
+                self.prefs.startup = startup;
+                self.save_preferences(context);
+            }
+            ShellMsg::DefaultProfileChosen(profile) => {
+                self.prefs.default_profile = profile;
+                self.save_preferences(context);
+            }
+            ShellMsg::PreferencesSaved(saved, result) => {
+                self.prefs_saving = false;
                 if let Err(error) = result {
-                    self.set_status(format!("Theme choice not saved: {error}"));
+                    self.alert(format!("Preferences not saved: {error}"));
                 }
-                // A newer choice arrived while this one was written.
-                if saved != self.appearance.pref {
-                    self.save_settings(context);
+                // A newer change arrived while this one was written.
+                if saved != self.prefs {
+                    self.save_preferences(context);
                 }
             }
+            ShellMsg::TitlesLoaded(titles) => {
+                self.nav.titles_inflight = false;
+                self.nav.titles.extend(titles);
+                self.load_titles(context);
+            }
+            ShellMsg::AlertDismissed => self.alert = None,
             ShellMsg::FieldsPrimed(epoch) => {
                 if epoch != self.prime_epoch {
                     return;
@@ -343,9 +321,138 @@ impl DesktopApp {
         }
     }
 
+    /// Leave the open conversation locally (the Agent keeps running) and
+    /// show the empty new-task view.
+    pub(super) fn new_task(&mut self, context: &ComponentContext<Self>) {
+        if self.main != Main::Conversation {
+            self.main = Main::Conversation;
+            self.reprime_fields(context);
+        }
+        // Keyboard focus goes back to the composer (no-op while it is unbound).
+        let _ = self.chat.composer_ref.request_focus();
+        self.chat.epoch += 1;
+        if let Some(task) = self.chat.live_task.take() {
+            task.cancel();
+        }
+        self.nav.selection.select_agent(None);
+        self.chat.convo = None;
+        self.chat.detail = None;
+        self.chat.live = LiveStatus::Idle;
+        self.chat.items = Rc::new(Vec::new());
+        self.chat.items_revision = 0;
+        self.chat.unseen = 0;
+        if self.panel == Panel::Details {
+            self.close_panel();
+        }
+        self.set_status("New task.");
+    }
+
+    /// The project a new task starts in: its checkout, and its profile
+    /// allowlist when it is registered.
+    fn pick_project(&mut self, checkout: &str) {
+        let registered = self
+            .nav
+            .projects
+            .iter()
+            .find(|project| project.workspace == checkout)
+            .cloned();
+        self.launch.workspace = checkout.to_owned();
+        self.launch.custom_workspace = false;
+        match registered {
+            Some(project) => {
+                self.launch.profiles = project.profiles.clone();
+                self.nav.selection.project = Some(project.id.clone());
+            }
+            None => {
+                self.launch.profiles.clear();
+                self.nav.selection.project = None;
+            }
+        }
+        self.launch.reconcile_choice();
+    }
+
+    /// Open the last conversation once at start, when the preference asks.
+    fn open_startup_conversation(&mut self, context: &ComponentContext<Self>) {
+        if self.startup_done {
+            return;
+        }
+        self.startup_done = true;
+        if self.prefs.startup != Startup::LastConversation || self.chat.convo.is_some() {
+            return;
+        }
+        let last = self
+            .prefs
+            .last_agent
+            .as_ref()
+            .and_then(|id| self.nav.agents.iter().find(|agent| &agent.id == id))
+            .cloned();
+        if let Some(agent) = last {
+            self.open_conversation(&agent, context);
+        }
+    }
+
+    /// Read titles of shown Agents that have none yet, one batch at a time.
+    fn load_titles(&mut self, context: &ComponentContext<Self>) {
+        if self.nav.titles_inflight {
+            return;
+        }
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let branch_children = self.nav.branches.values().flat_map(|branch| match branch {
+            Branch::Loaded { children, .. } => children.as_slice(),
+            _ => &[],
+        });
+        let mut missing: Vec<String> = Vec::new();
+        for agent in self.nav.agents.iter().chain(branch_children) {
+            if !self.nav.titles.contains_key(&agent.id) && !missing.contains(&agent.id) {
+                missing.push(agent.id.clone());
+            }
+            if missing.len() == TITLE_BATCH {
+                break;
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        self.nav.titles_inflight = true;
+        let _task = context.spawn_background(move |_| {
+            let titles = client::block_on(async {
+                futures_util::stream::iter(missing)
+                    .map(|id| {
+                        let data_dir = data_dir.clone();
+                        async move {
+                            // A failed read leaves the id as the title; it
+                            // is not retried in a loop.
+                            let title = client::first_input(&data_dir, &id)
+                                .await
+                                .ok()
+                                .flatten()
+                                .and_then(|text| nav::title(&text));
+                            (id, title)
+                        }
+                    })
+                    .buffer_unordered(client::MAX_CONCURRENT_READS)
+                    .collect::<Vec<_>>()
+                    .await
+            });
+            Message::Shell(ShellMsg::TitlesLoaded(titles))
+        });
+    }
+
+    /// The conversation title of `agent`: its first message, else its id.
+    pub(super) fn agent_title(&self, agent: &str) -> String {
+        self.nav
+            .titles
+            .get(agent)
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| agent.to_owned())
+    }
+
     /// Reactor 0.100.0 creates a TextBox with `Text` before `AcceptsReturn`,
     /// and a TextBox that is still single-line keeps only the first line of
-    /// the text it is given. Whenever the screen tree is re-created the
+    /// the text it is given. Whenever the main tree is re-created the
     /// multi-line editors (composer, profile and script sources) therefore
     /// render one turn empty and get their text on the next message, once
     /// they already accept returns: the same path as a first load.
@@ -377,35 +484,29 @@ impl DesktopApp {
         });
     }
 
-    /// The chat pane's width from the window width and the shell layout
-    /// below (rail, Agent list, optional monitor, spacing), or None until
-    /// the first size observation.
-    pub(super) fn chat_pane_width(&self) -> Option<f64> {
-        let monitor = if self.monitor.open {
-            theme::layout::MONITOR_WIDTH + theme::spacing::SM
-        } else {
+    /// The main area's width from the window width, the sidebar and the
+    /// open panel, or None until the first size observation.
+    pub(super) fn main_width(&self) -> Option<f64> {
+        let panel = if self.panel == Panel::Closed {
             0.0
+        } else {
+            theme::layout::PANEL_WIDTH
         };
-        self.window_width.map(|width| {
-            width
-                - theme::layout::RAIL_WIDTH
-                - theme::layout::LIST_WIDTH
-                - 2.0 * theme::spacing::SM
-                - monitor
-        })
+        self.window_width
+            .map(|width| width - theme::layout::SIDEBAR_WIDTH - panel)
     }
 
-    /// Write the current theme choice, one write at a time (a newer choice
-    /// is written when the running write reports back).
-    fn save_settings(&mut self, context: &ComponentContext<Self>) {
-        if self.settings_saving {
+    /// Write the preferences, one write at a time (a newer state is
+    /// written when the running write reports back).
+    pub(super) fn save_preferences(&mut self, context: &ComponentContext<Self>) {
+        if self.prefs_saving {
             return;
         }
-        self.settings_saving = true;
-        let theme = self.appearance.pref;
+        self.prefs_saving = true;
+        let prefs = self.prefs.clone();
         let _task = context.spawn_background(move |_| {
-            let saved = crate::settings::save(&crate::settings::Settings { theme });
-            Message::Shell(ShellMsg::SettingsSaved(theme, saved))
+            let saved = config_client::save_preferences(&prefs);
+            Message::Shell(ShellMsg::PreferencesSaved(prefs, saved))
         });
     }
 
@@ -414,83 +515,12 @@ impl DesktopApp {
         if self.fields_primed { text } else { "" }
     }
 
+    /// The registered project a new task starts in, if any.
     pub(super) fn selected_project(&self) -> Option<&UiProject> {
         self.nav
-            .project_idx
-            .and_then(|index| index.checked_sub(1))
-            .and_then(|index| self.nav.projects.get(index))
-    }
-
-    /// Recompute the rows on screen and the native selection index.
-    ///
-    /// Never point the native SelectedIndex at a row this same render adds
-    /// or moves: Reactor 0.100.0 applies the SelectedIndex before the new
-    /// items reach the ListView; an index past them fails with E_INVALIDARG
-    /// (0x80070057), which Reactor treats as a fatal native command failure
-    /// (the process aborts with 0xC0000409; standalone repro 2026-11-14), and
-    /// an index shifted by an insertion would select another row. An index
-    /// is kept only when the same Agent was already on it; otherwise the
-    /// selected row is highlighted on the next tick, once published.
-    pub(super) fn refresh_rows(&mut self, context: &ComponentContext<Self>) {
-        let registered: Vec<(String, String)> = self
-            .nav
             .projects
             .iter()
-            .map(|project| (project.workspace.clone(), project.id.clone()))
-            .collect();
-        let group = self.selected_project().is_none();
-        let rows = nav::rows(
-            &self.nav.agents,
-            &self.nav.branches,
-            &self.nav.expanded,
-            group,
-            &|label| nav::project_name(label, &registered),
-        );
-        // Rows replaced earlier in this same message batch never reached
-        // the native list; the published ids are the last rendered ones.
-        if self.renders.get() != self.nav.rows_render {
-            self.nav.published = self
-                .nav
-                .rows
-                .iter()
-                .map(|row| row.agent.id.clone())
-                .collect();
-        }
-        self.nav.rows = rows;
-        self.nav.rows_render = self.renders.get();
-        let Some(id) = self.nav.selection.agent.clone() else {
-            self.nav.agent_idx = None;
-            return;
-        };
-        self.highlight_published(&id, context);
-    }
-
-    /// Point the native selection at `id` only where the native list already
-    /// shows it at the same index; otherwise clear it and try again on the
-    /// next tick, after the rows are published.
-    pub(super) fn highlight_published(&mut self, id: &str, context: &ComponentContext<Self>) {
-        let index = self.nav.rows.iter().position(|row| row.agent.id == id);
-        let rendered: Vec<&str> = if self.renders.get() == self.nav.rows_render {
-            self.nav.published.iter().map(String::as_str).collect()
-        } else {
-            // A render happened since the rows changed: they are on screen.
-            self.nav
-                .rows
-                .iter()
-                .map(|row| row.agent.id.as_str())
-                .collect()
-        };
-        let stable = index.is_some_and(|index| rendered.get(index) == Some(&id));
-        if stable {
-            self.nav.agent_idx = index;
-        } else {
-            self.nav.agent_idx = None;
-            if index.is_some() {
-                let id = id.to_owned();
-                let _task =
-                    context.spawn_background(move |_| Message::Shell(ShellMsg::HighlightAgent(id)));
-            }
-        }
+            .find(|project| project.workspace == self.launch.workspace)
     }
 
     /// Read one manager's direct children (`agent.list` with `parent`).
@@ -524,14 +554,9 @@ impl DesktopApp {
         let append = after.is_some();
         self.nav.list_epoch += 1;
         let list_epoch = self.nav.list_epoch;
-        // An Agent's project label is its registered checkout path, not the
-        // registration id, so the filter is the checkout.
         let request = AgentListRequest {
             after,
             limit: AGENT_PAGE,
-            project: self
-                .selected_project()
-                .map(|project| project.workspace.clone()),
             ..Default::default()
         };
         self.nav.agents_loading = true;
@@ -544,10 +569,9 @@ impl DesktopApp {
         });
     }
 
-    /// The window: navigation rail, the selected screen on rounded panes,
-    /// the openable monitor and one status line (issue #407 §1).
+    /// The window: sidebar, main area and the optional right panel.
     pub(super) fn shell_view(&self, context: &mut ViewContext<Self>) -> View {
-        context.window_title("Swarm Desktop");
+        context.window_title("Eliot Swarm");
         // A bounded first window instead of WinUI's share of the monitor
         // (3826 px wide on a 5120 px display). Reactor applies only visuals
         // that differ from the default, so this declaration also carries the
@@ -555,7 +579,7 @@ impl DesktopApp {
         context.window_visuals(
             WindowVisuals::new()
                 .client_size(theme::layout::WINDOW_WIDTH, theme::layout::WINDOW_HEIGHT)
-                .theme(window_theme(self.appearance.pref)),
+                .theme(window_theme(self.prefs.theme)),
         );
         context.on_color_scheme(
             context.callback(|scheme| Message::Shell(ShellMsg::SchemeObserved(scheme))),
@@ -564,66 +588,34 @@ impl DesktopApp {
             .on_window_size(context.callback(|size| Message::Shell(ShellMsg::WindowResized(size))));
         let palette = self.palette();
 
-        let screen: View = match self.screen {
-            Screen::Chat => Grid::new()
-                .columns([
-                    GridLength::Pixel(theme::layout::LIST_WIDTH),
-                    GridLength::STAR,
-                ])
-                .column_spacing(theme::spacing::SM)
-                .children((
-                    m3::pane(palette)
-                        .grid_column(0)
-                        .content(self.nav_view(context, palette)),
-                    m3::pane(palette)
-                        .padding(Thickness::uniform(0.0))
-                        .grid_column(1)
-                        .content(self.chat_view(context, palette)),
-                )),
-            Screen::Profiles => m3::pane(palette).content(self.profiles_view(context, palette)),
-            Screen::Automation => m3::pane(palette).content(config_view::automation_screen(
-                &self.automation.rules,
-                &self.automation.status,
-                context.message(Message::Automation(
-                    AutomationMsg::AutomationRefreshRequested,
-                )),
-                palette,
-            )),
-            Screen::Scripts => m3::pane(palette).content(self.scripts_view(context, palette)),
+        let main: View = match self.main {
+            Main::Conversation => self.chat_view(context, palette),
+            Main::Settings => self.settings_view(context, palette),
         };
-        let mut columns = vec![GridLength::STAR];
-        let monitor: View = if self.monitor.open {
-            columns.push(GridLength::Pixel(theme::layout::MONITOR_WIDTH));
-            m3::pane(palette)
-                .grid_column(1)
-                .content(self.monitor_view(context, palette))
-        } else {
+        let mut columns = vec![
+            GridLength::Pixel(theme::layout::SIDEBAR_WIDTH),
+            GridLength::STAR,
+        ];
+        let panel: View = if self.panel == Panel::Closed {
             View::empty()
+        } else {
+            columns.push(GridLength::Pixel(theme::layout::PANEL_WIDTH));
+            Border::new()
+                .grid_column(2)
+                .background(palette.sidebar())
+                .content(self.panel_view(context, palette))
         };
-        let content = Grid::new()
-            .grid_column(1)
-            .rows([GridLength::STAR, GridLength::Auto])
-            .margin(Thickness::new(
-                0.0,
-                theme::spacing::SM,
-                theme::spacing::SM,
-                0.0,
-            ))
-            .children((
-                Grid::new()
-                    .columns(columns)
-                    .column_spacing(theme::spacing::SM)
-                    .children((screen, monitor)),
-                Border::new().grid_row(1).content(self.status_line(palette)),
-            ));
-
         let window = Grid::new()
-            .background(palette.background())
-            .columns([
-                GridLength::Pixel(theme::layout::RAIL_WIDTH),
-                GridLength::STAR,
-            ])
-            .children((self.rail_view(context, palette), content));
+            .background(palette.surface())
+            .columns(columns)
+            .children((
+                Border::new()
+                    .grid_column(0)
+                    .background(palette.sidebar())
+                    .content(self.sidebar_view(context, palette)),
+                Border::new().grid_column(1).content(main),
+                panel,
+            ));
         // Reactor updates a Button's resource overrides in place, but WinUI
         // resolves a template's ThemeResource values only when the template
         // is applied or the theme changes, and the theme change arrives before
@@ -638,228 +630,133 @@ impl DesktopApp {
         Grid::new().keyed_children(vec![KeyedView::new(palette_key.to_owned(), window)])
     }
 
-    /// The M3 navigation rail: the new-conversation FAB, the destinations
-    /// with their active indicator, and the monitor and theme switches.
-    fn rail_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let chat = self.rail_item(
-            palette,
-            self.screen == Screen::Chat,
-            m3::glyph::CHAT,
-            "Chat",
-            "Chat screen",
-            context.message(Message::Shell(ShellMsg::ScreenSelected(Screen::Chat))),
-        );
-        let profiles = self.rail_item(
-            palette,
-            self.screen == Screen::Profiles,
-            m3::glyph::PROFILES,
-            "Profiles",
-            "Profiles screen",
-            context.message(Message::Shell(ShellMsg::ScreenSelected(Screen::Profiles))),
-        );
-        let automation = self.rail_item(
-            palette,
-            self.screen == Screen::Automation,
-            m3::glyph::AUTOMATION,
-            "Automation",
-            "Automation screen",
-            context.message(Message::Shell(ShellMsg::ScreenSelected(Screen::Automation))),
-        );
-        let scripts = self.rail_item(
-            palette,
-            self.screen == Screen::Scripts,
-            m3::glyph::SCRIPTS,
-            "Scripts",
-            "Scripts screen",
-            context.message(Message::Shell(ShellMsg::ScreenSelected(Screen::Scripts))),
-        );
-        let monitor = self.rail_item(
-            palette,
-            self.monitor.open,
-            m3::glyph::MONITOR,
-            "Monitor",
-            "Monitor",
-            context.message(Message::Monitor(MonitorMsg::MonitorToggled(
-                !self.monitor.open,
-            ))),
-        );
-        let fab = Button::new()
-            .grid_row(0)
-            .automation_name("New conversation")
-            .resource_overrides(palette.fab())
-            .width(56.0)
-            .height(56.0)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .on_click(context.message(Message::Shell(ShellMsg::NewConversation)))
-            .content(m3::icon(m3::glyph::ADD));
-        let pref = self.appearance.pref;
-        let theme_switch = Button::new()
-            .automation_name(format!(
-                "Theme: {} (switch to {})",
-                pref.label(),
-                pref.next().label()
-            ))
-            .resource_overrides(palette.rail_item(false))
-            .width(theme::layout::RAIL_ITEM_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .on_click(context.message(Message::Shell(ShellMsg::ThemeCycled)))
-            .content(rail_label(theme_glyph(pref), pref.label(), false, None));
-        Grid::new()
-            .grid_column(0)
-            .rows([
-                GridLength::Auto,
-                GridLength::Auto,
-                GridLength::STAR,
-                GridLength::Auto,
-            ])
-            .row_spacing(theme::spacing::XL)
+    /// The sidebar: the app name, New task, the projects with their Agents,
+    /// Recents, then the fleet status and Settings at the bottom.
+    fn sidebar_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let gutter = theme::spacing::SM;
+        let new_task_selected = self.main == Main::Conversation && self.chat.convo.is_none();
+        let header = Grid::new()
+            .columns([GridLength::STAR, GridLength::Auto])
             .margin(Thickness::new(
-                0.0,
                 theme::spacing::MD,
-                0.0,
                 theme::spacing::MD,
-            ))
-            .children((
-                fab,
-                StackPanel::new()
-                    .grid_row(1)
-                    .spacing(theme::spacing::MD)
-                    .children((chat, profiles, automation, scripts)),
-                StackPanel::new()
-                    .grid_row(3)
-                    .spacing(theme::spacing::SM)
-                    .children((monitor, theme_switch)),
-            ))
-    }
-
-    /// One rail destination: a real Button with the M3 indicator pill behind
-    /// its icon when selected. The accessible name carries the selection.
-    fn rail_item(
-        &self,
-        palette: Palette,
-        selected: bool,
-        glyph: &str,
-        label: &str,
-        name: &str,
-        on_click: Callback<()>,
-    ) -> View {
-        Button::new()
-            .automation_name(if selected {
-                format!("{name} (current)")
-            } else {
-                name.to_owned()
-            })
-            .resource_overrides(palette.rail_item(selected))
-            .width(theme::layout::RAIL_ITEM_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .on_click(on_click)
-            .content(rail_label(
-                glyph,
-                label,
-                selected,
-                selected.then(|| palette.indicator()),
-            ))
-    }
-
-    /// Connection state as a chip, then the latest status message.
-    fn status_line(&self, palette: Palette) -> View {
-        let (tone, short) = match &self.chat.live {
-            LiveStatus::Idle => (StatusTone::Neutral, "No conversation"),
-            LiveStatus::Loading => (StatusTone::Pending, "Loading"),
-            LiveStatus::Live => (StatusTone::Ready, "Live"),
-            LiveStatus::Stale(_) => (StatusTone::Unknown, "Stale"),
-            LiveStatus::Reconnecting { .. } => (StatusTone::Unknown, "Reconnecting"),
-            LiveStatus::Stopped(_) => (StatusTone::Failed, "Stopped"),
-        };
-        let detail = match &self.chat.live {
-            LiveStatus::Stale(_) | LiveStatus::Reconnecting { .. } | LiveStatus::Stopped(_) => {
-                format!("{} · {}", self.chat.live.label(), self.status)
-            }
-            _ => self.status.clone(),
-        };
-        StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(theme::spacing::SM)
-            .margin(Thickness::new(
-                theme::spacing::XS,
-                theme::spacing::XS,
-                theme::spacing::SM,
+                gutter,
                 theme::spacing::SM,
             ))
             .children((
-                m3::chip(palette, tone, short),
-                m3::muted(detail, theme::type_scale::BODY_SMALL)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .text_trimming(TextTrimming::CharacterEllipsis),
-            ))
-    }
+                m3::title("Eliot Swarm", theme::type_scale::TITLE_MEDIUM)
+                    .vertical_alignment(VerticalAlignment::Center),
+                m3::icon_button(palette)
+                    .grid_column(1)
+                    .automation_name("Refresh")
+                    .on_click(context.message(Message::Shell(ShellMsg::RefreshRequested)))
+                    .content(m3::icon(m3::glyph::REFRESH)),
+            ));
+        let new_task = m3::row(palette, new_task_selected)
+            .grid_row(1)
+            .margin(Thickness::xy(gutter, 0.0))
+            .automation_name("New task")
+            .on_click(context.message(Message::Shell(ShellMsg::NewTask)))
+            .content(m3::icon_label(m3::glyph::NEW_TASK, "New task"));
 
-    /// Projects and Agents: the list beside the conversation.
-    pub(super) fn nav_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let mut project_names = vec![ALL_PROJECTS.to_owned()];
-        project_names.extend(self.nav.projects.iter().map(|project| project.id.clone()));
-        // WinUI drops a ComboBox's selection when its items are replaced, so
-        // a new project list gets a new control (as in `configure::panel`).
-        let picker_key = format!("projects:{}", project_names.join("\u{1f}"));
-        let project_picker = Grid::new().grid_row(1).keyed_children(vec![KeyedView::new(
-            picker_key,
-            ComboBox::new()
-                .items_source(project_names)
-                .selected_index(self.nav.project_idx)
-                .placeholder_text("Project")
-                .automation_name("Project")
-                .horizontal_alignment(HorizontalAlignment::Stretch)
-                .on_selection_changed(
-                    context.callback(|value| Message::Shell(ShellMsg::ProjectSelected(value))),
-                ),
-        )]);
-
-        let agent_items: Vec<KeyedView> = self
+        let mut items: Vec<KeyedView> = vec![KeyedView::new(
+            "projects-caption",
+            m3::caption("Projects").margin(caption_margin()),
+        )];
+        let registered: Vec<(String, String)> = self
             .nav
-            .rows
+            .projects
             .iter()
-            .map(|row| KeyedView::new(row.agent.id.clone(), nav_row(row, context, palette)))
+            .map(|project| (project.workspace.clone(), project.id.clone()))
             .collect();
-        let agent_list = ListView::new()
+        let rows = nav::rows(
+            &self.nav.agents,
+            &self.nav.branches,
+            &self.nav.expanded,
+            true,
+            &|label| nav::project_name(label, &registered),
+        );
+        let sections = nav::sections(rows, &registered);
+        if sections.is_empty() {
+            items.push(KeyedView::new(
+                "no-projects",
+                quiet_line(if self.nav.agents_loading {
+                    "Loading…"
+                } else {
+                    "No projects yet"
+                }),
+            ));
+        }
+        for section in &sections {
+            items.push(KeyedView::new(
+                format!("project:{}", section.checkout),
+                self.project_row(section, new_task_selected, context, palette),
+            ));
+            if section.rows.is_empty() {
+                items.push(KeyedView::new(
+                    format!("empty:{}", section.checkout),
+                    quiet_line("No tasks").margin(Thickness::new(40.0, 0.0, 0.0, 4.0)),
+                ));
+            }
+            for row in &section.rows {
+                items.push(KeyedView::new(
+                    format!("agent:{}", row.agent.id),
+                    self.agent_row(row, context, palette),
+                ));
+            }
+        }
+        if self.nav.agents.len() < self.nav.agents_total && self.nav.agents_next.is_some() {
+            items.push(KeyedView::new(
+                "more",
+                m3::text_button(palette)
+                    .is_enabled(!self.nav.agents_loading)
+                    .margin(Thickness::new(32.0, 0.0, 0.0, 0.0))
+                    .on_click(context.message(Message::Shell(ShellMsg::MoreAgentsRequested)))
+                    .content(m3::text(
+                        format!(
+                            "Show more ({} of {})",
+                            self.nav.agents.len(),
+                            self.nav.agents_total
+                        ),
+                        theme::type_scale::BODY_SMALL,
+                    )),
+            ));
+        }
+        let recents = nav::recents(&self.nav.agents, RECENTS);
+        if !recents.is_empty() {
+            items.push(KeyedView::new(
+                "recents-caption",
+                m3::caption("Recents").margin(caption_margin()),
+            ));
+            for agent in recents {
+                items.push(KeyedView::new(
+                    format!("recent:{}", agent.id),
+                    self.recent_row(agent, context, palette),
+                ));
+            }
+        }
+        let list = ScrollViewer::new()
             .grid_row(2)
-            .selected_index(self.nav.agent_idx)
-            .automation_name("Agents")
-            .on_selection_changed(
-                context.callback(|value| Message::Shell(ShellMsg::AgentSelected(value))),
-            )
-            .collection_slot(ListViewSlot::Items, agent_items);
+            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+            .automation_name("Projects and Agents")
+            .content(
+                StackPanel::new()
+                    .spacing(2.0)
+                    .margin(Thickness::new(gutter, 0.0, gutter, gutter))
+                    .keyed_children(items),
+            );
 
-        let counter = m3::muted(
-            if self.nav.agents_loading {
-                "Loading Agents…".to_owned()
-            } else {
-                format!(
-                    "Showing {} of {} Agent(s){}",
-                    self.nav.agents.len(),
-                    self.nav.agents_total,
-                    if self.nav.agents_next.is_some()
-                        && self.nav.agents.len() < self.nav.agents_total
-                    {
-                        "; more exist"
-                    } else {
-                        ""
-                    }
-                )
-            },
-            theme::type_scale::BODY_SMALL,
-        )
-        .vertical_alignment(VerticalAlignment::Center)
-        .text_wrapping(TextWrapping::Wrap);
-        let more = m3::text_button(palette)
-            .grid_column(1)
-            .is_enabled(!self.nav.agents_loading && self.nav.agents.len() < self.nav.agents_total)
-            .on_click(context.message(Message::Shell(ShellMsg::MoreAgentsRequested)))
-            .content(TextBlock::new().text("More Agents"));
-        let refresh = m3::text_button(palette)
-            .grid_column(1)
-            .automation_name("Refresh")
-            .on_click(context.message(Message::Shell(ShellMsg::RefreshRequested)))
-            .content(m3::icon(m3::glyph::REFRESH));
+        let bottom = StackPanel::new()
+            .grid_row(3)
+            .spacing(2.0)
+            .margin(Thickness::new(gutter, gutter, gutter, theme::spacing::MD))
+            .children((
+                self.fleet_row(context, palette),
+                m3::row(palette, self.main == Main::Settings)
+                    .automation_name("Settings")
+                    .on_click(context.message(Message::Shell(ShellMsg::SettingsOpened)))
+                    .content(m3::icon_label(m3::glyph::SETTINGS, "Settings")),
+            ));
 
         Grid::new()
             .rows([
@@ -868,152 +765,235 @@ impl DesktopApp {
                 GridLength::STAR,
                 GridLength::Auto,
             ])
-            .row_spacing(theme::spacing::MD)
-            .children((
-                Grid::new()
-                    .grid_row(0)
-                    .columns([GridLength::STAR, GridLength::Auto])
-                    .children((
-                        m3::title("Agents", theme::type_scale::TITLE_LARGE)
-                            .vertical_alignment(VerticalAlignment::Center),
-                        refresh,
-                    )),
-                project_picker,
-                agent_list,
-                Grid::new()
-                    .grid_row(3)
-                    .columns([GridLength::STAR, GridLength::Auto])
-                    .children((counter, more)),
+            .children((header, new_task, list, bottom))
+    }
+
+    /// A project row: a new task in that project.
+    fn project_row(
+        &self,
+        section: &Section,
+        new_task_selected: bool,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let selected = new_task_selected && self.launch.workspace == section.checkout;
+        m3::row(palette, selected)
+            .automation_name(format!("New task in {}", section.name))
+            .on_click(context.message(Message::Shell(ShellMsg::ProjectPicked(
+                section.checkout.clone(),
+            ))))
+            .content(m3::icon_label(m3::glyph::FOLDER, &section.name))
+    }
+
+    /// An Agent row: indent, the expand chevron when it has children, its
+    /// title and a status dot when its state needs a look.
+    fn agent_row(&self, row: &Row, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let agent = &row.agent;
+        let title = self.agent_title(&agent.id);
+        let selected = self.main == Main::Conversation
+            && self.nav.selection.agent.as_deref() == Some(agent.id.as_str());
+        let chevron: View = if row.expandable() {
+            let (glyph, name) = if row.expanded {
+                (
+                    m3::glyph::CHEVRON_DOWN,
+                    format!("Collapse workers of {title}"),
+                )
+            } else {
+                (
+                    m3::glyph::CHEVRON_RIGHT,
+                    format!("Show {} worker(s) of {title}", row.children),
+                )
+            };
+            m3::text_button(palette)
+                .width(CHEVRON)
+                .height(CHEVRON)
+                .vertical_alignment(VerticalAlignment::Center)
+                .automation_name(name)
+                .on_click(context.message(Message::Shell(ShellMsg::ExpandToggled(
+                    agent.id.clone(),
+                    !row.expanded,
+                ))))
+                .content(chevron_icon(glyph))
+        } else {
+            View::empty()
+        };
+        let mut name = format!("{title}, {}, Agent {}", agent.state, agent.id);
+        if row.depth > 0 {
+            name.push_str(&format!(", worker level {}", row.depth));
+        }
+        let note: View = match &row.note {
+            Some(note) => quiet_line(note)
+                .margin(Thickness::new(CHEVRON + theme::spacing::MD, 0.0, 0.0, 0.0))
+                .grid_row(1)
+                .grid_column(1)
+                .into(),
+            None => View::empty(),
+        };
+        Grid::new()
+            .margin(Thickness::new(
+                theme::spacing::MD + row.depth as f64 * TREE_INDENT,
+                0.0,
+                0.0,
+                0.0,
             ))
+            .columns([GridLength::Pixel(CHEVRON), GridLength::STAR])
+            .rows([GridLength::Auto, GridLength::Auto])
+            .children((
+                Border::new()
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .content(chevron),
+                m3::row(palette, selected)
+                    .grid_column(1)
+                    .automation_name(name)
+                    .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
+                    .content(row_content(&title, m3::list_dot(palette, &agent.state))),
+                note,
+            ))
+    }
+
+    /// A Recents row: the title and its dot, no tree.
+    fn recent_row(
+        &self,
+        agent: &UiAgent,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let title = self.agent_title(&agent.id);
+        m3::row(palette, false)
+            .automation_name(format!("Recent: {title}, {}", agent.state))
+            .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
+            .content(row_content(&title, m3::list_dot(palette, &agent.state)))
+    }
+
+    /// The fleet in one line ("2 running · 1 waiting"); it opens the
+    /// monitor.
+    fn fleet_row(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let (summary, tone) = fleet_summary(&self.nav.agents, self.nav.agents_total);
+        let dot = palette.dot(tone).map_or_else(View::empty, m3::dot);
+        let open = self.panel == Panel::Monitor;
+        m3::row(palette, open)
+            .automation_name(format!(
+                "Monitor: {summary} ({})",
+                if open { "open" } else { "closed" }
+            ))
+            .on_click(context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Monitor))))
+            .content(
+                Grid::new()
+                    .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+                    .column_spacing(theme::spacing::SM)
+                    .children((
+                        m3::icon(m3::glyph::PULSE),
+                        TextBlock::new()
+                            .grid_column(1)
+                            .text(summary)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .text_trimming(TextTrimming::CharacterEllipsis),
+                        Border::new().grid_column(2).content(dot),
+                    )),
+            )
+    }
+
+    /// Show a short notice above the composer (refusals, uncertain
+    /// outcomes, failed reads); it stays until dismissed or replaced.
+    pub(super) fn alert(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.set_status(text.clone());
+        self.alert = Some(text);
+    }
+
+    /// The right panel: the monitor or the open Agent's details.
+    fn panel_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        match self.panel {
+            Panel::Monitor => self.monitor_view(context, palette),
+            Panel::Details => self.details_view(context, palette),
+            Panel::Closed => View::empty(),
+        }
     }
 }
 
-/// One Agent row: its project caption when it opens a group, the indent of
-/// its level, an expand chevron when it has children, identity and state.
-fn nav_row(row: &Row, context: &mut ViewContext<DesktopApp>, palette: Palette) -> View {
-    let agent = &row.agent;
-    // ListViewItem exposes no content alignment in Reactor 0.100.0, so the
-    // row takes the list's fixed inner width to right-align the chip.
-    let row_width = theme::layout::LIST_WIDTH - 2.0 * theme::spacing::LG - 40.0;
-    let indent = row.depth as f64 * TREE_INDENT;
-    let chevron: View = if row.expandable() {
-        let (glyph, name) = if row.expanded {
-            (
-                m3::glyph::CHEVRON_DOWN,
-                format!("Collapse children of {}", agent.id),
-            )
-        } else {
-            (
-                m3::glyph::CHEVRON_RIGHT,
-                format!("Expand {} child(ren) of {}", row.children, agent.id),
-            )
-        };
-        m3::icon_button(palette)
-            .width(CHEVRON_BUTTON.0)
-            .height(CHEVRON_BUTTON.1)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .vertical_alignment(VerticalAlignment::Center)
-            .automation_name(name)
-            .on_click(context.message(Message::Shell(ShellMsg::ExpandToggled(
-                agent.id.clone(),
-                !row.expanded,
-            ))))
-            .content(m3::icon(glyph))
-    } else {
-        View::empty()
-    };
-    let mut detail = format!("{} · gen {}", agent.harness, agent.generation);
-    match (&row.note, row.expanded, row.children) {
-        (Some(note), _, _) => detail.push_str(&format!(" · {note}")),
-        (None, false, children) if children > 0 => {
-            detail.push_str(&format!(" · {children} child(ren)"));
-        }
-        _ => {}
-    }
-    // Every row reserves the chevron column, leaf or not, and its level
-    // indent sits before it, so names of one level align and each level
-    // starts one indent further in; the name never shares the chevron's
-    // column or its focus visual.
-    let main = Grid::new()
-        .grid_row(1)
-        .margin(Thickness::new(indent, 0.0, 0.0, 0.0))
-        .columns([
-            GridLength::Pixel(CHEVRON_COLUMN),
-            GridLength::STAR,
-            GridLength::Auto,
-        ])
-        .column_spacing(theme::spacing::SM)
-        .children((
-            chevron,
-            StackPanel::new()
-                .grid_column(1)
-                .spacing(2.0)
-                .vertical_alignment(VerticalAlignment::Center)
-                .children((
-                    m3::text(agent.id.clone(), theme::type_scale::TITLE_SMALL),
-                    m3::muted(detail, theme::type_scale::BODY_SMALL)
-                        .text_trimming(TextTrimming::CharacterEllipsis),
-                )),
-            Border::new()
-                .grid_column(2)
-                .content(m3::status_chip(palette, &agent.state)),
-        ));
-    let caption: View = match &row.group {
-        Some(project) => m3::text(project.clone(), theme::type_scale::LABEL_MEDIUM)
-            .foreground(palette.primary())
-            .automation_heading_level(AutomationHeadingLevel::Level3)
-            .margin(Thickness::new(
-                0.0,
-                theme::spacing::XS,
-                0.0,
-                theme::spacing::XS,
-            ))
-            .into(),
-        None => View::empty(),
-    };
-    let mut name = format!(
-        "Agent {}, {}, {}, generation {}",
-        agent.id, agent.state, agent.harness, agent.generation
-    );
-    if let Some(project) = &row.group {
-        name = format!("{project}: {name}");
-    }
-    if row.depth > 0 {
-        name.push_str(&format!(", level {}", row.depth + 1));
-    }
-    ListViewItem::new().automation_name(name).content(
-        Grid::new()
-            .width(row_width)
-            .rows([GridLength::Auto, GridLength::Auto])
-            .margin(Thickness::xy(0.0, theme::spacing::SM))
-            .children((caption, main)),
+fn caption_margin() -> Thickness {
+    Thickness::new(
+        theme::spacing::MD,
+        theme::spacing::MD,
+        0.0,
+        theme::spacing::XS,
     )
 }
 
-/// Icon over label, with the M3 indicator pill behind the icon when given.
-fn rail_label(glyph: &str, label: &str, selected: bool, indicator: Option<Brush>) -> View {
-    StackPanel::new()
-        .spacing(theme::spacing::XS)
-        .horizontal_alignment(HorizontalAlignment::Center)
+/// A muted one-line note in a list.
+fn quiet_line(text: &str) -> TextBlock {
+    m3::muted(text, theme::type_scale::BODY_SMALL).text_trimming(TextTrimming::CharacterEllipsis)
+}
+
+/// A 12-DIP chevron for the tree toggle.
+fn chevron_icon(glyph: &str) -> View {
+    Viewbox::new()
+        .width(10.0)
+        .height(10.0)
+        .slot(ViewboxSlot::Child, FontIcon::new().glyph(glyph.to_owned()))
+}
+
+/// A row's content: the title, trimmed, and an optional trailing mark.
+fn row_content(title: &str, trailing: View) -> View {
+    Grid::new()
+        .columns([GridLength::STAR, GridLength::Auto])
+        .column_spacing(theme::spacing::SM)
         .children((
+            TextBlock::new()
+                .text(title.to_owned())
+                .vertical_alignment(VerticalAlignment::Center)
+                .text_trimming(TextTrimming::CharacterEllipsis),
             Border::new()
-                .width(56.0)
-                .height(32.0)
-                .corner_radius(16.0)
-                .background(indicator.unwrap_or(Brush::Solid(Color::transparent())))
-                .content(
-                    m3::icon(glyph)
-                        .horizontal_alignment(HorizontalAlignment::Center)
-                        .vertical_alignment(VerticalAlignment::Center),
-                ),
-            m3::text(
-                label,
-                if selected {
-                    theme::type_scale::LABEL_MEDIUM
-                } else {
-                    theme::type_scale::BODY_SMALL
-                },
-            )
-            .horizontal_alignment(HorizontalAlignment::Center),
+                .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center)
+                .content(trailing),
         ))
+}
+
+/// The fleet line and its most urgent tone, from the listed Agents.
+pub(super) fn fleet_summary(agents: &[UiAgent], total: usize) -> (String, StatusTone) {
+    let count = |tone: StatusTone| {
+        agents
+            .iter()
+            .filter(|agent| StatusTone::of_state(&agent.state) == tone)
+            .count()
+    };
+    let (running, waiting, failed, unknown) = (
+        count(StatusTone::Active) + count(StatusTone::Pending),
+        count(StatusTone::Attention),
+        count(StatusTone::Failed),
+        count(StatusTone::Unknown),
+    );
+    let mut parts = Vec::new();
+    if running > 0 {
+        parts.push(format!("{running} running"));
+    }
+    if waiting > 0 {
+        parts.push(format!("{waiting} waiting"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    if unknown > 0 {
+        parts.push(format!("{unknown} unknown"));
+    }
+    let tone = if failed > 0 {
+        StatusTone::Failed
+    } else if waiting > 0 {
+        StatusTone::Attention
+    } else if unknown > 0 {
+        StatusTone::Unknown
+    } else if running > 0 {
+        StatusTone::Active
+    } else {
+        StatusTone::Ready
+    };
+    let summary = if !parts.is_empty() {
+        parts.join(" · ")
+    } else if total == 0 {
+        "No Agents yet".to_owned()
+    } else {
+        format!("All quiet · {total} Agents")
+    };
+    (summary, tone)
 }
