@@ -3,13 +3,13 @@
 //! result facts, gate meanings, when "finish" applies) live in
 //! [`crate::handoff`].
 //!
-//! Every destination is its own button, bound when it is built to what it
-//! shows (B and its generation, the profile, or the ad-hoc harness, model
-//! and effort): no picker index decides where work goes.
+//! The destination is one radio group whose options carry what they show
+//! (B and its generation, or the profile); the ad-hoc harness, model and
+//! effort are read from the shown pickers when the one primary action is
+//! clicked, so no index decides where work goes.
 
 use super::*;
 use crate::handoff::{self, Outcome, SendRow, Submitted};
-use crate::theme::winui::Palette;
 use eliot_core::CommandState;
 use eliot_core::api::{
     CommandResolution, HandoffRequest, HarnessModelsResponse, SwitchLaunch, SwitchRequest,
@@ -20,6 +20,14 @@ use eliot_core::api::{
 const SWITCH_POLL_MS: u64 = 2_000;
 const SWITCH_POLLS: u32 = 150;
 const HARNESS_DEFAULT: &str = "Harness default";
+
+/// The destination picked in the dialog's radio group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Choice {
+    Existing { agent: String, generation: i64 },
+    Profile { name: String, harness: String },
+    Adhoc,
+}
 
 /// Where the transfer goes, bound at the button.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +60,10 @@ pub(super) enum HandoffMsg {
     CatalogLoaded(u64, String, Box<Fallible<HarnessModelsResponse>>),
     ModelPicked(Option<usize>),
     EffortPicked(Option<usize>),
+    /// A destination was checked, or unchecked by another one.
+    Chose(Choice),
+    Unchose(Choice),
+    DetailsToggled(bool),
     Submit(Target),
     Retry,
     /// Epoch, whether this reply answers a submission (and so settles its
@@ -81,6 +93,12 @@ pub(super) struct DialogState {
     task: Option<String>,
     /// Selected SEND ids, kept in admission order.
     chosen: Vec<String>,
+    /// The destination radio choice.
+    choice: Option<Choice>,
+    /// "Readback details (ids)" expanded.
+    details_open: bool,
+    /// The last definite refusal, until another destination or submission.
+    refusal: Option<String>,
     harness: Option<usize>,
     catalog: Option<(String, Fallible<HarnessModelsResponse>)>,
     model: Option<usize>,
@@ -189,10 +207,30 @@ impl DesktopApp {
                     .map(|row| row.id.clone())
                     .collect();
             }
+            HandoffMsg::Chose(choice) => {
+                if self.handoff.submitted.is_none() && !self.handoff.uncertain {
+                    if self.handoff.choice.as_ref() != Some(&choice) {
+                        self.handoff.refusal = None;
+                    }
+                    self.handoff.choice = Some(choice);
+                }
+            }
+            HandoffMsg::Unchose(choice) => {
+                // WinUI unchecks the previous option of the group; only the
+                // option still recorded is cleared.
+                if self.handoff.choice.as_ref() == Some(&choice) {
+                    self.handoff.choice = None;
+                }
+            }
+            HandoffMsg::DetailsToggled(open) => self.handoff.details_open = open,
             HandoffMsg::HarnessPicked(index) => {
                 let Some(harness) = index.and_then(|index| ADHOC_HARNESSES.get(index)) else {
                     return;
                 };
+                // Picking the ad-hoc harness picks the ad-hoc destination.
+                if self.handoff.submitted.is_none() && !self.handoff.uncertain {
+                    self.handoff.choice = Some(Choice::Adhoc);
+                }
                 if self.handoff.harness == index {
                     return;
                 }
@@ -240,6 +278,7 @@ impl DesktopApp {
                 {
                     return;
                 }
+                self.handoff.refusal = None;
                 match self.handoff_request(target) {
                     Ok(submitted) => self.handoff_send(submitted, context),
                     Err(error) => self.handoff.status = error,
@@ -350,6 +389,7 @@ impl DesktopApp {
                             }
                         }
                         self.handoff.status = format!("Refused: {error}");
+                        self.handoff.refusal = Some(format!("Refused: {error}"));
                     }
                 }
             }
@@ -377,33 +417,21 @@ impl DesktopApp {
                     return;
                 }
                 let key = format!("resolve:{command}:{}", resolution.as_str());
-                let label = format!("Resolve {command} as {}", resolution.as_str());
+                let label = format!("Resolve the brief as {}", resolution.as_str());
                 self.handoff_owner_action(key, label, context, move |data_dir, id| {
                     client::block_on(client::resolve_command(
                         data_dir, id, &command, resolution, reason,
                     ))
-                    .map(|reply| {
-                        format!(
-                            "{} is {}",
-                            reply.command_id,
-                            handoff::state_name(reply.state)
-                        )
-                    })
+                    .map(|reply| format!("now {}", handoff::state_name(reply.state)))
                     .map_err(|error| error.to_string())
                 });
             }
             HandoffMsg::CancelRequested(command) => {
                 let key = format!("cancel:{command}");
-                let label = format!("Withdraw {command}");
+                let label = "Withdraw the input".to_owned();
                 self.handoff_owner_action(key, label, context, move |data_dir, id| {
                     client::block_on(client::cancel_command(data_dir, id, &command))
-                        .map(|reply| {
-                            format!(
-                                "{} is {}",
-                                reply.command_id,
-                                handoff::state_name(reply.state)
-                            )
-                        })
+                        .map(|reply| format!("now {}", handoff::state_name(reply.state)))
                         .map_err(|error| error.to_string())
                 });
             }
@@ -428,12 +456,31 @@ impl DesktopApp {
         }
     }
 
-    /// Live, non-source Agents of the navigation list.
+    /// Live, non-source Agents of the navigation list in the source's
+    /// project (the daemon requires a same-project B and checks again).
     fn handoff_targets(&self) -> Vec<&UiAgent> {
-        self.nav
-            .agents
-            .iter()
+        let listed = || {
+            self.nav
+                .agents
+                .iter()
+                .chain(self.nav.branches.values().flat_map(|branch| match branch {
+                    nav::Branch::Loaded { children, .. } => children.as_slice(),
+                    _ => &[],
+                }))
+        };
+        let project = listed()
+            .find(|agent| agent.id == self.handoff.from)
+            .map(|agent| agent.project.clone())
+            .filter(|project| !project.is_empty());
+        let mut seen = HashSet::new();
+        listed()
+            .filter(|agent| seen.insert(agent.id.as_str()))
             .filter(|agent| agent.id != self.handoff.from)
+            .filter(|agent| {
+                project
+                    .as_ref()
+                    .is_none_or(|project| &agent.project == project)
+            })
             .filter(|agent| {
                 !matches!(
                     agent.state.as_str(),
@@ -520,7 +567,10 @@ impl DesktopApp {
 
     fn handoff_send(&mut self, submitted: Submitted, context: &ComponentContext<Self>) {
         self.in_flight_key = Some(submitted.key());
-        self.handoff.status = format!("Submitting {}…", submitted.id());
+        self.handoff.status = match &submitted {
+            Submitted::Handoff(request) => format!("Handing off to {}…", request.to),
+            Submitted::Switch(_) => "Switching…".to_owned(),
+        };
         self.handoff.submitted = Some(submitted);
         self.handoff.polls = 0;
         self.handoff_readback(0, true, context);
@@ -588,7 +638,7 @@ impl DesktopApp {
         };
         let mutation_id = self.ledger.id_for(&key);
         self.in_flight_key = Some(key);
-        self.handoff.owner_status = format!("{label} ({mutation_id})…");
+        self.handoff.owner_status = format!("{label}…");
         let epoch = self.handoff.epoch;
         let _task = context.spawn_background(move |_| {
             Message::Handoff(HandoffMsg::OwnerDone(
@@ -599,12 +649,27 @@ impl DesktopApp {
         });
     }
 
-    /// The dialog; an empty view while closed.
-    pub(super) fn handoff_dialog(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    /// The dialog; an empty view while closed. The destination is picked
+    /// from one radio group (existing Agents, profiles, ad-hoc); the one
+    /// primary action at the bottom right submits what is shown, bound when
+    /// clicked. Ids stay out of the main view: SENDs show their text and age,
+    /// and the readback with ids sits under "Readback details".
+    ///
+    /// WinUI 3 shows a ContentDialog in the popup layer, which follows the
+    /// application theme, not the window root's RequestedTheme (Reactor
+    /// 0.100.0 sets that on the host Grid only and exposes no RequestedTheme
+    /// on ContentDialog). Nothing inside therefore uses the window palette:
+    /// text and controls resolve the dialog's own theme resources, and the
+    /// primary is WinUI's AccentButtonStyle, which `app_resources` maps to
+    /// the M3 filled roles of either theme.
+    pub(super) fn handoff_dialog(&self, context: &mut ViewContext<Self>) -> View {
         let state = &self.handoff;
         if !state.open {
-            return View::empty();
+            // Reactor hides an open dialog only through is_open(false);
+            // removing its node would leave it on screen.
+            return ContentDialog::new().is_open(false).content(View::empty());
         }
+        let now = handoff::now_ms();
         let rows: &[SendRow] = match &state.sends {
             Some(Ok(rows)) => rows,
             _ => &[],
@@ -618,143 +683,15 @@ impl DesktopApp {
             && state.task.is_some();
         let mut sections: Vec<KeyedView> = Vec::new();
         let mut push = |key: &str, view: View| sections.push(KeyedView::new(key.to_owned(), view));
-        push("status", small(state.status.clone()).into());
-        push(
-            "task-label",
-            small("Original task SEND (its text opens the brief):").into(),
-        );
-        let task_labels: Vec<String> = rows.iter().map(SendRow::label).collect();
-        push(
-            &format!("task:{}", task_labels.join("\u{1f}")),
-            ComboBox::new()
-                .items_source(task_labels.clone())
-                .selected_index(
-                    state
-                        .task
-                        .as_ref()
-                        .and_then(|task| rows.iter().position(|row| &row.id == task)),
-                )
-                .is_enabled(can_act)
-                .automation_name("Original task SEND")
-                .on_selection_changed(
-                    context.callback(|index| Message::Handoff(HandoffMsg::TaskPicked(index))),
-                )
-                .into(),
-        );
-        let transferable: Vec<&SendRow> = rows.iter().filter(|row| row.transferable()).collect();
-        push(
-            "sends-label",
-            small(format!(
-                "Undispatched SENDs to move (at most {}; the rest stay on {}):",
-                eliot_core::api::MAX_HANDOFF_SENDS,
-                state.from
-            ))
-            .into(),
-        );
-        if transferable.is_empty() {
+        if state.outcome.is_none() {
             push(
-                "no-sends",
-                small("No accepted or queued SENDs on this generation: the transfer carries context, claims, Goal and children only.")
+                "status",
+                small(state.status.clone())
                     .opacity(theme::MUTED_OPACITY)
                     .into(),
             );
         }
-        for row in transferable {
-            let id = row.id.clone();
-            push(
-                &format!("send-{}", row.id),
-                CheckBox::new()
-                    .is_checked(state.chosen.contains(&row.id))
-                    .is_enabled(can_act)
-                    .automation_name(format!("Move {}", row.label()))
-                    .on_is_checked_changed(context.callback(move |checked| {
-                        Message::Handoff(HandoffMsg::SendToggled(id.clone(), checked))
-                    }))
-                    .content(small(row.label())),
-            );
-        }
-        push(
-            "summary",
-            small(format!(
-                "Bound: {} generation {} · task {} · moving {}",
-                state.from,
-                state.from_generation,
-                state.task.as_deref().unwrap_or("not chosen"),
-                if state.chosen.is_empty() {
-                    "no SENDs".to_owned()
-                } else {
-                    state.chosen.join(", ")
-                }
-            ))
-            .into(),
-        );
-        push(
-            "existing-label",
-            heading("Hand off to an existing Agent").into(),
-        );
-        let targets: Vec<KeyedView> = self
-            .handoff_targets()
-            .into_iter()
-            .map(|agent| {
-                let label = format!(
-                    "Hand off to {} ({}, {}, generation {})",
-                    agent.id, agent.state, agent.harness, agent.generation
-                );
-                KeyedView::new(
-                    agent.id.clone(),
-                    action(
-                        label,
-                        context.message(Message::Handoff(HandoffMsg::Submit(Target::Existing {
-                            agent: agent.id.clone(),
-                            generation: agent.generation,
-                        }))),
-                        can_act,
-                        palette,
-                    ),
-                )
-            })
-            .collect();
-        push(
-            "existing",
-            StackPanel::new()
-                .spacing(theme::spacing::XS)
-                .keyed_children(targets),
-        );
-        push(
-            "profile-label",
-            heading("Switch to a new Agent from a profile").into(),
-        );
-        let profiles: Vec<KeyedView> = self
-            .launch
-            .profile_summaries
-            .iter()
-            .map(|profile| {
-                KeyedView::new(
-                    profile.name.clone(),
-                    action(
-                        format!(
-                            "Switch to a new {} Agent ({})",
-                            profile.name, profile.harness
-                        ),
-                        context.message(Message::Handoff(HandoffMsg::Submit(Target::Profile(
-                            profile.name.clone(),
-                        )))),
-                        can_act,
-                        palette,
-                    ),
-                )
-            })
-            .collect();
-        push(
-            "profiles",
-            StackPanel::new()
-                .spacing(theme::spacing::XS)
-                .keyed_children(profiles),
-        );
-        push(
-            "adhoc-label",
-            heading("Switch to a new ad-hoc Agent").into(),
-        );
+
         let models = self.handoff_models();
         let efforts = self.handoff_efforts();
         let harness = state
@@ -763,134 +700,248 @@ impl DesktopApp {
             .map(|harness| (*harness).to_owned());
         let model = configure::picked(&models, state.model);
         let effort = configure::picked(&efforts, state.effort);
-        let adhoc_label = match &harness {
-            Some(harness) => format!(
-                "Switch to a new ad-hoc {harness} Agent · model {} · effort {}",
-                model.as_deref().unwrap_or("harness default"),
-                effort.as_deref().unwrap_or("harness default")
-            ),
-            None => "Pick a harness for the ad-hoc Agent".to_owned(),
-        };
-        let adhoc_target = harness.clone().map(|harness| Target::Adhoc {
-            harness,
-            model: model.clone(),
-            effort: effort.clone(),
-        });
-        let catalog_line = match &state.catalog {
-            Some((harness, Ok(reply))) => format!(
-                "{harness} catalogue: {} model(s){}",
-                reply.models.len(),
-                reply
-                    .note
-                    .as_deref()
-                    .map(|note| format!(" · {note}"))
-                    .unwrap_or_default()
-            ),
-            Some((harness, Err(error))) => format!("{harness} catalogue unavailable: {error}"),
-            None => "Pick a harness to read its catalogue.".to_owned(),
-        };
-        push(
-            "adhoc",
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(theme::spacing::XS)
-                .keyed_children(vec![
-                    KeyedView::new(
-                        "harness",
-                        ComboBox::new()
-                            .items_source(ADHOC_HARNESSES.map(str::to_owned).to_vec())
-                            .selected_index(state.harness)
-                            .is_enabled(can_act)
-                            .placeholder_text("Harness")
-                            .automation_name("Switch harness")
-                            .on_selection_changed(context.callback(|index| {
-                                Message::Handoff(HandoffMsg::HarnessPicked(index))
-                            })),
-                    ),
-                    // Option lists that change get a new control (see
-                    // `configure::panel`).
-                    KeyedView::new(
-                        format!("model:{}", models.join("\u{1f}")),
-                        ComboBox::new()
-                            .items_source(models.clone())
-                            .selected_index(state.model)
-                            .is_enabled(can_act)
-                            .automation_name("Switch model")
-                            .on_selection_changed(context.callback(|index| {
-                                Message::Handoff(HandoffMsg::ModelPicked(index))
-                            })),
-                    ),
-                    KeyedView::new(
-                        format!("effort:{}", efforts.join("\u{1f}")),
-                        ComboBox::new()
-                            .items_source(efforts.clone())
-                            .selected_index(state.effort)
-                            .is_enabled(can_act)
-                            .automation_name("Switch effort")
-                            .on_selection_changed(context.callback(|index| {
-                                Message::Handoff(HandoffMsg::EffortPicked(index))
-                            })),
-                    ),
-                ]),
-        );
-        push(
-            "catalog",
-            small(catalog_line).opacity(theme::MUTED_OPACITY).into(),
-        );
-        push(
-            "adhoc-submit",
-            match adhoc_target {
-                Some(target) => action(
-                    adhoc_label,
-                    context.message(Message::Handoff(HandoffMsg::Submit(target))),
-                    can_act,
-                    palette,
-                ),
-                None => small(adhoc_label).opacity(theme::MUTED_OPACITY).into(),
-            },
-        );
-        if let Some(submitted) = &state.submitted {
-            let retry = state.uncertain;
+        // Once the daemon answered, the dialog shows the result instead of
+        // the (then fixed) choices.
+        if state.outcome.is_none() {
+            push("task-head", heading("Original task").into());
+            let task_labels: Vec<String> = rows.iter().map(|row| row.label(now)).collect();
             push(
-                "readback",
+                &format!("task:{}", task_labels.join("\u{1f}")),
+                ComboBox::new()
+                    .items_source(task_labels.clone())
+                    .selected_index(
+                        state
+                            .task
+                            .as_ref()
+                            .and_then(|task| rows.iter().position(|row| &row.id == task)),
+                    )
+                    .is_enabled(can_act)
+                    .placeholder_text("The SEND whose text opens the brief")
+                    .automation_name("Original task SEND")
+                    .horizontal_alignment(HorizontalAlignment::Stretch)
+                    .on_selection_changed(
+                        context.callback(|index| Message::Handoff(HandoffMsg::TaskPicked(index))),
+                    )
+                    .into(),
+            );
+
+            push("sends-head", heading("Waiting SENDs to move").into());
+            let transferable: Vec<&SendRow> =
+                rows.iter().filter(|row| row.transferable()).collect();
+            if transferable.is_empty() {
+                push(
+                "no-sends",
+                small("None are waiting on this generation: the transfer carries context, claims, Goal and children only.")
+                    .opacity(theme::MUTED_OPACITY)
+                    .into(),
+            );
+            } else {
+                push(
+                    "sends-note",
+                    small(format!(
+                        "At most {}; the rest stay on {}.",
+                        eliot_core::api::MAX_HANDOFF_SENDS,
+                        state.from
+                    ))
+                    .opacity(theme::MUTED_OPACITY)
+                    .into(),
+                );
+            }
+            for row in transferable {
+                let id = row.id.clone();
+                let label = row.label(now);
+                push(
+                    &format!("send-{}", row.id),
+                    CheckBox::new()
+                        .is_checked(state.chosen.contains(&row.id))
+                        .is_enabled(can_act)
+                        .automation_name(format!("Move {label}"))
+                        .on_is_checked_changed(context.callback(move |checked| {
+                            Message::Handoff(HandoffMsg::SendToggled(id.clone(), checked))
+                        }))
+                        .content(small(label)),
+                );
+            }
+
+            push(
+                "existing-head",
+                heading("Hand off to an existing Agent").into(),
+            );
+            let targets = self.handoff_targets();
+            if targets.is_empty() {
+                push(
+                    "existing-none",
+                    small("No other live Agent can take this work.")
+                        .opacity(theme::MUTED_OPACITY)
+                        .into(),
+                );
+            }
+            for agent in targets {
+                let choice = Choice::Existing {
+                    agent: agent.id.clone(),
+                    generation: agent.generation,
+                };
+                push(
+                    &format!("existing-{}", agent.id),
+                    destination(
+                        format!("{} · {} · {}", agent.id, agent.state, agent.harness),
+                        &choice,
+                        state.choice.as_ref(),
+                        can_act,
+                        context,
+                    ),
+                );
+            }
+
+            push(
+                "profile-head",
+                heading("Switch to a new Agent from a profile").into(),
+            );
+            if self.launch.profile_summaries.is_empty() {
+                push(
+                    "profile-none",
+                    small("No configured profile was read.")
+                        .opacity(theme::MUTED_OPACITY)
+                        .into(),
+                );
+            }
+            for profile in &self.launch.profile_summaries {
+                let choice = Choice::Profile {
+                    name: profile.name.clone(),
+                    harness: profile.harness.clone(),
+                };
+                push(
+                    &format!("profile-{}", profile.name),
+                    destination(
+                        format!("New {} Agent ({})", profile.name, profile.harness),
+                        &choice,
+                        state.choice.as_ref(),
+                        can_act,
+                        context,
+                    ),
+                );
+            }
+
+            push("adhoc-head", heading("Switch to a new ad-hoc Agent").into());
+            push(
+                "adhoc-choice",
+                destination(
+                    match &harness {
+                        Some(harness) => format!("New ad-hoc {harness} Agent"),
+                        None => "New ad-hoc Agent (pick its harness)".to_owned(),
+                    },
+                    &Choice::Adhoc,
+                    state.choice.as_ref(),
+                    can_act,
+                    context,
+                ),
+            );
+            let labelled = |label: &str, picker: ComboBox| -> View {
+                StackPanel::new().spacing(2.0).children((
+                    small(label.to_owned()).opacity(theme::MUTED_OPACITY),
+                    picker.min_width(150.0),
+                ))
+            };
+            push(
+                "adhoc",
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .spacing(theme::spacing::SM)
-                    .children((
-                        action(
-                            format!("Retry {} with the same id", submitted.id()),
-                            context.message(Message::Handoff(HandoffMsg::Retry)),
-                            retry && !self.submitting(),
-                            palette,
+                    .margin(Thickness::new(28.0, 0.0, 0.0, 0.0))
+                    .keyed_children(vec![
+                        KeyedView::new(
+                            "harness",
+                            labelled(
+                                "Harness",
+                                ComboBox::new()
+                                    .items_source(ADHOC_HARNESSES.map(str::to_owned).to_vec())
+                                    .selected_index(state.harness)
+                                    .is_enabled(can_act)
+                                    .placeholder_text("Pick one")
+                                    .automation_name("Ad-hoc harness")
+                                    .on_selection_changed(context.callback(|index| {
+                                        Message::Handoff(HandoffMsg::HarnessPicked(index))
+                                    })),
+                            ),
                         ),
-                        action(
-                            "Refresh the result".to_owned(),
-                            context.message(Message::Handoff(HandoffMsg::RefreshRequested)),
-                            !self.submitting(),
-                            palette,
+                        // Option lists that change get a new control (see
+                        // `configure::panel`).
+                        KeyedView::new(
+                            format!("model:{}", models.join("\u{1f}")),
+                            labelled(
+                                "Model",
+                                ComboBox::new()
+                                    .items_source(models.clone())
+                                    .selected_index(state.model)
+                                    .is_enabled(can_act && harness.is_some())
+                                    .automation_name("Ad-hoc model")
+                                    .on_selection_changed(context.callback(|index| {
+                                        Message::Handoff(HandoffMsg::ModelPicked(index))
+                                    })),
+                            ),
                         ),
-                    )),
+                        KeyedView::new(
+                            format!("effort:{}", efforts.join("\u{1f}")),
+                            labelled(
+                                "Effort",
+                                ComboBox::new()
+                                    .items_source(efforts.clone())
+                                    .selected_index(state.effort)
+                                    .is_enabled(can_act && harness.is_some())
+                                    .automation_name("Ad-hoc effort")
+                                    .on_selection_changed(context.callback(|index| {
+                                        Message::Handoff(HandoffMsg::EffortPicked(index))
+                                    })),
+                            ),
+                        ),
+                    ]),
+            );
+            let catalog_line = match &state.catalog {
+                Some((harness, Ok(reply))) => format!(
+                    "{harness} catalogue: {} model(s){}",
+                    reply.models.len(),
+                    reply
+                        .note
+                        .as_deref()
+                        .map(|note| format!(" · {note}"))
+                        .unwrap_or_default()
+                ),
+                Some((harness, Err(error))) => format!("{harness} catalogue unavailable: {error}"),
+                None if harness.is_some() => "Reading the catalogue…".to_owned(),
+                None => "Picking a harness reads its model catalogue.".to_owned(),
+            };
+            push(
+                "catalog",
+                small(catalog_line)
+                    .opacity(theme::MUTED_OPACITY)
+                    .margin(Thickness::new(28.0, 0.0, 0.0, 0.0))
+                    .into(),
             );
         }
+
         if let Some(outcome) = &state.outcome {
+            push("result-head", heading("Result").into());
+            push("result", small(handoff::outcome_summary(outcome)).into());
             let lines = match outcome {
                 Outcome::Handoff(reply) => handoff::handoff_lines(reply),
                 Outcome::Switch(reply) => handoff::switch_lines(reply),
             };
-            push("result", small(lines.join("\n")).into());
-            if let Some((agent, generation)) = outcome.finish_target() {
-                push(
-                    "finish",
-                    action(
-                        format!(
-                            "Finish switch with ordinary handoff to {agent} (generation {generation})"
+            push(
+                "details",
+                Expander::new()
+                    .is_expanded(state.details_open)
+                    .horizontal_alignment(HorizontalAlignment::Stretch)
+                    .on_is_expanded_changed(
+                        context.callback(|open| Message::Handoff(HandoffMsg::DetailsToggled(open))),
+                    )
+                    .slots([
+                        SlotView::new(ExpanderSlot::Header, small("Readback details (ids)")),
+                        SlotView::new(
+                            ExpanderSlot::Content,
+                            small(lines.join("\n")).opacity(theme::MUTED_OPACITY),
                         ),
-                        context.message(Message::Handoff(HandoffMsg::Finish { agent, generation })),
-                        !self.submitting(),
-                        palette,
-                    ),
-                );
-            }
+                    ]),
+            );
         }
         if !state.children.is_empty() {
             let brief = state
@@ -902,119 +953,307 @@ impl DesktopApp {
                 .children
                 .iter()
                 .map(|child| {
-                    format!(
-                        "{} {} · {}",
-                        if Some(&child.id) == brief.as_ref() {
-                            "brief"
-                        } else {
-                            "successor"
-                        },
-                        child.id,
-                        handoff::state_name(child.state)
-                    )
+                    if Some(&child.id) == brief.as_ref() {
+                        format!("The brief · {}", handoff::state_name(child.state))
+                    } else {
+                        format!(
+                            "\u{201c}{}\u{201d} · {}",
+                            child_preview(child),
+                            handoff::state_name(child.state)
+                        )
+                    }
                 })
                 .collect();
+            push("children-head", heading("Moved inputs").into());
             push("children", small(lines.join("\n")).into());
-            push(
-                "reason",
-                TextBox::new()
-                    .text(state.reason.clone())
-                    .placeholder_text("Reason for an Owner assertion (required)")
-                    .automation_name("Owner reason")
-                    .on_text_changed(
-                        context.callback(|text| Message::Handoff(HandoffMsg::ReasonChanged(text))),
-                    )
-                    .into(),
-            );
             let mut owner: Vec<KeyedView> = Vec::new();
             for child in &state.children {
                 let is_brief = Some(&child.id) == brief.as_ref();
-                let mut add = |label: String, message: HandoffMsg| {
+                let mut add = |key: String, label: String, message: HandoffMsg| {
                     owner.push(KeyedView::new(
-                        label.clone(),
-                        action(
-                            label,
-                            context.message(Message::Handoff(message)),
-                            !self.submitting(),
-                            palette,
-                        ),
+                        key,
+                        Button::new()
+                            .is_enabled(!self.submitting())
+                            .automation_name(label.clone())
+                            .on_click(context.message(Message::Handoff(message)))
+                            .content(TextBlock::new().text(label)),
                     ));
                 };
                 if is_brief && child.state == CommandState::Unknown {
                     add(
-                        format!("Resolve brief {} applied", child.id),
+                        format!("applied:{}", child.id),
+                        "Resolve the brief as applied".to_owned(),
                         HandoffMsg::ResolveRequested(child.id.clone(), CommandResolution::Applied),
                     );
                     add(
-                        format!("Resolve brief {} failed", child.id),
+                        format!("failed:{}", child.id),
+                        "Resolve the brief as failed".to_owned(),
                         HandoffMsg::ResolveRequested(child.id.clone(), CommandResolution::Failed),
                     );
                 }
                 if is_brief && child.state == CommandState::Failed {
                     add(
-                        format!("Assert failed brief {} applied", child.id),
+                        format!("assert:{}", child.id),
+                        "Assert the failed brief applied".to_owned(),
                         HandoffMsg::ResolveRequested(child.id.clone(), CommandResolution::Applied),
                     );
                 }
                 if matches!(child.state, CommandState::Accepted | CommandState::Queued) {
                     add(
-                        format!("Withdraw {}", child.id),
+                        format!("withdraw:{}", child.id),
+                        format!("Withdraw \u{201c}{}\u{201d}", child_preview(child)),
                         HandoffMsg::CancelRequested(child.id.clone()),
                     );
                 }
             }
-            push(
-                "owner-actions",
-                StackPanel::new()
-                    .spacing(theme::spacing::XS)
-                    .keyed_children(owner),
-            );
+            // An Owner assertion needs a reason; without one to make, no box.
+            if !owner.is_empty() {
+                push(
+                    "reason",
+                    TextBox::new()
+                        .text(state.reason.clone())
+                        .placeholder_text("Reason for an Owner assertion (required)")
+                        .automation_name("Owner reason")
+                        .on_text_changed(
+                            context
+                                .callback(|text| Message::Handoff(HandoffMsg::ReasonChanged(text))),
+                        )
+                        .into(),
+                );
+                push(
+                    "owner-actions",
+                    StackPanel::new()
+                        .spacing(theme::spacing::XS)
+                        .keyed_children(owner),
+                );
+            }
             push("owner-status", small(state.owner_status.clone()).into());
         }
+
+        // The one primary action follows the dialog's state.
+        let choice_label = match state.choice {
+            Some(Choice::Existing { .. }) | None => "Hand off",
+            Some(_) => "Switch",
+        };
+        let pending = state.outcome.as_ref().is_some_and(Outcome::switch_pending);
+        let (primary_label, primary_message, primary_enabled) = if state.uncertain {
+            (
+                "Retry with the same id".to_owned(),
+                Some(HandoffMsg::Retry),
+                !self.submitting(),
+            )
+        } else if let Some((agent, generation)) =
+            state.outcome.as_ref().and_then(Outcome::finish_target)
+        {
+            (
+                format!("Finish: hand off to {agent}"),
+                Some(HandoffMsg::Finish { agent, generation }),
+                !self.submitting(),
+            )
+        } else if pending {
+            (
+                "Refresh the result".to_owned(),
+                Some(HandoffMsg::RefreshRequested),
+                !self.submitting(),
+            )
+        } else if state.outcome.is_some() {
+            // Done: Close is the only action left (no primary below).
+            (String::new(), None, false)
+        } else if state.submitted.is_some() {
+            // In flight: the action keeps its name until the daemon answers.
+            (choice_label.to_owned(), None, false)
+        } else {
+            let target = self.handoff_target(harness.clone(), model.clone(), effort.clone());
+            let enabled = can_act && target.is_some();
+            (
+                choice_label.to_owned(),
+                target.map(HandoffMsg::Submit),
+                enabled,
+            )
+        };
+        let primary: View = match primary_message {
+            _ if primary_label.is_empty() => View::empty(),
+            Some(message) => Button::new()
+                .is_enabled(primary_enabled)
+                .on_click(context.message(Message::Handoff(message)))
+                .style(ButtonStyle::Accent)
+                .automation_name(primary_label.clone())
+                .content(TextBlock::new().text(primary_label)),
+            None => Button::new()
+                .is_enabled(false)
+                .style(ButtonStyle::Accent)
+                .automation_name(primary_label.clone())
+                .content(TextBlock::new().text(primary_label)),
+        };
+        let close = Button::new()
+            .style(ButtonStyle::Subtle)
+            .automation_name("Close")
+            .on_click(context.message(Message::Handoff(HandoffMsg::Closed)))
+            .content(TextBlock::new().text("Close"));
+        // A definite refusal leads the footer in the theme's critical color
+        // (a theme brush: the dialog may not share the window's palette).
+        let summary = self.handoff_summary(harness, model, effort);
+        let summary: View = match &state.refusal {
+            Some(refusal) => StackPanel::new()
+                .spacing(2.0)
+                .vertical_alignment(VerticalAlignment::Center)
+                .children((
+                    small(refusal.clone()).foreground(Brush::Theme(ThemeBrush::SystemCritical)),
+                    small(summary),
+                )),
+            None => small(summary)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into(),
+        };
+        let footer = Grid::new()
+            .grid_row(1)
+            .columns([GridLength::STAR, GridLength::Auto])
+            .column_spacing(theme::spacing::LG)
+            .children((
+                summary,
+                StackPanel::new()
+                    .grid_column(1)
+                    .orientation(Orientation::Horizontal)
+                    .spacing(theme::spacing::SM)
+                    .vertical_alignment(VerticalAlignment::Bottom)
+                    .children((close, primary)),
+            ));
         ContentDialog::new()
             .is_open(true)
-            .title(format!(
-                "Hand off or switch {} (generation {})",
-                state.from, state.from_generation
-            ))
-            .close_button_text("Close")
+            .title(format!("Hand off or switch {}", state.from))
             .on_closed(context.callback(|_| Message::Handoff(HandoffMsg::Closed)))
             .content(
-                ScrollViewer::new()
-                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                    .max_height(560.0)
-                    .content(
-                        StackPanel::new()
-                            .spacing(theme::spacing::SM)
-                            .keyed_children(sections),
-                    ),
+                Grid::new()
+                    .rows([GridLength::STAR, GridLength::Auto])
+                    .row_spacing(theme::spacing::LG)
+                    .children((
+                        ScrollViewer::new()
+                            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                            .max_height(520.0)
+                            .content(
+                                StackPanel::new()
+                                    .spacing(theme::spacing::XS)
+                                    .margin(Thickness::new(0.0, 0.0, theme::spacing::LG, 0.0))
+                                    .keyed_children(sections),
+                            ),
+                        footer,
+                    )),
             )
+    }
+
+    /// The submission for the chosen destination, from what is shown: the
+    /// existing Agent and its generation, the profile, or the ad-hoc
+    /// harness/model/effort on screen. None until a destination is complete.
+    fn handoff_target(
+        &self,
+        harness: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Option<Target> {
+        match self.handoff.choice.as_ref()? {
+            Choice::Existing { agent, generation } => Some(Target::Existing {
+                agent: agent.clone(),
+                generation: *generation,
+            }),
+            Choice::Profile { name, .. } => Some(Target::Profile(name.clone())),
+            Choice::Adhoc => harness.map(|harness| Target::Adhoc {
+                harness,
+                model,
+                effort,
+            }),
+        }
+    }
+
+    /// What will move, in plain language, beside the primary action.
+    fn handoff_summary(
+        &self,
+        harness: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> String {
+        let state = &self.handoff;
+        let from = &state.from;
+        if state.outcome.is_some() {
+            // The body states the result.
+            return String::new();
+        }
+        if state.submitted.is_some() || state.uncertain {
+            return state.status.clone();
+        }
+        let sends = match state.chosen.len() {
+            0 => String::new(),
+            1 => ", plus 1 waiting SEND".to_owned(),
+            count => format!(", plus {count} waiting SENDs"),
+        };
+        let carried = format!(
+            "a brief from the original task, {from}'s context, claims, Goal and children{sends}"
+        );
+        match &state.choice {
+            None => format!("Choose where {from}'s work goes."),
+            Some(Choice::Existing { agent, .. }) => format!(
+                "Moves {from}'s task to {agent}: {carried}. Other work stays on {from}, which keeps running."
+            ),
+            Some(Choice::Profile { name, harness }) => format!(
+                "Starts a new {name} Agent ({harness}) in {from}'s workspace and moves the task to it: {carried}. {from} keeps running."
+            ),
+            Some(Choice::Adhoc) => match harness {
+                Some(harness) => format!(
+                    "Starts a new ad-hoc {harness} Agent (model {}, effort {}) in {from}'s workspace and moves the task to it: {carried}. {from} keeps running.",
+                    model.as_deref().unwrap_or("harness default"),
+                    effort.as_deref().unwrap_or("harness default")
+                ),
+                None => "Pick the ad-hoc Agent's harness.".to_owned(),
+            },
+        }
     }
 }
 
-fn action(label: String, on_click: Callback<()>, enabled: bool, palette: Palette) -> View {
-    m3::tonal(palette)
+/// One destination of the dialog's single radio group, bound to `choice`.
+fn destination(
+    label: String,
+    choice: &Choice,
+    chosen: Option<&Choice>,
+    enabled: bool,
+    context: &mut ViewContext<DesktopApp>,
+) -> View {
+    let message = choice.clone();
+    RadioButton::new()
+        .group_name("handoff-destination")
+        .is_checked(chosen == Some(choice))
         .is_enabled(enabled)
         .automation_name(label.clone())
-        .on_click(on_click)
-        .content(
-            TextBlock::new()
-                .text(label)
-                .text_wrapping(TextWrapping::Wrap),
-        )
+        .on_checked(context.callback(move |checked: bool| {
+            Message::Handoff(if checked {
+                HandoffMsg::Chose(message.clone())
+            } else {
+                HandoffMsg::Unchose(message.clone())
+            })
+        }))
+        .content(small(label))
+}
+
+/// The text of a moved input, previewed (never its id).
+fn child_preview(command: &Command) -> String {
+    handoff::preview(
+        command
+            .args
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(no text)"),
+        60,
+    )
 }
 
 fn heading(text: &str) -> TextBlock {
-    TextBlock::new()
-        .text(text.to_owned())
-        .font_weight(FontWeight::SEMI_BOLD)
+    m3::text(text.to_owned(), theme::type_scale::TITLE_SMALL)
+        .margin(Thickness::new(0.0, theme::spacing::SM, 0.0, 0.0))
         .automation_heading_level(AutomationHeadingLevel::Level3)
 }
 
 fn small(text: impl Into<String>) -> TextBlock {
     TextBlock::new()
         .text(text.into())
-        .font_size(theme::type_scale::LABEL_MEDIUM.size)
+        .font_size(theme::type_scale::BODY_SMALL.size + 1.0)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }

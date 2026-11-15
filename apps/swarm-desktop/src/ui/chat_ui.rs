@@ -1214,7 +1214,7 @@ impl DesktopApp {
                             .children((turn_actions, primary)),
                     )),
             );
-        let dialog = self.handoff_dialog(context, palette);
+        let dialog = self.handoff_dialog(context);
 
         Grid::new()
             .rows([

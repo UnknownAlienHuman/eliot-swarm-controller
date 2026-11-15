@@ -98,6 +98,28 @@ pub fn entries(s: &Scheme) -> Vec<(&'static str, Value)> {
             "TextOnAccentFillColorSelectedTextBrush",
             opaque(s.on_primary),
         ),
+        // WinUI's AccentButtonStyle as the M3 filled button (used where the
+        // window palette cannot apply, such as inside a ContentDialog).
+        ("AccentButtonBackground", opaque(s.primary)),
+        (
+            "AccentButtonBackgroundPointerOver",
+            opaque(s.primary.mix(s.on_primary, 0.08)),
+        ),
+        (
+            "AccentButtonBackgroundPressed",
+            opaque(s.primary.mix(s.on_primary, 0.12)),
+        ),
+        (
+            "AccentButtonBackgroundDisabled",
+            Value::Brush(s.on_surface, alpha(0.12)),
+        ),
+        ("AccentButtonForeground", opaque(s.on_primary)),
+        ("AccentButtonForegroundPointerOver", opaque(s.on_primary)),
+        ("AccentButtonForegroundPressed", opaque(s.on_primary)),
+        (
+            "AccentButtonForegroundDisabled",
+            Value::Brush(s.on_surface, alpha(0.38)),
+        ),
         // List selection: the M3 secondary-container row with a primary
         // indicator, and on-surface state layers on hover and press.
         (
