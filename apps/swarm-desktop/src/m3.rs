@@ -31,6 +31,8 @@ pub mod glyph {
     pub const HAND_OFF: &str = "\u{E8AB}";
     pub const CHEVRON_RIGHT: &str = "\u{E76C}";
     pub const CHEVRON_DOWN: &str = "\u{E70D}";
+    pub const ARROW_DOWN: &str = "\u{E74B}";
+    pub const STEER: &str = "\u{E72A}";
 }
 
 pub fn weight(style: TypeStyle) -> FontWeight {

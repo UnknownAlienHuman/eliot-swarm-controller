@@ -18,12 +18,56 @@ pub(super) enum ChatMsg {
     ToolsToggled(String, bool),
     CopyPart(String),
     CopyCode(String, usize),
-    SendRequested,
+    /// Send, Steer or Resume with the draft, bound when it was clicked.
+    DraftRequested(DraftAction),
     SendSubmitted(Fallible<SendOutcome>),
     InterruptRequested,
     ApprovalRequested(UiPending, bool),
     AnswerRequested(UiPending),
     ControlSubmitted(String, Fallible<String>),
+}
+
+/// What the composer's draft is submitted as, with the binding captured at
+/// click time: the Agent, and for Steer its generation and active turn, for
+/// Resume its retained generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum DraftAction {
+    Send { agent: String },
+    Steer(BoundAction),
+    Resume { agent: String, generation: i64 },
+}
+
+impl DraftAction {
+    fn agent(&self) -> &str {
+        match self {
+            Self::Send { agent } | Self::Resume { agent, .. } => agent,
+            Self::Steer(bound) => &bound.agent,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Send { .. } => "Send",
+            Self::Steer(_) => "Steer",
+            Self::Resume { .. } => "Resume",
+        }
+    }
+
+    /// One ledger key per distinct action and draft revision.
+    fn key(&self, revision: u64) -> String {
+        match self {
+            Self::Send { agent } => format!("send:{agent}:{revision}"),
+            Self::Steer(bound) => format!(
+                "steer:{}:{}:{}:{revision}",
+                bound.agent,
+                bound.generation,
+                bound.turn.as_deref().unwrap_or_default()
+            ),
+            Self::Resume { agent, generation } => {
+                format!("resume:{agent}:{generation}:{revision}")
+            }
+        }
+    }
 }
 
 /// The selected Agent's conversation, its delivery chain and per-Agent drafts.
@@ -44,7 +88,11 @@ pub(super) struct ChatState {
     pub(super) items_revision: u64,
     pub(super) expanded: HashSet<String>,
     pub(super) unseen: usize,
-    pub(super) end_anchor: ElementRef<TextBox>,
+    /// A button of the latest turn, rendered outside the virtualized
+    /// repeater so it always exists: "Jump to latest" focuses it, and WinUI
+    /// brings a focused control into view (Reactor 0.100.0 exposes no
+    /// ScrollViewer offset or ChangeView).
+    pub(super) end_anchor: ElementRef<Button>,
     /// The composer, focused again after input is admitted, a launch and New.
     pub(super) composer_ref: ElementRef<TextBox>,
     pub(super) pending_local: Option<(String, String, String)>,
@@ -214,7 +262,9 @@ impl DesktopApp {
             ChatMsg::JumpToLatest => {
                 self.chat.unseen = 0;
                 if !self.chat.end_anchor.request_focus() {
-                    self.set_status("Jump to latest: the transcript end is not realized yet.");
+                    self.set_status(
+                        "Jump to latest: the latest turn has no control to move to yet.",
+                    );
                 }
             }
             ChatMsg::ToolsToggled(key, expanded) => {
@@ -250,55 +300,88 @@ impl DesktopApp {
                     None => self.set_status("That code block is no longer resident."),
                 }
             }
-            ChatMsg::SendRequested => {
+            ChatMsg::DraftRequested(action) => {
                 if self.submitting() {
                     return;
                 }
-                let (Ok(data_dir), Some(agent)) =
-                    (self.data_dir.clone(), self.selected_agent().cloned())
-                else {
-                    self.set_status("Select an Agent first.");
+                let Ok(data_dir) = self.data_dir.clone() else {
                     return;
                 };
-                let text = profiles::normalize_newlines(self.chat.drafts.get(&agent.id));
-                if text.trim().is_empty() {
-                    self.set_status("Type a message before sending.");
+                let agent_id = action.agent().to_owned();
+                let text = profiles::normalize_newlines(self.chat.drafts.get(&agent_id));
+                // A plain Resume needs no text; Send and Steer do.
+                let blank = text.trim().is_empty();
+                if blank && !matches!(action, DraftAction::Resume { .. }) {
+                    self.set_status(format!(
+                        "Type a message before {}.",
+                        if matches!(action, DraftAction::Steer(_)) {
+                            "steering"
+                        } else {
+                            "sending"
+                        }
+                    ));
                     return;
                 }
-                let revision = self.chat.drafts.revision(&agent.id);
-                let key = format!("send:{}:{revision}", agent.id);
+                let revision = self.chat.drafts.revision(&agent_id);
+                let key = action.key(revision);
                 let mutation_id = self.ledger.id_for(&key);
                 self.in_flight_key = Some(key);
-                self.set_status(format!("Sending ({mutation_id})…"));
-                let agent_id = agent.id.clone();
+                let what = action.label();
+                self.set_status(format!("{what} ({mutation_id})…"));
                 let _task = context.spawn_background(move |_| {
                     Message::Chat(ChatMsg::SendSubmitted(client::block_on(async {
-                        let submitted =
-                            client::submit_send(&data_dir, mutation_id.clone(), &agent_id, &text)
-                                .await;
-                        let (command_id, state, recovered) = match submitted {
-                            Ok(reply) => (reply.command_id.clone(), submit_note(&reply), false),
+                        let id = mutation_id.clone();
+                        let submitted = match &action {
+                            DraftAction::Send { agent } => {
+                                client::submit_send(&data_dir, id, agent, &text).await
+                            }
+                            DraftAction::Steer(bound) => {
+                                client::submit_steer(
+                                    &data_dir,
+                                    id,
+                                    &bound.agent,
+                                    bound.generation,
+                                    bound.turn.clone().unwrap_or_default(),
+                                    &text,
+                                )
+                                .await
+                            }
+                            DraftAction::Resume { agent, generation } => {
+                                let text = (!blank).then_some(text.as_str());
+                                client::submit_resume(&data_dir, id, agent, *generation, text).await
+                            }
+                        };
+                        let (command_id, state, linked, recovered) = match submitted {
+                            Ok(reply) => (
+                                reply.command_id.clone(),
+                                submit_note(&reply),
+                                reply.linked_command.clone(),
+                                false,
+                            ),
                             Err(error)
                                 if matches!(error.code.as_str(), "unknown" | "unavailable") =>
                             {
                                 // Uncertain reply: read the retained command
-                                // instead of sending again under a new id.
+                                // instead of submitting again under a new id.
                                 let command = client::read_command(&data_dir, &mutation_id)
                                     .await
                                     .map_err(|_| error.to_string())?;
                                 (
                                     command.id,
                                     format!("{:?}", command.state).to_lowercase(),
+                                    None,
                                     true,
                                 )
                             }
                             Err(error) => return Err(error.to_string()),
                         };
                         Ok(SendOutcome {
+                            what,
                             agent: agent_id,
                             command_id,
+                            linked,
                             draft_rev: revision,
-                            text,
+                            text: if blank { String::new() } else { text },
                             state,
                             recovered,
                         })
@@ -314,16 +397,31 @@ impl DesktopApp {
                         // Bound to the submitting Agent and draft revision, not
                         // to whatever conversation is open now.
                         self.chat.drafts.ack(&outcome.agent, outcome.draft_rev);
-                        if let Some(convo) = self.chat.convo.as_mut()
+                        // A SEND, or a resume's linked SEND, is new input of
+                        // this conversation; steering joins the active turn.
+                        let input = match outcome.what {
+                            "Send" => Some(outcome.command_id.as_str()),
+                            "Resume" => outcome.linked.as_deref(),
+                            _ => None,
+                        };
+                        if let Some(command) = input
+                            && !outcome.text.is_empty()
+                            && let Some(convo) = self.chat.convo.as_mut()
                             && convo.agent() == outcome.agent
                         {
-                            convo.note_local_input(&outcome.command_id, &outcome.text);
+                            convo.note_local_input(command, &outcome.text);
                         }
                         self.rebuild_items();
                         self.set_status(format!(
-                            "Send {} ({}){}.",
+                            "{} {} ({}){}{}.",
+                            outcome.what,
                             outcome.state,
                             outcome.command_id,
+                            outcome
+                                .linked
+                                .as_deref()
+                                .map(|linked| format!("; its message is {linked}"))
+                                .unwrap_or_default(),
                             if outcome.recovered {
                                 ", confirmed by reading the retained command"
                             } else {
@@ -333,7 +431,7 @@ impl DesktopApp {
                     }
                     Err(error) => {
                         self.set_status(format!(
-                            "Send not admitted (Send again reuses its id): {error}"
+                            "Not admitted (the same button reuses its id): {error}"
                         ));
                     }
                 }
@@ -709,33 +807,30 @@ impl DesktopApp {
     pub(super) fn chat_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let gutter = theme::spacing::XL;
         let agent = self.selected_agent_id();
+        // State, harness and model as chips; generation, profile, turn and
+        // configuration details live in the monitor and the configure panel.
         let header: View = match (&self.chat.detail, agent.as_deref()) {
-            (Some(detail), Some(agent)) => Grid::new()
-                .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
-                .column_spacing(theme::spacing::MD)
-                .children((
-                    m3::title(agent.to_owned(), theme::type_scale::TITLE_LARGE)
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .is_text_selection_enabled(true),
-                    Border::new()
-                        .grid_column(1)
-                        .content(m3::status_chip(palette, &detail.state)),
-                    m3::muted(
-                        format!(
-                            "gen {} · {} · profile {} · {} · turn {}",
-                            detail.generation,
-                            detail.harness,
-                            detail.profile,
-                            detail.settings.summary(),
-                            detail.active_turn.as_deref().unwrap_or("none"),
-                        ),
-                        theme::type_scale::BODY_MEDIUM,
-                    )
-                    .grid_column(2)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .text_trimming(TextTrimming::CharacterEllipsis)
-                    .is_text_selection_enabled(true),
-                )),
+            (Some(detail), Some(agent)) => {
+                let model = detail
+                    .settings
+                    .effective_model
+                    .as_deref()
+                    .or(detail.settings.profile_model.as_deref())
+                    .unwrap_or("default model")
+                    .to_owned();
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(theme::spacing::SM)
+                    .children((
+                        m3::title(agent.to_owned(), theme::type_scale::TITLE_LARGE)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .margin(Thickness::new(0.0, 0.0, theme::spacing::XS, 0.0))
+                            .is_text_selection_enabled(true),
+                        m3::status_chip(palette, &detail.state),
+                        m3::chip(palette, StatusTone::Neutral, &detail.harness),
+                        m3::chip(palette, StatusTone::Neutral, &model),
+                    ))
+            }
             (None, Some(agent)) => StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(theme::spacing::MD)
@@ -772,37 +867,6 @@ impl DesktopApp {
         .automation_name("Hand off or switch")
         .content(m3::icon_label(m3::glyph::HAND_OFF, "Hand off or switch…"));
 
-        let coverage_lines = self
-            .chat
-            .convo
-            .as_ref()
-            .map(|convo| convo.coverage().lines(convo.inputs_unavailable()))
-            .unwrap_or_default();
-        let can_load_older = self
-            .chat
-            .convo
-            .as_ref()
-            .is_some_and(|convo| convo.coverage().can_load_older())
-            && !matches!(self.chat.live, LiveStatus::Loading);
-        let coverage = Grid::new()
-            .columns([GridLength::STAR, GridLength::Auto])
-            .column_spacing(theme::spacing::SM)
-            .children((
-                m3::muted(coverage_lines.join("\n"), theme::type_scale::BODY_SMALL)
-                    .text_wrapping(TextWrapping::Wrap)
-                    .vertical_alignment(VerticalAlignment::Center),
-                m3::text_button(palette)
-                    .grid_column(1)
-                    .is_enabled(can_load_older)
-                    .on_click(context.message(Message::Chat(ChatMsg::LoadOlderRequested)))
-                    .content(TextBlock::new().text("Load older")),
-            ));
-        // Coverage and "Load older" belong to a conversation being shown.
-        let coverage: View = if self.chat.convo.is_some() {
-            coverage
-        } else {
-            View::empty()
-        };
         let top = StackPanel::new()
             .grid_row(0)
             .spacing(theme::spacing::SM)
@@ -818,8 +882,47 @@ impl DesktopApp {
                     .column_spacing(theme::spacing::MD)
                     .children((header, hand_off)),
                 self.configure_view(context, palette),
-                coverage,
             ));
+
+        // The start of the shown history: "Load older" centered above the
+        // first message, with the coverage it extends.
+        let history_start: View = match self.chat.convo.as_ref() {
+            Some(convo) => {
+                let coverage = convo.coverage();
+                let load_older: View = if coverage.can_load_older() {
+                    m3::text_button(palette)
+                        .is_enabled(!matches!(self.chat.live, LiveStatus::Loading))
+                        .horizontal_alignment(HorizontalAlignment::Center)
+                        .on_click(context.message(Message::Chat(ChatMsg::LoadOlderRequested)))
+                        .content(TextBlock::new().text("Load older"))
+                } else {
+                    View::empty()
+                };
+                let mut lines = coverage.lines(convo.inputs_unavailable());
+                if self.chat.items.is_empty() {
+                    lines.push("No retained turns in coverage yet.".to_owned());
+                }
+                // One centered TextBlock per line (Reactor 0.100.0 has no
+                // TextAlignment).
+                let lines: Vec<KeyedView> = lines
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        KeyedView::new(
+                            index,
+                            m3::muted(line, theme::type_scale::BODY_SMALL)
+                                .horizontal_alignment(HorizontalAlignment::Center)
+                                .text_wrapping(TextWrapping::Wrap),
+                        )
+                    })
+                    .collect();
+                StackPanel::new()
+                    .spacing(theme::spacing::XS)
+                    .margin(Thickness::new(0.0, 0.0, 0.0, theme::spacing::LG))
+                    .children((load_older, StackPanel::new().keyed_children(lines)))
+            }
+            None => View::empty(),
+        };
 
         let callbacks = RowCallbacks {
             copy_part: context.callback(|value| Message::Chat(ChatMsg::CopyPart(value))),
@@ -830,9 +933,25 @@ impl DesktopApp {
                 Message::Chat(ChatMsg::ToolsToggled(key, expanded))
             }),
         };
+        // Every turn but the latest is virtualized; the latest is a plain
+        // child that always exists and carries the end anchor.
+        let earlier = self.chat.items.len().saturating_sub(1);
+        let expanded = Rc::new(self.chat.expanded.clone());
+        let latest: View = match self.chat.items.last() {
+            Some(item) => StackPanel::new().keyed_children(vec![KeyedView::new(
+                item.key.clone(),
+                views::item_view(
+                    item,
+                    &expanded,
+                    &callbacks,
+                    palette,
+                    Some(&self.chat.end_anchor),
+                ),
+            )]),
+            None => View::empty(),
+        };
         let items = Rc::clone(&self.chat.items);
         let keys = Rc::clone(&self.chat.items);
-        let expanded = Rc::new(self.chat.expanded.clone());
         // A palette change re-realises the rows in the new colors.
         let palette_code = palette
             .scheme()
@@ -842,42 +961,55 @@ impl DesktopApp {
                 .items_revision
                 .wrapping_mul(3)
                 .wrapping_add(palette_code),
-            items.len(),
+            earlier,
             move |index| keys[index].key.clone(),
-            move |index| views::item_view(&items[index], &expanded, &callbacks, palette),
+            move |index| views::item_view(&items[index], &expanded, &callbacks, palette, None),
         );
-        // The end anchor is an inline reply box bound to the same draft as the
-        // composer: WinUI brings a focused TextBox into view, which a focused
-        // Button is not, and Reactor exposes no ScrollViewer offset API.
-        let end_anchor = TextBox::new()
-            .element_ref(&self.chat.end_anchor)
-            .text(self.primed(&self.composer_text()).to_owned())
-            .placeholder_text(match self.chat.convo.as_ref() {
-                Some(_) if self.chat.items.is_empty() => {
-                    "No retained turns in coverage yet. Reply here…"
-                }
-                Some(_) => "End of conversation. Reply here…",
-                None => "",
-            })
-            .automation_name("End of conversation reply")
-            .background(Brush::Solid(Color::transparent()))
-            .border_thickness(Thickness::uniform(0.0))
-            .accepts_return(true)
-            .text_wrapping(TextWrapping::Wrap)
-            .on_text_changed(
-                context.callback(|value| Message::Chat(ChatMsg::ComposerChanged(value))),
-            );
+        // The reading column has the composer's width: the reading width,
+        // or the pane less its gutters and scroll bar when narrower. Inside
+        // the ScrollViewer a stretched MaxWidth column was arranged in a
+        // slot wider than the viewport (off center), so it is centered at an
+        // explicit width; content-sized until the window size is observed.
+        let column = self.chat_pane_width().map(|pane| {
+            (pane - 2.0 * gutter - theme::spacing::LG).clamp(240.0, theme::layout::READING_WIDTH)
+        });
         let transcript = ScrollViewer::new()
             .grid_row(1)
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .automation_name("Conversation")
             .content(
                 StackPanel::new()
+                    .width(column)
                     .max_width(theme::layout::READING_WIDTH)
-                    .horizontal_alignment(HorizontalAlignment::Stretch)
-                    .margin(Thickness::xy(gutter, theme::spacing::SM))
-                    .children((ItemsRepeater::new().virtual_source(source), end_anchor)),
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .margin(Thickness::xy(0.0, theme::spacing::SM))
+                    .children((
+                        history_start,
+                        ItemsRepeater::new().virtual_source(source),
+                        latest,
+                    )),
             );
+        // Reactor 0.100.0 cannot tell whether the transcript is scrolled to
+        // the bottom (no offset, extent or ViewChanged), so the chip shows
+        // whenever there is history, floating over the transcript's bottom
+        // edge, outside the composer.
+        let jump: View = if self.chat.items.is_empty() {
+            View::empty()
+        } else {
+            let label = if self.chat.unseen > 0 {
+                format!("Jump to latest · {} new", self.chat.unseen)
+            } else {
+                "Jump to latest".to_owned()
+            };
+            m3::tonal(palette)
+                .grid_row(1)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Bottom)
+                .margin(Thickness::new(0.0, 0.0, 0.0, theme::spacing::SM))
+                .automation_name(label.clone())
+                .on_click(context.message(Message::Chat(ChatMsg::JumpToLatest)))
+                .content(m3::icon_label(m3::glyph::ARROW_DOWN, &label))
+        };
 
         let pending_rows: Vec<KeyedView> = self
             .chat
@@ -983,49 +1115,83 @@ impl DesktopApp {
             .on_text_changed(
                 context.callback(|value| Message::Chat(ChatMsg::ComposerChanged(value))),
             );
-        let busy_turn = self
-            .chat
-            .detail
-            .as_ref()
-            .and_then(|detail| detail.active_turn.as_ref())
-            .is_some();
-        let primary = if has_agent {
-            let label = if busy_turn { "Queue" } else { "Send" };
-            m3::filled(palette)
-                .is_enabled(!self.submitting())
-                .automation_name(label)
-                .on_click(context.message(Message::Chat(ChatMsg::SendRequested)))
-                .content(m3::icon_label(m3::glyph::SEND, label))
-        } else {
-            m3::filled(palette)
+        // Turn controls are bound now, from the detail on screen: the Agent,
+        // its generation and its active turn (Steer, Interrupt) or its
+        // retained generation (Resume).
+        let detail = self.chat.detail.as_ref();
+        let active_turn = detail.and_then(|detail| detail.active_turn.clone());
+        let resumable = detail.is_some_and(|detail| {
+            matches!(detail.state.as_str(), "stopped" | "failed" | "lost")
+                && detail.active_turn.is_none()
+        });
+        let draft_blank = self.composer_text().trim().is_empty();
+        let primary = match (agent.clone(), detail) {
+            (Some(agent), Some(detail)) if resumable => {
+                let label = if draft_blank {
+                    "Resume"
+                } else {
+                    "Resume with message"
+                };
+                m3::filled(palette)
+                    .is_enabled(!self.submitting())
+                    .automation_name(format!("{label} (generation {})", detail.generation))
+                    .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
+                        DraftAction::Resume {
+                            agent,
+                            generation: detail.generation,
+                        },
+                    ))))
+                    .content(m3::icon_label(m3::glyph::SEND, label))
+            }
+            (Some(agent), _) => {
+                let label = if active_turn.is_some() {
+                    "Queue"
+                } else {
+                    "Send"
+                };
+                m3::filled(palette)
+                    .is_enabled(!self.submitting())
+                    .automation_name(label)
+                    .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
+                        DraftAction::Send { agent },
+                    ))))
+                    .content(m3::icon_label(m3::glyph::SEND, label))
+            }
+            (None, _) => m3::filled(palette)
                 .is_enabled(!self.submitting())
                 .automation_name("Launch Agent")
                 .on_click(context.message(Message::Launch(LaunchMsg::LaunchRequested)))
-                .content(m3::icon_label(m3::glyph::SEND, "Launch Agent"))
+                .content(m3::icon_label(m3::glyph::SEND, "Launch Agent")),
         };
-        let interrupt = m3::tonal(palette)
-            .is_enabled(!self.submitting() && busy_turn)
-            .automation_name("Interrupt the active turn")
-            .on_click(context.message(Message::Chat(ChatMsg::InterruptRequested)))
-            .content(m3::icon_label(m3::glyph::INTERRUPT, "Interrupt"));
-        let jump = m3::text_button(palette)
-            .is_enabled(!self.chat.items.is_empty())
-            .on_click(context.message(Message::Chat(ChatMsg::JumpToLatest)))
-            .content(TextBlock::new().text(if self.chat.unseen > 0 {
-                format!("Jump to latest ({} new)", self.chat.unseen)
-            } else {
-                "Jump to latest".to_owned()
-            }));
+        // Steer and Interrupt exist only while a turn is active.
+        let turn_actions: View = match (agent.as_deref(), detail, active_turn.as_deref()) {
+            (Some(agent), Some(detail), Some(turn)) => {
+                let bound = BoundAction::turn_control(agent, detail.generation, turn);
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(theme::spacing::SM)
+                    .children((
+                        m3::tonal(palette)
+                            .is_enabled(!self.submitting())
+                            .automation_name(format!("Interrupt turn {turn}"))
+                            .on_click(context.message(Message::Chat(ChatMsg::InterruptRequested)))
+                            .content(m3::icon_label(m3::glyph::INTERRUPT, "Interrupt")),
+                        m3::tonal(palette)
+                            .is_enabled(!self.submitting() && !draft_blank)
+                            .automation_name(format!("Steer turn {turn} with the message"))
+                            .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
+                                DraftAction::Steer(bound),
+                            ))))
+                            .content(m3::icon_label(m3::glyph::STEER, "Steer")),
+                    ))
+            }
+            _ => View::empty(),
+        };
         let composer_card = Border::new()
             .grid_row(4)
             .background(palette.surface_container_high())
             .corner_radius(theme::shape::XL)
-            .padding(Thickness::new(
-                theme::spacing::SM,
-                theme::spacing::SM,
-                theme::spacing::SM,
-                theme::spacing::SM,
-            ))
+            .padding(Thickness::uniform(theme::spacing::SM))
             .max_width(theme::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Stretch)
             .margin(Thickness::new(
@@ -1040,17 +1206,12 @@ impl DesktopApp {
                     .row_spacing(theme::spacing::XS)
                     .children((
                         composer,
-                        Grid::new()
+                        StackPanel::new()
                             .grid_row(1)
-                            .columns([GridLength::STAR, GridLength::Auto])
-                            .children((
-                                jump,
-                                StackPanel::new()
-                                    .grid_column(1)
-                                    .orientation(Orientation::Horizontal)
-                                    .spacing(theme::spacing::SM)
-                                    .children((interrupt, primary)),
-                            )),
+                            .orientation(Orientation::Horizontal)
+                            .horizontal_alignment(HorizontalAlignment::Right)
+                            .spacing(theme::spacing::SM)
+                            .children((turn_actions, primary)),
                     )),
             );
         let dialog = self.handoff_dialog(context, palette);
@@ -1063,6 +1224,14 @@ impl DesktopApp {
                 GridLength::Auto,
                 GridLength::Auto,
             ])
-            .children((top, transcript, pending, launch, composer_card, dialog))
+            .children((
+                top,
+                transcript,
+                jump,
+                pending,
+                launch,
+                composer_card,
+                dialog,
+            ))
     }
 }

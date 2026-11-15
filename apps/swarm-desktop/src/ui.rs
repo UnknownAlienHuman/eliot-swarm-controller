@@ -136,17 +136,20 @@ struct UiDetail {
     generation: i64,
     active_turn: Option<String>,
     pending: Vec<UiPending>,
-    profile: String,
     harness: String,
     settings: configure::Settings,
     state: String,
 }
 
-/// Admission of one send: bound Agent, draft revision and submitted text.
+/// Admission of one draft submission (Send, Steer or Resume): bound Agent,
+/// draft revision and submitted text.
 #[derive(Clone, Debug)]
 struct SendOutcome {
+    what: &'static str,
     agent: String,
     command_id: String,
+    /// A resume's linked `<id>/send`, when it carried text.
+    linked: Option<String>,
     draft_rev: u64,
     text: String,
     state: String,
@@ -186,6 +189,8 @@ struct DesktopApp {
     data_dir: Fallible<PathBuf>,
     status: String,
     appearance: shell_ui::Appearance,
+    /// The window's client width in DIPs, once observed.
+    window_width: Option<f64>,
     /// False for the one render after the screen tree is re-created: the
     /// multi-line editors are then created empty (see `reprime_fields`).
     fields_primed: bool,
@@ -298,7 +303,6 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
         generation: reply.agent.generation,
         active_turn: reply.agent.active_turn.clone(),
         pending,
-        profile: reply.agent.profile.clone(),
         harness: reply.agent.harness.clone(),
         settings: configure::Settings::from_reply(reply),
         state: format!("{:?}", reply.agent.state).to_lowercase(),
@@ -402,6 +406,7 @@ impl Component for DesktopApp {
             data_dir,
             status: "Connecting to the daemon…".to_owned(),
             appearance: shell_ui::Appearance::new(),
+            window_width: None,
             fields_primed: true,
             prime_epoch: 0,
             renders: std::cell::Cell::new(0),

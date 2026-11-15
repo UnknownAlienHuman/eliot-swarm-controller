@@ -19,6 +19,8 @@ pub(super) enum ShellMsg {
     ScreenSelected(Screen),
     /// The window's actual Light/Dark scheme (Reactor `on_color_scheme`).
     SchemeObserved(ColorScheme),
+    /// The window's client size (Reactor `on_window_size`).
+    WindowResized(WindowSize),
     /// System → Light → Dark → System.
     ThemeCycled,
     /// The re-created editors of this re-prime exist: give them their text.
@@ -299,6 +301,7 @@ impl DesktopApp {
                     self.reprime_fields(context);
                 }
             }
+            ShellMsg::WindowResized(size) => self.window_width = Some(size.width),
             ShellMsg::HighContrastRead(on) => {
                 if on != self.appearance.high_contrast {
                     self.appearance.high_contrast = on;
@@ -369,6 +372,24 @@ impl DesktopApp {
         });
     }
 
+    /// The chat pane's width from the window width and the shell layout
+    /// below (rail, Agent list, optional monitor, spacing), or None until
+    /// the first size observation.
+    pub(super) fn chat_pane_width(&self) -> Option<f64> {
+        let monitor = if self.monitor.open {
+            theme::layout::MONITOR_WIDTH + theme::spacing::SM
+        } else {
+            0.0
+        };
+        self.window_width.map(|width| {
+            width
+                - theme::layout::RAIL_WIDTH
+                - theme::layout::LIST_WIDTH
+                - 2.0 * theme::spacing::SM
+                - monitor
+        })
+    }
+
     /// `text` once the editors are primed, empty during the priming render.
     pub(super) fn primed<'a>(&self, text: &'a str) -> &'a str {
         if self.fields_primed { text } else { "" }
@@ -379,20 +400,6 @@ impl DesktopApp {
             .project_idx
             .and_then(|index| index.checked_sub(1))
             .and_then(|index| self.nav.projects.get(index))
-    }
-
-    /// The selected Agent, wherever it is listed: a collapsed child keeps
-    /// its conversation and controls.
-    pub(super) fn selected_agent(&self) -> Option<&UiAgent> {
-        let id = self.nav.selection.agent.as_deref()?;
-        self.nav
-            .agents
-            .iter()
-            .chain(self.nav.branches.values().flat_map(|branch| match branch {
-                Branch::Loaded { children, .. } => children.as_slice(),
-                _ => &[],
-            }))
-            .find(|agent| agent.id == id)
     }
 
     /// Recompute the rows on screen and the native selection index.
@@ -506,6 +513,8 @@ impl DesktopApp {
         context.on_color_scheme(
             context.callback(|scheme| Message::Shell(ShellMsg::SchemeObserved(scheme))),
         );
+        context
+            .on_window_size(context.callback(|size| Message::Shell(ShellMsg::WindowResized(size))));
         let palette = self.palette();
 
         let screen: View = match self.screen {

@@ -266,12 +266,19 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
         .collect()
 }
 
+/// `anchor`, when given, binds the part's own button (Copy message or the
+/// tool group header): the end anchor of the transcript.
 fn part_view(
     part: &RenderedPart,
     expanded: bool,
     callbacks: &RowCallbacks,
     palette: Palette,
+    anchor: Option<&ElementRef<Button>>,
 ) -> View {
+    let anchored = |button: Button| match anchor {
+        Some(anchor) => button.element_ref(anchor),
+        None => button,
+    };
     let copy = callbacks.copy_part.clone();
     let key = part.key.clone();
     let copy_message = move || {
@@ -293,7 +300,7 @@ fn part_view(
                         body_text(&part.plain, palette)
                             .foreground(palette.on_secondary_container()),
                     ),
-                copy_button("Copy message", palette, copy_message)
+                anchored(copy_button("Copy message", palette, copy_message))
                     .horizontal_alignment(HorizontalAlignment::Right)
                     .content(copy_label("Copy message")),
             )),
@@ -313,7 +320,7 @@ fn part_view(
             // An outlined button rather than a ToggleButton: Reactor 0.100.0
             // themes only Buttons, so a checked toggle would show the system
             // accent. The accessible name carries the state.
-            let header = crate::m3::outlined(palette)
+            let header = anchored(crate::m3::outlined(palette))
                 .automation_name(format!(
                     "Tool operations: {} ({})",
                     part.plain,
@@ -355,7 +362,7 @@ fn part_view(
         PartKind::Final => {
             let mut actions: Vec<KeyedView> = vec![KeyedView::new(
                 "copy",
-                copy_button("Copy message", palette, copy_message)
+                anchored(copy_button("Copy message", palette, copy_message))
                     .content(copy_label("Copy message")),
             )];
             if part.code_blocks > 0 {
@@ -410,20 +417,37 @@ fn part_view(
 }
 
 /// One realized turn: keyed parts, so new activity appends children instead
-/// of replacing the item.
+/// of replacing the item. `anchor` binds the last part that has a button of
+/// its own (see [`part_view`]).
 pub fn item_view(
     item: &RenderedItem,
     expanded: &HashSet<String>,
     callbacks: &RowCallbacks,
     palette: Palette,
+    anchor: Option<&ElementRef<Button>>,
 ) -> View {
+    let anchored = anchor.and_then(|_| {
+        item.parts.iter().rposition(|part| {
+            matches!(
+                part.kind,
+                PartKind::Input | PartKind::Tools | PartKind::Final
+            )
+        })
+    });
     let parts: Vec<KeyedView> = item
         .parts
         .iter()
-        .map(|part| {
+        .enumerate()
+        .map(|(index, part)| {
             KeyedView::new(
                 part.key.clone(),
-                part_view(part, expanded.contains(&part.key), callbacks, palette),
+                part_view(
+                    part,
+                    expanded.contains(&part.key),
+                    callbacks,
+                    palette,
+                    anchor.filter(|_| anchored == Some(index)),
+                ),
             )
         })
         .collect();
