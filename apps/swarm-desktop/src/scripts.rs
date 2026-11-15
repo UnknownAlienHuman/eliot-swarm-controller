@@ -48,6 +48,32 @@ pub fn running_timers(rules: &[RuleListEntry], project: Option<&str>, path: &str
         .collect()
 }
 
+/// Executables that run (or shell-open) a script given as their argument.
+const SCRIPT_HOSTS: &[&str] = &[
+    "pwsh",
+    "powershell",
+    "cmd",
+    "wscript",
+    "cscript",
+    "mshta",
+    "python",
+    "pythonw",
+    "py",
+    "pyw",
+    "node",
+    "bash",
+    "sh",
+    "wsl",
+    "rundll32",
+    "regsvr32",
+    "msiexec",
+    "explorer",
+    "conhost",
+    "wt",
+    "windowsterminal",
+    "swarm",
+];
+
 /// A user-selected editor must be an absolute path to an existing `.exe`.
 /// Script hosts and shell-associated files (`.cmd`, `.bat`, `.ps1`, `.lnk`,
 /// ...) are refused: the editor is started with literal argv, never through
@@ -63,6 +89,18 @@ pub fn editor_executable(raw: &str) -> Result<PathBuf, String> {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
     if !is_exe {
         return Err("the editor must be an .exe, not a script or shell association".to_owned());
+    }
+    // Hosts that would execute the entry instead of editing it, and the shell
+    // that would follow its file association, are refused by name.
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if SCRIPT_HOSTS.contains(&stem.as_str()) {
+        return Err(format!(
+            "{stem}.exe would run the script, not edit it; choose an editor"
+        ));
     }
     if !path.is_file() {
         return Err(format!("{} does not exist", path.display()));
@@ -171,6 +209,19 @@ mod tests {
         assert!(editor_executable("C:/nope/editor.exe").is_err());
         if Path::new("C:/Windows/System32/notepad.exe").is_file() {
             assert!(editor_executable("C:/Windows/System32/notepad.exe").is_ok());
+        }
+        for host in ["C:/Windows/System32/cmd.exe", "C:/Windows/explorer.exe"] {
+            if Path::new(host).is_file() {
+                assert!(editor_executable(host).is_err(), "{host}");
+            }
+        }
+        let pwsh = "C:/Program Files/PowerShell/7/pwsh.exe";
+        if Path::new(pwsh).is_file() {
+            assert!(
+                editor_executable(pwsh)
+                    .unwrap_err()
+                    .contains("would run the script")
+            );
         }
     }
 }

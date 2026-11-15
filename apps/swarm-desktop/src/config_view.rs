@@ -63,6 +63,8 @@ pub struct ProfilesData<'a> {
     pub editable: bool,
     pub reason: Option<&'a str>,
     pub draft: &'a str,
+    /// The source TextBox's own text, bound back unchanged.
+    pub view: &'a str,
     pub dirty: bool,
     pub selected: Option<&'a str>,
     pub duplicate_name: &'a str,
@@ -177,7 +179,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View
 
     let source = TextBox::new()
         .grid_row(5)
-        .text(data.draft.to_owned())
+        .text(data.view.to_owned())
         .accepts_return(true)
         .text_wrapping(TextWrapping::NoWrap)
         .is_enabled(data.editable && !data.busy)
@@ -200,6 +202,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View
             StackPanel::new().grid_row(0).spacing(2.0).children((
                 TextBlock::new()
                     .text("Profiles")
+                    .automation_heading_level(AutomationHeadingLevel::Level2)
                     .font_size(theme::type_scale::HEADING)
                     .font_weight(FontWeight::SEMI_BOLD),
                 small(saved),
@@ -389,6 +392,7 @@ pub fn automation_screen(
             StackPanel::new().grid_row(0).spacing(2.0).children((
                 TextBlock::new()
                     .text("Automation")
+                    .automation_heading_level(AutomationHeadingLevel::Level2)
                     .font_size(theme::type_scale::HEADING)
                     .font_weight(FontWeight::SEMI_BOLD),
                 small("Read-only. No daemon operation pauses or resumes a rule or timer: `enabled` comes from the rule file, and `paused` is set by the daemon (backlog). Edit rules in <data_dir>/rules/*.toml; the watcher keeps the last valid definition on a bad edit.").opacity(theme::MUTED_OPACITY),
@@ -425,7 +429,8 @@ pub struct ScriptsData<'a> {
     pub revision: Option<&'a str>,
     pub editable: bool,
     pub reason: Option<&'a str>,
-    pub draft: &'a str,
+    /// The editor TextBox's own text, bound back unchanged.
+    pub view: &'a str,
     pub dirty: bool,
     pub timers: &'a [String],
     pub editor_exe: &'a str,
@@ -514,6 +519,7 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions) -> View {
             StackPanel::new().grid_row(0).spacing(2.0).children((
                 TextBlock::new()
                     .text("Scripts")
+                    .automation_heading_level(AutomationHeadingLevel::Level2)
                     .font_size(theme::type_scale::HEADING)
                     .font_weight(FontWeight::SEMI_BOLD),
                 small("Existing entries under <data_dir>/scripts/ and registered .eliot/scripts/. Save replaces the file only when its revision still matches; Run goes through a timer's run action, with the daemon's custody, timeout and unknown-outcome rules.").opacity(theme::MUTED_OPACITY),
@@ -575,7 +581,7 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions) -> View {
                 .keyed_children(runs),
             TextBox::new()
                 .grid_row(5)
-                .text(data.draft.to_owned())
+                .text(data.view.to_owned())
                 .accepts_return(true)
                 .text_wrapping(TextWrapping::NoWrap)
                 .is_enabled(data.editable && !data.busy)

@@ -42,7 +42,7 @@ and it never executes anything. It rejects:
 - NUL or the redaction marker (`invalid`);
 - a known secret (`not_allowed`).
 
-The file's byte-order mark and CRLF endings are kept. The save writes a temporary file in
+An entry the read withholds (oversized, binary, NUL or holding a known secret) is never replaced (`not_allowed`). The file's byte-order mark is kept, and a file that uses CRLF keeps CRLF (mixed endings become CRLF). The save writes a temporary file in
 the entry's directory and renames it over the entry; global entries stay private. A
 failure after the rename is `unknown`. A Run admitted before a save fails its digest check
 at dispatch (`source_integrity`) and never runs the new bytes. Running a script stays with

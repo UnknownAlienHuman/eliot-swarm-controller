@@ -17,8 +17,12 @@
 //! ratio, so the transcript cannot detect "at the bottom" or auto-follow;
 //! "Jump to latest" moves focus to the end anchor, which WinUI brings into
 //! view. There is no font-family property (code is not monospace), no
-//! clipboard (see [`crate::clipboard`]) and no key events on `TextBox`
-//! (Enter cannot send; Ctrl+Enter is a Send accelerator).
+//! clipboard (see [`crate::clipboard`]) and no key events on `TextBox`, so
+//! Enter cannot send. A multiline `TextBox` consumes Ctrl+Enter as a newline
+//! before any `KeyboardAccelerator` sees it, and Reactor's Button/Grid
+//! accelerators (Ctrl+R, Ctrl+Enter) did not fire under real keystrokes in
+//! this window, so none is offered: the keyboard path is Tab to the action
+//! button, then Enter or Space.
 //!
 //! Checked against windows-rs master `f37e2f9046cf9710fe00285436c4d22ad6053d72`
 //! (2026-11-14, unreleased `windows-reactor` 0.101.0, MIT OR Apache-2.0):
@@ -87,7 +91,10 @@ struct ScriptsEditor {
     revision: Option<String>,
     display_path: Option<String>,
     base: String,
+    /// Line-feed text the dirty check and save use.
     draft: String,
+    /// The editor TextBox's text exactly as reported (CR line breaks).
+    view: String,
     editable: bool,
     reason: Option<String>,
     status: String,
@@ -104,7 +111,10 @@ struct ScriptsEditor {
 struct ProfilesEditor {
     revision: Option<String>,
     base: String,
+    /// Line-feed text the form, dirty check and save use.
     draft: String,
+    /// The source TextBox's text exactly as reported (CR line breaks).
+    view: String,
     editable: bool,
     reason: Option<String>,
     selected: Option<String>,
@@ -253,7 +263,7 @@ enum Message {
     ScriptDraftChanged(String),
     ScriptValidateRequested,
     ScriptSaveRequested,
-    ScriptSaved(bool, Fallible<ScriptSaveResponse>),
+    ScriptSaved(u64, bool, Fallible<ScriptSaveResponse>),
     ScriptReloadRequested,
     EditorPathChanged(String),
     OpenInEditorRequested,
@@ -306,6 +316,8 @@ struct DesktopApp {
     expanded: HashSet<String>,
     unseen: usize,
     end_anchor: ElementRef<TextBox>,
+    /// The composer, focused again after input is admitted, a launch and New.
+    composer_ref: ElementRef<TextBox>,
     pending_local: Option<(String, String, String)>,
     // Mutations.
     drafts: DraftStore,
@@ -433,6 +445,17 @@ impl DesktopApp {
             .map(|(project, path, _)| (project.clone(), path.clone()))
     }
 
+    fn clear_script_editor(&mut self) {
+        let editor = &mut self.scripts;
+        editor.revision = None;
+        editor.display_path = None;
+        editor.base.clear();
+        editor.draft.clear();
+        editor.view.clear();
+        editor.editable = false;
+        editor.reason = None;
+    }
+
     fn load_scripts(&mut self, context: &ComponentContext<Self>) {
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
@@ -485,8 +508,10 @@ impl DesktopApp {
         }
         .to_owned();
         let draft = self.scripts.draft.clone();
+        let epoch = self.scripts.load_epoch;
         let _task = context.spawn_background(move |_| {
             Message::ScriptSaved(
+                epoch,
                 dry_run,
                 client::block_on(async {
                     client::save_script(&data_dir, project, path, revision, draft, dry_run)
@@ -1008,6 +1033,7 @@ impl Component for DesktopApp {
             expanded: HashSet::new(),
             unseen: 0,
             end_anchor: ElementRef::new(),
+            composer_ref: ElementRef::new(),
             pending_local: None,
             drafts: DraftStore::default(),
             ledger: MutationLedger::default(),
@@ -1048,7 +1074,9 @@ impl Component for DesktopApp {
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
         match message {
             Message::ComposerChanged(text) => {
-                let text = profiles::normalize_newlines(&text);
+                // Keep the text exactly as the TextBox reports it: a normalized
+                // copy would differ, be written back, and move the caret (or end
+                // an IME composition). Line endings are normalized at submission.
                 if let Some(agent) = self.selected_agent_id() {
                     self.drafts.set(&agent, text);
                 } else {
@@ -1168,6 +1196,8 @@ impl Component for DesktopApp {
                 }
             }
             Message::NewConversation => {
+                // Keyboard focus goes back to the composer (no-op while it is unbound).
+                let _ = self.composer_ref.request_focus();
                 // Leave the conversation locally; the Agent keeps running.
                 self.epoch += 1;
                 if let Some(task) = self.live_task.take() {
@@ -1375,7 +1405,7 @@ impl Component for DesktopApp {
                         return;
                     }
                 };
-                let text = self.launch_text.clone();
+                let text = profiles::normalize_newlines(&self.launch_text);
                 if text.trim().is_empty() || self.workspace.trim().is_empty() {
                     self.set_status("Type the workspace and the first message before launching.");
                     return;
@@ -1412,6 +1442,8 @@ impl Component for DesktopApp {
                 });
             }
             Message::LaunchSubmitted(outcome) => {
+                // Keyboard focus goes back to the composer (no-op while it is unbound).
+                let _ = self.composer_ref.request_focus();
                 self.settle_mutation(outcome.is_ok());
                 match outcome {
                     Ok(outcome) => {
@@ -1456,7 +1488,7 @@ impl Component for DesktopApp {
                     self.set_status("Select an Agent first.");
                     return;
                 };
-                let text = self.drafts.get(&agent.id).to_owned();
+                let text = profiles::normalize_newlines(self.drafts.get(&agent.id));
                 if text.trim().is_empty() {
                     self.set_status("Type a message before sending.");
                     return;
@@ -1502,6 +1534,8 @@ impl Component for DesktopApp {
                 });
             }
             Message::SendSubmitted(outcome) => {
+                // Keyboard focus goes back to the composer (no-op while it is unbound).
+                let _ = self.composer_ref.request_focus();
                 self.settle_mutation(outcome.is_ok());
                 match outcome {
                     Ok(outcome) => {
@@ -1793,6 +1827,7 @@ impl Component for DesktopApp {
                         let source = profiles::normalize_newlines(&read.source.unwrap_or_default());
                         self.editor.revision = read.revision;
                         self.editor.base = source.clone();
+                        self.editor.view = source.clone();
                         self.editor.draft = source;
                         self.editor.editable = read.editable;
                         self.editor.reason = read.reason;
@@ -1815,6 +1850,7 @@ impl Component for DesktopApp {
             Message::ProfilesDraftChanged(text) => {
                 if self.editor.editable && !self.editor.busy {
                     self.editor.draft = profiles::normalize_newlines(&text);
+                    self.editor.view = text;
                 }
             }
             Message::ProfileEditSelected(index) => {
@@ -1829,7 +1865,10 @@ impl Component for DesktopApp {
                 {
                     let value = Some(value.trim()).filter(|value| !value.is_empty());
                     match profiles::set_field(&self.editor.draft, &name, key, value) {
-                        Ok(draft) => self.editor.draft = draft,
+                        Ok(draft) => {
+                            self.editor.view = draft.clone();
+                            self.editor.draft = draft;
+                        }
                         Err(error) => self.editor.status = error,
                     }
                 }
@@ -1840,6 +1879,7 @@ impl Component for DesktopApp {
                     let to = self.editor.duplicate_name.trim().to_owned();
                     match profiles::duplicate(&self.editor.draft, &from, &to) {
                         Ok(draft) => {
+                            self.editor.view = draft.clone();
                             self.editor.draft = draft;
                             self.editor.selected = Some(to.clone());
                             self.editor.duplicate_name.clear();
@@ -1961,6 +2001,9 @@ impl Component for DesktopApp {
                                 .iter()
                                 .position(|(p, e, _)| *p == project && *e == path)
                         });
+                        if self.scripts.selected.is_none() {
+                            self.clear_script_editor();
+                        }
                         self.scripts.status =
                             format!("{} script entr(ies) listed.", self.scripts.entries.len());
                     }
@@ -1969,7 +2012,13 @@ impl Component for DesktopApp {
             }
             Message::ScriptSelected(index) => {
                 if index.is_some() && index != self.scripts.selected {
+                    if self.scripts.draft != self.scripts.base {
+                        self.scripts.status =
+                            "The draft has unsaved edits: Save or Reload it before opening another entry.".to_owned();
+                        return;
+                    }
                     self.scripts.selected = index;
+                    self.clear_script_editor();
                     self.load_script(context);
                 }
             }
@@ -1984,6 +2033,7 @@ impl Component for DesktopApp {
                         self.scripts.revision = Some(read.revision);
                         self.scripts.display_path = Some(read.display_path);
                         self.scripts.base = text.clone();
+                        self.scripts.view = text.clone();
                         self.scripts.draft = text;
                         self.scripts.editable = read.editable;
                         self.scripts.reason = read.reason;
@@ -1997,11 +2047,16 @@ impl Component for DesktopApp {
             Message::ScriptDraftChanged(text) => {
                 if self.scripts.editable && !self.scripts.busy {
                     self.scripts.draft = profiles::normalize_newlines(&text);
+                    self.scripts.view = text;
                 }
             }
             Message::ScriptValidateRequested => self.save_script(context, true),
             Message::ScriptSaveRequested => self.save_script(context, false),
-            Message::ScriptSaved(dry_run, result) => {
+            Message::ScriptSaved(epoch, dry_run, result) => {
+                // A save for an entry that is no longer loaded changes nothing here.
+                if epoch != self.scripts.load_epoch {
+                    return;
+                }
                 self.scripts.busy = false;
                 match result {
                     Ok(_) if dry_run => {
@@ -2096,7 +2151,15 @@ impl Component for DesktopApp {
                 });
             }
             Message::ScriptRunSubmitted(result) => {
-                self.settle_mutation(result.is_ok());
+                // Only an uncertain reply keeps the key (so a retry reuses the id);
+                // a definite refusal ends that action.
+                let uncertain = result.as_ref().err().is_some_and(|error| {
+                    error.starts_with("unknown:") || error.starts_with("unavailable:")
+                });
+                self.settle_mutation(!uncertain);
+                if result.is_err() && !uncertain {
+                    self.scripts.run_seq += 1;
+                }
                 match result {
                     Ok(command) => {
                         self.scripts.run_seq += 1;
@@ -2115,8 +2178,13 @@ impl Component for DesktopApp {
                     }
                     Err(error) => {
                         self.scripts.run_busy = false;
-                        self.scripts.run_status =
-                            format!("Run not admitted (Run again reuses its id): {error}");
+                        self.scripts.run_status = if uncertain {
+                            format!(
+                                "Run outcome uncertain (Run again reuses its id, so it cannot run twice): {error}"
+                            )
+                        } else {
+                            format!("Run refused: {error}")
+                        };
                     }
                 }
             }
@@ -2248,6 +2316,7 @@ impl Component for DesktopApp {
             .children((
                 TextBlock::new()
                     .text("Swarm Desktop")
+                    .automation_heading_level(AutomationHeadingLevel::Level1)
                     .font_size(theme::type_scale::TITLE)
                     .font_weight(FontWeight::BOLD),
                 ToggleButton::new()
@@ -2429,7 +2498,7 @@ impl DesktopApp {
             revision: editor.revision.as_deref(),
             editable: editor.editable,
             reason: editor.reason.as_deref(),
-            draft: &editor.draft,
+            view: &editor.view,
             dirty: editor.draft != editor.base,
             timers: &timers,
             editor_exe: &editor.editor_exe,
@@ -2464,6 +2533,7 @@ impl DesktopApp {
             editable: self.editor.editable,
             reason: self.editor.reason.as_deref(),
             draft: &self.editor.draft,
+            view: &self.editor.view,
             dirty: self.editor.draft != self.editor.base,
             selected: self.editor.selected.as_deref(),
             duplicate_name: &self.editor.duplicate_name,
@@ -2505,17 +2575,22 @@ impl DesktopApp {
             .map(|agent| {
                 KeyedView::new(
                     agent.id.clone(),
-                    ListViewItem::new().content(
-                        StackPanel::new().spacing(2.0).children((
-                            TextBlock::new()
-                                .text(format!("{} · {}", agent.id, agent.state))
-                                .font_weight(FontWeight::SEMI_BOLD),
-                            TextBlock::new()
-                                .text(format!("{} · gen {}", agent.harness, agent.generation))
-                                .font_size(theme::type_scale::LABEL)
-                                .opacity(theme::MUTED_OPACITY),
-                        )),
-                    ),
+                    ListViewItem::new()
+                        .automation_name(format!(
+                            "Agent {}, {}, {}, generation {}",
+                            agent.id, agent.state, agent.harness, agent.generation
+                        ))
+                        .content(
+                            StackPanel::new().spacing(2.0).children((
+                                TextBlock::new()
+                                    .text(format!("{} · {}", agent.id, agent.state))
+                                    .font_weight(FontWeight::SEMI_BOLD),
+                                TextBlock::new()
+                                    .text(format!("{} · gen {}", agent.harness, agent.generation))
+                                    .font_size(theme::type_scale::LABEL)
+                                    .opacity(theme::MUTED_OPACITY),
+                            )),
+                        ),
                 )
             })
             .collect();
@@ -2633,6 +2708,7 @@ impl DesktopApp {
             .automation_name("Workspace")
             .on_text_changed(context.callback(Message::WorkspaceChanged));
         let refresh = Button::new()
+            .automation_name("Refresh")
             .on_click(context.message(Message::RefreshRequested))
             .content(TextBlock::new().text("Refresh"));
         let new_chat = Button::new()
@@ -2847,9 +2923,10 @@ impl DesktopApp {
             .keyed_children(pending_rows);
 
         let composer = TextBox::new()
+            .element_ref(&self.composer_ref)
             .text(self.composer_text())
             .placeholder_text(if self.selected_agent_id().is_some() {
-                "Message the selected Agent… (Ctrl+Enter sends)"
+                "Message the selected Agent…"
             } else {
                 "First message for a new Agent…"
             })
@@ -2869,17 +2946,14 @@ impl DesktopApp {
             Button::new()
                 .resource_overrides(theme::winui::primary_button(self.dark_accent))
                 .is_enabled(!self.submitting())
-                .key_accelerators(KeyAccelerators::new([KeyAccelerator::new(
-                    AcceleratorKey::Enter,
-                    AcceleratorModifiers::Control,
-                    context.message(Message::SendRequested),
-                )]))
+                .automation_name(if busy_turn { "Queue" } else { "Send" })
                 .on_click(context.message(Message::SendRequested))
                 .content(TextBlock::new().text(if busy_turn { "Queue" } else { "Send" }))
         } else {
             Button::new()
                 .resource_overrides(theme::winui::primary_button(self.dark_accent))
                 .is_enabled(!self.submitting())
+                .automation_name("Launch Agent")
                 .on_click(context.message(Message::LaunchRequested))
                 .content(TextBlock::new().text("Launch Agent"))
         };
