@@ -13,6 +13,15 @@ Claude Code 2.1.278): [headless](https://code.claude.com/docs/en/headless),
 [hooks](https://code.claude.com/docs/en/hooks),
 [CLI](https://code.claude.com/docs/en/cli-reference).
 The TypeScript Agent SDK is not used.
+The send association was rechecked on 2026-11-15 against installed Claude Code
+2.1.325 (`--help` and a real Haiku 5.5 stream-json session), alongside the
+official [streaming input documentation](https://code.claude.com/docs/en/agent-sdk/streaming-vs-single-mode).
+A UUID-stamped input written while a tool turn was busy emitted its exact
+`command_lifecycle.command_uuid` with `queued`, then `started`; the terminal
+`result.user_message_uuids` listed both inputs when the CLI consumed the second
+inside the running turn. An idle follow-up emitted its own exact lifecycle
+and terminal. This observation does not establish that every CLI version or
+every busy input will produce that sequence.
 These notes do not establish runtime support or a current license approval.
 Verified live on Claude Code 2.1.278: with
 `--permission-prompt-tool stdio` a tool use arrives as a `control_request`
@@ -122,6 +131,32 @@ Unix the plugin leads its own process group and the daemon group-kills it
 | answer | unsupported: the AskUserQuestion shape on the installed CLI is unverified |
 | configure | applied at start, not a runtime verb: `--model` / `--permission-mode` argv on a fresh start, `set_model` / `set_permission_mode` realign on resume; requested vs effective settings are reported before readiness, with `effective.model` null at readiness (the CLI never reads the active model back in `initialize`; `models[]` membership proves availability/membership only, never which model is actually serving). A non-empty `message.model` reported by an actual native `assistant` record is carried on its `message.completed` fact and merged as the only change into `Agent.effective.model`, preserving pid/permissions/session fields and the requested profile alias; missing/null stays unobserved and a reported model change is not a gap |
 | goal | no native goal mechanism; goal selection stays in Eliot |
+
+### Send admission and uncertainty
+
+The daemon owns the SEND FIFO and normally waits for the previous turn. The
+plugin separately refuses a fresh SEND before writing when its session/source
+is unavailable, an exact turn is still active, or one prior input still awaits
+association. These are authoritative `rejected` replies carrying the actual
+reason: a generic `busy` RPC error after daemon dispatch would be classified
+`unknown` despite no native input having been written. The event task repeats
+the active/pending/source checks when registering the single input waiter, so
+a race with a native frame is also a no-write rejection.
+
+Register the command/UUID waiter before the native write. A proven no-write
+error withdraws only that exact registration and retains a rejected outcome.
+An ambiguous write or association deadline retains `unknown`, its actual
+reason and bounded cause, plus the exact outcome receiver; it never resends
+the text or sets a session-wide unknown latch. Silence does not free the
+pending slot. Native write and association share a 25-second deadline inside
+the daemon's 30-second command RPC budget, leaving time to return the native
+cause instead of racing the outer timeout. A later exact lifecycle, after its source commit acknowledgement,
+can settle the receiver and retire that slot. Reconcile it before same-command
+replay, fresh input, and snapshot readback, retaining the original command/turn
+binding. A source gap or lost event task still refuses fresh writes. Resolving
+a daemon command alone does not manufacture native evidence or clear an
+unassociated plugin input. After exact late association and turn completion,
+later distinct sends can proceed without restarting the Agent.
 
 If a turn ends before queued hook context or a queued steer is consumed, do not
 deliver it to a later turn: the steer settles `rejected` and the text is

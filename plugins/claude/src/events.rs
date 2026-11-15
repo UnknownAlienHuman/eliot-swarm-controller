@@ -100,7 +100,7 @@ pub(crate) struct EventHandle {
 pub(crate) enum TurnOutcome {
     Associated,
     Rejected(String),
-    Unknown,
+    Unknown(String),
 }
 
 /// Outcome of one queued steer wait, decided by the exact hook facts. Only
@@ -827,7 +827,11 @@ impl EventHandle {
     }
 
     pub fn status(&self) -> EventStatus {
-        self.status.borrow().clone()
+        let mut status = self.status.borrow().clone();
+        if self.control.is_closed() && status.failure.is_none() {
+            status.failure = Some("Claude event task is unavailable".to_owned());
+        }
+        status
     }
 
     async fn send(
@@ -1563,7 +1567,12 @@ impl EventProcessor {
         match parsed.state.as_str() {
             "queued" | "started" => {
                 if self.writes_blocked {
-                    settle(outcome, TurnOutcome::Unknown);
+                    settle(
+                        outcome,
+                        TurnOutcome::Unknown(
+                            "Claude event source acknowledgement is unresolved".to_owned(),
+                        ),
+                    );
                     return Err(Error::new(
                         "unknown",
                         "Claude event source acknowledgement is unresolved",
@@ -1585,7 +1594,7 @@ impl EventProcessor {
                     data["context_outcomes"] = json!(context_outcomes);
                 }
                 if let Err(error) = self.commit_event("turn.started", native_id, data).await {
-                    settle(outcome, TurnOutcome::Unknown);
+                    settle(outcome, TurnOutcome::Unknown(error.message.clone()));
                     return Err(error);
                 }
                 settle(outcome, TurnOutcome::Associated);
@@ -1601,7 +1610,12 @@ impl EventProcessor {
                 Ok(())
             }
             _ => {
-                settle(outcome, TurnOutcome::Unknown);
+                settle(
+                    outcome,
+                    TurnOutcome::Unknown(
+                        "Claude lifecycle carried an unknown turn state".to_owned(),
+                    ),
+                );
                 self.record_gap("Claude lifecycle carried an unknown turn state")
                     .await
             }
@@ -3020,7 +3034,12 @@ impl EventProcessor {
             if let Some(pending) = self.pending_turn.take() {
                 // An uncorrelated terminal before association cannot prove the
                 // pending input ran; its fate stays unknown.
-                self.settle_pending(pending, TurnOutcome::Unknown);
+                self.settle_pending(
+                    pending,
+                    TurnOutcome::Unknown(
+                        "Claude terminal record did not match the exact active turn".to_owned(),
+                    ),
+                );
             }
             return self
                 .record_gap("Claude terminal record did not match the exact active turn")
@@ -3172,16 +3191,21 @@ impl EventProcessor {
             self.status.failure = Some(error.message);
         }
         if !self.gap_reported && !self.writes_blocked {
-            if let Some(pending) = self.pending_turn.take() {
-                self.settle_pending(pending, TurnOutcome::Unknown);
-            }
             let reason = self
                 .pending_fault_gap
                 .take()
                 .unwrap_or_else(|| "Claude event stream closed outside a planned stop".to_owned());
+            if let Some(pending) = self.pending_turn.take() {
+                self.settle_pending(pending, TurnOutcome::Unknown(reason.clone()));
+            }
             let _ = self.record_gap(&reason).await;
         } else if let Some(pending) = self.pending_turn.take() {
-            self.settle_pending(pending, TurnOutcome::Unknown);
+            self.settle_pending(
+                pending,
+                TurnOutcome::Unknown(self.status.failure.clone().unwrap_or_else(|| {
+                    "Claude event source acknowledgement is unresolved".to_owned()
+                })),
+            );
         }
         // The CLI died with these asks open: latch every still-available
         // one unknown so later replies never attempt native I/O. The
@@ -3276,7 +3300,12 @@ impl EventProcessor {
             });
         }
         if let Some(pending) = self.pending_turn.take() {
-            self.settle_pending(pending, TurnOutcome::Unknown);
+            self.settle_pending(
+                pending,
+                TurnOutcome::Unknown(
+                    "Claude stopped before the input association was observed".to_owned(),
+                ),
+            );
         }
         // BeginStop already settled this; the take is a no-op then.
         self.fail_pending_steer(SteerOutcome::Rejected(
