@@ -23,31 +23,82 @@ limit = { max = 3, per = "agent", window = "1h" }
 
 Owner-only `script.list`, `script.read` and `script.save`
 ([`scripts/edit.rs`](../../crates/eliot-daemon/src/scripts/edit.rs)) edit existing script
-entries for owner screens. They cover only the roots Run resolves: the global
-`<data_dir>/scripts/` directory and each registered project's canonical `.eliot/scripts/`.
-An entry is addressed by its root (`project`, absent = global) and a relative path, and is
-checked with the same capture rules Run freezes with: no `..`, links, reparse points,
-devices or alternate streams, and a canonical regular file inside the root. Listing skips
-links and an interrupted save's temporaries.
+entries only under `<data_dir>/scripts/` and registered canonical checkouts'
+`.eliot/scripts/` directories. An entry is addressed by `project` (absent = global)
+and a relative `/`-separated path. Windows editing supports local drive volumes;
+UNC and mapped remote roots are refused (the network rename protocol cannot honor
+this RootDirectory contract). No `..`, links, reparse points, devices or alternate
+streams are allowed. Opened regular files must have exactly one hard link. Valid existing
+dotfiles can be edited; interrupted-save `.tmp` files are omitted from listing.
 
-`script.read` returns the UTF-8 text without a byte-order mark, the SHA-256 revision of the
-bytes and the canonical display path. The text is withheld with a reason when the entry is
-larger than 256 KiB, not UTF-8, contains NUL, or contains a value the daemon's secret
-policy knows.
+`script.list` takes an optional `cursor` and returns `roots` plus `next_cursor`.
+Continue until `next_cursor` is absent, including after an empty page (withheld root).
+Each RPC scans one root, at most 500 filesystem directory entries in total (directories,
+refused entries and temporaries count), to depth six. It stops immediately at the scan
+budget, sorts only that bounded selection and pages it within the encoded-byte budget
+in [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). A root can span
+several pages. `truncated` means the scan budget was reached; further entries may exist
+and require an external editor. Cursors are numeric root/entry positions, contain no
+names and are best-effort continuations, not snapshots. Directory/registration changes
+between pages can change the selection; refresh to restart. The desktop fetches all pages.
+Complete entries (project id, relative path, display path and returned fields) are checked
+against the current secret policy; unsafe entries/roots are withheld rather than redacted
+into an editable identity. A read with an unsafe response identity is `not_allowed`.
 
-`script.save` replaces an existing entry only. It never creates, renames or deletes files,
-and it never executes anything. It rejects:
+`script.read` opens through verified directory handles and reads at most the 256 KiB
+editor limit plus one byte from that same file handle. Oversized files are refused
+(`not_allowed`), without a full-file read or revision hash. Otherwise it returns the
+SHA-256 revision of the actual bytes and UTF-8 text without a byte-order mark. Non-UTF-8,
+NUL-containing or secret-bearing content is withheld with a reason. Secret checks inspect
+raw text and, when parseable as TOML or JSON, decoded keys and values as well. This does
+not interpret arbitrary programming languages. Read and save use the same content gate;
+a withheld entry cannot be overwritten through this editor. Save also checks the encoded
+BOM/line-ending-preserved bytes. Known secrets and redaction markers are never saved.
 
-- a different current revision (`conflict`), rechecked just before the rename;
-- NUL or the redaction marker (`invalid`);
-- a known secret (`not_allowed`).
+`script.save` never executes anything and never adds, renames or deletes a user entry.
+It replaces an existing entry after checking `expected_revision`, retaining its BOM and
+CRLF convention (mixed endings become CRLF). The daemon serializes saves with one mutex.
+It pins every directory component from the volume/filesystem root, creates and syncs a
+new temporary relative to the pinned parent, then reopens the target relative to that
+parent and rechecks file identity, link count and bytes immediately before replacement.
+On Windows, directory handles use open-reparse/backup semantics and relative opens use
+`NtCreateFile`, `OBJECT_ATTRIBUTES.RootDirectory` and `OBJ_DONT_REPARSE`. Directory delete
+sharing is denied while pinned; file reads deny write sharing. Replacement
+uses the native `NtSetInformationFile(FileRenameInformationEx)` form of
+`FileRenameInfoEx` with the parent `RootDirectory` (the Win32 wrapper rejected this
+relative form with error 87 on the qualification host); no path-based fallback is used.
+Global temporaries inherit the private data-directory boundary. On Unix, existing libc
+`openat(O_NOFOLLOW)` / `renameat` keep operations relative to retained file descriptors;
+temporaries have mode 0600 and the directory is synced after rename. Unix reopens the
+installed target after rename and verifies it against the temporary's inode and bytes;
+a mismatch or inability to verify is `unknown`. Failed Unix temporaries remain for
+explicit owner cleanup: pathname-based `unlinkat` could delete another writer's substitute.
 
-An entry the read withholds (oversized, binary, NUL or holding a known secret) is never replaced (`not_allowed`). The file's byte-order mark is kept, and a file that uses CRLF keeps CRLF (mixed endings become CRLF). The save writes a temporary file in
-the entry's directory and renames it over the entry; global entries stay private. A
-failure after the rename is `unknown`. A Run admitted before a save fails its digest check
-at dispatch (`source_integrity`) and never runs the new bytes. Running a script stays with
-the existing Owner Run path, `timer.run` of a timer whose `run` action names the entry.
-The Owner still cannot submit a standalone `run`.
+The conflict guarantee is daemon-save exclusion plus an immediate handle-based recheck,
+not atomic compare-and-swap against every external writer. Windows must permit target
+delete sharing for replacement; an external rename/removal can race the last check.
+Unix cannot exclude external writes, temporary-name substitution or directory moves
+with these APIs; post-rename verification detects a substituted source but cannot undo
+its effect. It is not a source-inode-bound atomic rename guarantee. Pinned handles
+prevent a junction/symlink swap from redirecting temporary creation or replacement to a
+newly substituted directory, but Unix may still operate on an approved directory moved
+by another process. Coordinate external editing with saves. Windows does not promise
+power-loss durability of the directory rename; Unix sync failure after replacement is
+`unknown`. No uncertain save is automatically retried.
+
+A Run admitted before a save fails its digest check at dispatch (`source_integrity`)
+instead of executing new bytes. Run remains the existing Owner `timer.run` path for a
+timer whose `run` action names the entry; there is no standalone Owner `run`.
+
+The desktop's Open in editor uses literal argv and an absolute existing `.exe` from the
+supported GUI-editor names in [`scripts.rs`](../../apps/swarm-desktop/src/scripts.rs)
+(Notepad, Notepad++, VS Code/Insiders, VSCodium, Sublime Text, gVim, Zed, Notepad4).
+A positive list prevents ordinary interpreter aliases from executing scripts through
+this action. It validates user intent, not the authenticity of a renamed executable.
+The child starts with `env_clear()` and restores only `SystemRoot`, `WINDIR`, `PATH`,
+`TEMP`, `TMP`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `HOMEDRIVE`, `HOMEPATH` when present.
+`COMSPEC`, provider credentials and Eliot credentials are not inherited. An existing
+editor process may retain the environment it was originally launched with.
 
 `rule.list` reads one namespace's stored rule states, timer states and canonical
 definitions for owner screens. No operation pauses, resumes, enables or disables a rule or

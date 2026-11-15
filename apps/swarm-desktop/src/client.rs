@@ -462,12 +462,30 @@ pub async fn list_rules(
 
 /// Existing script entries under the approved Run roots.
 pub async fn list_scripts(data_dir: &Path) -> Result<ScriptListResponse> {
-    let params = ScriptListRequest {};
-    params.validate()?;
-    let reply: ScriptListResponse =
-        eliot_daemon::client_call_typed(data_dir, "script.list", &params).await?;
-    params.validate_response(&reply)?;
-    Ok(reply)
+    let mut params = ScriptListRequest::default();
+    let mut roots: Vec<eliot_core::api::ScriptRootView> = Vec::new();
+    loop {
+        params.validate()?;
+        let reply: ScriptListResponse =
+            eliot_daemon::client_call_typed(data_dir, "script.list", &params).await?;
+        params.validate_response(&reply)?;
+        for root in reply.roots {
+            if let Some(existing) = roots.iter_mut().find(|r| r.project == root.project) {
+                existing.entries.extend(root.entries);
+                existing.truncated |= root.truncated;
+            } else {
+                roots.push(root);
+            }
+        }
+        match reply.next_cursor {
+            Some(next) => params.cursor = Some(next),
+            None => break,
+        }
+    }
+    Ok(ScriptListResponse {
+        roots,
+        next_cursor: None,
+    })
 }
 
 /// One script entry's text and revision.

@@ -2106,20 +2106,7 @@ impl Component for DesktopApp {
                     (Ok(editor), Some(path)) => {
                         // Literal argv, no shell and no file association; the
                         // editor gets no Eliot credentials from this window.
-                        let mut command = std::process::Command::new(&editor);
-                        command.arg(&path);
-                        for name in [
-                            "ELIOT_AGENT_ID",
-                            "ELIOT_AGENT_GENERATION",
-                            "ELIOT_AGENT_TOKEN",
-                            "ELIOT_RUN_COMMAND_ID",
-                            "ELIOT_RUN_TOKEN",
-                            "ELIOT_OWNER_ID",
-                            "ELIOT_OWNER_TOKEN",
-                            "ELIOT_OWNER_CREDENTIAL",
-                        ] {
-                            command.env_remove(name);
-                        }
+                        let mut command = scripts::editor_command(&editor, &path);
                         self.scripts.status = match command.spawn() {
                             Ok(child) => format!(
                                 "Opened {path} in {} (pid {}). Reload here after saving in the editor.",

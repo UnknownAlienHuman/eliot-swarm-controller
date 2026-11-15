@@ -15,8 +15,10 @@ use crate::{Error, Result};
 
 /// Largest script the editor reads or writes.
 pub const MAX_SCRIPT_EDIT_BYTES: usize = 256 * 1024;
-/// Entries listed per root at most.
+/// Filesystem entries scanned per root at most, including refused entries.
 pub const MAX_SCRIPT_ENTRIES: usize = 500;
+/// Encoded list page budget, leaving room for the RPC envelope.
+pub const MAX_SCRIPT_PAGE_BYTES: usize = 64 * 1024;
 /// Longest relative entry path.
 pub const MAX_SCRIPT_PATH_BYTES: usize = 1024;
 
@@ -34,7 +36,7 @@ fn validate_entry(project: &Option<String>, path: &str) -> Result<()> {
         || path.chars().any(char::is_control)
         || path
             .split(['/', '\\'])
-            .any(|part| part == ".." || part.is_empty());
+            .any(|part| matches!(part, "." | "..") || part.is_empty());
     if bad {
         return Err(Error::new(
             "invalid",
@@ -58,17 +60,58 @@ fn validate_revision(revision: &str) -> Result<()> {
     Ok(())
 }
 
-/// Request for `script.list`. Empty object.
+/// Request for `script.list`. Cursor positions are listing hints, not snapshots.
 #[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ScriptListRequest {}
+pub struct ScriptListRequest {
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
 
 impl ScriptListRequest {
+    pub fn position(&self) -> Result<(usize, usize)> {
+        let Some(cursor) = &self.cursor else {
+            return Ok((0, 0));
+        };
+        if cursor.len() > 32 {
+            return Err(Error::new("invalid", "script cursor is too long"));
+        }
+        let (root, entry) = cursor
+            .split_once(':')
+            .ok_or_else(|| Error::new("invalid", "invalid script cursor"))?;
+        let root = root
+            .parse::<usize>()
+            .map_err(|_| Error::new("invalid", "invalid script root cursor"))?;
+        let entry = entry
+            .parse::<usize>()
+            .map_err(|_| Error::new("invalid", "invalid script entry cursor"))?;
+        if entry > MAX_SCRIPT_ENTRIES || cursor != &format!("{root}:{entry}") {
+            return Err(Error::new("invalid", "invalid script cursor"));
+        }
+        Ok((root, entry))
+    }
+
     pub fn validate(&self) -> Result<()> {
-        Ok(())
+        self.position().map(|_| ())
     }
 
     pub fn validate_response(&self, reply: &ScriptListResponse) -> Result<()> {
+        if serde_json::to_vec(reply)
+            .map_err(|_| Error::new("invalid", "script page cannot be encoded"))?
+            .len()
+            > MAX_SCRIPT_PAGE_BYTES
+        {
+            return Err(Error::new("invalid", "script page exceeds byte budget"));
+        }
+        if let Some(next) = &reply.next_cursor {
+            let position = ScriptListRequest {
+                cursor: Some(next.clone()),
+            }
+            .position()?;
+            if position <= self.position()? {
+                return Err(Error::new("invalid", "script cursor did not advance"));
+            }
+        }
         for root in &reply.roots {
             if root.available == root.reason.is_some() {
                 return Err(Error::new(
@@ -108,7 +151,7 @@ pub struct ScriptRootView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub entries: Vec<ScriptEntryView>,
-    /// More entries exist than were listed.
+    /// The scan budget was reached; further entries may exist.
     pub truncated: bool,
 }
 
@@ -116,6 +159,8 @@ pub struct ScriptRootView {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptListResponse {
     pub roots: Vec<ScriptRootView>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 /// Request for `script.read`.
@@ -233,6 +278,39 @@ pub struct ScriptSaveResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_cursors_and_page_bytes_are_bounded_and_must_advance() {
+        let request = ScriptListRequest {
+            cursor: Some("3:2".into()),
+        };
+        assert_eq!(request.position().unwrap(), (3, 2));
+        for cursor in ["", "x", "03:0", "1:501", "-1:0", "1:0:0"] {
+            assert!(
+                ScriptListRequest {
+                    cursor: Some(cursor.into())
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        let mut reply = ScriptListResponse {
+            roots: Vec::new(),
+            next_cursor: Some("3:3".into()),
+        };
+        request.validate_response(&reply).unwrap();
+        reply.next_cursor = Some("3:2".into());
+        assert!(request.validate_response(&reply).is_err());
+        reply.next_cursor = None;
+        reply.roots.push(ScriptRootView {
+            project: None,
+            available: false,
+            reason: Some("x".repeat(MAX_SCRIPT_PAGE_BYTES)),
+            entries: Vec::new(),
+            truncated: false,
+        });
+        assert!(request.validate_response(&reply).is_err());
+    }
 
     #[test]
     fn entry_paths_stay_relative_and_inside() {

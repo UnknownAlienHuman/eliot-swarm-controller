@@ -114,9 +114,9 @@ pub use resolutions::{
 };
 pub use rules::{RuleCatchUpRequest, RuleLimit, RuleLimitScope};
 pub use script_edit::{
-    MAX_SCRIPT_EDIT_BYTES, MAX_SCRIPT_ENTRIES, MAX_SCRIPT_PATH_BYTES, ScriptEntryView,
-    ScriptListRequest, ScriptListResponse, ScriptReadRequest, ScriptReadResponse, ScriptRootView,
-    ScriptSaveRequest, ScriptSaveResponse,
+    MAX_SCRIPT_EDIT_BYTES, MAX_SCRIPT_ENTRIES, MAX_SCRIPT_PAGE_BYTES, MAX_SCRIPT_PATH_BYTES,
+    ScriptEntryView, ScriptListRequest, ScriptListResponse, ScriptReadRequest, ScriptReadResponse,
+    ScriptRootView, ScriptSaveRequest, ScriptSaveResponse,
 };
 pub use scripts::{
     FrozenScriptContext, FrozenScriptInterpreter, FrozenScriptRun, RunDefinitionArgs,

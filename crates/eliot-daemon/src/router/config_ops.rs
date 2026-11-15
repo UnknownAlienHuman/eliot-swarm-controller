@@ -103,20 +103,67 @@ impl Router {
     }
 
     /// Registered projects whose `.eliot/scripts/` roots scripts may live in.
-    async fn script_registrations(&self) -> Result<Vec<ProjectRegistrationView>> {
-        self.inner
-            .store
-            .lock()
-            .await
-            .list_project_registrations("owner", None, PAGE_MAX)
+    async fn script_registrations(
+        &self,
+        project: Option<&str>,
+    ) -> Result<Vec<ProjectRegistrationView>> {
+        match project {
+            Some(id) => Ok(self
+                .inner
+                .store
+                .lock()
+                .await
+                .get_project_registration("owner", id)?
+                .into_iter()
+                .collect()),
+            None => Ok(Vec::new()),
+        }
     }
 
     pub(super) async fn script_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
         let request: ScriptListRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
-        let registrations = self.script_registrations().await?;
-        let reply = crate::scripts::edit::list(&self.inner.data_root, &registrations);
+        let (root_index, _) = request.position()?;
+        let store = self.inner.store.lock().await;
+        // Keep root inventory bounded too: retain only one Store page while
+        // locating the numeric root. The cursor never carries a secret name.
+        let mut after = None;
+        let mut remaining = root_index.saturating_sub(1);
+        let (registration, more) = loop {
+            let page = store.list_project_registrations("owner", after.as_deref(), PAGE_MAX)?;
+            if root_index == 0 {
+                break (None, !page.is_empty());
+            }
+            if remaining < page.len() {
+                let selected = page[remaining].clone();
+                let more = remaining + 1 < page.len()
+                    || !store
+                        .list_project_registrations("owner", Some(&selected.id), 1)?
+                        .is_empty();
+                break (Some(selected), more);
+            }
+            if page.is_empty() {
+                return encode(
+                    &eliot_core::api::ScriptListResponse {
+                        roots: Vec::new(),
+                        next_cursor: None,
+                    },
+                    "script list",
+                );
+            }
+            remaining -= page.len();
+            after = page.last().map(|r| r.id.clone());
+        };
+        drop(store);
+        let policy = self.secret_policy_snapshot();
+        let reply = crate::scripts::edit::list(
+            &self.inner.data_root,
+            registration.as_ref(),
+            &request,
+            more,
+            &policy,
+        )?;
         request.validate_response(&reply)?;
         encode(&reply, "script list")
     }
@@ -125,7 +172,9 @@ impl Router {
         require_owner(principal)?;
         let request: ScriptReadRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
-        let registrations = self.script_registrations().await?;
+        let registrations = self
+            .script_registrations(request.project.as_deref())
+            .await?;
         let policy = self.secret_policy_snapshot();
         let reply =
             crate::scripts::edit::read(&self.inner.data_root, &registrations, &request, &policy)?;
@@ -137,7 +186,9 @@ impl Router {
         require_owner(principal)?;
         let request: ScriptSaveRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
-        let registrations = self.script_registrations().await?;
+        let registrations = self
+            .script_registrations(request.project.as_deref())
+            .await?;
         let policy = self.secret_policy_snapshot();
         let reply =
             crate::scripts::edit::save(&self.inner.data_root, &registrations, &request, &policy)?;

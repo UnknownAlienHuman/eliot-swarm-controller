@@ -75,7 +75,7 @@ fn row_view(row: &MonitorRow) -> View {
                 title,
                 small(row.operation()).opacity(theme::MUTED_OPACITY),
                 small(format!(
-                    "RSS {} · {} · {}",
+                    "RSS {} · {} · {} · {}",
                     bytes_label(row.obs.rss_bytes()),
                     cpu_time_label(row.obs.cpu_time_ns()),
                     row.obs.freshness(),
@@ -84,7 +84,6 @@ fn row_view(row: &MonitorRow) -> View {
                 .opacity(theme::MUTED_OPACITY),
             )),
         )
-
 }
 
 /// Native bar sparkline: one `Border` per point, unknown points drawn as a
