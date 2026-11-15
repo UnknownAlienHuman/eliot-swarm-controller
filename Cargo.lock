@@ -2274,7 +2274,10 @@ dependencies = [
  "tokio",
  "ulid",
  "url",
+ "windows-collections",
+ "windows-core 0.100.0",
  "windows-reactor",
+ "windows-reference",
  "windows-sys 0.61.2",
 ]
 

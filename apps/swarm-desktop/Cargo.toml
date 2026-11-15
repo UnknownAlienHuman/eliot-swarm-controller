@@ -41,6 +41,12 @@ url.workspace = true
 # the library is used directly. WinUI staging at runtime uses Reactor's own
 # bootstrap inside App::run; no self-contained exe is promised.
 windows-reactor = "=0.100.0"
+# The same windows-rs 0.100.0 crates Reactor depends on, for the four WinUI
+# calls Reactor does not expose: the application's theme dictionaries
+# (`app_resources`). No new crate versions enter the lockfile.
+windows-collections = { version = "=0.100.0", default-features = false, features = ["std"] }
+windows-core = { version = "=0.100.0", default-features = false }
+windows-reference = { version = "=0.100.0", default-features = false, features = ["std"] }
 # Clipboard (Reactor 0.100.0 has no clipboard API) and the High Contrast
 # check (Reactor reports Light/Dark only): the workspace pin.
 windows-sys = { workspace = true, features = [

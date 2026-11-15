@@ -483,6 +483,10 @@ impl Component for DesktopApp {
                 epoch: 0,
             },
         };
+        // Before the first controls exist (see `app_resources::install`).
+        if let Err(error) = crate::app_resources::install() {
+            app.status = format!("WinUI accent resources not applied: {error}");
+        }
         if let Ok(data_dir) = app.data_dir.clone() {
             let _task = context.spawn_background(move |_| {
                 Message::Shell(ShellMsg::ProjectsLoaded(load_projects_blocking(&data_dir)))

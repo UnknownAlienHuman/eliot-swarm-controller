@@ -11,6 +11,8 @@
 #[cfg(windows)]
 mod accessibility;
 #[cfg(windows)]
+mod app_resources;
+#[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
 mod config_view;

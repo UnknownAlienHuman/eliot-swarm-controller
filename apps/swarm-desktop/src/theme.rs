@@ -161,6 +161,11 @@ pub struct Scheme {
     pub warning: Rgb8,
     pub warning_container: Rgb8,
     pub on_warning_container: Rgb8,
+    /// The WinUI accent ramp (`SystemAccentColorDark3`…`Light3`) from the
+    /// primary tonal palette: tones 20, 30, 40, 60, 80, 90. WinUI fills with
+    /// Dark1 in Light theme and Light2 in Dark theme, which are exactly the
+    /// M3 primary of each scheme (tones 40 and 80).
+    pub accent_ramp: [Rgb8; 6],
 }
 
 impl Scheme {
@@ -213,6 +218,7 @@ impl Scheme {
             warning: c(warning.tone(accent)),
             warning_container: c(warning.tone(container)),
             on_warning_container: c(warning.tone(on_container)),
+            accent_ramp: [20, 30, 40, 60, 80, 90].map(|tone| c(s.primary_palette.tone(tone))),
         }
     }
 
