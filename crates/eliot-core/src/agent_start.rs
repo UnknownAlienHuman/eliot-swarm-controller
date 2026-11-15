@@ -29,6 +29,23 @@ pub struct AgentStartParams {
     pub resume_from: Option<Value>,
     #[serde(default)]
     pub initial: Option<Value>,
+    /// Effective model for a `resume` running under an inherited
+    /// `configure` overlay, resolved by the daemon from the resume
+    /// command's retained configuration revision. `None` on a fresh
+    /// launch or a resume without an overlay; the plugin then realigns
+    /// the retained native session to the frozen profile exactly as
+    /// before. Present only for harnesses with sticky native session
+    /// state (OpenCode, Antigravity); Codex/Muse apply overlays per turn
+    /// at send time and never read these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
+    /// Effective effort for such a resume, resolved like `model_override`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_override: Option<String>,
+    /// Configuration revision the resume runs under. Present exactly when
+    /// the overrides above apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_revision: Option<i64>,
 }
 
 impl AgentStartParams {
@@ -49,6 +66,9 @@ impl AgentStartParams {
             source_state: None,
             resume_from: None,
             initial: None,
+            model_override: None,
+            effort_override: None,
+            config_revision: None,
         }
     }
 }

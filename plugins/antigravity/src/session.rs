@@ -27,8 +27,9 @@ use crate::{
     hooks::{self, HookOutput, HookServer},
     host::TIMEOUT,
     native::{
-        AgyClient, AgyFrame, AgyProcess, FencedKind, InitializeResult, LoadSessionResult,
-        PreparedFencedCall, SessionResult, SetConfigOptionResult, StreamState, prompt_params,
+        AgyClient, AgyFrame, AgyProcess, ConfigOption, FencedKind, InitializeResult,
+        LoadSessionResult, PreparedFencedCall, SessionResult, SetConfigOptionResult, StreamState,
+        prompt_params,
     },
     profile::Plan,
 };
@@ -121,6 +122,22 @@ fn check_history<'a>(
     HistoryDecision::Advance
 }
 
+/// Advertised values for one config option id from a session open
+/// (`session/new` or `session/load`) result. Surprises decode as no
+/// values, so a required write rejects instead of guessing.
+fn advertised_option_values(options: Option<&Vec<ConfigOption>>, id: &str) -> Vec<String> {
+    options
+        .and_then(|options| options.iter().find(|option| option.id == id))
+        .map(|option| {
+            option
+                .option_values()
+                .into_iter()
+                .map(|(value, _)| value)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) struct Session {
     pub agent: String,
     pub generation: i64,
@@ -142,6 +159,19 @@ pub(crate) struct Session {
     steer_retained: Option<RetainedCommand>,
     steer_inflight: Option<i64>,
     stop: Option<(String, bool, Result<Value>)>,
+    /// Advertised `model` option values from the latest session open
+    /// (`session/new` or `session/load` result), refreshed on resume.
+    /// Required writes must name one of these; anything else rejects
+    /// before any native write.
+    advertised_models: Vec<String>,
+    /// Advertised `thought_level` option values, refreshed like the models.
+    advertised_levels: Vec<String>,
+    /// Tracked native selectors: the base model id and thought level this
+    /// session runs. Initialized from the effective start target (frozen
+    /// profile or inherited overlay) and advanced only by verified
+    /// configures, so an effort-only configure keeps the current base.
+    current_base: String,
+    current_level: Option<String>,
 }
 
 impl Session {
@@ -196,6 +226,10 @@ impl Session {
             plan.policy.clone(),
             String::new(),
         )));
+        // Tracked selectors start at the effective start target (frozen
+        // profile or inherited overlay); the advertised sets fill in once
+        // the session opens and refresh on every resume.
+        let (effective_base, effective_level) = plan.effective_target();
         Ok(Self {
             agent: params.agent_id.clone(),
             generation: params.generation,
@@ -217,6 +251,10 @@ impl Session {
             steer_retained: None,
             steer_inflight: None,
             stop: None,
+            advertised_models: Vec::new(),
+            advertised_levels: Vec::new(),
+            current_base: effective_base,
+            current_level: effective_level,
         })
     }
 
@@ -375,6 +413,11 @@ impl Session {
             })?
         };
         let mut effective = plan.check_session(&init, &session)?;
+        // Refresh the advertised sets from this open (fresh or resumed):
+        // every required write must name one of these values.
+        self.advertised_models = advertised_option_values(session.config_options.as_ref(), "model");
+        self.advertised_levels =
+            advertised_option_values(session.config_options.as_ref(), "thought_level");
         self.conversation = session.session_id.clone();
         {
             let mut state = self.state.lock().await;
@@ -382,32 +425,8 @@ impl Session {
         }
         // Verify each required config write by its echoed current value.
         for (config_id, value) in plan.config_writes() {
-            let echoed = self
-                .client
-                .call(
-                    "session/set_config_option",
-                    json!({"sessionId": self.conversation, "configId": config_id, "value": value}),
-                    deadline,
-                )
+            self.write_config_option(&config_id, &value, deadline)
                 .await?;
-            let echoed: SetConfigOptionResult = serde_json::from_value(echoed).map_err(|_| {
-                Error::new(
-                    "unknown",
-                    "Antigravity ACP set_config_option response did not match its envelope",
-                )
-            })?;
-            let verified = echoed
-                .config_options
-                .iter()
-                .find(|option| option.id == config_id)
-                .and_then(|option| option.current_value_str())
-                .is_some_and(|current| current == value);
-            if !verified {
-                return Err(Error::new(
-                    "unknown",
-                    "Antigravity ACP config write was not echoed by the server",
-                ));
-            }
         }
         // A requested session mode must be one the server actually
         // advertised for this session; anything else (including CLI
@@ -461,6 +480,7 @@ impl Session {
     pub async fn command(&mut self, params: AgentCommandParams) -> Result<Value> {
         match params.verb.as_str() {
             "send" => self.send(params).await,
+            "configure" => self.configure(params).await,
             "steer" => Err(Error::new(
                 "internal",
                 "Antigravity steer must use the deferred host response path",
@@ -468,9 +488,131 @@ impl Session {
             "interrupt" => self.interrupt(params).await,
             _ => Err(Error::new(
                 "unsupported",
-                "Antigravity supports send, steer and interrupt; inject/configure are unsupported",
+                "Antigravity supports send, configure, steer and interrupt; inject is unsupported",
             )),
         }
+    }
+
+    /// One verified `session/set_config_option` write: the echoed option
+    /// set must carry the written value back. A missing or mismatched echo
+    /// is unknown: the write may have applied.
+    async fn write_config_option(
+        &self,
+        config_id: &str,
+        value: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        let echoed = self
+            .client
+            .call(
+                "session/set_config_option",
+                json!({"sessionId": self.conversation, "configId": config_id, "value": value}),
+                deadline,
+            )
+            .await?;
+        let echoed: SetConfigOptionResult = serde_json::from_value(echoed).map_err(|_| {
+            Error::new(
+                "unknown",
+                "Antigravity ACP set_config_option response did not match its envelope",
+            )
+        })?;
+        let verified = echoed
+            .config_options
+            .iter()
+            .find(|option| option.id == config_id)
+            .and_then(|option| option.current_value_str())
+            .is_some_and(|current| current == value);
+        if !verified {
+            return Err(Error::new(
+                "unknown",
+                "Antigravity ACP config write was not echoed by the server",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Native `configure`: switch the live session's `model` and
+    /// `thought_level` selectors through `session/set_config_option` and
+    /// prove each write with its echoed current value. A requested value
+    /// the session did not advertise rejects before any write, never
+    /// guessing; anything ambiguous after a write is unknown, and nothing
+    /// is stored by this layer (the Router stores the overlay only after
+    /// this proof). Always writes the resolved selectors, so a retried
+    /// configure after an uncertain outcome is idempotent.
+    pub async fn configure(&mut self, params: AgentCommandParams) -> Result<Value> {
+        if params.turn_id.is_some() || params.request_id.is_some() {
+            return Err(Error::new(
+                "invalid",
+                "Antigravity configure targets the session, without a turn or request target",
+            ));
+        }
+        if self.native.transport.process_exit_observed() {
+            return Err(Error::new(
+                "unknown",
+                "Antigravity process exited; the configuration was not dispatched",
+            ));
+        }
+        if !self.ready {
+            return Err(Error::new(
+                "unknown",
+                "Antigravity session readiness is unresolved",
+            ));
+        }
+        // Pre-write validation failures reject with proof of no effect
+        // (the resolver is pure and nothing has been written yet), so the
+        // settings lane stays free. Only an ambiguous outcome at or after
+        // the first write is unknown.
+        let target = match crate::profile::resolve_configure_target(
+            &params.args,
+            &self.current_base,
+            self.current_level.as_deref(),
+        ) {
+            Ok(target) => target,
+            Err(error) if matches!(error.code.as_str(), "invalid" | "unsupported") => {
+                return Ok(json!({
+                    "state": "rejected",
+                    "reason": error.message,
+                }));
+            }
+            Err(error) => return Err(error),
+        };
+        if !self
+            .advertised_models
+            .iter()
+            .any(|model| model == &target.base)
+        {
+            return Ok(json!({
+                "state": "rejected",
+                "reason": format!("Antigravity model {} is not advertised by the ACP session", target.base),
+            }));
+        }
+        if target.level.as_deref().is_some_and(|level| {
+            !self
+                .advertised_levels
+                .iter()
+                .any(|advertised| advertised == level)
+        }) {
+            return Ok(json!({
+                "state": "rejected",
+                "reason": "Antigravity thought level is not advertised by the ACP session",
+            }));
+        }
+        let deadline = Instant::now() + TIMEOUT;
+        self.write_config_option("model", &target.base, deadline)
+            .await?;
+        if let Some(level) = target.level.as_deref() {
+            self.write_config_option("thought_level", level, deadline)
+                .await?;
+        }
+        self.current_base = target.base.clone();
+        self.current_level = target.level.clone();
+        Ok(json!({
+            "state": "applied",
+            "model": target.effective_model,
+            "effort": target.level.clone(),
+            "model_verified": true,
+            "effort_verified": target.level.is_some(),
+        }))
     }
 
     pub async fn send(&mut self, params: AgentCommandParams) -> Result<Value> {

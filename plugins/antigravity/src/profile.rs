@@ -23,6 +23,12 @@ pub(crate) struct Plan {
     pub launch: NativeLaunch,
     pub policy: SecretPolicy,
     pub model: String,
+    /// Native realignment target: the inherited overlay's effective base
+    /// model and thought level on a resume that carries them, else the
+    /// frozen profile translation. `requested()` stays frozen; these drive
+    /// the ACP writes, the readback, and the Session's tracked selectors.
+    effective_base: String,
+    effective_level: Option<String>,
     pub scope: String,
     pub resume: Option<String>,
     pub hook_discovery: PathBuf,
@@ -299,6 +305,43 @@ impl Plan {
             resume.as_deref(),
             hook_discovery_dir,
         );
+        // The native realignment target: the inherited overlay's effective
+        // values on a resume that carries them (the retained session
+        // already runs them), else the frozen profile translation. A
+        // carried effort names a thought level it must spell exactly;
+        // retained data that does not is corruption, never guessed.
+        let (effective_base, effective_level) =
+            if params.model_override.is_none() && params.effort_override.is_none() {
+                translate_model(&model)
+            } else {
+                let base = params
+                    .model_override
+                    .as_deref()
+                    .map(|model| translate_model(model).0)
+                    .unwrap_or_else(|| translate_model(&model).0);
+                let level = params.effort_override.clone().or_else(|| {
+                    params
+                        .model_override
+                        .as_deref()
+                        .and_then(|model| translate_model(model).1)
+                });
+                if level
+                    .as_deref()
+                    .is_some_and(|level| !matches!(level, "low" | "medium" | "high" | "xhigh"))
+                {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "Antigravity retained configure effort is not a thought level",
+                    ));
+                }
+                if base.trim().is_empty() {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "Antigravity retained configure model is empty",
+                    ));
+                }
+                (base, level)
+            };
         Ok(Self {
             launch: NativeLaunch {
                 program: program.into(),
@@ -308,6 +351,8 @@ impl Plan {
             },
             policy: SecretPolicy::new(secrets),
             model,
+            effective_base,
+            effective_level,
             scope,
             resume,
             hook_discovery: hook_discovery_dir.to_owned(),
@@ -384,7 +429,11 @@ impl Plan {
                 ));
             }
         }
-        let (base_model, thought_level) = translate_model(&self.model);
+        // The reported effective selectors are the realignment target
+        // (overlay or frozen); `requested_model` stays the frozen profile
+        // id so the original request is never rewritten.
+        let base_model = self.effective_base.clone();
+        let thought_level = self.effective_level.clone();
         // ACP exposes no MCP inventory on any checked surface (the
         // `session/new` / `session/load` results and `session/update`
         // stream carry no server list), so the effective server set stays
@@ -406,15 +455,22 @@ impl Plan {
     }
 
     /// The `session/set_config_option` pairs this plan requires, in wire
-    /// order: base model first, then thought level when the requested model
-    /// carried an effort suffix.
+    /// order: base model first, then thought level when the realignment
+    /// target carries one (an explicit effort, a model suffix, or the
+    /// inherited overlay level).
     pub fn config_writes(&self) -> Vec<(String, String)> {
-        let (base_model, thought_level) = translate_model(&self.model);
-        let mut writes = vec![("model".to_owned(), base_model)];
-        if let Some(level) = thought_level {
+        let mut writes = vec![("model".to_owned(), self.effective_base.clone())];
+        if let Some(level) = self.effective_level.clone() {
             writes.push(("thought_level".to_owned(), level));
         }
         writes
+    }
+
+    /// The native realignment target: the inherited overlay's effective
+    /// base model and thought level on a resume that carries them, else
+    /// the frozen profile translation.
+    pub fn effective_target(&self) -> (String, Option<String>) {
+        (self.effective_base.clone(), self.effective_level.clone())
     }
 
     pub fn resume(&self) -> Option<&str> {
@@ -491,6 +547,104 @@ fn config_scope(environment: &[(OsString, OsString)]) -> Result<String> {
     serde_json::to_string(&paths)
         .map(|paths| format!("antigravity-config:{paths}"))
         .map_err(|_| Error::new("internal", "Could not encode Antigravity config namespace"))
+}
+
+/// A resolved `configure` target: the effective native selectors the
+/// session must prove (the explicit `--effort` wins over a model suffix;
+/// either falls back to the tracked session level, and the base falls
+/// back to the tracked session base for an effort-only change). The
+/// effective model id recombines base and level so the overlay vocabulary
+/// matches the frozen profile ids. The verbatim request stays in the
+/// retained command args; the Router records it from there.
+#[derive(Debug)]
+pub(crate) struct ConfigureTarget {
+    pub base: String,
+    pub level: Option<String>,
+    pub effective_model: String,
+}
+
+/// Resolve one `configure` request against the session's tracked
+/// selectors. Pure and natively ignorant: the caller proves the resolved
+/// values against the advertised options, writes them, and verifies the
+/// echo before the Router stores anything.
+pub(crate) fn resolve_configure_target(
+    args: &Value,
+    current_base: &str,
+    current_level: Option<&str>,
+) -> Result<ConfigureTarget> {
+    let args = args.as_object().ok_or_else(|| {
+        Error::new(
+            "invalid",
+            "Antigravity configure args must be a JSON object",
+        )
+    })?;
+    for key in args.keys() {
+        if !matches!(key.as_str(), "model" | "effort") {
+            return Err(Error::new(
+                "unsupported",
+                format!("configure does not support {key}"),
+            ));
+        }
+    }
+    let requested_model = match args.get("model") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(model)) if !model.trim().is_empty() => Some(model.clone()),
+        _ => {
+            return Err(Error::new(
+                "invalid",
+                "Antigravity configure requires a non-empty model",
+            ));
+        }
+    };
+    let requested_effort = match args.get("effort") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(effort))
+            if matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh") =>
+        {
+            Some(effort.clone())
+        }
+        Some(Value::String(_)) => {
+            return Err(Error::new(
+                "invalid",
+                "Antigravity configure effort must be low, medium, high, or xhigh",
+            ));
+        }
+        _ => {
+            return Err(Error::new(
+                "invalid",
+                "Antigravity configure effort must be a string",
+            ));
+        }
+    };
+    if requested_model.is_none() && requested_effort.is_none() {
+        return Err(Error::new(
+            "invalid",
+            "Antigravity configure requires model and/or effort",
+        ));
+    }
+    let (base, suffix_level) = match requested_model.as_deref() {
+        Some(model) => translate_model(model),
+        None => (current_base.to_owned(), None),
+    };
+    if base.trim().is_empty() {
+        return Err(Error::new(
+            "invalid",
+            "Antigravity configure requires a non-empty model",
+        ));
+    }
+    let level = requested_effort
+        .clone()
+        .or(suffix_level)
+        .or_else(|| current_level.map(ToOwned::to_owned));
+    let effective_model = match level.as_deref() {
+        Some(level) => format!("{base}-{level}"),
+        None => base.clone(),
+    };
+    Ok(ConfigureTarget {
+        base,
+        level,
+        effective_model,
+    })
 }
 
 /// Translate a requested CLI model id into the ACP session vocabulary.
@@ -640,6 +794,74 @@ mod tests {
             "xhigh",
         ] {
             assert_eq!(translate_model(model), (model.to_owned(), None), "{model}");
+        }
+    }
+
+    #[test]
+    fn configure_target_prefers_explicit_effort_over_model_suffix() {
+        // `--model X-low` carries its level; `--effort` wins over the
+        // suffix; an effort-only change keeps the tracked base.
+        let target = resolve_configure_target(
+            &json!({"model": "gemini-4-hydrogen-low"}),
+            "gemini-4-argon",
+            Some("low"),
+        )
+        .unwrap();
+        assert_eq!(target.base, "gemini-4-hydrogen");
+        assert_eq!(target.level.as_deref(), Some("low"));
+        assert_eq!(target.effective_model, "gemini-4-hydrogen-low");
+
+        let target = resolve_configure_target(
+            &json!({"model": "gemini-4-hydrogen-low", "effort": "high"}),
+            "gemini-4-argon",
+            Some("low"),
+        )
+        .unwrap();
+        assert_eq!(target.base, "gemini-4-hydrogen");
+        assert_eq!(target.level.as_deref(), Some("high"));
+        assert_eq!(target.effective_model, "gemini-4-hydrogen-high");
+
+        let target =
+            resolve_configure_target(&json!({"effort": "high"}), "gemini-4-hydrogen", Some("low"))
+                .unwrap();
+        assert_eq!(target.base, "gemini-4-hydrogen");
+        assert_eq!(target.level.as_deref(), Some("high"));
+        assert_eq!(target.effective_model, "gemini-4-hydrogen-high");
+
+        // A suffix-less model keeps the tracked level; a suffix-less
+        // session leaves the level absent.
+        let target = resolve_configure_target(
+            &json!({"model": "gemini-4-hydrogen"}),
+            "gemini-4-argon",
+            Some("low"),
+        )
+        .unwrap();
+        assert_eq!(target.level.as_deref(), Some("low"));
+        assert_eq!(target.effective_model, "gemini-4-hydrogen-low");
+        let target = resolve_configure_target(
+            &json!({"model": "gemini-4-hydrogen"}),
+            "gemini-4-argon",
+            None,
+        )
+        .unwrap();
+        assert_eq!(target.level, None);
+        assert_eq!(target.effective_model, "gemini-4-hydrogen");
+
+        // Malformed and unknown fields refuse honestly.
+        for (args, code) in [
+            (json!({}), "invalid"),
+            (json!({"model": null, "effort": null}), "invalid"),
+            (json!({"model": ""}), "invalid"),
+            (json!({"model": 1}), "invalid"),
+            (json!({"effort": "ultra"}), "invalid"),
+            (json!({"effort": 1}), "invalid"),
+            (
+                json!({"model": "gemini-4-hydrogen", "bogus": 1}),
+                "unsupported",
+            ),
+        ] {
+            let error = resolve_configure_target(&args, "gemini-4-argon", Some("low")).unwrap_err();
+            assert_eq!(error.code, code, "configure args must be refused honestly");
         }
     }
 

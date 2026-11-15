@@ -662,7 +662,8 @@ impl Router {
             }
             "stop" => self.execute_stop_command(&id, &agent, dispatched).await,
             "configure" => {
-                self.execute_configure_command(&id, &agent).await;
+                self.execute_configure_command(&id, &agent, dispatched, Some(dispatch_seq))
+                    .await;
                 true
             }
             "detach" => {
@@ -1207,11 +1208,28 @@ impl Router {
 
     /// Apply a dispatched `configure`: store the model/effort overlay, then
     /// settle applied with the requested and effective values, the assigned
-    /// revision and the application point. No native I/O runs here; the
-    /// next send carries the effective values in its native turn request.
-    /// Settlement happens only after the Store commit, so an applied
-    /// configure always has a retained row to read back.
-    async fn execute_configure_command(&self, id: &str, agent: &Agent) {
+    /// revision and the application point. Codex and Muse stay Store-only
+    /// here (no native I/O runs; the next send carries the effective
+    /// values in its native turn request). OpenCode and Antigravity first
+    /// switch the live native session through the owned plugin and prove
+    /// the switch with the native echo or `GET` before the Router stores
+    /// anything: the outcome carries the native `model_verified` (and
+    /// Antigravity `effort_verified`) flags, set only from that proof, and
+    /// an unverified or refused switch never stores an overlay. Settlement
+    /// happens only after the Store commit, so an applied configure always
+    /// has a retained row to read back.
+    async fn execute_configure_command(
+        &self,
+        id: &str,
+        agent: &Agent,
+        dispatched: Command,
+        dispatch_seq: Option<i64>,
+    ) {
+        if matches!(agent.harness.as_str(), "opencode" | "antigravity") {
+            self.execute_native_configure_command(id, agent, dispatched, dispatch_seq)
+                .await;
+            return;
+        }
         let outcome = {
             let mut store = self.inner.store.lock().await;
             store.apply_agent_config(id, now_ms())
@@ -1232,6 +1250,124 @@ impl Router {
                     "application": config.application,
                     "harness": agent.harness,
                 });
+                let _ = self.settle(id, CommandState::Applied, Some(outcome)).await;
+            }
+            Err(error) => {
+                let _ = self
+                    .settle(
+                        id,
+                        CommandState::Rejected,
+                        Some(json!({"reason": error.code})),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    /// Apply a dispatched `configure` on a sticky-session harness: switch
+    /// the live native session through the owned plugin, prove the switch
+    /// with the native echo or `GET`, then store the verified overlay and
+    /// settle applied with the native verification flags. A refused switch
+    /// settles the plugin's verdict and stores nothing; an ambiguous or
+    /// unproven outcome settles unknown and stores nothing, so no
+    /// unverified application is ever claimed or retained.
+    async fn execute_native_configure_command(
+        &self,
+        id: &str,
+        agent: &Agent,
+        dispatched: Command,
+        dispatch_seq: Option<i64>,
+    ) {
+        let response = self
+            .inner
+            .plugin_host
+            .command(agent, dispatched, dispatch_seq)
+            .await;
+        let proven = match response {
+            Ok(value) => match value.get("state").and_then(Value::as_str) {
+                Some("applied") => Some(value),
+                Some("rejected") | Some("failed") => {
+                    let mut value = value;
+                    self.redact_native_value(&mut value);
+                    let state = if value.get("state").and_then(Value::as_str) == Some("failed") {
+                        CommandState::Failed
+                    } else {
+                        CommandState::Rejected
+                    };
+                    let _ = self.settle(id, state, Some(value)).await;
+                    return;
+                }
+                Some("unknown") => {
+                    let mut value = value;
+                    if let Some(cause) = self
+                        .inner
+                        .plugin_host
+                        .take_late_batch_cause(&agent.id, agent.generation)
+                    {
+                        value["cause"] = Value::String(cause);
+                    }
+                    self.redact_native_value(&mut value);
+                    let _ = self.settle(id, CommandState::Unknown, Some(value)).await;
+                    return;
+                }
+                _ => None,
+            },
+            Err(error) => {
+                self.settle_plugin_error(id, &error).await;
+                return;
+            }
+        };
+        let Some(proven) = proven else {
+            self.settle_plugin_error(
+                id,
+                &Error::new(
+                    "unknown",
+                    "plugin configure response omitted its command outcome",
+                ),
+            )
+            .await;
+            return;
+        };
+        let native_model = proven
+            .get("model")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let native_effort = proven
+            .get("effort")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let model_verified = proven
+            .get("model_verified")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let effort_verified = proven
+            .get("effort_verified")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let outcome = {
+            let mut store = self.inner.store.lock().await;
+            store.apply_agent_config_native(id, now_ms(), native_model, native_effort)
+        };
+        match outcome {
+            Ok(config) => {
+                let mut outcome = json!({
+                    "state": "applied",
+                    "requested": {
+                        "model": config.requested_model,
+                        "effort": config.requested_effort,
+                    },
+                    "effective": {
+                        "model": config.model,
+                        "effort": config.effort,
+                    },
+                    "config_revision": config.revision,
+                    "application": config.application,
+                    "harness": agent.harness,
+                    "model_verified": model_verified,
+                });
+                if agent.harness == "antigravity" {
+                    outcome["effort_verified"] = json!(effort_verified);
+                }
                 let _ = self.settle(id, CommandState::Applied, Some(outcome)).await;
             }
             Err(error) => {

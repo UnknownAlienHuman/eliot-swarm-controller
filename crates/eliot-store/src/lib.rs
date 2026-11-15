@@ -4906,12 +4906,41 @@ impl Store {
     /// the Router cannot settle the command `rejected` past the fault.
     pub fn apply_agent_config(&mut self, command_id: &str, now: i64) -> Result<AgentConfig> {
         self.ensure_writer_healthy()?;
-        let result = self.apply_agent_config_inner(command_id, now);
+        let result = self.apply_agent_config_inner(command_id, now, None);
         self.fault_on_persistence_error(&result);
         result
     }
 
-    fn apply_agent_config_inner(&mut self, command_id: &str, now: i64) -> Result<AgentConfig> {
+    /// Commit one dispatched `configure` command's overlay with natively
+    /// verified effective values (OpenCode/Antigravity): the plugin proved
+    /// these against the native echo or `GET` before the Router stored
+    /// anything. `requested` still records exactly what the owner asked
+    /// (re-resolved from the retained args); each `Some` native value
+    /// replaces the resolved fill, while `None` keeps it (a native knob
+    /// the harness does not have, such as OpenCode effort). A requested
+    /// field without a proven native value stores nothing and reports
+    /// `source_integrity`: the Router must only call this after verified
+    /// plugin proof, never to paper over an unverified application.
+    pub fn apply_agent_config_native(
+        &mut self,
+        command_id: &str,
+        now: i64,
+        native_model: Option<String>,
+        native_effort: Option<String>,
+    ) -> Result<AgentConfig> {
+        self.ensure_writer_healthy()?;
+        let result =
+            self.apply_agent_config_inner(command_id, now, Some((native_model, native_effort)));
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn apply_agent_config_inner(
+        &mut self,
+        command_id: &str,
+        now: i64,
+        native: Option<(Option<String>, Option<String>)>,
+    ) -> Result<AgentConfig> {
         self.ensure_writer_healthy()?;
         let tx = self
             .connection
@@ -4987,11 +5016,59 @@ impl Store {
                 "configure requires a live Agent generation with a native session",
             ));
         }
-        let (requested, effective, application) = admission::resolve_configure(
+        let (requested, resolved_effective, application) = admission::resolve_configure(
             &record.command.args,
             &agent.harness,
             &agent.profile_snapshot,
         )?;
+        // A native proof replaces the resolved fill exactly where the
+        // harness proved it; anything else keeps the resolved value (an
+        // unrequested field, or a knob the harness does not have, such as
+        // OpenCode effort). A requested field without proof stores nothing.
+        let effective = match native {
+            None => resolved_effective,
+            Some((native_model, native_effort)) => {
+                if requested.get("model").and_then(Value::as_str).is_some()
+                    && native_model.is_none()
+                {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "configure stored no proven native model for its requested model",
+                    ));
+                }
+                if requested.get("effort").and_then(Value::as_str).is_some()
+                    && native_effort.is_none()
+                {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "configure stored no proven native effort for its requested effort",
+                    ));
+                }
+                let model = admission::check_native_effective(
+                    native_model,
+                    "model",
+                    admission::MAX_CONFIGURE_MODEL_LEN,
+                )?
+                .or_else(|| {
+                    resolved_effective
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                });
+                let effort = admission::check_native_effective(
+                    native_effort,
+                    "effort",
+                    admission::MAX_CONFIGURE_EFFORT_LEN,
+                )?
+                .or_else(|| {
+                    resolved_effective
+                        .get("effort")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                });
+                json!({"model": model, "effort": effort})
+            }
+        };
         let revision = current_config_revision_tx(&tx, agent_num, generation)? + 1;
         let requested_json = encode_json(&requested)?;
         let effective_json = encode_json(&effective)?;

@@ -1438,6 +1438,15 @@ async fn run_agent_inner(
             return;
         }
     };
+    // A resume that inherited a `configure` overlay carries its effective
+    // values as the native realignment target: the retained session
+    // already runs them, so the plugin must prove them instead of
+    // reverting to the frozen snapshot.
+    let resume_config = resolve_resume_config(&actor).await;
+    let (model_override, effort_override, config_revision) = match resume_config {
+        Some((model, effort, revision)) => (model, effort, Some(revision)),
+        None => (None, None, None),
+    };
     let start_params = AgentStartParams {
         agent_id: actor.agent.id.clone(),
         generation: actor.agent.generation,
@@ -1450,6 +1459,9 @@ async fn run_agent_inner(
         source_state: actor.source_state.clone(),
         resume_from: actor.resume_from.clone(),
         initial: None,
+        model_override,
+        effort_override,
+        config_revision,
     };
     let start = match serde_json::to_value(start_params) {
         // PluginClient validates the exact completed RPC frame, including its
@@ -2820,6 +2832,12 @@ fn plugin_command_args(command: &Command) -> Result<Value> {
         "send" => {
             args.remove("notice_kind");
         }
+        "configure" => {
+            // The model/effort overlay rides to the plugin verbatim: the
+            // plugin performs the harness-native switch (OpenCode,
+            // Antigravity) and proves it before the Router stores anything.
+            // A configure carries no turn or request binding.
+        }
         "steer" | "interrupt" => {
             command.turn_id.as_ref().ok_or_else(|| {
                 Error::new("stale_generation", "turn control has no captured turn id")
@@ -2886,6 +2904,33 @@ async fn resolve_send_config(
     store.send_effective_config(&command.id)
 }
 
+/// Effective model/effort overrides for a `resume` running under an
+/// inherited `configure` overlay on a sticky-session harness (OpenCode,
+/// Antigravity): the retained native session already runs the overlay's
+/// effective values, so the plugin must realign to them instead of
+/// reverting to the frozen snapshot. `None` on launch, on resumes without
+/// an overlay, and on harnesses that apply overlays per turn at send
+/// time (Codex, Muse); a resolution failure also yields `None`, and the
+/// plugin then keeps the frozen behavior with the readback deciding.
+async fn resolve_resume_config(
+    actor: &AgentActorConfig,
+) -> Option<(Option<String>, Option<String>, i64)> {
+    if actor.start_command.verb != "resume"
+        || !matches!(actor.agent.harness.as_str(), "opencode" | "antigravity")
+    {
+        return None;
+    }
+    let state = actor.state.upgrade()?;
+    let store = state.store.lock().await;
+    let config = store
+        .command_effective_config(
+            &actor.start_command.id,
+            &["launch", "resume", "send", "configure"],
+        )
+        .ok()??;
+    Some((config.model.clone(), config.effort.clone(), config.revision))
+}
+
 /// Build the `agent.command` wire params for one dispatched command, relaying
 /// Store-committed FIFO `next_input` items as top-level `context` (omitted
 /// when empty). The reserved `context_items` member is stripped so `args`
@@ -2935,11 +2980,43 @@ fn agent_command_params(
 fn validate_agent_command_result(value: Value, verb: &str) -> Result<Value> {
     match value.get("state").and_then(Value::as_str) {
         Some("applied") if verb == "send" => validate_send_result(value),
+        Some("applied") if verb == "configure" => validate_configure_result(value),
         Some("applied" | "rejected" | "failed" | "unknown") => Ok(value),
         _ => Err(Error::new(
             "unknown",
             "plugin command response omitted its command outcome",
         )),
+    }
+}
+
+/// An applied native `configure` proves what it switched: the effective
+/// model (always, for both switching harnesses) and the effective effort
+/// where the harness has that knob (Antigravity `thought_level`), each
+/// with its native-echo/GET verification flag. Anything less is not an
+/// application and must not reach the Store.
+fn validate_configure_result(value: Value) -> Result<Value> {
+    let model = value.get("model").and_then(Value::as_str);
+    let model_verified = value.get("model_verified").and_then(Value::as_bool);
+    let effort_verified = value
+        .get("effort_verified")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let proven = model.is_some_and(|model| !model.trim().is_empty())
+        && model_verified == Some(true)
+        && value.get("effort").is_none_or(|effort| {
+            effort.is_null()
+                || effort
+                    .as_str()
+                    .is_some_and(|effort| !effort.trim().is_empty())
+        })
+        && (value.get("effort").and_then(Value::as_str).is_none() || effort_verified);
+    if proven {
+        Ok(value)
+    } else {
+        Err(Error::new(
+            "unknown",
+            "plugin configure response omitted its verified native proof",
+        ))
     }
 }
 
@@ -3080,6 +3157,7 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         "inject",
         "attach",
         "detach",
+        "configure",
     ];
     if verbs.len() != manifest.verbs.len()
         || verbs.len() < 3
@@ -5910,6 +5988,75 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&data_root);
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn validate_configure_result_requires_verified_native_proof() {
+        // OpenCode shape: model plus its GET proof, no effort knob.
+        assert!(
+            validate_configure_result(json!({
+                "state": "applied",
+                "model": "p/m1",
+                "model_verified": true,
+            }))
+            .is_ok()
+        );
+        // Antigravity shape: recombined model plus thought level, both proven.
+        assert!(
+            validate_configure_result(json!({
+                "state": "applied",
+                "model": "base-high",
+                "effort": "high",
+                "model_verified": true,
+                "effort_verified": true,
+            }))
+            .is_ok()
+        );
+        // Antigravity without a level: unverified effort is honest.
+        assert!(
+            validate_configure_result(json!({
+                "state": "applied",
+                "model": "base",
+                "model_verified": true,
+                "effort_verified": false,
+            }))
+            .is_ok()
+        );
+        // A claimed effort without its proof, a missing model, or an
+        // unverified model is not an application.
+        assert!(
+            validate_configure_result(json!({
+                "state": "applied",
+                "model": "base-high",
+                "effort": "high",
+                "model_verified": true,
+                "effort_verified": false,
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_configure_result(json!({
+                "state": "applied",
+                "model_verified": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_configure_result(json!({
+                "state": "applied",
+                "model": "p/m1",
+                "model_verified": false,
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_configure_result(json!({
+                "state": "applied",
+                "model": "   ",
+                "model_verified": true,
+            }))
+            .is_err()
+        );
     }
 
     #[test]

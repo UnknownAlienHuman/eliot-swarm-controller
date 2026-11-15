@@ -12734,6 +12734,117 @@ fn configure_applies_overlay_and_stamps_monotonic_revisions() {
 }
 
 #[test]
+fn configure_native_effective_stores_verified_proof() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+
+    // OpenCode: the native model proof replaces the resolved fill, while
+    // the unrequested effort keeps the snapshot fill (no native knob).
+    let opencode = ready_configure_agent(
+        &mut store,
+        "configure-native-opencode",
+        "opencode",
+        json!({"model": "p/m0"}),
+        now,
+    );
+    let first = configure_request(&opencode, 1, json!({"model": "p/m1"}));
+    let first_id = first.id.clone();
+    store
+        .submit("owner", first, now + 1)
+        .expect("admit configure");
+    store
+        .dispatch(&first_id, now + 2)
+        .expect("dispatch configure");
+    let applied = store
+        .apply_agent_config_native(&first_id, now + 3, Some("p/m1".to_owned()), None)
+        .expect("apply verified configure");
+    assert_eq!(applied.revision, 1);
+    assert_eq!(applied.requested_model.as_deref(), Some("p/m1"));
+    assert_eq!(applied.requested_effort, None);
+    assert_eq!(applied.model.as_deref(), Some("p/m1"));
+    assert_eq!(applied.effort, None, "no native knob keeps no effort");
+    assert_eq!(applied.application, "next_turn");
+    assert_eq!(applied.provenance, "configure");
+    store
+        .settle(&first_id, CommandState::Applied, None, now + 4)
+        .expect("settle configure");
+
+    // Antigravity: requested stays verbatim while the native proof carries
+    // the recombined effective id and the explicit level.
+    let antigravity = ready_configure_agent(
+        &mut store,
+        "configure-native-antigravity",
+        "antigravity",
+        json!({"model": "base-low"}),
+        now + 10,
+    );
+    let second = configure_request(
+        &antigravity,
+        1,
+        json!({"model": "base2-low", "effort": "high"}),
+    );
+    let second_id = second.id.clone();
+    store
+        .submit("owner", second, now + 11)
+        .expect("admit configure");
+    store
+        .dispatch(&second_id, now + 12)
+        .expect("dispatch configure");
+    let applied = store
+        .apply_agent_config_native(
+            &second_id,
+            now + 13,
+            Some("base2-high".to_owned()),
+            Some("high".to_owned()),
+        )
+        .expect("apply verified configure");
+    assert_eq!(applied.revision, 1);
+    assert_eq!(applied.requested_model.as_deref(), Some("base2-low"));
+    assert_eq!(applied.requested_effort.as_deref(), Some("high"));
+    assert_eq!(applied.model.as_deref(), Some("base2-high"));
+    assert_eq!(applied.effort.as_deref(), Some("high"));
+    store
+        .settle(&second_id, CommandState::Applied, None, now + 14)
+        .expect("settle configure");
+
+    // A requested field without proven native proof stores nothing, and a
+    // malformed native value is refused at the trust boundary.
+    let missing = configure_request(&opencode, 1, json!({"model": "p/m2"}));
+    let missing_id = missing.id.clone();
+    store
+        .submit("owner", missing, now + 20)
+        .expect("admit configure");
+    store
+        .dispatch(&missing_id, now + 21)
+        .expect("dispatch configure");
+    assert_eq!(
+        store
+            .apply_agent_config_native(&missing_id, now + 22, None, None)
+            .unwrap_err()
+            .code,
+        "source_integrity",
+        "requested model without proof stores nothing"
+    );
+    assert_eq!(
+        store
+            .apply_agent_config_native(&missing_id, now + 23, Some("   ".to_owned()), None)
+            .unwrap_err()
+            .code,
+        "invalid",
+        "malformed native proof stores nothing"
+    );
+    assert_eq!(
+        store
+            .get_agent_config_current(&opencode, 1)
+            .expect("read overlay")
+            .expect("overlay exists")
+            .revision,
+        1,
+        "failed native applies keep the retained revision"
+    );
+}
+
+#[test]
 fn configure_rejects_authority_unknown_and_malformed_fields() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
@@ -12854,20 +12965,53 @@ fn configure_gates_harness_generation_state_and_principal() {
         "unsupported",
         "mixed Muse configure is atomic: nothing applies"
     );
-    for harness_agent in [&claude, &opencode, &antigravity] {
-        assert_eq!(
-            store
-                .submit(
-                    "owner",
-                    configure_request(harness_agent, 1, json!({"effort": "high"})),
-                    now + 13
-                )
-                .unwrap_err()
-                .code,
-            "unsupported",
-            "adapters without a verified mechanism refuse configure"
-        );
-    }
+    assert_eq!(
+        store
+            .submit(
+                "owner",
+                configure_request(&claude, 1, json!({"effort": "high"})),
+                now + 13
+            )
+            .unwrap_err()
+            .code,
+        "unsupported",
+        "adapters without a verified mechanism refuse configure"
+    );
+    // OpenCode effort stays unsupported: the native API has no effort knob.
+    let opencode_effort = store
+        .submit(
+            "owner",
+            configure_request(&opencode, 1, json!({"effort": "high"})),
+            now + 13,
+        )
+        .unwrap_err();
+    assert_eq!(opencode_effort.code, "unsupported");
+    assert!(
+        opencode_effort.message.contains("no native effort knob"),
+        "OpenCode effort refusal names the missing knob: {}",
+        opencode_effort.message
+    );
+    // OpenCode model and Antigravity model/effort ride their proven native
+    // setters, so admission accepts them; the overlay itself is stored by
+    // the Router only after native proof.
+    store
+        .submit(
+            "owner",
+            configure_request(&opencode, 1, json!({"model": "p/m1"})),
+            now + 14,
+        )
+        .expect("admit OpenCode model configure");
+    store
+        .submit(
+            "owner",
+            configure_request(
+                &antigravity,
+                1,
+                json!({"model": "base-low", "effort": "high"}),
+            ),
+            now + 15,
+        )
+        .expect("admit Antigravity model and effort configure");
     assert_eq!(
         store
             .get_agent_config_current(&muse, 1)
@@ -12882,7 +13026,7 @@ fn configure_gates_harness_generation_state_and_principal() {
             .submit(
                 "owner",
                 configure_request(&codex, 99, json!({"effort": "high"})),
-                now + 14
+                now + 20
             )
             .unwrap_err()
             .code,
@@ -12893,7 +13037,7 @@ fn configure_gates_harness_generation_state_and_principal() {
             .submit(
                 "agent:a9#1",
                 configure_request(&codex, 1, json!({"effort": "high"})),
-                now + 15
+                now + 21
             )
             .unwrap_err()
             .code,
@@ -12912,7 +13056,7 @@ fn configure_gates_harness_generation_state_and_principal() {
             .submit(
                 "owner",
                 configure_request(&codex, 1, json!({"effort": "high"})),
-                now + 16
+                now + 22
             )
             .unwrap_err()
             .code,

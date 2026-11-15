@@ -105,11 +105,19 @@ Stop sends a best-effort `session/close` for the retained session, then
 closes stdin and drains stdout before settling the session; force targets
 only owned custody. Resume creates a new Agent generation loading the
 exact retained session id, without replaying the old prompt. Connected
-verbs are launch/resume/send/steer/interrupt/stop. There is no direct plugin
-`inject` verb: `active_turn` inject is unsupported, while system context
-flows through the shared `next_input` (claimed at send) and
-`turn_safe_point` (claimed at `PreInvocation`) points below. Configure,
-approve, deny and answer remain `unsupported`.
+verbs are launch/resume/send/configure/steer/interrupt/stop.
+`configure` switches the live session's `model` and `thought_level`
+selectors through `session/set_config_option` at configure time, proving
+each write with its echoed current value (`model_verified`,
+`effort_verified`); a requested value the session did not advertise
+rejects before any write, never guessing, and a refused or unproven switch
+stores nothing and never claims applied. An explicit `--effort` wins over a
+model suffix; otherwise the suffix, then the session's tracked level,
+selects the thought level, and the effective model id recombines base and
+level. There is no direct plugin `inject` verb: `active_turn` inject is
+unsupported, while system context flows through the shared `next_input`
+(claimed at send) and `turn_safe_point` (claimed at `PreInvocation`)
+points below. Approve, deny and answer remain `unsupported`.
 `profile.store` is unsupported: launch carries no native store binding.
 
 ## System context and steer hooks
