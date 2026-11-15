@@ -2510,6 +2510,14 @@ impl Component for DesktopApp {
 
     fn view(&self, _input: &(), context: &mut ViewContext<Self>) -> View {
         context.window_title("Swarm Desktop");
+        // A bounded first window instead of WinUI's share of the monitor
+        // (3826 px wide on a 5120 px display). Reactor applies only visuals
+        // that differ from the default, so this declaration is also what
+        // makes the title bar follow the app's (system) theme.
+        context.window_visuals(
+            WindowVisuals::new()
+                .client_size(theme::layout::WINDOW_WIDTH, theme::layout::WINDOW_HEIGHT),
+        );
         let header = StackPanel::new()
             .grid_row(0)
             .orientation(Orientation::Horizontal)
@@ -2608,6 +2616,7 @@ impl Component for DesktopApp {
             ));
 
         Grid::new()
+            .background(theme::winui::window_surface())
             .rows([GridLength::Auto, GridLength::STAR])
             .children((header, main))
     }

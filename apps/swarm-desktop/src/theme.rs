@@ -39,6 +39,9 @@ pub mod layout {
     pub const READING_WIDTH: f64 = 820.0;
     pub const MONITOR_WIDTH: f64 = 380.0;
     pub const COMPOSER_HEIGHT: f64 = 96.0;
+    /// First window client size in DIPs; the user resizes freely after.
+    pub const WINDOW_WIDTH: f64 = 1440.0;
+    pub const WINDOW_HEIGHT: f64 = 900.0;
 }
 
 /// Fixed M3-inspired seed accents, one per color scheme. The surrounding
@@ -57,6 +60,14 @@ pub mod winui {
     fn accent_color(dark: bool) -> Color {
         let (r, g, b) = if dark { ACCENT_DARK } else { ACCENT_LIGHT };
         Color::rgb(r, g, b)
+    }
+
+    /// The window surface behind every screen. A WinUI 3 window with no
+    /// root background and no system backdrop shows black, so Light-theme
+    /// text (dark) would be invisible on it; the live theme's solid base
+    /// keeps text readable in Light, Dark and High Contrast.
+    pub fn window_surface() -> Brush {
+        Brush::Theme(ThemeBrush::SolidBackground)
     }
 
     /// Primary body text from the active WinUI theme.
@@ -92,5 +103,17 @@ pub mod winui {
             .set("ButtonBackground", accent_color(dark))
             .set("ButtonForeground", Color::rgb(0xFF, 0xFF, 0xFF))
             .set("ControlCornerRadius", CornerRadius::from(radius::MD))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn window_surface_resolves_from_the_live_theme() {
+            // Never a fixed color and never absent: the theme resource
+            // follows Light, Dark and High Contrast.
+            assert_eq!(window_surface(), Brush::Theme(ThemeBrush::SolidBackground));
+        }
     }
 }
