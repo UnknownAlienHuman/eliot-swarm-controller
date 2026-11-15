@@ -1250,8 +1250,26 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             let command_id = required_text(event, "command_id")?;
             let turn_id = required_text(event, "turn_id")?;
             let effort = optional_observed_effort(event)?;
+            let model = optional_observed_model(event)?;
             next.state = AgentState::Busy;
             next.active_turn = Some(turn_id.clone());
+            // Refresh the admitted native settings when the harness reports
+            // what its turn request carried (Codex reports model/effort and
+            // Muse reports effort, only under a `configure` overlay): the
+            // exact-turn association acknowledges native admission of those
+            // values, so they read back verified as carried. Absent fields
+            // invent nothing and a missing `effective` object is never
+            // fabricated: only launch readback creates it.
+            if let Some(Value::Object(effective)) = next.effective.as_mut() {
+                if let Some(model) = model.as_deref() {
+                    effective.insert("model".to_owned(), Value::String(model.to_owned()));
+                    effective.insert("model_verified".to_owned(), Value::Bool(true));
+                }
+                if let Some(effort) = effort.as_deref() {
+                    effective.insert("effort".to_owned(), Value::String(effort.to_owned()));
+                    effective.insert("effort_verified".to_owned(), Value::Bool(true));
+                }
+            }
             effects.push(Effect::CommandTurnAssociated {
                 command_id,
                 turn_id,

@@ -56,9 +56,10 @@ config write by its echoed current value before committing
 
 The ACP `model` selector carries base family ids only; the requested CLI
 model (`gemini-3.8-flash-high`) translates to base `gemini-3.8-flash` plus
-`thought_level = high` via `session/set_config_option`, and both writes
-are verified against the server's advertised options and echoed values —
-an unadvertised id fails startup instead of being guessed. Session mode
+`thought_level = high` via `session/set_config_option` (documented suffixes
+`-low`/`-medium`/`-high`/`-xhigh`, observed against agy 1.5.9), and both
+writes are verified against the server's advertised options and echoed
+values — an unadvertised id fails startup instead of being guessed. Session mode
 is applied only when the profile mode names an actually advertised ACP
 mode; any other requested mode (including CLI `auto`, which has no ACP
 mode id) fails startup with a clear `unsupported` instead of being
@@ -323,7 +324,16 @@ stays in the plugin spec.
 Owner-only and freezes a profile-equivalent snapshot from safe defaults
 (`dangerously_skip_permissions = false`, MCP `inherit`) plus flags. A model
 is required (no native default is mapped; omission is `profile_error`).
-`cmd` is the installed app at
+`cmd` is the installed `agy` CLI when it is on `PATH` (it serves both `acp`
+and `models`), falling back to the installed app at
 `%LOCALAPPDATA%\Programs\Antigravity\Antigravity.exe`, or `unsupported` when
-the harness needs a different binary. `swarm models --harness antigravity`
-reports no catalogue: name an explicit model.
+neither is found. `swarm models --harness antigravity` returns the live
+read-only catalogue from `agy models` (exact argv `models`, bounded time and
+output, same environment construction as launch): tab-separated native ids
+kept verbatim (for example `gemini-4-argon-medium`, `gemini-4-hydrogen-xhigh`,
+`gemini-pro-orchestrator-g1-pro`, `claude-opus-5-5-high`, `gpt-oss-120b-medium`),
+cached per scope with freshness and credential identity. The documented
+effort suffixes (`-low`/`-medium`/`-high`/`-xhigh`) map to the ACP
+`thought_level` selector at launch; any other suffix stays part of the base
+id and is verified against the advertised session options instead of guessed.
+A failing `agy models` child reports an honest typed error naming `models`.

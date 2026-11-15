@@ -241,6 +241,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `project.list/get` | owner-only read of registered project authority |
 | `rule.list/get/catch_up` | owner-only paged rule list (state, timer state, canonical definition), one rule read, and finite committed-history catch-up |
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
+| `script.list/read/save` | Owner-only scripts under approved Run roots: cursor/encoded-byte-bounded list (one root scan per page; continue through empty pages until `next_cursor` is absent), verified-handle bounded read, and serialized revision-guarded replacement. Complete secret-bearing entries are withheld; raw and decoded TOML/JSON keys/values are checked. Saves never execute; external-writer conflict limits and editor environment are specified in [automation](automation.md#script-editing). DTOs/budgets: [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). |
 | `config.profiles.read/save` | owner-only read and validated, revision-guarded replacement of the `[profiles.*]` sections of `config.toml` |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
 | `goal.set/get/pause/clear/resume/round` | owner-only Eliot-mode Goal with explicit and automatic idle rounds plus explicit cadence slot rounds; automatic driving needs `max_turns` or `max_rounds`, native mode and cost limits are `unsupported` |
@@ -360,6 +361,17 @@ The rule worker propagates its actual exit reason from its admission-closed
 return sites: an intentional admission/shutdown exit surfaces as `stopped`,
 while any other `Ok(())` surfaces as `failed` (`worker_exited`).
 
+`daemon.status` also reports the retention view: the `eliot.db` main and WAL
+file sizes in bytes, the configured `daemon.retention` windows (`null` is an
+unset window that disables pruning for that side), and the retained-event
+watermark `pruned_through`. `unbounded` is true only when all three windows
+are unset — the default daemon never prunes. When retention is unbounded and
+the combined store size passes the documented threshold, the view carries a
+bounded `size_advisory` naming the remedy; the hourly maintenance tick logs
+one line for the same condition. See
+[configuration](configuration.md) for the windows and the
+threshold, and [monitoring](monitoring.md#views) for the advisory.
+
 `maintenance.run` is owner-only and accepts an empty object. It reloads the
 daemon retention settings and runs the same bounded retention epochs as the
 hourly tick (same row and time budgets, same drain rule), returning the Core
@@ -403,7 +415,15 @@ action child. Manual runs do not consume the scheduled slot. See the timer seman
 `agent.get` includes the current generation's source rows and the managed workspace
 target generation's rows when it differs. If persisted state requires a live owner and
 the corresponding source is absent, it returns `unknown` rather than asserting the
-persisted state is current.
+persisted state is current. The Agent `effective` settings are the last
+natively admitted values, never a prediction: the launch `session.ready`
+readback sets them, and a `configure` revision's turn refreshes them when the
+harness proves what its native turn request carried (Codex reports the
+carried model/effort and Muse reports the carried effort through the
+exact-turn association, which acknowledges native admission of those values;
+`effort_verified`/`model_verified` mark that admission). Values no turn
+re-proves stay at their admission readback; no value is ever presented as
+verified without that admission.
 
 Request DTOs reject unknown fields. Required Agent IDs are nonempty after a trim check
 and are kept as supplied. Optional `generation`, `after` and process `scope` members may
@@ -810,7 +830,9 @@ assertion establishes process closure. A resolution never releases a
 retained reservation is released only by custody closure (restart recovery).
 Known failure can include partial effects; it never implies rollback or automatic retry.
 Observe-only Agents have no resolvable commands or turns; resolving any of
-theirs is refused with `not_allowed`.
+theirs is refused with `not_allowed`. Such unknowns still stop blocking
+drain once no live process, turn or reader backs them: the drain receipt
+lists them as retained-unresolved instead (see the drain section).
 
 `command.resolve {id, command_id, as: applied|failed, reason}` requires the target
 command to be stored `unknown`. The one additional Owner assertion is
@@ -1013,9 +1035,14 @@ restores revoked control; unknown blocks another takeover.
 per-harness installation facts (installed, resolved `cmd`, `--version`; Claude
 additionally reports every discovered install newest first in `candidates`);
 `harness.models` (`HarnessModelsRequest`/`HarnessModelsResponse`) returns the
-harness's own read-only catalogue (Codex/Muse native `model/list`, the OpenCode
-provider/model list; Claude reports aliases plus the CLI default, Antigravity
-reports no catalogue). An optional `profile` selects the native route/account
+harness's own read-only catalogue (Codex/Muse native `model/list`, OpenCode
+native `opencode models` provider/model ids verbatim, Antigravity
+`agy models`; Claude reports aliases plus the CLI default). The `catalogue`
+member is `native` for a live read, `aliases` for Claude, `empty` when the
+native read ran but listed no models (ad-hoc Muse on a launcher-marked binary
+with an empty `model/list`: the note names that binary and the `--cmd` /
+profile remedy), or `none` when the harness exposes no catalogue.
+An optional `profile` selects the native route/account
 (the named profile must exist and its frozen harness must match); omitted it
 means ad-hoc daemon defaults. The read is cached per native route/account
 scope with a freshness timestamp (`fetched_at_ms`, `ttl_ms`) and a nonsecret
@@ -1381,11 +1408,30 @@ reply, the fallback still dispatches force and returns `store_write_faulted:true
 the dispatched state; that fallback is not a retained write result. When present,
 `store_write_faulted` is true.
 
+A stored `unknown` command with no live process, turn or reader behind its
+generation is retained-unresolved: it is excluded from the blockers and listed
+in the `drain` report under `retained_unresolved` instead, with its verb,
+Agent, generation, stored outcome reason, resolvability and owner action.
+An open source row counts as a reader only while its generation is the
+agent's current live generation; rows on fenced or terminal generations are
+residue. Retained ids are excluded from the receipt's unsettled section and
+its count as well, so the receipt never double-lists them.
+`resolvable` is false for observe-only commands, which `cmd resolve` refuses
+by design; those entries need no action and stay retained as the honest
+record (retention keeps sets containing `unknown` work). A `true` entry
+names an owner-resolvable command the owner may still retire with
+`cmd resolve` (or its turn with `turn resolve`). Either way the stored
+outcome stays `unknown`: drain retires the wait, never the outcome.
+Unresolved dispatched/queued/accepted commands, live turns, live owned
+processes and live readers still block; `--force` stays their only escape.
+
 `daemon.status` carries the same bounded `drain` report; while draining it is the
 current blockers snapshot, while open it reflects the current fleet.
 `swarm daemon stop --drain` prints the retained `DaemonShutdownResponse` including
 `blockers` and `drain`; `swarm status` prints the typed `DaemonStatusResponse`
-including `blockers`, `unsettled_commands`, `unknown_commands` and `drain`.
+including `blockers`, `unsettled_commands`, `unknown_commands`, `drain` and
+the retention view (store sizes, configured windows or unbounded,
+`pruned_through`, and the unbounded-growth advisory when due).
 
 Drain rejects new turn-producing work and new automation, while continuing pre-admitted
 work and allowing exact stop/interrupt/request replies/cancel/detach/readback. Unknown

@@ -63,6 +63,8 @@ pub struct ProfilesData<'a> {
     pub editable: bool,
     pub reason: Option<&'a str>,
     pub draft: &'a str,
+    /// The source TextBox's own text, bound back unchanged.
+    pub view: &'a str,
     pub dirty: bool,
     pub selected: Option<&'a str>,
     pub duplicate_name: &'a str,
@@ -177,7 +179,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View
 
     let source = TextBox::new()
         .grid_row(5)
-        .text(data.draft.to_owned())
+        .text(data.view.to_owned())
         .accepts_return(true)
         .text_wrapping(TextWrapping::NoWrap)
         .is_enabled(data.editable && !data.busy)
@@ -200,6 +202,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View
             StackPanel::new().grid_row(0).spacing(2.0).children((
                 TextBlock::new()
                     .text("Profiles")
+                    .automation_heading_level(AutomationHeadingLevel::Level2)
                     .font_size(theme::type_scale::HEADING)
                     .font_weight(FontWeight::SEMI_BOLD),
                 small(saved),
@@ -328,6 +331,8 @@ pub fn rule_lines(entry: &RuleListEntry) -> Vec<String> {
 
 /// One namespace read for the Automation screen.
 pub struct RuleNamespace {
+    /// Registered project id; absent for the global namespace.
+    pub project: Option<String>,
     pub label: String,
     pub rules: Result<Vec<RuleListEntry>, String>,
     pub more: bool,
@@ -387,6 +392,7 @@ pub fn automation_screen(
             StackPanel::new().grid_row(0).spacing(2.0).children((
                 TextBlock::new()
                     .text("Automation")
+                    .automation_heading_level(AutomationHeadingLevel::Level2)
                     .font_size(theme::type_scale::HEADING)
                     .font_weight(FontWeight::SEMI_BOLD),
                 small("Read-only. No daemon operation pauses or resumes a rule or timer: `enabled` comes from the rule file, and `paused` is set by the daemon (backlog). Edit rules in <data_dir>/rules/*.toml; the watcher keeps the last valid definition on a bad edit.").opacity(theme::MUTED_OPACITY),
@@ -411,5 +417,176 @@ pub fn automation_screen(
                         .horizontal_alignment(HorizontalAlignment::Left)
                         .keyed_children(rows),
                 ),
+        ))
+}
+
+/// State the Scripts screen renders.
+pub struct ScriptsData<'a> {
+    pub labels: Vec<String>,
+    pub unavailable: &'a [String],
+    pub selected: Option<usize>,
+    pub display_path: Option<&'a str>,
+    pub revision: Option<&'a str>,
+    pub editable: bool,
+    pub reason: Option<&'a str>,
+    /// The editor TextBox's own text, bound back unchanged.
+    pub view: &'a str,
+    pub dirty: bool,
+    pub timers: &'a [String],
+    pub editor_exe: &'a str,
+    pub status: &'a str,
+    pub run_status: &'a str,
+    pub busy: bool,
+    pub run_busy: bool,
+}
+
+/// Callbacks the Scripts screen emits; `run` has one entry per timer.
+pub struct ScriptsActions {
+    pub select: Callback<Option<usize>>,
+    pub draft_changed: Callback<String>,
+    pub validate: Callback<()>,
+    pub save: Callback<()>,
+    pub reload: Callback<()>,
+    pub refresh: Callback<()>,
+    pub editor_changed: Callback<String>,
+    pub open_editor: Callback<()>,
+    pub run: Vec<Callback<()>>,
+}
+
+pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions) -> View {
+    let selected = data.selected.is_some();
+    let meta = match (data.display_path, data.revision) {
+        (Some(path), Some(revision)) => format!(
+            "{path} · revision {}",
+            revision.chars().take(12).collect::<String>()
+        ),
+        _ => "Select a script entry.".to_owned(),
+    };
+    let draft_state = if !selected {
+        String::new()
+    } else if !data.editable {
+        format!(
+            "Not editable here: {}",
+            data.reason.unwrap_or("withheld by the daemon")
+        )
+    } else if data.dirty {
+        "Draft: modified, not saved. Saving never runs the script.".to_owned()
+    } else {
+        "Draft: same as the saved file.".to_owned()
+    };
+    let mut runs: Vec<KeyedView> = Vec::new();
+    if selected && data.timers.is_empty() {
+        runs.push(KeyedView::new(
+            "no-timer",
+            small("Run: no timer's run action names this script. Add one to <data_dir>/rules/*.toml (for example a once timer) to run it through the daemon's Run path.")
+                .opacity(theme::MUTED_OPACITY),
+        ));
+    }
+    for (index, (timer, callback)) in data.timers.iter().zip(actions.run).enumerate() {
+        runs.push(KeyedView::new(
+            format!("run-{index}"),
+            Button::new()
+                .is_enabled(!data.run_busy && !data.dirty)
+                .automation_name(format!("Run via timer {timer}"))
+                .on_click(callback)
+                .content(TextBlock::new().text(format!("Run via timer {timer}"))),
+        ));
+    }
+    if !data.run_status.is_empty() {
+        runs.push(KeyedView::new(
+            "run-status",
+            small(data.run_status.to_owned()),
+        ));
+    }
+    let unavailable = if data.unavailable.is_empty() {
+        String::new()
+    } else {
+        format!("Unavailable roots: {}", data.unavailable.join("; "))
+    };
+    Grid::new()
+        .grid_column(1)
+        .rows([
+            GridLength::Auto,
+            GridLength::Auto,
+            GridLength::Auto,
+            GridLength::Auto,
+            GridLength::Auto,
+            GridLength::STAR,
+            GridLength::Auto,
+        ])
+        .row_spacing(theme::spacing::SM)
+        .children((
+            StackPanel::new().grid_row(0).spacing(2.0).children((
+                TextBlock::new()
+                    .text("Scripts")
+                    .automation_heading_level(AutomationHeadingLevel::Level2)
+                    .font_size(theme::type_scale::HEADING)
+                    .font_weight(FontWeight::SEMI_BOLD),
+                small("Existing entries under <data_dir>/scripts/ and registered .eliot/scripts/. Save replaces the file only when its revision still matches; Run goes through a timer's run action, with the daemon's custody, timeout and unknown-outcome rules.").opacity(theme::MUTED_OPACITY),
+                small(unavailable).opacity(theme::MUTED_OPACITY),
+            )),
+            StackPanel::new()
+                .grid_row(1)
+                .orientation(Orientation::Horizontal)
+                .spacing(theme::spacing::SM)
+                .children((
+                    ComboBox::new()
+                        .items_source(data.labels)
+                        .selected_index(data.selected)
+                        .placeholder_text("Script entry")
+                        .automation_name("Script entry")
+                        .on_selection_changed(actions.select),
+                    Button::new()
+                        .automation_name("Refresh script list")
+                        .on_click(actions.refresh)
+                        .content(TextBlock::new().text("Refresh")),
+                )),
+            small(format!("{meta}\n{draft_state}")).grid_row(2),
+            StackPanel::new()
+                .grid_row(3)
+                .orientation(Orientation::Horizontal)
+                .spacing(theme::spacing::SM)
+                .children((
+                    Button::new()
+                        .is_enabled(data.editable && !data.busy)
+                        .automation_name("Validate script")
+                        .on_click(actions.validate)
+                        .content(TextBlock::new().text("Validate")),
+                    Button::new()
+                        .resource_overrides(theme::winui::primary_button(false))
+                        .is_enabled(data.editable && data.dirty && !data.busy)
+                        .automation_name("Save script")
+                        .on_click(actions.save)
+                        .content(TextBlock::new().text("Save")),
+                    Button::new()
+                        .is_enabled(selected && !data.busy)
+                        .automation_name("Reload script")
+                        .on_click(actions.reload)
+                        .content(TextBlock::new().text("Reload (discard draft)")),
+                    TextBox::new()
+                        .text(data.editor_exe.to_owned())
+                        .placeholder_text("Editor .exe (absolute path)")
+                        .automation_name("Editor executable")
+                        .width(260.0)
+                        .on_text_changed(actions.editor_changed),
+                    Button::new()
+                        .is_enabled(selected && data.display_path.is_some())
+                        .automation_name("Open in editor")
+                        .on_click(actions.open_editor)
+                        .content(TextBlock::new().text("Open in editor")),
+                )),
+            StackPanel::new()
+                .grid_row(4)
+                .spacing(theme::spacing::XS)
+                .keyed_children(runs),
+            TextBox::new()
+                .grid_row(5)
+                .text(data.view.to_owned())
+                .accepts_return(true)
+                .text_wrapping(TextWrapping::NoWrap)
+                .is_enabled(data.editable && !data.busy)
+                .automation_name("Script source")
+                .on_text_changed(actions.draft_changed),
+            small(data.status.to_owned()).grid_row(6),
         ))
 }

@@ -41,14 +41,15 @@ use crate::native::{
         NativeApprovalUpdatedNotification, NativeHistoryNoneReason, NativeItem,
         NativeItemCompletedNotification, NativeItemReadOutputParams, NativeItemReadOutputResult,
         NativeItemStartedNotification, NativePatchRef, NativeSessionClosedNotification,
-        NativeSessionContextUsageNotification, NativeSessionStartedNotification,
-        NativeSessionTokenUsageNotification, NativeSessionViewHealthChangedNotification,
-        NativeTurnCompletedNotification, NativeTurnError, NativeTurnStartedNotification,
-        NativeTurnTerminal, NativeUnframedViewEvent, NativeUserInputAnswerResult,
-        NativeUserInputCancelResult, NativeUserInputSettledNotification, NativeViewHealth,
-        NativeViewPageParams, NativeViewPageResult, NativeViewSubscribeParams,
-        NativeViewSubscribeResult, NativeWorkflowChild, NativeWorkflowItemNotification,
-        session_usage_from_context_usage, session_usage_from_token_usage, turn_usage,
+        NativeSessionContextUsageNotification, NativeSessionReadParams, NativeSessionReadResult,
+        NativeSessionStartedNotification, NativeSessionTokenUsageNotification,
+        NativeSessionViewHealthChangedNotification, NativeTurnCompletedNotification,
+        NativeTurnError, NativeTurnStartedNotification, NativeTurnTerminal,
+        NativeUnframedViewEvent, NativeUserInputAnswerResult, NativeUserInputCancelResult,
+        NativeUserInputSettledNotification, NativeViewHealth, NativeViewPageParams,
+        NativeViewPageResult, NativeViewSubscribeParams, NativeViewSubscribeResult,
+        NativeWorkflowChild, NativeWorkflowItemNotification, session_usage_from_context_usage,
+        session_usage_from_token_usage, turn_usage,
     },
 };
 
@@ -203,6 +204,7 @@ enum Control {
         command_id: String,
         turn_id: String,
         context: Vec<ContextItem>,
+        effort: Option<String>,
         reply: oneshot::Sender<Result<()>>,
     },
     ReplyRequest {
@@ -357,6 +359,36 @@ struct BufferedFrame {
     size: usize,
 }
 
+/// Store identities acknowledged during the active turn, independently of
+/// the sink's most recent batch and the bounded view-cursor replay history.
+#[derive(Default)]
+struct TurnMessages {
+    acknowledged: HashSet<String>,
+    final_text: Option<String>,
+}
+
+impl TurnMessages {
+    async fn complete(
+        &mut self,
+        source: &mut StreamSource<'_>,
+        native_id: String,
+        text: String,
+        data: Value,
+    ) -> Result<()> {
+        if self.acknowledged.contains(&native_id) {
+            // Readback may carry an older message/revision. Keep the latest
+            // acknowledged text instead of replacing it from that snapshot.
+            return Ok(());
+        }
+        source
+            .commit_event("message.completed", native_id.clone(), data)
+            .await?;
+        self.acknowledged.insert(native_id);
+        self.final_text = Some(text);
+        Ok(())
+    }
+}
+
 struct EventProcessor {
     native: NativeClient,
     host: PeerClient,
@@ -401,7 +433,7 @@ struct EventProcessor {
     /// normalization; the first application did the binding and conflict
     /// checks. Remembered only on success, never on gaps or failures.
     applied_view_cursors: AppliedViewCursors,
-    final_text: Option<String>,
+    messages: TurnMessages,
     pending_requests: HashMap<String, PendingNativeRequest>,
     /// Native approval/user-input id to public pending id.
     native_index: HashMap<String, String>,
@@ -496,11 +528,13 @@ impl EventHandle {
         command_id: String,
         turn_id: String,
         context: Vec<ContextItem>,
+        effort: Option<String>,
     ) -> Result<()> {
         self.send(|reply| Control::AssociateTurn {
             command_id,
             turn_id,
             context,
+            effort,
             reply,
         })
         .await
@@ -662,7 +696,7 @@ impl EventProcessor {
             session_usage_seq: 0,
             view_recovery: None,
             applied_view_cursors: AppliedViewCursors::default(),
-            final_text: None,
+            messages: TurnMessages::default(),
             pending_requests: HashMap::new(),
             native_index: HashMap::new(),
             resolved_native_ids: HashSet::new(),
@@ -737,9 +771,12 @@ impl EventProcessor {
                 command_id,
                 turn_id,
                 context,
+                effort,
                 reply,
             } => {
-                let result = self.associate_turn(command_id, turn_id, context).await;
+                let result = self
+                    .associate_turn(command_id, turn_id, context, effort)
+                    .await;
                 let _ = reply.send(result);
                 true
             }
@@ -1051,6 +1088,7 @@ impl EventProcessor {
         command_id: String,
         turn_id: String,
         context: Vec<ContextItem>,
+        effort: Option<String>,
     ) -> Result<()> {
         if !self.status.ready
             || self.status.session_id.is_none()
@@ -1076,14 +1114,20 @@ impl EventProcessor {
         }
         self.status.active_command_id = Some(command_id.clone());
         self.status.active_turn_id = Some(turn_id.clone());
-        self.final_text = None;
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = event_id(session_id, &turn_id, &turn_id, "turn.started")?;
         let mut data = json!({"command_id": command_id, "turn_id": turn_id});
+        // Report the effort the native turn request actually carried, so the
+        // Store readback shows the resolved value instead of the overlay's
+        // absent override. Omitted when unknown: nothing is invented.
+        if let Some(effort) = effort.as_deref().filter(|effort| !effort.trim().is_empty()) {
+            data["effort"] = json!(effort);
+        }
         if !context.is_empty() {
             data["context_outcomes"] = json!(next_input_outcomes(&context, &command_id));
         }
         self.commit_event("turn.started", native_id, data).await?;
+        self.messages = TurnMessages::default();
         // The gap may have landed while `turn/start` awaited its reply, with
         // no active turn to arm recovery for. Now that association is
         // acknowledged, arm its settlement deadline when view loss is latched.
@@ -2269,6 +2313,32 @@ impl EventProcessor {
                 }
             }
             "turn/completed" => {
+                if needs_terminal_fence(&self.status, &params) {
+                    if !self.status.view_unavailable {
+                        let session_id = self.status.session_id.clone().unwrap_or_default();
+                        let turn_id = self.status.active_turn_id.clone().unwrap_or_default();
+                        if self.projection_turn_state(&session_id, &turn_id).await
+                            == ProjectionTurnState::Idle
+                            && self.recover_projection_terminal().await
+                        {
+                            return Ok(());
+                        }
+                        self.view_unavailable(&session_id, NativeHistoryNoneReason::Unknown)
+                            .await?;
+                    }
+                    // Replay from the same unavailable projection needs the
+                    // same command-plane fence as private page readback. An
+                    // error also prevents marking this cursor applied.
+                    self.view_recovery = Some(ViewRecovery {
+                        head: None,
+                        head_seen: false,
+                        deadline: Instant::now(),
+                    });
+                    return Err(Error::new(
+                        "native_readback",
+                        "Muse unavailable-view terminal requires command-plane confirmation",
+                    ));
+                }
                 self.complete_turn(params, false).await?;
             }
             "session/tokenUsage" => {
@@ -2386,10 +2456,8 @@ impl EventProcessor {
             item_id,
             "message.completed",
         )?;
-        // The accumulated reply; a later `agentMessage` replaces an earlier one.
-        self.final_text = Some(text);
-        self.commit_event("message.completed", native_id, data)
-            .await
+        let (mut source, messages) = self.stream_source_and_messages();
+        messages.complete(&mut source, native_id, text, data).await
     }
 
     /// Fold one `session/tokenUsage` event into the retained session snapshot
@@ -2771,7 +2839,7 @@ impl EventProcessor {
         if let Some(usage) = turn_usage(&notification) {
             data["usage"] = serde_json::to_value(&usage).unwrap_or(Value::Null);
         }
-        if let Some(text) = self.final_text.as_ref() {
+        if let Some(text) = self.messages.final_text.as_ref() {
             attach_final_text(
                 &mut data,
                 text,
@@ -2802,12 +2870,13 @@ impl EventProcessor {
             command_id,
             turn_id: notification.turn_id,
             status: Some(status_text.to_owned()),
-            final_text: self.final_text.take(),
+            final_text: self.messages.final_text.take(),
             native_error,
             terminal: true,
         });
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
+        self.messages = TurnMessages::default();
         // The turn's requests die with it: drop them locally (their Store
         // rows stay bound to the dead turn, so no later reply can address
         // them) and swallow their late resolutions. Resume orphans that never
@@ -3200,6 +3269,7 @@ impl EventProcessor {
         self.status.ready = false;
         self.status.active_command_id = None;
         self.status.active_turn_id = None;
+        self.messages = TurnMessages::default();
         Ok(())
     }
 
@@ -3853,7 +3923,8 @@ impl EventProcessor {
                 .read_recovery_page(session_id, cursor.clone())
                 .await
                 .ok()?;
-            for event in &page.events {
+            // Backward pages still contain ascending events on the wire.
+            for event in page.events.iter().rev() {
                 match fold_recovery_event(&mut scan, event, session_id, turn_id) {
                     RecoveryFold::Complete => {
                         return scan
@@ -3903,19 +3974,27 @@ impl EventProcessor {
         else {
             return false;
         };
-        if let Some(params) = message_params.clone()
+        if let Some(params) = message_params
             && let Ok(message) =
                 serde_json::from_value::<NativeItemCompletedNotification>(params.clone())
             && let Some(text) = message.item.text.clone()
-            && self
+        {
+            if self
                 .complete_message(&turn_id, &message.item.item_id, &text)
                 .await
-                .is_ok()
-            && let Some(cursor) = params.get("viewCursor").and_then(Value::as_str)
-            && !cursor.trim().is_empty()
-        {
-            self.applied_view_cursors
-                .insert(applied_fact_key("item/completed", cursor, &params));
+                .is_err()
+            {
+                return false;
+            }
+            if let Some(cursor) = params.get("viewCursor").and_then(Value::as_str)
+                && !cursor.trim().is_empty()
+            {
+                self.applied_view_cursors.insert(applied_fact_key(
+                    "item/completed",
+                    cursor,
+                    &params,
+                ));
+            }
         }
         if self.complete_turn(turn_params.clone(), true).await.is_err() {
             return false;
@@ -3939,10 +4018,10 @@ impl EventProcessor {
         true
     }
 
-    /// Settle the projection-gapped turn: first attempt durable recovery of
-    /// the exact terminal from the retained view, and only then settle
-    /// `unknown` through the shared turn-unknown path, never as success or
-    /// failure. The plugin host stays alive and the Agent is not marked lost:
+    /// Recheck a projection-gapped turn. The command plane can prove it still
+    /// running; only explicit idle permits a fresh terminal scan. An unproven
+    /// state/outcome settles `unknown` through the shared turn-unknown path.
+    /// The plugin host stays alive and the Agent is not marked lost:
     /// only the active turn is cleared, so a later replayed terminal for the
     /// same turn gaps instead of resurrecting it, and a later stop settles
     /// the session normally. Idempotent: with no active turn there is nothing
@@ -3958,21 +4037,35 @@ impl EventProcessor {
         ) else {
             return;
         };
-        // The live view is lost, but the durable view may still hold the
-        // exact terminal: page it before giving the turn up for unknown. A
-        // proven terminal commits through the exact live shapes with the real
-        // final message and retires recovery; only an unproven terminal
-        // settles unknown below.
-        if self.recover_projection_terminal().await {
-            return;
+        let session_id = self.status.session_id.clone().unwrap_or_default();
+        // An unavailable projection can synthesize a failed terminal for an
+        // unfinished source prefix while the native run continues. The owned
+        // host's command plane must prove this exact turn no longer running
+        // before a fresh page can supply terminal evidence.
+        match self.projection_turn_state(&session_id, &turn_id).await {
+            ProjectionTurnState::Running => {
+                self.view_recovery = Some(ViewRecovery {
+                    head: None,
+                    head_seen: false,
+                    deadline: Instant::now() + EVENT_DEADLINE,
+                });
+                return;
+            }
+            ProjectionTurnState::Idle => {
+                if self.recover_projection_terminal().await {
+                    return;
+                }
+            }
+            ProjectionTurnState::Unproven => {}
         }
+        // Neither the command plane nor a fresh idle-time scan supplied a
+        // proven terminal. Preserve uncertainty instead of a projected verdict.
         let reason_label = self
             .status
             .view_unavailable_reason
             .map(|reason| reason.label().to_owned())
             .unwrap_or_else(|| "unknown".to_owned());
         let reason = format!("{MUSE_VIEW_UNKNOWN_REASON_PREFIX} ({reason_label})");
-        let session_id = self.status.session_id.clone().unwrap_or_default();
         let data = json!({
             "command_id": command_id.clone(),
             "turn_id": turn_id.clone(),
@@ -4001,6 +4094,42 @@ impl EventProcessor {
         self.clear_projection_gap_turn(&command_id, &turn_id);
     }
 
+    /// One bounded, read-only command-plane observation, independent of the
+    /// unavailable history envelope. It never supplies a terminal outcome.
+    async fn projection_turn_state(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> ProjectionTurnState {
+        let params = NativeSessionReadParams {
+            session_id: session_id.to_owned(),
+            exclude_items: Some(true),
+        };
+        let Ok(params) = serde_json::to_value(params) else {
+            return ProjectionTurnState::Unproven;
+        };
+        let Ok(result) = self
+            .native
+            .call(
+                "session/read",
+                params,
+                Instant::now() + RECOVERY_PAGE_DEADLINE,
+            )
+            .await
+        else {
+            return ProjectionTurnState::Unproven;
+        };
+        let state = projection_turn_state(&result, session_id, turn_id);
+        if let Ok(readback) = serde_json::from_value::<NativeSessionReadResult>(result)
+            && readback.session.session_id == session_id
+            && let Some(reason) = readback.history.unavailable_reason()
+            && self.view_unavailable(session_id, reason).await.is_err()
+        {
+            return ProjectionTurnState::Unproven;
+        }
+        state
+    }
+
     fn clear_projection_gap_turn(&mut self, command_id: &str, turn_id: &str) {
         let dropped = self
             .pending_requests
@@ -4019,7 +4148,7 @@ impl EventProcessor {
             }
         }
         self.expected_requests.clear();
-        self.final_text = None;
+        self.messages = TurnMessages::default();
         self.status.last_turn = Some(TurnFacts {
             command_id: command_id.to_owned(),
             turn_id: turn_id.to_owned(),
@@ -4104,7 +4233,11 @@ impl EventProcessor {
 
     /// The shared stream-commit half of this processor.
     fn stream_source(&mut self) -> StreamSource<'_> {
-        StreamSource {
+        self.stream_source_and_messages().0
+    }
+
+    fn stream_source_and_messages(&mut self) -> (StreamSource<'_>, &mut TurnMessages) {
+        let source = StreamSource {
             sink: &mut self.sink,
             host: &self.host,
             credential: &self.credential,
@@ -4119,7 +4252,8 @@ impl EventProcessor {
             source_unknown: &mut self.status.source_unknown,
             batch_unknown: &mut self.status.batch_unknown,
             failure: &mut self.status.failure,
-        }
+        };
+        (source, &mut self.messages)
     }
 }
 
@@ -4207,6 +4341,46 @@ fn should_arm_recovery_after_associate(status: &EventStatus, has_recovery: bool)
 struct RecoveryScan {
     turn_params: Option<Value>,
     message_params: Option<Value>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProjectionTurnState {
+    Running,
+    Idle,
+    Unproven,
+}
+
+fn needs_terminal_fence(status: &EventStatus, params: &Value) -> bool {
+    let Ok(terminal) = serde_json::from_value::<NativeTurnCompletedNotification>(params.clone())
+    else {
+        return false;
+    };
+    status.session_id.as_deref() == Some(terminal.session_id.as_str())
+        && status.active_turn_id.as_deref() == Some(terminal.turn_id.as_str())
+        && (status.view_unavailable
+            || terminal.terminal == NativeTurnTerminal::Failed && terminal.error.is_none())
+}
+
+/// The installed Session.activeTurnId is required-nullable. Check presence
+/// before decoding Option<String>, so omission never becomes idle proof.
+fn projection_turn_state(result: &Value, session_id: &str, turn_id: &str) -> ProjectionTurnState {
+    let Some(active) = result
+        .get("session")
+        .and_then(|session| session.get("activeTurnId"))
+    else {
+        return ProjectionTurnState::Unproven;
+    };
+    let Ok(readback) = serde_json::from_value::<NativeSessionReadResult>(result.clone()) else {
+        return ProjectionTurnState::Unproven;
+    };
+    if readback.session.session_id != session_id {
+        return ProjectionTurnState::Unproven;
+    }
+    match (readback.session.status.as_str(), active) {
+        ("running", Value::String(active)) if active == turn_id => ProjectionTurnState::Running,
+        ("idle", Value::Null) => ProjectionTurnState::Idle,
+        _ => ProjectionTurnState::Unproven,
+    }
 }
 
 /// One recovery-fold step over a single durable view record.
@@ -4826,6 +5000,225 @@ fn attach_provider_restriction(
 mod tests {
     use super::*;
     use eliot_plugin::protocol::MAX_COMMAND_ID_BYTES;
+
+    #[tokio::test]
+    async fn acknowledged_message_skips_recovery_write_after_usage_batch() {
+        use eliot_plugin::{Peer, protocol::RpcRequest};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
+
+        let (host_io, plugin_io) = duplex(64 * 1024);
+        let (plugin_read, plugin_write) = split(plugin_io);
+        let mut peer = Peer::from_io(plugin_read, plugin_write);
+        let host = peer.client();
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+        let (host_read, mut host_write) = split(host_io);
+        let mut host_reader = BufReader::new(host_read);
+
+        let acknowledge = async {
+            let mut native_ids = HashSet::new();
+            for (index, kind) in ["message.completed", "session.usage", "turn.completed"]
+                .into_iter()
+                .enumerate()
+            {
+                let mut line = String::new();
+                host_reader.read_line(&mut line).await.unwrap();
+                let request: RpcRequest = serde_json::from_str(&line).unwrap();
+                assert_eq!(request.method, "events.put");
+                let event = &request.params["events"][0];
+                assert_eq!(event["kind"], kind);
+                assert!(native_ids.insert(event["native_id"].as_str().unwrap().to_owned()));
+                if kind == "message.completed" {
+                    assert_eq!(
+                        event["native_id"],
+                        event_id("session-1", "turn-1", "message-1", "message.completed").unwrap()
+                    );
+                    assert_eq!(event["data"]["command_id"], "command-1");
+                    assert_eq!(event["data"]["turn_id"], "turn-1");
+                }
+                if kind == "turn.completed" {
+                    assert_eq!(event["data"]["status"], "failed");
+                    assert_eq!(event["data"]["final_text"], "committed final answer");
+                    assert_eq!(
+                        event["data"][VIEW_RECOVERY_MARKER_FIELD],
+                        VIEW_RECOVERY_READBACK
+                    );
+                }
+                let seq = index + 1;
+                let response = json!({
+                    "jsonrpc": "2.0", "id": request.id,
+                    "result": {"first_seq": seq, "last_seq": seq, "cursor": null},
+                });
+                host_write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        };
+        let commits = async {
+            let mut sink = CommitSink::new(host.clone(), "credential");
+            let mut writes_blocked = false;
+            let mut gap_reported = false;
+            let mut gap_number = 0;
+            let mut source_unknown = false;
+            let mut batch_unknown = false;
+            let mut failure = None;
+            let mut source = StreamSource {
+                sink: &mut sink,
+                host: &host,
+                credential: "credential",
+                agent_id: "a1",
+                generation: 1,
+                harness: "Muse",
+                id_prefix: "muse",
+                families: &["session", "turn", "message"],
+                writes_blocked: &mut writes_blocked,
+                gap_reported: &mut gap_reported,
+                gap_number: &mut gap_number,
+                source_unknown: &mut source_unknown,
+                batch_unknown: &mut batch_unknown,
+                failure: &mut failure,
+            };
+            let mut messages = TurnMessages::default();
+            let message_id =
+                event_id("session-1", "turn-1", "message-1", "message.completed").unwrap();
+            messages
+                .complete(
+                    &mut source,
+                    message_id.clone(),
+                    "committed final answer".to_owned(),
+                    json!({"command_id": "command-1", "turn_id": "turn-1", "text": "committed final answer"}),
+                )
+                .await
+                .unwrap();
+            // In production this advances Store's last-batch replay identity:
+            // submitting the old message again would no longer be a last-batch retry.
+            let token_usage: NativeSessionTokenUsageNotification = serde_json::from_value(json!({
+                "sessionId": "session-1", "turnId": "turn-1",
+                "cumulative": {"promptTokens": 120, "outputTokens": 30, "totalTokens": 150},
+            }))
+            .unwrap();
+            let usage = session_usage_from_token_usage(&token_usage, None).unwrap();
+            source
+                .commit_event(
+                    "session.usage",
+                    event_id("session-1", "turn-1", "session-1", "session.usage").unwrap(),
+                    json!({"usage": usage}),
+                )
+                .await
+                .unwrap();
+
+            let status = EventStatus {
+                session_id: Some("session-1".to_owned()),
+                active_turn_id: Some("turn-1".to_owned()),
+                active_command_id: Some("command-1".to_owned()),
+                ..EventStatus::default()
+            };
+            let terminal = json!({
+                "sessionId": "session-1", "turnId": "turn-1", "viewCursor": "rev-9",
+                "terminal": "failed", "reason": "incomplete",
+            });
+            assert!(needs_terminal_fence(&status, &terminal));
+            assert_eq!(
+                projection_turn_state(
+                    &projection_session_read("idle", Value::Null),
+                    "session-1",
+                    "turn-1"
+                ),
+                ProjectionTurnState::Idle
+            );
+            // A newer cursor/revision still names the same Store identity.
+            // Its snapshot text must not replace text already acknowledged live.
+            let (scan, folded) = fold_recovery_all(
+                &[
+                    recovery_event("turn/completed", terminal),
+                    recovery_event(
+                        "item/completed",
+                        json!({
+                            "sessionId": "session-1", "viewCursor": "rev-8",
+                            "item": {"itemId": "message-1", "kind": "agentMessage",
+                                     "revision": 2, "status": "completed",
+                                     "turnId": "turn-1", "text": "readback snapshot text"},
+                        }),
+                    ),
+                ],
+                "session-1",
+                "turn-1",
+            );
+            assert!(matches!(folded, RecoveryFold::Complete));
+            let recovered: NativeItemCompletedNotification =
+                serde_json::from_value(scan.message_params.unwrap()).unwrap();
+            let recovered_text = recovered.item.text.unwrap();
+            messages
+                .complete(
+                    &mut source,
+                    event_id(
+                        "session-1",
+                        "turn-1",
+                        &recovered.item.item_id,
+                        "message.completed",
+                    )
+                    .unwrap(),
+                    recovered_text.clone(),
+                    json!({"command_id": "command-1", "turn_id": "turn-1", "text": recovered_text}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(messages.acknowledged.len(), 1);
+            assert!(messages.acknowledged.contains(&message_id));
+            let terminal: NativeTurnCompletedNotification =
+                serde_json::from_value(scan.turn_params.unwrap()).unwrap();
+            let mut data = json!({
+                "command_id": "command-1", "turn_id": terminal.turn_id,
+                "status": turn_status(&terminal.terminal).unwrap(),
+                "outcome": turn_outcome(&terminal.terminal),
+                "native_status": native_terminal(&terminal.terminal),
+            });
+            attach_final_text(
+                &mut data,
+                messages.final_text.as_deref().unwrap(),
+                true,
+                &SecretPolicy::default(),
+            );
+            mark_readback_recovery(&mut data);
+            source
+                .commit_event(
+                    "turn.completed",
+                    event_id("session-1", "turn-1", "turn-1", "turn.completed").unwrap(),
+                    data,
+                )
+                .await
+                .unwrap();
+            assert!(!*source.writes_blocked);
+            assert!(!source.sink.is_unknown("a1", 1, "stream"));
+
+            // An unacknowledged completion cannot enter the dedup set or
+            // replace the committed text, even if the source is blocked.
+            *source.writes_blocked = true;
+            assert!(
+                messages
+                    .complete(
+                        &mut source,
+                        "unacknowledged".to_owned(),
+                        "uncommitted".to_owned(),
+                        json!({})
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(messages.acknowledged.len(), 1);
+            assert_eq!(
+                messages.final_text.as_deref(),
+                Some("committed final answer")
+            );
+        };
+        timeout_at(Instant::now() + Duration::from_secs(5), async {
+            tokio::join!(acknowledge, commits);
+        })
+        .await
+        .expect("message, usage and terminal acknowledgements finish");
+        peer_task.abort();
+        let _ = peer_task.await;
+    }
 
     #[test]
     fn native_request_gap_reason_keeps_only_bounded_metadata() {
@@ -5633,6 +6026,92 @@ mod tests {
             &latched_no_turn,
             false
         ));
+    }
+
+    fn projection_session_read(status: &str, active: Value) -> Value {
+        json!({
+            "session": {"sessionId": "session-1", "status": status, "activeTurnId": active},
+            "history": {"mode": "none", "noneReason": "projectionUnavailable", "items": null, "snapshot": null},
+            "viewCursor": "cursor-1",
+        })
+    }
+
+    #[test]
+    fn projection_terminal_waits_for_the_exact_running_turn() {
+        // A page can contain a synthetic failed/incomplete for a source
+        // prefix while the same native run still produces tools/model steps.
+        let mut result = projection_session_read("running", json!("turn-1"));
+        assert_eq!(
+            projection_turn_state(&result, "session-1", "turn-1"),
+            ProjectionTurnState::Running
+        );
+        result["session"]["activeTurnId"] = json!("other-turn");
+        assert_eq!(
+            projection_turn_state(&result, "session-1", "turn-1"),
+            ProjectionTurnState::Unproven
+        );
+        result["session"]["activeTurnId"] = Value::Null;
+        assert_eq!(
+            projection_turn_state(&result, "session-1", "turn-1"),
+            ProjectionTurnState::Unproven
+        );
+        result["session"]["status"] = json!("idle");
+        // Idle permits fresh paging; this predicate supplies no verdict.
+        assert_eq!(
+            projection_turn_state(&result, "session-1", "turn-1"),
+            ProjectionTurnState::Idle
+        );
+        result["session"]["sessionId"] = json!("foreign-session");
+        assert_eq!(
+            projection_turn_state(&result, "session-1", "turn-1"),
+            ProjectionTurnState::Unproven
+        );
+    }
+
+    #[test]
+    fn projection_idle_proof_requires_explicit_null_and_a_loaded_session() {
+        let mut result = projection_session_read("idle", Value::Null);
+        result["session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("activeTurnId");
+        assert_eq!(
+            projection_turn_state(&result, "session-1", "turn-1"),
+            ProjectionTurnState::Unproven
+        );
+        result["session"]["activeTurnId"] = json!(false);
+        assert_eq!(
+            projection_turn_state(&result, "session-1", "turn-1"),
+            ProjectionTurnState::Unproven
+        );
+        result = projection_session_read("notLoaded", Value::Null);
+        assert_eq!(
+            projection_turn_state(&result, "session-1", "turn-1"),
+            ProjectionTurnState::Unproven
+        );
+    }
+
+    #[test]
+    fn synthetic_failure_requires_confirmation_even_without_a_health_push() {
+        let mut status = EventStatus {
+            session_id: Some("session-1".to_owned()),
+            active_turn_id: Some("turn-1".to_owned()),
+            ..EventStatus::default()
+        };
+        let mut terminal = json!({
+            "sessionId": "session-1", "turnId": "turn-1", "viewCursor": "cursor-1",
+            "terminal": "failed", "reason": "incomplete",
+        });
+        assert!(needs_terminal_fence(&status, &terminal));
+        terminal["error"] = json!({"kind": "internal", "message": "failed", "retryable": false});
+        assert!(!needs_terminal_fence(&status, &terminal));
+        terminal["terminal"] = json!("completed");
+        terminal.as_object_mut().unwrap().remove("error");
+        assert!(!needs_terminal_fence(&status, &terminal));
+        status.view_unavailable = true;
+        assert!(needs_terminal_fence(&status, &terminal));
+        terminal["turnId"] = json!("foreign-turn");
+        assert!(!needs_terminal_fence(&status, &terminal));
     }
 
     #[test]

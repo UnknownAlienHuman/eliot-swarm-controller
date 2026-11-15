@@ -17,16 +17,37 @@
 //! ratio, so the transcript cannot detect "at the bottom" or auto-follow;
 //! "Jump to latest" moves focus to the end anchor, which WinUI brings into
 //! view. There is no font-family property (code is not monospace), no
-//! clipboard (see [`crate::clipboard`]) and no key events on `TextBox`
-//! (Enter cannot send; Ctrl+Enter is a Send accelerator).
+//! clipboard (see [`crate::clipboard`]) and no key events on `TextBox`, so
+//! Enter cannot send. A multiline `TextBox` consumes Ctrl+Enter as a newline
+//! before any `KeyboardAccelerator` sees it, and Reactor's Button/Grid
+//! accelerators (Ctrl+R, Ctrl+Enter) did not fire under real keystrokes in
+//! this window, so none is offered: the keyboard path is Tab to the action
+//! button, then Enter or Space.
+//!
+//! Checked against windows-rs master `f37e2f9046cf9710fe00285436c4d22ad6053d72`
+//! (2026-11-14, unreleased `windows-reactor` 0.101.0, MIT OR Apache-2.0):
+//! it adds `TextBlock::font_family`, `Border::on_preview_key_down` /
+//! `on_key_up` / `on_character_received` (a `RoutedCallback<KeyEventInfo>`
+//! whose `bool` sets `Handled`), and `ElementRef::request_notification`.
+//! It still has no `ScrollViewer`/`ScrollView` view-changed event, offset,
+//! extent or viewport readback, `ChangeView`/`ScrollTo`/`StartBringIntoView`
+//! or `VerticalAnchorRatio`, no `ElementRef` for scroll viewers, no `TextBox`
+//! key events, no Shift `AcceleratorModifiers` variant and no IME
+//! composition events. It is not pinned: conditional bottom-follow stays
+//! impossible there, and a Git pin makes every lockfile resolution
+//! (including both uncached CI jobs) fetch the 1.48 GB windows-rs
+//! repository. Monospace code and Enter-to-send wait for a published
+//! release that carries those two APIs.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use eliot_core::Command;
 use eliot_core::api::{
     AgentGetResponse, AgentListRequest, CommandSubmitResponse, ProfileListResponse, ProfileSummary,
-    ProfilesReadResponse, ProfilesSaveResponse, RuleListEntry,
+    ProfilesReadResponse, ProfilesSaveResponse, RuleListEntry, ScriptListResponse,
+    ScriptReadResponse, ScriptSaveResponse,
 };
 use windows_reactor::*;
 
@@ -39,6 +60,7 @@ use crate::markdown::Doc;
 use crate::monitor::{self, Monitor, MonitorSnapshot};
 use crate::monitor_view::{self, MonitorActions};
 use crate::profiles::{self, FORM_FIELDS};
+use crate::scripts;
 use crate::state::{BoundAction, DraftStore, MutationLedger, Selection};
 use crate::theme;
 use crate::views::{self, RenderCache, RenderedItem, RowCallbacks};
@@ -54,6 +76,34 @@ enum Screen {
     Chat,
     Profiles,
     Automation,
+    Scripts,
+}
+
+/// Scripts screen: one text draft over the daemon's `script.read`.
+#[derive(Clone, Debug, Default)]
+struct ScriptsEditor {
+    /// Flattened entries: (project, relative path, size).
+    entries: Vec<(Option<String>, String, u64)>,
+    unavailable: Vec<String>,
+    listed: bool,
+    selected: Option<usize>,
+    load_epoch: u64,
+    revision: Option<String>,
+    display_path: Option<String>,
+    base: String,
+    /// Line-feed text the dirty check and save use.
+    draft: String,
+    /// The editor TextBox's text exactly as reported (CR line breaks).
+    view: String,
+    editable: bool,
+    reason: Option<String>,
+    status: String,
+    busy: bool,
+    editor_exe: String,
+    run_status: String,
+    run_busy: bool,
+    /// Distinguishes one Run click from the next in the mutation ledger.
+    run_seq: u64,
 }
 
 /// Profiles screen: one document draft over the daemon's profile source.
@@ -61,7 +111,10 @@ enum Screen {
 struct ProfilesEditor {
     revision: Option<String>,
     base: String,
+    /// Line-feed text the form, dirty check and save use.
     draft: String,
+    /// The source TextBox's text exactly as reported (CR line breaks).
+    view: String,
     editable: bool,
     reason: Option<String>,
     selected: Option<String>,
@@ -201,8 +254,22 @@ enum Message {
     ProfilesSaveRequested,
     ProfilesSaved(bool, Fallible<ProfilesSaveResponse>),
     ProfilesReloadRequested,
-    RulesLoaded(u64, Vec<(String, Fallible<RulePage>)>),
+    RulesLoaded(u64, Vec<(Option<String>, String, Fallible<RulePage>)>),
     AutomationRefreshRequested,
+    ScriptsListed(Fallible<ScriptListResponse>),
+    ScriptsRefreshRequested,
+    ScriptSelected(Option<usize>),
+    ScriptLoaded(u64, Fallible<ScriptReadResponse>),
+    ScriptDraftChanged(String),
+    ScriptValidateRequested,
+    ScriptSaveRequested,
+    ScriptSaved(u64, bool, Fallible<ScriptSaveResponse>),
+    ScriptReloadRequested,
+    EditorPathChanged(String),
+    OpenInEditorRequested,
+    ScriptRunRequested(String),
+    ScriptRunSubmitted(Fallible<Command>),
+    ScriptRunSettled(Fallible<Command>),
     MonitorToggled(bool),
     MonitorLoaded(u64, Option<Box<MonitorSnapshot>>),
     MonitorSelected(Option<usize>),
@@ -249,6 +316,8 @@ struct DesktopApp {
     expanded: HashSet<String>,
     unseen: usize,
     end_anchor: ElementRef<TextBox>,
+    /// The composer, focused again after input is admitted, a launch and New.
+    composer_ref: ElementRef<TextBox>,
     pending_local: Option<(String, String, String)>,
     // Mutations.
     drafts: DraftStore,
@@ -278,6 +347,7 @@ struct DesktopApp {
     rules_status: String,
     /// Tags rule loads; an older reply is dropped.
     rules_epoch: u64,
+    scripts: ScriptsEditor,
     /// Monitor rows published before the latest refresh; the native
     /// selection never points past them (see `monitor_view`).
     monitor_published: usize,
@@ -368,6 +438,90 @@ impl DesktopApp {
         });
     }
 
+    fn selected_script(&self) -> Option<(Option<String>, String)> {
+        self.scripts
+            .selected
+            .and_then(|index| self.scripts.entries.get(index))
+            .map(|(project, path, _)| (project.clone(), path.clone()))
+    }
+
+    fn clear_script_editor(&mut self) {
+        let editor = &mut self.scripts;
+        editor.revision = None;
+        editor.display_path = None;
+        editor.base.clear();
+        editor.draft.clear();
+        editor.view.clear();
+        editor.editable = false;
+        editor.reason = None;
+    }
+
+    fn load_scripts(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let _task = context.spawn_background(move |_| {
+            Message::ScriptsListed(client::block_on(async {
+                client::list_scripts(&data_dir)
+                    .await
+                    .map_err(|error| error.to_string())
+            }))
+        });
+    }
+
+    fn load_script(&mut self, context: &ComponentContext<Self>) {
+        let (Ok(data_dir), Some((project, path))) = (self.data_dir.clone(), self.selected_script())
+        else {
+            return;
+        };
+        self.scripts.load_epoch += 1;
+        let epoch = self.scripts.load_epoch;
+        self.scripts.busy = true;
+        let _task = context.spawn_background(move |_| {
+            Message::ScriptLoaded(
+                epoch,
+                client::block_on(async {
+                    client::read_script(&data_dir, project, path)
+                        .await
+                        .map_err(|error| error.to_string())
+                }),
+            )
+        });
+    }
+
+    fn save_script(&mut self, context: &ComponentContext<Self>, dry_run: bool) {
+        let (Ok(data_dir), Some((project, path)), Some(revision)) = (
+            self.data_dir.clone(),
+            self.selected_script(),
+            self.scripts.revision.clone(),
+        ) else {
+            return;
+        };
+        if self.scripts.busy || !self.scripts.editable {
+            return;
+        }
+        self.scripts.busy = true;
+        self.scripts.status = if dry_run {
+            "Validating…"
+        } else {
+            "Saving…"
+        }
+        .to_owned();
+        let draft = self.scripts.draft.clone();
+        let epoch = self.scripts.load_epoch;
+        let _task = context.spawn_background(move |_| {
+            Message::ScriptSaved(
+                epoch,
+                dry_run,
+                client::block_on(async {
+                    client::save_script(&data_dir, project, path, revision, draft, dry_run)
+                        .await
+                        .map_err(|error| error.to_string())
+                }),
+            )
+        });
+    }
+
     fn load_rules(&mut self, context: &ComponentContext<Self>) {
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
@@ -384,6 +538,7 @@ impl DesktopApp {
             let mut namespaces = Vec::new();
             client::block_on(async {
                 namespaces.push((
+                    None,
                     "Global rules".to_owned(),
                     client::list_rules(&data_dir, None)
                         .await
@@ -393,7 +548,7 @@ impl DesktopApp {
                     let page = client::list_rules(&data_dir, Some(project.clone()))
                         .await
                         .map_err(|error| error.to_string());
-                    namespaces.push((format!("Project {project}"), page));
+                    namespaces.push((Some(project.clone()), format!("Project {project}"), page));
                 }
             });
             Message::RulesLoaded(epoch, namespaces)
@@ -790,6 +945,48 @@ fn effective_summary(reply: &AgentGetResponse) -> String {
     summary
 }
 
+/// Follow a `timer.run` command to its Run child and wait (bounded,
+/// cancellable) until that command is terminal. The timeout, custody and
+/// unknown outcome are the daemon's; this only reads them.
+fn settle_run(data_dir: &Path, parent: Command, cancelled: &dyn Fn() -> bool) -> Fallible<Command> {
+    const POLL_MS: u64 = 1_000;
+    const MAX_POLLS: usize = 15 * 60;
+    let mut watched = parent;
+    for _ in 0..MAX_POLLS {
+        if cancelled() {
+            return Err(
+                "stopped waiting (window closed or cancelled); the Run continues in the daemon"
+                    .to_owned(),
+            );
+        }
+        if watched.verb != "run" {
+            let children = client::block_on(client::command_children(data_dir, &watched.id))
+                .map_err(|error| error.to_string())?;
+            if let Some(run) = children.into_iter().find(|child| child.verb == "run") {
+                watched = run;
+                continue;
+            }
+        }
+        if scripts::is_terminal(watched.state) && watched.verb == "run" {
+            return Ok(watched);
+        }
+        if scripts::is_terminal(watched.state) && watched.verb != "run" {
+            // A refused or settled timer occurrence without a Run child.
+            return Ok(watched);
+        }
+        if !feed::backoff(POLL_MS, cancelled) {
+            continue;
+        }
+        watched = client::block_on(client::read_command(data_dir, &watched.id))
+            .map_err(|error| error.to_string())?;
+    }
+    Err(format!(
+        "still {} after 15 minutes; the outcome stays with the daemon (command {})",
+        format!("{:?}", watched.state).to_lowercase(),
+        watched.id
+    ))
+}
+
 fn submit_note(reply: &CommandSubmitResponse) -> String {
     format!("{:?}", reply.state).to_lowercase()
 }
@@ -836,6 +1033,7 @@ impl Component for DesktopApp {
             expanded: HashSet::new(),
             unseen: 0,
             end_anchor: ElementRef::new(),
+            composer_ref: ElementRef::new(),
             pending_local: None,
             drafts: DraftStore::default(),
             ledger: MutationLedger::default(),
@@ -861,6 +1059,7 @@ impl Component for DesktopApp {
             rules: Vec::new(),
             rules_status: String::new(),
             rules_epoch: 0,
+            scripts: ScriptsEditor::default(),
         };
         if let Ok(data_dir) = app.data_dir.clone() {
             let _task = context.spawn_background(move |_| {
@@ -875,7 +1074,9 @@ impl Component for DesktopApp {
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
         match message {
             Message::ComposerChanged(text) => {
-                let text = profiles::normalize_newlines(&text);
+                // Keep the text exactly as the TextBox reports it: a normalized
+                // copy would differ, be written back, and move the caret (or end
+                // an IME composition). Line endings are normalized at submission.
                 if let Some(agent) = self.selected_agent_id() {
                     self.drafts.set(&agent, text);
                 } else {
@@ -933,6 +1134,13 @@ impl Component for DesktopApp {
                         }
                         // Never point the native SelectedIndex at a row this same
                         // render adds: highlight a new row on the next tick.
+                        // Reactor 0.100.0 applies the SelectedIndex before the
+                        // new item reaches the ListView; WinUI rejects it with
+                        // E_INVALIDARG (0x80070057), which Reactor treats as a
+                        // fatal native command failure and the process aborts
+                        // with 0xC0000409. A standalone repro on 2026-11-14
+                        // aborted on the first same-update select and stayed up
+                        // through repeated next-tick selects.
                         match index {
                             Some(index) if index >= published => {
                                 self.agent_idx = None;
@@ -995,6 +1203,8 @@ impl Component for DesktopApp {
                 }
             }
             Message::NewConversation => {
+                // Keyboard focus goes back to the composer (no-op while it is unbound).
+                let _ = self.composer_ref.request_focus();
                 // Leave the conversation locally; the Agent keeps running.
                 self.epoch += 1;
                 if let Some(task) = self.live_task.take() {
@@ -1202,7 +1412,7 @@ impl Component for DesktopApp {
                         return;
                     }
                 };
-                let text = self.launch_text.clone();
+                let text = profiles::normalize_newlines(&self.launch_text);
                 if text.trim().is_empty() || self.workspace.trim().is_empty() {
                     self.set_status("Type the workspace and the first message before launching.");
                     return;
@@ -1239,6 +1449,8 @@ impl Component for DesktopApp {
                 });
             }
             Message::LaunchSubmitted(outcome) => {
+                // Keyboard focus goes back to the composer (no-op while it is unbound).
+                let _ = self.composer_ref.request_focus();
                 self.settle_mutation(outcome.is_ok());
                 match outcome {
                     Ok(outcome) => {
@@ -1283,7 +1495,7 @@ impl Component for DesktopApp {
                     self.set_status("Select an Agent first.");
                     return;
                 };
-                let text = self.drafts.get(&agent.id).to_owned();
+                let text = profiles::normalize_newlines(self.drafts.get(&agent.id));
                 if text.trim().is_empty() {
                     self.set_status("Type a message before sending.");
                     return;
@@ -1329,6 +1541,8 @@ impl Component for DesktopApp {
                 });
             }
             Message::SendSubmitted(outcome) => {
+                // Keyboard focus goes back to the composer (no-op while it is unbound).
+                let _ = self.composer_ref.request_focus();
                 self.settle_mutation(outcome.is_ok());
                 match outcome {
                     Ok(outcome) => {
@@ -1490,6 +1704,12 @@ impl Component for DesktopApp {
                         self.load_profile_list(context);
                     }
                     Screen::Automation => self.load_rules(context),
+                    Screen::Scripts => {
+                        if !self.scripts.listed {
+                            self.load_scripts(context);
+                        }
+                        self.load_rules(context);
+                    }
                     _ => {}
                 }
             }
@@ -1614,6 +1834,7 @@ impl Component for DesktopApp {
                         let source = profiles::normalize_newlines(&read.source.unwrap_or_default());
                         self.editor.revision = read.revision;
                         self.editor.base = source.clone();
+                        self.editor.view = source.clone();
                         self.editor.draft = source;
                         self.editor.editable = read.editable;
                         self.editor.reason = read.reason;
@@ -1636,6 +1857,7 @@ impl Component for DesktopApp {
             Message::ProfilesDraftChanged(text) => {
                 if self.editor.editable && !self.editor.busy {
                     self.editor.draft = profiles::normalize_newlines(&text);
+                    self.editor.view = text;
                 }
             }
             Message::ProfileEditSelected(index) => {
@@ -1650,7 +1872,10 @@ impl Component for DesktopApp {
                 {
                     let value = Some(value.trim()).filter(|value| !value.is_empty());
                     match profiles::set_field(&self.editor.draft, &name, key, value) {
-                        Ok(draft) => self.editor.draft = draft,
+                        Ok(draft) => {
+                            self.editor.view = draft.clone();
+                            self.editor.draft = draft;
+                        }
                         Err(error) => self.editor.status = error,
                     }
                 }
@@ -1661,6 +1886,7 @@ impl Component for DesktopApp {
                     let to = self.editor.duplicate_name.trim().to_owned();
                     match profiles::duplicate(&self.editor.draft, &from, &to) {
                         Ok(draft) => {
+                            self.editor.view = draft.clone();
                             self.editor.draft = draft;
                             self.editor.selected = Some(to.clone());
                             self.editor.duplicate_name.clear();
@@ -1702,6 +1928,14 @@ impl Component for DesktopApp {
                             "Save outcome uncertain; Reload to see the current file (the draft is kept): {error}"
                         );
                     }
+                    Err(error) if error.starts_with("conflict:") => {
+                        // The file changed on disk under this draft: nothing
+                        // was written by this save, and Reload would discard
+                        // the draft, so say both.
+                        self.editor.status = format!(
+                            "Not saved: config.toml changed on disk after this draft was read. Copy what you need from the draft, then Reload to edit the current file. ({error})"
+                        );
+                    }
                     Err(error) => {
                         self.editor.status = format!(
                             "{} The draft is kept and the saved file is unchanged: {error}",
@@ -1721,7 +1955,8 @@ impl Component for DesktopApp {
                 }
                 self.rules = namespaces
                     .into_iter()
-                    .map(|(label, page)| RuleNamespace {
+                    .map(|(project, label, page)| RuleNamespace {
+                        project,
                         label,
                         more: page.as_ref().is_ok_and(|(_, more)| *more),
                         rules: page.map(|(rules, _)| rules),
@@ -1735,6 +1970,225 @@ impl Component for DesktopApp {
                 self.rules_status = format!("{count} rule(s) and timer(s) read.");
             }
             Message::AutomationRefreshRequested => self.load_rules(context),
+            Message::ScriptsRefreshRequested => {
+                self.load_scripts(context);
+                self.load_rules(context);
+            }
+            Message::ScriptsListed(result) => {
+                self.scripts.listed = true;
+                match result {
+                    Ok(list) => {
+                        let previous = self.selected_script();
+                        self.scripts.unavailable = list
+                            .roots
+                            .iter()
+                            .filter_map(|root| {
+                                root.reason.as_ref().map(|reason| {
+                                    format!(
+                                        "{}: {reason}",
+                                        root.project.as_deref().unwrap_or("global")
+                                    )
+                                })
+                            })
+                            .collect();
+                        self.scripts.entries = list
+                            .roots
+                            .into_iter()
+                            .flat_map(|root| {
+                                let project = root.project;
+                                root.entries
+                                    .into_iter()
+                                    .map(move |entry| (project.clone(), entry.path, entry.size))
+                            })
+                            .collect();
+                        // Keep the selection by identity, not by index.
+                        self.scripts.selected = previous.and_then(|(project, path)| {
+                            self.scripts
+                                .entries
+                                .iter()
+                                .position(|(p, e, _)| *p == project && *e == path)
+                        });
+                        if self.scripts.selected.is_none() {
+                            self.clear_script_editor();
+                        }
+                        self.scripts.status =
+                            format!("{} script entr(ies) listed.", self.scripts.entries.len());
+                    }
+                    Err(error) => self.scripts.status = format!("script.list failed: {error}"),
+                }
+            }
+            Message::ScriptSelected(index) => {
+                if index.is_some() && index != self.scripts.selected {
+                    if self.scripts.draft != self.scripts.base {
+                        self.scripts.status =
+                            "The draft has unsaved edits: Save or Reload it before opening another entry.".to_owned();
+                        return;
+                    }
+                    self.scripts.selected = index;
+                    self.clear_script_editor();
+                    self.load_script(context);
+                }
+            }
+            Message::ScriptLoaded(epoch, result) => {
+                if epoch != self.scripts.load_epoch {
+                    return;
+                }
+                self.scripts.busy = false;
+                match result {
+                    Ok(read) => {
+                        let text = profiles::normalize_newlines(&read.content.unwrap_or_default());
+                        self.scripts.revision = Some(read.revision);
+                        self.scripts.display_path = Some(read.display_path);
+                        self.scripts.base = text.clone();
+                        self.scripts.view = text.clone();
+                        self.scripts.draft = text;
+                        self.scripts.editable = read.editable;
+                        self.scripts.reason = read.reason;
+                    }
+                    Err(error) => {
+                        self.scripts.editable = false;
+                        self.scripts.reason = Some(format!("script.read failed: {error}"));
+                    }
+                }
+            }
+            Message::ScriptDraftChanged(text) => {
+                if self.scripts.editable && !self.scripts.busy {
+                    self.scripts.draft = profiles::normalize_newlines(&text);
+                    self.scripts.view = text;
+                }
+            }
+            Message::ScriptValidateRequested => self.save_script(context, true),
+            Message::ScriptSaveRequested => self.save_script(context, false),
+            Message::ScriptSaved(epoch, dry_run, result) => {
+                // A save for an entry that is no longer loaded changes nothing here.
+                if epoch != self.scripts.load_epoch {
+                    return;
+                }
+                self.scripts.busy = false;
+                match result {
+                    Ok(_) if dry_run => {
+                        self.scripts.status =
+                            "Valid: the daemon accepts this text for the entry. Not saved yet; nothing ran.".to_owned();
+                    }
+                    Ok(reply) => {
+                        self.scripts.status = format!(
+                            "Saved revision {}; nothing ran. A Run admitted before this save fails its digest check instead of running the new text.",
+                            &reply.revision[..12]
+                        );
+                        self.load_script(context);
+                    }
+                    Err(error) if error.starts_with("conflict:") => {
+                        self.scripts.status = format!(
+                            "Not saved: the script changed on disk after it was read. Copy what you need from the draft, then Reload. ({error})"
+                        );
+                    }
+                    Err(error) if error.starts_with("unknown:") => {
+                        self.scripts.status = format!(
+                            "Save outcome uncertain; Reload to see the current file (the draft is kept): {error}"
+                        );
+                    }
+                    Err(error) => {
+                        self.scripts.status = format!(
+                            "{} The draft is kept and the file is unchanged: {error}",
+                            if dry_run { "Invalid." } else { "Not saved." }
+                        );
+                    }
+                }
+            }
+            Message::ScriptReloadRequested => {
+                self.scripts.status = "Reloaded the saved script.".to_owned();
+                self.load_script(context);
+            }
+            Message::EditorPathChanged(text) => self.scripts.editor_exe = text,
+            Message::OpenInEditorRequested => {
+                let path = self.scripts.display_path.clone();
+                match (scripts::editor_executable(&self.scripts.editor_exe), path) {
+                    (Ok(editor), Some(path)) => {
+                        // Literal argv, no shell and no file association; the
+                        // editor gets no Eliot credentials from this window.
+                        let mut command = scripts::editor_command(&editor, &path);
+                        self.scripts.status = match command.spawn() {
+                            Ok(child) => format!(
+                                "Opened {path} in {} (pid {}). Reload here after saving in the editor.",
+                                editor.display(),
+                                child.id()
+                            ),
+                            Err(error) => format!("The editor did not start: {error}"),
+                        };
+                    }
+                    (Err(error), _) => self.scripts.status = format!("Open in editor: {error}."),
+                    (_, None) => self.scripts.status = "Select a script first.".to_owned(),
+                }
+            }
+            Message::ScriptRunRequested(rule) => {
+                if self.submitting() || self.scripts.run_busy {
+                    return;
+                }
+                let (Ok(data_dir), Some((project, _))) =
+                    (self.data_dir.clone(), self.selected_script())
+                else {
+                    return;
+                };
+                // One ULID per Run click; an uncertain reply keeps the key so
+                // a retry reuses the same id and the daemon deduplicates it.
+                let key = format!("timer.run:{project:?}:{rule}:{}", self.scripts.run_seq);
+                let mutation_id = self.ledger.id_for(&key);
+                self.in_flight_key = Some(key);
+                self.scripts.run_busy = true;
+                self.scripts.run_status = format!("Submitting timer {rule} ({mutation_id})…");
+                let _task = context.spawn_background(move |_| {
+                    Message::ScriptRunSubmitted(client::block_on(async {
+                        client::run_timer(&data_dir, mutation_id, project, &rule)
+                            .await
+                            .map_err(|error| error.to_string())
+                    }))
+                });
+            }
+            Message::ScriptRunSubmitted(result) => {
+                // Only an uncertain reply keeps the key (so a retry reuses the id);
+                // a definite refusal ends that action.
+                let uncertain = result.as_ref().err().is_some_and(|error| {
+                    error.starts_with("unknown:") || error.starts_with("unavailable:")
+                });
+                self.settle_mutation(!uncertain);
+                if result.is_err() && !uncertain {
+                    self.scripts.run_seq += 1;
+                }
+                match result {
+                    Ok(command) => {
+                        self.scripts.run_seq += 1;
+                        self.scripts.run_status = format!(
+                            "Admitted {} ({}); waiting for the daemon's outcome…",
+                            command.id,
+                            format!("{:?}", command.state).to_lowercase()
+                        );
+                        let Ok(data_dir) = self.data_dir.clone() else {
+                            return;
+                        };
+                        let _task = context.spawn_background(move |cancel| {
+                            let cancelled = || cancel.is_cancelled();
+                            Message::ScriptRunSettled(settle_run(&data_dir, command, &cancelled))
+                        });
+                    }
+                    Err(error) => {
+                        self.scripts.run_busy = false;
+                        self.scripts.run_status = if uncertain {
+                            format!(
+                                "Run outcome uncertain (Run again reuses its id, so it cannot run twice): {error}"
+                            )
+                        } else {
+                            format!("Run refused: {error}")
+                        };
+                    }
+                }
+            }
+            Message::ScriptRunSettled(result) => {
+                self.scripts.run_busy = false;
+                self.scripts.run_status = match result {
+                    Ok(command) => scripts::outcome_line(&command),
+                    Err(error) => format!("Run outcome not read: {error}"),
+                };
+            }
             Message::MonitorToggled(open) => {
                 self.monitor_open = open;
                 if open {
@@ -1856,6 +2310,7 @@ impl Component for DesktopApp {
             .children((
                 TextBlock::new()
                     .text("Swarm Desktop")
+                    .automation_heading_level(AutomationHeadingLevel::Level1)
                     .font_size(theme::type_scale::TITLE)
                     .font_weight(FontWeight::BOLD),
                 ToggleButton::new()
@@ -1879,6 +2334,13 @@ impl Component for DesktopApp {
                         context.callback(|_: bool| Message::ScreenSelected(Screen::Automation)),
                     )
                     .content(TextBlock::new().text("Automation")),
+                ToggleButton::new()
+                    .is_checked(self.screen == Screen::Scripts)
+                    .automation_name("Scripts screen")
+                    .on_is_checked_changed(
+                        context.callback(|_: bool| Message::ScreenSelected(Screen::Scripts)),
+                    )
+                    .content(TextBlock::new().text("Scripts")),
                 ToggleButton::new()
                     .is_checked(self.monitor_open)
                     .automation_name("Monitor")
@@ -1927,6 +2389,7 @@ impl Component for DesktopApp {
                         &self.rules_status,
                         context.message(Message::AutomationRefreshRequested),
                     ),
+                    Screen::Scripts => self.scripts_view(context),
                 },
                 monitor_pane,
             ));
@@ -1996,6 +2459,65 @@ impl DesktopApp {
         )
     }
 
+    /// Timers whose run action names the selected script.
+    fn script_timers(&self) -> Vec<String> {
+        let Some((project, path)) = self.selected_script() else {
+            return Vec::new();
+        };
+        self.rules
+            .iter()
+            .filter(|namespace| namespace.project == project)
+            .filter_map(|namespace| namespace.rules.as_ref().ok())
+            .flat_map(|rules| scripts::running_timers(rules, project.as_deref(), &path))
+            .collect()
+    }
+
+    fn scripts_view(&self, context: &mut ViewContext<Self>) -> View {
+        let timers = self.script_timers();
+        let editor = &self.scripts;
+        let data = config_view::ScriptsData {
+            labels: editor
+                .entries
+                .iter()
+                .map(|(project, path, size)| {
+                    format!(
+                        "{}: {path} ({size} B)",
+                        project.as_deref().unwrap_or("global")
+                    )
+                })
+                .collect(),
+            unavailable: &editor.unavailable,
+            selected: editor.selected,
+            display_path: editor.display_path.as_deref(),
+            revision: editor.revision.as_deref(),
+            editable: editor.editable,
+            reason: editor.reason.as_deref(),
+            view: &editor.view,
+            dirty: editor.draft != editor.base,
+            timers: &timers,
+            editor_exe: &editor.editor_exe,
+            status: &editor.status,
+            run_status: &editor.run_status,
+            busy: editor.busy,
+            run_busy: editor.run_busy || self.submitting(),
+        };
+        let actions = config_view::ScriptsActions {
+            select: context.callback(Message::ScriptSelected),
+            draft_changed: context.callback(Message::ScriptDraftChanged),
+            validate: context.message(Message::ScriptValidateRequested),
+            save: context.message(Message::ScriptSaveRequested),
+            reload: context.message(Message::ScriptReloadRequested),
+            refresh: context.message(Message::ScriptsRefreshRequested),
+            editor_changed: context.callback(Message::EditorPathChanged),
+            open_editor: context.message(Message::OpenInEditorRequested),
+            run: timers
+                .iter()
+                .map(|timer| context.message(Message::ScriptRunRequested(timer.clone())))
+                .collect(),
+        };
+        config_view::scripts_screen(data, actions)
+    }
+
     fn profiles_view(&self, context: &mut ViewContext<Self>) -> View {
         let list = self.profile_list.as_ref();
         let data = ProfilesData {
@@ -2005,6 +2527,7 @@ impl DesktopApp {
             editable: self.editor.editable,
             reason: self.editor.reason.as_deref(),
             draft: &self.editor.draft,
+            view: &self.editor.view,
             dirty: self.editor.draft != self.editor.base,
             selected: self.editor.selected.as_deref(),
             duplicate_name: &self.editor.duplicate_name,
@@ -2046,17 +2569,22 @@ impl DesktopApp {
             .map(|agent| {
                 KeyedView::new(
                     agent.id.clone(),
-                    ListViewItem::new().content(
-                        StackPanel::new().spacing(2.0).children((
-                            TextBlock::new()
-                                .text(format!("{} · {}", agent.id, agent.state))
-                                .font_weight(FontWeight::SEMI_BOLD),
-                            TextBlock::new()
-                                .text(format!("{} · gen {}", agent.harness, agent.generation))
-                                .font_size(theme::type_scale::LABEL)
-                                .opacity(theme::MUTED_OPACITY),
-                        )),
-                    ),
+                    ListViewItem::new()
+                        .automation_name(format!(
+                            "Agent {}, {}, {}, generation {}",
+                            agent.id, agent.state, agent.harness, agent.generation
+                        ))
+                        .content(
+                            StackPanel::new().spacing(2.0).children((
+                                TextBlock::new()
+                                    .text(format!("{} · {}", agent.id, agent.state))
+                                    .font_weight(FontWeight::SEMI_BOLD),
+                                TextBlock::new()
+                                    .text(format!("{} · gen {}", agent.harness, agent.generation))
+                                    .font_size(theme::type_scale::LABEL)
+                                    .opacity(theme::MUTED_OPACITY),
+                            )),
+                        ),
                 )
             })
             .collect();
@@ -2174,6 +2702,7 @@ impl DesktopApp {
             .automation_name("Workspace")
             .on_text_changed(context.callback(Message::WorkspaceChanged));
         let refresh = Button::new()
+            .automation_name("Refresh")
             .on_click(context.message(Message::RefreshRequested))
             .content(TextBlock::new().text("Refresh"));
         let new_chat = Button::new()
@@ -2388,9 +2917,10 @@ impl DesktopApp {
             .keyed_children(pending_rows);
 
         let composer = TextBox::new()
+            .element_ref(&self.composer_ref)
             .text(self.composer_text())
             .placeholder_text(if self.selected_agent_id().is_some() {
-                "Message the selected Agent… (Ctrl+Enter sends)"
+                "Message the selected Agent…"
             } else {
                 "First message for a new Agent…"
             })
@@ -2410,17 +2940,14 @@ impl DesktopApp {
             Button::new()
                 .resource_overrides(theme::winui::primary_button(self.dark_accent))
                 .is_enabled(!self.submitting())
-                .key_accelerators(KeyAccelerators::new([KeyAccelerator::new(
-                    AcceleratorKey::Enter,
-                    AcceleratorModifiers::Control,
-                    context.message(Message::SendRequested),
-                )]))
+                .automation_name(if busy_turn { "Queue" } else { "Send" })
                 .on_click(context.message(Message::SendRequested))
                 .content(TextBlock::new().text(if busy_turn { "Queue" } else { "Send" }))
         } else {
             Button::new()
                 .resource_overrides(theme::winui::primary_button(self.dark_accent))
                 .is_enabled(!self.submitting())
+                .automation_name("Launch Agent")
                 .on_click(context.message(Message::LaunchRequested))
                 .content(TextBlock::new().text("Launch Agent"))
         };

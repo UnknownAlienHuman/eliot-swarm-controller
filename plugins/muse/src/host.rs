@@ -1047,9 +1047,40 @@ impl MusePlugin {
                 "Muse command was already dispatched without a retained exact outcome",
             ));
         }
-        let event_status = session.events.status();
+        // A fresh send has no native effect yet. Serialize this check behind
+        // the event actor's queued facts/terminal commit, rather than using
+        // its potentially older watch snapshot. A durable terminal recovered
+        // after projection loss does not restore the live source.
+        let event_status = match session
+            .events
+            .view_readback(
+                session
+                    .session_id
+                    .clone()
+                    .ok_or_else(|| Error::new("unknown", "Muse session identity is unresolved"))?,
+                None,
+            )
+            .await
+        {
+            Ok(status) => status,
+            Err(_) => {
+                session
+                    .command_inputs
+                    .insert(params.command_id.clone(), text.to_owned());
+                session.rejected_commands.insert(params.command_id.clone());
+                return Ok(rejected_control(
+                    "Muse native observation is unresolved; turn/start was not dispatched",
+                ));
+            }
+        };
         if let Some(reason) = event_status.failure {
-            return Err(Error::new("unknown", reason));
+            session
+                .command_inputs
+                .insert(params.command_id.clone(), text.to_owned());
+            session.rejected_commands.insert(params.command_id.clone());
+            return Ok(rejected_control(&format!(
+                "{reason}; turn/start was not dispatched"
+            )));
         }
         if event_status.active_turn_id.is_some() {
             return Err(Error::new("busy", "Muse already has an active turn"));
@@ -1073,6 +1104,14 @@ impl MusePlugin {
             .effort_override
             .clone()
             .or_else(|| session.selected_effort.clone());
+        // What the native turn request actually carries, reported through
+        // the turn association only under a `configure` overlay; plain
+        // sends keep their exact event shape.
+        let sent_effort = params
+            .config_revision
+            .is_some()
+            .then(|| effort.clone())
+            .flatten();
         let turn_params = Self::turn_start_params(
             native_command_id.clone(),
             session
@@ -1111,10 +1150,11 @@ impl MusePlugin {
                     "reason": "Muse turn/start frame exceeded the native transport bound before dispatch",
                 }));
             }
-            Err(_) => {
+            Err(error) => {
                 session.unknown_commands.insert(command_id);
                 session.phase = SessionPhase::Unknown;
-                return Err(Error::new(
+                return Err(contextual_error(
+                    error,
                     "unknown",
                     "Muse turn/start may have applied; the input will not be repeated",
                 ));
@@ -1163,7 +1203,12 @@ impl MusePlugin {
             .insert(command_id.clone(), turn_id.clone());
         if session
             .events
-            .associate_turn(command_id.clone(), turn_id.clone(), params.context.clone())
+            .associate_turn(
+                command_id.clone(),
+                turn_id.clone(),
+                params.context.clone(),
+                sent_effort.clone(),
+            )
             .await
             .is_err()
         {

@@ -1197,6 +1197,80 @@ impl Store {
         Ok((owners, usize::try_from(total.max(0)).unwrap_or(0)))
     }
 
+    /// Liveness inputs for one retained unknown command's generation: whether
+    /// Store custody still shows a live owned process or an open non-daemon
+    /// source at exactly this Agent generation. The daemon adds its own
+    /// plugin-reader and active-turn checks before retiring the drain wait.
+    /// Exact generation match only: a new generation's reader or child never
+    /// backs a fenced generation's unknown.
+    pub fn generation_liveness(&self, agent: &str, generation: i64) -> Result<GenerationLiveness> {
+        let agent_num = parse_agent_id(agent)?;
+        let live_process: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM processes WHERE owner IN (?1, ?2) AND state IN ('running','unknown'))",
+                params![
+                    format!("agent:{agent}#{generation}"),
+                    format!("workspace:{agent}#{generation}")
+                ],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        let open_source: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM source_state WHERE agent = ?1 AND generation = ?2
+                 AND source NOT IN ('daemon','os','git','workspace_process') AND state = 'open')",
+                params![agent_num, generation],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        Ok(GenerationLiveness {
+            live_process,
+            open_source,
+        })
+    }
+
+    /// Last retained-event watermark for status and retention readback: the
+    /// same `rule_history_coverage.pruned_through` the event bounds report.
+    pub fn retention_watermark(&self) -> Result<i64> {
+        retention::coverage_pruned_through(&self.connection)
+    }
+
+    /// Bounded page of stored-`unknown` command ids, newest first, with the
+    /// exact total. Lets drain classification cover unknowns the daemon never
+    /// saw dispatched (for example across a restart, where the in-memory
+    /// unknown cache starts empty) without an unbounded scan. Callers that
+    /// need more than the page must keep the unclassified remainder blocking:
+    /// an unlisted id is never silently excused.
+    pub fn list_unknown_command_ids_page(&self, limit: usize) -> Result<(Vec<String>, usize)> {
+        validate_limit(limit)?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM commands WHERE state = 'unknown' ORDER BY rowid DESC LIMIT ?1")
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([limit as i64], |row| row.get(0))
+            .map_err(sql_error)?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row.map_err(sql_error)?);
+        }
+        let total: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM commands WHERE state = 'unknown'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        Ok((
+            ids,
+            usize::try_from(total.max(0))
+                .map_err(|_| Error::new("internal", "unknown command count is invalid"))?,
+        ))
+    }
+
     /// Return unsettled commands without letting terminal history consume the limit.
     pub fn list_unsettled_commands(&self, limit: usize) -> Result<Vec<Command>> {
         validate_limit(limit)?;
@@ -3173,6 +3247,15 @@ pub struct LiveProcessOwner {
     pub agent: String,
     pub generation: i64,
     pub workspace: bool,
+}
+
+/// Whether Store custody still backs one Agent generation: a live owned
+/// process record or an open non-daemon source row at exactly that
+/// generation. Anything else (closed sources, exited processes, other
+/// generations) is not backing.
+pub struct GenerationLiveness {
+    pub live_process: bool,
+    pub open_source: bool,
 }
 
 /// Parse a stored process owner (`agent:<id>#<generation>` or

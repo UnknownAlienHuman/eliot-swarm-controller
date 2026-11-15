@@ -142,6 +142,10 @@ control commands reject as well. Detach closes only owned reader resources and s
 lifecycle; it preserves the canonical native subject, history and unknown native state.
 A detached unknown row with closed sources is not a live controlled-Agent drain blocker.
 Unresolved transitions and owned reader custody still block clean drain as appropriate.
+The same rule covers the command side: a stored `unknown` command with no live
+process, turn or reader behind its generation (for example an observer attach
+fenced by a later detach) does not block drain; the drain receipt lists it as
+retained-unresolved instead, and the stored outcome stays `unknown`.
 
 Compute `apply(state,input) -> (next_state,effects)` without I/O or mutating published
 state. Store commits event, next projection and derived facts atomically, then publishes.
