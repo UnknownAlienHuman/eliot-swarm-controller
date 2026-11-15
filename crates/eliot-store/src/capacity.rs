@@ -1,6 +1,6 @@
 //! Durable Store reservations for configured live Agent capacity.
 use super::*;
-use eliot_core::CapacityScope;
+use eliot_core::{CapacityScope, ScriptCustody};
 
 const MIGRATION_BATCH_SIZE: i64 = 128;
 const RETAINED_PAGE_SIZE: i64 = 128;
@@ -206,6 +206,11 @@ impl Store {
             .map_err(sql_error)?;
             let mut events = Vec::new();
             if release_proven_generation_tx(&tx, agent_num, generation)? {
+                let custody = if orphan_possible {
+                    ScriptCustody::Degraded
+                } else {
+                    ScriptCustody::Exact
+                };
                 events.push(insert_daemon_event(
                     &tx,
                     now,
@@ -216,6 +221,7 @@ impl Store {
                     json!({
                         "reason": "restart_custody_closed",
                         "evidence": evidence,
+                        "custody": custody,
                         "orphan_possible": orphan_possible,
                         "processes": processes,
                     }),
@@ -457,6 +463,11 @@ pub(super) fn release_owned_exit_event_tx(
     if !release_owned_exit_tx(tx, agent, generation)? {
         return Ok(None);
     }
+    let (custody, orphan_possible) = if cfg!(windows) {
+        (ScriptCustody::Exact, false)
+    } else {
+        (ScriptCustody::Degraded, true)
+    };
     insert_daemon_event(
         tx,
         now,
@@ -464,7 +475,11 @@ pub(super) fn release_owned_exit_event_tx(
         "source",
         Some(agent),
         Some(generation),
-        json!({ "reason": reason }),
+        json!({
+            "reason": reason,
+            "custody": custody,
+            "orphan_possible": orphan_possible,
+        }),
     )
     .map(Some)
 }

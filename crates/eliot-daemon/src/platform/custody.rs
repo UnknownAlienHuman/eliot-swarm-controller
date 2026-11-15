@@ -658,6 +658,10 @@ mod named_job_tests {
             windows::named_job_closed(&name).expect("probe terminated job"),
             "terminated family must leave no named Job"
         );
+        assert!(
+            windows::terminate_named_generation_job(&name).expect("repeat named force"),
+            "an empty Job still held by its actor is an idempotent force"
+        );
         timeout(Duration::from_secs(10), child.wait())
             .await
             .expect("family deadline")

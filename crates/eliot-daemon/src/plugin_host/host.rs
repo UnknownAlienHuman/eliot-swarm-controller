@@ -121,6 +121,60 @@ struct AgentKey {
     generation: i64,
 }
 
+/// Own loss suppression until the force command's Store settlement commits.
+/// Actor teardown may finish first, so retain its proven loss for cancellation.
+pub(crate) struct ForceStopGuard {
+    state: Weak<HostState>,
+    key: AgentKey,
+    deferred_loss: Arc<AtomicBool>,
+    committed: bool,
+}
+
+impl ForceStopGuard {
+    // Caller holds the Store lock, also used by mark_lost_state.
+    #[cfg(any(windows, test))]
+    fn new(state: &Arc<HostState>, key: AgentKey) -> Result<Self> {
+        let deferred_loss = Arc::new(AtomicBool::new(false));
+        let mut planned = state.planned_stops.lock_recover();
+        if planned.contains_key(&key) {
+            return Err(Error::new("unknown", "force-stop is already settling"));
+        }
+        planned.insert(key.clone(), Arc::clone(&deferred_loss));
+        Ok(Self {
+            state: Arc::downgrade(state),
+            key,
+            deferred_loss,
+            committed: false,
+        })
+    }
+
+    pub(crate) fn finish(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ForceStopGuard {
+    fn drop(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        // Clear synchronously even when the enclosing future is cancelled.
+        // Only this attempt owns the entry; actor cleanup must not remove it.
+        state.planned_stops.lock_recover().remove(&self.key);
+        if !self.committed
+            && self.deferred_loss.load(Ordering::Acquire)
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let key = self.key.clone();
+            runtime.spawn(async move {
+                mark_lost_state(&Arc::downgrade(&state), &key).await;
+            });
+        }
+        // Without a runtime, the persisted exit/drain facts remain available
+        // to restart reconciliation; Drop must not panic trying to spawn.
+    }
+}
+
 struct RuntimeEntry {
     sender: mpsc::Sender<RuntimeMessage>,
     start_command_id: String,
@@ -165,6 +219,7 @@ struct HostState {
     progress: watch::Sender<u64>,
     late_batch_causes: Mutex<HashMap<AgentKey, String>>,
     running: Mutex<HashMap<AgentKey, RuntimeEntry>>,
+    planned_stops: Mutex<HashMap<AgentKey, Arc<AtomicBool>>>,
     startup_gate: AsyncMutex<()>,
     startup_closed: AtomicBool,
     observers: Mutex<HashMap<AgentKey, Arc<observation::ObserverEntry>>>,
@@ -287,6 +342,7 @@ impl PluginHost {
                 progress,
                 late_batch_causes: Mutex::new(HashMap::new()),
                 running: Mutex::new(HashMap::new()),
+                planned_stops: Mutex::new(HashMap::new()),
                 startup_gate: AsyncMutex::new(()),
                 startup_closed: AtomicBool::new(false),
                 observers: Mutex::new(HashMap::new()),
@@ -668,7 +724,30 @@ impl PluginHost {
         result.map_err(|error| diagnose_error(error, &stderr, &credentials))
     }
 
-    pub(crate) async fn stop(&self, agent: &Agent, command: Command, force: bool) -> Result<Value> {
+    pub(crate) async fn stop(
+        &self,
+        agent: &Agent,
+        command: Command,
+        force: bool,
+    ) -> Result<(Value, Option<ForceStopGuard>)> {
+        if command.verb != "stop"
+            || command.target.as_deref() != Some(agent.id.as_str())
+            || command.generation != Some(agent.generation)
+        {
+            return Err(Error::new(
+                "stale_generation",
+                "stop does not match the owned Agent generation",
+            ));
+        }
+        #[cfg(windows)]
+        if force {
+            return timeout_at(
+                Instant::now() + RPC_DEADLINE + STOP_GRACE + RPC_GRACE,
+                self.force_stop_generation(agent, &command),
+            )
+            .await
+            .map_err(|_| Error::new("unknown", "force-stop custody settlement timed out"))?;
+        }
         let key = AgentKey {
             id: agent.id.clone(),
             generation: agent.generation,
@@ -676,17 +755,6 @@ impl PluginHost {
         let (sender, stderr, credentials) = match self.sender(&key, "stop") {
             Ok(found) => found,
             Err(error) => {
-                if force && error.code == "not_found" {
-                    // No live runtime entry, but a fenced or stuck actor task
-                    // can still hold the generation Job open with tool
-                    // descendants alive. Terminate the named Job explicitly
-                    // so a forced stop leaves no owned family behind even
-                    // when there is no actor left to terminate. Best effort
-                    // and outcome-neutral: the original error still
-                    // describes the stop.
-                    self.terminate_orphaned_generation_job(agent, &command)
-                        .await;
-                }
                 return Err(if error.code == "not_found" {
                     // This exact-generation lookup happens before enqueue, so no
                     // native stop was dispatched for the missing runtime.
@@ -720,7 +788,9 @@ impl PluginHost {
                 "Agent plugin stop exceeded its absolute deadline",
             )),
         };
-        result.map_err(|error| diagnose_error(error, &stderr, &credentials))
+        result
+            .map(|value| (value, None))
+            .map_err(|error| diagnose_error(error, &stderr, &credentials))
     }
 
     /// Read one exact native turn through the owned plugin (`agent.snapshot`
@@ -1079,145 +1149,92 @@ impl PluginHost {
         self.state.secrets.lock_recover().remove(credential);
     }
 
-    /// Best-effort named-Job termination for a force-stop that found no live
-    /// runtime entry. A removed routing entry does not imply a closed Job: the
-    /// actor task can still own it while draining or stuck, keeping tool
-    /// descendants alive after the stop reports not_found. Missing name means
-    /// the generation already closed; anything else is swallowed so the
-    /// original stop outcome stands. A concurrent respawn creates the
-    /// generation Job before registering its running-map entry, so the kill
-    /// is skipped while the Store still shows a live driver for the exact
-    /// generation; the re-check afterwards only reports a race that already
-    /// happened. One bounded log line always names the agent, generation,
-    /// and outcome.
-    async fn terminate_orphaned_generation_job(&self, agent: &Agent, command: &Command) {
-        let generation = agent.generation.to_string();
-        #[cfg_attr(not(windows), allow(unused_mut))]
-        let mut ids = vec![
-            ("agent", agent.id.as_str()),
-            ("generation", generation.as_str()),
-        ];
-        #[cfg(windows)]
-        {
-            if self
-                .generation_driver_live(agent, command)
-                .await
-                .unwrap_or(false)
-            {
-                crate::logging::record(
-                    &SecretPolicy::default(),
-                    "orphaned_generation_job_skipped",
-                    &ids,
-                    None,
-                );
-                return;
-            }
-            let namespace = match self.state.store.lock().await.custody_namespace() {
-                Ok(namespace) => namespace,
-                Err(error) => {
-                    crate::logging::record(
-                        &SecretPolicy::default(),
-                        "orphaned_generation_job_skipped",
-                        &ids,
-                        Some(&error),
-                    );
-                    return;
-                }
-            };
-            let name = crate::platform::custody::agent_custody_name(
-                &namespace,
-                &agent.id,
-                agent.generation,
-            );
-            let kill = tokio::task::spawn_blocking(move || {
-                crate::platform::windows::terminate_named_generation_job(&name)
-            })
-            .await;
-            match kill {
-                Ok(Ok(true)) => {
-                    if self.controls_generation(&agent.id, agent.generation) {
-                        ids.push(("respawn_detected", "true"));
-                    }
-                    crate::logging::record(
-                        &SecretPolicy::default(),
-                        "orphaned_generation_job_terminated",
-                        &ids,
-                        None,
-                    );
-                }
-                Ok(Ok(false)) => {
-                    crate::logging::record(
-                        &SecretPolicy::default(),
-                        "orphaned_generation_job_absent",
-                        &ids,
-                        None,
-                    );
-                }
-                Ok(Err(error)) => {
-                    crate::logging::record(
-                        &SecretPolicy::default(),
-                        "orphaned_generation_job_kill_unknown",
-                        &ids,
-                        Some(&error),
-                    );
-                }
-                Err(join) => {
-                    crate::logging::record(
-                        &SecretPolicy::default(),
-                        "orphaned_generation_job_kill_unknown",
-                        &ids,
-                        Some(&Error::new("unknown", format!("orphan kill join: {join}"))),
-                    );
-                }
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (agent, command, ids);
-        }
-    }
-
-    /// True when the Store still shows a live driver for the exact
-    /// generation: an unsettled command naming this agent and generation,
-    /// other than this stop itself and other stops (which create no
-    /// family). A concurrent respawn dispatches before it creates the
-    /// generation Job, so a live driver means the named Job may be fresh
-    /// and the name-kill must wait for the live path. Truncation fails
-    /// safe toward skipping; a store error fails open here and is
-    /// re-decided at the namespace lookup below.
+    /// Force is a custody operation, independent of the plugin command queue.
+    /// Keep startup serialized through closure so a missing routing entry cannot
+    /// race a newly created Job. A fenced actor still drains its source after
+    /// the kernel terminates its family; neither EOF nor an absent name alone
+    /// permits an Applied result or capacity release.
     #[cfg(windows)]
-    async fn generation_driver_live(&self, agent: &Agent, command: &Command) -> Result<bool> {
-        const LIMIT: usize = 1000;
-        let store = self.state.store.lock().await;
-        let total = store.count_unsettled_commands()?;
-        let commands = store.list_unsettled_commands(LIMIT)?;
-        drop(store);
-        Ok(Self::generation_has_live_driver(
-            &commands, total, agent, command,
-        ))
-    }
-
-    /// Pure live-driver predicate: an unsettled command naming this agent
-    /// and generation, other than this stop itself and other stops (which
-    /// create no family). Unknown commands prove nothing live. A truncated
-    /// unsettled list cannot prove absence, so truncation counts as live.
-    #[cfg(any(windows, test))]
-    fn generation_has_live_driver(
-        commands: &[Command],
-        total_unsettled: i64,
+    async fn force_stop_generation(
+        &self,
         agent: &Agent,
         command: &Command,
-    ) -> bool {
-        if total_unsettled > commands.len() as i64 {
-            return true;
-        }
-        commands.iter().any(|other| {
-            other.id != command.id
-                && other.verb != "stop"
-                && other.state != eliot_core::CommandState::Unknown
-                && other.target.as_deref() == Some(agent.id.as_str())
-                && other.generation == Some(agent.generation)
+    ) -> Result<(Value, Option<ForceStopGuard>)> {
+        let _startup = self.state.startup_gate.lock().await;
+        let key = AgentKey {
+            id: agent.id.clone(),
+            generation: agent.generation,
+        };
+        let (namespace, guard) = {
+            let store = self.state.store.lock().await;
+            let current = store
+                .get_agent(&agent.id)?
+                .ok_or_else(|| Error::new("not_found", "force-stop Agent was not found"))?;
+            let retained = store
+                .get_command(&command.id)?
+                .ok_or_else(|| Error::new("not_found", "force-stop command was not found"))?;
+            if current.generation != agent.generation
+                || current.observe_only
+                || retained.verb != "stop"
+                || retained.target.as_deref() != Some(agent.id.as_str())
+                || retained.generation != Some(agent.generation)
+                || retained.args.get("force").and_then(Value::as_bool) != Some(true)
+                || !matches!(
+                    retained.state,
+                    eliot_core::CommandState::Dispatched | eliot_core::CommandState::Unknown
+                )
+            {
+                return Err(Error::new(
+                    "stale_generation",
+                    "force-stop binding is no longer current",
+                ));
+            }
+            // Source EOF can remove routing before the actor finishes draining.
+            // Publish planned exit under the same Store lock used by loss
+            // settlement so it cannot turn this stop Unknown in that race.
+            let namespace = store.custody_namespace()?;
+            let guard = ForceStopGuard::new(&self.state, key)?;
+            (namespace, guard)
+        };
+        let name =
+            crate::platform::custody::agent_custody_name(&namespace, &agent.id, agent.generation);
+        tokio::task::spawn_blocking(move || {
+            crate::platform::windows::terminate_named_generation_job(&name)
         })
+        .await
+        .map_err(|_| Error::new("unknown", "force-stop Job termination task failed"))?
+        .map_err(|_| {
+            Error::new(
+                "unknown",
+                "force-stop could not verify an empty generation Job",
+            )
+        })?;
+        loop {
+            // The observer refreshes exact creation-time identities and closes
+            // OS custody only after a complete empty Job sample. Store requires
+            // all recorded processes exited AND the host reader-drain record.
+            self.state
+                .monitoring
+                .sample_generation(agent)
+                .await
+                .map_err(|_| Error::new("unknown", "force-stop process readback is unconfirmed"))?;
+            if self
+                .state
+                .store
+                .lock()
+                .await
+                .has_owned_exit_and_reader_drain(&agent.id, agent.generation)?
+            {
+                return Ok((
+                    json!({
+                        "state": "applied", "custody": "exact", "terminated": true,
+                        "graceful": false,
+                    }),
+                    Some(guard),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     async fn mark_reader_unavailable(&self, key: &AgentKey) {
@@ -3836,6 +3853,10 @@ async fn mark_lost_state(state: &Weak<HostState>, key: &AgentKey) {
     fence_runtime_generation(&state, key);
     {
         let mut store = state.store.lock().await;
+        if let Some(deferred) = state.planned_stops.lock_recover().get(key) {
+            deferred.store(true, Ordering::Release);
+            return;
+        }
         if let Ok(events) = store.mark_lost(&key.id, key.generation, now_ms()) {
             state.bus.publish(&events);
             note_unknown_commands(&state, &events);
@@ -4023,91 +4044,6 @@ mod tests {
         let steered = agent_command_params(&agent, &steer, None, Some(&config)).unwrap();
         assert!(steered.get("model_override").is_none());
         assert!(steered.get("config_revision").is_none());
-    }
-
-    #[test]
-    fn orphan_kill_skips_generations_with_a_live_driver() {
-        let mut agent = Agent::new("a9", "proj", "muse", "fake", 0);
-        agent.generation = 7;
-        let stop = Command {
-            id: "stop-1".to_owned(),
-            principal: "owner".to_owned(),
-            method: "command.submit".to_owned(),
-            verb: "stop".to_owned(),
-            target: Some("a9".to_owned()),
-            selector: None,
-            expected_generation: Some(7),
-            generation: Some(7),
-            args: json!({}),
-            state: CommandState::Dispatched,
-            turn_id: None,
-            request_id: None,
-            outcome: None,
-            created_at: 0,
-            updated_at: 0,
-            probe: false,
-            config_revision: 0,
-            config: None,
-        };
-        // Only our own stop unsettled: no driver, the name-kill proceeds.
-        assert!(!PluginHost::generation_has_live_driver(
-            std::slice::from_ref(&stop),
-            1,
-            &agent,
-            &stop
-        ));
-        // A concurrent resume for the exact generation may be creating the
-        // family right now: skip the name-kill.
-        let resume = Command {
-            id: "resume-1".to_owned(),
-            verb: "resume".to_owned(),
-            ..stop.clone()
-        };
-        assert!(PluginHost::generation_has_live_driver(
-            &[stop.clone(), resume.clone()],
-            2,
-            &agent,
-            &stop
-        ));
-        // Other generations, other agents, other stops, and unknown states
-        // prove no live driver.
-        let other_generation = Command {
-            generation: Some(6),
-            ..resume.clone()
-        };
-        let other_agent = Command {
-            target: Some("a4".to_owned()),
-            ..resume.clone()
-        };
-        let other_stop = Command {
-            id: "stop-2".to_owned(),
-            ..stop.clone()
-        };
-        let unknown = Command {
-            id: "resume-2".to_owned(),
-            state: CommandState::Unknown,
-            ..resume.clone()
-        };
-        for commands in [
-            vec![stop.clone(), other_generation],
-            vec![stop.clone(), other_agent],
-            vec![stop.clone(), other_stop],
-            vec![stop.clone(), unknown],
-            vec![stop.clone()],
-        ] {
-            let total = commands.len() as i64;
-            assert!(
-                !PluginHost::generation_has_live_driver(&commands, total, &agent, &stop),
-                "stale or foreign commands must not block the orphan kill"
-            );
-        }
-        // A truncated unsettled list cannot prove absence: fail safe.
-        assert!(PluginHost::generation_has_live_driver(
-            std::slice::from_ref(&stop),
-            2,
-            &agent,
-            &stop
-        ));
     }
 
     #[test]
@@ -5423,6 +5359,245 @@ mod tests {
             },
             start_id,
         )
+    }
+
+    async fn force_stop_fixture() -> (PluginHost, AgentKey, String) {
+        let (host, key, start_id) = source_exit_fixture("codex");
+        {
+            let mut store = host.state.store.lock().await;
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: Ulid::new().to_string(),
+                        agent_id: key.id.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        cursor: None,
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "session.ready".to_owned(),
+                            native_id: Ulid::new().to_string(),
+                            data: json!({"command_id":start_id}),
+                        }],
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store
+                .settle(&start_id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            let send_id = Ulid::new().to_string();
+            let mut send = SubmitCommand::new(&send_id, "send");
+            send.target = Some(key.id.clone());
+            send.expected_generation = Some(1);
+            send.args = json!({"text":"bounded regression task"});
+            store.submit("owner", send, now_ms()).unwrap();
+            store.dispatch(&send_id, now_ms()).unwrap();
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: Ulid::new().to_string(),
+                        agent_id: key.id.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        cursor: None,
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "turn.started".to_owned(),
+                            native_id: Ulid::new().to_string(),
+                            data: json!({"command_id":send_id, "turn_id":"force-turn"}),
+                        }],
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            assert_eq!(
+                store.get_agent(&key.id).unwrap().unwrap().state,
+                AgentState::Busy
+            );
+        }
+        let stop_id = Ulid::new().to_string();
+        {
+            let mut store = host.state.store.lock().await;
+            let mut stop = SubmitCommand::new(&stop_id, "stop");
+            stop.target = Some(key.id.clone());
+            stop.expected_generation = Some(1);
+            stop.args = json!({"force":true});
+            store.submit("owner", stop, now_ms()).unwrap();
+            store.dispatch(&stop_id, now_ms()).unwrap();
+        }
+        (host, key, stop_id)
+    }
+
+    async fn assert_force_loss(host: &PluginHost, key: &AgentKey, stop_id: &str) {
+        let store = host.state.store.lock().await;
+        let agent = store.get_agent(&key.id).unwrap().unwrap();
+        assert_eq!(agent.state, AgentState::Lost);
+        assert!(agent.active_turn.is_none());
+        assert!(agent.pending.is_empty());
+        assert_eq!(
+            store
+                .get_turn(&key.id, 1, "force-turn")
+                .unwrap()
+                .unwrap()
+                .state,
+            eliot_core::TurnState::Unknown
+        );
+        assert_eq!(
+            store.get_command(stop_id).unwrap().unwrap().state,
+            CommandState::Unknown
+        );
+        assert_eq!(
+            store
+                .read_events(0, 1000, None)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "agent.lost")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn force_guard_drop_outside_runtime_does_not_panic() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let (host, key, _) = source_exit_fixture("codex");
+        let guard = {
+            let _store = host.state.store.try_lock().unwrap();
+            ForceStopGuard::new(&host.state, key.clone()).unwrap()
+        };
+        guard.deferred_loss.store(true, Ordering::Release);
+        let deferred_loss = Arc::clone(&guard.deferred_loss);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guard)));
+
+        assert!(result.is_ok(), "dropping without a runtime must not panic");
+        assert!(!host.state.planned_stops.lock_recover().contains_key(&key));
+        assert!(deferred_loss.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn force_verification_timeout_then_late_proven_exit_settles_lost() {
+        let (host, key, stop_id) = force_stop_fixture().await;
+        let result = async {
+            let _guard = ForceStopGuard::new(&host.state, key.clone()).unwrap();
+            timeout_at(Instant::now(), std::future::pending::<()>()).await
+        }
+        .await;
+        assert!(result.is_err());
+        assert!(!host.state.planned_stops.lock_recover().contains_key(&key));
+        host.state
+            .store
+            .lock()
+            .await
+            .settle(&stop_id, CommandState::Unknown, None, now_ms())
+            .unwrap();
+        settle_drained_source_exit(&Arc::downgrade(&host.state), &key, true, true, "late_exit")
+            .await
+            .unwrap();
+        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        cleanup_actor(&Arc::downgrade(&host.state), &key, "", false).await;
+        assert_force_loss(&host, &key, &stop_id).await;
+    }
+
+    #[tokio::test]
+    async fn force_failure_reconciles_loss_deferred_before_actor_teardown() {
+        let (host, key, stop_id) = force_stop_fixture().await;
+        let guard = ForceStopGuard::new(&host.state, key.clone()).unwrap();
+        settle_drained_source_exit(&Arc::downgrade(&host.state), &key, true, true, "early_exit")
+            .await
+            .unwrap();
+        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        cleanup_actor(&Arc::downgrade(&host.state), &key, "", false).await;
+        assert!(host.state.planned_stops.lock_recover().contains_key(&key));
+        assert_eq!(
+            host.state
+                .store
+                .lock()
+                .await
+                .get_agent(&key.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentState::Busy
+        );
+        let mut progress = host.state.progress.subscribe();
+        drop(guard);
+        assert!(!host.state.planned_stops.lock_recover().contains_key(&key));
+        timeout_at(deadline(), progress.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_force_loss(&host, &key, &stop_id).await;
+    }
+
+    #[tokio::test]
+    async fn force_outer_cancellation_clears_marker() {
+        let (host, key, stop_id) = force_stop_fixture().await;
+        let mut force = Box::pin(async {
+            let _guard = ForceStopGuard::new(&host.state, key.clone()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        assert!(futures_util::poll!(&mut force).is_pending());
+        assert!(host.state.planned_stops.lock_recover().contains_key(&key));
+        // Drop the enclosing future, as the outer force deadline does.
+        drop(force);
+        assert!(!host.state.planned_stops.lock_recover().contains_key(&key));
+        assert_eq!(
+            host.state
+                .store
+                .lock()
+                .await
+                .get_agent(&key.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentState::Busy
+        );
+        settle_drained_source_exit(
+            &Arc::downgrade(&host.state),
+            &key,
+            true,
+            true,
+            "cancelled_exit",
+        )
+        .await
+        .unwrap();
+        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        assert_force_loss(&host, &key, &stop_id).await;
+    }
+
+    #[tokio::test]
+    async fn force_success_suppresses_loss_through_stop_commit() {
+        let (host, key, stop_id) = force_stop_fixture().await;
+        let guard = ForceStopGuard::new(&host.state, key.clone()).unwrap();
+        settle_drained_source_exit(&Arc::downgrade(&host.state), &key, true, true, "force_exit")
+            .await
+            .unwrap();
+        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        cleanup_actor(&Arc::downgrade(&host.state), &key, "", false).await;
+        assert!(host.state.planned_stops.lock_recover().contains_key(&key));
+        host.state
+            .store
+            .lock()
+            .await
+            .settle(&stop_id, CommandState::Applied, None, now_ms())
+            .unwrap();
+        guard.finish();
+        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        assert!(!host.state.planned_stops.lock_recover().contains_key(&key));
+        let store = host.state.store.lock().await;
+        assert_eq!(
+            store.get_agent(&key.id).unwrap().unwrap().state,
+            AgentState::Stopped
+        );
+        assert!(
+            store
+                .read_events(0, 1000, None)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "agent.lost")
+        );
     }
 
     #[tokio::test]

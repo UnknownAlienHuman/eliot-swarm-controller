@@ -1432,7 +1432,7 @@ impl Router {
             .stop(agent, dispatched.clone(), force)
             .await
         {
-            Ok(value) => {
+            Ok((value, force_stop)) => {
                 let mut summary = json!({
                     "state": "applied",
                     "custody": value.get("custody").cloned().unwrap_or(Value::Null),
@@ -1442,7 +1442,14 @@ impl Router {
                     summary["diagnostics"] = diagnostics.clone();
                 }
                 self.redact_native_value(&mut summary);
-                let _ = self.settle(id, CommandState::Applied, Some(summary)).await;
+                if self
+                    .settle(id, CommandState::Applied, Some(summary))
+                    .await
+                    .is_some_and(|command| command.state == CommandState::Applied)
+                    && let Some(guard) = force_stop
+                {
+                    guard.finish();
+                }
             }
             Err(error) => {
                 self.settle_plugin_error(id, &error).await;

@@ -800,13 +800,13 @@ impl Drop for Job {
     }
 }
 
-/// Terminate the named generation Job when its runtime entry is already gone.
+/// Terminate the exact named generation Job, independently of its runtime actor.
 /// A removed routing entry does not imply a closed Job: the actor task can
 /// still own it while draining or stuck, keeping tool descendants alive
 /// after a stop that reports `not_found`. Opening by name never adopts
 /// custody: a missing name means the generation already closed and there is
-/// nothing to terminate. Returns whether a live Job was terminated and
-/// observed empty within a bounded wait.
+/// nothing to terminate. Returns false only when the name is absent; a live
+/// Job must be observed empty within the bounded wait or the outcome is unknown.
 pub(crate) fn terminate_named_generation_job(name: &str) -> Result<bool> {
     let wide: Vec<u16> = OsStr::new(name).encode_wide().chain(Some(0)).collect();
     // JOB_OBJECT_TERMINATE (0x0008) plus the query-only rights from
@@ -848,7 +848,13 @@ pub(crate) fn terminate_named_generation_job(name: &str) -> Result<bool> {
             terminated_error,
         ));
     }
-    Ok(empty)
+    if !empty {
+        return Err(Error::new(
+            "unknown",
+            "terminated generation Job did not confirm empty before its deadline",
+        ));
+    }
+    Ok(true)
 }
 
 /// Whether a named kill-on-close custody Job has been closed. The name leaves

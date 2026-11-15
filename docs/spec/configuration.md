@@ -841,6 +841,11 @@ harness), no native source open, and the plugin host's record that it saw the
 plugin exit and drained its reader (a stop or lost transition closes sources
 without a drain). The host record and the OS closure arrive in either order;
 each re-checks the proof and the later one releases.
+`capacity.released` reports `custody: "exact"` with `orphan_possible: false` for
+Windows live releases, and `custody: "degraded"` with `orphan_possible: true`
+on Unix, where escaped descendants cannot be excluded. Restart releases report
+the custody guarantee and `orphan_possible` established by their recorded
+closure evidence.
 Uncertain starts retain their reservation across daemon replacement. These limits describe Eliot's admitted workload,
 not vendor entitlements, account permissions or provider quotas. Named native
 profiles may use named profile/account caps; a profile acquires a proxy route
