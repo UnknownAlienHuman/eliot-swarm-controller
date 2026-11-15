@@ -137,8 +137,29 @@ fn submit_selector_tx(
 /// bounded, no control characters. Native catalog support is enforced at
 /// the next turn, never here, and catalog failures never select another
 /// model or account.
-const MAX_CONFIGURE_MODEL_LEN: usize = 256;
-const MAX_CONFIGURE_EFFORT_LEN: usize = 128;
+pub(super) const MAX_CONFIGURE_MODEL_LEN: usize = 256;
+pub(super) const MAX_CONFIGURE_EFFORT_LEN: usize = 128;
+
+/// Shape check for a natively verified `configure` effective value: the
+/// plugin proved this string against the native echo or `GET`, and the
+/// Store rechecks the same nonempty/bounded/no-control-character shape
+/// at the trust boundary before persisting it.
+pub(super) fn check_native_effective(
+    value: Option<String>,
+    field: &str,
+    max_len: usize,
+) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() || value.len() > max_len || value.chars().any(char::is_control) {
+        return Err(Error::new(
+            "invalid",
+            format!("configure native {field} violates its shape bound"),
+        ));
+    }
+    Ok(Some(value))
+}
 
 /// Authority-adjacent profile fields a `configure` must never touch.
 /// Named here they are rejected outright (`not_allowed`); any other
@@ -210,8 +231,12 @@ fn configure_value(
 /// unsupported. Codex carries both as per-turn `turn/start` overrides;
 /// Muse carries effort per turn while a model change needs a new native
 /// session (`restart_required`, refused with `unsupported`, never
-/// restarted silently); adapters without a verified mechanism refuse the
-/// whole command. Shared by admission and by the Router-side apply so
+/// restarted silently); OpenCode switches its retained session model
+/// through the native `POST /api/session/{id}/model` setter at configure
+/// time (effort has no native knob and is refused); Antigravity switches
+/// `model` and `thought_level` through ACP `session/set_config_option` at
+/// configure time; adapters without a verified mechanism (Claude) refuse
+/// the whole command. Shared by admission and by the Router-side apply so
 /// both agree on what was requested and what takes effect.
 pub(super) fn resolve_configure(
     args: &Value,
@@ -253,6 +278,15 @@ pub(super) fn resolve_configure(
                 ));
             }
         }
+        "opencode" => {
+            if effort.is_some() {
+                return Err(Error::new(
+                    "unsupported",
+                    "configure --effort is not supported for the opencode harness: no native effort knob",
+                ));
+            }
+        }
+        "antigravity" => {}
         _ => {
             return Err(Error::new(
                 "unsupported",

@@ -7,6 +7,6 @@ pub(crate) use client::{
 };
 pub(crate) use models::{MODELS_TIMEOUT, run_models};
 pub(crate) use types::{
-    AcpUpdate, InitializeResult, LoadSessionResult, PromptResult, SessionResult,
+    AcpUpdate, ConfigOption, InitializeResult, LoadSessionResult, PromptResult, SessionResult,
     SetConfigOptionResult, classify_update, prompt_params, session_usage_from_update,
 };

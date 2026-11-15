@@ -4,7 +4,7 @@ use crate::{
         AuthSetup, BackendKind, HttpOutcome, IntegrationSelector, LocalProvider, OpenCodeHttp,
         OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch,
         models::run_models,
-        types::{InboxUser, McpServerReadback, ModelRef, SessionInfo},
+        types::{InboxUser, McpServerReadback, ModelRef, NativeModelEntry, SessionInfo},
     },
 };
 use eliot_core::{ContextItem, Error, InjectPoint, Result};
@@ -156,6 +156,13 @@ struct ParsedStart {
     requested_model: Option<String>,
     /// Split model ref, present exactly when a model was requested.
     model_ref: Option<ModelRef>,
+    /// Inherited-overlay realignment target for a resume: the retained
+    /// effective model the session already runs. `None` on launch and on
+    /// resumes without an overlay; the daemon resolves it from the resume
+    /// command's retained revision.
+    override_model: Option<String>,
+    /// Split override ref, present exactly when an override was carried.
+    override_model_ref: Option<ModelRef>,
     requested_agent: Option<String>,
     workspace: PathBuf,
     program: OsString,
@@ -549,6 +556,10 @@ impl OpenCodePlugin {
             })
             .transpose()?;
         let (requested_model, model_ref) = start_model_ref(profile)?;
+        // A resume that inherited a `configure` overlay carries its
+        // effective model as the native realignment target. A carried
+        // effort is ignored here: the native API has no effort knob.
+        let (override_model, override_model_ref) = start_config_override(&params)?;
         let requested_agent = optional_profile_text(profile, "agent", "OpenCode")?;
         // A local-backend profile always carries an explicit model (the
         // eliot-local segment): local fields without a model fail closed
@@ -604,6 +615,8 @@ impl OpenCodePlugin {
             params,
             requested_model,
             model_ref,
+            override_model,
+            override_model_ref,
             requested_agent,
             workspace,
             program,
@@ -1320,13 +1333,24 @@ impl OpenCodePlugin {
                 "OpenCode retained session directory is not the frozen workspace",
             ));
         }
-        // An omitted request keeps the retained server-selected model.
-        let model_needed = parsed.requested_model.as_deref().is_some_and(|requested| {
+        // The realignment target is the inherited overlay's effective
+        // model when a resume carries one (the retained session already
+        // runs it), else the frozen request. An omitted request keeps the
+        // retained server-selected model.
+        let target_model = parsed
+            .override_model
+            .as_deref()
+            .or(parsed.requested_model.as_deref());
+        let target_ref = parsed
+            .override_model_ref
+            .as_ref()
+            .or(parsed.model_ref.as_ref());
+        let model_needed = target_model.is_some_and(|target| {
             current
                 .model
                 .as_ref()
                 .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()))
-                != Some(requested.to_owned())
+                != Some(target.to_owned())
         });
         let agent_needed = parsed
             .requested_agent
@@ -1358,10 +1382,10 @@ impl OpenCodePlugin {
             )?;
         }
         if model_needed {
-            let model_ref = parsed.model_ref.as_ref().ok_or_else(|| {
+            let model_ref = target_ref.ok_or_else(|| {
                 Error::new(
-                    "internal",
-                    "OpenCode resume needs a model ref for its requested model",
+                    "source_integrity",
+                    "OpenCode resume needs a model ref for its retained target model",
                 )
             })?;
             Self::resume_switch(
@@ -1372,34 +1396,44 @@ impl OpenCodePlugin {
                 "model",
             )?;
         }
-        let effective = session
-            .http
-            .get_session(session_id, deadline)
-            .await
-            .map_err(|error| {
-                Error::new(
-                    "unknown",
-                    format!(
-                        "OpenCode resume configure readback is unresolved ({})",
-                        error.message
-                    ),
+        // The single shared echo verification proves the session runs
+        // the realignment target (overlay or frozen), never a reverted
+        // value. An omitted request keeps the server default and only
+        // re-reads.
+        let effective = match target_model {
+            Some(target) => {
+                Self::readback_session_model(
+                    &session.http,
+                    session_id,
+                    target,
+                    deadline,
+                    "resume configure",
                 )
-            })?;
-        let model_verified = parsed.requested_model.as_deref().is_none_or(|requested| {
-            effective
-                .model
-                .as_ref()
-                .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()))
-                == Some(requested.to_owned())
-        });
+                .await?
+            }
+            None => session
+                .http
+                .get_session(session_id, deadline)
+                .await
+                .map_err(|error| {
+                    Error::new(
+                        "unknown",
+                        format!(
+                            "OpenCode resume configure readback is unresolved ({})",
+                            error.message
+                        ),
+                    )
+                })?,
+        };
+        let model_verified = true;
         let agent_verified = parsed
             .requested_agent
             .as_ref()
             .is_none_or(|agent| effective.agent.as_ref() == Some(agent));
-        if !model_verified || !agent_verified {
+        if !agent_verified {
             return Err(Error::new(
                 "unknown",
-                "OpenCode effective model or agent contradicts the applied configuration",
+                "OpenCode effective agent contradicts the applied configuration",
             ));
         }
         let mut effective_value = json!({
@@ -1429,6 +1463,48 @@ impl OpenCodePlugin {
         effective_value["mcp_servers"] = mcp_servers;
         effective_value["mcp_servers_verified"] = json!(mcp_servers_verified);
         Ok(effective_value)
+    }
+
+    /// Re-read the session and prove it runs `target`: the single echo
+    /// verification behind every verified model switch. Resume realign
+    /// and mid-run configure share it, so exactly one place turns a switch
+    /// into verified effective state; a lost readback or an echo that
+    /// contradicts the target is `unknown` (the switch may have applied
+    /// without echoing). `context` names the caller (`resume configure`,
+    /// `configure`). The switch dispatch itself stays per-caller: resume
+    /// maps every write failure to `unknown` (an earlier setter in the
+    /// same realign may have applied), while configure maps a proven
+    /// no-effect refusal to its `rejected` value.
+    async fn readback_session_model(
+        http: &OpenCodeHttp,
+        session_id: &str,
+        target: &str,
+        deadline: Instant,
+        context: &str,
+    ) -> Result<SessionInfo> {
+        let echoed = http
+            .get_session(session_id, deadline)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "OpenCode {context} readback is unresolved ({})",
+                        error.message
+                    ),
+                )
+            })?;
+        let echoed_model = echoed
+            .model
+            .as_ref()
+            .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()));
+        if echoed_model.as_deref() != Some(target) {
+            return Err(Error::new(
+                "unknown",
+                format!("OpenCode {context} model contradicts the applied configuration"),
+            ));
+        }
+        Ok(echoed)
     }
 
     /// One resume setter: only its 204 applies. The session existed
@@ -1525,6 +1601,7 @@ impl OpenCodePlugin {
         )?;
         match params.verb.as_str() {
             "send" => self.send_command(params).await,
+            "configure" => self.configure_command(params).await,
             "steer" => self.steer_command(params).await,
             "interrupt" => self.interrupt_command(params).await,
             "approve" | "deny" | "answer" => self.reply_command(params).await,
@@ -1533,6 +1610,142 @@ impl OpenCodePlugin {
                 "OpenCode plugin command verb is not implemented",
             )),
         }
+    }
+
+    /// Native `configure`: switch the retained session's model through the
+    /// installed `POST /api/session/{id}/model` setter and prove the
+    /// switch with a fresh `session.get`. `effort` has no native knob and
+    /// is refused outright; a requested model outside the live native
+    /// catalogue is rejected before any write, never substituted. A
+    /// refused write proves no effect (`rejected`); anything ambiguous
+    /// after a write may have been admitted (`unknown`). The session that
+    /// already runs the requested model skips the write and verifies by
+    /// readback, so a retried configure after an uncertain outcome is
+    /// idempotent.
+    async fn configure_command(&mut self, params: AgentCommandParams) -> Result<Value> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| Error::new("bad_state", "OpenCode Agent session has not started"))?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "OpenCode",
+        )?;
+        if session.phase != SessionPhase::Ready || native_io_blocked(session) {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode session or event source outcome is unresolved",
+            ));
+        }
+        // Pre-write validation failures reject with proof of no effect
+        // (nothing has been written yet), so the settings lane stays free.
+        // Only an ambiguous outcome at or after the first write is unknown.
+        let requested = match parse_configure_model(&params.args) {
+            Ok(model) => model,
+            Err(error) if matches!(error.code.as_str(), "invalid" | "unsupported") => {
+                return Ok(json!({
+                    "state": "rejected",
+                    "reason": error.message,
+                }));
+            }
+            Err(error) => return Err(error),
+        };
+        let session_id = session
+            .session_id
+            .clone()
+            .ok_or_else(|| Error::new("unknown", "OpenCode session identity is unresolved"))?;
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        // The installed server validates nothing (a bogus model 204s and
+        // echoes back), so the live catalogue gates the write: a miss
+        // proves nothing was written and rejects honestly. A catalogue
+        // read failure is a readback, never an uncertain write.
+        let catalogue = session
+            .http
+            .list_native_models(deadline)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "native_readback",
+                    format!(
+                        "OpenCode configure catalogue readback failed ({})",
+                        error.message
+                    ),
+                )
+            })?;
+        if !catalogue_contains(&catalogue, &requested) {
+            return Ok(json!({
+                "state": "rejected",
+                "reason": format!("OpenCode model {requested} is not in the native catalogue"),
+            }));
+        }
+        let current = session
+            .http
+            .get_session(&session_id, deadline)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "OpenCode configure session read is unresolved ({})",
+                        error.message
+                    ),
+                )
+            })?;
+        let current_model = current
+            .model
+            .as_ref()
+            .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()));
+        if current_model.as_deref() != Some(requested.as_str()) {
+            let model_ref = split_model(&requested).ok_or_else(|| {
+                Error::new(
+                    "invalid",
+                    "OpenCode configure model must be provider/model with non-empty slash segments and no variant suffix",
+                )
+            })?;
+            match session
+                .http
+                .switch_model(&session_id, &model_ref, deadline)
+                .await
+            {
+                Ok(()) => {}
+                Err(HttpOutcome::Rejected { reason, .. }) => {
+                    return Ok(json!({
+                        "state": "rejected",
+                        "reason": format!("OpenCode refused the model switch ({reason})"),
+                    }));
+                }
+                Err(HttpOutcome::NotDispatched { reason }) => {
+                    return Ok(json!({
+                        "state": "rejected",
+                        "reason": format!("OpenCode model switch was not dispatched ({reason})"),
+                    }));
+                }
+                Err(HttpOutcome::Unknown { reason }) => {
+                    return Err(Error::new(
+                        "unknown",
+                        format!("OpenCode model switch outcome is unresolved ({reason})"),
+                    ));
+                }
+            }
+        }
+        // The single shared echo verification: only a readback that
+        // names the requested model proves the switch.
+        Self::readback_session_model(
+            &session.http,
+            &session_id,
+            &requested,
+            deadline,
+            "configure",
+        )
+        .await?;
+        Ok(json!({
+            "state": "applied",
+            "model": requested,
+            "model_verified": true,
+        }))
     }
 
     async fn send_command(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -3013,6 +3226,74 @@ async fn verify_local_effective(
     }))
 }
 
+/// The requested configure model: exactly one `provider/model` string.
+/// `effort` has no native knob on this harness and refuses the whole
+/// command, as does any other unknown field. Pure and natively ignorant:
+/// the caller gates the write on the live native catalogue and proves the
+/// switch with `session.get`.
+fn parse_configure_model(args: &Value) -> Result<String> {
+    let args = args
+        .as_object()
+        .ok_or_else(|| Error::new("invalid", "OpenCode configure args must be a JSON object"))?;
+    for key in args.keys() {
+        if !matches!(key.as_str(), "model" | "effort") {
+            return Err(Error::new(
+                "unsupported",
+                format!("configure does not support {key}"),
+            ));
+        }
+    }
+    if args.get("effort").is_some_and(|effort| !effort.is_null()) {
+        return Err(Error::new(
+            "unsupported",
+            "configure --effort is not supported for the opencode harness: no native effort knob",
+        ));
+    }
+    let model = args
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| Error::new("invalid", "OpenCode configure requires a non-empty model"))?;
+    split_model(model).ok_or_else(|| {
+        Error::new(
+            "invalid",
+            "OpenCode configure model must be provider/model with non-empty slash segments and no variant suffix",
+        )
+    })?;
+    Ok(model.to_owned())
+}
+
+/// Whether the live native catalogue carries the exact requested
+/// `provider/model` id. Entries missing either half never match; the
+/// installed server echoes even bogus switches, so this gate (read
+/// before any write) is what fails an unknown model honestly.
+fn catalogue_contains(catalogue: &[NativeModelEntry], requested: &str) -> bool {
+    catalogue.iter().any(
+        |entry| match (entry.provider_id.as_deref(), entry.id.as_deref()) {
+            (Some(provider), Some(id)) => format!("{}/{}", provider.trim(), id.trim()) == requested,
+            _ => false,
+        },
+    )
+}
+
+/// The inherited-overlay realignment target for a resume: the retained
+/// effective model the session already runs. `None` on launch and on
+/// resumes without an overlay; the daemon resolves it from the resume
+/// command's retained revision, so a value that no longer splits is
+/// retained-state corruption, never a profile verdict.
+fn start_config_override(params: &AgentStartParams) -> Result<(Option<String>, Option<ModelRef>)> {
+    let Some(model) = params.model_override.as_deref() else {
+        return Ok((None, None));
+    };
+    let model_ref = split_model(model).ok_or_else(|| {
+        Error::new(
+            "source_integrity",
+            "OpenCode retained configure model is not provider/model with non-empty slash segments and no variant suffix",
+        )
+    })?;
+    Ok((Some(model.to_owned()), Some(model_ref)))
+}
+
 /// The frozen profile model: an exact `provider/id` selection plus its
 /// native reference, or absent when the profile omitted it and the
 /// configured native default applies.
@@ -3249,6 +3530,7 @@ fn opencode_manifest() -> PluginManifest {
             "launch".to_owned(),
             "resume".to_owned(),
             "send".to_owned(),
+            "configure".to_owned(),
             "steer".to_owned(),
             "interrupt".to_owned(),
             "approve".to_owned(),
@@ -3272,11 +3554,12 @@ fn opencode_manifest() -> PluginManifest {
 mod tests {
     use super::{
         BackendKind, LocalProvider, McpSettle, OpenCodeHttp, OpenCodePlugin, SWARM_MCP_SERVER_NAME,
-        StartAdmission, fetch_backend_inventory, local_key_value, mcp_names, mcp_settle,
-        normalize_endpoint, opencode_manifest, opencode_scope, parse_local_provider, split_model,
-        start_auth_selector, start_model_ref, verify_local_effective,
+        StartAdmission, catalogue_contains, fetch_backend_inventory, local_key_value, mcp_names,
+        mcp_settle, normalize_endpoint, opencode_manifest, opencode_scope, parse_configure_model,
+        parse_local_provider, split_model, start_auth_selector, start_config_override,
+        start_model_ref, verify_local_effective,
     };
-    use crate::native::types::{McpServerReadback, McpStatusReadback};
+    use crate::native::types::{McpServerReadback, McpStatusReadback, NativeModelEntry};
     use eliot_core::{AgentStartParams, Result};
     use eliot_plugin::session::{
         ResumeSubject, optional_profile_text, parse_resume_subject, validate_source_plan,
@@ -3333,6 +3616,85 @@ mod tests {
     const FAMILIES: &[&str] = &["session", "turn", "message", "request"];
 
     #[test]
+    fn configure_model_parsing_refuses_effort_and_malformed_ids() {
+        // One exact provider/model id configures; effort and unknown
+        // fields refuse the whole command, never partially apply.
+        assert_eq!(
+            parse_configure_model(&json!({"model": "opencode/kimi"})).unwrap(),
+            "opencode/kimi"
+        );
+        assert_eq!(
+            parse_configure_model(&json!({"model": "p/a/b"})).unwrap(),
+            "p/a/b",
+            "later slashes stay in the model id"
+        );
+        for (args, code) in [
+            (json!({"effort": "low"}), "unsupported"),
+            (
+                json!({"model": "opencode/kimi", "effort": "low"}),
+                "unsupported",
+            ),
+            (json!({"model": "opencode/kimi", "bogus": 1}), "unsupported"),
+            (json!({}), "invalid"),
+            (json!({"model": ""}), "invalid"),
+            (json!({"model": "noslash"}), "invalid"),
+            (json!({"model": "/empty-provider"}), "invalid"),
+            (json!({"model": "trailing/"}), "invalid"),
+            (json!({"model": "p/a#b"}), "invalid"),
+            (json!({"model": null}), "invalid"),
+        ] {
+            let error = parse_configure_model(&args).unwrap_err();
+            assert_eq!(error.code, code, "configure args must be refused honestly");
+        }
+        let effort = parse_configure_model(&json!({
+            "model": "opencode/kimi",
+            "effort": "low"
+        }))
+        .unwrap_err();
+        assert!(
+            effort.message.contains("no native effort knob"),
+            "effort refusal names the missing knob: {}",
+            effort.message
+        );
+    }
+
+    #[test]
+    fn configure_catalogue_matches_exact_provider_model_ids() {
+        let catalogue = vec![
+            NativeModelEntry {
+                id: Some("kimi".to_owned()),
+                provider_id: Some("opencode".to_owned()),
+                limit: None,
+            },
+            NativeModelEntry {
+                id: None,
+                provider_id: Some("opencode".to_owned()),
+                limit: None,
+            },
+        ];
+        assert!(catalogue_contains(&catalogue, "opencode/kimi"));
+        assert!(!catalogue_contains(&catalogue, "opencode/other"));
+        assert!(!catalogue_contains(&catalogue, "other/kimi"));
+        assert!(!catalogue_contains(&[], "opencode/kimi"));
+    }
+
+    #[test]
+    fn resume_override_resolves_the_retained_effective_model() {
+        let mut params = AgentStartParams::new("a1", 1, "c1");
+        assert!(start_config_override(&params).unwrap().0.is_none());
+        params.model_override = Some("opencode/kimi".to_owned());
+        let (model, model_ref) = start_config_override(&params).unwrap();
+        assert_eq!(model.as_deref(), Some("opencode/kimi"));
+        assert!(model_ref.is_some());
+        params.model_override = Some("noslash".to_owned());
+        assert_eq!(
+            start_config_override(&params).unwrap_err().code,
+            "source_integrity",
+            "a retained override that no longer splits is corruption"
+        );
+    }
+
+    #[test]
     fn manifest_advertises_the_connected_pr2_verbs() {
         let manifest = opencode_manifest();
         assert_eq!(manifest.name, "opencode");
@@ -3346,6 +3708,7 @@ mod tests {
                 "launch",
                 "resume",
                 "send",
+                "configure",
                 "steer",
                 "interrupt",
                 "approve",

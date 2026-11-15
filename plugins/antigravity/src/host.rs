@@ -427,9 +427,17 @@ impl Plugin {
             harness_version: "1.5.2".into(),
             available: true,
             mode: "per_agent".into(),
-            verbs: ["launch", "resume", "send", "steer", "interrupt", "stop"]
-                .map(str::to_owned)
-                .to_vec(),
+            verbs: [
+                "launch",
+                "resume",
+                "send",
+                "configure",
+                "steer",
+                "interrupt",
+                "stop",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
             child_verbs: vec![],
             proxy: "none".into(),
             features: ManifestFeatures {

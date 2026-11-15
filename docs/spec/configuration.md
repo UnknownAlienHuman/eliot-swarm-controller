@@ -667,10 +667,16 @@ submit it.
 Codex carries both values as per-turn `turn/start` overrides
 (`TurnStartParams.model`/`effort`); Muse carries effort through per-turn
 `reasoningEffort`, while a Muse `model` change needs a new native session
-and is refused as `unsupported`, storing nothing. Claude, OpenCode and
-Antigravity have no verified per-turn mechanism and refuse the command. A
-catalog or quota failure at the next turn fails that turn honestly; it never
-selects another model or account. The cached readback behind that rule is
+and is refused as `unsupported`, storing nothing. OpenCode switches the
+retained session model at configure time (`POST /api/session/{id}/model`
+with a `session.get` proof; the requested model must be in the live model
+catalogue or the command rejects before any write, and effort has no native
+knob and is refused). Antigravity switches `model` and `thought_level` at
+configure time (`session/set_config_option` with echo proof; unadvertised
+values reject before any write). Claude has no verified mechanism and
+refuses the command. A catalog or quota failure at the next turn fails that
+turn honestly; it never selects another model or account. The cached
+readback behind that rule is
 `harness.models` (bounded per-route/account catalogue with freshness and
 credential identity) and the separate `harness.quota` (timestamp, scope and
 an explicit supported/unsupported/unknown status with provider-verbatim
@@ -704,7 +710,12 @@ generation's latest overlay as its own revision 1 with provenance
 the resume command); the frozen snapshot itself is unchanged. Generations
 without an overlay start at revision 0 with no row. The inherited row is the
 new generation's honest starting configuration: the next send runs under it,
-and the readback shows it. Retention keeps every command a retained overlay
+and the readback shows it. On OpenCode and Antigravity the retained native
+session already runs the inherited effective values (sticky native session
+state), so resume carries them as the native realignment target and proves
+the session runs the inherited revision instead of reverting to the frozen
+snapshot; a resume without an overlay realigns to the frozen profile
+exactly as before. Retention keeps every command a retained overlay
 references, including the resume command of an inherited revision and the
 source configure it inherited from: pruning never deletes a command named by
 `agent_config`, so configuration provenance survives expiry. `swarm show`

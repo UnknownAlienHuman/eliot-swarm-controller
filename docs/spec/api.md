@@ -554,11 +554,26 @@ catalog/provider/billing siblings) are rejected outright as `not_allowed`.
 Only the Owner principal may submit it. Codex carries both values as per-turn
 `turn/start` overrides and Muse carries effort the same way; a Muse `model`
 change needs a new native session and returns `unsupported`
-(`restart_required`) storing nothing, as do adapters without a verified
-per-turn mechanism (Claude, OpenCode, Antigravity). The Router stores the
-overlay after dispatch, then settles `applied` with the requested and
-effective values, the monotonically increasing `config_revision` for the
-generation, `application:\"next_turn\"`, and provenance `\"configure\"`.
+(`restart_required`) storing nothing, as does Claude, which has no verified
+mechanism. OpenCode switches the retained session model through the native
+`POST /api/session/{id}/model` setter at configure time and proves it with
+a fresh `session.get` (`--effort` stays `unsupported`: the native API has
+no effort knob); Antigravity switches `model` and `thought_level` through
+ACP `session/set_config_option` at configure time and proves each write
+with its echoed current value. On those two harnesses the Router switches
+the live native session through the owned plugin first and stores the
+overlay only after that proof, then settles `applied` with the requested
+and effective values, the monotonically increasing `config_revision` for
+the generation, `application:\"next_turn\"`, provenance `\"configure\"`,
+and the native `model_verified` (plus `effort_verified` on Antigravity)
+flags, each set only from the native echo or `GET`. A refused or unproven
+switch stores nothing and never claims `applied`; it never selects another
+model on failure. A validation failure before the first native write
+(malformed args, an unknown model, an unadvertised value) settles
+`rejected` and holds nothing; only an ambiguous outcome at or after a
+write settles `unknown` and holds the settings lane. Settlement happens
+only after the Store commit, so an applied configure always has a
+retained row to read back.
 Each admitted native command (`launch`, `resume`, `send`) records the
 configuration it runs under as the retained profile-snapshot identity plus
 its stamped `config_revision`; each turn records the revision it ran under.
