@@ -28,15 +28,19 @@ hook discovery truly requires a directory root. The manifest's native version
 (`1.5.2`) stays diagnostic metadata, not a startup version gate.
 
 The adapter speaks Agent Client Protocol v1 (pinned schema
-`v1-7ec5185c.json`, AGY 1.5.2) over bounded NDJSON JSON-RPC stdio through
+`v1-7ec5185c.json`, AGY 1.5.2; permission and usage shapes re-verified
+against installed agy 1.5.9) over bounded NDJSON JSON-RPC stdio through
 the shared `native_stdio` transport: one process, correlated pending
 calls, a bounded frame queue, and output drained before any loss
 conclusion. Turn progress arrives as `session/update` notifications;
-agent-to-client requests (`fs/*`, `terminal/*`, `session/request_permission`,
-`elicitation/create`) are always explicitly rejected as unsupported — never
-auto-approved. ACP has no steer, inject or hook method. The system-context
-and steer paths below use the separate native CLI `PreInvocation` hook;
-they are not ACP operations. `active_turn` injection remains unsupported.
+`session/request_permission` opens a Swarm approval request decided by
+an explicit `approve`/`deny` (never auto-approved, see Model and
+permission mapping). Every other agent-to-client request (`fs/*`,
+`terminal/*`, `elicitation/create` and anything unknown) is explicitly
+rejected as unsupported. ACP has no steer, inject or hook method. The
+system-context and steer paths below use the separate native CLI
+`PreInvocation` hook; they are not ACP operations. `active_turn`
+injection remains unsupported.
 
 The adapter uses `start_requires_input = false`: spawn, `initialize`
 (protocol 1), then `session/new` — or `session/load` with the exact
@@ -68,6 +72,38 @@ silently ignored. The launch-time permission posture remains
 `--dangerously-skip-permissions`; cwd is a launch fact (the server is
 spawned in the workspace), since the session response echoes no cwd.
 
+A `session/request_permission` ask (`{sessionId, toolCall, options}`)
+opens a Swarm approval request with a distinct bounded local id for each
+native JSON-RPC request, bound to the exact generation and turn. The
+native JSON-RPC id, tool call id and options remain separately retained
+inside the plugin; repeated asks for one tool call stay independently
+answerable. The request has kind `approval` and the shared `ApprovalRequest`
+public details: a redacted plain-text summary (title plus tool
+name/kind and compact raw input, never the native record) and one
+choice per usable offered option, `approve` for `allow_once`/
+`allow_always` and `deny` for `reject_once`/`reject_always`
+(`feedback_allowed: false`; unknown kinds are never offered).
+`swarm approve`/`deny` map to the ACP outcome using those kinds: an
+explicit `choice_id` must name an option whose kind matches the verb,
+otherwise the verb takes the least-privilege default (`allow_once`
+before `allow_always`, `reject_once` before `reject_always`); feedback
+is rejected, and an unmatched verb/choice rejects before any native
+write. The plugin writes `{outcome: {outcome: "selected", optionId}}`
+and commits `request.resolved`; only a proven no-write keeps the ask
+answerable, anything uncertain latches unknown without a rewrite.
+Nothing is ever auto-approved: an unanswered ask keeps the turn busy
+(and the Agent waiting) until the owner, the manager, or a cancel
+resolves it. A validated permission ask associates the pending input
+before `request.opened` is committed. Interrupt/stop latches cancellation
+for the exact turn under the event lock and answers both existing and
+subsequently arriving asks `cancelled` once (uncertain writes are never
+repeated). The latch never carries into a new turn. Asks the
+native ends without consuming are closed (`request.closed`) ahead of
+the terminal commit. Verified live 2026-11-15 against installed agy
+1.5.9: a `git log` ask approved (command ran, final answer returned),
+denied (tool refused, empty turn honestly marked), and
+interrupt-cancelled (ask closed, turn cancelled).
+
 ## Native mapping
 
 Launch establishes the session before input; send dispatches one
@@ -75,17 +111,37 @@ Launch establishes the session before input; send dispatches one
 call: its terminal reply re-enters the ordered frame channel behind every
 preceding `session/update`, so the exact prepared turn settles only
 after those updates have been consumed — never from a direct pending
-route, a sleep, or silence. Send returns `applied` on the first
-associated update; the terminal `stopReason` settles the turn through
+route, a sleep, or silence. A successful stdin flush proves transport
+delivery only. Send returns `applied` only after the event owner commits
+`turn.started` from matching-session native progress, a validated
+permission ask, or the correlated fenced terminal response. A schema-valid
+`usage_update` (both `used` and `size`) is early session progress: when one
+input is outstanding in this uninterrupted process it can establish its
+association without waiting for model text; idle/startup usage creates no
+turn. This uses the [pinned ACP v1 schema](https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/7ec5185c18ca928b48e457d2d8a163800be013c8/schema/v1/schema.json),
+which defines session progress but guarantees neither an admission update
+nor its timing. The supplied ctl6 observation (agy 1.5.9, 2026-11-15,
+`usage_update` immediately before `turn.started`) has not been re-verified
+on this branch: account quota is exhausted for approximately 150 hours.
+The terminal `stopReason` settles the turn through
 the event state, never from the send ack alone. The fenced registration
 is held until that actual in-band terminal reply, an error, a stream
 fault, stop, or drop — stream silence is not staleness and no
 model-turn timer expires admitted work. `end_turn`/`max_tokens`/`max_turn_requests` complete the
 turn, `cancelled` settles an interrupt, `refusal` fails it, and any other
 stop reason is a native protocol gap. Assistant text is accumulated from
-`agent_message_chunk` updates (bounded at 256 KiB, then
-`final_text_unavailable:"event_budget"`); thought and user chunks are
-bookkeeping. Tool calls map from `tool_call`/`tool_call_update` with the
+`agent_message_chunk` updates carrying text blocks only (other content
+blocks contribute no text), bounded at 256 KiB, then
+`final_text_unavailable:"event_budget"`; thought and user chunks are
+bookkeeping. A normal completion with no assistant text at all keeps its
+native `stopReason` but carries
+`final_text_unavailable:"empty_native_response"` (see Facts and recovery),
+so silence is never presented as a normal answer. Send uses one 25 s
+deadline for preparation, the native write and committed association,
+inside the daemon's 30 s plugin RPC. With no confirmed association by
+that deadline it returns retained `unknown`, never `applied` or an RPC
+timeout. The pending input and terminal fence remain live; neither the
+deadline nor an exact command retry resends input. Tool calls map from `tool_call`/`tool_call_update` with the
 vendor `toolCallId` as the item id. Tool updates are partial deltas:
 title and status merge into the known per-id state before any event is
 derived, so an omitted field inherits the last known value and only a
@@ -106,7 +162,7 @@ Stop sends a best-effort `session/close` for the retained session, then
 closes stdin and drains stdout before settling the session; force targets
 only owned custody. Resume creates a new Agent generation loading the
 exact retained session id, without replaying the old prompt. Connected
-verbs are launch/resume/send/configure/steer/interrupt/stop.
+verbs are launch/resume/send/configure/steer/interrupt/approve/deny/stop.
 `configure` switches the live session's `model` and `thought_level`
 selectors through `session/set_config_option` at configure time, proving
 each write with its echoed current value (`model_verified`,
@@ -118,7 +174,10 @@ selects the thought level, and the effective model id recombines base and
 level. There is no direct plugin `inject` verb: `active_turn` inject is
 unsupported, while system context flows through the shared `next_input`
 (claimed at send) and `turn_safe_point` (claimed at `PreInvocation`)
-points below. Approve, deny and answer remain `unsupported`.
+points below. Approve and deny reply to the exact offered native
+permission ask; the public details are the shared `ApprovalRequest`
+(`swarm approve`/`deny`, optional `choice_id`, no `feedback`), and a lost
+reply is unknown and never rewritten. Answer remains `unsupported`.
 `profile.store` is unsupported: launch carries no native store binding.
 
 ## System context and steer hooks
@@ -150,8 +209,10 @@ ends. Requested and effective settings carry each native root with its purpose
 Native tool-access restrictions stay at the existing posture: the ACP
 `initialize` advertises no filesystem or terminal capability
 (`fs.readTextFile`/`writeTextFile: false`, `terminal: false`,
-`auth.terminal: false`), and agent-to-client requests are always rejected.
-The CLI also offers `--sandbox`, which is not enabled: it would change
+`auth.terminal: false`; unchanged against installed agy 1.5.9, whose
+`session/request_permission` round-trip this page bridges instead), so
+`fs/*` and `terminal/*` agent-to-client requests stay explicitly
+rejected. The CLI also offers `--sandbox`, which is not enabled: it would change
 execution semantics beyond hook discovery. Same-user filesystem access is not
 a hostile-agent boundary; the guarantee is that secrets and state are never
 under a writable native root, not a sandbox.
@@ -216,11 +277,20 @@ The terminal `session/prompt` response (`stopReason`) is authoritative
 for turn completion, correlated with the single outstanding prompt
 prepared before dispatch in the same uninterrupted process. A soft-denied
 tool remains visible as a failed `tool_call_update` even under a
-successful final turn. ACP `session/prompt` results carry only
-`stopReason`: no per-turn usage object and no `_meta` usage was observed,
-so terminal facts carry no usage counters and turn scope stays null;
-requested, verified and served model are separate facts and one never
-stands in for another. ACP v1 `usage_update` carries context occupancy
+successful final turn. The pinned ACP schema names only `stopReason` on
+`session/prompt` results, but installed `agy` 1.5.9 extends the response
+with a per-turn `usage` object (`inputTokens`, `outputTokens`,
+`cachedReadTokens`, `cachedWriteTokens`, `thoughtTokens`, `totalTokens`;
+observed 2026-11-15, `gemini-4-argon-high`). The terminal attaches it as
+turn-scoped `TurnUsage` (`scope: "turn"`) when usable; a missing or
+malformed extension leaves turn usage null and never blocks completion.
+Requested, verified and served model are separate facts and one never
+stands in for another. When a normal stop reason (`end_turn`,
+`max_tokens`, `max_turn_requests`) arrives with no assistant text at all,
+the turn still completes with its native `stopReason`, but the terminal
+carries `final_text_unavailable: "empty_native_response"` and no
+`message.completed` precedes it, so the missing answer is never presented
+as a normal reply. ACP v1 `usage_update` carries context occupancy
 (`used` tokens currently in context, `size` context-window capacity) and
 optional cumulative session `cost` with its currency/unit: session-scoped
 facts, not per-turn input/output totals. The adapter ignores them for turn
@@ -230,10 +300,11 @@ retained `SessionUsage` snapshot and commits it as `session.usage` when
 accepted (source `antigravity:usage_update`), with `observed_at` captured at
 acceptance: `used`/`size` replace the retained context
 counters and a supplied cost replaces the retained cumulative cost with
-its verbatim unit. No cumulative input/output/cache counters exist on this
-route (`cumulative_tokens` stays null), and occupancy/cost are never mapped
-to `TurnUsage`: per-turn token usage is unavailable (`unsupported`) on the
-checked native surfaces below. Live 2026-11-14 with installed `agy` 1.5.3
+its verbatim unit. No cumulative input/output/cache counters exist on the `usage_update`
+surface (`cumulative_tokens` stays null), and occupancy/cost are never
+mapped to `TurnUsage`: the session stream alone cannot supply per-turn
+usage. Per-turn usage arrives only on the terminal prompt response above.
+Live 2026-11-14 with installed `agy` 1.5.3
 (`gemini-3.8-flash-high`, served as base `gemini-3.8-flash` plus
 `thought_level high`): one Agent, one short task (read `task.txt`, reply
 `42`), `end_turn` success with final text `42`. The checked surfaces

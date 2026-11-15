@@ -92,15 +92,23 @@ pub(crate) struct FencedGuard {
 /// The caller can arm the corresponding event state with `request_id`
 /// before dispatching it.
 pub(crate) struct PreparedFencedCall {
+    write: FencedWrite,
+    registration: FencedGuard,
+}
+
+pub(crate) struct FencedWrite {
     id: String,
     method: String,
     encoded: String,
-    registration: FencedGuard,
 }
 
 impl PreparedFencedCall {
     pub fn request_id(&self) -> &str {
-        &self.id
+        &self.write.id
+    }
+
+    pub fn split(self) -> (FencedWrite, FencedGuard) {
+        (self.write, self.registration)
     }
 }
 
@@ -164,6 +172,15 @@ struct OutboundResponse {
     jsonrpc: &'static str,
     id: Value,
     error: NativeRpcError,
+}
+
+/// One agent-to-client success answer. The id is written verbatim:
+/// JSON-RPC ids are not necessarily strings.
+#[derive(Serialize)]
+struct OutboundResult {
+    jsonrpc: &'static str,
+    id: Value,
+    result: Value,
 }
 
 #[derive(Serialize)]
@@ -264,21 +281,6 @@ impl AgyClient {
         self.write_encoded(encoded, deadline).await
     }
 
-    /// Dispatch one request whose reply must be consumed in wire order
-    /// behind preceding stream records. Returns the request id plus the
-    /// RAII registration guard; the reply arrives as the matching
-    /// [`AgyFrame`] variant on the event channel.
-    pub async fn call_fenced(
-        &self,
-        method: &str,
-        params: Value,
-        deadline: Instant,
-        kind: FencedKind,
-    ) -> Result<(String, FencedGuard)> {
-        let prepared = self.prepare_fenced(method, params, kind)?;
-        self.dispatch_fenced(prepared, deadline).await
-    }
-
     /// Reserve the exact request id and its ordered response route without
     /// writing to the native process. Load callers use this to arm the
     /// event-state filter before any `session/load` I/O.
@@ -315,9 +317,11 @@ impl AgyClient {
             id: id.clone(),
         };
         Ok(PreparedFencedCall {
-            id,
-            method: method.to_owned(),
-            encoded,
+            write: FencedWrite {
+                id,
+                method: method.to_owned(),
+                encoded,
+            },
             registration,
         })
     }
@@ -328,16 +332,27 @@ impl AgyClient {
         prepared: PreparedFencedCall,
         deadline: Instant,
     ) -> Result<(String, FencedGuard)> {
-        let PreparedFencedCall {
+        let (write, registration) = prepared.split();
+        self.dispatch_fenced_write(write, deadline)
+            .await
+            .map(|id| (id, registration))
+    }
+
+    /// Dispatch after the event owner has taken the registration, so a
+    /// slow commit cannot delay the send acknowledgement or retire its fence.
+    pub async fn dispatch_fenced_write(
+        &self,
+        write: FencedWrite,
+        deadline: Instant,
+    ) -> Result<String> {
+        let FencedWrite {
             id,
             method,
             encoded,
-            registration,
-        } = prepared;
+        } = write;
         match self.write_encoded(encoded, deadline).await {
-            Ok(()) => Ok((id, registration)),
+            Ok(()) => Ok(id),
             Err(error) => {
-                // `registration` drops here and retires both maps.
                 if error.code == "native_not_dispatched" {
                     return Err(error);
                 }
@@ -349,9 +364,40 @@ impl AgyClient {
         }
     }
 
-    /// Reject one agent-to-client request as unsupported. There is no
-    /// approve/answer channel on this route, so every such request is an
-    /// explicit rejection, never an auto-approval.
+    /// Answer one agent-to-client request with a success result. Used only
+    /// for `session/request_permission` outcomes decided by an explicit
+    /// owner/manager reply or a cancelling interrupt/stop — never
+    /// auto-answered. The id is written verbatim: JSON-RPC ids are not
+    /// necessarily strings.
+    pub async fn respond_permission(
+        &self,
+        id: Value,
+        result: Value,
+        deadline: Instant,
+    ) -> Result<()> {
+        if !result.is_object() {
+            return Err(Error::new(
+                "invalid",
+                "Antigravity permission answer requires an object result",
+            ));
+        }
+        let encoded = encode_frame(
+            LABELS.server,
+            &OutboundResult {
+                jsonrpc: "2.0",
+                id,
+                result,
+            },
+        )?;
+        self.write_encoded(encoded, deadline).await
+    }
+
+    /// Reject one agent-to-client request as unsupported. Filesystem and
+    /// terminal requests stay on this path: `initialize` advertises no
+    /// such capability, so the server must not send them and every such
+    /// request is an explicit rejection, never an auto-approval.
+    /// `session/request_permission` no longer uses this path: it bridges
+    /// to an explicit owner/manager decision instead.
     pub async fn reject_unsupported_request(
         &self,
         id: Value,

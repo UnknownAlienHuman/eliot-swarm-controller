@@ -6,6 +6,7 @@ use std::{
 use eliot_core::{
     ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy, SessionUsage,
     SourceHealthUpdate,
+    requests::{ApprovalArgs, ApprovalChoice, ApprovalDecision, ApprovalRequest},
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, MAX_FRAME_BYTES, PeerClient,
@@ -13,7 +14,10 @@ use eliot_plugin::{
         ProcessBirthIdentity, StreamState, process_birth_boundary, process_birth_identity,
     },
     protocol::{HookEvent, HookResponse},
-    session::{EVENT_DEADLINE, StreamSource, attach_final_text, event_id, next_input_outcomes},
+    session::{
+        EVENT_DEADLINE, StreamSource, attach_final_text, event_id, next_input_outcomes,
+        rejected_control, request_event_id, unknown_control,
+    },
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -28,13 +32,14 @@ use crate::{
         MAX_HOOK_FRAME_BYTES,
     },
     native::{
-        AcpUpdate, AgyClient, AgyFrame, FencedGuard, PromptResult, classify_update,
-        session_usage_from_update,
+        AcpUpdate, AgyClient, AgyFrame, FencedGuard, PermissionAsk, PermissionOption, PromptResult,
+        classify_update, default_permission_option, parse_permission_request,
+        permission_option_grants, prompt_turn_usage, session_usage_from_update,
     },
 };
 use ulid::Ulid;
 
-pub(crate) const FAMILIES: &[&str] = &["session", "turn", "message", "tool"];
+pub(crate) const FAMILIES: &[&str] = &["session", "turn", "message", "tool", "request"];
 pub(crate) const STEER_MECHANISM: &str = "antigravity.PreInvocation.injectSteps.systemMessage";
 pub(crate) type Shared = Arc<Mutex<State>>;
 
@@ -75,6 +80,76 @@ struct PendingSteer {
     turn_id: String,
     text: String,
     reply: oneshot::Sender<Result<Value>>,
+}
+
+/// Upper bound on concurrently open native permission asks. Beyond this
+/// the ask is refused and gapped, exactly like the sibling harnesses.
+const MAX_PENDING_REQUESTS: usize = 16;
+
+/// Delivery state of one pending permission answer. A reply that may
+/// have reached the native is never rewritten; a proven no-write keeps
+/// the ask answerable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeReplyState {
+    Available,
+    Writing,
+    Unknown,
+}
+
+/// One open `session/request_permission` ask: the exact native round
+/// (verbatim JSON-RPC id plus offered options) bound to its Swarm turn.
+/// The public `request.opened` carries only the redacted summary plus
+/// the shared approval choices; the native transport binding stays here.
+struct PendingNativeRequest {
+    turn_id: String,
+    native_id: Value,
+    tool_call_id: String,
+    options: Vec<PermissionOption>,
+    reply_command_id: Option<String>,
+    reply_state: NativeReplyState,
+}
+
+impl PendingNativeRequest {
+    fn begin_cancel(&mut self, command_id: &str) -> Option<Value> {
+        if self.reply_state != NativeReplyState::Available {
+            return None;
+        }
+        self.reply_state = NativeReplyState::Writing;
+        self.reply_command_id = Some(command_id.to_owned());
+        Some(self.native_id.clone())
+    }
+}
+
+struct CancellationIntent {
+    turn_id: String,
+    command_id: String,
+}
+
+/// The ACP `cancelled` permission outcome: the prompt turn ended before
+/// the user responded. Used for cancelling interrupt/stop answers and
+/// for safe fallbacks that must never grant anything.
+fn cancelled_permission_outcome() -> Value {
+    json!({"outcome": {"outcome": "cancelled"}})
+}
+
+/// Least-privilege fallback for an ask that can never be presented: a
+/// one-time refusal when the offer names one (else a standing refusal),
+/// else `cancelled`. Never selects a grant.
+fn fallback_permission_outcome(ask: &PermissionAsk) -> Value {
+    let selected = ask
+        .options
+        .iter()
+        .find(|option| option.kind == "reject_once")
+        .or_else(|| {
+            ask.options
+                .iter()
+                .find(|option| option.kind == "reject_always")
+        })
+        .map(|option| option.option_id.clone());
+    match selected {
+        Some(option_id) => json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
+        None => cancelled_permission_outcome(),
+    }
 }
 
 #[derive(Clone)]
@@ -135,6 +210,12 @@ pub(crate) struct State {
     source_health_attempted: bool,
     pub source_health_stale: bool,
     pub source_health_unknown: bool,
+    /// Open native permission asks by distinct local request id. The ask stays open
+    /// (and the Agent waiting) until an explicit approve/deny reply, a
+    /// cancelling interrupt/stop, or the turn closing it.
+    pending_requests: HashMap<String, PendingNativeRequest>,
+    /// Retained until a new input is prepared; never applies to a later turn.
+    cancellation: Option<CancellationIntent>,
     pub failure: Option<String>,
     pub source_unknown: bool,
     pub batch_unknown: bool,
@@ -195,6 +276,8 @@ impl State {
             source_health_attempted: false,
             source_health_stale: false,
             source_health_unknown: false,
+            pending_requests: HashMap::new(),
+            cancellation: None,
             failure: None,
             source_unknown: false,
             batch_unknown: false,
@@ -488,6 +571,7 @@ impl State {
             associated: false,
             reply: Some(reply),
         });
+        self.cancellation = None;
         self.tool_emitted.clear();
         self.tools.clear();
         self.clear_fenced();
@@ -547,7 +631,10 @@ impl State {
         .await
     }
 
-    async fn associate(&mut self) -> Result<()> {
+    /// Bind the prepared input to its turn by committing `turn.started`.
+    /// Called only by the ordered native event owner on correlated progress,
+    /// a permission ask or the fenced terminal response, never by the writer.
+    pub(crate) async fn associate(&mut self) -> Result<()> {
         let pending = self.pending.as_ref().ok_or_else(|| {
             Error::new(
                 "source_integrity",
@@ -571,6 +658,569 @@ impl State {
             }
         }
         result
+    }
+
+    /// Open one native `session/request_permission` ask as a Swarm
+    /// approval request bound to the exact generation, turn and tool
+    /// call. Never auto-answers: the native outcome is written only by
+    /// an explicit approve/deny reply or a cancelling interrupt/stop, so
+    /// an unanswered ask keeps the turn busy (and waiting) until the
+    /// owner, the manager, or a cancel resolves it.
+    async fn open_permission_request(
+        &mut self,
+        client: &AgyClient,
+        native_id: Value,
+        params: &Value,
+    ) -> Result<()> {
+        let Some(ask) = parse_permission_request(params) else {
+            return self
+                .gap_unanswerable_request(
+                    client,
+                    native_id,
+                    "Antigravity permission ask did not match its envelope",
+                )
+                .await;
+        };
+        let bound = self
+            .pending
+            .as_ref()
+            .map(|pending| (pending.command.clone(), pending.turn.clone()));
+        let session_ok = !self.conversation.is_empty()
+            && params.get("sessionId").and_then(Value::as_str) == Some(self.conversation.as_str());
+        let Some((command_id, turn_id)) = bound else {
+            return self
+                .stray_permission_request(
+                    client,
+                    native_id,
+                    Some(&ask),
+                    "Antigravity permission ask arrived with no prepared input",
+                )
+                .await;
+        };
+        if !session_ok {
+            return self
+                .stray_permission_request(
+                    client,
+                    native_id,
+                    Some(&ask),
+                    "Antigravity permission ask did not match the exact session",
+                )
+                .await;
+        }
+        if let Some(entry) = self
+            .pending_requests
+            .values()
+            .find(|entry| entry.native_id == native_id)
+        {
+            return if entry.turn_id == turn_id && entry.tool_call_id == ask.tool_call_id {
+                Ok(())
+            } else {
+                Err(Error::new(
+                    "source_integrity",
+                    "Antigravity native request id changed binding",
+                ))
+            };
+        }
+        if self.pending_requests.len() >= MAX_PENDING_REQUESTS {
+            return self
+                .stray_permission_request(
+                    client,
+                    native_id,
+                    Some(&ask),
+                    "Antigravity pending native request bound was exceeded",
+                )
+                .await;
+        }
+        if !ask
+            .options
+            .iter()
+            .any(|option| permission_option_grants(&option.kind).is_some())
+        {
+            return self
+                .gap_unanswerable_request(
+                    client,
+                    native_id,
+                    "Antigravity permission offer carried no usable option",
+                )
+                .await;
+        }
+        let summary = self.permission_summary(&ask);
+        let choices: Vec<ApprovalChoice> = ask
+            .options
+            .iter()
+            .filter_map(|option| {
+                let decision = match permission_option_grants(&option.kind)? {
+                    true => ApprovalDecision::Approve,
+                    false => ApprovalDecision::Deny,
+                };
+                Some(ApprovalChoice {
+                    id: option.option_id.clone(),
+                    label: option.name.clone(),
+                    decision,
+                    feedback_allowed: false,
+                })
+            })
+            .collect();
+        let details = serde_json::to_value(&ApprovalRequest {
+            summary,
+            choices,
+            feedback_allowed: false,
+        })
+        .map_err(|_| {
+            Error::new(
+                "internal",
+                "Antigravity approval details could not be encoded",
+            )
+        })?;
+        let data = json!({
+            "command_id": command_id,
+            "turn_id": turn_id,
+            "kind": "approval",
+            "details": details,
+        });
+        let publication = self
+            .publish_permission_request(
+                data,
+                PendingNativeRequest {
+                    turn_id: turn_id.clone(),
+                    native_id: native_id.clone(),
+                    tool_call_id: ask.tool_call_id.clone(),
+                    options: ask.options.clone(),
+                    reply_command_id: None,
+                    reply_state: NativeReplyState::Available,
+                },
+            )
+            .await;
+        if publication
+            .as_ref()
+            .is_err_and(|error| error.code == "frame_too_large")
+        {
+            return self
+                .stray_permission_request(
+                    client,
+                    native_id,
+                    Some(&ask),
+                    "Antigravity normalized request exceeded the persisted-event bound",
+                )
+                .await;
+        }
+        publication?;
+        if let Some(command_id) = self.cancellation_for_pending().map(str::to_owned) {
+            self.answer_pending_cancelled(client, &command_id, Some(&turn_id))
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn publish_permission_request(
+        &mut self,
+        mut data: Value,
+        entry: PendingNativeRequest,
+    ) -> Result<()> {
+        if self.pending.as_ref().is_none_or(|pending| {
+            pending.turn != entry.turn_id
+                || data["turn_id"] != pending.turn
+                || data["command_id"] != pending.command
+        }) {
+            return Err(Error::new(
+                "source_integrity",
+                "Antigravity permission turn binding changed",
+            ));
+        }
+        let request_id = format!("agy-request-{}", Ulid::new());
+        data["request_id"] = json!(request_id);
+        if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
+            return Err(Error::new(
+                "frame_too_large",
+                "Antigravity normalized request exceeded its bound",
+            ));
+        }
+        let native_event = request_event_id(&request_id, "request.opened", "agy", "Antigravity")?;
+        // The session and pending binding were validated before publication.
+        // A native ask is itself evidence that AGY accepted this input.
+        self.associate().await?;
+        self.source()
+            .commit_event("request.opened", native_event, data)
+            .await?;
+        self.pending_requests.insert(request_id, entry);
+        Ok(())
+    }
+
+    pub fn latch_cancellation(&mut self, command_id: &str, turn_id: Option<&str>) {
+        if let Some(pending) = self.pending.as_ref()
+            && turn_id.is_none_or(|turn| turn == pending.turn)
+        {
+            self.cancellation = Some(CancellationIntent {
+                turn_id: pending.turn.clone(),
+                command_id: command_id.to_owned(),
+            });
+        }
+    }
+
+    fn cancellation_for_pending(&self) -> Option<&str> {
+        self.cancellation.as_ref().and_then(|intent| {
+            self.pending
+                .as_ref()
+                .filter(|pending| pending.turn == intent.turn_id)
+                .map(|_| intent.command_id.as_str())
+        })
+    }
+
+    /// Compose the public approval summary from the decision-relevant
+    /// operation only (title plus tool name/kind and compact raw input,
+    /// as plain text, never the native record), redacted and bounded.
+    /// Native transport ids stay private in the retained pending entry.
+    fn permission_summary(&self, ask: &PermissionAsk) -> String {
+        let mut parts = vec![ask.title.clone()];
+        if let Some(name) = ask.tool_name.as_deref().filter(|name| !name.is_empty()) {
+            parts.push(format!("tool: {name}"));
+        }
+        if let Some(kind) = ask.tool_kind.as_deref().filter(|kind| !kind.is_empty()) {
+            parts.push(format!("kind: {kind}"));
+        }
+        let raw = match &ask.raw_input {
+            Value::Null => String::new(),
+            Value::String(text) => text.clone(),
+            Value::Number(_) | Value::Bool(_) => ask.raw_input.to_string(),
+            Value::Array(_) | Value::Object(_) => {
+                serde_json::to_string(&ask.raw_input).unwrap_or_default()
+            }
+        };
+        let raw: String = raw.chars().take(2048).collect();
+        if !raw.trim().is_empty() {
+            parts.push(format!("input: {raw}"));
+        }
+        self.policy.redact_text(&parts.join("; "))
+    }
+
+    /// Safe fallback for an ask that reached the native but can never be
+    /// presented: record the gap, then answer the least-privilege outcome
+    /// (a one-time refusal when the offer names one, else `cancelled`)
+    /// so the turn ends visibly instead of hanging on an undecidable ask.
+    /// Never grants anything.
+    async fn stray_permission_request(
+        &mut self,
+        client: &AgyClient,
+        native_id: Value,
+        ask: Option<&PermissionAsk>,
+        reason: &str,
+    ) -> Result<()> {
+        let mut source = self.source();
+        let _ = source
+            .record_gap_until(reason, Instant::now() + EVENT_DEADLINE)
+            .await;
+        let outcome = ask.map(fallback_permission_outcome);
+        client
+            .respond_permission(
+                native_id,
+                outcome.unwrap_or_else(cancelled_permission_outcome),
+                Instant::now() + EVENT_DEADLINE,
+            )
+            .await
+    }
+
+    /// Safe fallback for a malformed ask: record the gap, then answer
+    /// `cancelled` (no grant; the turn ends visibly instead of hanging).
+    async fn gap_unanswerable_request(
+        &mut self,
+        client: &AgyClient,
+        native_id: Value,
+        reason: &str,
+    ) -> Result<()> {
+        let mut source = self.source();
+        let _ = source
+            .record_gap_until(reason, Instant::now() + EVENT_DEADLINE)
+            .await;
+        client
+            .respond_permission(
+                native_id,
+                cancelled_permission_outcome(),
+                Instant::now() + EVENT_DEADLINE,
+            )
+            .await
+    }
+
+    /// Decide one open permission: validate the exact binding, then write
+    /// the ACP outcome for the explicit approve/deny verb and commit the
+    /// exact `request.resolved`. The write has no transport ack, so a
+    /// queued write is the delivery; only a proven no-write keeps the ask
+    /// available, anything uncertain latches unknown without a rewrite.
+    pub async fn reply_request(
+        &mut self,
+        command_id: &str,
+        request_id: &str,
+        turn_id: &str,
+        verb: &str,
+        args: &Value,
+        client: &AgyClient,
+    ) -> Result<Value> {
+        if command_id.trim().is_empty() || request_id.trim().is_empty() || turn_id.trim().is_empty()
+        {
+            return Err(Error::new(
+                "invalid",
+                "Antigravity request reply requires exact command, request, and turn ids",
+            ));
+        }
+        let (turn, native_id, options) = match self.pending_requests.get(request_id) {
+            Some(entry) => (
+                entry.turn_id.clone(),
+                entry.native_id.clone(),
+                entry.options.clone(),
+            ),
+            None => {
+                return Ok(rejected_control("Antigravity request is no longer pending"));
+            }
+        };
+        if turn != turn_id {
+            return Ok(rejected_control(
+                "Antigravity request reply does not match the captured turn",
+            ));
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_none_or(|pending| pending.turn != turn_id)
+            || self.settlement_for(turn_id).is_some()
+        {
+            return Ok(rejected_control(
+                "Antigravity request is no longer attached to the active turn",
+            ));
+        }
+        match self
+            .pending_requests
+            .get(request_id)
+            .map(|entry| entry.reply_state)
+        {
+            Some(NativeReplyState::Writing) | Some(NativeReplyState::Unknown) => {
+                return Ok(unknown_control(
+                    "Antigravity request reply outcome is unresolved and will not be repeated",
+                ));
+            }
+            _ => {}
+        }
+        if self.conversation.is_empty()
+            || self.stopped
+            || self.stopping
+            || self.cancellation_for_pending().is_some()
+        {
+            return Ok(rejected_control(
+                "Antigravity request session is no longer writable",
+            ));
+        }
+        if self.source_unknown || self.failure.is_some() {
+            self.retain_unknown_reply(request_id, command_id);
+            return Ok(unknown_control(
+                "Antigravity request session outcome is unresolved; it will not be repeated",
+            ));
+        }
+        if !matches!(verb, "approve" | "deny") {
+            return Ok(rejected_control(
+                "Antigravity request reply verb is not implemented",
+            ));
+        }
+        let parsed = match ApprovalArgs::parse(args) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                return Ok(rejected_control(
+                    "Antigravity approval reply args are invalid",
+                ));
+            }
+        };
+        if parsed.feedback.is_some() {
+            return Ok(rejected_control(
+                "Antigravity approvals do not accept feedback",
+            ));
+        }
+        let approve = verb == "approve";
+        let selected = match parsed.choice_id.as_deref() {
+            Some(choice) => match options.iter().find(|option| option.option_id == choice) {
+                Some(found) if permission_option_grants(&found.kind) == Some(approve) => found,
+                _ => {
+                    return Ok(rejected_control(
+                        "Antigravity approval choice does not match the reply verb",
+                    ));
+                }
+            },
+            None => match default_permission_option(&options, approve) {
+                Some(found) => found,
+                None => {
+                    return Ok(rejected_control(
+                        "Antigravity approval has no offered option for the reply verb",
+                    ));
+                }
+            },
+        };
+        let result = json!({"outcome": {"outcome": "selected", "optionId": selected.option_id}});
+        if let Some(entry) = self.pending_requests.get_mut(request_id) {
+            entry.reply_state = NativeReplyState::Writing;
+            entry.reply_command_id = Some(command_id.to_owned());
+        }
+        if let Err(error) = client
+            .respond_permission(native_id, result, Instant::now() + EVENT_DEADLINE)
+            .await
+        {
+            if matches!(
+                error.code.as_str(),
+                "native_not_dispatched" | "frame_too_large"
+            ) {
+                if let Some(entry) = self.pending_requests.get_mut(request_id)
+                    && entry.reply_state == NativeReplyState::Writing
+                {
+                    entry.reply_state = NativeReplyState::Available;
+                    entry.reply_command_id = None;
+                }
+                return Ok(rejected_control(
+                    "Antigravity request reply was not admitted",
+                ));
+            }
+            self.retain_unknown_reply(request_id, command_id);
+            return Ok(unknown_control(
+                "Antigravity request reply may have been dispatched; it will not be repeated",
+            ));
+        }
+        let data = json!({
+            "command_id": command_id,
+            "request_id": request_id,
+            "turn_id": turn_id,
+        });
+        let native_event =
+            match request_event_id(request_id, "request.resolved", "agy", "Antigravity") {
+                Ok(native_event) => native_event,
+                Err(_) => {
+                    self.retain_unknown_reply(request_id, command_id);
+                    return Ok(unknown_control(
+                        "Antigravity request resolution identity exceeded its bound",
+                    ));
+                }
+            };
+        if self
+            .source()
+            .commit_event("request.resolved", native_event, data)
+            .await
+            .is_err()
+        {
+            self.retain_unknown_reply(request_id, command_id);
+            return Ok(unknown_control(
+                "Antigravity request resolution was not committed",
+            ));
+        }
+        self.pending_requests.remove(request_id);
+        Ok(json!({
+            "state": "applied",
+            "command_id": command_id,
+            "request_id": request_id,
+            "turn_id": turn_id,
+        }))
+    }
+
+    pub(crate) fn retain_unknown_reply(&mut self, request_id: &str, command_id: &str) {
+        if let Some(entry) = self.pending_requests.get_mut(request_id) {
+            entry.reply_state = NativeReplyState::Unknown;
+            entry.reply_command_id = Some(command_id.to_owned());
+        }
+    }
+
+    /// Answer every pending ask of the exact turn (or all asks when
+    /// `turn_id` is `None`) with the ACP `cancelled` outcome, then close
+    /// each answered ask without a command binding: the store binds
+    /// `request.resolved` to an explicit approve/deny/answer reply only,
+    /// so an interrupt/stop-driven cancel closes the Swarm request it
+    /// never decided. Best-effort per ask: a proven no-write leaves the
+    /// ask available for the terminal to close; any uncertain write
+    /// latches unknown without a rewrite.
+    pub async fn answer_pending_cancelled(
+        &mut self,
+        client: &AgyClient,
+        command_id: &str,
+        turn_id: Option<&str>,
+    ) {
+        let ids: Vec<String> = self
+            .pending_requests
+            .iter()
+            .filter(|(_, entry)| turn_id.is_none_or(|turn| entry.turn_id == turn))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for request_id in ids {
+            let Some(entry) = self.pending_requests.get_mut(&request_id) else {
+                continue;
+            };
+            let turn = entry.turn_id.clone();
+            let Some(native_id) = entry.begin_cancel(command_id) else {
+                continue;
+            };
+            match client
+                .respond_permission(
+                    native_id,
+                    cancelled_permission_outcome(),
+                    Instant::now() + EVENT_DEADLINE,
+                )
+                .await
+            {
+                Ok(()) => {
+                    let data = json!({
+                        "request_id": request_id,
+                        "turn_id": turn,
+                    });
+                    match request_event_id(&request_id, "request.closed", "agy", "Antigravity") {
+                        Ok(native_event) => {
+                            if self
+                                .source()
+                                .commit_event("request.closed", native_event, data)
+                                .await
+                                .is_ok()
+                            {
+                                self.pending_requests.remove(&request_id);
+                                continue;
+                            }
+                            self.retain_unknown_reply(&request_id, command_id);
+                        }
+                        Err(_) => self.retain_unknown_reply(&request_id, command_id),
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "native_not_dispatched" | "frame_too_large"
+                    ) =>
+                {
+                    if let Some(entry) = self.pending_requests.get_mut(&request_id)
+                        && entry.reply_state == NativeReplyState::Writing
+                    {
+                        entry.reply_state = NativeReplyState::Available;
+                        entry.reply_command_id = None;
+                    }
+                }
+                Err(_) => self.retain_unknown_reply(&request_id, command_id),
+            }
+        }
+    }
+
+    /// Close every retained ask of one finished turn (or of the stopped
+    /// session) without a command binding: the native ended without
+    /// consuming them, so they resolve to nothing. Runs before the
+    /// terminal commit it precedes.
+    pub(crate) async fn close_pending_requests(&mut self, turn_id: Option<&str>) -> Result<()> {
+        let ids: Vec<String> = self
+            .pending_requests
+            .iter()
+            .filter(|(_, entry)| turn_id.is_none_or(|turn| entry.turn_id == turn))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for request_id in ids {
+            let Some(entry) = self.pending_requests.get(&request_id) else {
+                continue;
+            };
+            let data = json!({
+                "request_id": request_id,
+                "turn_id": entry.turn_id,
+            });
+            let native_id = request_event_id(&request_id, "request.closed", "agy", "Antigravity")?;
+            self.source()
+                .commit_event("request.closed", native_id, data)
+                .await?;
+            self.pending_requests.remove(&request_id);
+        }
+        Ok(())
     }
 
     async fn observe(&mut self, frame: AgyFrame, client: &AgyClient) -> Result<()> {
@@ -609,7 +1259,7 @@ impl State {
             AgyFrame::PromptResponse(result) => match result {
                 Ok(value) => match serde_json::from_value::<PromptResult>(value) {
                     Ok(prompt) => {
-                        self.complete_prompt(&prompt.stop_reason).await;
+                        self.complete_prompt(&prompt).await;
                         Ok(())
                     }
                     Err(_) => {
@@ -627,18 +1277,24 @@ impl State {
                 }
             },
             AgyFrame::ServerRequest { id, method, params } => {
-                // No approve/answer channel is connected on this route, so
-                // every agent request is an explicit unsupported rejection
-                // (never an auto-approval). A failed reply means the stream
-                // itself is broken and the turn outcome is unknown.
-                client
-                    .reject_unsupported_request(
-                        id,
-                        &method,
-                        &params,
-                        Instant::now() + EVENT_DEADLINE,
-                    )
-                    .await
+                // `session/request_permission` bridges to an explicit
+                // owner/manager decision; every other agent request
+                // (`fs/*`, `terminal/*`, `elicitation/create` and anything
+                // unknown) is an explicit unsupported rejection, never an
+                // auto-approval. A failed reply means the stream itself is
+                // broken and the turn outcome is unknown.
+                if method == "session/request_permission" {
+                    self.open_permission_request(client, id, &params).await
+                } else {
+                    client
+                        .reject_unsupported_request(
+                            id,
+                            &method,
+                            &params,
+                            Instant::now() + EVENT_DEADLINE,
+                        )
+                        .await
+                }
             }
         }
     }
@@ -711,17 +1367,24 @@ impl State {
                 // `session.usage` when accepted, with `observed_at` captured
                 // at acceptance. Session-scoped facts, never per-turn
                 // input/output totals.
-                let Some(merged) = session_usage_from_update(
+                if let Some(merged) = session_usage_from_update(
                     used,
                     size,
                     cost_amount,
                     cost_unit,
                     self.session_usage.as_ref(),
-                ) else {
-                    return Ok(());
-                };
-                self.session_usage = Some(merged.clone());
-                self.commit_session_usage_now(merged).await
+                ) {
+                    self.session_usage = Some(merged.clone());
+                    self.commit_session_usage_now(merged).await?;
+                }
+                // ACP session progress is correlated by the exact session
+                // and its one outstanding input in this uninterrupted process.
+                // Idle/startup usage remains session-only. Require the schema's
+                // two counters; tolerant partial snapshots cannot admit input.
+                if used.is_some() && size.is_some() && self.pending.is_some() {
+                    self.associate().await?;
+                }
+                Ok(())
             }
             AcpUpdate::ToolCall {
                 tool_call_id,
@@ -845,14 +1508,11 @@ impl State {
     /// Settle the prepared turn from the terminal `session/prompt`
     /// response. Only the actual stop reason settles the turn: `cancelled`
     /// is the interrupt settlement and is never inferred from silence.
-    pub async fn complete_prompt(&mut self, stop_reason: &str) {
+    pub async fn complete_prompt(&mut self, prompt: &PromptResult) {
         if self.failure.is_some() {
             return;
         }
-        let result = PromptResult {
-            stop_reason: stop_reason.to_owned(),
-        };
-        match self.settle_prompt(&result).await {
+        match self.settle_prompt(prompt).await {
             Ok(()) => {}
             Err(error) => self.lose(&error.message).await,
         }
@@ -884,6 +1544,9 @@ impl State {
             "cancelled" => "interrupted",
             _ => "unknown",
         };
+        // Unanswered asks die with their turn: close them before the
+        // terminal commit, without a command binding.
+        self.close_pending_requests(Some(&turn)).await?;
         let text = self.policy.redact_text(&self.text_accum);
         let truncated = self.text_truncated;
         let mut data = json!({"command_id": command, "turn_id": turn,
@@ -900,6 +1563,19 @@ impl State {
         }
         if truncated {
             data["final_text_unavailable"] = json!("event_budget");
+        } else if status == "completed" && text.is_empty() {
+            // The native ended the turn normally but supplied no assistant
+            // text at all: keep the native `end_turn` fact, but mark the
+            // missing final message honestly instead of presenting a
+            // normal answer. Consumers distinguish this from a real reply
+            // by the absent `message.completed` plus this marker.
+            data["final_text_unavailable"] = json!("empty_native_response");
+        }
+        // Installed agy 1.5.9 reports the turn's model usage on the
+        // terminal response (older servers send none): attach it when
+        // usable, never block completion on it.
+        if let Some(usage) = prompt_turn_usage(result) {
+            data["usage"] = json!(usage);
         }
         if failed && data.get("final_text").is_none() && !text.is_empty() && !truncated {
             attach_final_text(&mut data, &text, true, &self.policy);
@@ -1423,4 +2099,272 @@ fn hook_ipc_response_fits(output: &HookOutput) -> bool {
     };
     serde_json::to_vec(&response)
         .is_ok_and(|bytes| bytes.len().saturating_add(1) <= MAX_HOOK_FRAME_BYTES)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split},
+        task::JoinHandle,
+        time::{Duration, timeout},
+    };
+
+    type CommitRecord = (Value, oneshot::Sender<()>);
+
+    // Exercise the real commit/ACK path over in-memory plugin I/O, without
+    // launching a native process or claiming vendor/runtime qualification.
+    fn state_with_commits() -> (State, mpsc::Receiver<CommitRecord>, [JoinHandle<()>; 2]) {
+        let (host_io, plugin_io) = duplex(64 * 1024);
+        let (read, write) = split(plugin_io);
+        let mut peer = eliot_plugin::Peer::from_io(read, write);
+        let state = State::new(
+            peer.client(),
+            "credential".into(),
+            "a1".into(),
+            1,
+            SecretPolicy::new(Vec::<String>::new()),
+            "session-1".into(),
+        );
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+        let (tx, rx) = mpsc::channel(8);
+        let host_task = tokio::spawn(async move {
+            let (read, mut write) = split(host_io);
+            let mut reader = BufReader::new(read);
+            let mut seq = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let request: eliot_plugin::RpcRequest = serde_json::from_str(&line).unwrap();
+                assert_eq!(request.method, "events.put");
+                let event = request.params["events"][0].clone();
+                let (ack, acknowledged) = oneshot::channel();
+                tx.send((event, ack)).await.unwrap();
+                acknowledged.await.unwrap();
+                seq += 1;
+                let response = json!({"jsonrpc": "2.0", "id": request.id,
+                    "result": {"first_seq": seq, "last_seq": seq, "cursor": null}});
+                write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        (state, rx, [peer_task, host_task])
+    }
+
+    async fn next_commit(commits: &mut mpsc::Receiver<CommitRecord>, kind: &str) -> CommitRecord {
+        let (event, ack) = timeout(Duration::from_secs(1), commits.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event["kind"], kind);
+        (event, ack)
+    }
+
+    async fn finish(tasks: [JoinHandle<()>; 2]) {
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    fn request_data() -> Value {
+        json!({"command_id": "command-1", "turn_id": "turn-1", "kind": "approval",
+            "details": {"summary": "run tool", "choices": [{"id": "yes", "label": "yes",
+                "decision": "approve", "feedback_allowed": false}], "feedback_allowed": false}})
+    }
+
+    fn request(native_id: Value) -> PendingNativeRequest {
+        PendingNativeRequest {
+            turn_id: "turn-1".into(),
+            native_id,
+            tool_call_id: "same-tool".into(),
+            options: vec![PermissionOption {
+                option_id: "yes".into(),
+                name: "yes".into(),
+                kind: "allow_once".into(),
+            }],
+            reply_command_id: None,
+            reply_state: NativeReplyState::Available,
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_admission_waits_for_commit_and_needs_no_model_output() {
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let mut association = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        assert!(matches!(
+            association.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        let update = json!({"sessionId": "session-1", "update": {
+            "sessionUpdate": "usage_update", "used": 12, "size": 100}});
+        let (result, ()) = tokio::join!(state.update(&update), async {
+            for kind in ["session.usage", "turn.started"] {
+                let (_, ack) = next_commit(&mut commits, kind).await;
+                assert!(matches!(
+                    association.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+                ack.send(()).unwrap();
+            }
+        });
+        result.unwrap();
+        association.await.unwrap().unwrap();
+        assert!(state.text_accum.is_empty());
+        finish(tasks).await;
+    }
+
+    #[tokio::test]
+    async fn idle_partial_and_other_session_usage_cannot_admit_input() {
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let usage = json!({"sessionUpdate": "usage_update", "used": 12, "size": 100});
+        let (result, ()) = tokio::join!(
+            state.apply_update(
+                "session-1".into(),
+                classify_update(&json!({"sessionId": "session-1", "update": usage}))
+                    .unwrap()
+                    .1
+            ),
+            async {
+                next_commit(&mut commits, "session.usage")
+                    .await
+                    .1
+                    .send(())
+                    .unwrap();
+            }
+        );
+        result.unwrap();
+        assert!(state.pending.is_none());
+        let mut association = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        assert!(
+            state
+                .update(&json!({"sessionId": "other", "update": usage}))
+                .await
+                .is_err()
+        );
+        state
+            .update(&json!({"sessionId": "session-1", "update": {
+            "sessionUpdate": "usage_update", "used": 12}}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            association.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        // An unchanged but complete native snapshot still proves progress.
+        let update = json!({"sessionId": "session-1", "update": usage});
+        let (result, ()) = tokio::join!(state.update(&update), async {
+            next_commit(&mut commits, "turn.started")
+                .await
+                .1
+                .send(())
+                .unwrap();
+        });
+        result.unwrap();
+        association.await.unwrap().unwrap();
+        finish(tasks).await;
+    }
+
+    #[tokio::test]
+    async fn early_permission_associates_before_open_and_preserves_distinct_native_rounds() {
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let association = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        let ((), events) = tokio::join!(
+            async {
+                state
+                    .publish_permission_request(request_data(), request(json!("native-1")))
+                    .await
+                    .unwrap();
+                state
+                    .publish_permission_request(request_data(), request(json!(2)))
+                    .await
+                    .unwrap();
+            },
+            async {
+                let mut events = Vec::new();
+                for kind in ["turn.started", "request.opened", "request.opened"] {
+                    let (event, ack) = next_commit(&mut commits, kind).await;
+                    events.push(event);
+                    ack.send(()).unwrap();
+                }
+                events
+            }
+        );
+        association.await.unwrap().unwrap();
+        assert_ne!(events[1]["native_id"], events[2]["native_id"]);
+        let first = events[1]["data"]["request_id"].as_str().unwrap();
+        let second = events[2]["data"]["request_id"].as_str().unwrap();
+        assert_ne!(first, second);
+        assert!(first.len() < 64 && second.len() < 64);
+        assert_eq!(state.pending_requests.len(), 2);
+        assert_eq!(state.pending_requests[first].native_id, "native-1");
+        assert_eq!(state.pending_requests[second].native_id, 2);
+        assert_eq!(state.pending_requests[first].tool_call_id, "same-tool");
+        assert_eq!(state.pending_requests[second].options[0].option_id, "yes");
+        finish(tasks).await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_and_stop_latch_before_late_asks_and_cancel_once() {
+        for stopping in [false, true] {
+            let (mut state, mut commits, tasks) = state_with_commits();
+            let _association = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+            assert!(state.pending_requests.is_empty()); // original snapshot missed the queued ask
+            state.stopping = stopping;
+            state.latch_cancellation("cancel-1", if stopping { None } else { Some("turn-1") });
+            let (result, ()) = tokio::join!(
+                state.publish_permission_request(request_data(), request(json!("late-native"))),
+                async {
+                    for kind in ["turn.started", "request.opened"] {
+                        next_commit(&mut commits, kind).await.1.send(()).unwrap();
+                    }
+                }
+            );
+            result.unwrap();
+            let command = state.cancellation_for_pending().unwrap().to_owned();
+            let entry = state.pending_requests.values_mut().next().unwrap();
+            assert_eq!(entry.begin_cancel(&command), Some(json!("late-native")));
+            assert!(entry.begin_cancel(&command).is_none());
+            entry.reply_state = NativeReplyState::Unknown;
+            assert!(entry.begin_cancel(&command).is_none());
+            assert_eq!(
+                cancelled_permission_outcome(),
+                json!({"outcome": {"outcome": "cancelled"}})
+            );
+            finish(tasks).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_intent_never_binds_a_different_or_new_turn() {
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let _association = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        state.latch_cancellation("wrong", Some("other-turn"));
+        assert!(state.cancellation_for_pending().is_none());
+        state.latch_cancellation("cancel-1", Some("turn-1"));
+        let prompt = PromptResult {
+            stop_reason: "cancelled".into(),
+            usage: None,
+        };
+        let (result, ()) = tokio::join!(state.settle_prompt(&prompt), async {
+            for kind in ["turn.started", "turn.completed"] {
+                next_commit(&mut commits, kind).await.1.send(()).unwrap();
+            }
+        });
+        result.unwrap();
+        let _new_association = state.prepare("command-2".into(), "turn-2".into()).unwrap();
+        assert!(state.cancellation_for_pending().is_none());
+        assert!(
+            state
+                .publish_permission_request(request_data(), request(json!(3)))
+                .await
+                .is_err()
+        );
+        assert!(commits.try_recv().is_err());
+        finish(tasks).await;
+    }
 }
