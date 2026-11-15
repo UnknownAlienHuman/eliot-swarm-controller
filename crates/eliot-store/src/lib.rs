@@ -137,6 +137,7 @@ mod git;
 mod goals;
 mod handoff;
 mod hierarchy;
+pub mod inference;
 mod lifecycle;
 mod native_children;
 mod reparent;

@@ -60,6 +60,48 @@ impl Router {
             ));
         }
         match kind {
+            "memory_inference" => {
+                let client_id = auth
+                    .get("client_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                eliot_core::api::inference::inference_client(client_id)?;
+                let version = auth
+                    .get("token_version")
+                    .and_then(Value::as_i64)
+                    .filter(|v| *v > 0)
+                    .ok_or_else(|| {
+                        Error::new("not_allowed", "Memory credential version is invalid")
+                    })?;
+                let hash = self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .inference_token_hash(client_id, version)?;
+                if !hash.is_some_and(|hash| {
+                    secure_eq(
+                        &hash,
+                        &eliot_core::api::inference::inference_sha256(credential.as_bytes()),
+                    )
+                }) {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "Memory credential is invalid or revoked",
+                    ));
+                }
+                self.inner
+                    .secrets
+                    .lock_recover()
+                    .insert(credential.to_owned());
+                Ok((
+                    Principal::MemoryInference {
+                        client_id: client_id.to_owned(),
+                        token_version: version,
+                    },
+                    payload,
+                ))
+            }
             "owner" => {
                 if secure_eq(credential, &self.inner.owner_token) {
                     if let Some(remote) = auth.get("remote_call") {
@@ -174,6 +216,25 @@ impl Router {
 }
 
 pub(super) fn authorize_rpc_method(principal: &Principal, method: &str) -> Result<()> {
+    if matches!(principal, Principal::MemoryInference { .. }) {
+        if method == "client.identity"
+            || method.starts_with("inference.") && !method.starts_with("inference.client.")
+        {
+            return Ok(());
+        }
+        return Err(Error::new(
+            "not_allowed",
+            "Memory credentials grant inference methods only",
+        ));
+    }
+    if method == "client.identity"
+        || method.starts_with("inference.") && !method.starts_with("inference.client.")
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "inference requires a Memory principal",
+        ));
+    }
     if matches!(principal, Principal::Run { .. }) && method != "command.get" {
         return Err(Error::new(
             "not_allowed",
@@ -189,6 +250,7 @@ fn auth_fields_are_exact(auth: &serde_json::Map<String, Value>, kind: &str) -> b
     }
     let fields: &[&str] = match kind {
         "owner" => &["kind", "credential"],
+        "memory_inference" => &["kind", "client_id", "token_version", "credential"],
         "agent" => &["kind", "agent_id", "generation", "credential"],
         "run" => &["kind", "run_command_id", "credential"],
         _ => return false,

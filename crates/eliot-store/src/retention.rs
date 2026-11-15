@@ -605,6 +605,7 @@ fn prune_writes_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
     Ok(db!(tx.execute(
         "DELETE FROM writes WHERE id IN (
              SELECT id FROM writes WHERE created_at <= ?1
+               AND method NOT LIKE 'inference.%'
                AND NOT (method = 'goal.round'
                         AND json_extract(result, '$.outcome') IS json_extract(?3, '$'))
              ORDER BY created_at, id LIMIT ?2

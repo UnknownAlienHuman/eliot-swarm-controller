@@ -135,7 +135,7 @@ impl fmt::Debug for RunCredentialGuard {
     }
 }
 
-fn random_256_bit_token() -> String {
+pub(crate) fn random_256_bit_token() -> String {
     let mut bytes = [0_u8; 32];
     for chunk in bytes.chunks_mut(10) {
         // Ulid::new uses rand's thread CSPRNG; its low 80 bits are random, independent

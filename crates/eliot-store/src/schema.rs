@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 37;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 38;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -882,6 +882,30 @@ impl Store {
                  INSERT INTO schema_migrations(version) VALUES (37);",
             )
             .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 38 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE inference_clients (
+                     client_id TEXT PRIMARY KEY, current_version INTEGER NOT NULL,
+                     current_hash TEXT NOT NULL, current_file TEXT NOT NULL, pending_version INTEGER, pending_hash TEXT, pending_file TEXT,
+                     previous_version INTEGER, previous_hash TEXT,
+                     rotation_seq INTEGER NOT NULL DEFAULT 0, pending_proven INTEGER NOT NULL DEFAULT 0,
+                     last_admission_seq INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE inference_calls (
+                     id TEXT PRIMARY KEY REFERENCES writes(id), client_id TEXT NOT NULL REFERENCES inference_clients(client_id),
+                     admission_seq INTEGER NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                     request TEXT NOT NULL, route TEXT NOT NULL, result_sha256 TEXT, result_bytes INTEGER,
+                     cleanup_complete INTEGER NOT NULL DEFAULT 0, native_session_id TEXT, native_turns INTEGER,
+                     cancel_id TEXT REFERENCES writes(id), release_id TEXT REFERENCES writes(id),
+                     UNIQUE(client_id, admission_seq));
+                 CREATE INDEX inference_client_calls ON inference_calls(client_id, admission_seq);
+                 INSERT INTO schema_migrations(version) VALUES (38);"
+            ).map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
         Ok(())

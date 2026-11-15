@@ -1,5 +1,6 @@
 //! Descriptions beside Router registration. Wire shapes belong to Core DTOs.
 use super::{Principal, Router};
+use eliot_core::api::inference::*;
 use eliot_core::{
     Command, Error, Result, Turn,
     api::{discovery::*, *},
@@ -43,6 +44,24 @@ macro_rules! method {
 // Every Router match arm is described here. The coverage regression below makes
 // omission deliberate: new methods must be described before they can ship.
 const METHODS: &[Method] = &[
+    method!(
+        "client.identity",
+        InferenceIdentityRequest,
+        InferenceIdentityResponse,
+        false,
+        false,
+        "Read the authenticated Memory installation identity; Memory principal only.",
+        {}
+    ),
+    method!("inference.client.install", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Install one private Memory credential; Owner only; exact replay reconciles the same private publication.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":0}),
+    method!("inference.client.rotate", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Stage one pending Memory credential; Owner only; no version allocation on retry.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":1}),
+    method!("inference.client.promote", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Promote pending credential after its authenticated pre-rotation call read; retain one previous credential.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":1}),
+    method!("inference.text", InferenceTextRequest, InferenceReceipt, false, true, "Admit one bounded tool-free text inference; Memory principal only; exact replay never launches again.", {"id":EXAMPLE_ID,"profile":"memory-text-v1","origin":"episode:1","disclosure":"provider_allowed","text":"hello","input_sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","input_bytes":5,"response_format":"text","max_result_bytes":1024,"deadline_ms":30000}),
+    method!("inference.get", InferenceGetRequest, InferenceCall, false, false, "Read current own-call physical state; Memory principal only.", {"call_id":EXAMPLE_ID}),
+    method!("inference.write.get", InferenceWriteGetRequest, InferenceWriteResponse, false, false, "Read an exact own mutation binding, live absence or history gap without admission.", {"id":EXAMPLE_ID}),
+    method!("inference.result.read", InferenceResultRequest, InferenceResultResponse, false, false, "Read an exact own-result byte range after full private digest/length verification.", {"call_id":EXAMPLE_ID,"result_sha256":"0000000000000000000000000000000000000000000000000000000000000000","offset":0,"length":1024}),
+    method!("inference.cancel", InferenceCancelRequest, InferenceMutationResponse, false, true, "Cancel an own queued call; sending calls honestly report too_late.", {"id":EXAMPLE_ID,"call_id":EXAMPLE_ID}),
+    method!("inference.release", InferenceReleaseRequest, InferenceMutationResponse, false, true, "Fence publication and clean owned copies after dependency-free Memory release; cleanup is separately observed.", {"id":EXAMPLE_ID,"call_id":EXAMPLE_ID,"disposition":"abandon_for_erasure","result_sha256":null,"no_backup_dependencies":true}),
     method!("api.methods", MethodsRequest, MethodsResponse, false, false, "List/search callable canonical methods in bounded pages.", {"query":"mail", "limit":20}),
     method!("api.help", MethodHelpRequest, MethodHelpResponse, false, false, "Read a method's DTO schemas, example and limits.", {"method":"mail.send"}),
     method!(
@@ -233,10 +252,16 @@ fn request_takes_id(method: &Method) -> bool {
 fn visible(method: &Method, principal: &Principal) -> bool {
     match principal {
         Principal::Owner => true,
-        Principal::Agent { .. } => !method.owner_only,
+        Principal::Agent { .. } => {
+            !method.owner_only
+                && method.name != "client.identity"
+                && !method.name.starts_with("inference.")
+        }
         // These principals have no discovery RPC authority. Keep the helper
         // conservative even when used internally; do not broaden their gate.
-        Principal::Run { .. } | Principal::ProjectRule { .. } => false,
+        Principal::Run { .. }
+        | Principal::ProjectRule { .. }
+        | Principal::MemoryInference { .. } => false,
     }
 }
 
@@ -369,7 +394,7 @@ impl Router {
             cli_aliases:aliases.iter().map(|s| (*s).to_owned()).collect(),
             request_schema:(method.input)(), response_schema:(method.output)(),
             example:json!({"method":method.name,"params":example}),
-            mutation_id:if method.mutation { "id is optional on MCP: omit it and the server mints a ULID and returns it in the reply; retry with that same id. Otherwise supply a fresh caller-retained ULID in id before the first write. Retry only with that same id, principal, method and identical semantic payload. Never mint another id after an uncertain outcome; read back the retained result. The example id is illustrative; replace it for a new write." } else { "Read-only; no mutation id is required." }.to_owned(),
+            mutation_id:if method.name.starts_with("inference.") && method.mutation { "Supply a caller-retained literal ULID before send; do not omit it. After a lost reply retry with that same id and identical semantic payload, or read inference.write.get. Never allocate another id to recover an uncertain mutation." } else if method.mutation { "id is optional on MCP: omit it and the server mints a ULID and returns it in the reply; retry with that same id. Otherwise supply a fresh caller-retained ULID in id before the first write. Retry only with that same id, principal, method and identical semantic payload. Never mint another id after an uncertain outcome; read back the retained result. The example id is illustrative; replace it for a new write." } else { "Read-only; no mutation id is required." }.to_owned(),
             scopes, limits:format!("{} Responses retain their DTO pagination and daemon 4 MiB frame bounds; one help result is at most 256 KiB. Examples for existing resources require their actual retained ids/profile/source/view.", method_limits(method.name)), unsupported,
         })
     }
@@ -614,7 +639,12 @@ mod tests {
             generation: 1,
         };
         for method in METHODS {
-            assert_eq!(visible(method, &agent), !method.owner_only);
+            assert_eq!(
+                visible(method, &agent),
+                !method.owner_only
+                    && method.name != "client.identity"
+                    && !method.name.starts_with("inference.")
+            );
             assert!(!visible(
                 method,
                 &Principal::Run {

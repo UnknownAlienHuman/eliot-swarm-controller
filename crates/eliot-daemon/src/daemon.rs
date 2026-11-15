@@ -133,6 +133,7 @@ async fn run_owned(
     let recovered = {
         let mut store = store.lock().await;
         let events = store.recover_on_restart(now_ms())?;
+        store.inference_recover()?;
         bus.publish(&events);
         events
     };
