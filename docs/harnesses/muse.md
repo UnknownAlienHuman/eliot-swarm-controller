@@ -201,11 +201,17 @@ and reuses the latest committed final text; unknown writes never populate
 that identity state or replace the text. Recovery marks those records applied
 so a later live replay of the same revision skips instead of recommitting,
 retires the recovery deadline, and keeps the recorded gap and stale health
-latched. Only when the command-plane observation is unproven or no fresh idle-time page
-proves the terminal does the adapter settle the active
-turn `unknown` with the recorded gap through the shared turn-unknown path
-(`turn.unknown` with the exact command/turn binding and the gap reason),
-never as success or failure. The turn binding clears only after that terminal
+latched. A readback that proves nothing (a failed `session/read`, an
+unexpected shape, or an idle scan with no durable terminal) never settles the
+turn: it re-arms one more bounded `session/read` after a backoff (5s, 10s,
+20s, then the 30s recovery interval). Only the fifth consecutive unproven
+readback settles the active turn `unknown` through the shared turn-unknown
+path (`turn.unknown` with the exact command/turn binding, the recorded gap
+label and the exact readback failure), never as success or failure. An exact
+`running` observation resets that count: while the native turn is still
+active the Swarm turn stays active with the source stale, the Agent never
+goes idle, and a new send is rejected or queued behind the running turn,
+never delivered into it. The turn binding clears only after that terminal
 write is acknowledged; a failed write keeps the binding and retries on the
 next opportunity instead of stranding the Store turn. The plugin host stays
 alive and the Agent is not marked lost; the session remains for stop/readback

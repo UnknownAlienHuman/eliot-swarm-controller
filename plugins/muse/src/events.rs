@@ -83,11 +83,44 @@ const PATCH_READ_DEADLINE: Duration = Duration::from_secs(10);
 /// fired, and a hung page behind a projection-failed host must not stall the
 /// loop past one bounded wait per page.
 const RECOVERY_PAGE_DEADLINE: Duration = Duration::from_secs(10);
+/// First retry delay after a projection-gap readback proves nothing (a
+/// failed `session/read` or an idle scan with no durable terminal). Later
+/// delays double from here up to `EVENT_DEADLINE`, per the monitoring
+/// backpressure bound.
+const RECOVERY_RETRY_BASE_SECS: u64 = 5;
+/// Cap on consecutive unproven readbacks before the gapped turn settles
+/// unknown. A proven `running` observation resets the count; only truly
+/// unprovable results exhaust it.
+const MAX_RECOVERY_READBACK_ATTEMPTS: u32 = 5;
 
 struct ViewRecovery {
     head: Option<String>,
     head_seen: bool,
     deadline: Instant,
+    /// Consecutive readbacks that proved nothing since the last exact
+    /// `running` observation. Reset on every proven state, on live recovery
+    /// and on terminal recovery; only the cap settles unknown.
+    unproven_attempts: u32,
+}
+
+/// Delay before the next bounded `session/read` after `failures` consecutive
+/// unproven readbacks (1-based): 5s, 10s, 20s, then the 30s event deadline.
+/// A timer alone never proves anything; each retry still needs a fresh exact
+/// native observation to renew the turn.
+fn recovery_retry_delay(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(3);
+    let secs = RECOVERY_RETRY_BASE_SECS.saturating_mul(1 << shift);
+    Duration::from_secs(secs.min(EVENT_DEADLINE.as_secs()))
+}
+
+/// Unknown reason for an exhausted projection-gap recovery. Keeps the shared
+/// unknown prefix (so the journal count is stable) and the recorded gap
+/// label, then names the exact readback failure and the bounded attempt
+/// count that proved it unprovable.
+fn recovery_unknown_reason(gap_label: &str, detail: &str, attempts: u32) -> String {
+    format!(
+        "{MUSE_VIEW_UNKNOWN_REASON_PREFIX} ({gap_label}; {detail} after {attempts} bounded readbacks)"
+    )
 }
 
 /// Already-applied live view cursors, newest last. A cursor is remembered
@@ -2317,7 +2350,10 @@ impl EventProcessor {
                     if !self.status.view_unavailable {
                         let session_id = self.status.session_id.clone().unwrap_or_default();
                         let turn_id = self.status.active_turn_id.clone().unwrap_or_default();
-                        if self.projection_turn_state(&session_id, &turn_id).await
+                        if self
+                            .projection_turn_state_checked(&session_id, &turn_id)
+                            .await
+                            .0
                             == ProjectionTurnState::Idle
                             && self.recover_projection_terminal().await
                         {
@@ -2333,6 +2369,7 @@ impl EventProcessor {
                         head: None,
                         head_seen: false,
                         deadline: Instant::now(),
+                        unproven_attempts: 0,
                     });
                     return Err(Error::new(
                         "native_readback",
@@ -3826,6 +3863,7 @@ impl EventProcessor {
                 } else {
                     Instant::now()
                 },
+                unproven_attempts: 0,
             });
         }
         gap_result
@@ -3863,19 +3901,13 @@ impl EventProcessor {
             } else {
                 Instant::now()
             },
+            unproven_attempts: 0,
         });
     }
 
     async fn expire_view_recovery(&mut self) {
-        self.view_recovery = None;
         self.status.source_unknown = true;
         self.settle_projection_gap_unknown().await;
-        if self.status.failure.is_none() {
-            self.status.failure = Some(
-                "Muse native view recovery did not prove live delivery after the recorded gap"
-                    .to_owned(),
-            );
-        }
     }
 
     /// One backward `view/page` fetch for recovery, newest records first.
@@ -4019,59 +4051,127 @@ impl EventProcessor {
     }
 
     /// Recheck a projection-gapped turn. The command plane can prove it still
-    /// running; only explicit idle permits a fresh terminal scan. An unproven
-    /// state/outcome settles `unknown` through the shared turn-unknown path.
-    /// The plugin host stays alive and the Agent is not marked lost:
-    /// only the active turn is cleared, so a later replayed terminal for the
-    /// same turn gaps instead of resurrecting it, and a later stop settles
-    /// the session normally. Idempotent: with no active turn there is nothing
-    /// to settle. The local binding drops only after the terminal write is
-    /// acknowledged; a failed commit (for example a lost gap ack latching
-    /// `writes_blocked` so `turn.unknown` cannot be submitted) keeps the
-    /// binding and re-arms an expiry so the next opportunity retries instead
-    /// of stranding the Store's running turn while the adapter looks idle.
+    /// running: an exact `running` observation keeps the Swarm turn active
+    /// with the source stale and resets the readback retry count, so a new
+    /// send can never be delivered into the running native turn. Only
+    /// explicit idle permits a fresh terminal scan. A readback that proves
+    /// nothing (failed `session/read`, an unexpected shape, or an idle scan
+    /// with no durable terminal) re-arms one more bounded read with backoff;
+    /// only the capped attempt settles `unknown` through the shared
+    /// turn-unknown path, naming the exact readback failure. The plugin host
+    /// stays alive and the Agent is not marked lost: only the active turn is
+    /// cleared, so a later replayed terminal for the same turn gaps instead
+    /// of resurrecting it, and a later stop settles the session normally.
+    /// Idempotent: with no active turn there is nothing to settle. The local
+    /// binding drops only after the terminal write is acknowledged; a failed
+    /// commit (for example a lost gap ack latching `writes_blocked` so
+    /// `turn.unknown` cannot be submitted) keeps the binding and re-arms an
+    /// expiry so the next opportunity retries instead of stranding the
+    /// Store's running turn while the adapter looks idle.
     async fn settle_projection_gap_unknown(&mut self) {
         let (Some(command_id), Some(turn_id)) = (
             self.status.active_command_id.clone(),
             self.status.active_turn_id.clone(),
         ) else {
+            self.view_recovery = None;
             return;
         };
         let session_id = self.status.session_id.clone().unwrap_or_default();
-        // An unavailable projection can synthesize a failed terminal for an
-        // unfinished source prefix while the native run continues. The owned
-        // host's command plane must prove this exact turn no longer running
-        // before a fresh page can supply terminal evidence.
-        match self.projection_turn_state(&session_id, &turn_id).await {
-            ProjectionTurnState::Running => {
-                self.view_recovery = Some(ViewRecovery {
-                    head: None,
-                    head_seen: false,
-                    deadline: Instant::now() + EVENT_DEADLINE,
-                });
-                return;
-            }
-            ProjectionTurnState::Idle => {
-                if self.recover_projection_terminal().await {
-                    return;
-                }
-            }
-            ProjectionTurnState::Unproven => {}
-        }
-        // Neither the command plane nor a fresh idle-time scan supplied a
-        // proven terminal. Preserve uncertainty instead of a projected verdict.
-        let reason_label = self
+        let prior_attempts = self
+            .view_recovery
+            .as_ref()
+            .map(|recovery| recovery.unproven_attempts)
+            .unwrap_or(0);
+        let gap_label = self
             .status
             .view_unavailable_reason
             .map(|reason| reason.label().to_owned())
             .unwrap_or_else(|| "unknown".to_owned());
-        let reason = format!("{MUSE_VIEW_UNKNOWN_REASON_PREFIX} ({reason_label})");
+        // An unavailable projection can synthesize a failed terminal for an
+        // unfinished source prefix while the native run continues. The owned
+        // host's command plane must prove this exact turn no longer running
+        // before a fresh page can supply terminal evidence.
+        match self
+            .projection_turn_state_checked(&session_id, &turn_id)
+            .await
+        {
+            (ProjectionTurnState::Running, _) => {
+                self.view_recovery = Some(ViewRecovery {
+                    head: None,
+                    head_seen: false,
+                    deadline: Instant::now() + EVENT_DEADLINE,
+                    unproven_attempts: 0,
+                });
+            }
+            (ProjectionTurnState::Idle, _) => {
+                if self.recover_projection_terminal().await {
+                    return;
+                }
+                let step = decide_recovery_step(
+                    prior_attempts,
+                    ProjectionTurnState::Idle,
+                    &gap_label,
+                    "idle session/read proved no active turn but the bounded view/page scan held no terminal for the exact turn",
+                );
+                self.retry_or_settle_unknown(&command_id, &turn_id, &session_id, step)
+                    .await;
+            }
+            (ProjectionTurnState::Unproven, detail) => {
+                let step = decide_recovery_step(
+                    prior_attempts,
+                    ProjectionTurnState::Unproven,
+                    &gap_label,
+                    detail.as_deref().unwrap_or("session/read proved nothing"),
+                );
+                self.retry_or_settle_unknown(&command_id, &turn_id, &session_id, step)
+                    .await;
+            }
+        }
+    }
+
+    /// One more bounded readback after a readback that proved nothing, or the
+    /// terminal `unknown` settlement once the cap exhausts. Retries keep the
+    /// exact turn binding (the Swarm turn stays busy, the Agent never goes
+    /// idle); only the capped attempt settles unknown, with the exact
+    /// readback failure in the reason. A failed `turn.unknown` commit keeps
+    /// the binding at the cap so the next expiry settles instead of
+    /// stranding the Store's running turn.
+    async fn retry_or_settle_unknown(
+        &mut self,
+        command_id: &str,
+        turn_id: &str,
+        session_id: &str,
+        step: RecoveryStep,
+    ) {
+        let (attempts, reason) = match step {
+            RecoveryStep::KeepRunning => {
+                self.view_recovery = Some(ViewRecovery {
+                    head: None,
+                    head_seen: false,
+                    deadline: Instant::now() + EVENT_DEADLINE,
+                    unproven_attempts: 0,
+                });
+                return;
+            }
+            RecoveryStep::Retry { attempts } => {
+                self.view_recovery = Some(ViewRecovery {
+                    head: None,
+                    head_seen: false,
+                    deadline: Instant::now() + recovery_retry_delay(attempts),
+                    unproven_attempts: attempts,
+                });
+                return;
+            }
+            RecoveryStep::SettleUnknown { attempts, reason } => (attempts, reason),
+        };
+        // Neither the command plane nor a fresh idle-time scan supplied a
+        // proven terminal. Preserve uncertainty instead of a projected verdict.
         let data = json!({
-            "command_id": command_id.clone(),
-            "turn_id": turn_id.clone(),
+            "command_id": command_id.to_owned(),
+            "turn_id": turn_id.to_owned(),
             "reason": reason.clone(),
         });
-        let acknowledged = match event_id(&session_id, &turn_id, &turn_id, "turn.unknown") {
+        let acknowledged = match event_id(session_id, turn_id, turn_id, "turn.unknown") {
             Ok(native_id) => self
                 .commit_event("turn.unknown", native_id, data)
                 .await
@@ -4087,28 +4187,34 @@ impl EventProcessor {
                 head: None,
                 head_seen: false,
                 deadline: Instant::now() + EVENT_DEADLINE,
+                unproven_attempts: attempts,
             });
             return;
         }
         self.status.failure = Some(reason);
-        self.clear_projection_gap_turn(&command_id, &turn_id);
+        self.clear_projection_gap_turn(command_id, turn_id);
     }
 
     /// One bounded, read-only command-plane observation, independent of the
     /// unavailable history envelope. It never supplies a terminal outcome.
-    async fn projection_turn_state(
+    /// The detail names the exact readback failure for the bounded retry
+    /// accounting; `None` means the observation proved its state.
+    async fn projection_turn_state_checked(
         &mut self,
         session_id: &str,
         turn_id: &str,
-    ) -> ProjectionTurnState {
+    ) -> (ProjectionTurnState, Option<String>) {
         let params = NativeSessionReadParams {
             session_id: session_id.to_owned(),
             exclude_items: Some(true),
         };
         let Ok(params) = serde_json::to_value(params) else {
-            return ProjectionTurnState::Unproven;
+            return (
+                ProjectionTurnState::Unproven,
+                Some("session/read params could not be encoded".to_owned()),
+            );
         };
-        let Ok(result) = self
+        let result = match self
             .native
             .call(
                 "session/read",
@@ -4116,18 +4222,36 @@ impl EventProcessor {
                 Instant::now() + RECOVERY_PAGE_DEADLINE,
             )
             .await
-        else {
-            return ProjectionTurnState::Unproven;
+        {
+            Ok(result) => result,
+            Err(error) => {
+                return (
+                    ProjectionTurnState::Unproven,
+                    Some(format!("session/read transport failed ({})", error.code)),
+                );
+            }
         };
         let state = projection_turn_state(&result, session_id, turn_id);
+        if state == ProjectionTurnState::Unproven {
+            return (
+                ProjectionTurnState::Unproven,
+                Some(describe_unproven_session_read(&result, session_id, turn_id)),
+            );
+        }
         if let Ok(readback) = serde_json::from_value::<NativeSessionReadResult>(result)
             && readback.session.session_id == session_id
             && let Some(reason) = readback.history.unavailable_reason()
             && self.view_unavailable(session_id, reason).await.is_err()
         {
-            return ProjectionTurnState::Unproven;
+            return (
+                ProjectionTurnState::Unproven,
+                Some(
+                    "session/read proved the state but re-latching the recorded gap failed"
+                        .to_owned(),
+                ),
+            );
         }
-        state
+        (state, None)
     }
 
     fn clear_projection_gap_turn(&mut self, command_id: &str, turn_id: &str) {
@@ -4333,6 +4457,44 @@ fn should_arm_recovery_after_associate(status: &EventStatus, has_recovery: bool)
     status.view_unavailable && !has_recovery && status.active_turn_id.is_some()
 }
 
+/// Pure next step after a projection-gap `session/read` that did not prove
+/// the turn still running (an unproven shape, or explicit idle whose bounded
+/// page scan held no durable terminal). Split from the commit path so the
+/// exact running-to-unknown sequence is pinned without a native server: an
+/// exact `running` observation always keeps the turn no matter how many
+/// readbacks already failed, anything unproven retries with backoff, and
+/// only the capped attempt settles unknown with the exact readback failure.
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveryStep {
+    /// Exact native proof the turn still runs: keep the Swarm turn active
+    /// with the source stale and reset the retry count.
+    KeepRunning,
+    /// Nothing proven yet: re-arm one more bounded read after the backoff.
+    Retry { attempts: u32 },
+    /// Cap exhausted: settle unknown with the exact readback failure.
+    SettleUnknown { attempts: u32, reason: String },
+}
+
+fn decide_recovery_step(
+    prior_attempts: u32,
+    state: ProjectionTurnState,
+    gap_label: &str,
+    detail: &str,
+) -> RecoveryStep {
+    if state == ProjectionTurnState::Running {
+        return RecoveryStep::KeepRunning;
+    }
+    let attempts = prior_attempts.saturating_add(1);
+    if attempts < MAX_RECOVERY_READBACK_ATTEMPTS {
+        RecoveryStep::Retry { attempts }
+    } else {
+        RecoveryStep::SettleUnknown {
+            attempts,
+            reason: recovery_unknown_reason(gap_label, detail, attempts),
+        }
+    }
+}
+
 /// Durable terminal proof accumulated across `view/page` records for the
 /// exact active turn, newest first. Raw params only: the commit path
 /// re-parses and re-validates everything through the exact live shapes, so
@@ -4380,6 +4542,43 @@ fn projection_turn_state(result: &Value, session_id: &str, turn_id: &str) -> Pro
         ("running", Value::String(active)) if active == turn_id => ProjectionTurnState::Running,
         ("idle", Value::Null) => ProjectionTurnState::Idle,
         _ => ProjectionTurnState::Unproven,
+    }
+}
+
+/// Exact reason a `session/read` result proved nothing about the gapped
+/// turn. Mirrors `projection_turn_state` case by case so the capped
+/// `unknown` settlement names the readback failure instead of the gap alone.
+/// Shapes are described, never quoted verbatim, and the status text is
+/// bounded: the wire status is open for evolution.
+fn describe_unproven_session_read(result: &Value, session_id: &str, turn_id: &str) -> String {
+    let Some(active) = result
+        .get("session")
+        .and_then(|session| session.get("activeTurnId"))
+    else {
+        return "session/read omitted activeTurnId".to_owned();
+    };
+    let Ok(readback) = serde_json::from_value::<NativeSessionReadResult>(result.clone()) else {
+        return "session/read response did not match the 1.4 schema".to_owned();
+    };
+    if readback.session.session_id != session_id {
+        return "session/read named a foreign session".to_owned();
+    }
+    let status = readback.session.status.as_str();
+    match (status, active) {
+        ("running", Value::String(active)) if active != turn_id => {
+            "session/read reported running for another turn".to_owned()
+        }
+        ("running", _) => "session/read reported running with no active turn".to_owned(),
+        ("idle", Value::String(_)) => "session/read reported idle with an active turn".to_owned(),
+        ("idle", _) => "session/read reported idle without a null active turn".to_owned(),
+        ("notLoaded", _) => "session/read reported the session notLoaded".to_owned(),
+        _ => {
+            let mut short = status.to_owned();
+            if short.len() > 32 {
+                short.truncate(32);
+            }
+            format!("session/read reported status {short}")
+        }
     }
 }
 
@@ -6088,6 +6287,138 @@ mod tests {
         assert_eq!(
             projection_turn_state(&result, "session-1", "turn-1"),
             ProjectionTurnState::Unproven
+        );
+    }
+
+    #[test]
+    fn recovery_retry_backs_off_to_the_event_deadline() {
+        assert_eq!(recovery_retry_delay(1), Duration::from_secs(5));
+        assert_eq!(recovery_retry_delay(2), Duration::from_secs(10));
+        assert_eq!(recovery_retry_delay(3), Duration::from_secs(20));
+        assert_eq!(recovery_retry_delay(4), Duration::from_secs(30));
+        assert_eq!(recovery_retry_delay(5), Duration::from_secs(30));
+        assert_eq!(recovery_retry_delay(100), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn recovery_unknown_reason_keeps_the_counted_prefix_with_exact_detail() {
+        let reason = recovery_unknown_reason(
+            "projectionUnavailable",
+            "session/read transport failed (timeout)",
+            5,
+        );
+        assert!(reason.starts_with(MUSE_VIEW_UNKNOWN_REASON_PREFIX));
+        assert!(reason.contains("projectionUnavailable"));
+        assert!(reason.contains("session/read transport failed (timeout)"));
+        assert!(reason.contains("5"));
+    }
+
+    #[test]
+    fn recovery_step_runs_the_native_running_to_idle_sequence() {
+        // Real native `session/read` shapes through the real parser: first the
+        // turn is still running, then the session is idle with no proven
+        // terminal. The step decision must keep the Swarm turn active while
+        // running is proven, retry boundedly, and settle unknown only at the
+        // cap with the exact readback failure.
+        let running = projection_session_read("running", json!("turn-1"));
+        assert_eq!(
+            projection_turn_state(&running, "session-1", "turn-1"),
+            ProjectionTurnState::Running
+        );
+        // An exact running observation always keeps the turn, even after
+        // earlier readback failures: this is the controller a8 case.
+        for prior in [0, 3, 4, 100] {
+            assert_eq!(
+                decide_recovery_step(
+                    prior,
+                    ProjectionTurnState::Running,
+                    "projectionUnavailable",
+                    "session/read transport failed (timeout)",
+                ),
+                RecoveryStep::KeepRunning
+            );
+        }
+        let idle = projection_session_read("idle", Value::Null);
+        assert_eq!(
+            projection_turn_state(&idle, "session-1", "turn-1"),
+            ProjectionTurnState::Idle
+        );
+        let detail = "idle session/read proved no active turn but the bounded view/page scan held no terminal for the exact turn";
+        for (prior, expected) in [(0, 1), (1, 2), (2, 3), (3, 4)] {
+            assert_eq!(
+                decide_recovery_step(
+                    prior,
+                    ProjectionTurnState::Idle,
+                    "projectionUnavailable",
+                    detail
+                ),
+                RecoveryStep::Retry { attempts: expected }
+            );
+        }
+        let RecoveryStep::SettleUnknown { attempts, reason } = decide_recovery_step(
+            4,
+            ProjectionTurnState::Idle,
+            "projectionUnavailable",
+            detail,
+        ) else {
+            panic!("capped idle readback must settle unknown");
+        };
+        assert_eq!(attempts, 5);
+        assert!(reason.starts_with(MUSE_VIEW_UNKNOWN_REASON_PREFIX));
+        assert!(reason.contains("projectionUnavailable"));
+        assert!(reason.contains(detail));
+        // An unproven shape retries the same way and settles with its own
+        // exact failure at the cap.
+        let foreign = projection_session_read("running", json!("other-turn"));
+        assert_eq!(
+            projection_turn_state(&foreign, "session-1", "turn-1"),
+            ProjectionTurnState::Unproven
+        );
+        let foreign_detail = describe_unproven_session_read(&foreign, "session-1", "turn-1");
+        assert_eq!(
+            decide_recovery_step(
+                0,
+                ProjectionTurnState::Unproven,
+                "projectionUnavailable",
+                &foreign_detail
+            ),
+            RecoveryStep::Retry { attempts: 1 }
+        );
+        let RecoveryStep::SettleUnknown { reason, .. } = decide_recovery_step(
+            4,
+            ProjectionTurnState::Unproven,
+            "projectionUnavailable",
+            &foreign_detail,
+        ) else {
+            panic!("capped unproven readback must settle unknown");
+        };
+        assert!(reason.contains("another turn"));
+    }
+
+    #[test]
+    fn unproven_session_read_names_the_exact_failure() {
+        let mut result = projection_session_read("running", json!("other-turn"));
+        assert!(
+            describe_unproven_session_read(&result, "session-1", "turn-1").contains("another turn")
+        );
+        result = projection_session_read("notLoaded", Value::Null);
+        assert!(
+            describe_unproven_session_read(&result, "session-1", "turn-1").contains("notLoaded")
+        );
+        result = projection_session_read("idle", Value::Null);
+        result["session"]["sessionId"] = json!("foreign-session");
+        assert!(
+            describe_unproven_session_read(&result, "session-1", "turn-1")
+                .contains("foreign session")
+        );
+        result = projection_session_read("idle", Value::Null);
+        result["session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("activeTurnId");
+        assert!(
+            describe_unproven_session_read(&result, "session-1", "turn-1")
+                .contains("omitted activeTurnId")
         );
     }
 
