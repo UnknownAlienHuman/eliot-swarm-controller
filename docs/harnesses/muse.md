@@ -384,6 +384,43 @@ no feature switch, login, credential copy or model turn was used.
   }
   ```
 
+The settings-only copy follow-up (2026-11-14) copied the owner's actual
+`settings.json` byte-for-byte into a fresh private config root, retaining its
+`schema_version`, `model`, `reasoning_effort`, `tui` and both original
+`mcpServers` entries. Neither `auth.json` nor `trust.json` was copied. The first
+probe used Eliot's Windows
+[`BASE_ENVIRONMENT_NAMES`](../../crates/eliot-daemon/src/plugin_host/host.rs)
+when present, plus the private `XDG_CONFIG_HOME`; it preserved `PATH` and
+`USERPROFILE` and injected no provider credentials. All four probes used the
+same binary, workspace and `serve --disable-sandbox` arguments, negotiated
+`sessionMcp`, sent `initialized`, read `model/list`, then submitted the same
+`session/start` shape above with a fresh command id. Results:
+
+| Config root / environment | Session MCP additions | Native result |
+| --- | --- | --- |
+| Unchanged settings-only copy / plugin minimum | Present | Accepted, idle; `providerId="muse"` |
+| Unchanged settings-only copy / additional noncredential ambient variables | Present | Accepted, idle; `providerId="muse"` |
+| Normal config root / plugin minimum | Present | `-32603`, reason `session_mcp_base_unavailable` |
+| Normal config root / plugin minimum | Omitted | Accepted, idle; `providerId="meta"` |
+
+The complete copy was accepted, so the conditional entry-removal/transport
+bisection was not triggered: neither original server was removed or normalized.
+`codebase_memory.command` is an existing absolute executable, with no arguments;
+its explicit `CBM_CACHE_DIR` setting has no variable references. The original
+`context7` transport spelling and URL were retained. No missing plugin `PATH` or
+`USERPROFILE` defect was demonstrated. Owner settings bytes were unchanged
+before/after every probe; private roots contained only `settings.json`, and all
+owned hosts and observed descendants exited. No model turns were run.
+
+This localizes the refusal to the normal config/auth/runtime context; it does
+**not** establish an exact offending server entry, field, or native internal
+cause. In particular, copied settings can select the unauthenticated `muse`
+runtime while the normal root selects `meta`, so acceptance in the former does
+not prove those entries work in the latter. No owner-config normalization or
+plugin environment change is justified by this comparison alone. Native MCP
+startup/readiness still has no readback here, and constructor acceptance is not
+tool connectivity proof.
+
 Construction success does not qualify login or authenticated tools. On this
 Windows installation, `XDG_CONFIG_HOME` relocates `settings.json`, `auth.json` and
 `trust.json`; the normal login is in the owner's config root. It does not move
