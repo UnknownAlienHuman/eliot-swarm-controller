@@ -13,6 +13,7 @@ use crate::monitor::{
     state_name, tokens_label,
 };
 use crate::theme;
+use crate::theme::winui::Palette;
 
 /// Messages the pane emits, prepared by the screen with their bindings.
 pub struct MonitorActions {
@@ -40,7 +41,7 @@ pub struct MoveRow {
 fn small(text: impl Into<String>) -> TextBlock {
     TextBlock::new()
         .text(text.into())
-        .font_size(theme::type_scale::LABEL)
+        .font_size(theme::type_scale::LABEL_MEDIUM.size)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }
@@ -55,32 +56,15 @@ fn utc_clock(ms: i64) -> String {
     )
 }
 
-fn row_view(row: &MonitorRow) -> View {
-    let attention = matches!(
-        row.state,
-        eliot_core::AgentState::Waiting
-            | eliot_core::AgentState::Failed
-            | eliot_core::AgentState::Lost
-            | eliot_core::AgentState::Unknown
-    );
+fn row_view(row: &MonitorRow, palette: Palette) -> View {
     let manager = row
         .parent
         .as_deref()
         .map(|parent| format!(" · under {parent}"))
         .unwrap_or_default();
-    let title = TextBlock::new()
-        .text(format!(
-            "{} · {} · {}{manager}",
-            row.id,
-            state_name(row.state),
-            row.harness
-        ))
-        .font_weight(FontWeight::SEMI_BOLD);
-    let title = if attention {
-        title.foreground(theme::winui::text_critical())
-    } else {
-        title
-    };
+    // ListViewItem exposes no content alignment in Reactor 0.100.0, so the
+    // row takes the pane's fixed inner width to right-align the chip.
+    let row_width = theme::layout::MONITOR_WIDTH - 2.0 * theme::spacing::LG - 40.0;
     ListViewItem::new()
         .automation_name(format!(
             "Agent {}, {}, {}{}, {}",
@@ -94,24 +78,47 @@ fn row_view(row: &MonitorRow) -> View {
             row.operation()
         ))
         .content(
-            StackPanel::new().spacing(2.0).children((
-                title,
-                small(row.operation()).opacity(theme::MUTED_OPACITY),
-                small(format!(
-                    "RSS {} · {} · {} · {}",
-                    bytes_label(row.obs.rss_bytes()),
-                    cpu_time_label(row.obs.cpu_time_ns()),
-                    row.obs.freshness(),
-                    tokens_label(row)
-                ))
-                .opacity(theme::MUTED_OPACITY),
-            )),
+            StackPanel::new()
+                .width(row_width)
+                .spacing(2.0)
+                .margin(Thickness::xy(0.0, theme::spacing::SM))
+                .children((
+                    Grid::new()
+                        .columns([GridLength::STAR, GridLength::Auto])
+                        .column_spacing(theme::spacing::SM)
+                        .children((
+                            crate::m3::text(
+                                format!("{} · {}{manager}", row.id, row.harness),
+                                theme::type_scale::TITLE_SMALL,
+                            )
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .text_trimming(TextTrimming::CharacterEllipsis),
+                            Border::new()
+                                .grid_column(1)
+                                .content(crate::m3::status_chip(palette, state_name(row.state))),
+                        )),
+                    small(row.operation()).opacity(theme::MUTED_OPACITY),
+                    small(format!(
+                        "RSS {} · {} · {} · {}",
+                        bytes_label(row.obs.rss_bytes()),
+                        cpu_time_label(row.obs.cpu_time_ns()),
+                        row.obs.freshness(),
+                        tokens_label(row)
+                    ))
+                    .opacity(theme::MUTED_OPACITY),
+                )),
         )
 }
 
 /// Native bar sparkline: one `Border` per point, unknown points drawn as a
 /// faint stub so gaps stay visible.
-fn sparkline(points: &[&Point], value: impl Fn(&Point) -> Option<f64>, max_hint: f64) -> View {
+fn sparkline(
+    points: &[&Point],
+    value: impl Fn(&Point) -> Option<f64>,
+    max_hint: f64,
+    palette: Palette,
+    bar: Brush,
+) -> View {
     let values: Vec<Option<f64>> = points.iter().map(|point| value(point)).collect();
     let max = values
         .iter()
@@ -128,14 +135,15 @@ fn sparkline(points: &[&Point], value: impl Fn(&Point) -> Option<f64>, max_hint:
                 Some(value) => Border::new()
                     .width(4.0)
                     .height((value / max * height).clamp(1.0, height))
+                    .corner_radius(1.5)
                     .vertical_alignment(VerticalAlignment::Bottom)
-                    .background(theme::winui::text_accent()),
+                    .background(bar),
                 None => Border::new()
                     .width(4.0)
                     .height(2.0)
                     .opacity(0.3)
                     .vertical_alignment(VerticalAlignment::Bottom)
-                    .background(theme::winui::stroke()),
+                    .background(palette.outline_variant()),
             };
             KeyedView::new(index, bar)
         })
@@ -225,11 +233,20 @@ fn counter(value: Option<i64>) -> String {
     value.map_or_else(|| "—".to_owned(), |value| value.to_string())
 }
 
-fn action_button(label: &str, callback: Option<Callback<()>>, enabled: bool) -> View {
+fn action_button(
+    label: &str,
+    callback: Option<Callback<()>>,
+    enabled: bool,
+    palette: Palette,
+) -> View {
     let available = callback.is_some();
-    let button = Button::new()
-        .is_enabled(enabled && available)
-        .automation_name(label.to_owned());
+    let button = if label.contains("top") {
+        crate::m3::outlined(palette)
+    } else {
+        crate::m3::tonal(palette)
+    }
+    .is_enabled(enabled && available)
+    .automation_name(label.to_owned());
     let button = match callback {
         Some(callback) => button.on_click(callback),
         None => button,
@@ -245,6 +262,7 @@ pub fn monitor_pane(
     controls_enabled: bool,
     reparent: ReparentData<'_>,
     actions: MonitorActions,
+    palette: Palette,
 ) -> View {
     // Only highlight a row index that already existed before this refresh,
     // so the native SelectedIndex never runs ahead of the items it indexes
@@ -256,7 +274,7 @@ pub fn monitor_pane(
     let rows: Vec<KeyedView> = monitor
         .rows
         .iter()
-        .map(|row| KeyedView::new(row.id.clone(), row_view(row)))
+        .map(|row| KeyedView::new(row.id.clone(), row_view(row, palette)))
         .collect();
     let status = match monitor.read_at_ms {
         Some(at) => format!(
@@ -287,8 +305,7 @@ pub fn monitor_pane(
         (Some(_), Some(Err(error))) => {
             details.push(KeyedView::new(
                 "error",
-                small(format!("Detail read failed: {error}"))
-                    .foreground(theme::winui::text_critical()),
+                small(format!("Detail read failed: {error}")).foreground(palette.error()),
             ));
         }
         (Some(_), _) => details.push(KeyedView::new("loading", small("Reading details…"))),
@@ -316,7 +333,13 @@ pub fn monitor_pane(
                 details.push(KeyedView::new("cpu-label", small(cpu_label)));
                 details.push(KeyedView::new(
                     "cpu",
-                    sparkline(&recent, |point| point.cpu_percent, 100.0),
+                    sparkline(
+                        &recent,
+                        |point| point.cpu_percent,
+                        100.0,
+                        palette,
+                        palette.primary(),
+                    ),
                 ));
                 details.push(KeyedView::new(
                     "rss-label",
@@ -331,6 +354,8 @@ pub fn monitor_pane(
                         &recent,
                         |point| point.rss_bytes.map(|bytes| bytes as f64),
                         0.0,
+                        palette,
+                        palette.tertiary(),
                     ),
                 ));
                 details.push(KeyedView::new(
@@ -359,20 +384,29 @@ pub fn monitor_pane(
             details.push(KeyedView::new(
                 "unsupported",
                 small("Controls unavailable: observe-only Agents reject native control verbs.")
-                    .foreground(theme::winui::text_critical()),
+                    .foreground(palette.error()),
             ));
         }
         details.push(KeyedView::new(
             "actions",
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(theme::spacing::SM)
-                .children((
-                    action_button("Open conversation", actions.open, true),
-                    action_button("Interrupt", actions.interrupt, controls_enabled),
-                    action_button("Stop", actions.stop, controls_enabled),
-                    action_button("Force stop", actions.force_stop, controls_enabled),
-                )),
+            // Conversation and turn actions, then lifecycle: two rows fit the
+            // monitor's width.
+            StackPanel::new().spacing(theme::spacing::SM).children((
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(theme::spacing::SM)
+                    .children((
+                        action_button("Open conversation", actions.open, true, palette),
+                        action_button("Interrupt", actions.interrupt, controls_enabled, palette),
+                    )),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(theme::spacing::SM)
+                    .children((
+                        action_button("Stop", actions.stop, controls_enabled, palette),
+                        action_button("Force stop", actions.force_stop, controls_enabled, palette),
+                    )),
+            )),
         ));
         // One row per possible manager, each button already bound to that
         // row's generation: no selection state can disagree with the screen.
@@ -390,8 +424,18 @@ pub fn monitor_pane(
                             .orientation(Orientation::Horizontal)
                             .spacing(theme::spacing::SM)
                             .children((
-                                action_button(&agent_label, row.move_agent, controls_enabled),
-                                action_button(&children_label, row.move_children, controls_enabled),
+                                action_button(
+                                    &agent_label,
+                                    row.move_agent,
+                                    controls_enabled,
+                                    palette,
+                                ),
+                                action_button(
+                                    &children_label,
+                                    row.move_children,
+                                    controls_enabled,
+                                    palette,
+                                ),
                             )),
                     )),
                 )
@@ -421,27 +465,25 @@ pub fn monitor_pane(
     }
 
     Grid::new()
-        .grid_column(2)
         .rows([
             GridLength::Auto,
             GridLength::Auto,
-            GridLength::STAR,
+            GridLength::Auto,
             GridLength::STAR,
         ])
-        .row_spacing(theme::spacing::SM)
+        .row_spacing(theme::spacing::MD)
         .children((
             StackPanel::new().grid_row(0).spacing(2.0).children((
-                TextBlock::new()
-                    .text("Monitor")
-                    .automation_heading_level(AutomationHeadingLevel::Level2)
-                    .font_size(theme::type_scale::HEADING)
-                    .font_weight(FontWeight::SEMI_BOLD),
+                crate::m3::title("Monitor", theme::type_scale::TITLE_LARGE),
                 small(status).opacity(theme::MUTED_OPACITY),
-                small(errors).foreground(theme::winui::text_critical()),
+                small(errors).foreground(palette.error()),
             )),
-            small(monitor.counter_line()).grid_row(1),
+            small(monitor.counter_line())
+                .opacity(theme::MUTED_OPACITY)
+                .grid_row(1),
             ListView::new()
                 .grid_row(2)
+                .max_height(320.0)
                 .selected_index(selected_index)
                 .automation_name("Monitored Agents")
                 .on_selection_changed(actions.select)
@@ -451,9 +493,11 @@ pub fn monitor_pane(
                 .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                 .automation_name("Agent details")
                 .content(
-                    StackPanel::new()
-                        .spacing(theme::spacing::SM)
-                        .keyed_children(details),
+                    crate::m3::card(palette).content(
+                        StackPanel::new()
+                            .spacing(theme::spacing::SM)
+                            .keyed_children(details),
+                    ),
                 ),
         ))
 }

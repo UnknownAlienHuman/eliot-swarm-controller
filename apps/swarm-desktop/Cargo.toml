@@ -16,6 +16,13 @@ workspace = true
 eliot-core.workspace = true
 eliot-daemon.workspace = true
 futures-util.workspace = true
+# First code import of material-colors 0.5.0
+# (https://github.com/Aiving/material-colors), MIT OR Apache-2.0,
+# rust-version 1.97, a port of Google's material-color-utilities
+# (https://github.com/material-foundation/material-color-utilities, Apache-2.0).
+# Used as a library for HCT tonal palettes and the M3 dynamic scheme roles;
+# default features only (no runtime dependencies); no source copied.
+material-colors = "=0.5.0"
 # First code import of pulldown-cmark 0.13.1
 # (https://github.com/pulldown-cmark/pulldown-cmark), MIT, rust-version 1.71.1.
 # Used directly as a pull parser (no HTML renderer, no CLI); no source copied.
@@ -34,9 +41,13 @@ url.workspace = true
 # the library is used directly. WinUI staging at runtime uses Reactor's own
 # bootstrap inside App::run; no self-contained exe is promised.
 windows-reactor = "=0.100.0"
-# Clipboard only (Reactor 0.100.0 has no clipboard API): the workspace pin.
+# Clipboard (Reactor 0.100.0 has no clipboard API) and the High Contrast
+# check (Reactor reports Light/Dark only): the workspace pin.
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
+    # High Contrast detection (SPI_GETHIGHCONTRAST) for the theme fallback.
+    "Win32_UI_Accessibility",
+    "Win32_UI_WindowsAndMessaging",
 ] }

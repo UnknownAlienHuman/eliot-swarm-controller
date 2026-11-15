@@ -1,6 +1,7 @@
 //! The one launch picker: configured profile or ad-hoc harness/model/effort, workspace and the first message.
 
 use super::*;
+use crate::theme::winui::Palette;
 
 #[derive(Clone, Debug)]
 pub(super) enum LaunchMsg {
@@ -274,5 +275,154 @@ impl DesktopApp {
                     .map_err(|error| error.to_string())
             })))
         });
+    }
+
+    /// The one launch picker beside the first message (issue #407 §1): a
+    /// configured profile with its requested summary, or an ad-hoc
+    /// harness/model/effort, plus the workspace. Requested settings only;
+    /// the Agent detail shows the effective readback after launch.
+    pub(super) fn launch_card(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let adhoc = self.launch.picker_adhoc;
+        let mode = |label: &str, name: &str, index: usize, selected: bool| {
+            m3::segment(palette, selected)
+                .automation_name(if selected {
+                    format!("{name} (selected)")
+                } else {
+                    name.to_owned()
+                })
+                .on_click(
+                    context.message(Message::Launch(LaunchMsg::PickerModeSelected(Some(index)))),
+                )
+                .content(TextBlock::new().text(label.to_owned()))
+        };
+        let modes = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(theme::spacing::XS)
+            .children((
+                mode("Profile", "Launch mode: configured profile", 0, !adhoc),
+                mode("Ad-hoc harness", "Launch mode: ad-hoc harness", 1, adhoc),
+            ));
+
+        let picker_profiles = self.picker_profiles();
+        let selected_summary = self
+            .launch
+            .profile_idx
+            .and_then(|index| picker_profiles.get(index).copied());
+        let field_width = 220.0;
+        let (inputs, note): (View, String) = if adhoc {
+            (
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(theme::spacing::SM)
+                    .children((
+                        ComboBox::new()
+                            .items_source(ADHOC_HARNESSES.map(str::to_owned).to_vec())
+                            .selected_index(self.launch.adhoc_harness_idx)
+                            .automation_name("Ad-hoc harness")
+                            .on_selection_changed(context.callback(|value| {
+                                Message::Launch(LaunchMsg::AdhocHarnessSelected(value))
+                            })),
+                        m3::field(palette)
+                            .text(self.launch.adhoc_model.clone())
+                            .placeholder_text("Model (harness default)")
+                            .automation_name("Ad-hoc model")
+                            .width(field_width)
+                            .on_text_changed(context.callback(|value| {
+                                Message::Launch(LaunchMsg::AdhocModelChanged(value))
+                            })),
+                        m3::field(palette)
+                            .text(self.launch.adhoc_effort.clone())
+                            .placeholder_text("Effort (harness default)")
+                            .automation_name("Ad-hoc effort")
+                            .width(160.0)
+                            .on_text_changed(context.callback(|value| {
+                                Message::Launch(LaunchMsg::AdhocEffortChanged(value))
+                            })),
+                        m3::text_button(palette)
+                            .on_click(
+                                context.message(Message::Launch(LaunchMsg::HarnessModelsRequested)),
+                            )
+                            .content(TextBlock::new().text("Harness defaults")),
+                    )),
+                self.launch.harness_hint.clone(),
+            )
+        } else if !self.launch.profile_summaries.is_empty() {
+            (
+                ComboBox::new()
+                    .items_source(
+                        picker_profiles
+                            .iter()
+                            .map(|profile| profile.name.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                    .selected_index(self.launch.profile_idx)
+                    .placeholder_text("Profile")
+                    .automation_name("Profile")
+                    .width(field_width)
+                    .on_selection_changed(
+                        context
+                            .callback(|value| Message::Launch(LaunchMsg::ProfileSelected(value))),
+                    )
+                    .into(),
+                selected_summary.map_or_else(
+                    || {
+                        "Pick a profile: its requested harness, model and route appear here."
+                            .to_owned()
+                    },
+                    config_view::summary_line,
+                ),
+            )
+        } else if self.launch.profiles.is_empty() {
+            (
+                m3::field(palette)
+                    .text(self.launch.profile_text.clone())
+                    .placeholder_text("Configured profile name")
+                    .automation_name("Profile")
+                    .width(field_width)
+                    .on_text_changed(
+                        context.callback(|value| {
+                            Message::Launch(LaunchMsg::ProfileTextChanged(value))
+                        }),
+                    )
+                    .into(),
+                String::new(),
+            )
+        } else {
+            (
+                ComboBox::new()
+                    .items_source(self.launch.profiles.clone())
+                    .selected_index(self.launch.profile_idx)
+                    .placeholder_text("Profile")
+                    .automation_name("Profile")
+                    .width(field_width)
+                    .on_selection_changed(
+                        context
+                            .callback(|value| Message::Launch(LaunchMsg::ProfileSelected(value))),
+                    )
+                    .into(),
+                String::new(),
+            )
+        };
+        let workspace = m3::field(palette)
+            .text(self.launch.workspace.clone())
+            .placeholder_text("Workspace path")
+            .automation_name("Workspace")
+            .on_text_changed(
+                context.callback(|value| Message::Launch(LaunchMsg::WorkspaceChanged(value))),
+            );
+
+        m3::card(palette).content(
+            StackPanel::new().spacing(theme::spacing::SM).children((
+                Grid::new()
+                    .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
+                    .column_spacing(theme::spacing::MD)
+                    .children((
+                        modes,
+                        Border::new().grid_column(1).content(inputs),
+                        workspace.grid_column(2),
+                    )),
+                m3::muted(note, theme::type_scale::BODY_SMALL).text_wrapping(TextWrapping::Wrap),
+            )),
+        )
     }
 }

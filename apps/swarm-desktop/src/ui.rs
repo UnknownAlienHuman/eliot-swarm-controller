@@ -76,6 +76,7 @@ use crate::config_view::{self, ProfilesActions, ProfilesData, RuleNamespace};
 use crate::configure;
 use crate::feed::{self, Delivery, Depth, Reread, Snapshot};
 use crate::live::{self, LiveStatus, Next};
+use crate::m3;
 use crate::markdown::Doc;
 use crate::monitor::{self, Monitor, MonitorSnapshot};
 use crate::monitor_view::{self, MonitorActions};
@@ -192,7 +193,16 @@ enum Message {
 struct DesktopApp {
     data_dir: Fallible<PathBuf>,
     status: String,
-    dark_accent: bool,
+    appearance: shell_ui::Appearance,
+    /// False for the one render after the screen tree is re-created: the
+    /// multi-line editors are then created empty (see `reprime_fields`).
+    fields_primed: bool,
+    /// Tags one re-prime; a `FieldsPrimed` for an older one is ignored.
+    prime_epoch: u64,
+    /// Renders composed so far, and the count when the last re-prime began:
+    /// the editors get their text only after a render without it.
+    renders: std::cell::Cell<u64>,
+    prime_after: u64,
     ledger: MutationLedger,
     /// Ledger key of the single unresolved submission; blocks duplicates.
     in_flight_key: Option<String>,
@@ -209,6 +219,11 @@ struct DesktopApp {
 }
 
 impl DesktopApp {
+    /// The active M3 palette (system colors under High Contrast).
+    fn palette(&self) -> theme::winui::Palette {
+        self.appearance.palette()
+    }
+
     fn submitting(&self) -> bool {
         self.in_flight_key.is_some()
     }
@@ -392,7 +407,11 @@ impl Component for DesktopApp {
         let mut app = Self {
             data_dir,
             status: "Connecting to the daemon…".to_owned(),
-            dark_accent: false,
+            appearance: shell_ui::Appearance::new(),
+            fields_primed: true,
+            prime_epoch: 0,
+            renders: std::cell::Cell::new(0),
+            prime_after: 0,
             ledger: MutationLedger::default(),
             in_flight_key: None,
             screen: Screen::Chat,
@@ -469,6 +488,7 @@ impl Component for DesktopApp {
                 Message::Shell(ShellMsg::ProjectsLoaded(load_projects_blocking(&data_dir)))
             });
             app.load_agents(context, None);
+            app.watch_high_contrast(context);
             app.load_profile_list(context);
         }
         app
@@ -489,127 +509,10 @@ impl Component for DesktopApp {
     }
 
     fn view(&self, _input: &(), context: &mut ViewContext<Self>) -> View {
-        context.window_title("Swarm Desktop");
-        // A bounded first window instead of WinUI's share of the monitor
-        // (3826 px wide on a 5120 px display). Reactor applies only visuals
-        // that differ from the default, so this declaration is also what
-        // makes the title bar follow the app's (system) theme.
-        context.window_visuals(
-            WindowVisuals::new()
-                .client_size(theme::layout::WINDOW_WIDTH, theme::layout::WINDOW_HEIGHT),
-        );
-        let header = StackPanel::new()
-            .grid_row(0)
-            .orientation(Orientation::Horizontal)
-            .spacing(theme::spacing::LG)
-            .margin(Thickness::new(
-                theme::spacing::LG,
-                theme::spacing::MD,
-                theme::spacing::LG,
-                theme::spacing::SM,
-            ))
-            .children((
-                TextBlock::new()
-                    .text("Swarm Desktop")
-                    .automation_heading_level(AutomationHeadingLevel::Level1)
-                    .font_size(theme::type_scale::TITLE)
-                    .font_weight(FontWeight::BOLD),
-                ToggleButton::new()
-                    .is_checked(self.screen == Screen::Chat)
-                    .automation_name("Chat screen")
-                    .on_is_checked_changed(
-                        context.callback(|_: bool| {
-                            Message::Shell(ShellMsg::ScreenSelected(Screen::Chat))
-                        }),
-                    )
-                    .content(TextBlock::new().text("Chat")),
-                ToggleButton::new()
-                    .is_checked(self.screen == Screen::Profiles)
-                    .automation_name("Profiles screen")
-                    .on_is_checked_changed(context.callback(|_: bool| {
-                        Message::Shell(ShellMsg::ScreenSelected(Screen::Profiles))
-                    }))
-                    .content(TextBlock::new().text("Profiles")),
-                ToggleButton::new()
-                    .is_checked(self.screen == Screen::Automation)
-                    .automation_name("Automation screen")
-                    .on_is_checked_changed(context.callback(|_: bool| {
-                        Message::Shell(ShellMsg::ScreenSelected(Screen::Automation))
-                    }))
-                    .content(TextBlock::new().text("Automation")),
-                ToggleButton::new()
-                    .is_checked(self.screen == Screen::Scripts)
-                    .automation_name("Scripts screen")
-                    .on_is_checked_changed(context.callback(|_: bool| {
-                        Message::Shell(ShellMsg::ScreenSelected(Screen::Scripts))
-                    }))
-                    .content(TextBlock::new().text("Scripts")),
-                ToggleButton::new()
-                    .is_checked(self.monitor.open)
-                    .automation_name("Monitor")
-                    .on_is_checked_changed(
-                        context
-                            .callback(|value| Message::Monitor(MonitorMsg::MonitorToggled(value))),
-                    )
-                    .content(TextBlock::new().text("Monitor")),
-                TextBlock::new()
-                    .text(self.chat.live.label())
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .foreground(theme::winui::text_accent()),
-                TextBlock::new()
-                    .text(self.status.clone())
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .text_trimming(TextTrimming::CharacterEllipsis)
-                    .opacity(theme::MUTED_OPACITY),
-            ));
-
-        let mut columns = vec![
-            GridLength::Pixel(theme::layout::NAV_WIDTH),
-            GridLength::STAR,
-        ];
-        if self.monitor.open {
-            columns.push(GridLength::Pixel(theme::layout::MONITOR_WIDTH));
-        }
-        let monitor_pane = if self.monitor.open {
-            self.monitor_view(context)
-        } else {
-            View::empty()
-        };
-        let main = Grid::new()
-            .grid_row(1)
-            .columns(columns)
-            .column_spacing(theme::spacing::LG)
-            .margin(Thickness::new(
-                theme::spacing::LG,
-                0.0,
-                theme::spacing::LG,
-                theme::spacing::LG,
-            ))
-            .children((
-                self.nav_view(context),
-                match self.screen {
-                    Screen::Chat => self.chat_view(context),
-                    Screen::Profiles => self.profiles_view(context),
-                    Screen::Automation => config_view::automation_screen(
-                        &self.automation.rules,
-                        &self.automation.status,
-                        context.message(Message::Automation(
-                            AutomationMsg::AutomationRefreshRequested,
-                        )),
-                    ),
-                    Screen::Scripts => self.scripts_view(context),
-                },
-                monitor_pane,
-            ));
-
-        Grid::new()
-            .background(theme::winui::window_surface())
-            .rows([GridLength::Auto, GridLength::STAR])
-            .children((header, main))
+        self.renders.set(self.renders.get() + 1);
+        self.shell_view(context)
     }
 }
-
-impl DesktopApp {}
 
 /// Run the single desktop window. Blocks while the WinUI message loop runs;
 /// closing the window disconnects the UI, never the Agent.

@@ -1,6 +1,8 @@
 //! Navigation shell: projects, the Agent list, screen selection and the root layout.
 
 use super::*;
+use crate::theme::StatusTone;
+use crate::theme::winui::Palette;
 
 #[derive(Clone, Debug)]
 pub(super) enum ShellMsg {
@@ -13,6 +15,84 @@ pub(super) enum ShellMsg {
     MoreAgentsRequested,
     HighlightAgent(String),
     ScreenSelected(Screen),
+    /// The window's actual Light/Dark scheme (Reactor `on_color_scheme`).
+    SchemeObserved(ColorScheme),
+    /// System → Light → Dark → System.
+    ThemeCycled,
+    /// The re-created editors of this re-prime exist: give them their text.
+    FieldsPrimed(u64),
+    /// The periodic High Contrast reading.
+    HighContrastRead(bool),
+}
+
+/// Reactor 0.100.0 reports the window's Light/Dark scheme only, and a High
+/// Contrast theme can keep the same base scheme, so High Contrast is read
+/// at the monitor's cadence.
+const HIGH_CONTRAST_POLL_MS: u64 = 2_000;
+/// Re-check for the empty editor render one frame later.
+const PRIME_RETRY_MS: u64 = 16;
+
+/// The owner's theme choice for this window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ThemePref {
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemePref {
+    fn next(self) -> Self {
+        match self {
+            Self::System => Self::Light,
+            Self::Light => Self::Dark,
+            Self::Dark => Self::System,
+        }
+    }
+
+    fn window_theme(self) -> WindowTheme {
+        match self {
+            Self::System => WindowTheme::System,
+            Self::Light => WindowTheme::Light,
+            Self::Dark => WindowTheme::Dark,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::System => m3::glyph::THEME_SYSTEM,
+            Self::Light => m3::glyph::THEME_LIGHT,
+            Self::Dark => m3::glyph::THEME_DARK,
+        }
+    }
+}
+
+/// Theme choice, the scheme the window actually shows, and High Contrast.
+pub(super) struct Appearance {
+    pref: ThemePref,
+    dark: bool,
+    high_contrast: bool,
+}
+
+impl Appearance {
+    pub(super) fn new() -> Self {
+        Self {
+            pref: ThemePref::System,
+            dark: false,
+            high_contrast: crate::accessibility::high_contrast_on(),
+        }
+    }
+
+    pub(super) fn palette(&self) -> theme::winui::Palette {
+        theme::winui::Palette::new(self.dark, self.high_contrast)
+    }
 }
 
 /// Projects, the Agent list page and the current selection.
@@ -173,6 +253,9 @@ impl DesktopApp {
                 }
             }
             ShellMsg::ScreenSelected(screen) => {
+                if self.screen != screen {
+                    self.reprime_fields(context);
+                }
                 self.screen = screen;
                 match screen {
                     Screen::Profiles if !self.editor.loaded && !self.editor.busy => {
@@ -189,7 +272,75 @@ impl DesktopApp {
                     _ => {}
                 }
             }
+            ShellMsg::SchemeObserved(scheme) => {
+                let before = self.palette();
+                self.appearance.dark = scheme == ColorScheme::Dark;
+                self.appearance.high_contrast = crate::accessibility::high_contrast_on();
+                if self.palette() != before {
+                    // The palette-keyed tree is rebuilt with new controls.
+                    self.reprime_fields(context);
+                }
+            }
+            ShellMsg::HighContrastRead(on) => {
+                if on != self.appearance.high_contrast {
+                    self.appearance.high_contrast = on;
+                    self.reprime_fields(context);
+                }
+                self.watch_high_contrast(context);
+            }
+            ShellMsg::ThemeCycled => self.appearance.pref = self.appearance.pref.next(),
+            ShellMsg::FieldsPrimed(epoch) => {
+                if epoch != self.prime_epoch {
+                    return;
+                }
+                // Reactor drains queued messages before it composes, so this
+                // can arrive before the empty render: wait for one.
+                if self.renders.get() > self.prime_after {
+                    self.fields_primed = true;
+                } else {
+                    self.post_fields_primed(epoch, PRIME_RETRY_MS, context);
+                }
+            }
         }
+    }
+
+    /// Reactor 0.100.0 creates a TextBox with `Text` before `AcceptsReturn`,
+    /// and a TextBox that is still single-line keeps only the first line of
+    /// the text it is given. Whenever the screen tree is re-created the
+    /// multi-line editors (composer, profile and script sources) therefore
+    /// render one turn empty and get their text on the next message, once
+    /// they already accept returns: the same path as a first load.
+    pub(super) fn reprime_fields(&mut self, context: &ComponentContext<Self>) {
+        self.fields_primed = false;
+        self.prime_epoch += 1;
+        self.prime_after = self.renders.get();
+        self.post_fields_primed(self.prime_epoch, 0, context);
+    }
+
+    fn post_fields_primed(&self, epoch: u64, delay_ms: u64, context: &ComponentContext<Self>) {
+        let _task = context.spawn_background(move |cancel| {
+            let cancelled = || cancel.is_cancelled();
+            if delay_ms > 0 {
+                let _ = feed::backoff(delay_ms, &cancelled);
+            }
+            Message::Shell(ShellMsg::FieldsPrimed(epoch))
+        });
+    }
+
+    /// The next High Contrast reading, one cadence from now.
+    pub(super) fn watch_high_contrast(&self, context: &ComponentContext<Self>) {
+        let _task = context.spawn_background(|cancel| {
+            let cancelled = || cancel.is_cancelled();
+            let _ = feed::backoff(HIGH_CONTRAST_POLL_MS, &cancelled);
+            Message::Shell(ShellMsg::HighContrastRead(
+                crate::accessibility::high_contrast_on(),
+            ))
+        });
+    }
+
+    /// `text` once the editors are primed, empty during the priming render.
+    pub(super) fn primed<'a>(&self, text: &'a str) -> &'a str {
+        if self.fields_primed { text } else { "" }
     }
 
     pub(super) fn selected_project(&self) -> Option<&UiProject> {
@@ -232,10 +383,260 @@ impl DesktopApp {
         });
     }
 
-    pub(super) fn nav_view(&self, context: &mut ViewContext<Self>) -> View {
+    /// The window: navigation rail, the selected screen on rounded panes,
+    /// the openable monitor and one status line (issue #407 §1).
+    pub(super) fn shell_view(&self, context: &mut ViewContext<Self>) -> View {
+        context.window_title("Swarm Desktop");
+        // A bounded first window instead of WinUI's share of the monitor
+        // (3826 px wide on a 5120 px display). Reactor applies only visuals
+        // that differ from the default, so this declaration also carries the
+        // title-bar theme.
+        context.window_visuals(
+            WindowVisuals::new()
+                .client_size(theme::layout::WINDOW_WIDTH, theme::layout::WINDOW_HEIGHT)
+                .theme(self.appearance.pref.window_theme()),
+        );
+        context.on_color_scheme(
+            context.callback(|scheme| Message::Shell(ShellMsg::SchemeObserved(scheme))),
+        );
+        let palette = self.palette();
+
+        let screen: View = match self.screen {
+            Screen::Chat => Grid::new()
+                .columns([
+                    GridLength::Pixel(theme::layout::LIST_WIDTH),
+                    GridLength::STAR,
+                ])
+                .column_spacing(theme::spacing::SM)
+                .children((
+                    m3::pane(palette)
+                        .grid_column(0)
+                        .content(self.nav_view(context, palette)),
+                    m3::pane(palette)
+                        .padding(Thickness::uniform(0.0))
+                        .grid_column(1)
+                        .content(self.chat_view(context, palette)),
+                )),
+            Screen::Profiles => m3::pane(palette).content(self.profiles_view(context, palette)),
+            Screen::Automation => m3::pane(palette).content(config_view::automation_screen(
+                &self.automation.rules,
+                &self.automation.status,
+                context.message(Message::Automation(
+                    AutomationMsg::AutomationRefreshRequested,
+                )),
+                palette,
+            )),
+            Screen::Scripts => m3::pane(palette).content(self.scripts_view(context, palette)),
+        };
+        let mut columns = vec![GridLength::STAR];
+        let monitor: View = if self.monitor.open {
+            columns.push(GridLength::Pixel(theme::layout::MONITOR_WIDTH));
+            m3::pane(palette)
+                .grid_column(1)
+                .content(self.monitor_view(context, palette))
+        } else {
+            View::empty()
+        };
+        let content = Grid::new()
+            .grid_column(1)
+            .rows([GridLength::STAR, GridLength::Auto])
+            .margin(Thickness::new(
+                0.0,
+                theme::spacing::SM,
+                theme::spacing::SM,
+                0.0,
+            ))
+            .children((
+                Grid::new()
+                    .columns(columns)
+                    .column_spacing(theme::spacing::SM)
+                    .children((screen, monitor)),
+                Border::new().grid_row(1).content(self.status_line(palette)),
+            ));
+
+        let window = Grid::new()
+            .background(palette.background())
+            .columns([
+                GridLength::Pixel(theme::layout::RAIL_WIDTH),
+                GridLength::STAR,
+            ])
+            .children((self.rail_view(context, palette), content));
+        // Reactor updates a Button's resource overrides in place, but WinUI
+        // resolves a template's ThemeResource values only when the template
+        // is applied or the theme changes, and the theme change arrives before
+        // the new palette. Keying the tree by palette rebuilds the native
+        // controls on a scheme switch (rare) so every button takes the new
+        // overrides; all view state is model-bound and is redrawn as it was.
+        let palette_key = match palette.scheme() {
+            None => "high-contrast",
+            Some(scheme) if scheme.dark => "dark",
+            Some(_) => "light",
+        };
+        Grid::new().keyed_children(vec![KeyedView::new(palette_key.to_owned(), window)])
+    }
+
+    /// The M3 navigation rail: the new-conversation FAB, the destinations
+    /// with their active indicator, and the monitor and theme switches.
+    fn rail_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let chat = self.rail_item(
+            palette,
+            self.screen == Screen::Chat,
+            m3::glyph::CHAT,
+            "Chat",
+            "Chat screen",
+            context.message(Message::Shell(ShellMsg::ScreenSelected(Screen::Chat))),
+        );
+        let profiles = self.rail_item(
+            palette,
+            self.screen == Screen::Profiles,
+            m3::glyph::PROFILES,
+            "Profiles",
+            "Profiles screen",
+            context.message(Message::Shell(ShellMsg::ScreenSelected(Screen::Profiles))),
+        );
+        let automation = self.rail_item(
+            palette,
+            self.screen == Screen::Automation,
+            m3::glyph::AUTOMATION,
+            "Automation",
+            "Automation screen",
+            context.message(Message::Shell(ShellMsg::ScreenSelected(Screen::Automation))),
+        );
+        let scripts = self.rail_item(
+            palette,
+            self.screen == Screen::Scripts,
+            m3::glyph::SCRIPTS,
+            "Scripts",
+            "Scripts screen",
+            context.message(Message::Shell(ShellMsg::ScreenSelected(Screen::Scripts))),
+        );
+        let monitor = self.rail_item(
+            palette,
+            self.monitor.open,
+            m3::glyph::MONITOR,
+            "Monitor",
+            "Monitor",
+            context.message(Message::Monitor(MonitorMsg::MonitorToggled(
+                !self.monitor.open,
+            ))),
+        );
+        let fab = Button::new()
+            .grid_row(0)
+            .automation_name("New conversation")
+            .resource_overrides(palette.fab())
+            .width(56.0)
+            .height(56.0)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .on_click(context.message(Message::Shell(ShellMsg::NewConversation)))
+            .content(m3::icon(m3::glyph::ADD));
+        let pref = self.appearance.pref;
+        let theme_switch = Button::new()
+            .automation_name(format!(
+                "Theme: {} (switch to {})",
+                pref.label(),
+                pref.next().label()
+            ))
+            .resource_overrides(palette.rail_item(false))
+            .width(theme::layout::RAIL_ITEM_WIDTH)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .on_click(context.message(Message::Shell(ShellMsg::ThemeCycled)))
+            .content(rail_label(pref.glyph(), pref.label(), false, None));
+        Grid::new()
+            .grid_column(0)
+            .rows([
+                GridLength::Auto,
+                GridLength::Auto,
+                GridLength::STAR,
+                GridLength::Auto,
+            ])
+            .row_spacing(theme::spacing::XL)
+            .margin(Thickness::new(
+                0.0,
+                theme::spacing::MD,
+                0.0,
+                theme::spacing::MD,
+            ))
+            .children((
+                fab,
+                StackPanel::new()
+                    .grid_row(1)
+                    .spacing(theme::spacing::MD)
+                    .children((chat, profiles, automation, scripts)),
+                StackPanel::new()
+                    .grid_row(3)
+                    .spacing(theme::spacing::SM)
+                    .children((monitor, theme_switch)),
+            ))
+    }
+
+    /// One rail destination: a real Button with the M3 indicator pill behind
+    /// its icon when selected. The accessible name carries the selection.
+    fn rail_item(
+        &self,
+        palette: Palette,
+        selected: bool,
+        glyph: &str,
+        label: &str,
+        name: &str,
+        on_click: Callback<()>,
+    ) -> View {
+        Button::new()
+            .automation_name(if selected {
+                format!("{name} (current)")
+            } else {
+                name.to_owned()
+            })
+            .resource_overrides(palette.rail_item(selected))
+            .width(theme::layout::RAIL_ITEM_WIDTH)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .on_click(on_click)
+            .content(rail_label(
+                glyph,
+                label,
+                selected,
+                selected.then(|| palette.indicator()),
+            ))
+    }
+
+    /// Connection state as a chip, then the latest status message.
+    fn status_line(&self, palette: Palette) -> View {
+        let (tone, short) = match &self.chat.live {
+            LiveStatus::Idle => (StatusTone::Neutral, "No conversation"),
+            LiveStatus::Loading => (StatusTone::Pending, "Loading"),
+            LiveStatus::Live => (StatusTone::Ready, "Live"),
+            LiveStatus::Stale(_) => (StatusTone::Unknown, "Stale"),
+            LiveStatus::Reconnecting { .. } => (StatusTone::Unknown, "Reconnecting"),
+            LiveStatus::Stopped(_) => (StatusTone::Failed, "Stopped"),
+        };
+        let detail = match &self.chat.live {
+            LiveStatus::Stale(_) | LiveStatus::Reconnecting { .. } | LiveStatus::Stopped(_) => {
+                format!("{} · {}", self.chat.live.label(), self.status)
+            }
+            _ => self.status.clone(),
+        };
+        StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(theme::spacing::SM)
+            .margin(Thickness::new(
+                theme::spacing::XS,
+                theme::spacing::XS,
+                theme::spacing::SM,
+                theme::spacing::SM,
+            ))
+            .children((
+                m3::chip(palette, tone, short),
+                m3::muted(detail, theme::type_scale::BODY_SMALL)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .text_trimming(TextTrimming::CharacterEllipsis),
+            ))
+    }
+
+    /// Projects and Agents: the list beside the conversation.
+    pub(super) fn nav_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let mut project_names = vec![ALL_PROJECTS.to_owned()];
         project_names.extend(self.nav.projects.iter().map(|project| project.id.clone()));
         let project_picker = ComboBox::new()
+            .grid_row(1)
             .items_source(project_names)
             .selected_index(self.nav.project_idx)
             .placeholder_text("Project")
@@ -245,6 +646,9 @@ impl DesktopApp {
                 context.callback(|value| Message::Shell(ShellMsg::ProjectSelected(value))),
             );
 
+        // ListViewItem exposes no content alignment in Reactor 0.100.0, so
+        // the row takes the list's fixed inner width to right-align the chip.
+        let row_width = theme::layout::LIST_WIDTH - 2.0 * theme::spacing::LG - 40.0;
         let agent_items: Vec<KeyedView> = self
             .nav
             .agents
@@ -258,21 +662,38 @@ impl DesktopApp {
                             agent.id, agent.state, agent.harness, agent.generation
                         ))
                         .content(
-                            StackPanel::new().spacing(2.0).children((
-                                TextBlock::new()
-                                    .text(format!("{} · {}", agent.id, agent.state))
-                                    .font_weight(FontWeight::SEMI_BOLD),
-                                TextBlock::new()
-                                    .text(format!("{} · gen {}", agent.harness, agent.generation))
-                                    .font_size(theme::type_scale::LABEL)
-                                    .opacity(theme::MUTED_OPACITY),
-                            )),
+                            Grid::new()
+                                .width(row_width)
+                                .columns([GridLength::STAR, GridLength::Auto])
+                                .column_spacing(theme::spacing::SM)
+                                .margin(Thickness::xy(0.0, theme::spacing::SM))
+                                .children((
+                                    StackPanel::new()
+                                        .spacing(2.0)
+                                        .vertical_alignment(VerticalAlignment::Center)
+                                        .children((
+                                            m3::text(
+                                                agent.id.clone(),
+                                                theme::type_scale::TITLE_SMALL,
+                                            ),
+                                            m3::muted(
+                                                format!(
+                                                    "{} · gen {}",
+                                                    agent.harness, agent.generation
+                                                ),
+                                                theme::type_scale::BODY_SMALL,
+                                            ),
+                                        )),
+                                    Border::new()
+                                        .grid_column(1)
+                                        .content(m3::status_chip(palette, &agent.state)),
+                                )),
                         ),
                 )
             })
             .collect();
         let agent_list = ListView::new()
-            .grid_row(3)
+            .grid_row(2)
             .selected_index(self.nav.agent_idx)
             .automation_name("Agents")
             .on_selection_changed(
@@ -280,8 +701,8 @@ impl DesktopApp {
             )
             .collection_slot(ListViewSlot::Items, agent_items);
 
-        let counter = TextBlock::new()
-            .text(if self.nav.agents_loading {
+        let counter = m3::muted(
+            if self.nav.agents_loading {
                 "Loading Agents…".to_owned()
             } else {
                 format!(
@@ -296,168 +717,73 @@ impl DesktopApp {
                         ""
                     }
                 )
-            })
-            .font_size(theme::type_scale::LABEL)
-            .opacity(theme::MUTED_OPACITY);
-        let more = Button::new()
-            .grid_row(5)
+            },
+            theme::type_scale::BODY_SMALL,
+        )
+        .vertical_alignment(VerticalAlignment::Center)
+        .text_wrapping(TextWrapping::Wrap);
+        let more = m3::text_button(palette)
+            .grid_column(1)
             .is_enabled(!self.nav.agents_loading && self.nav.agents.len() < self.nav.agents_total)
             .on_click(context.message(Message::Shell(ShellMsg::MoreAgentsRequested)))
             .content(TextBlock::new().text("More Agents"));
-
-        let picker_profiles = self.picker_profiles();
-        let selected_summary = self
-            .launch
-            .profile_idx
-            .and_then(|index| picker_profiles.get(index).copied());
-        let picker_mode = ComboBox::new()
-            .items_source(vec![
-                "Configured profile".to_owned(),
-                "Ad-hoc harness".to_owned(),
-            ])
-            .selected_index(Some(usize::from(self.launch.picker_adhoc)))
-            .automation_name("Launch mode")
-            .on_selection_changed(
-                context.callback(|value| Message::Launch(LaunchMsg::PickerModeSelected(value))),
-            );
-        let profile_input: View = if self.launch.picker_adhoc {
-            StackPanel::new().spacing(theme::spacing::XS).children((
-                ComboBox::new()
-                    .items_source(ADHOC_HARNESSES.map(str::to_owned).to_vec())
-                    .selected_index(self.launch.adhoc_harness_idx)
-                    .automation_name("Ad-hoc harness")
-                    .on_selection_changed(
-                        context.callback(|value| {
-                            Message::Launch(LaunchMsg::AdhocHarnessSelected(value))
-                        }),
-                    ),
-                TextBox::new()
-                    .text(self.launch.adhoc_model.clone())
-                    .placeholder_text("model (unset: harness default)")
-                    .automation_name("Ad-hoc model")
-                    .on_text_changed(
-                        context
-                            .callback(|value| Message::Launch(LaunchMsg::AdhocModelChanged(value))),
-                    ),
-                TextBox::new()
-                    .text(self.launch.adhoc_effort.clone())
-                    .placeholder_text("effort (unset: harness default)")
-                    .automation_name("Ad-hoc effort")
-                    .on_text_changed(
-                        context.callback(|value| {
-                            Message::Launch(LaunchMsg::AdhocEffortChanged(value))
-                        }),
-                    ),
-                Button::new()
-                    .on_click(context.message(Message::Launch(LaunchMsg::HarnessModelsRequested)))
-                    .content(TextBlock::new().text("Harness defaults")),
-                TextBlock::new()
-                    .text(self.launch.harness_hint.clone())
-                    .font_size(theme::type_scale::LABEL)
-                    .text_wrapping(TextWrapping::Wrap)
-                    .opacity(theme::MUTED_OPACITY),
-            ))
-        } else if !self.launch.profile_summaries.is_empty() {
-            StackPanel::new()
-                .spacing(theme::spacing::XS)
-                .children((
-                    ComboBox::new()
-                        .items_source(
-                            picker_profiles
-                                .iter()
-                                .map(|profile| profile.name.clone())
-                                .collect::<Vec<_>>(),
-                        )
-                        .selected_index(self.launch.profile_idx)
-                        .placeholder_text("Profile")
-                        .automation_name("Profile")
-                        .on_selection_changed(context.callback(|value| Message::Launch(LaunchMsg::ProfileSelected(value)))),
-                    TextBlock::new()
-                        .text(selected_summary.map_or_else(
-                            || "Requested settings appear here; the Agent detail shows the effective readback after launch.".to_owned(),
-                            config_view::summary_line,
-                        ))
-                        .font_size(theme::type_scale::LABEL)
-                        .text_wrapping(TextWrapping::Wrap)
-                        .opacity(theme::MUTED_OPACITY),
-                ))
-        } else if self.launch.profiles.is_empty() {
-            TextBox::new()
-                .text(self.launch.profile_text.clone())
-                .placeholder_text("Configured profile name")
-                .automation_name("Profile")
-                .on_text_changed(
-                    context.callback(|value| Message::Launch(LaunchMsg::ProfileTextChanged(value))),
-                )
-                .into()
-        } else {
-            ComboBox::new()
-                .items_source(self.launch.profiles.clone())
-                .selected_index(self.launch.profile_idx)
-                .placeholder_text("Profile")
-                .automation_name("Profile")
-                .on_selection_changed(
-                    context.callback(|value| Message::Launch(LaunchMsg::ProfileSelected(value))),
-                )
-                .into()
-        };
-        let workspace_box = TextBox::new()
-            .text(self.launch.workspace.clone())
-            .placeholder_text("Workspace path")
-            .automation_name("Workspace")
-            .on_text_changed(
-                context.callback(|value| Message::Launch(LaunchMsg::WorkspaceChanged(value))),
-            );
-        let refresh = Button::new()
+        let refresh = m3::text_button(palette)
+            .grid_column(1)
             .automation_name("Refresh")
             .on_click(context.message(Message::Shell(ShellMsg::RefreshRequested)))
-            .content(TextBlock::new().text("Refresh"));
-        let new_chat = Button::new()
-            .automation_name("New conversation")
-            .on_click(context.message(Message::Shell(ShellMsg::NewConversation)))
-            .content(TextBlock::new().text("New"));
+            .content(m3::icon(m3::glyph::REFRESH));
 
-        let section = |text: &str| {
-            TextBlock::new()
-                .text(text.to_owned())
-                .font_size(theme::type_scale::LABEL)
-                .font_weight(FontWeight::SEMI_BOLD)
-        };
         Grid::new()
-            .grid_column(0)
             .rows([
-                GridLength::Auto,
                 GridLength::Auto,
                 GridLength::Auto,
                 GridLength::STAR,
                 GridLength::Auto,
-                GridLength::Auto,
-                GridLength::Auto,
-                GridLength::Auto,
-                GridLength::Auto,
-                GridLength::Auto,
-                GridLength::Auto,
             ])
-            .row_spacing(theme::spacing::SM)
+            .row_spacing(theme::spacing::MD)
             .children((
-                section("Project").grid_row(0),
-                project_picker.grid_row(1),
-                section("Agents").grid_row(2),
+                Grid::new()
+                    .grid_row(0)
+                    .columns([GridLength::STAR, GridLength::Auto])
+                    .children((
+                        m3::title("Agents", theme::type_scale::TITLE_LARGE)
+                            .vertical_alignment(VerticalAlignment::Center),
+                        refresh,
+                    )),
+                project_picker,
                 agent_list,
-                counter.grid_row(4),
-                more,
-                section("Launch").grid_row(6),
-                StackPanel::new()
-                    .grid_row(7)
-                    .spacing(theme::spacing::XS)
-                    .children((picker_mode, profile_input)),
-                section("Workspace").grid_row(8),
-                workspace_box.grid_row(9),
-                StackPanel::new()
-                    .grid_row(10)
-                    .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::SM)
-                    .children((refresh, new_chat)),
+                Grid::new()
+                    .grid_row(3)
+                    .columns([GridLength::STAR, GridLength::Auto])
+                    .children((counter, more)),
             ))
     }
+}
+
+/// Icon over label, with the M3 indicator pill behind the icon when given.
+fn rail_label(glyph: &str, label: &str, selected: bool, indicator: Option<Brush>) -> View {
+    StackPanel::new()
+        .spacing(theme::spacing::XS)
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .children((
+            Border::new()
+                .width(56.0)
+                .height(32.0)
+                .corner_radius(16.0)
+                .background(indicator.unwrap_or(Brush::Solid(Color::transparent())))
+                .content(
+                    m3::icon(glyph)
+                        .horizontal_alignment(HorizontalAlignment::Center)
+                        .vertical_alignment(VerticalAlignment::Center),
+                ),
+            m3::text(
+                label,
+                if selected {
+                    theme::type_scale::LABEL_MEDIUM
+                } else {
+                    theme::type_scale::BODY_SMALL
+                },
+            )
+            .horizontal_alignment(HorizontalAlignment::Center),
+        ))
 }

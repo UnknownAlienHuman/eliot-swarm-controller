@@ -9,11 +9,15 @@
 //! default workspace build and Ubuntu CI stay green.
 
 #[cfg(windows)]
+mod accessibility;
+#[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
 mod config_view;
 #[cfg(windows)]
 mod configure;
+#[cfg(windows)]
+mod m3;
 #[cfg(windows)]
 mod monitor_view;
 #[cfg(windows)]

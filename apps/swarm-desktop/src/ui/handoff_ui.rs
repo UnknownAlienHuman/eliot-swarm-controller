@@ -9,6 +9,7 @@
 
 use super::*;
 use crate::handoff::{self, Outcome, SendRow, Submitted};
+use crate::theme::winui::Palette;
 use eliot_core::CommandState;
 use eliot_core::api::{
     CommandResolution, HandoffRequest, HarnessModelsResponse, SwitchLaunch, SwitchRequest,
@@ -599,7 +600,7 @@ impl DesktopApp {
     }
 
     /// The dialog; an empty view while closed.
-    pub(super) fn handoff_dialog(&self, context: &mut ViewContext<Self>) -> View {
+    pub(super) fn handoff_dialog(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let state = &self.handoff;
         if !state.open {
             return View::empty();
@@ -708,6 +709,7 @@ impl DesktopApp {
                             generation: agent.generation,
                         }))),
                         can_act,
+                        palette,
                     ),
                 )
             })
@@ -738,6 +740,7 @@ impl DesktopApp {
                             profile.name.clone(),
                         )))),
                         can_act,
+                        palette,
                     ),
                 )
             })
@@ -841,6 +844,7 @@ impl DesktopApp {
                     adhoc_label,
                     context.message(Message::Handoff(HandoffMsg::Submit(target))),
                     can_act,
+                    palette,
                 ),
                 None => small(adhoc_label).opacity(theme::MUTED_OPACITY).into(),
             },
@@ -857,11 +861,13 @@ impl DesktopApp {
                             format!("Retry {} with the same id", submitted.id()),
                             context.message(Message::Handoff(HandoffMsg::Retry)),
                             retry && !self.submitting(),
+                            palette,
                         ),
                         action(
                             "Refresh the result".to_owned(),
                             context.message(Message::Handoff(HandoffMsg::RefreshRequested)),
                             !self.submitting(),
+                            palette,
                         ),
                     )),
             );
@@ -881,6 +887,7 @@ impl DesktopApp {
                         ),
                         context.message(Message::Handoff(HandoffMsg::Finish { agent, generation })),
                         !self.submitting(),
+                        palette,
                     ),
                 );
             }
@@ -929,6 +936,7 @@ impl DesktopApp {
                             label,
                             context.message(Message::Handoff(message)),
                             !self.submitting(),
+                            palette,
                         ),
                     ));
                 };
@@ -984,8 +992,8 @@ impl DesktopApp {
     }
 }
 
-fn action(label: String, on_click: Callback<()>, enabled: bool) -> View {
-    Button::new()
+fn action(label: String, on_click: Callback<()>, enabled: bool, palette: Palette) -> View {
+    m3::tonal(palette)
         .is_enabled(enabled)
         .automation_name(label.clone())
         .on_click(on_click)
@@ -1006,7 +1014,7 @@ fn heading(text: &str) -> TextBlock {
 fn small(text: impl Into<String>) -> TextBlock {
     TextBlock::new()
         .text(text.into())
-        .font_size(theme::type_scale::LABEL)
+        .font_size(theme::type_scale::LABEL_MEDIUM.size)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }

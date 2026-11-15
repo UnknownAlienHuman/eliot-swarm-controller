@@ -1,6 +1,7 @@
 //! Script entries: native editing, revision-checked save, editor launch and Run through a timer.
 
 use super::*;
+use crate::theme::winui::Palette;
 
 #[derive(Clone, Debug)]
 pub(super) enum ScriptsMsg {
@@ -376,7 +377,7 @@ impl DesktopApp {
             .collect()
     }
 
-    pub(super) fn scripts_view(&self, context: &mut ViewContext<Self>) -> View {
+    pub(super) fn scripts_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let timers = self.script_timers();
         let editor = &self.scripts;
         let data = config_view::ScriptsData {
@@ -396,7 +397,7 @@ impl DesktopApp {
             revision: editor.revision.as_deref(),
             editable: editor.editable,
             reason: editor.reason.as_deref(),
-            view: &editor.view,
+            view: self.primed(&editor.view),
             dirty: editor.draft != editor.base,
             timers: &timers,
             editor_exe: &editor.editor_exe,
@@ -425,6 +426,6 @@ impl DesktopApp {
                 })
                 .collect(),
         };
-        config_view::scripts_screen(data, actions)
+        config_view::scripts_screen(data, actions, palette)
     }
 }

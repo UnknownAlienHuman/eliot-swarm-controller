@@ -15,6 +15,7 @@ use serde_json::Value;
 use windows_reactor::*;
 
 use crate::theme;
+use crate::theme::winui::Palette;
 
 /// First entry of each picker: submit nothing for that field.
 pub const KEEP: &str = "Keep current";
@@ -278,13 +279,13 @@ pub struct ConfigureActions {
 fn small(text: impl Into<String>) -> TextBlock {
     TextBlock::new()
         .text(text.into())
-        .font_size(theme::type_scale::LABEL)
+        .font_size(theme::type_scale::LABEL_MEDIUM.size)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }
 
 /// Collapsible "Model and effort" section of the Agent detail.
-pub fn panel(data: ConfigureData<'_>, actions: ConfigureActions) -> View {
+pub fn panel(data: ConfigureData<'_>, actions: ConfigureActions, palette: Palette) -> View {
     let refusal = |reason: Option<&str>, field: &str| -> View {
         match reason {
             Some(reason) => small(format!("{field} cannot change: {reason}"))
@@ -311,7 +312,7 @@ pub fn panel(data: ConfigureData<'_>, actions: ConfigureActions) -> View {
         .on_selection_changed(actions.effort);
     let lines = data.settings.lines().join("\n");
     // The button says exactly what it submits.
-    let apply = Button::new()
+    let apply = crate::m3::filled(palette)
         .is_enabled(data.can_apply)
         .automation_name(data.apply_label.clone())
         .on_click(actions.apply)
@@ -327,7 +328,7 @@ pub fn panel(data: ConfigureData<'_>, actions: ConfigureActions) -> View {
                 KeyedView::new("apply", apply),
                 KeyedView::new(
                     "reread",
-                    Button::new()
+                    crate::m3::text_button(palette)
                         .automation_name("Reread catalogue")
                         .on_click(actions.refresh)
                         .content(TextBlock::new().text("Reread catalogue")),

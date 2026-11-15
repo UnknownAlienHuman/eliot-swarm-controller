@@ -17,6 +17,7 @@ use windows_reactor::*;
 use crate::chat::{self, Part, PartKind, TurnItem, text_hash};
 use crate::markdown::{Block, Doc, Inline};
 use crate::theme;
+use crate::theme::winui::Palette;
 
 /// One display block, ready for the UI thread.
 #[derive(Clone)]
@@ -170,35 +171,36 @@ pub struct RowCallbacks {
 fn label(text: &str) -> TextBlock {
     TextBlock::new()
         .text(text.to_owned())
-        .font_size(theme::type_scale::LABEL)
+        .font_size(theme::type_scale::LABEL_MEDIUM.size)
         .font_weight(FontWeight::SEMI_BOLD)
         .opacity(theme::MUTED_OPACITY)
 }
 
-fn body_text(text: &str) -> TextBlock {
+fn body_text(text: &str, palette: Palette) -> TextBlock {
     TextBlock::new()
         .text(text.to_owned())
-        .font_size(theme::type_scale::BODY)
+        .font_size(theme::type_scale::BODY_MEDIUM.size)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
-        .foreground(theme::winui::text_primary())
+        .foreground(palette.on_surface())
 }
 
-fn copy_button(name: &str, callback: impl Fn() + 'static) -> View {
-    Button::new()
-        .style(ButtonStyle::Subtle)
+fn copy_button(name: &str, palette: Palette, callback: impl Fn() + 'static) -> Button {
+    crate::m3::text_button(palette)
         .automation_name(name.to_owned())
         .on_click(callback)
-        .content(
-            TextBlock::new()
-                .text(name.to_owned())
-                .font_size(theme::type_scale::LABEL),
-        )
 }
 
-fn block_views(part: &RenderedPart, callbacks: &RowCallbacks) -> Vec<KeyedView> {
+/// The label of a copy button.
+fn copy_label(name: &str) -> TextBlock {
+    TextBlock::new()
+        .text(name.to_owned())
+        .font_size(theme::type_scale::LABEL_MEDIUM.size)
+}
+
+fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) -> Vec<KeyedView> {
     let Some(blocks) = part.blocks.as_ref() else {
-        return vec![KeyedView::new("plain", body_text(&part.plain))];
+        return vec![KeyedView::new("plain", body_text(&part.plain, palette))];
     };
     blocks
         .iter()
@@ -207,16 +209,16 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks) -> Vec<KeyedView> 
             let view: View = match block {
                 RenderedBlock::Rich(text) => RichTextBlock::new()
                     .paragraphs(text.clone())
-                    .font_size(theme::type_scale::BODY)
+                    .font_size(theme::type_scale::BODY_MEDIUM.size)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
                     .into(),
                 RenderedBlock::Heading(level, text) => TextBlock::new()
                     .text(text.clone())
                     .font_size(match level {
-                        1 => theme::type_scale::TITLE,
-                        2 => theme::type_scale::HEADING,
-                        _ => theme::type_scale::SUBHEADING,
+                        1 => theme::type_scale::TITLE_LARGE.size,
+                        2 => theme::type_scale::TITLE_MEDIUM.size,
+                        _ => theme::type_scale::TITLE_SMALL.size,
                     })
                     .font_weight(FontWeight::SEMI_BOLD)
                     .text_wrapping(TextWrapping::Wrap)
@@ -233,11 +235,9 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks) -> Vec<KeyedView> 
                     let code_index = *code_index;
                     StackPanel::new().spacing(theme::spacing::XS).children((
                         Border::new()
-                            .background(theme::winui::surface())
-                            .border_brush(theme::winui::stroke())
-                            .border_thickness(1.0)
-                            .corner_radius(theme::radius::SM)
-                            .padding(Thickness::uniform(theme::spacing::SM))
+                            .background(palette.surface_container_highest())
+                            .corner_radius(theme::shape::MD)
+                            .padding(Thickness::uniform(theme::spacing::MD))
                             .content(
                                 ScrollViewer::new()
                                     .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
@@ -245,19 +245,20 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks) -> Vec<KeyedView> 
                                     .content(
                                         TextBlock::new()
                                             .text(text.clone())
-                                            .font_size(theme::type_scale::LABEL + 1.0)
+                                            .font_size(theme::type_scale::BODY_SMALL.size + 1.0)
                                             .text_wrapping(TextWrapping::NoWrap)
                                             .is_text_selection_enabled(true),
                                     ),
                             ),
-                        copy_button("Copy code", move || {
+                        copy_button("Copy code", palette, move || {
                             let _ = copy.call((key.clone(), code_index));
-                        }),
+                        })
+                        .content(copy_label("Copy code")),
                     ))
                 }
                 RenderedBlock::Rule => Border::new()
                     .height(1.0)
-                    .background(theme::winui::stroke())
+                    .background(palette.outline_variant())
                     .into(),
             };
             KeyedView::new(index, view)
@@ -265,41 +266,61 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks) -> Vec<KeyedView> 
         .collect()
 }
 
-fn part_view(part: &RenderedPart, expanded: bool, callbacks: &RowCallbacks) -> View {
+fn part_view(
+    part: &RenderedPart,
+    expanded: bool,
+    callbacks: &RowCallbacks,
+    palette: Palette,
+) -> View {
     let copy = callbacks.copy_part.clone();
     let key = part.key.clone();
     let copy_message = move || {
         let _ = copy.call(key.clone());
     };
     match part.kind {
-        PartKind::Input => Border::new()
-            .background(theme::winui::surface())
-            .border_brush(theme::winui::stroke())
-            .border_thickness(1.0)
-            .corner_radius(theme::radius::MD)
-            .padding(Thickness::uniform(theme::spacing::MD))
-            .content(StackPanel::new().spacing(theme::spacing::XS).children((
-                label(&part.label),
-                body_text(&part.plain),
-                copy_button("Copy message", copy_message),
-            ))),
+        // The user's message: a secondary-container bubble on the right.
+        PartKind::Input => StackPanel::new()
+            .spacing(theme::spacing::XS)
+            .horizontal_alignment(HorizontalAlignment::Right)
+            .max_width(theme::layout::READING_WIDTH * 0.8)
+            .children((
+                label(&part.label).horizontal_alignment(HorizontalAlignment::Right),
+                Border::new()
+                    .background(palette.secondary_container())
+                    .corner_radius(CornerRadius::new(20.0, 4.0, 20.0, 20.0))
+                    .padding(Thickness::xy(theme::spacing::LG, theme::spacing::MD))
+                    .content(
+                        body_text(&part.plain, palette)
+                            .foreground(palette.on_secondary_container()),
+                    ),
+                copy_button("Copy message", palette, copy_message)
+                    .horizontal_alignment(HorizontalAlignment::Right)
+                    .content(copy_label("Copy message")),
+            )),
+        // Interim notes stay unboxed and quiet.
         PartKind::Progress => StackPanel::new()
             .spacing(theme::spacing::XS)
-            .opacity(0.9)
+            .opacity(theme::MUTED_OPACITY)
             .children((
                 label(&part.label),
                 StackPanel::new()
                     .spacing(theme::spacing::SM)
-                    .keyed_children(block_views(part, callbacks)),
+                    .keyed_children(block_views(part, callbacks, palette)),
             )),
         PartKind::Tools => {
             let toggle = callbacks.toggle_tools.clone();
             let key = part.key.clone();
-            let header = ToggleButton::new()
-                .is_checked(expanded)
-                .automation_name(format!("Tool operations: {}", part.plain))
-                .on_is_checked_changed(move |checked: bool| {
-                    let _ = toggle.call((key.clone(), checked));
+            // An outlined button rather than a ToggleButton: Reactor 0.100.0
+            // themes only Buttons, so a checked toggle would show the system
+            // accent. The accessible name carries the state.
+            let header = crate::m3::outlined(palette)
+                .automation_name(format!(
+                    "Tool operations: {} ({})",
+                    part.plain,
+                    if expanded { "expanded" } else { "collapsed" }
+                ))
+                .on_click(move || {
+                    let _ = toggle.call((key.clone(), !expanded));
                 })
                 .content(
                     TextBlock::new()
@@ -308,46 +329,67 @@ fn part_view(part: &RenderedPart, expanded: bool, callbacks: &RowCallbacks) -> V
                             if expanded { "▾" } else { "▸" },
                             part.plain
                         ))
-                        .font_size(theme::type_scale::LABEL),
+                        .font_size(theme::type_scale::LABEL_MEDIUM.size),
                 );
             if expanded {
                 StackPanel::new().spacing(theme::spacing::XS).children((
                     header,
-                    TextBlock::new()
-                        .text(part.detail.join("\n"))
-                        .font_size(theme::type_scale::LABEL)
-                        .is_text_selection_enabled(true)
-                        .opacity(theme::MUTED_OPACITY),
+                    Border::new()
+                        .background(palette.surface_container_highest())
+                        .corner_radius(theme::shape::MD)
+                        .padding(Thickness::uniform(theme::spacing::MD))
+                        .content(
+                            TextBlock::new()
+                                .text(part.detail.join("\n"))
+                                .font_size(theme::type_scale::BODY_SMALL.size)
+                                .text_wrapping(TextWrapping::Wrap)
+                                .is_text_selection_enabled(true)
+                                .opacity(theme::MUTED_OPACITY),
+                        ),
                 ))
             } else {
                 header
             }
         }
+        // The assistant's answer: a tonal container on the left.
         PartKind::Final => {
             let mut actions: Vec<KeyedView> = vec![KeyedView::new(
                 "copy",
-                copy_button("Copy message", copy_message),
+                copy_button("Copy message", palette, copy_message)
+                    .content(copy_label("Copy message")),
             )];
             if part.code_blocks > 0 {
                 actions.push(KeyedView::new(
                     "codes",
-                    label(&format!("{} code block(s)", part.code_blocks)),
+                    label(&format!("{} code block(s)", part.code_blocks))
+                        .vertical_alignment(VerticalAlignment::Center),
                 ));
             }
-            StackPanel::new().spacing(theme::spacing::SM).children((
-                TextBlock::new()
-                    .text(part.label.clone())
-                    .font_size(theme::type_scale::LABEL)
-                    .font_weight(FontWeight::BOLD)
-                    .foreground(theme::winui::text_accent()),
-                StackPanel::new()
-                    .spacing(theme::spacing::SM)
-                    .keyed_children(block_views(part, callbacks)),
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::SM)
-                    .keyed_children(actions),
-            ))
+            Border::new()
+                .background(palette.surface_container_low())
+                .corner_radius(CornerRadius::new(4.0, 20.0, 20.0, 20.0))
+                .padding(Thickness::new(
+                    theme::spacing::LG,
+                    theme::spacing::MD,
+                    theme::spacing::LG,
+                    theme::spacing::XS,
+                ))
+                .content(
+                    StackPanel::new().spacing(theme::spacing::SM).children((
+                        TextBlock::new()
+                            .text(part.label.clone())
+                            .font_size(theme::type_scale::LABEL_MEDIUM.size)
+                            .font_weight(FontWeight::SEMI_BOLD)
+                            .foreground(palette.primary()),
+                        StackPanel::new()
+                            .spacing(theme::spacing::SM)
+                            .keyed_children(block_views(part, callbacks, palette)),
+                        StackPanel::new()
+                            .orientation(Orientation::Horizontal)
+                            .spacing(theme::spacing::SM)
+                            .keyed_children(actions),
+                    )),
+                )
         }
         PartKind::Working => StackPanel::new().spacing(theme::spacing::XS).children((
             label(&part.label),
@@ -360,7 +402,7 @@ fn part_view(part: &RenderedPart, expanded: bool, callbacks: &RowCallbacks) -> V
             label(&part.label),
             TextBlock::new()
                 .text(part.plain.clone())
-                .font_size(theme::type_scale::LABEL)
+                .font_size(theme::type_scale::BODY_SMALL.size)
                 .text_wrapping(TextWrapping::Wrap)
                 .opacity(theme::MUTED_OPACITY),
         )),
@@ -373,6 +415,7 @@ pub fn item_view(
     item: &RenderedItem,
     expanded: &HashSet<String>,
     callbacks: &RowCallbacks,
+    palette: Palette,
 ) -> View {
     let parts: Vec<KeyedView> = item
         .parts
@@ -380,18 +423,13 @@ pub fn item_view(
         .map(|part| {
             KeyedView::new(
                 part.key.clone(),
-                part_view(part, expanded.contains(&part.key), callbacks),
+                part_view(part, expanded.contains(&part.key), callbacks, palette),
             )
         })
         .collect();
     StackPanel::new()
         .spacing(theme::spacing::MD)
-        .margin(Thickness::new(
-            0.0,
-            0.0,
-            theme::spacing::MD,
-            theme::spacing::LG,
-        ))
+        .margin(Thickness::new(0.0, 0.0, 0.0, theme::spacing::XL))
         .keyed_children(parts)
 }
 

@@ -1,6 +1,8 @@
 //! The conversation: retained history and live delivery, the composer, Send/Interrupt and pending requests.
 
 use super::*;
+use crate::theme::StatusTone;
+use crate::theme::winui::Palette;
 
 #[derive(Clone, Debug)]
 pub(super) enum ChatMsg {
@@ -701,21 +703,75 @@ impl DesktopApp {
         });
     }
 
-    pub(super) fn chat_view(&self, context: &mut ViewContext<Self>) -> View {
-        let detail_text = match (&self.chat.detail, self.selected_agent_id()) {
-            (Some(detail), Some(agent)) => format!(
-                "{agent} · gen {} · {} · {} · profile {} · {} · turn {}",
-                detail.generation,
-                detail.state,
-                detail.harness,
-                detail.profile,
-                detail.settings.summary(),
-                detail.active_turn.as_deref().unwrap_or("none"),
-            ),
-            (None, Some(agent)) => format!("{agent} · reading…"),
-            _ => "New conversation: choose a profile and workspace, then type the first message."
-                .to_owned(),
+    /// The conversation pane: Agent header, transcript in a bounded reading
+    /// column, pending requests, the launch picker for a new conversation
+    /// and the composer with its primary action.
+    pub(super) fn chat_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let gutter = theme::spacing::XL;
+        let agent = self.selected_agent_id();
+        let header: View = match (&self.chat.detail, agent.as_deref()) {
+            (Some(detail), Some(agent)) => Grid::new()
+                .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
+                .column_spacing(theme::spacing::MD)
+                .children((
+                    m3::title(agent.to_owned(), theme::type_scale::TITLE_LARGE)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .is_text_selection_enabled(true),
+                    Border::new()
+                        .grid_column(1)
+                        .content(m3::status_chip(palette, &detail.state)),
+                    m3::muted(
+                        format!(
+                            "gen {} · {} · profile {} · {} · turn {}",
+                            detail.generation,
+                            detail.harness,
+                            detail.profile,
+                            detail.settings.summary(),
+                            detail.active_turn.as_deref().unwrap_or("none"),
+                        ),
+                        theme::type_scale::BODY_MEDIUM,
+                    )
+                    .grid_column(2)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .text_trimming(TextTrimming::CharacterEllipsis)
+                    .is_text_selection_enabled(true),
+                )),
+            (None, Some(agent)) => StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(theme::spacing::MD)
+                .children((
+                    m3::title(agent.to_owned(), theme::type_scale::TITLE_LARGE),
+                    m3::muted("reading…", theme::type_scale::BODY_MEDIUM)
+                        .vertical_alignment(VerticalAlignment::Center),
+                )),
+            _ => StackPanel::new().spacing(2.0).children((
+                m3::title("New conversation", theme::type_scale::TITLE_LARGE),
+                m3::muted(
+                    "Pick a profile and a workspace, then write the first message.",
+                    theme::type_scale::BODY_MEDIUM,
+                ),
+            )),
         };
+        // A is bound when the dialog opens: the generation shown now.
+        let open_handoff = agent
+            .clone()
+            .zip(self.chat.detail.as_ref())
+            .map(|(agent, detail)| {
+                context.message(Message::Handoff(handoff_ui::HandoffMsg::Open {
+                    agent,
+                    generation: detail.generation,
+                }))
+            });
+        let hand_off = match open_handoff {
+            Some(open) => m3::tonal(palette)
+                .is_enabled(!self.submitting())
+                .on_click(open),
+            None => m3::tonal(palette).is_enabled(false),
+        }
+        .grid_column(1)
+        .automation_name("Hand off or switch")
+        .content(m3::icon_label(m3::glyph::HAND_OFF, "Hand off or switch…"));
+
         let coverage_lines = self
             .chat
             .convo
@@ -728,21 +784,41 @@ impl DesktopApp {
             .as_ref()
             .is_some_and(|convo| convo.coverage().can_load_older())
             && !matches!(self.chat.live, LiveStatus::Loading);
-        let coverage = StackPanel::new()
-            .grid_row(1)
-            .spacing(theme::spacing::SM)
-            .orientation(Orientation::Horizontal)
+        let coverage = Grid::new()
+            .columns([GridLength::STAR, GridLength::Auto])
+            .column_spacing(theme::spacing::SM)
             .children((
-                TextBlock::new()
-                    .text(coverage_lines.join("\n"))
-                    .font_size(theme::type_scale::LABEL)
+                m3::muted(coverage_lines.join("\n"), theme::type_scale::BODY_SMALL)
                     .text_wrapping(TextWrapping::Wrap)
-                    .max_width(theme::layout::READING_WIDTH - 140.0)
-                    .opacity(theme::MUTED_OPACITY),
-                Button::new()
+                    .vertical_alignment(VerticalAlignment::Center),
+                m3::text_button(palette)
+                    .grid_column(1)
                     .is_enabled(can_load_older)
                     .on_click(context.message(Message::Chat(ChatMsg::LoadOlderRequested)))
                     .content(TextBlock::new().text("Load older")),
+            ));
+        // Coverage and "Load older" belong to a conversation being shown.
+        let coverage: View = if self.chat.convo.is_some() {
+            coverage
+        } else {
+            View::empty()
+        };
+        let top = StackPanel::new()
+            .grid_row(0)
+            .spacing(theme::spacing::SM)
+            .margin(Thickness::new(
+                gutter,
+                theme::spacing::LG,
+                gutter,
+                theme::spacing::SM,
+            ))
+            .children((
+                Grid::new()
+                    .columns([GridLength::STAR, GridLength::Auto])
+                    .column_spacing(theme::spacing::MD)
+                    .children((header, hand_off)),
+                self.configure_view(context, palette),
+                coverage,
             ));
 
         let callbacks = RowCallbacks {
@@ -757,18 +833,25 @@ impl DesktopApp {
         let items = Rc::clone(&self.chat.items);
         let keys = Rc::clone(&self.chat.items);
         let expanded = Rc::new(self.chat.expanded.clone());
+        // A palette change re-realises the rows in the new colors.
+        let palette_code = palette
+            .scheme()
+            .map_or(0, |scheme| 1 + u64::from(scheme.dark));
         let source = VirtualSource::new(
-            self.chat.items_revision,
+            self.chat
+                .items_revision
+                .wrapping_mul(3)
+                .wrapping_add(palette_code),
             items.len(),
             move |index| keys[index].key.clone(),
-            move |index| views::item_view(&items[index], &expanded, &callbacks),
+            move |index| views::item_view(&items[index], &expanded, &callbacks, palette),
         );
         // The end anchor is an inline reply box bound to the same draft as the
         // composer: WinUI brings a focused TextBox into view, which a focused
         // Button is not, and Reactor exposes no ScrollViewer offset API.
         let end_anchor = TextBox::new()
             .element_ref(&self.chat.end_anchor)
-            .text(self.composer_text())
+            .text(self.primed(&self.composer_text()).to_owned())
             .placeholder_text(match self.chat.convo.as_ref() {
                 Some(_) if self.chat.items.is_empty() => {
                     "No retained turns in coverage yet. Reply here…"
@@ -777,19 +860,22 @@ impl DesktopApp {
                 None => "",
             })
             .automation_name("End of conversation reply")
+            .background(Brush::Solid(Color::transparent()))
+            .border_thickness(Thickness::uniform(0.0))
             .accepts_return(true)
             .text_wrapping(TextWrapping::Wrap)
             .on_text_changed(
                 context.callback(|value| Message::Chat(ChatMsg::ComposerChanged(value))),
             );
         let transcript = ScrollViewer::new()
-            .grid_row(2)
+            .grid_row(1)
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .automation_name("Conversation")
             .content(
                 StackPanel::new()
                     .max_width(theme::layout::READING_WIDTH)
-                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .horizontal_alignment(HorizontalAlignment::Stretch)
+                    .margin(Thickness::xy(gutter, theme::spacing::SM))
                     .children((ItemsRepeater::new().virtual_source(source), end_anchor)),
             );
 
@@ -812,45 +898,43 @@ impl DesktopApp {
                             Message::Chat(ChatMsg::AnswerChanged(key.clone(), text))
                         })
                     });
+                let (fill, on) = palette.chip(StatusTone::Attention);
                 KeyedView::new(
                     key,
                     Border::new()
-                        .background(theme::winui::surface())
-                        .border_brush(theme::winui::text_critical())
-                        .border_thickness(1.0)
-                        .corner_radius(theme::radius::MD)
-                        .padding(Thickness::uniform(theme::spacing::SM))
+                        .background(fill)
+                        .corner_radius(theme::shape::LG)
+                        .padding(Thickness::uniform(theme::spacing::LG))
                         .content(
-                            StackPanel::new().spacing(theme::spacing::XS).children((
-                                TextBlock::new()
-                                    .text(format!(
-                                        "Pending {} · turn {}",
-                                        request.kind, request.turn_id
-                                    ))
-                                    .font_weight(FontWeight::SEMI_BOLD)
-                                    .foreground(theme::winui::text_critical()),
+                            StackPanel::new().spacing(theme::spacing::SM).children((
+                                m3::text(
+                                    format!("Pending {} · turn {}", request.kind, request.turn_id),
+                                    theme::type_scale::TITLE_SMALL,
+                                )
+                                .foreground(on),
                                 TextBlock::new()
                                     .text(request.summary.clone())
+                                    .foreground(on)
                                     .text_wrapping(TextWrapping::Wrap)
                                     .is_text_selection_enabled(true),
                                 answer_box,
                                 StackPanel::new()
                                     .orientation(Orientation::Horizontal)
-                                    .spacing(theme::spacing::XS)
+                                    .spacing(theme::spacing::SM)
                                     .children((
-                                        Button::new()
+                                        m3::filled(palette)
                                             .is_enabled(!self.submitting())
                                             .on_click(context.message(Message::Chat(
                                                 ChatMsg::ApprovalRequested(request.clone(), true),
                                             )))
                                             .content(TextBlock::new().text("Approve")),
-                                        Button::new()
+                                        m3::tonal(palette)
                                             .is_enabled(!self.submitting())
                                             .on_click(context.message(Message::Chat(
                                                 ChatMsg::ApprovalRequested(request.clone(), false),
                                             )))
                                             .content(TextBlock::new().text("Deny")),
-                                        Button::new()
+                                        m3::text_button(palette)
                                             .is_enabled(!self.submitting())
                                             .on_click(context.message(Message::Chat(
                                                 ChatMsg::AnswerRequested(request.clone()),
@@ -863,27 +947,42 @@ impl DesktopApp {
             })
             .collect();
         let pending = StackPanel::new()
-            .grid_row(3)
-            .spacing(theme::spacing::XS)
+            .grid_row(2)
+            .spacing(theme::spacing::SM)
+            .max_width(theme::layout::READING_WIDTH)
+            .horizontal_alignment(HorizontalAlignment::Stretch)
+            .margin(Thickness::xy(gutter, 0.0))
             .keyed_children(pending_rows);
+
+        let has_agent = agent.is_some();
+        let launch: View = if has_agent {
+            View::empty()
+        } else {
+            Border::new()
+                .grid_row(3)
+                .max_width(theme::layout::READING_WIDTH)
+                .horizontal_alignment(HorizontalAlignment::Stretch)
+                .margin(Thickness::new(gutter, theme::spacing::SM, gutter, 0.0))
+                .content(self.launch_card(context, palette))
+        };
 
         let composer = TextBox::new()
             .element_ref(&self.chat.composer_ref)
-            .text(self.composer_text())
-            .placeholder_text(if self.selected_agent_id().is_some() {
+            .text(self.primed(&self.composer_text()).to_owned())
+            .placeholder_text(if has_agent {
                 "Message the selected Agent…"
             } else {
                 "First message for a new Agent…"
             })
             .automation_name("Message")
+            .background(palette.surface_container_high())
+            .border_thickness(Thickness::uniform(0.0))
             .accepts_return(true)
             .text_wrapping(TextWrapping::Wrap)
-            .height(theme::layout::COMPOSER_HEIGHT)
+            .height(theme::layout::COMPOSER_HEIGHT - 24.0)
             .on_text_changed(
                 context.callback(|value| Message::Chat(ChatMsg::ComposerChanged(value))),
             );
-
-        let has_agent = self.selected_agent_id().is_some();
         let busy_turn = self
             .chat
             .detail
@@ -891,26 +990,25 @@ impl DesktopApp {
             .and_then(|detail| detail.active_turn.as_ref())
             .is_some();
         let primary = if has_agent {
-            Button::new()
-                .resource_overrides(theme::winui::primary_button(self.dark_accent))
+            let label = if busy_turn { "Queue" } else { "Send" };
+            m3::filled(palette)
                 .is_enabled(!self.submitting())
-                .automation_name(if busy_turn { "Queue" } else { "Send" })
+                .automation_name(label)
                 .on_click(context.message(Message::Chat(ChatMsg::SendRequested)))
-                .content(TextBlock::new().text(if busy_turn { "Queue" } else { "Send" }))
+                .content(m3::icon_label(m3::glyph::SEND, label))
         } else {
-            Button::new()
-                .resource_overrides(theme::winui::primary_button(self.dark_accent))
+            m3::filled(palette)
                 .is_enabled(!self.submitting())
                 .automation_name("Launch Agent")
                 .on_click(context.message(Message::Launch(LaunchMsg::LaunchRequested)))
-                .content(TextBlock::new().text("Launch Agent"))
+                .content(m3::icon_label(m3::glyph::SEND, "Launch Agent"))
         };
-        let interrupt = Button::new()
+        let interrupt = m3::tonal(palette)
             .is_enabled(!self.submitting() && busy_turn)
             .automation_name("Interrupt the active turn")
             .on_click(context.message(Message::Chat(ChatMsg::InterruptRequested)))
-            .content(TextBlock::new().text("Interrupt"));
-        let jump = Button::new()
+            .content(m3::icon_label(m3::glyph::INTERRUPT, "Interrupt"));
+        let jump = m3::text_button(palette)
             .is_enabled(!self.chat.items.is_empty())
             .on_click(context.message(Message::Chat(ChatMsg::JumpToLatest)))
             .content(TextBlock::new().text(if self.chat.unseen > 0 {
@@ -918,58 +1016,53 @@ impl DesktopApp {
             } else {
                 "Jump to latest".to_owned()
             }));
-        // A is bound when the dialog opens: the generation shown now.
-        let open_handoff =
-            self.selected_agent_id()
-                .zip(self.chat.detail.as_ref())
-                .map(|(agent, detail)| {
-                    context.message(Message::Handoff(handoff_ui::HandoffMsg::Open {
-                        agent,
-                        generation: detail.generation,
-                    }))
-                });
-        let hand_off = match open_handoff {
-            Some(open) => Button::new().is_enabled(!self.submitting()).on_click(open),
-            None => Button::new().is_enabled(false),
-        }
-        .automation_name("Hand off or switch")
-        .content(TextBlock::new().text("Hand off or switch…"));
-        let actions = StackPanel::new()
-            .grid_row(5)
-            .orientation(Orientation::Horizontal)
-            .spacing(theme::spacing::SM)
-            .children((primary, interrupt, jump, hand_off));
-        let dialog = self.handoff_dialog(context);
-        let settings = self.configure_view(context);
+        let composer_card = Border::new()
+            .grid_row(4)
+            .background(palette.surface_container_high())
+            .corner_radius(theme::shape::XL)
+            .padding(Thickness::new(
+                theme::spacing::SM,
+                theme::spacing::SM,
+                theme::spacing::SM,
+                theme::spacing::SM,
+            ))
+            .max_width(theme::layout::READING_WIDTH)
+            .horizontal_alignment(HorizontalAlignment::Stretch)
+            .margin(Thickness::new(
+                gutter,
+                theme::spacing::MD,
+                gutter,
+                theme::spacing::LG,
+            ))
+            .content(
+                Grid::new()
+                    .rows([GridLength::Auto, GridLength::Auto])
+                    .row_spacing(theme::spacing::XS)
+                    .children((
+                        composer,
+                        Grid::new()
+                            .grid_row(1)
+                            .columns([GridLength::STAR, GridLength::Auto])
+                            .children((
+                                jump,
+                                StackPanel::new()
+                                    .grid_column(1)
+                                    .orientation(Orientation::Horizontal)
+                                    .spacing(theme::spacing::SM)
+                                    .children((interrupt, primary)),
+                            )),
+                    )),
+            );
+        let dialog = self.handoff_dialog(context, palette);
 
         Grid::new()
-            .grid_column(1)
             .rows([
-                GridLength::Auto,
                 GridLength::Auto,
                 GridLength::STAR,
                 GridLength::Auto,
                 GridLength::Auto,
                 GridLength::Auto,
             ])
-            .row_spacing(theme::spacing::SM)
-            .children((
-                StackPanel::new()
-                    .grid_row(0)
-                    .spacing(theme::spacing::XS)
-                    .children((
-                        TextBlock::new()
-                            .text(detail_text)
-                            .text_wrapping(TextWrapping::Wrap)
-                            .is_text_selection_enabled(true),
-                        settings,
-                    )),
-                coverage,
-                transcript,
-                pending,
-                composer.max_width(theme::layout::READING_WIDTH).grid_row(4),
-                actions,
-                dialog,
-            ))
+            .children((top, transcript, pending, launch, composer_card, dialog))
     }
 }

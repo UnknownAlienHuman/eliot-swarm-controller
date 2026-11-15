@@ -1,6 +1,7 @@
 //! Profile editing: one draft for form and source, validate, revision-checked save.
 
 use super::*;
+use crate::theme::winui::Palette;
 
 #[derive(Clone, Debug)]
 pub(super) enum ProfilesMsg {
@@ -206,7 +207,7 @@ impl DesktopApp {
         });
     }
 
-    pub(super) fn profiles_view(&self, context: &mut ViewContext<Self>) -> View {
+    pub(super) fn profiles_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let list = self.launch.profile_list.as_ref();
         let data = ProfilesData {
             revision: self.editor.revision.as_deref(),
@@ -215,7 +216,7 @@ impl DesktopApp {
             editable: self.editor.editable,
             reason: self.editor.reason.as_deref(),
             draft: &self.editor.draft,
-            view: &self.editor.view,
+            view: self.primed(&self.editor.view),
             dirty: self.editor.draft != self.editor.base,
             selected: self.editor.selected.as_deref(),
             duplicate_name: &self.editor.duplicate_name,
@@ -242,6 +243,6 @@ impl DesktopApp {
             save: context.message(Message::Profiles(ProfilesMsg::ProfilesSaveRequested)),
             reload: context.message(Message::Profiles(ProfilesMsg::ProfilesReloadRequested)),
         };
-        config_view::profiles_screen(data, actions)
+        config_view::profiles_screen(data, actions, palette)
     }
 }

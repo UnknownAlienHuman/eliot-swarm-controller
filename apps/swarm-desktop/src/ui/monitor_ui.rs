@@ -1,6 +1,7 @@
 //! The openable swarm monitor: refresh chain, selection, detail controls and manager moves.
 
 use super::*;
+use crate::theme::winui::Palette;
 
 #[derive(Clone, Debug)]
 pub(super) enum MonitorMsg {
@@ -200,7 +201,7 @@ impl DesktopApp {
 
     /// Monitor column. Control messages carry the Agent, generation and turn
     /// of the detail shown on screen: what is clicked is what was displayed.
-    pub(super) fn monitor_view(&self, context: &mut ViewContext<Self>) -> View {
+    pub(super) fn monitor_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let shown = self
             .monitor
             .data
@@ -283,6 +284,7 @@ impl DesktopApp {
             !self.submitting(),
             reparent_data,
             actions,
+            palette,
         )
     }
 }

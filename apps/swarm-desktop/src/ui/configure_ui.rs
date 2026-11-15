@@ -1,6 +1,7 @@
 //! Model and effort for the selected Agent: catalogue read under its route, configure, requested versus effective.
 
 use super::*;
+use crate::theme::winui::Palette;
 
 #[derive(Clone, Debug)]
 pub(super) enum ConfigureMsg {
@@ -209,7 +210,7 @@ impl DesktopApp {
     }
 
     /// The Agent detail's model/effort section; empty without a readback.
-    pub(super) fn configure_view(&self, context: &mut ViewContext<Self>) -> View {
+    pub(super) fn configure_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let Some(detail) = self
             .chat
             .detail
@@ -264,6 +265,7 @@ impl DesktopApp {
                 expanded: context
                     .callback(|value| Message::Configure(ConfigureMsg::ConfigureExpanded(value))),
             },
+            palette,
         )
     }
 }

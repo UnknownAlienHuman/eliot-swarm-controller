@@ -343,8 +343,10 @@ of the explicitly selected release scope.
 ## Desktop companion (optional WinUI 3 client)
 
 - [x] **D1 Styled real chat.** One optional Windows package (`apps/swarm-desktop`,
-      binary `swarm-desktop`) on WinUI 3 through `windows-reactor`: native window and
-      a small Material 3 Expressive-inspired theme; project/Agent/profile selection;
+      binary `swarm-desktop`) on WinUI 3 through `windows-reactor`: native window with
+      a navigation rail and Material 3 roles generated from one seed (tonal palettes
+      through `material-colors`; system colors under High Contrast; System/Light/Dark
+      switch); project/Agent/profile selection;
       `launch(text)` with its linked command; send to an existing Agent; the real
       final output from result/turn readback; pending requests with exact bindings
       and interrupt bound to the current generation and turn. First input is
