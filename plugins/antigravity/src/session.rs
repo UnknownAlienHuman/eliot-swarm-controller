@@ -709,12 +709,11 @@ impl Session {
         }
         let combined = with_claimed_context(text, &params.context, "Antigravity")?;
         let turn = format!("agy-{}", ulid::Ulid::new());
-        let associated = {
+        {
             let mut state = self.state.lock().await;
-            let associated = state.prepare(params.command_id.clone(), turn.clone())?;
+            state.prepare(params.command_id.clone(), turn.clone())?;
             state.attach_context(&params.command_id, params.context.clone())?;
-            associated
-        };
+        }
         self.highwater_seq = seq;
         let unknown = Err(Error::new(
             "unknown",
@@ -729,12 +728,8 @@ impl Session {
         });
         // The terminal reply is fenced into the ordered frame channel, so
         // the event task settles this exact turn behind every preceding
-        // update. This send only waits for the first association, as
-        // before; a slow first update keeps the retained `unknown`
-        // outcome while the fenced reply still settles the turn in order.
-        // One shared deadline bounds the write plus the wait: the total
-        // must stay under the daemon's 30 s plugin RPC or the command
-        // settles `plugin_rpc_timeout` with no plugin cause.
+        // update. The dispatch deadline bounds the native write only: the
+        // acknowledgement below never waits for model output.
         let prompt = prompt_params(&self.conversation, &combined);
         let deadline = Instant::now() + SEND_TIMEOUT;
         let dispatched = self
@@ -771,16 +766,39 @@ impl Session {
         // unless this exact turn already settled while the write was in
         // flight, in which case `arm_fenced` retires it immediately.
         self.state.lock().await.arm_fenced(registration, &turn);
-        let result = match timeout_at(deadline, associated).await {
-            Ok(Ok(Ok(()))) => Ok(json!({"state": "applied", "turn_id": turn})),
-            Ok(Ok(Err(error))) if native_no_write(&error.code) => {
-                self.state
-                    .lock()
-                    .await
-                    .withdraw_unwritten(&params.command_id)?;
-                Ok(json!({"state": "rejected", "reason": "Antigravity input was not dispatched"}))
+        // The send acknowledgement is bound to native admission, not model
+        // output: the prompt write was accepted, so bind the exact turn
+        // now and ack applied. Waiting for the first update would hold the
+        // plugin RPC past the daemon deadline whenever high thought levels
+        // delay the first emission (observed: a native turn starting
+        // minutes after its send settled unknown). A terminal that already
+        // settled in flight proves admission; only its unknown outcome
+        // keeps this send unknown.
+        let result = {
+            let mut state = self.state.lock().await;
+            let settled = state.settlement_for(&turn).map(str::to_owned);
+            if let Some(status) = settled {
+                if status == "unknown" {
+                    unknown
+                } else {
+                    Ok(json!({"state": "applied", "turn_id": turn}))
+                }
+            } else {
+                match state.associate().await {
+                    Ok(()) => Ok(json!({"state": "applied", "turn_id": turn})),
+                    Err(error) if native_no_write(&error.code) => {
+                        drop(state);
+                        self.state
+                            .lock()
+                            .await
+                            .withdraw_unwritten(&params.command_id)?;
+                        Ok(
+                            json!({"state": "rejected", "reason": "Antigravity input was not dispatched"}),
+                        )
+                    }
+                    Err(_) => unknown,
+                }
             }
-            _ => unknown,
         };
         if let Some(retained) = self.retained.as_mut().filter(|r| r.seq == seq) {
             retained.outcome = result.clone();

@@ -547,7 +547,12 @@ impl State {
         .await
     }
 
-    async fn associate(&mut self) -> Result<()> {
+    /// Bind the prepared input to its turn by committing `turn.started`.
+    /// Called at native admission (right after the prompt write is
+    /// accepted); the event task also calls it on the first native update
+    /// or terminal, idempotently, so ordering races never duplicate the
+    /// commit or downgrade an admitted turn.
+    pub(crate) async fn associate(&mut self) -> Result<()> {
         let pending = self.pending.as_ref().ok_or_else(|| {
             Error::new(
                 "source_integrity",

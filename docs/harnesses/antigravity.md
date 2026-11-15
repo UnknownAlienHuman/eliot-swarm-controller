@@ -74,8 +74,11 @@ Launch establishes the session before input; send dispatches one
 call: its terminal reply re-enters the ordered frame channel behind every
 preceding `session/update`, so the exact prepared turn settles only
 after those updates have been consumed — never from a direct pending
-route, a sleep, or silence. Send returns `applied` on the first
-associated update; the terminal `stopReason` settles the turn through
+route, a sleep, or silence. Send returns `applied` on native admission
+(the accepted prompt write binds the exact turn via `turn.started`),
+never on the first model output: at high thought levels the first
+emission can lag admission by minutes, past the plugin RPC deadline.
+The terminal `stopReason` settles the turn through
 the event state, never from the send ack alone. The fenced registration
 is held until that actual in-band terminal reply, an error, a stream
 fault, stop, or drop — stream silence is not staleness and no
