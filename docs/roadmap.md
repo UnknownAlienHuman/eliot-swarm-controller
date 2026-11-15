@@ -320,7 +320,12 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       Daemon maintenance deletes expired history via bounded Store pruning;
       queries/backlog handling alone do not. Keep open/unknown work and current
       projections; no full rewrite, forced unknown resolution or separate cleanup ledger.
-- [ ] Core/Store/API/reducer and event replay, including retention and non-reused ids.
+- [x] Core/Store/API/reducer and event replay, including retention and non-reused ids.
+      Qualified 2026-11-15 on release 70E7859B with real Muse/Codex Agents. Covered:
+      replay equal to live; restart without effect replay; a mid-turn kill settling
+      `unknown`; same-id idempotency and `id_conflict`; fresh ids and seq across
+      restarts; cursor gaps; deletion of 25 h-old rows (nonzero counts,
+      `history_gap`, preserved unknown turns and vars, idempotent second pass).
 - [x] CLI E2E on the real harness, exact generations/turns/requests, queue ordering and unknown outcomes.
       Qualified 2026-11-14 on Codex and Muse; the unknown-turn send fence it exposed was fixed (#468).
 - [x] Crash at admission, native effect, event commit, reply and source-drain boundaries;
