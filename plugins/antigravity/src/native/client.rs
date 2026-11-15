@@ -166,6 +166,15 @@ struct OutboundResponse {
     error: NativeRpcError,
 }
 
+/// One agent-to-client success answer. The id is written verbatim:
+/// JSON-RPC ids are not necessarily strings.
+#[derive(Serialize)]
+struct OutboundResult {
+    jsonrpc: &'static str,
+    id: Value,
+    result: Value,
+}
+
 #[derive(Serialize)]
 struct NativeRpcError {
     code: i64,
@@ -349,9 +358,40 @@ impl AgyClient {
         }
     }
 
-    /// Reject one agent-to-client request as unsupported. There is no
-    /// approve/answer channel on this route, so every such request is an
-    /// explicit rejection, never an auto-approval.
+    /// Answer one agent-to-client request with a success result. Used only
+    /// for `session/request_permission` outcomes decided by an explicit
+    /// owner/manager reply or a cancelling interrupt/stop — never
+    /// auto-answered. The id is written verbatim: JSON-RPC ids are not
+    /// necessarily strings.
+    pub async fn respond_permission(
+        &self,
+        id: Value,
+        result: Value,
+        deadline: Instant,
+    ) -> Result<()> {
+        if !result.is_object() {
+            return Err(Error::new(
+                "invalid",
+                "Antigravity permission answer requires an object result",
+            ));
+        }
+        let encoded = encode_frame(
+            LABELS.server,
+            &OutboundResult {
+                jsonrpc: "2.0",
+                id,
+                result,
+            },
+        )?;
+        self.write_encoded(encoded, deadline).await
+    }
+
+    /// Reject one agent-to-client request as unsupported. Filesystem and
+    /// terminal requests stay on this path: `initialize` advertises no
+    /// such capability, so the server must not send them and every such
+    /// request is an explicit rejection, never an auto-approval.
+    /// `session/request_permission` no longer uses this path: it bridges
+    /// to an explicit owner/manager decision instead.
     pub async fn reject_unsupported_request(
         &self,
         id: Value,

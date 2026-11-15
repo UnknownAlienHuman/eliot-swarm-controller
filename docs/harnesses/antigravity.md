@@ -27,15 +27,19 @@ hook discovery truly requires a directory root. The manifest's native version
 (`1.5.2`) stays diagnostic metadata, not a startup version gate.
 
 The adapter speaks Agent Client Protocol v1 (pinned schema
-`v1-7ec5185c.json`, AGY 1.5.2) over bounded NDJSON JSON-RPC stdio through
+`v1-7ec5185c.json`, AGY 1.5.2; permission and usage shapes re-verified
+against installed agy 1.5.9) over bounded NDJSON JSON-RPC stdio through
 the shared `native_stdio` transport: one process, correlated pending
 calls, a bounded frame queue, and output drained before any loss
 conclusion. Turn progress arrives as `session/update` notifications;
-agent-to-client requests (`fs/*`, `terminal/*`, `session/request_permission`,
-`elicitation/create`) are always explicitly rejected as unsupported — never
-auto-approved. ACP has no steer, inject or hook method. The system-context
-and steer paths below use the separate native CLI `PreInvocation` hook;
-they are not ACP operations. `active_turn` injection remains unsupported.
+`session/request_permission` opens a Swarm approval request decided by
+an explicit `approve`/`deny` (never auto-approved, see Model and
+permission mapping). Every other agent-to-client request (`fs/*`,
+`terminal/*`, `elicitation/create` and anything unknown) is explicitly
+rejected as unsupported. ACP has no steer, inject or hook method. The
+system-context and steer paths below use the separate native CLI
+`PreInvocation` hook; they are not ACP operations. `active_turn`
+injection remains unsupported.
 
 The adapter uses `start_requires_input = false`: spawn, `initialize`
 (protocol 1), then `session/new` — or `session/load` with the exact
@@ -67,6 +71,32 @@ silently ignored. The launch-time permission posture remains
 `--dangerously-skip-permissions`; cwd is a launch fact (the server is
 spawned in the workspace), since the session response echoes no cwd.
 
+A `session/request_permission` ask (`{sessionId, toolCall, options}`)
+opens a Swarm approval request bound to the exact generation, turn and
+tool call id, with kind `approval` and the shared `ApprovalRequest`
+public details: a redacted plain-text summary (title plus tool
+name/kind and compact raw input, never the native record) and one
+choice per usable offered option, `approve` for `allow_once`/
+`allow_always` and `deny` for `reject_once`/`reject_always`
+(`feedback_allowed: false`; unknown kinds are never offered).
+`swarm approve`/`deny` map to the ACP outcome using those kinds: an
+explicit `choice_id` must name an option whose kind matches the verb,
+otherwise the verb takes the least-privilege default (`allow_once`
+before `allow_always`, `reject_once` before `reject_always`); feedback
+is rejected, and an unmatched verb/choice rejects before any native
+write. The plugin writes `{outcome: {outcome: "selected", optionId}}`
+and commits `request.resolved`; only a proven no-write keeps the ask
+answerable, anything uncertain latches unknown without a rewrite.
+Nothing is ever auto-approved: an unanswered ask keeps the turn busy
+(and the Agent waiting) until the owner, the manager, or a cancel
+resolves it. An interrupt or stop answers every open ask `cancelled`
+(the ACP cancellation contract) before the terminal settles; asks the
+native ends without consuming are closed (`request.closed`) ahead of
+the terminal commit. Verified live 2026-11-15 against installed agy
+1.5.9: a `git log` ask approved (command ran, final answer returned),
+denied (tool refused, empty turn honestly marked), and
+interrupt-cancelled (ask closed, turn cancelled).
+
 ## Native mapping
 
 Launch establishes the session before input; send dispatches one
@@ -92,8 +122,9 @@ bookkeeping. A normal completion with no assistant text at all keeps its
 native `stopReason` but carries
 `final_text_unavailable:"empty_native_response"` (see Facts and recovery),
 so silence is never presented as a normal answer. Send itself is bounded
-(25 s for the native write plus the first association) so the plugin
-always settles before the daemon's 30 s plugin RPC. Tool calls map from `tool_call`/`tool_call_update` with the
+(25 s for the native write; the acknowledgement binds at admission, not
+at the first model output) so the plugin always settles before the
+daemon's 30 s plugin RPC. Tool calls map from `tool_call`/`tool_call_update` with the
 vendor `toolCallId` as the item id. Tool updates are partial deltas:
 title and status merge into the known per-id state before any event is
 derived, so an omitted field inherits the last known value and only a
@@ -114,7 +145,7 @@ Stop sends a best-effort `session/close` for the retained session, then
 closes stdin and drains stdout before settling the session; force targets
 only owned custody. Resume creates a new Agent generation loading the
 exact retained session id, without replaying the old prompt. Connected
-verbs are launch/resume/send/configure/steer/interrupt/stop.
+verbs are launch/resume/send/configure/steer/interrupt/approve/deny/stop.
 `configure` switches the live session's `model` and `thought_level`
 selectors through `session/set_config_option` at configure time, proving
 each write with its echoed current value (`model_verified`,
@@ -126,7 +157,10 @@ selects the thought level, and the effective model id recombines base and
 level. There is no direct plugin `inject` verb: `active_turn` inject is
 unsupported, while system context flows through the shared `next_input`
 (claimed at send) and `turn_safe_point` (claimed at `PreInvocation`)
-points below. Approve, deny and answer remain `unsupported`.
+points below. Approve and deny reply to the exact offered native
+permission ask; the public details are the shared `ApprovalRequest`
+(`swarm approve`/`deny`, optional `choice_id`, no `feedback`), and a lost
+reply is unknown and never rewritten. Answer remains `unsupported`.
 `profile.store` is unsupported: launch carries no native store binding.
 
 ## System context and steer hooks
@@ -156,8 +190,10 @@ ends. Requested and effective settings carry each native root with its purpose
 Native tool-access restrictions stay at the existing posture: the ACP
 `initialize` advertises no filesystem or terminal capability
 (`fs.readTextFile`/`writeTextFile: false`, `terminal: false`,
-`auth.terminal: false`), and agent-to-client requests are always rejected.
-The CLI also offers `--sandbox`, which is not enabled: it would change
+`auth.terminal: false`; unchanged against installed agy 1.5.9, whose
+`session/request_permission` round-trip this page bridges instead), so
+`fs/*` and `terminal/*` agent-to-client requests stay explicitly
+rejected. The CLI also offers `--sandbox`, which is not enabled: it would change
 execution semantics beyond hook discovery. Same-user filesystem access is not
 a hostile-agent boundary; the guarantee is that secrets and state are never
 under a writable native root, not a sandbox.

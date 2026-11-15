@@ -434,6 +434,8 @@ impl Plugin {
                 "configure",
                 "steer",
                 "interrupt",
+                "approve",
+                "deny",
                 "stop",
             ]
             .map(str::to_owned)

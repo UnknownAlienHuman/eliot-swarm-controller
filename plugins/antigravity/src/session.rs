@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -49,6 +50,16 @@ struct RetainedCommand {
     payload_sha256: [u8; 32],
     turn: String,
     outcome: Result<Value>,
+}
+
+/// Retained approve/deny outcome for exact command-id replay. The stored
+/// verb plus request and turn ids reject a reused command id bound to a
+/// different reply, mirroring the sibling harnesses.
+struct ReplyOutcome {
+    verb: String,
+    request_id: String,
+    turn_id: String,
+    result: Value,
 }
 
 pub(crate) struct OwnedHookConfig {
@@ -163,6 +174,7 @@ pub(crate) struct Session {
     retained: Option<RetainedCommand>,
     interrupt_retained: Option<RetainedCommand>,
     steer_retained: Option<RetainedCommand>,
+    reply_outcomes: HashMap<String, ReplyOutcome>,
     steer_inflight: Option<i64>,
     stop: Option<(String, bool, Result<Value>)>,
     /// Advertised `model` option values from the latest session open
@@ -255,6 +267,7 @@ impl Session {
             retained: None,
             interrupt_retained: None,
             steer_retained: None,
+            reply_outcomes: HashMap::new(),
             steer_inflight: None,
             stop: None,
             advertised_models: Vec::new(),
@@ -492,11 +505,91 @@ impl Session {
                 "Antigravity steer must use the deferred host response path",
             )),
             "interrupt" => self.interrupt(params).await,
+            "approve" | "deny" => self.reply_request(params).await,
             _ => Err(Error::new(
                 "unsupported",
-                "Antigravity supports send, configure, steer and interrupt; inject is unsupported",
+                "Antigravity supports send, configure, steer, interrupt, approve and deny; inject and answer are unsupported",
             )),
         }
+    }
+
+    /// Answer one open native permission ask with the explicit
+    /// owner/manager decision. Replays the retained outcome for the exact
+    /// command id; a reused command id bound to a different reply is a
+    /// source-integrity error, never a second native write.
+    async fn reply_request(&mut self, params: AgentCommandParams) -> Result<Value> {
+        let turn_id = params
+            .turn_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "stale_turn",
+                    "Antigravity request reply needs its captured turn id",
+                )
+            })?;
+        let request_id = params
+            .request_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "not_found",
+                    "Antigravity request reply needs its captured request id",
+                )
+            })?;
+        if let Some(previous) = self.reply_outcomes.get(&params.command_id) {
+            if previous.verb != params.verb
+                || previous.request_id != request_id
+                || previous.turn_id != turn_id
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "Antigravity command id was reused for another request reply",
+                ));
+            }
+            return Ok(previous.result.clone());
+        }
+        // The event task owns no transport client: the native decision
+        // travels on this call, serialized behind queued frames. A dead
+        // native process latches unknown without attempting a write.
+        if self.native.transport.process_exit_observed() {
+            let mut state = self.state.lock().await;
+            state.retain_unknown_reply(request_id, &params.command_id);
+            return Ok(eliot_plugin::session::unknown_control(
+                "Antigravity request reply destination is unavailable; it will not be repeated",
+            ));
+        }
+        let native = self.client.clone();
+        let result = match self
+            .state
+            .lock()
+            .await
+            .reply_request(
+                &params.command_id,
+                request_id,
+                turn_id,
+                &params.verb,
+                &params.args,
+                &native,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => eliot_plugin::session::unknown_control(
+                "Antigravity request reply outcome is unknown",
+            ),
+        };
+        self.reply_outcomes.insert(
+            params.command_id.clone(),
+            ReplyOutcome {
+                verb: params.verb,
+                request_id: request_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                result: result.clone(),
+            },
+        );
+        Ok(result)
     }
 
     /// One verified `session/set_config_option` write: the echoed option
@@ -1094,6 +1187,17 @@ impl Session {
             .await;
         let result = match dispatched {
             Ok(()) => {
+                // Per the ACP cancellation contract, answer every pending
+                // permission ask of this exact turn with `cancelled`
+                // before waiting: the native cannot reach its cancelled
+                // terminal while an ask is still open. Best-effort per
+                // ask; the terminal below still decides the interrupt.
+                {
+                    let mut state = self.state.lock().await;
+                    state
+                        .answer_pending_cancelled(&self.client, &params.command_id, Some(turn_id))
+                        .await;
+                }
                 // The notification write proves dispatch only, never
                 // cancellation. Wait (bounded, lock-free between polls)
                 // for the prompt task's actual settlement of this exact
@@ -1246,6 +1350,17 @@ impl Session {
             params.force,
             Err(Error::new("unknown", "Antigravity stop is unresolved")),
         ));
+        // Answer open permission asks `cancelled` best-effort, then close
+        // whatever remains: the native session is ending, so no ask may
+        // stay open behind it. Commit failures here are ignored; the
+        // session teardown below still decides the stop.
+        {
+            let mut state = self.state.lock().await;
+            state
+                .answer_pending_cancelled(&self.client, &params.command_id, None)
+                .await;
+            let _ = state.close_pending_requests(None).await;
+        }
         let result = self
             .terminate(params.force)
             .await

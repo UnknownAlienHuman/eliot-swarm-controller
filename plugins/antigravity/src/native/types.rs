@@ -189,6 +189,127 @@ pub(crate) fn prompt_turn_usage(result: &PromptResult) -> Option<TurnUsage> {
     })
 }
 
+/// One option the native offers for a `session/request_permission` ask.
+/// `kind` is one of the ACP `PermissionOptionKind` values (`allow_once`,
+/// `allow_always`, `reject_once`, `reject_always`); any other kind is
+/// retained but never maps to a reply decision.
+#[derive(Clone, Debug)]
+pub(crate) struct PermissionOption {
+    pub option_id: String,
+    pub name: String,
+    pub kind: String,
+}
+
+/// A parsed `session/request_permission` ask: the tool call awaiting
+/// authorization plus the exact offered options. `raw_input` stays a
+/// `Value`: it is only ever rendered into a redacted bounded summary,
+/// never persisted verbatim.
+#[derive(Clone, Debug)]
+pub(crate) struct PermissionAsk {
+    pub tool_call_id: String,
+    pub title: String,
+    pub tool_name: Option<String>,
+    pub tool_kind: Option<String>,
+    pub raw_input: Value,
+    pub options: Vec<PermissionOption>,
+}
+
+/// Map an offered option kind to its reply direction: `true` grants
+/// (`allow_once`, `allow_always`), `false` refuses (`reject_once`,
+/// `reject_always`). Unknown kinds map to nothing and can never drive a
+/// reply on their own.
+pub(crate) fn permission_option_grants(kind: &str) -> Option<bool> {
+    match kind {
+        "allow_once" | "allow_always" => Some(true),
+        "reject_once" | "reject_always" => Some(false),
+        _ => None,
+    }
+}
+
+/// Default option for an explicit owner/manager reply verb: the least
+/// persistent matching kind (`allow_once` before `allow_always`,
+/// `reject_once` before `reject_always`). An explicit `choice_id` still
+/// overrides this; the verb alone never invents an option.
+pub(crate) fn default_permission_option(
+    options: &[PermissionOption],
+    approve: bool,
+) -> Option<&PermissionOption> {
+    let kinds: &[&str] = if approve {
+        &["allow_once", "allow_always"]
+    } else {
+        &["reject_once", "reject_always"]
+    };
+    kinds
+        .iter()
+        .filter_map(|kind| options.iter().find(|option| option.kind == *kind))
+        .next()
+}
+
+/// Parse a `session/request_permission` params body. Malformed option
+/// entries are skipped, never fatal: an ask with no usable options is
+/// still returned so the caller can record the gap and answer the safe
+/// fallback instead of hanging the turn.
+pub(crate) fn parse_permission_request(params: &Value) -> Option<PermissionAsk> {
+    let body = params.as_object()?;
+    let tool_call = body.get("toolCall").and_then(Value::as_object)?;
+    let tool_call_id = tool_call
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())?
+        .to_owned();
+    let title = tool_call
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("ACP tool call")
+        .to_owned();
+    let tool_name = tool_call
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned);
+    let tool_kind = tool_call
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.trim().is_empty())
+        .map(str::to_owned);
+    let raw_input = tool_call.get("rawInput").cloned().unwrap_or(Value::Null);
+    let mut options = Vec::new();
+    if let Some(offered) = body.get("options").and_then(Value::as_array) {
+        for option in offered {
+            let entry = option.as_object();
+            let (Some(option_id), Some(name), Some(kind)) = (
+                entry
+                    .and_then(|entry| entry.get("optionId"))
+                    .and_then(Value::as_str),
+                entry
+                    .and_then(|entry| entry.get("name"))
+                    .and_then(Value::as_str),
+                entry
+                    .and_then(|entry| entry.get("kind"))
+                    .and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if option_id.trim().is_empty() {
+                continue;
+            }
+            options.push(PermissionOption {
+                option_id: option_id.to_owned(),
+                name: name.to_owned(),
+                kind: kind.to_owned(),
+            });
+        }
+    }
+    Some(PermissionAsk {
+        tool_call_id,
+        title,
+        tool_name,
+        tool_kind,
+        raw_input,
+        options,
+    })
+}
+
 impl PromptResult {
     /// Map the pinned `StopReason` vocabulary onto Eliot turn statuses.
     /// `end_turn`/`max_tokens`/`max_turn_requests` end the turn normally,
@@ -479,6 +600,77 @@ mod tests {
         let bare: PromptResult = serde_json::from_value(json!({"stopReason": "end_turn"}))
             .expect("bare prompt result parses");
         assert_eq!(prompt_turn_usage(&bare), None);
+    }
+
+    #[test]
+    fn permission_request_parses_tool_call_and_offered_options() {
+        // Per the ACP schema (`RequestPermissionRequest`): the `git log`
+        // ask carries the tool call plus options in the four kinds.
+        let params = json!({
+            "sessionId": "session-1",
+            "toolCall": {
+                "toolCallId": "tool-call_1",
+                "title": "Run git log",
+                "name": "exec",
+                "kind": "execute",
+                "status": "pending",
+                "rawInput": {"command": "git log --oneline -n 100"},
+            },
+            "options": [
+                {"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
+                {"optionId": "allow-always", "name": "Allow always", "kind": "allow_always"},
+                {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
+                {"optionId": "reject-always", "name": "Always reject", "kind": "reject_always"},
+            ],
+        });
+        let ask = parse_permission_request(&params).expect("permission ask parses");
+        assert_eq!(ask.tool_call_id, "tool-call_1");
+        assert_eq!(ask.title, "Run git log");
+        assert_eq!(ask.tool_name.as_deref(), Some("exec"));
+        assert_eq!(ask.tool_kind.as_deref(), Some("execute"));
+        assert_eq!(ask.options.len(), 4);
+
+        // Direction mapping follows the option kinds, never the labels.
+        assert_eq!(permission_option_grants("allow_once"), Some(true));
+        assert_eq!(permission_option_grants("allow_always"), Some(true));
+        assert_eq!(permission_option_grants("reject_once"), Some(false));
+        assert_eq!(permission_option_grants("reject_always"), Some(false));
+        assert_eq!(permission_option_grants("sometimes"), None);
+
+        // Defaults are least-privilege: the one-time kind wins per verb.
+        assert_eq!(
+            default_permission_option(&ask.options, true).map(|option| option.option_id.as_str()),
+            Some("allow-once")
+        );
+        assert_eq!(
+            default_permission_option(&ask.options, false).map(|option| option.option_id.as_str()),
+            Some("reject-once")
+        );
+
+        // Malformed option entries are skipped, never fatal.
+        let sparse = parse_permission_request(&json!({
+            "sessionId": "session-1",
+            "toolCall": {"toolCallId": "tool-call_2"},
+            "options": [
+                {"optionId": "", "name": "Empty", "kind": "allow_once"},
+                {"name": "No id", "kind": "reject_once"},
+                {"optionId": "ok", "name": "Ok", "kind": "reject_once"},
+            ],
+        }))
+        .expect("sparse permission ask parses");
+        assert_eq!(sparse.title, "ACP tool call");
+        assert_eq!(sparse.options.len(), 1);
+        assert_eq!(sparse.options[0].option_id, "ok");
+
+        // Missing tool call identity is not an ask at all.
+        assert!(
+            parse_permission_request(&json!({
+                "sessionId": "session-1",
+                "toolCall": {"title": "No id"},
+                "options": [],
+            }))
+            .is_none()
+        );
     }
 
     #[test]
