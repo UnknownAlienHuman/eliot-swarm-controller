@@ -2781,7 +2781,7 @@ impl EventProcessor {
         }
         // The durable terminal record keeps the structured error message,
         // falling back to the terminal reason the readback used to drop.
-        let native_error = turn_native_error(&notification, &secrets);
+        let native_error = turn_native_error(&notification, &notification.terminal, &secrets);
         attach_native_error(&mut data, native_error.as_deref(), &secrets);
         if readback_recovery {
             mark_readback_recovery(&mut data);
@@ -4740,19 +4740,21 @@ pub(crate) fn native_terminal(terminal: &NativeTurnTerminal) -> Option<&'static 
 }
 
 /// Native failure text for one terminal `turn/completed`: the structured
-/// error message first, the terminal reason when no error was carried.
-/// Redacted and bounded for the turn readback; turns with no native text
-/// (successes, silent cancels) stay `None` so the readback keeps proving
-/// nothing it was not told.
+/// error message first, the terminal reason when a failed turn carried no
+/// error. A vendor reason on a completed or cancelled turn never surfaces
+/// as a native error. Redacted and bounded for the turn readback; turns
+/// with no native text (successes, silent cancels) stay `None` so the
+/// readback keeps proving nothing it was not told.
 pub(crate) fn turn_native_error(
     notification: &NativeTurnCompletedNotification,
+    terminal: &NativeTurnTerminal,
     policy: &SecretPolicy,
 ) -> Option<String> {
-    let message = notification
-        .error
-        .as_ref()
-        .map(|error| error.message.as_str())
-        .or(notification.reason.as_deref())?;
+    let message = match notification.error.as_ref() {
+        Some(error) => Some(error.message.as_str()),
+        None if matches!(terminal, NativeTurnTerminal::Failed) => notification.reason.as_deref(),
+        None => None,
+    }?;
     if message.trim().is_empty() {
         return None;
     }
@@ -5443,7 +5445,11 @@ mod tests {
     fn turn_native_error_prefers_the_structured_error_message() {
         let notification = failed_notification();
         assert_eq!(
-            turn_native_error(&notification, &SecretPolicy::default()),
+            turn_native_error(
+                &notification,
+                &NativeTurnTerminal::Failed,
+                &SecretPolicy::default()
+            ),
             Some("native turn failed".to_owned())
         );
     }
@@ -5453,9 +5459,37 @@ mod tests {
         let mut notification = failed_notification();
         notification.error = None;
         assert_eq!(
-            turn_native_error(&notification, &SecretPolicy::default()),
+            turn_native_error(
+                &notification,
+                &NativeTurnTerminal::Failed,
+                &SecretPolicy::default()
+            ),
             Some("terminal reason".to_owned())
         );
+    }
+
+    #[test]
+    fn turn_native_error_ignores_vendor_reasons_off_failed_terminals() {
+        let policy = SecretPolicy::default();
+        for terminal in [NativeTurnTerminal::Completed, NativeTurnTerminal::Cancelled] {
+            let mut notification = failed_notification();
+            notification.terminal = terminal;
+            notification.error = None;
+            assert_eq!(
+                turn_native_error(&notification, &notification.terminal, &policy),
+                None
+            );
+            // A structured error still surfaces wherever the native put one.
+            notification.error = Some(NativeTurnError {
+                kind: "internal".to_owned(),
+                message: "native turn failed".to_owned(),
+                retryable: false,
+            });
+            assert_eq!(
+                turn_native_error(&notification, &notification.terminal, &policy),
+                Some("native turn failed".to_owned())
+            );
+        }
     }
 
     #[test]
@@ -5464,16 +5498,25 @@ mod tests {
         let mut notification = failed_notification();
         notification.error = None;
         notification.reason = None;
-        assert_eq!(turn_native_error(&notification, &policy), None);
+        assert_eq!(
+            turn_native_error(&notification, &NativeTurnTerminal::Failed, &policy),
+            None
+        );
         notification.reason = Some("   ".to_owned());
-        assert_eq!(turn_native_error(&notification, &policy), None);
+        assert_eq!(
+            turn_native_error(&notification, &NativeTurnTerminal::Failed, &policy),
+            None
+        );
         notification.error = Some(NativeTurnError {
             kind: "internal".to_owned(),
             message: "  ".to_owned(),
             retryable: false,
         });
         notification.reason = None;
-        assert_eq!(turn_native_error(&notification, &policy), None);
+        assert_eq!(
+            turn_native_error(&notification, &NativeTurnTerminal::Failed, &policy),
+            None
+        );
     }
 
     #[test]
@@ -5486,7 +5529,7 @@ mod tests {
         });
         notification.reason = None;
         let policy = SecretPolicy::new(["hunter2".to_owned()]);
-        let text = turn_native_error(&notification, &policy)
+        let text = turn_native_error(&notification, &NativeTurnTerminal::Failed, &policy)
             .expect("redacted native error must still be present");
         assert!(!text.contains("hunter2"));
 
@@ -5495,8 +5538,12 @@ mod tests {
             message: "é".repeat(8 * 1024),
             retryable: false,
         });
-        let text = turn_native_error(&notification, &SecretPolicy::default())
-            .expect("oversize native error must truncate, not vanish");
+        let text = turn_native_error(
+            &notification,
+            &NativeTurnTerminal::Failed,
+            &SecretPolicy::default(),
+        )
+        .expect("oversize native error must truncate, not vanish");
         assert!(text.len() <= 4 * 1024);
         assert!(text.len() >= 4 * 1024 - 4);
     }

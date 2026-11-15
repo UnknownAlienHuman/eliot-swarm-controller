@@ -2613,7 +2613,7 @@ fn observe_view_event(
                 // live terminal commits: keep the first record's text so the
                 // readback surfaces the native reason an empty turn hides.
                 if native_error.is_none() {
-                    *native_error = turn_native_error(&completed, policy);
+                    *native_error = turn_native_error(&completed, &completed.terminal, policy);
                 }
             }
         }
