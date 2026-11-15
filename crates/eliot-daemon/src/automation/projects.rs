@@ -37,6 +37,12 @@ pub(super) struct LoadedProjectRules {
 /// Call before Store admission; no Store lock is acquired during filesystem or Git work.
 pub(super) async fn load_registrations(data_root: &Path) -> Result<Vec<RegistrationSnapshot>> {
     let configured = config::load_project_registration_config(data_root)?;
+    resolve_registrations(configured).await
+}
+
+pub(super) async fn resolve_registrations(
+    configured: Vec<ProjectRegistrationConfig>,
+) -> Result<Vec<RegistrationSnapshot>> {
     if configured.is_empty() {
         return Ok(Vec::new());
     }

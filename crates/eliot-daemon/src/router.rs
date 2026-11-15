@@ -49,12 +49,12 @@ use eliot_core::{
         MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
         MaintenanceRunRequest, MaintenanceRunResponse, NotifyDefinitionArgs, ObservationPage,
         ObservationQuery, ObservationView, OwnedProcessKind, OwnedProcessSummary,
-        ProcessPageCursor, ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest,
-        RetainedUnknownSummary, RetentionView, RuleGetRequest, RuleStateView, RunningTurnSummary,
-        ShutdownMode, SourceState, StatusBlocker, SwarmWaitRequest, SwarmWaitResponse,
-        TimerGetRequest, TimerStateView, TurnGetRequest, UnsettledCommandSummary, UsageScopeView,
-        UsageSummaryRequest, WaitEntryResult, WorkerTaskHealth, WorkerTaskStatus,
-        WorkspaceCustodyView,
+        ProcessPageCursor, ProjectDiscoverRequest, ProjectRegistrationView,
+        ProviderClearHoldRequest, ProviderHoldsRequest, RetainedUnknownSummary, RetentionView,
+        RuleGetRequest, RuleStateView, RunningTurnSummary, ShutdownMode, SourceState,
+        StatusBlocker, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView,
+        TurnGetRequest, UnsettledCommandSummary, UsageScopeView, UsageSummaryRequest,
+        WaitEntryResult, WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -355,9 +355,12 @@ impl Router {
             "command.cancel" => self.command_cancel(&params, &principal).await,
             "project.get" => self.project_get(&params, &principal).await,
             "project.list" => self.project_list(&params, &principal).await,
+            "project.discover" => self.project_discover(&params, &principal).await,
             "profile.list" => self.profile_list(&params, &principal).await,
             "config.profiles.read" => self.config_profiles_read(&params, &principal).await,
             "config.profiles.save" => self.config_profiles_save(&params, &principal).await,
+            "settings.read" => self.settings_read(&params, &principal).await,
+            "settings.save" => self.settings_save(&params, &principal).await,
             "rule.list" => self.rule_list(&params, &principal).await,
             "script.list" => self.script_list(&params, &principal).await,
             "script.read" => self.script_read(&params, &principal).await,
@@ -1583,6 +1586,19 @@ impl Router {
                         hierarchy::default_agent_child_workspace(&store, &mut request, principal)?;
                     }
                     normalize_launch(&mut request, principal)?;
+                    if matches!(principal, Principal::Owner)
+                        && let Some(workspace) =
+                            request.args.get("workspace").and_then(Value::as_str)
+                    {
+                        let policy = self.secret_policy_snapshot();
+                        crate::bootstrap::discover_project(
+                            &self.inner.data_root,
+                            &self.inner.store,
+                            std::path::Path::new(workspace),
+                            &policy,
+                        )
+                        .await?;
+                    }
                     {
                         let store = self.inner.store.lock().await;
                         hierarchy::inherit_launch_project(&store, &mut request)?;
@@ -1987,9 +2003,19 @@ impl Router {
         let (profile_name, snapshot, harness) = match agent_child_snapshot {
             Some((name, harness, snapshot)) => (name, snapshot, harness),
             None => {
-                let profile_name = required_text(&request.args, "profile")?;
+                let (profile_name, profile_choice) = match request.args.get("profile") {
+                    Some(Value::String(name)) => (name.to_owned(), None),
+                    Some(_) => (required_text(&request.args, "profile")?.to_owned(), None),
+                    None if matches!(principal, Principal::Owner)
+                        && request.args.get("harness").is_none() =>
+                    {
+                        let (name, choice) = self.default_profile_choice().await?;
+                        (name, Some(choice))
+                    }
+                    None => (required_text(&request.args, "profile")?.to_owned(), None),
+                };
                 let mut snapshot =
-                    crate::config::resolve_profile(&self.inner.data_root, profile_name)?;
+                    crate::config::resolve_profile(&self.inner.data_root, &profile_name)?;
                 crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                     std::env::var_os(name)
                 })?;
@@ -1999,7 +2025,12 @@ impl Router {
                     .filter(|harness| !harness.trim().is_empty())
                     .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
                     .to_owned();
-                (profile_name.to_owned(), snapshot, harness)
+                if let Some(choice) = profile_choice
+                    && let Some(args) = request.args.as_object_mut()
+                {
+                    args.insert("profile_choice".to_owned(), choice);
+                }
+                (profile_name, snapshot, harness)
             }
         };
         // The retained wire shape keeps the named profile so Store admission
@@ -2013,6 +2044,37 @@ impl Router {
             hierarchy::check_agent_launch_authority(&store, principal, request)?;
         }
         Ok(false)
+    }
+
+    async fn default_profile_choice(&self) -> Result<(String, Value)> {
+        let policy = self.secret_policy_snapshot();
+        let mut store = self.inner.store.lock().await;
+        let settings = crate::config::settings::read_internal(
+            &self.inner.data_root,
+            &mut store,
+            Some(&[eliot_core::api::SettingsSection::Routing]),
+            &policy,
+        )?;
+        let candidates = settings
+            .sections
+            .get(&eliot_core::api::SettingsSection::Routing)
+            .and_then(|routing| routing.get("default"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::new("not_found", "no default launch profile is configured"))?;
+        let profile = candidates
+            .first()
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| Error::new("not_found", "no default launch profile is configured"))?
+            .to_owned();
+        Ok((
+            profile.clone(),
+            json!({
+                "profile": profile,
+                "source": "settings.routing.default",
+                "reason": "first configured default candidate",
+            }),
+        ))
     }
 
     async fn provider_holds(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -2082,6 +2144,24 @@ impl Router {
         }
         serde_json::to_value(registrations)
             .map_err(|_| Error::new("internal", "project registrations could not be encoded"))
+    }
+
+    async fn project_discover(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: ProjectDiscoverRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let policy = self.secret_policy_snapshot();
+        let response = crate::bootstrap::discover_project(
+            &self.inner.data_root,
+            &self.inner.store,
+            std::path::Path::new(&request.workspace),
+            &policy,
+        )
+        .await?;
+        request.validate_response(&response)?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "project discovery could not be encoded"))
     }
 
     async fn rule_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -5642,7 +5722,7 @@ fn validate_project_rule_resume_command(
     Ok(())
 }
 
-fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Result<()> {
+fn normalize_launch(request: &mut SubmitCommand, _principal: &Principal) -> Result<()> {
     if request.verb != "launch" {
         return Ok(());
     }
@@ -5686,16 +5766,10 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
         .args
         .as_object_mut()
         .ok_or_else(|| Error::new("invalid", "launch args must be an object"))?;
-    // An Agent launch without `parent` was already defaulted to the caller
-    // by authorize_command, so an Agent child carries `parent` here and
-    // keeps the profile optional. Only non-Agent callers (Owner
-    // parentless, Run/ProjectRule) require a named profile at this stage;
-    // the freeze step re-checks the principal boundary.
-    // A present profile must be a nonempty string for every caller.
-    // Absence is optional only for an Agent principal, whose child
-    // reuses the parent's frozen snapshot; every other caller requires it.
-    // Ad-hoc Owner launch names a harness instead of a profile, with
-    // optional model/effort/auth; profile and harness are mutually exclusive.
+    // Owner launches without a harness may omit the profile; the freeze step
+    // resolves their single configured routing.default candidate. Agent
+    // children may also omit it to inherit the parent's frozen profile.
+    // Ad-hoc Owner launch names a harness instead of a profile.
     if let Some(harness) = args.get("harness") {
         let Some(name) = harness.as_str().filter(|name| !name.trim().is_empty()) else {
             return Err(Error::new(
@@ -5740,11 +5814,6 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
                 ));
             };
             let _ = name;
-        } else if !matches!(principal, Principal::Agent { .. }) {
-            return Err(Error::new(
-                "invalid",
-                "launch requires a profile name or an ad-hoc harness",
-            ));
         }
     }
     args.insert("workspace".to_owned(), Value::String(workspace.clone()));
@@ -5901,6 +5970,7 @@ struct RetainedLaunchProfile {
     command_has_harness: bool,
     command_has_snapshot: bool,
     profile: String,
+    profile_choice: Option<Value>,
     workspace: Option<Value>,
     project: Option<Value>,
     preparation: Option<Value>,
@@ -5967,6 +6037,11 @@ fn retained_launch_profile(
         .get("profile")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    let profile_choice = command
+        .args
+        .get("profile_choice")
+        .filter(|choice| choice.is_object())
+        .cloned();
     let workspace = command.args.get("workspace").cloned();
     let project = command.args.get("project").cloned();
     let preparation = command.args.get("workspace_preparation").cloned();
@@ -5996,6 +6071,7 @@ fn retained_launch_profile(
             command_has_harness,
             command_has_snapshot,
             profile,
+            profile_choice,
             workspace,
             project,
             preparation,
@@ -6020,6 +6096,7 @@ fn retained_launch_profile(
             command_has_harness,
             command_has_snapshot,
             profile,
+            profile_choice,
             workspace,
             project,
             preparation,
@@ -6088,6 +6165,7 @@ fn install_retained_profile(
         command_has_harness,
         command_has_snapshot,
         profile,
+        profile_choice,
         workspace,
         project,
         preparation,
@@ -6118,8 +6196,12 @@ fn install_retained_profile(
     // Restore the admitted profile only when the retry omits it, so a
     // no-profile retry hashes to the persisted digest and an explicitly
     // changed profile stays untouched for the canonical id_conflict check.
-    args.entry("profile".to_owned())
-        .or_insert(Value::String(profile));
+    if !args.contains_key("profile") {
+        args.insert("profile".to_owned(), Value::String(profile));
+        if let Some(choice) = profile_choice {
+            args.insert("profile_choice".to_owned(), choice);
+        }
+    }
     if let Some(preparation) = preparation {
         args.insert("workspace_preparation".to_owned(), preparation);
     } else {
@@ -6225,6 +6307,7 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
         ));
     }
     for reserved in [
+        "profile_choice",
         "source_plan",
         "target_environment",
         "workspace_preparation",
@@ -14358,7 +14441,7 @@ do = [{ action = "stop", target = "${event.agent}", expected_generation = "${eve
 
 #[cfg(test)]
 mod run_authorization_tests {
-    use super::tests::{read_fixture_event, result_fixture, router};
+    use super::tests::{read_fixture_event, result_fixture, router, router_with_data_root};
     use super::*;
 
     pub(super) fn command(id: &str) -> Command {
@@ -14814,6 +14897,63 @@ mod run_authorization_tests {
             "unexpected message: {}",
             error.message
         );
+    }
+
+    #[tokio::test]
+    async fn profile_free_launch_retry_replays_frozen_default_after_routing_changes() {
+        let root = std::env::temp_dir().join(format!("eliot-default-route-{}", ulid::Ulid::new()));
+        let data_root = root.join("data");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&data_root).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let workspace = workspace.to_str().unwrap().to_owned();
+        std::fs::write(
+            data_root.join("config.toml"),
+            "[routing]\ndefault = ['first']\n\
+             [profiles.first]\nharness = 'codex'\n\
+             [profiles.second]\nharness = 'codex'\n",
+        )
+        .unwrap();
+        let router = router_with_data_root(data_root.clone());
+        let id = ulid::Ulid::new().to_string();
+        let mut first = SubmitCommand::new(&id, "launch");
+        first.expected_generation = Some(0);
+        first.args = json!({"workspace":workspace, "project":workspace, "text":"same task"});
+        router
+            .freeze_launch_profile(&Principal::Owner, &mut first)
+            .await
+            .unwrap();
+        assert_eq!(first.args["profile"], "first");
+        assert_eq!(first.args["profile_choice"]["profile"], "first");
+        {
+            let mut store = router.inner.store.lock().await;
+            store.submit("owner", first, now_ms()).unwrap();
+        }
+
+        std::fs::write(
+            data_root.join("config.toml"),
+            "[routing]\ndefault = ['second']\n\
+             [profiles.first]\nharness = 'codex'\n\
+             [profiles.second]\nharness = 'codex'\n",
+        )
+        .unwrap();
+        let before = router.inner.store.lock().await.high_water().unwrap();
+        let mut retry = SubmitCommand::new(&id, "launch");
+        retry.expected_generation = Some(0);
+        retry.args = json!({"workspace":workspace, "text":"same task"});
+        let replay = router
+            .replay_command_submission(&mut retry, &Principal::Owner, None)
+            .await
+            .unwrap();
+        assert!(replay.is_some());
+        assert_eq!(retry.args["profile"], "first");
+        assert_eq!(retry.args["profile_choice"]["profile"], "first");
+        assert_eq!(
+            router.inner.store.lock().await.high_water().unwrap(),
+            before
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

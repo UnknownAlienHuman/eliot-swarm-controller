@@ -37,6 +37,21 @@ remains. This clarification replaces the earlier treatment of remote access as L
 
 ## What Eliot is
 
+### Owner clarification, 2026-11-15
+
+> "Everything should be automated: routing, assignments and so on."
+> "Everything you'd have to dig into goes to Settings."
+> "The system must allow a hot start, working out of the box."
+> "Unified settings: everything the human does and everything the machine does is stored in one place."
+> "Finish it and make it right."
+
+The private daemon data directory owns one settings source and typed API, including
+desktop preferences and bounded history of human and machine edits. First use discovers
+installed harnesses, creates editable native-default profiles and registers the opened
+Git checkout. Policy selects a profile before admission and records its choice; uncertain
+external effects are never retried on another route. Assignment uses existing rules and
+timers, not a Task engine. The S1-S4 increments in the roadmap own delivery order.
+
 A small local Rust controller that launches vendor coding harnesses, observes native/
 process/Git facts and exposes one CLI/API for control, bounded automation and direct
 agent coordination. Vendor model loops, tools and detailed native transcripts remain

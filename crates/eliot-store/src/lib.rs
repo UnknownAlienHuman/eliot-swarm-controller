@@ -8,6 +8,7 @@ mod projects;
 mod provider_holds;
 mod rules;
 mod scripts;
+mod settings;
 
 pub use attribution::WhoWorkerRow;
 pub use capacity::{RecordedProcess, RetainedGeneration};

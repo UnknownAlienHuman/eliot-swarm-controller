@@ -36,16 +36,18 @@ pub use agent_views::{
     AgentProcessesRequest, AgentProcessesResponse, AgentStatsRequest, AgentStatsResponse,
     AgentSummary, CloudMcpCustody, CloudMcpHealth, CloudMcpStatus, DaemonStatusRequest,
     DaemonStatusResponse, DrainReport, GitCredentialHelper, OwnedProcessKind, OwnedProcessSummary,
-    PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectGitView, ProjectRegistrationView,
-    RetainedUnknownSummary, RetentionView, RunningTurnSummary, SourceOwner, SourceState,
-    StatusBlocker, UnsettledCommandSummary, WorkerTaskHealth, WorkerTaskStatus,
-    WorkspaceCustodyView,
+    PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectDiscoverRequest, ProjectDiscoverResponse,
+    ProjectGitView, ProjectRegistrationView, RetainedUnknownSummary, RetentionView,
+    RunningTurnSummary, SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary,
+    WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
 };
 pub use config_views::{
     CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,
     ProfileListResponse, ProfileSummary, ProfilesReadRequest, ProfilesReadResponse,
     ProfilesSaveRequest, ProfilesSaveResponse, REDACTION_MARKER, RuleListEntry, RuleListRequest,
-    RuleListResponse,
+    RuleListResponse, SettingsClientSource, SettingsHistoryEntry, SettingsHistoryStatus,
+    SettingsReadRequest, SettingsReadResponse, SettingsSaveRequest, SettingsSaveResponse,
+    SettingsSection,
 };
 pub use coordination::{
     ClaimConflict, ClaimListRequest, ClaimListResponse, ClaimReleaseRequest, ClaimReleaseResponse,

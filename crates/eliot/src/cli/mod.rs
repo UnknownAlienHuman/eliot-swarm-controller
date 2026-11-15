@@ -7,6 +7,7 @@ mod coord;
 mod daemon;
 mod reads;
 mod rules;
+mod settings;
 pub(crate) mod support;
 
 use self::args::CliCommand;
@@ -20,6 +21,7 @@ pub(crate) async fn dispatch(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     match command {
+        CliCommand::Settings(args) => settings::run(args, data_dir, json_output).await,
         CliCommand::Daemon(args) => daemon::run_daemon(args, data_dir, json_output, id).await,
         CliCommand::Mcp(args) => daemon::run_mcp(args, data_dir, json_output).await,
         CliCommand::Status => daemon::run_status(data_dir, json_output).await,

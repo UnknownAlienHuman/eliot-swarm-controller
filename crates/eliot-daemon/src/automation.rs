@@ -346,6 +346,22 @@ fn project_registration_input(
     }
 }
 
+/// Load the canonical project registrations represented by `projects.*` in
+/// config.toml for a settings.save reconciliation. Keep this on the same
+/// resolver path used by daemon startup and automation reloads.
+pub(crate) async fn project_registration_inputs(
+    configured: Vec<crate::config::ProjectRegistrationConfig>,
+) -> Result<Vec<eliot_store::ProjectRegistrationInput>> {
+    let registrations = projects::resolve_registrations(configured).await?;
+    for registration in &registrations {
+        validate_project_git_endpoints(registration.git.as_ref())?;
+    }
+    Ok(registrations
+        .iter()
+        .map(project_registration_input)
+        .collect())
+}
+
 fn project_registration_snapshot(
     registration: &ProjectRegistrationView,
 ) -> projects::RegistrationSnapshot {

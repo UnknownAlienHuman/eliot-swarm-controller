@@ -14,20 +14,22 @@ use std::path::{Component, Path, PathBuf};
 
 pub(crate) fn ensure_private_root(path: &Path) -> Result<()> {
     check_path_components(path)?;
-    fs::create_dir_all(path).map_err(|error| io_error("create data directory", error))?;
-    check_path_components(path)?;
-
-    let metadata =
-        fs::symlink_metadata(path).map_err(|error| io_error("inspect data directory", error))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(Error::new(
-            "unsafe_data_dir",
-            "data directory must be a real directory, not a symlink or file",
-        ));
+    match fs::symlink_metadata(path) {
+        Ok(_) => validate_private_root(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700).recursive(true);
+            match builder.create(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(io_error("create private data directory", error)),
+            }
+            check_path_components(path)?;
+            validate_private_root(path)
+        }
+        Err(error) => Err(io_error("inspect data directory", error)),
     }
-    require_current_owner(&metadata, "data directory")?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|error| io_error("restrict data directory", error))
 }
 
 pub(crate) fn ensure_private_file(path: &Path) -> Result<()> {
@@ -1018,6 +1020,55 @@ fn check_path_components(path: &Path) -> Result<()> {
 
 fn io_error(action: &str, error: std::io::Error) -> Error {
     Error::new("platform_io", format!("{action}: {error}"))
+}
+
+#[cfg(test)]
+mod private_root_tests {
+    use super::*;
+
+    struct TempPath(PathBuf);
+
+    impl TempPath {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!("eliot-private-root-{}", ulid::Ulid::new())))
+        }
+    }
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn existing_broad_root_is_rejected_without_chmod() {
+        let temp = TempPath::new();
+        fs::create_dir(&temp.0).expect("create fixture");
+        fs::set_permissions(&temp.0, fs::Permissions::from_mode(0o755)).expect("set broad mode");
+        let error = ensure_private_root(&temp.0).expect_err("unsafe existing root refused");
+        assert_eq!(error.code, "unsafe_data_dir");
+        let mode = fs::symlink_metadata(&temp.0)
+            .expect("fixture remains")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "validation must not change existing mode");
+    }
+
+    #[test]
+    fn new_root_is_private_at_creation() {
+        let temp = TempPath::new();
+        let nested = temp.0.join("one").join("two");
+        ensure_private_root(&nested).expect("create private nested root");
+        for path in [temp.0.join("one"), nested] {
+            let mode = fs::symlink_metadata(path)
+                .expect("new directory exists")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

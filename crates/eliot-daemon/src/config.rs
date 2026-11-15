@@ -21,6 +21,7 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 pub(crate) mod profiles_edit;
+pub(crate) mod settings;
 
 const MAX_CONFIG_BYTES: usize = 128 * 1024;
 const MAX_PROFILE_NAME_LEN: usize = 128;
@@ -148,6 +149,58 @@ struct FileConfig {
     mail: MailConfig,
     #[serde(default)]
     cloud_mcp: Option<CloudMcpSettings>,
+    #[serde(default)]
+    routing: RoutingConfig,
+    #[serde(default)]
+    desktop: DesktopSettings,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RoutingConfig {
+    #[serde(default)]
+    pub(crate) default: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DesktopTheme {
+    Light,
+    Dark,
+    #[default]
+    System,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DesktopWindow {
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DesktopSettings {
+    #[serde(default)]
+    theme: DesktopTheme,
+    #[serde(default)]
+    window: Option<DesktopWindow>,
+}
+
+impl DesktopSettings {
+    fn validate(&self) -> core::Result<()> {
+        if self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.width < 640 || window.height < 480)
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: desktop window must be at least 640 by 480",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -1000,7 +1053,24 @@ fn read_config(data_root: &Path) -> core::Result<Option<(FileConfig, String)>> {
 /// The one `config.toml` parser: strict (`deny_unknown_fields`) with
 /// located errors.
 fn parse_config(source: &str) -> core::Result<FileConfig> {
-    toml::from_str(source).map_err(|error| map_toml_error(source, error))
+    let config: FileConfig =
+        toml::from_str(source).map_err(|error| map_toml_error(source, error))?;
+    config.desktop.validate()?;
+    if config.routing.default.len() > 1 {
+        return Err(core::Error::new(
+            "unsupported",
+            "routing currently supports one explicit default profile",
+        ));
+    }
+    for profile in &config.routing.default {
+        if !config.profiles.contains_key(profile) {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: routing.default names an unknown profile",
+            ));
+        }
+    }
+    Ok(config)
 }
 
 /// Raw `config.toml` text within the size bound; `None` when absent.
@@ -1149,22 +1219,10 @@ fn snapshot_from_entry(
     if harness == "antigravity" {
         return antigravity_snapshot_from_entry(name, entry, table_offset, source);
     }
-    let model = entry
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .ok_or_else(|| {
-            profile_field_error(
-                source,
-                table_offset,
-                name,
-                "model",
-                "required non-empty model is missing",
-                "profile_error",
-            )
-        })?;
-    validate_model(name, model, source, table_offset)?;
+    let model = entry.model.as_deref();
+    if let Some(model) = model {
+        validate_model(name, model, source, table_offset)?;
+    }
     let effort = entry.effort.as_deref().map(str::trim);
     if effort.is_some_and(|value| {
         value.is_empty() || value.len() > MAX_EFFORT_LEN || value.chars().any(char::is_control)
@@ -1275,7 +1333,9 @@ fn snapshot_from_entry(
     if let Some(cmd) = cmd {
         snapshot.insert("cmd".to_owned(), Value::String(cmd));
     }
-    snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    if let Some(model) = model {
+        snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
     if let Some(effort) = effort {
         snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
     }
@@ -1429,22 +1489,10 @@ fn muse_snapshot_from_entry(
     table_offset: usize,
     source: &str,
 ) -> core::Result<Value> {
-    let model = entry
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .ok_or_else(|| {
-            profile_field_error(
-                source,
-                table_offset,
-                name,
-                "model",
-                "required non-empty model is missing",
-                "profile_error",
-            )
-        })?;
-    validate_model(name, model, source, table_offset)?;
+    let model = entry.model.as_deref();
+    if let Some(model) = model {
+        validate_model(name, model, source, table_offset)?;
+    }
     let effort = entry.effort.as_deref().map(str::trim);
     if effort.is_some_and(|value| {
         value.is_empty() || value.len() > MAX_EFFORT_LEN || value.chars().any(char::is_control)
@@ -1537,7 +1585,9 @@ fn muse_snapshot_from_entry(
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("muse".to_owned()));
-    snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    if let Some(model) = model {
+        snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
     if let Some(effort) = effort {
         snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
     }
@@ -1588,22 +1638,10 @@ fn claude_snapshot_from_entry(
     table_offset: usize,
     source: &str,
 ) -> core::Result<Value> {
-    let model = entry
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .ok_or_else(|| {
-            profile_field_error(
-                source,
-                table_offset,
-                name,
-                "model",
-                "required non-empty model is missing",
-                "profile_error",
-            )
-        })?;
-    validate_model(name, model, source, table_offset)?;
+    let model = entry.model.as_deref();
+    if let Some(model) = model {
+        validate_model(name, model, source, table_offset)?;
+    }
     // Claude Code 2.1.278 `--effort <level>`: the CLI's closed vocabulary.
     // Absent effort keeps the CLI default; no value is fabricated.
     let effort = match entry.effort.as_deref().map(str::trim) {
@@ -1748,7 +1786,9 @@ fn claude_snapshot_from_entry(
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("claude".to_owned()));
     snapshot.insert("cmd".to_owned(), Value::String(cmd));
-    snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    if let Some(model) = model {
+        snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
     snapshot.insert(
         "permissions".to_owned(),
         Value::String(PERMISSION_WORKSPACE_WRITE.to_owned()),
@@ -2083,22 +2123,11 @@ fn opencode_snapshot_from_entry(
     table_offset: usize,
     source: &str,
 ) -> core::Result<Value> {
-    let model = entry
-        .model
-        .as_deref()
-        .filter(|model| !model.is_empty())
-        .ok_or_else(|| {
-            profile_field_error(
-                source,
-                table_offset,
-                name,
-                "model",
-                "required non-empty model is missing",
-                "profile_error",
-            )
-        })?;
-    validate_model(name, model, source, table_offset)?;
-    if split_provider_model(model).is_none() {
+    let model = entry.model.as_deref();
+    if let Some(model) = model {
+        validate_model(name, model, source, table_offset)?;
+    }
+    if model.is_some_and(|model| split_provider_model(model).is_none()) {
         return Err(profile_field_error(
             source,
             table_offset,
@@ -2163,8 +2192,20 @@ fn opencode_snapshot_from_entry(
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("opencode".to_owned()));
-    snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    if let Some(model) = model {
+        snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
     if has_local_backend_fields(entry) {
+        if model.is_none() {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                "model",
+                "required non-empty model is missing for adopted local backends",
+                "profile_error",
+            ));
+        }
         freeze_local_backend(&mut snapshot, name, entry, &tail, table_offset, source)?;
     } else if let Some(selector) = entry.auth_integration.as_deref() {
         snapshot.insert(
@@ -2205,22 +2246,10 @@ fn antigravity_snapshot_from_entry(
     table_offset: usize,
     source: &str,
 ) -> core::Result<Value> {
-    let model = entry
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .ok_or_else(|| {
-            profile_field_error(
-                source,
-                table_offset,
-                name,
-                "model",
-                "required non-empty model is missing",
-                "profile_error",
-            )
-        })?;
-    validate_model(name, model, source, table_offset)?;
+    let model = entry.model.as_deref();
+    if let Some(model) = model {
+        validate_model(name, model, source, table_offset)?;
+    }
     if entry
         .effort
         .as_deref()
@@ -2285,7 +2314,9 @@ fn antigravity_snapshot_from_entry(
         "harness".to_owned(),
         Value::String("antigravity".to_owned()),
     );
-    snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    if let Some(model) = model {
+        snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
     if let Some(mode) = mode {
         snapshot.insert("mode".to_owned(), Value::String(mode.to_owned()));
     }
@@ -2522,13 +2553,16 @@ fn validate_profile_name(name: &str) -> core::Result<()> {
     Ok(())
 }
 fn validate_model(profile: &str, model: &str, source: &str, offset: usize) -> core::Result<()> {
-    if model.len() > MAX_MODEL_LEN || model.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if model.is_empty()
+        || model.len() > MAX_MODEL_LEN
+        || model.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
         return Err(profile_field_error(
             source,
             offset,
             profile,
             "model",
-            "must be a single token of at most 256 characters",
+            "must be a nonempty single token of at most 256 characters",
             "profile_error",
         ));
     }
@@ -3936,6 +3970,19 @@ base_url_for.codex = "http://127.0.0.1:10300/v1"
         let direct = resolve_text_profile(direct, "direct").unwrap();
         assert!(direct.get("effort").is_none());
         assert!(direct.get("route_binding").is_none());
+    }
+
+    #[test]
+    fn native_default_model_requires_absence_not_an_explicit_blank() {
+        let omitted = resolve_text_profile("[profiles.native]\nharness = 'codex'\n", "native")
+            .expect("omitted model keeps native default");
+        assert!(omitted.get("model").is_none());
+        for model in ["", "   "] {
+            let source = format!("[profiles.native]\nharness = 'codex'\nmodel = {model:?}\n");
+            let error = resolve_text_profile(&source, "native")
+                .expect_err("an explicitly blank model must not become native default");
+            assert_eq!(error.code, "profile_error", "{model:?}");
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 pub(crate) mod adhoc;
 pub(crate) mod automation;
+pub mod bootstrap;
 mod bus;
 pub mod cloud_mcp;
 mod common;
@@ -21,6 +22,7 @@ mod restart_capacity;
 mod router;
 pub(crate) mod scripts;
 mod setup;
+pub mod startup;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod workspace_git;
@@ -34,6 +36,7 @@ pub use daemon::{
     daemon_connect_hint, daemon_failure_since, last_daemon_failure, last_daemon_phase,
     require_agent_identity, run,
 };
+pub use platform::data_dir::{persist_selected_root, resolve_data_dir, resolve_selected_root};
 pub use router::discovery::is_mutation_id_method;
 pub use router::discovery::mutation_id_methods;
 

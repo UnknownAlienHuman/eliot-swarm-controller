@@ -22,7 +22,7 @@ use crate::{
 pub(crate) struct Plan {
     pub launch: NativeLaunch,
     pub policy: SecretPolicy,
-    pub model: String,
+    pub model: Option<String>,
     /// Native realignment target: the inherited overlay's effective base
     /// model and thought level on a resume that carries them, else the
     /// frozen profile translation. `requested()` stays frozen; these drive
@@ -213,8 +213,7 @@ impl Plan {
                 "Antigravity effort is unconnected on this route",
             ));
         }
-        let model = optional_profile_text(profile, "model", "Antigravity")?
-            .ok_or_else(|| Error::new("profile_error", "Antigravity requires an exact model"))?;
+        let model = optional_profile_text(profile, "model", "Antigravity")?;
         let program = optional_profile_text(profile, "cmd", "Antigravity")?.ok_or_else(|| {
             Error::new(
                 "profile_error",
@@ -299,7 +298,7 @@ impl Plan {
             ));
         }
         let args = native_args(
-            &model,
+            model.as_deref().unwrap_or_default(),
             mode.as_deref(),
             skip_permissions,
             resume.as_deref(),
@@ -312,13 +311,13 @@ impl Plan {
         // retained data that does not is corruption, never guessed.
         let (effective_base, effective_level) =
             if params.model_override.is_none() && params.effort_override.is_none() {
-                translate_model(&model)
+                model.as_deref().map(translate_model).unwrap_or_default()
             } else {
                 let base = params
                     .model_override
                     .as_deref()
                     .map(|model| translate_model(model).0)
-                    .unwrap_or_else(|| translate_model(&model).0);
+                    .unwrap_or_else(|| model.as_deref().map(translate_model).unwrap_or_default().0);
                 let level = params.effort_override.clone().or_else(|| {
                     params
                         .model_override
@@ -432,8 +431,38 @@ impl Plan {
         // The reported effective selectors are the realignment target
         // (overlay or frozen); `requested_model` stays the frozen profile
         // id so the original request is never rewritten.
-        let base_model = self.effective_base.clone();
-        let thought_level = self.effective_level.clone();
+        let (base_model, thought_level) = if self.effective_base.is_empty() {
+            // ACP session-open currentValue is the native default. Require a
+            // nonblank, advertised selector instead of choosing a catalogue entry.
+            let current = |id: &str| -> Result<String> {
+                let option = options
+                    .iter()
+                    .find(|option| option.id == id)
+                    .ok_or_else(|| {
+                        Error::new("unknown", "Antigravity native default selector is missing")
+                    })?;
+                let value = option
+                    .current_value_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        Error::new("unknown", "Antigravity native default selector is empty")
+                    })?;
+                if !option
+                    .option_values()
+                    .iter()
+                    .any(|(advertised, _)| advertised == value)
+                {
+                    return Err(Error::new(
+                        "unknown",
+                        "Antigravity native default selector is not advertised",
+                    ));
+                }
+                Ok(value.to_owned())
+            };
+            (current("model")?, Some(current("thought_level")?))
+        } else {
+            (self.effective_base.clone(), self.effective_level.clone())
+        };
         // ACP exposes no MCP inventory on any checked surface (the
         // `session/new` / `session/load` results and `session/update`
         // stream carry no server list), so the effective server set stays
@@ -459,6 +488,9 @@ impl Plan {
     /// target carries one (an explicit effort, a model suffix, or the
     /// inherited overlay level).
     pub fn config_writes(&self) -> Vec<(String, String)> {
+        if self.effective_base.is_empty() {
+            return Vec::new();
+        }
         let mut writes = vec![("model".to_owned(), self.effective_base.clone())];
         if let Some(level) = self.effective_level.clone() {
             writes.push(("thought_level".to_owned(), level));
@@ -796,6 +828,51 @@ mod tests {
         ] {
             assert_eq!(translate_model(model), (model.to_owned(), None), "{model}");
         }
+    }
+
+    #[test]
+    fn native_default_uses_advertised_current_selectors_without_writes() {
+        let (base, workspace, hook_root) = test_dirs("native-default");
+        let mut params = start_params(&workspace, &base);
+        params
+            .profile
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("model");
+        let plan = Plan::new(&params, "cred", "hook-token", &hook_root).unwrap();
+        assert!(plan.config_writes().is_empty());
+        assert!(plan.requested()["model"].is_null());
+        let init =
+            serde_json::from_value(json!({"protocolVersion":1,"agentCapabilities":{}})).unwrap();
+        let mut response = json!({"sessionId":"native-default","configOptions":[
+            {"id":"model","category":"model","type":"select","currentValue":"native-model",
+                "options":[{"value":"native-model","name":"Native"}]},
+            {"id":"thought_level","category":"thought_level","type":"select","currentValue":"low",
+                "options":[{"value":"low","name":"Low"}]}
+        ]});
+        let effective = plan
+            .check_session(&init, &serde_json::from_value(response.clone()).unwrap())
+            .unwrap();
+        assert_eq!(effective["model"], "native-model");
+        assert_eq!(effective["thought_level"], "low");
+        assert!(effective["requested_model"].is_null());
+        response["configOptions"][0]["currentValue"] = json!("unadvertised");
+        assert_eq!(
+            plan.check_session(&init, &serde_json::from_value(response.clone()).unwrap())
+                .unwrap_err()
+                .code,
+            "unknown"
+        );
+        response["configOptions"][0]["currentValue"] = Value::Null;
+        assert_eq!(
+            plan.check_session(&init, &serde_json::from_value(response).unwrap())
+                .unwrap_err()
+                .code,
+            "unknown"
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

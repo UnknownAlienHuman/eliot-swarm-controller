@@ -12,10 +12,31 @@ This page owns stage numbers; harness pages describe capabilities, not another s
 Each checkbox is a useful increment; tick only implemented behavior.
 See AGENTS.md for the work loop.
 
+## Unified settings and hot start (2026-11-15)
+
+**Next:** S3 and S4, then L7 qualification.
+
+- [x] **S1 Settings store/API.** One revision-guarded `settings.read/save` path for
+      profiles, routing, projects, daemon limits/retention, automation, mail,
+      cloud MCP and desktop preferences; strict section validation, dry run and
+      bounded Store history with server-derived author. Replace desktop JSON.
+- [x] **S2 Hot start.** Private directory creation, visible native-default profiles
+      for installed harnesses, automatic Git project registration, daemon startup
+      from desktop, explicit safe remedy for unsafe existing roots, and a real
+      profile-free launch from a clean directory.
+- [ ] **S3 Routing.** Ordered role candidates, installed/provider-hold/quota/capacity
+      selection before admission, recorded choice/reason, authorized child scope
+      and no retry or reroute after dispatch or uncertain delivery.
+- [ ] **S4 Assignment through automation.** Settings-managed existing rules/timers
+      keep a configured number of Agents busy on a brief queue through ordinary
+      routing-aware launch; retain exact command identity and unknown gates.
+
+S1/S2 are the first increment; S3/S4 follow separately. The configuration and
+automation specs describe the target contract and identify the deferred behavior.
+
 ## Repairs to implemented paths
 
-**Next:** L7 qualification. Checked layers record delivered increments, not full
-crash/load qualification.
+Checked layers record delivered increments, not full crash/load qualification.
 
 - [x] **Restart capacity recovery.** Reconcile exact prior-generation custody and release
       or transfer the reservation under the [capacity contract](spec/configuration.md#accounts-and-configured-capacity).

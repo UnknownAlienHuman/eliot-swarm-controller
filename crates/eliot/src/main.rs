@@ -50,7 +50,23 @@ async fn run_inner(cli: Cli) -> ExitCode {
 
     let result = match command {
         CliCommand::Plugin(PluginArgs { command }) => run_plugin_command(command).await,
-        command => cli::dispatch(command, data_dir, json_output, id).await,
+        command => {
+            if !matches!(
+                command,
+                CliCommand::Daemon(_) | CliCommand::Status | CliCommand::Mcp(_)
+            ) {
+                let executable = match env::current_exe() {
+                    Ok(path) => path,
+                    Err(error) => return report_failure(Failure::new(1, error.to_string())),
+                };
+                if let Err(error) =
+                    eliot_daemon::startup::ensure_running(&data_dir, &executable).await
+                {
+                    return report_failure(Failure::from_core(error, false));
+                }
+            }
+            cli::dispatch(command, data_dir, json_output, id).await
+        }
     };
     match result {
         Ok(exit_code) => ExitCode::from(exit_code),
@@ -112,26 +128,5 @@ fn report_failure(failure: Failure) -> ExitCode {
 }
 
 fn resolve_data_dir(argument: Option<&Path>) -> Result<PathBuf, Failure> {
-    if let Some(path) = argument {
-        return Ok(path.to_path_buf());
-    }
-    if let Some(path) = env::var_os("ELIOT_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path));
-    }
-    if let Some(path) = env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path).join("Eliot"));
-    }
-    if let Some(path) = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(PathBuf::from(path)
-            .join(".local")
-            .join("share")
-            .join("eliot"));
-    }
-    Err(Failure::new(
-        1,
-        "cannot determine the data directory; set --data-dir or ELIOT_HOME",
-    ))
+    eliot_daemon::resolve_data_dir(argument).map_err(|error| Failure::new(1, error.message))
 }

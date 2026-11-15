@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 40;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 41;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -964,6 +964,28 @@ impl Store {
             db!(tx.execute("INSERT INTO schema_migrations(version) VALUES (40)", []));
             tx.commit().map_err(sql_error)?;
         }
+        if current < 41 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE settings_history (
+                     revision INTEGER PRIMARY KEY AUTOINCREMENT,
+                     previous_revision TEXT,
+                     current_revision TEXT NOT NULL,
+                     changed_sections TEXT NOT NULL,
+                     author TEXT NOT NULL,
+                     status TEXT NOT NULL CHECK(status IN ('pending','applied','not_applied','unknown')),
+                     created_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX settings_history_created
+                     ON settings_history(created_at DESC, revision DESC);
+                 INSERT INTO schema_migrations(version) VALUES (41);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -978,7 +1000,10 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE inference_clients DROP COLUMN expired_id_through_ms;
+                "DROP INDEX settings_history_created;
+             DROP TABLE settings_history;
+             DELETE FROM schema_migrations WHERE version=41;
+             ALTER TABLE inference_clients DROP COLUMN expired_id_through_ms;
              DELETE FROM schema_migrations WHERE version=40;",
             )
             .unwrap();
@@ -1030,7 +1055,10 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX inference_write_inventory;
+                "DROP INDEX settings_history_created;
+             DROP TABLE settings_history;
+             DELETE FROM schema_migrations WHERE version=41;
+             DROP INDEX inference_write_inventory;
              ALTER TABLE writes DROP COLUMN inference_seq;
              ALTER TABLE inference_clients DROP COLUMN last_write_seq;
              ALTER TABLE inference_clients DROP COLUMN retain_after_seq;

@@ -168,6 +168,8 @@ pub(crate) async fn run_launch(
     {
         return Err(Failure::new(2, "--profile must not be empty"));
     }
+    let workspace = std::path::absolute(&workspace)
+        .map_err(|error| Failure::new(2, format!("cannot resolve launch workspace: {error}")))?;
     if let Some(name) = &harness
         && name.trim().is_empty()
     {
@@ -199,12 +201,6 @@ pub(crate) async fn run_launch(
         && name.trim().is_empty()
     {
         return Err(Failure::new(2, "--cmd must not be empty"));
-    }
-    if profile.is_none() && harness.is_none() && parent.is_none() {
-        return Err(Failure::new(
-            2,
-            "--profile or --harness is required for a parentless launch",
-        ));
     }
     validate_text(prompt.as_deref())?;
     let deadline = wait_deadline(timeout_seconds)?;

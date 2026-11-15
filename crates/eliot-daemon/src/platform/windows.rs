@@ -99,8 +99,12 @@ pub(super) async fn wait_pipe_available(endpoint: &str, until: tokio::time::Inst
 pub(crate) fn start_background_daemon(data_dir: &Path) -> Result<()> {
     let executable =
         std::env::current_exe().map_err(|error| io_error("locate Eliot executable", error))?;
-    let mut command_line = background_daemon_command_line(&executable, data_dir)?;
-    let application = wide_path(&executable);
+    start_background_daemon_executable(&executable, data_dir)
+}
+
+pub(crate) fn start_background_daemon_executable(executable: &Path, data_dir: &Path) -> Result<()> {
+    let mut command_line = background_daemon_command_line(executable, data_dir)?;
+    let application = wide_path(executable);
     let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         ..STARTUPINFOW::default()
@@ -337,6 +341,11 @@ fn validate_new_or_raced_directory(path: &Path, created: bool) -> Result<()> {
 
 pub(crate) fn ensure_private_root(path: &Path) -> Result<()> {
     check_no_reparse_components(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => return validate_private_root(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("inspect data directory", error)),
+    }
     create_private_directories(path)?;
     check_no_reparse_components(path)?;
 
@@ -348,8 +357,7 @@ pub(crate) fn ensure_private_root(path: &Path) -> Result<()> {
             "data directory must be a real directory, not a reparse point or file",
         ));
     }
-    ensure_current_owner(path)?;
-    set_current_user_acl(path, true)
+    validate_private_root(path)
 }
 
 pub(crate) fn ensure_private_file(path: &Path) -> Result<()> {
