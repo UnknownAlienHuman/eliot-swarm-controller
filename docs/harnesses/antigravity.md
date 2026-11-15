@@ -306,8 +306,8 @@ An unmanaged Antigravity workspace can also discover Eliot Swarm via its native 
 `.agents/plugins/eliot-swarm/plugin.json` and `mcp_config.json`. The configuration declares
 a stdio MCP server invoking `swarm --data-dir <PATH> mcp`.
 
-Mutations require caller-supplied ULIDs in `params`; the server adds no auto-generated identifiers,
-automatic retries, defaults, or speculative rollbacks. Output frames and stdio line writes are
+Mutations carry a caller-retained ULID in `params.id`; MCP callers may omit it and the server mints a ULID
+and returns it in the reply for exact retry. The server adds no automatic retries, defaults, or speculative rollbacks. Output frames and stdio line writes are
 strictly bounded to [`MAX_RPC_FRAME_BYTES`](../../crates/eliot-daemon/src/daemon.rs) (4 MiB) via
 [`BoundedLineWriter`](../../crates/eliot/src/mcp/bounded_io.rs).
 

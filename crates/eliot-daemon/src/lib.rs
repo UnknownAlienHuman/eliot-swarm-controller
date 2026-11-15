@@ -18,7 +18,7 @@ mod plugin_host;
 mod proxy;
 mod redaction;
 mod restart_capacity;
-mod router;
+pub mod router;
 pub(crate) mod scripts;
 mod setup;
 #[cfg(test)]
@@ -33,6 +33,8 @@ pub use daemon::{
     client_call_with_agent_identity, client_call_with_owner_credential, daemon_connect_hint,
     daemon_failure_since, last_daemon_failure, last_daemon_phase, require_agent_identity, run,
 };
+pub use router::discovery::is_mutation_id_method;
+pub use router::discovery::mutation_id_methods;
 
 /// Start this executable's background daemon without inheriting caller handles.
 #[cfg(windows)]

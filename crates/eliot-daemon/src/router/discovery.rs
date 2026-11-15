@@ -5,6 +5,7 @@ use eliot_core::{
     api::{discovery::*, *},
 };
 use serde_json::{Value, json};
+use std::sync::OnceLock;
 
 struct Method {
     name: &'static str,
@@ -199,6 +200,40 @@ model = \"gpt-6-luna\"
     ),
     method!("claim.release", ClaimReleaseRequest, ClaimReleaseResponse, false, true, "Release one advisory work claim.", {"id":EXAMPLE_ID,"glob":"src/**"}),
 ];
+
+static MUTATION_ID_METHODS: OnceLock<Vec<&'static str>> = OnceLock::new();
+
+/// Canonical names of mutation methods whose request DTO carries a
+/// caller-retained `id`. Derived from this module's descriptors (mutation
+/// flag plus an `id` property in the request schema); MCP id minting follows
+/// this list so the two can never drift.
+pub fn mutation_id_methods() -> &'static [&'static str] {
+    MUTATION_ID_METHODS.get_or_init(|| {
+        METHODS
+            .iter()
+            .filter(|method| method.mutation && request_takes_id(method))
+            .map(|method| method.name)
+            .collect()
+    })
+}
+
+/// Whether `name` is a mutation method whose request DTO carries a
+/// caller-retained `id`. Same derivation as [`mutation_id_methods`].
+pub fn is_mutation_id_method(name: &str) -> bool {
+    for method in mutation_id_methods() {
+        if *method == name {
+            return true;
+        }
+    }
+    false
+}
+
+fn request_takes_id(method: &Method) -> bool {
+    (method.input)()
+        .get("properties")
+        .and_then(|properties| properties.get("id"))
+        .is_some()
+}
 
 fn visible(method: &Method, principal: &Principal) -> bool {
     match principal {
