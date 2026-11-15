@@ -399,6 +399,19 @@ of the explicitly selected release scope.
       `timer.run` of a timer whose `run` action names the entry, with the daemon's
       custody, timeout and unknown-outcome rules. "Open in editor" starts a
       user-selected `.exe` with literal argv and no Eliot credentials. (Refs #407)
+- [x] **D6 Coordination actions.** The Agent detail configures model and effort
+      from `harness.models` read under that Agent's frozen route (`agent`), with
+      the daemon's per-field `configure` refusals, then shows requested, next-turn
+      (revision, application point) and effective values with their turn-proven
+      verified marks. The monitor moves an Agent, or all of a manager's children,
+      to another manager through `swarm.reparent`, each move a button bound to the
+      generations shown. A Hand off / Switch dialog selects the original task SEND
+      and up to 64 undispatched SENDs, then hands off to an existing Agent
+      (`swarm.handoff`) or switches to a new profile or ad-hoc Agent
+      (`swarm.switch`, cross-harness). It shows cancellations, successors, brief
+      state, claim/Goal/child transfer and the successor gate, reads results back
+      only with the same id, and offers Owner `command.resolve`/`command.cancel`
+      for a held or failed brief and an ordinary handoff to finish a switch.
 
 ## M1 — Memory one-shot inference (#199)
 

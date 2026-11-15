@@ -268,31 +268,16 @@ pub(super) fn resolve_configure(
             "configure requires at least one of model or effort",
         ));
     }
-    match harness {
-        "codex" => {}
-        "muse" => {
-            if model.is_some() {
-                return Err(Error::new(
-                    "unsupported",
-                    "Muse model changes require a new native session (restart_required)",
-                ));
-            }
-        }
-        "opencode" => {
-            if effort.is_some() {
-                return Err(Error::new(
-                    "unsupported",
-                    "configure --effort is not supported for the opencode harness: no native effort knob",
-                ));
-            }
-        }
-        "antigravity" => {}
-        _ => {
-            return Err(Error::new(
-                "unsupported",
-                format!("configure is not supported for the {harness} harness"),
-            ));
-        }
+    // One table shared with the `harness.models` readback, so a client can
+    // disable exactly what admission refuses, with the same reason.
+    let support = eliot_core::api::ConfigureSupport::for_harness(harness);
+    let refusal = match (&model, &effort) {
+        (Some(_), _) if support.model_refusal.is_some() => support.model_refusal,
+        (_, Some(_)) if support.effort_refusal.is_some() => support.effort_refusal,
+        _ => None,
+    };
+    if let Some(reason) = refusal {
+        return Err(Error::new("unsupported", reason));
     }
     let original_model = snapshot
         .get("model")

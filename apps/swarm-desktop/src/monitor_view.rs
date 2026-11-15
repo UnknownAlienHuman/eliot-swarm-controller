@@ -23,6 +23,20 @@ pub struct MonitorActions {
     pub force_stop: Option<Callback<()>>,
 }
 
+/// The "Change manager" section of the selected Agent.
+pub struct ReparentData<'a> {
+    pub rows: Vec<MoveRow>,
+    pub status: &'a str,
+}
+
+/// One possible new manager with its two bound moves.
+pub struct MoveRow {
+    pub id: String,
+    pub label: String,
+    pub move_agent: Option<Callback<()>>,
+    pub move_children: Option<Callback<()>>,
+}
+
 fn small(text: impl Into<String>) -> TextBlock {
     TextBlock::new()
         .text(text.into())
@@ -49,9 +63,14 @@ fn row_view(row: &MonitorRow) -> View {
             | eliot_core::AgentState::Lost
             | eliot_core::AgentState::Unknown
     );
+    let manager = row
+        .parent
+        .as_deref()
+        .map(|parent| format!(" · under {parent}"))
+        .unwrap_or_default();
     let title = TextBlock::new()
         .text(format!(
-            "{} · {} · {}",
+            "{} · {} · {}{manager}",
             row.id,
             state_name(row.state),
             row.harness
@@ -64,10 +83,14 @@ fn row_view(row: &MonitorRow) -> View {
     };
     ListViewItem::new()
         .automation_name(format!(
-            "Agent {}, {}, {}, {}",
+            "Agent {}, {}, {}{}, {}",
             row.id,
             state_name(row.state),
             row.harness,
+            row.parent
+                .as_deref()
+                .map(|parent| format!(", under {parent}"))
+                .unwrap_or_default(),
             row.operation()
         ))
         .content(
@@ -220,6 +243,7 @@ pub fn monitor_pane(
     selected: Option<&str>,
     published_rows: usize,
     controls_enabled: bool,
+    reparent: ReparentData<'_>,
     actions: MonitorActions,
 ) -> View {
     // Only highlight a row index that already existed before this refresh,
@@ -349,6 +373,50 @@ pub fn monitor_pane(
                     action_button("Stop", actions.stop, controls_enabled),
                     action_button("Force stop", actions.force_stop, controls_enabled),
                 )),
+        ));
+        // One row per possible manager, each button already bound to that
+        // row's generation: no selection state can disagree with the screen.
+        let moves: Vec<KeyedView> = reparent
+            .rows
+            .into_iter()
+            .map(|row| {
+                let agent_label = format!("Move {id} under {}", row.id);
+                let children_label = format!("Move children of {id} under {}", row.id);
+                KeyedView::new(
+                    row.id.clone(),
+                    StackPanel::new().spacing(2.0).children((
+                        small(row.label),
+                        StackPanel::new()
+                            .orientation(Orientation::Horizontal)
+                            .spacing(theme::spacing::SM)
+                            .children((
+                                action_button(&agent_label, row.move_agent, controls_enabled),
+                                action_button(&children_label, row.move_children, controls_enabled),
+                            )),
+                    )),
+                )
+            })
+            .collect();
+        details.push(KeyedView::new(
+            "reparent",
+            StackPanel::new().spacing(theme::spacing::XS).children((
+                TextBlock::new()
+                    .text("Change manager")
+                    .font_weight(FontWeight::SEMI_BOLD)
+                    .automation_heading_level(AutomationHeadingLevel::Level3),
+                small(if moves.is_empty() {
+                    "No other live Agent is shown to become the manager.".to_owned()
+                } else {
+                    format!(
+                        "Move {id} with its subtree, or only its children, under a live Agent below. The daemon checks cycles, fanout limits, observe-only Agents and both generations."
+                    )
+                })
+                .opacity(theme::MUTED_OPACITY),
+                StackPanel::new()
+                    .spacing(theme::spacing::SM)
+                    .keyed_children(moves),
+                small(reparent.status.to_owned()),
+            )),
         ));
     }
 

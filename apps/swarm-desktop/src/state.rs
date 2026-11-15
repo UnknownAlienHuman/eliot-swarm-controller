@@ -101,6 +101,14 @@ impl MutationLedger {
     }
 }
 
+/// Whether a failed submission left its outcome uncertain (lost reply,
+/// daemon unavailable). Only then may the same mutation id be reused by a
+/// retry; a definite refusal ends that action, and nothing ever retries with
+/// a new id on its own.
+pub fn uncertain(error: &str) -> bool {
+    error.starts_with("unknown:") || error.starts_with("unavailable:")
+}
+
 /// Exact control binding captured at click time. The UI moves these values
 /// into the background submission; whatever the selection becomes afterwards
 /// cannot change them.

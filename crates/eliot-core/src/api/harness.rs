@@ -120,12 +120,26 @@ pub struct HarnessModelsRequest {
     /// must exist and its frozen harness must match `harness`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Optional Agent whose frozen launch snapshot selects the route/account
+    /// (the catalogue that Agent's `configure` draws from). Exclusive with
+    /// `profile`; the Agent's harness must match `harness`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 impl HarnessModelsRequest {
     pub fn validate(&self) -> Result<()> {
         validate_harness(&self.harness)?;
         validate_profile_opt(self.profile.as_deref())?;
+        if let Some(agent) = self.agent.as_deref() {
+            if self.profile.is_some() {
+                return Err(Error::new(
+                    "invalid",
+                    "name a profile or an Agent route, not both",
+                ));
+            }
+            crate::parse_agent_id(agent)?;
+        }
         Ok(())
     }
 
@@ -255,6 +269,54 @@ pub struct HarnessModelsResponse {
     /// Nonsecret credential identity the read ran under (an environment
     /// name, integration name or ambient marker; never a secret value).
     pub credential: String,
+    /// Which mid-session `configure` fields this harness applies.
+    #[serde(default)]
+    pub configure: ConfigureSupport,
+}
+
+/// Mid-session `configure` support of one harness: `None` when the field
+/// has a verified native mechanism, otherwise the exact refusal that
+/// `configure` admission returns (`unsupported`) for it. Admission and the
+/// `harness.models` readback share this one table.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigureSupport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_refusal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_refusal: Option<String>,
+}
+
+impl ConfigureSupport {
+    /// Codex carries model and effort per turn; Muse carries effort per
+    /// turn but a model change needs a new native session; OpenCode sets the
+    /// session model natively but has no effort knob; Antigravity sets
+    /// `model` and `thought_level` natively. Anything else has no verified
+    /// mechanism.
+    pub fn for_harness(harness: &str) -> Self {
+        let refuse = |reason: &str| Some(reason.to_owned());
+        match harness {
+            "codex" | "antigravity" => Self::default(),
+            "muse" => Self {
+                model_refusal: refuse(
+                    "Muse model changes require a new native session (restart_required)",
+                ),
+                effort_refusal: None,
+            },
+            "opencode" => Self {
+                model_refusal: None,
+                effort_refusal: refuse(
+                    "configure --effort is not supported for the opencode harness: no native effort knob",
+                ),
+            },
+            other => {
+                let reason = format!("configure is not supported for the {other} harness");
+                Self {
+                    model_refusal: Some(reason.clone()),
+                    effort_refusal: Some(reason),
+                }
+            }
+        }
+    }
 }
 
 impl HarnessModelsResponse {
@@ -421,6 +483,7 @@ mod tests {
             fetched_at_ms: 1,
             ttl_ms: HARNESS_READ_TTL_MS,
             credential: "ambient".to_owned(),
+            configure: ConfigureSupport::for_harness(harness),
         }
     }
 
@@ -429,18 +492,21 @@ mod tests {
         HarnessModelsRequest {
             harness: "codex".to_owned(),
             profile: None,
+            agent: None,
         }
         .validate()
         .unwrap();
         HarnessModelsRequest {
             harness: "codex".to_owned(),
             profile: Some("codex-main".to_owned()),
+            agent: None,
         }
         .validate()
         .unwrap();
         let error = HarnessModelsRequest {
             harness: "fake".to_owned(),
             profile: None,
+            agent: None,
         }
         .validate()
         .unwrap_err();
@@ -448,10 +514,51 @@ mod tests {
         let error = HarnessModelsRequest {
             harness: String::new(),
             profile: None,
+            agent: None,
         }
         .validate()
         .unwrap_err();
         assert_eq!(error.code, "invalid");
+    }
+
+    #[test]
+    fn models_request_takes_a_profile_or_an_agent_route() {
+        let request = |profile: Option<&str>, agent: Option<&str>| HarnessModelsRequest {
+            harness: "codex".to_owned(),
+            profile: profile.map(str::to_owned),
+            agent: agent.map(str::to_owned),
+        };
+        request(None, Some("a7")).validate().unwrap();
+        assert_eq!(
+            request(Some("p"), Some("a7")).validate().unwrap_err().code,
+            "invalid"
+        );
+        assert!(request(None, Some("seven")).validate().is_err());
+    }
+
+    #[test]
+    fn configure_support_names_each_refusal() {
+        assert_eq!(
+            ConfigureSupport::for_harness("codex"),
+            ConfigureSupport::default()
+        );
+        assert_eq!(
+            ConfigureSupport::for_harness("antigravity"),
+            ConfigureSupport::default()
+        );
+        let muse = ConfigureSupport::for_harness("muse");
+        assert!(muse.model_refusal.unwrap().contains("restart_required"));
+        assert!(muse.effort_refusal.is_none());
+        let opencode = ConfigureSupport::for_harness("opencode");
+        assert!(opencode.model_refusal.is_none());
+        assert!(
+            opencode
+                .effort_refusal
+                .unwrap()
+                .contains("no native effort knob")
+        );
+        let claude = ConfigureSupport::for_harness("claude");
+        assert!(claude.model_refusal.is_some() && claude.effort_refusal.is_some());
     }
 
     #[test]
@@ -491,6 +598,7 @@ mod tests {
         let request = HarnessModelsRequest {
             harness: "codex".to_owned(),
             profile: None,
+            agent: None,
         };
         let mut other = models_response("muse", vec![]);
         other.scope = "profile:adhoc harness:muse".to_owned();

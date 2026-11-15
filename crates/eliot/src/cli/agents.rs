@@ -85,7 +85,11 @@ pub(crate) async fn run_models(
         &data_dir,
         json_output,
         "harness.models",
-        HarnessModelsRequest { harness, profile },
+        HarnessModelsRequest {
+            harness,
+            profile,
+            agent: None,
+        },
         HarnessModelsResponse
     )
 }

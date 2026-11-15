@@ -13,7 +13,11 @@ mod clipboard;
 #[cfg(windows)]
 mod config_view;
 #[cfg(windows)]
+mod configure;
+#[cfg(windows)]
 mod monitor_view;
+#[cfg(windows)]
+mod reparent;
 #[cfg(windows)]
 mod ui;
 #[cfg(windows)]
@@ -25,6 +29,8 @@ mod chat;
 mod client;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod feed;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod handoff;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod live;
 #[cfg_attr(not(windows), allow(dead_code))]

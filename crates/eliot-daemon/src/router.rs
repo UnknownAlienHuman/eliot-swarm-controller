@@ -2615,6 +2615,38 @@ impl Router {
         Ok((None, "adhoc".to_owned()))
     }
 
+    /// The route an existing Agent's `configure` draws from: its frozen
+    /// launch snapshot, never the current profile file. The label carries the
+    /// exact Agent generation so a later profile edit cannot share its cache
+    /// entry. Observed Agents have no Eliot launch route.
+    async fn agent_catalog_snapshot(
+        &self,
+        agent: &str,
+        harness: &str,
+    ) -> Result<(Option<Value>, String)> {
+        let agent = self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_agent(agent)?
+            .ok_or_else(|| Error::new("not_found", "Agent was not found"))?;
+        if agent.observe_only || !agent.profile_snapshot.is_object() {
+            return Err(Error::new(
+                "not_allowed",
+                "an observed Agent has no Eliot launch route",
+            ));
+        }
+        if agent.harness != harness {
+            return Err(Error::new(
+                "invalid",
+                "harness does not match the selected Agent",
+            ));
+        }
+        let label = format!("{}@{}g{}", agent.profile, agent.id, agent.generation);
+        Ok((Some(agent.profile_snapshot), label))
+    }
+
     /// Read-only native model catalogue for a harness: no model turn, no
     /// inference. Codex/Muse/OpenCode/Antigravity use the harness's own
     /// read-only method through a dedicated metadata reader, cached per native
@@ -2634,7 +2666,10 @@ impl Router {
             ));
         }
         let profile = request.profile.as_deref().map(str::trim);
-        let (snapshot, label) = self.resolve_catalog_snapshot(&harness, profile, true)?;
+        let (snapshot, label) = match request.agent.as_deref() {
+            Some(agent) => self.agent_catalog_snapshot(agent, &harness).await?,
+            None => self.resolve_catalog_snapshot(&harness, profile, true)?,
+        };
         let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
         let now = now_ms();
         if let Some(hit) = self
@@ -2661,6 +2696,7 @@ impl Router {
                 fetched_at_ms: now_ms(),
                 ttl_ms: catalog::CATALOG_TTL_MS,
                 credential: credential.clone(),
+                configure: eliot_core::api::ConfigureSupport::for_harness(&harness),
             },
             "codex" | "muse" | "opencode" | "antigravity" => {
                 let Some(snapshot) = snapshot else {
@@ -2763,6 +2799,7 @@ impl Router {
                     fetched_at_ms: now_ms(),
                     ttl_ms: catalog::CATALOG_TTL_MS,
                     credential: credential.clone(),
+                    configure: eliot_core::api::ConfigureSupport::for_harness(&harness),
                 }
             }
             _ => {
