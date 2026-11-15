@@ -10,8 +10,8 @@ use crate::common::{now_ms, secure_eq, valid_environment_name};
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
 use eliot_core::{
-    Agent, AgentStartParams, Command, CommandState, ContextItem, Error, InjectArgs, InjectPoint,
-    Result, SecretPolicy, SourceBatch, SourceGap, SourceGapAck, StderrSource,
+    Agent, AgentStartParams, Command, ContextItem, Error, InjectArgs, InjectPoint, Result,
+    SecretPolicy, SourceBatch, SourceGap, SourceGapAck, StderrSource,
 };
 use eliot_plugin::{
     PluginManifest, StderrCapture, StderrView,
@@ -1203,7 +1203,7 @@ impl PluginHost {
         commands.iter().any(|other| {
             other.id != command.id
                 && other.verb != "stop"
-                && other.state != CommandState::Unknown
+                && other.state != eliot_core::CommandState::Unknown
                 && other.target.as_deref() == Some(agent.id.as_str())
                 && other.generation == Some(agent.generation)
         })
