@@ -720,37 +720,17 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
     );
 }
 
-/// Fleet usage cell for `swarm ls`/`swarm top`: the native turn total when
-/// the harness supplies one, otherwise the input+output sum as a fleet
-/// signal (never a native total), with a scope suffix. `(t)` marks
+/// Fleet usage cell for `swarm ls`/`swarm top`: the shared
+/// [`AgentSummary::fleet_usage`] count with a scope suffix. `(t)` marks
 /// turn-backed usage; `(s)` marks the session-snapshot fallback, which is
 /// visibility only and never turn expenditure. No usage reads as `-`.
 pub(crate) fn fleet_usage_cell(summary: &AgentSummary) -> String {
-    let Some(usage) = summary.usage.as_ref() else {
-        return "-".to_owned();
-    };
-    let tokens = usage
-        .total_tokens
-        .or_else(|| match (usage.input_tokens, usage.output_tokens) {
-            (Some(input), Some(output)) => input.checked_add(output),
-            (Some(input), None) => Some(input),
-            (None, Some(output)) => Some(output),
-            (None, None) => usage
-                .cache_read_tokens
-                .unwrap_or(0)
-                .checked_add(usage.cache_write_tokens.unwrap_or(0))
-                .filter(|_| {
-                    usage.cache_read_tokens.is_some() || usage.cache_write_tokens.is_some()
-                }),
-        });
-    let Some(tokens) = tokens else {
-        return "-".to_owned();
-    };
-    let suffix = match summary.usage_scope.as_deref() {
-        Some("session") => "(s)",
-        _ => "(t)",
-    };
-    format!("{tokens}{suffix}")
+    match summary.fleet_usage() {
+        None => "-".to_owned(),
+        Some((tokens, scope)) => {
+            format!("{tokens}{}", if scope == "session" { "(s)" } else { "(t)" })
+        }
+    }
 }
 
 /// Readable usage summary for `swarm usage`. Turn scopes never merge: each
@@ -1074,10 +1054,10 @@ mod tests {
     }
 
     #[test]
-    fn fleet_usage_cell_marks_turn_and_session_provenance() {
-        // No usage reads as absent.
+    fn fleet_usage_cell_suffixes_the_shared_provenance() {
+        // The count derivation lives on `AgentSummary::fleet_usage` (tested
+        // in eliot-core); the cell only adds the scope suffix.
         assert_eq!(fleet_usage_cell(&fleet_summary(None, None)), "-");
-        // Native totals keep the turn suffix.
         assert_eq!(
             fleet_usage_cell(&fleet_summary(
                 Some(turn_usage(Some(10), Some(5), Some(15))),
@@ -1085,15 +1065,6 @@ mod tests {
             )),
             "15(t)"
         );
-        // Without a native total the input+output sum is the fleet signal.
-        assert_eq!(
-            fleet_usage_cell(&fleet_summary(
-                Some(turn_usage(Some(2), Some(4), None)),
-                Some("turn")
-            )),
-            "6(t)"
-        );
-        // The session fallback never presents as turn usage.
         let mut session = turn_usage(Some(47_024), Some(207), None);
         session.scope = Some("session".to_owned());
         assert_eq!(

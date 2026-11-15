@@ -320,6 +320,39 @@ impl AgentSummary {
         }
         Ok(())
     }
+
+    /// Fleet token count for this summary plus its provenance scope:
+    /// `"turn"` for the newest terminal turn's native turn usage,
+    /// `"session"` for the session-snapshot fallback. The count is the
+    /// native total when the harness supplies one, otherwise the
+    /// input+output sum as a fleet signal (never a native total; cache
+    /// counters cover the remainder when neither is present). `None` when
+    /// the summary carries no usage. Every fleet surface (`swarm ls`,
+    /// `swarm top`, desktop monitor) derives its cell from this one
+    /// method so a session fallback can never pass as turn usage.
+    pub fn fleet_usage(&self) -> Option<(i64, &'static str)> {
+        let usage = self.usage.as_ref()?;
+        let tokens =
+            usage
+                .total_tokens
+                .or_else(|| match (usage.input_tokens, usage.output_tokens) {
+                    (Some(input), Some(output)) => input.checked_add(output),
+                    (Some(input), None) => Some(input),
+                    (None, Some(output)) => Some(output),
+                    (None, None) => usage
+                        .cache_read_tokens
+                        .unwrap_or(0)
+                        .checked_add(usage.cache_write_tokens.unwrap_or(0))
+                        .filter(|_| {
+                            usage.cache_read_tokens.is_some() || usage.cache_write_tokens.is_some()
+                        }),
+                })?;
+        let scope = match self.usage_scope.as_deref() {
+            Some("session") => "session",
+            _ => "turn",
+        };
+        Some((tokens, scope))
+    }
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2027,6 +2060,40 @@ mod tests {
             bad.usage_scope = scope;
             assert!(bad.validate().is_err());
         }
+    }
+
+    fn turn_usage(input: Option<i64>, output: Option<i64>, total: Option<i64>) -> TurnUsage {
+        TurnUsage {
+            scope: Some("turn".to_owned()),
+            message_id: None,
+            input_tokens: input,
+            output_tokens: output,
+            reasoning_tokens: None,
+            thinking_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            total_tokens: total,
+        }
+    }
+
+    #[test]
+    fn fleet_usage_reports_tokens_with_turn_or_session_provenance() {
+        // No usage reads as absent.
+        assert_eq!(summary().fleet_usage(), None);
+        // Native totals keep the turn scope.
+        let mut scoped = summary();
+        scoped.usage = Some(turn_usage(Some(10), Some(5), Some(15)));
+        scoped.usage_scope = Some("turn".to_owned());
+        assert_eq!(scoped.fleet_usage(), Some((15, "turn")));
+        // Without a native total the input+output sum is the fleet signal.
+        scoped.usage = Some(turn_usage(Some(2), Some(4), None));
+        assert_eq!(scoped.fleet_usage(), Some((6, "turn")));
+        // The session fallback never presents as turn usage.
+        let mut session = turn_usage(Some(47_024), Some(207), None);
+        session.scope = Some("session".to_owned());
+        scoped.usage = Some(session);
+        scoped.usage_scope = Some("session".to_owned());
+        assert_eq!(scoped.fleet_usage(), Some((47_231, "session")));
     }
 
     #[test]
