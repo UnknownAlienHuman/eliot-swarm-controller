@@ -195,6 +195,21 @@ admission alone, or a timer, never proves native turn completion or
 process/session exit; a bounded durable page proving the exact terminal does.
 Live recovery after projection failure remains unqualified until exercised
 through Swarm by the controller.
+After a proven terminal, a fresh send checks the event actor before any
+`turn/start` write. If observation is still unavailable or its check fails,
+that send is rejected as not dispatched; the previous turn's native verdict
+and source gap remain intact. Retained uncertain sends remain unknown and
+are never replayed. A failure after a native
+write retains the numeric native error and bounded stderr diagnostics instead
+of replacing them with an empty generic unknown error.
+The installed 1.4.0 schema and the vendor's
+[backpressure guide](https://meta-models.github.io/muse-code-sdk/1.4/guides/msp-wire/backpressure/)
+distinguish slow-subscriber delivery (`view/gap`, durable log untouched) from
+materialized-projection failure (`projectionUnavailable`). Neither documents
+the internal projection-failure trigger or establishes that projection failure
+causes a native `failed` terminal with reason `incomplete`. An unavailable-view
+episode alone therefore does not justify changing consumer bounds or claiming
+that batching repairs the native failure.
 PR #422's shared native-exit lifecycle helper still applies only after actual
 endpoint exit; projection unavailability alone cannot invoke that exit path.
 The projection path reuses the turn-unknown settlement without retiring the
