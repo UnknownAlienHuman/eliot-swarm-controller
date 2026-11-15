@@ -87,6 +87,9 @@ using that service.
   drains the native source before settling applied and releasing custody. Missing
   Job names alone do not prove reader drain or process exit; unconfirmed closure
   stays unknown. A repeated force after verified closure is an applied no-op.
+  Loss suppression belongs to the force attempt through successful Store stop
+  settlement. Failure or cancellation clears it; if actor teardown already
+  deferred proven control loss, reconcile that loss and any open turn as unknown.
 - only processes created inside the Job are contained: the Store records PIDs
   verified inside Agent custody, and a process spawned outside the Job by a
   broker or service (or attributed to the wrong owner) is invisible to the

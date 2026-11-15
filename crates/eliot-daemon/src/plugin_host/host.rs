@@ -121,6 +121,55 @@ struct AgentKey {
     generation: i64,
 }
 
+/// Own loss suppression until the force command's Store settlement commits.
+/// Actor teardown may finish first, so retain its proven loss for cancellation.
+pub(crate) struct ForceStopGuard {
+    state: Weak<HostState>,
+    key: AgentKey,
+    deferred_loss: Arc<AtomicBool>,
+    committed: bool,
+}
+
+impl ForceStopGuard {
+    // Caller holds the Store lock, also used by mark_lost_state.
+    #[cfg(any(windows, test))]
+    fn new(state: &Arc<HostState>, key: AgentKey) -> Result<Self> {
+        let deferred_loss = Arc::new(AtomicBool::new(false));
+        let mut planned = state.planned_stops.lock_recover();
+        if planned.contains_key(&key) {
+            return Err(Error::new("unknown", "force-stop is already settling"));
+        }
+        planned.insert(key.clone(), Arc::clone(&deferred_loss));
+        Ok(Self {
+            state: Arc::downgrade(state),
+            key,
+            deferred_loss,
+            committed: false,
+        })
+    }
+
+    pub(crate) fn finish(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ForceStopGuard {
+    fn drop(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        // Clear synchronously even when the enclosing future is cancelled.
+        // Only this attempt owns the entry; actor cleanup must not remove it.
+        state.planned_stops.lock_recover().remove(&self.key);
+        if !self.committed && self.deferred_loss.load(Ordering::Acquire) {
+            let key = self.key.clone();
+            tokio::spawn(async move {
+                mark_lost_state(&Arc::downgrade(&state), &key).await;
+            });
+        }
+    }
+}
+
 struct RuntimeEntry {
     sender: mpsc::Sender<RuntimeMessage>,
     start_command_id: String,
@@ -165,7 +214,7 @@ struct HostState {
     progress: watch::Sender<u64>,
     late_batch_causes: Mutex<HashMap<AgentKey, String>>,
     running: Mutex<HashMap<AgentKey, RuntimeEntry>>,
-    planned_stops: Mutex<HashMap<AgentKey, bool>>,
+    planned_stops: Mutex<HashMap<AgentKey, Arc<AtomicBool>>>,
     startup_gate: AsyncMutex<()>,
     startup_closed: AtomicBool,
     observers: Mutex<HashMap<AgentKey, Arc<observation::ObserverEntry>>>,
@@ -536,10 +585,6 @@ impl PluginHost {
         let (message_tx, message_rx) = mpsc::channel(16);
         let (started_tx, started_rx) = oneshot::channel();
         let actor_key = key.clone();
-        self.state
-            .planned_stops
-            .lock_recover()
-            .insert(actor_key.clone(), false);
         {
             let mut running = self.state.running.lock_recover();
             running.insert(
@@ -674,7 +719,12 @@ impl PluginHost {
         result.map_err(|error| diagnose_error(error, &stderr, &credentials))
     }
 
-    pub(crate) async fn stop(&self, agent: &Agent, command: Command, force: bool) -> Result<Value> {
+    pub(crate) async fn stop(
+        &self,
+        agent: &Agent,
+        command: Command,
+        force: bool,
+    ) -> Result<(Value, Option<ForceStopGuard>)> {
         if command.verb != "stop"
             || command.target.as_deref() != Some(agent.id.as_str())
             || command.generation != Some(agent.generation)
@@ -733,7 +783,9 @@ impl PluginHost {
                 "Agent plugin stop exceeded its absolute deadline",
             )),
         };
-        result.map_err(|error| diagnose_error(error, &stderr, &credentials))
+        result
+            .map(|value| (value, None))
+            .map_err(|error| diagnose_error(error, &stderr, &credentials))
     }
 
     /// Read one exact native turn through the owned plugin (`agent.snapshot`
@@ -1098,13 +1150,17 @@ impl PluginHost {
     /// the kernel terminates its family; neither EOF nor an absent name alone
     /// permits an Applied result or capacity release.
     #[cfg(windows)]
-    async fn force_stop_generation(&self, agent: &Agent, command: &Command) -> Result<Value> {
+    async fn force_stop_generation(
+        &self,
+        agent: &Agent,
+        command: &Command,
+    ) -> Result<(Value, Option<ForceStopGuard>)> {
         let _startup = self.state.startup_gate.lock().await;
         let key = AgentKey {
             id: agent.id.clone(),
             generation: agent.generation,
         };
-        let namespace = {
+        let (namespace, guard) = {
             let store = self.state.store.lock().await;
             let current = store
                 .get_agent(&agent.id)?
@@ -1131,10 +1187,9 @@ impl PluginHost {
             // Source EOF can remove routing before the actor finishes draining.
             // Publish planned exit under the same Store lock used by loss
             // settlement so it cannot turn this stop Unknown in that race.
-            if let Some(planned) = self.state.planned_stops.lock_recover().get_mut(&key) {
-                *planned = true;
-            }
-            store.custody_namespace()?
+            let namespace = store.custody_namespace()?;
+            let guard = ForceStopGuard::new(&self.state, key)?;
+            (namespace, guard)
         };
         let name =
             crate::platform::custody::agent_custody_name(&namespace, &agent.id, agent.generation);
@@ -1165,10 +1220,13 @@ impl PluginHost {
                 .await
                 .has_owned_exit_and_reader_drain(&agent.id, agent.generation)?
             {
-                return Ok(json!({
-                    "state": "applied", "custody": "exact", "terminated": true,
-                    "graceful": false,
-                }));
+                return Ok((
+                    json!({
+                        "state": "applied", "custody": "exact", "terminated": true,
+                        "graceful": false,
+                    }),
+                    Some(guard),
+                ));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -3790,7 +3848,8 @@ async fn mark_lost_state(state: &Weak<HostState>, key: &AgentKey) {
     fence_runtime_generation(&state, key);
     {
         let mut store = state.store.lock().await;
-        if state.planned_stops.lock_recover().get(key) == Some(&true) {
+        if let Some(deferred) = state.planned_stops.lock_recover().get(key) {
+            deferred.store(true, Ordering::Release);
             return;
         }
         if let Ok(events) = store.mark_lost(&key.id, key.generation, now_ms()) {
@@ -3844,7 +3903,6 @@ async fn cleanup_actor(
         return;
     };
     fence_runtime_generation(&state, key);
-    state.planned_stops.lock_recover().remove(key);
     let mut secrets = state.secrets.lock_recover();
     if !plugin_credential.is_empty() {
         secrets.remove(plugin_credential);
@@ -5296,6 +5354,227 @@ mod tests {
             },
             start_id,
         )
+    }
+
+    async fn force_stop_fixture() -> (PluginHost, AgentKey, String) {
+        let (host, key, start_id) = source_exit_fixture("codex");
+        {
+            let mut store = host.state.store.lock().await;
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: Ulid::new().to_string(),
+                        agent_id: key.id.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        cursor: None,
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "session.ready".to_owned(),
+                            native_id: Ulid::new().to_string(),
+                            data: json!({"command_id":start_id}),
+                        }],
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store
+                .settle(&start_id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            let send_id = Ulid::new().to_string();
+            let mut send = SubmitCommand::new(&send_id, "send");
+            send.target = Some(key.id.clone());
+            send.expected_generation = Some(1);
+            send.args = json!({"text":"bounded regression task"});
+            store.submit("owner", send, now_ms()).unwrap();
+            store.dispatch(&send_id, now_ms()).unwrap();
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: Ulid::new().to_string(),
+                        agent_id: key.id.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        cursor: None,
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "turn.started".to_owned(),
+                            native_id: Ulid::new().to_string(),
+                            data: json!({"command_id":send_id, "turn_id":"force-turn"}),
+                        }],
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            assert_eq!(
+                store.get_agent(&key.id).unwrap().unwrap().state,
+                AgentState::Busy
+            );
+        }
+        let stop_id = Ulid::new().to_string();
+        {
+            let mut store = host.state.store.lock().await;
+            let mut stop = SubmitCommand::new(&stop_id, "stop");
+            stop.target = Some(key.id.clone());
+            stop.expected_generation = Some(1);
+            stop.args = json!({"force":true});
+            store.submit("owner", stop, now_ms()).unwrap();
+            store.dispatch(&stop_id, now_ms()).unwrap();
+        }
+        (host, key, stop_id)
+    }
+
+    async fn assert_force_loss(host: &PluginHost, key: &AgentKey, stop_id: &str) {
+        let store = host.state.store.lock().await;
+        let agent = store.get_agent(&key.id).unwrap().unwrap();
+        assert_eq!(agent.state, AgentState::Lost);
+        assert!(agent.active_turn.is_none());
+        assert!(agent.pending.is_empty());
+        assert_eq!(
+            store
+                .get_turn(&key.id, 1, "force-turn")
+                .unwrap()
+                .unwrap()
+                .state,
+            eliot_core::TurnState::Unknown
+        );
+        assert_eq!(
+            store.get_command(stop_id).unwrap().unwrap().state,
+            CommandState::Unknown
+        );
+        assert_eq!(
+            store
+                .read_events(0, 1000, None)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "agent.lost")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn force_verification_timeout_then_late_proven_exit_settles_lost() {
+        let (host, key, stop_id) = force_stop_fixture().await;
+        let result = async {
+            let _guard = ForceStopGuard::new(&host.state, key.clone()).unwrap();
+            timeout_at(Instant::now(), std::future::pending::<()>()).await
+        }
+        .await;
+        assert!(result.is_err());
+        assert!(!host.state.planned_stops.lock_recover().contains_key(&key));
+        host.state
+            .store
+            .lock()
+            .await
+            .settle(&stop_id, CommandState::Unknown, None, now_ms())
+            .unwrap();
+        settle_drained_source_exit(&Arc::downgrade(&host.state), &key, true, true, "late_exit")
+            .await
+            .unwrap();
+        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        cleanup_actor(&Arc::downgrade(&host.state), &key, "", false).await;
+        assert_force_loss(&host, &key, &stop_id).await;
+    }
+
+    #[tokio::test]
+    async fn force_failure_reconciles_loss_deferred_before_actor_teardown() {
+        let (host, key, stop_id) = force_stop_fixture().await;
+        let guard = ForceStopGuard::new(&host.state, key.clone()).unwrap();
+        settle_drained_source_exit(&Arc::downgrade(&host.state), &key, true, true, "early_exit")
+            .await
+            .unwrap();
+        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        cleanup_actor(&Arc::downgrade(&host.state), &key, "", false).await;
+        assert!(host.state.planned_stops.lock_recover().contains_key(&key));
+        assert_eq!(
+            host.state
+                .store
+                .lock()
+                .await
+                .get_agent(&key.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentState::Busy
+        );
+        let mut progress = host.state.progress.subscribe();
+        drop(guard);
+        assert!(!host.state.planned_stops.lock_recover().contains_key(&key));
+        timeout_at(deadline(), progress.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_force_loss(&host, &key, &stop_id).await;
+    }
+
+    #[tokio::test]
+    async fn force_outer_cancellation_clears_marker() {
+        let (host, key, stop_id) = force_stop_fixture().await;
+        let mut force = Box::pin(async {
+            let _guard = ForceStopGuard::new(&host.state, key.clone()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        assert!(futures_util::poll!(&mut force).is_pending());
+        assert!(host.state.planned_stops.lock_recover().contains_key(&key));
+        // Drop the enclosing future, as the outer force deadline does.
+        drop(force);
+        assert!(!host.state.planned_stops.lock_recover().contains_key(&key));
+        assert_eq!(
+            host.state
+                .store
+                .lock()
+                .await
+                .get_agent(&key.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentState::Busy
+        );
+        settle_drained_source_exit(
+            &Arc::downgrade(&host.state),
+            &key,
+            true,
+            true,
+            "cancelled_exit",
+        )
+        .await
+        .unwrap();
+        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        assert_force_loss(&host, &key, &stop_id).await;
+    }
+
+    #[tokio::test]
+    async fn force_success_suppresses_loss_through_stop_commit() {
+        let (host, key, stop_id) = force_stop_fixture().await;
+        let guard = ForceStopGuard::new(&host.state, key.clone()).unwrap();
+        settle_drained_source_exit(&Arc::downgrade(&host.state), &key, true, true, "force_exit")
+            .await
+            .unwrap();
+        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        cleanup_actor(&Arc::downgrade(&host.state), &key, "", false).await;
+        assert!(host.state.planned_stops.lock_recover().contains_key(&key));
+        host.state
+            .store
+            .lock()
+            .await
+            .settle(&stop_id, CommandState::Applied, None, now_ms())
+            .unwrap();
+        guard.finish();
+        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        assert!(!host.state.planned_stops.lock_recover().contains_key(&key));
+        let store = host.state.store.lock().await;
+        assert_eq!(
+            store.get_agent(&key.id).unwrap().unwrap().state,
+            AgentState::Stopped
+        );
+        assert!(
+            store
+                .read_events(0, 1000, None)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "agent.lost")
+        );
     }
 
     #[tokio::test]
