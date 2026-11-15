@@ -876,6 +876,10 @@ fn io_error(action: &str, error: std::io::Error) -> Error {
     Error::new("platform_io", format!("{action}: {error}"))
 }
 
+fn unavailable(message: &str) -> Error {
+    Error::new("data_dir_unavailable", message)
+}
+
 #[cfg(test)]
 mod selected_root_tests {
     use super::*;
@@ -952,10 +956,6 @@ mod selected_root_tests {
             default
         );
     }
-}
-
-fn unavailable(message: &str) -> Error {
-    Error::new("data_dir_unavailable", message)
 }
 
 #[cfg(all(test, windows))]
