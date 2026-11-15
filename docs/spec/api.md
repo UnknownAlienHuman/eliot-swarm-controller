@@ -1313,6 +1313,10 @@ A stored `unknown` command with no live process, turn or reader behind its
 generation is retained-unresolved: it is excluded from the blockers and listed
 in the `drain` report under `retained_unresolved` instead, with its verb,
 Agent, generation, stored outcome reason, resolvability and owner action.
+An open source row counts as a reader only while its generation is the
+agent's current live generation; rows on fenced or terminal generations are
+residue. Retained ids are excluded from the receipt's unsettled section and
+its count as well, so the receipt never double-lists them.
 `resolvable` is false for observe-only commands, which `cmd resolve` refuses
 by design; those entries need no action and stay retained as the honest
 record (retention keeps sets containing `unknown` work). A `true` entry

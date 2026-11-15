@@ -1211,6 +1211,40 @@ impl Store {
         retention::coverage_pruned_through(&self.connection)
     }
 
+    /// Bounded page of stored-`unknown` command ids, newest first, with the
+    /// exact total. Lets drain classification cover unknowns the daemon never
+    /// saw dispatched (for example across a restart, where the in-memory
+    /// unknown cache starts empty) without an unbounded scan. Callers that
+    /// need more than the page must keep the unclassified remainder blocking:
+    /// an unlisted id is never silently excused.
+    pub fn list_unknown_command_ids_page(&self, limit: usize) -> Result<(Vec<String>, usize)> {
+        validate_limit(limit)?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM commands WHERE state = 'unknown' ORDER BY rowid DESC LIMIT ?1")
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([limit as i64], |row| row.get(0))
+            .map_err(sql_error)?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row.map_err(sql_error)?);
+        }
+        let total: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM commands WHERE state = 'unknown'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        Ok((
+            ids,
+            usize::try_from(total.max(0))
+                .map_err(|_| Error::new("internal", "unknown command count is invalid"))?,
+        ))
+    }
+
     /// Return unsettled commands without letting terminal history consume the limit.
     pub fn list_unsettled_commands(&self, limit: usize) -> Result<Vec<Command>> {
         validate_limit(limit)?;

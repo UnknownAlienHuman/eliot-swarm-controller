@@ -41,13 +41,20 @@ pub fn run_plugin_entry<F: Future>(entry: F) -> Result<F::Output> {
 /// Subscribe to the existing child waiter. A reader fault or an unconfirmed
 /// wait error is not process-death evidence. Cancellation never kills the child.
 ///
-/// Production-retirement note: this helper has no production caller. Every
-/// production retirement path goes through `drain_native_exit`, which waits
-/// under `EVENT_DEADLINE` and settles `unknown` (never a fabricated
-/// terminal) when the native tail does not settle in time. The fallthrough
-/// below never resolves on its own, so any future caller must bound this
-/// helper with an explicit timeout and settle unknown on expiry instead of
-/// awaiting it directly.
+/// Production-use note: the Codex, Claude, Muse and Antigravity plugin hosts
+/// call this helper, but only as one arm of a `biased tokio::select!`
+/// against host requests (plus steer, deferred-completion or deadline arms
+/// where applicable) — never awaited bare. When another arm wins, the select
+/// drops this future, so the `pending()` fallthrough below only parks that
+/// select arm while nothing else fires; it cannot hang the host loop by
+/// itself. Every caller routes the exit arm into bounded tail draining via
+/// `drain_native_exit` — Codex and Muse inline on the arm, Claude after the
+/// loop when the native endpoint retired, Antigravity through
+/// `retire_native_exit` — which waits under `EVENT_DEADLINE` and settles
+/// `unknown` (never a fabricated terminal) when the native tail does not
+/// settle in time. Any future bare caller must bound this helper with an
+/// explicit timeout and settle unknown on expiry instead of awaiting it
+/// directly.
 pub async fn wait_for_native_exit(child: Option<&mut NativeChild>) {
     if let Some(child) = child
         && child.wait_for_process_exit().await.is_ok()
