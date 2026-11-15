@@ -452,6 +452,16 @@ pub mod winui {
             })
         }
 
+        /// The standard icon button: no fill, on-surface-variant glyph,
+        /// state layers. (WinUI's default Button style reads its padding as
+        /// a StaticResource, so the size comes from the caller.)
+        pub fn icon_button(self) -> ResourceOverrides {
+            self.with(|s| {
+                family(s, "Button", None, s.on_surface_variant, None)
+                    .set("ControlCornerRadius", CornerRadius::from(shape::FULL))
+            })
+        }
+
         /// The rail's floating action button: primary-container with the M3
         /// large corner.
         pub fn fab(self) -> ResourceOverrides {

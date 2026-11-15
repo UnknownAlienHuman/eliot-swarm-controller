@@ -80,6 +80,7 @@ use crate::m3;
 use crate::markdown::Doc;
 use crate::monitor::{self, Monitor, MonitorSnapshot};
 use crate::monitor_view::{self, MonitorActions};
+use crate::nav::{self, UiAgent};
 use crate::profiles::{self, FORM_FIELDS};
 use crate::reparent;
 use crate::scripts;
@@ -110,15 +111,6 @@ struct UiProject {
     id: String,
     profiles: Vec<String>,
     workspace: String,
-}
-
-/// UI copy of one Agent row: identity, generation and liveness only.
-#[derive(Clone, Debug)]
-struct UiAgent {
-    id: String,
-    generation: i64,
-    harness: String,
-    state: String,
 }
 
 /// One page of the navigation list with its honest counters.
@@ -276,6 +268,8 @@ fn load_agents_blocking(data_dir: &Path, request: &AgentListRequest) -> Fallible
                     generation: row.summary.generation,
                     harness: row.summary.harness,
                     state: format!("{:?}", row.summary.state).to_lowercase(),
+                    project: row.summary.project,
+                    parent: row.summary.parent,
                 })
                 .collect(),
             next: reply.next,
@@ -424,6 +418,10 @@ impl Component for DesktopApp {
                 projects: Vec::new(),
                 project_idx: Some(0),
                 agents: Vec::new(),
+                branches: HashMap::new(),
+                expanded: HashSet::new(),
+                tree_epoch: 0,
+                rows: Vec::new(),
                 agent_idx: None,
                 agents_next: None,
                 agents_total: 0,

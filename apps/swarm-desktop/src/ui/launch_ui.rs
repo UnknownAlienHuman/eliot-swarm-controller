@@ -126,6 +126,9 @@ impl DesktopApp {
                             generation: outcome.generation,
                             harness: String::new(),
                             state: "created".to_owned(),
+                            // Placed by the list reload that follows.
+                            project: String::new(),
+                            parent: None,
                         });
                         self.nav.selection.select_agent(Some(outcome.agent));
                         self.load_agents(context, None);

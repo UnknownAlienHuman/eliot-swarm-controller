@@ -127,14 +127,18 @@ impl DesktopApp {
                                 generation: row.generation,
                                 harness: row.harness.clone(),
                                 state: monitor::state_name(row.state).to_owned(),
+                                project: String::new(),
+                                parent: row.parent.clone(),
                             })
                     });
                 if let Some(agent) = agent {
+                    // The rows are unchanged in this update: the index is
+                    // already published.
                     self.nav.agent_idx = self
                         .nav
-                        .agents
+                        .rows
                         .iter()
-                        .position(|known| known.id == agent.id);
+                        .position(|row| row.agent.id == agent.id);
                     if self.chat.convo.as_ref().map(Conversation::agent) != Some(&agent.id) {
                         self.open_conversation(&agent, context);
                     }

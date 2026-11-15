@@ -1,6 +1,8 @@
 //! Navigation shell: projects, the Agent list, screen selection and the root layout.
 
 use super::*;
+use crate::nav::{Branch, Row};
+use crate::settings::ThemeChoice;
 use crate::theme::StatusTone;
 use crate::theme::winui::Palette;
 
@@ -23,6 +25,12 @@ pub(super) enum ShellMsg {
     FieldsPrimed(u64),
     /// The periodic High Contrast reading.
     HighContrastRead(bool),
+    /// Expand (true) or collapse an Agent's children.
+    ExpandToggled(String, bool),
+    /// Tree epoch, manager id and its direct-children page.
+    BranchLoaded(u64, String, Fallible<AgentPage>),
+    /// The theme choice was written to the settings file (or not).
+    SettingsSaved(Result<(), String>),
 }
 
 /// Reactor 0.100.0 reports the window's Light/Dark scheme only, and a High
@@ -31,52 +39,29 @@ pub(super) enum ShellMsg {
 const HIGH_CONTRAST_POLL_MS: u64 = 2_000;
 /// Re-check for the empty editor render one frame later.
 const PRIME_RETRY_MS: u64 = 16;
+/// Indent per tree level in the Agent list.
+const TREE_INDENT: f64 = 16.0;
 
-/// The owner's theme choice for this window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ThemePref {
-    System,
-    Light,
-    Dark,
-}
-
-impl ThemePref {
-    fn next(self) -> Self {
-        match self {
-            Self::System => Self::Light,
-            Self::Light => Self::Dark,
-            Self::Dark => Self::System,
-        }
-    }
-
-    fn window_theme(self) -> WindowTheme {
-        match self {
-            Self::System => WindowTheme::System,
-            Self::Light => WindowTheme::Light,
-            Self::Dark => WindowTheme::Dark,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::System => "System",
-            Self::Light => "Light",
-            Self::Dark => "Dark",
-        }
-    }
-
-    fn glyph(self) -> &'static str {
-        match self {
-            Self::System => m3::glyph::THEME_SYSTEM,
-            Self::Light => m3::glyph::THEME_LIGHT,
-            Self::Dark => m3::glyph::THEME_DARK,
-        }
+fn window_theme(choice: ThemeChoice) -> WindowTheme {
+    match choice {
+        ThemeChoice::System => WindowTheme::System,
+        ThemeChoice::Light => WindowTheme::Light,
+        ThemeChoice::Dark => WindowTheme::Dark,
     }
 }
 
-/// Theme choice, the scheme the window actually shows, and High Contrast.
+fn theme_glyph(choice: ThemeChoice) -> &'static str {
+    match choice {
+        ThemeChoice::System => m3::glyph::THEME_SYSTEM,
+        ThemeChoice::Light => m3::glyph::THEME_LIGHT,
+        ThemeChoice::Dark => m3::glyph::THEME_DARK,
+    }
+}
+
+/// Theme choice (persisted per user), the scheme the window actually shows,
+/// and High Contrast.
 pub(super) struct Appearance {
-    pref: ThemePref,
+    pref: ThemeChoice,
     dark: bool,
     high_contrast: bool,
 }
@@ -84,7 +69,7 @@ pub(super) struct Appearance {
 impl Appearance {
     pub(super) fn new() -> Self {
         Self {
-            pref: ThemePref::System,
+            pref: crate::settings::load().theme,
             dark: false,
             high_contrast: crate::accessibility::high_contrast_on(),
         }
@@ -95,12 +80,20 @@ impl Appearance {
     }
 }
 
-/// Projects, the Agent list page and the current selection.
+/// Projects, the Agent list pages, expanded branches and the selection.
 pub(super) struct ShellState {
     pub(super) selection: Selection,
     pub(super) projects: Vec<UiProject>,
     pub(super) project_idx: Option<usize>,
+    /// Listed pages, in daemon order.
     pub(super) agents: Vec<UiAgent>,
+    /// Direct-children reads of expanded managers.
+    pub(super) branches: HashMap<String, Branch>,
+    pub(super) expanded: HashSet<String>,
+    /// Tags branch reads; a reply from before a project switch is dropped.
+    pub(super) tree_epoch: u64,
+    /// The rows on screen (see [`nav::rows`]); `agent_idx` indexes these.
+    pub(super) rows: Vec<Row>,
     pub(super) agent_idx: Option<usize>,
     pub(super) agents_next: Option<String>,
     pub(super) agents_total: usize,
@@ -117,6 +110,8 @@ impl DesktopApp {
                 Ok(projects) => {
                     let count = projects.len();
                     self.nav.projects = projects;
+                    // Group captions name registered projects by id.
+                    self.refresh_rows(context);
                     self.set_status(format!(
                         "{count} registered project(s); listing every Agent in scope."
                     ));
@@ -130,7 +125,6 @@ impl DesktopApp {
                 self.nav.agents_loading = false;
                 match page {
                     Ok(page) => {
-                        let published = self.nav.agents.len();
                         if append {
                             self.nav.agents.extend(page.rows);
                         } else {
@@ -150,40 +144,30 @@ impl DesktopApp {
                             .take()
                             .map(|agent| agent.id)
                             .or_else(|| self.nav.selection.agent.clone());
-                        let index = selected
-                            .and_then(|id| self.nav.agents.iter().position(|agent| agent.id == id));
-                        if let Some(agent) =
-                            index.and_then(|index| self.nav.agents.get(index)).cloned()
+                        if let Some(agent) = selected
+                            .and_then(|id| self.nav.agents.iter().find(|agent| agent.id == id))
+                            .cloned()
                             && self.chat.convo.as_ref().map(Conversation::agent) != Some(&agent.id)
                         {
                             self.open_conversation(&agent, context);
                         }
-                        // Never point the native SelectedIndex at a row this same
-                        // render adds: highlight a new row on the next tick.
-                        // Reactor 0.100.0 applies the SelectedIndex before the
-                        // new item reaches the ListView; WinUI rejects it with
-                        // E_INVALIDARG (0x80070057), which Reactor treats as a
-                        // fatal native command failure and the process aborts
-                        // with 0xC0000409. A standalone repro on 2026-11-14
-                        // aborted on the first same-update select and stayed up
-                        // through repeated next-tick selects.
-                        match index {
-                            Some(index) if index >= published => {
-                                self.nav.agent_idx = None;
-                                let id = self.nav.agents[index].id.clone();
-                                let _task = context.spawn_background(move |_| {
-                                    Message::Shell(ShellMsg::HighlightAgent(id))
-                                });
-                            }
-                            other => self.nav.agent_idx = other,
-                        }
+                        self.refresh_rows(context);
                     }
                     Err(error) => self.set_status(format!("agent.list failed: {error}")),
                 }
             }
             ShellMsg::ProjectSelected(index) => {
+                // The owner cannot clear a ComboBox: None only reports
+                // replaced items, and the same index is no change.
+                if index.is_none() || index == self.nav.project_idx {
+                    return;
+                }
                 self.nav.project_idx = index;
                 self.nav.agents.clear();
+                self.nav.branches.clear();
+                self.nav.expanded.clear();
+                self.nav.tree_epoch += 1;
+                self.nav.rows.clear();
                 self.nav.agent_idx = None;
                 self.nav.agents_next = None;
                 self.nav.agents_total = 0;
@@ -206,11 +190,38 @@ impl DesktopApp {
                 self.nav.agent_idx = index;
                 // A list reload clears the native selection (None); the open
                 // conversation and its feed stay as they are.
-                if let Some(agent) = self.selected_agent().cloned()
+                if let Some(agent) = index
+                    .and_then(|index| self.nav.rows.get(index))
+                    .map(|row| row.agent.clone())
                     && self.chat.convo.as_ref().map(Conversation::agent) != Some(&agent.id)
                 {
                     self.open_conversation(&agent, context);
                 }
+            }
+            ShellMsg::ExpandToggled(id, expand) => {
+                if expand {
+                    self.nav.expanded.insert(id.clone());
+                    if !matches!(self.nav.branches.get(&id), Some(Branch::Loaded { .. })) {
+                        self.load_branch(&id, context);
+                    }
+                } else {
+                    self.nav.expanded.remove(&id);
+                }
+                self.refresh_rows(context);
+            }
+            ShellMsg::BranchLoaded(epoch, id, page) => {
+                if epoch != self.nav.tree_epoch {
+                    return;
+                }
+                let branch = match page {
+                    Ok(page) => Branch::Loaded {
+                        more: page.next.is_some() && page.rows.len() < page.total,
+                        children: page.rows,
+                    },
+                    Err(error) => Branch::Failed(error),
+                };
+                self.nav.branches.insert(id, branch);
+                self.refresh_rows(context);
             }
             ShellMsg::RefreshRequested => {
                 if let Ok(data_dir) = self.data_dir.clone() {
@@ -219,6 +230,11 @@ impl DesktopApp {
                     });
                 }
                 self.load_agents(context, None);
+                // Expanded branches are read again; their rows stay until then.
+                let expanded: Vec<String> = self.nav.expanded.iter().cloned().collect();
+                for id in expanded {
+                    self.load_branch(&id, context);
+                }
                 if self.chat.convo.is_some() {
                     self.chat.failures = 0;
                     self.start_snapshot(context);
@@ -248,8 +264,10 @@ impl DesktopApp {
                 }
             }
             ShellMsg::HighlightAgent(id) => {
+                // The rows are unchanged since the last render, so the index
+                // already exists in the native list.
                 if self.nav.selection.agent.as_deref() == Some(id.as_str()) {
-                    self.nav.agent_idx = self.nav.agents.iter().position(|agent| agent.id == id);
+                    self.nav.agent_idx = self.nav.rows.iter().position(|row| row.agent.id == id);
                 }
             }
             ShellMsg::ScreenSelected(screen) => {
@@ -288,7 +306,20 @@ impl DesktopApp {
                 }
                 self.watch_high_contrast(context);
             }
-            ShellMsg::ThemeCycled => self.appearance.pref = self.appearance.pref.next(),
+            ShellMsg::ThemeCycled => {
+                self.appearance.pref = self.appearance.pref.next();
+                let settings = crate::settings::Settings {
+                    theme: self.appearance.pref,
+                };
+                let _task = context.spawn_background(move |_| {
+                    Message::Shell(ShellMsg::SettingsSaved(crate::settings::save(&settings)))
+                });
+            }
+            ShellMsg::SettingsSaved(result) => {
+                if let Err(error) = result {
+                    self.set_status(format!("Theme choice not saved: {error}"));
+                }
+            }
             ShellMsg::FieldsPrimed(epoch) => {
                 if epoch != self.prime_epoch {
                     return;
@@ -350,10 +381,82 @@ impl DesktopApp {
             .and_then(|index| self.nav.projects.get(index))
     }
 
+    /// The selected Agent, wherever it is listed: a collapsed child keeps
+    /// its conversation and controls.
     pub(super) fn selected_agent(&self) -> Option<&UiAgent> {
+        let id = self.nav.selection.agent.as_deref()?;
         self.nav
-            .agent_idx
-            .and_then(|index| self.nav.agents.get(index))
+            .agents
+            .iter()
+            .chain(self.nav.branches.values().flat_map(|branch| match branch {
+                Branch::Loaded { children, .. } => children.as_slice(),
+                _ => &[],
+            }))
+            .find(|agent| agent.id == id)
+    }
+
+    /// Recompute the rows on screen and the native selection index.
+    ///
+    /// Never point the native SelectedIndex at a row this same render adds
+    /// or moves: Reactor 0.100.0 applies the SelectedIndex before the new
+    /// items reach the ListView; an index past them fails with E_INVALIDARG
+    /// (0x80070057), which Reactor treats as a fatal native command failure
+    /// (the process aborts with 0xC0000409; standalone repro 2026-11-14), and
+    /// an index shifted by an insertion would select another row. An index
+    /// is kept only when the same Agent was already on it; otherwise the
+    /// selected row is highlighted on the next tick, once published.
+    pub(super) fn refresh_rows(&mut self, context: &ComponentContext<Self>) {
+        let registered: Vec<(String, String)> = self
+            .nav
+            .projects
+            .iter()
+            .map(|project| (project.workspace.clone(), project.id.clone()))
+            .collect();
+        let group = self.selected_project().is_none();
+        let rows = nav::rows(
+            &self.nav.agents,
+            &self.nav.branches,
+            &self.nav.expanded,
+            group,
+            &|label| nav::project_name(label, &registered),
+        );
+        let previous = std::mem::replace(&mut self.nav.rows, rows);
+        let Some(id) = self.nav.selection.agent.clone() else {
+            self.nav.agent_idx = None;
+            return;
+        };
+        let index = self.nav.rows.iter().position(|row| row.agent.id == id);
+        let stable =
+            index.is_some_and(|index| previous.get(index).map(|row| &row.agent.id) == Some(&id));
+        if stable {
+            self.nav.agent_idx = index;
+        } else {
+            self.nav.agent_idx = None;
+            if index.is_some() {
+                let _task =
+                    context.spawn_background(move |_| Message::Shell(ShellMsg::HighlightAgent(id)));
+            }
+        }
+    }
+
+    /// Read one manager's direct children (`agent.list` with `parent`).
+    fn load_branch(&mut self, id: &str, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        if !matches!(self.nav.branches.get(id), Some(Branch::Loaded { .. })) {
+            self.nav.branches.insert(id.to_owned(), Branch::Loading);
+        }
+        let request = AgentListRequest {
+            limit: AGENT_PAGE,
+            parent: Some(id.to_owned()),
+            ..Default::default()
+        };
+        let (epoch, id) = (self.nav.tree_epoch, id.to_owned());
+        let _task = context.spawn_background(move |_| {
+            let page = load_agents_blocking(&data_dir, &request);
+            Message::Shell(ShellMsg::BranchLoaded(epoch, id, page))
+        });
     }
 
     pub(super) fn selected_agent_id(&self) -> Option<String> {
@@ -367,10 +470,14 @@ impl DesktopApp {
         let append = after.is_some();
         self.nav.list_epoch += 1;
         let list_epoch = self.nav.list_epoch;
+        // An Agent's project label is its registered checkout path, not the
+        // registration id, so the filter is the checkout.
         let request = AgentListRequest {
             after,
             limit: AGENT_PAGE,
-            project: self.selected_project().map(|project| project.id.clone()),
+            project: self
+                .selected_project()
+                .map(|project| project.workspace.clone()),
             ..Default::default()
         };
         self.nav.agents_loading = true;
@@ -394,7 +501,7 @@ impl DesktopApp {
         context.window_visuals(
             WindowVisuals::new()
                 .client_size(theme::layout::WINDOW_WIDTH, theme::layout::WINDOW_HEIGHT)
-                .theme(self.appearance.pref.window_theme()),
+                .theme(window_theme(self.appearance.pref)),
         );
         context.on_color_scheme(
             context.callback(|scheme| Message::Shell(ShellMsg::SchemeObserved(scheme))),
@@ -540,7 +647,7 @@ impl DesktopApp {
             .width(theme::layout::RAIL_ITEM_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
             .on_click(context.message(Message::Shell(ShellMsg::ThemeCycled)))
-            .content(rail_label(pref.glyph(), pref.label(), false, None));
+            .content(rail_label(theme_glyph(pref), pref.label(), false, None));
         Grid::new()
             .grid_column(0)
             .rows([
@@ -635,62 +742,27 @@ impl DesktopApp {
     pub(super) fn nav_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let mut project_names = vec![ALL_PROJECTS.to_owned()];
         project_names.extend(self.nav.projects.iter().map(|project| project.id.clone()));
-        let project_picker = ComboBox::new()
-            .grid_row(1)
-            .items_source(project_names)
-            .selected_index(self.nav.project_idx)
-            .placeholder_text("Project")
-            .automation_name("Project")
-            .horizontal_alignment(HorizontalAlignment::Stretch)
-            .on_selection_changed(
-                context.callback(|value| Message::Shell(ShellMsg::ProjectSelected(value))),
-            );
+        // WinUI drops a ComboBox's selection when its items are replaced, so
+        // a new project list gets a new control (as in `configure::panel`).
+        let picker_key = format!("projects:{}", project_names.join("\u{1f}"));
+        let project_picker = Grid::new().grid_row(1).keyed_children(vec![KeyedView::new(
+            picker_key,
+            ComboBox::new()
+                .items_source(project_names)
+                .selected_index(self.nav.project_idx)
+                .placeholder_text("Project")
+                .automation_name("Project")
+                .horizontal_alignment(HorizontalAlignment::Stretch)
+                .on_selection_changed(
+                    context.callback(|value| Message::Shell(ShellMsg::ProjectSelected(value))),
+                ),
+        )]);
 
-        // ListViewItem exposes no content alignment in Reactor 0.100.0, so
-        // the row takes the list's fixed inner width to right-align the chip.
-        let row_width = theme::layout::LIST_WIDTH - 2.0 * theme::spacing::LG - 40.0;
         let agent_items: Vec<KeyedView> = self
             .nav
-            .agents
+            .rows
             .iter()
-            .map(|agent| {
-                KeyedView::new(
-                    agent.id.clone(),
-                    ListViewItem::new()
-                        .automation_name(format!(
-                            "Agent {}, {}, {}, generation {}",
-                            agent.id, agent.state, agent.harness, agent.generation
-                        ))
-                        .content(
-                            Grid::new()
-                                .width(row_width)
-                                .columns([GridLength::STAR, GridLength::Auto])
-                                .column_spacing(theme::spacing::SM)
-                                .margin(Thickness::xy(0.0, theme::spacing::SM))
-                                .children((
-                                    StackPanel::new()
-                                        .spacing(2.0)
-                                        .vertical_alignment(VerticalAlignment::Center)
-                                        .children((
-                                            m3::text(
-                                                agent.id.clone(),
-                                                theme::type_scale::TITLE_SMALL,
-                                            ),
-                                            m3::muted(
-                                                format!(
-                                                    "{} · gen {}",
-                                                    agent.harness, agent.generation
-                                                ),
-                                                theme::type_scale::BODY_SMALL,
-                                            ),
-                                        )),
-                                    Border::new()
-                                        .grid_column(1)
-                                        .content(m3::status_chip(palette, &agent.state)),
-                                )),
-                        ),
-                )
-            })
+            .map(|row| KeyedView::new(row.agent.id.clone(), nav_row(row, context, palette)))
             .collect();
         let agent_list = ListView::new()
             .grid_row(2)
@@ -758,6 +830,107 @@ impl DesktopApp {
                     .children((counter, more)),
             ))
     }
+}
+
+/// One Agent row: its project caption when it opens a group, the indent of
+/// its level, an expand chevron when it has children, identity and state.
+fn nav_row(row: &Row, context: &mut ViewContext<DesktopApp>, palette: Palette) -> View {
+    let agent = &row.agent;
+    // ListViewItem exposes no content alignment in Reactor 0.100.0, so the
+    // row takes the list's fixed inner width to right-align the chip.
+    let row_width = theme::layout::LIST_WIDTH - 2.0 * theme::spacing::LG - 40.0;
+    let indent = row.depth as f64 * TREE_INDENT;
+    // FontIcon's 20-DIP glyph inside WinUI's fixed button padding (11, 5,
+    // 11, 6): 44 x 32 shows it whole.
+    let (chevron_width, chevron_height) = (44.0, 32.0);
+    let chevron: View = if row.expandable() {
+        let (glyph, name) = if row.expanded {
+            (
+                m3::glyph::CHEVRON_DOWN,
+                format!("Collapse children of {}", agent.id),
+            )
+        } else {
+            (
+                m3::glyph::CHEVRON_RIGHT,
+                format!("Expand {} child(ren) of {}", row.children, agent.id),
+            )
+        };
+        m3::icon_button(palette)
+            .grid_column(1)
+            .width(chevron_width)
+            .height(chevron_height)
+            .vertical_alignment(VerticalAlignment::Center)
+            .automation_name(name)
+            .on_click(context.message(Message::Shell(ShellMsg::ExpandToggled(
+                agent.id.clone(),
+                !row.expanded,
+            ))))
+            .content(m3::icon(glyph))
+    } else {
+        View::empty()
+    };
+    let mut detail = format!("{} · gen {}", agent.harness, agent.generation);
+    match (&row.note, row.expanded, row.children) {
+        (Some(note), _, _) => detail.push_str(&format!(" · {note}")),
+        (None, false, children) if children > 0 => {
+            detail.push_str(&format!(" · {children} child(ren)"));
+        }
+        _ => {}
+    }
+    let main = Grid::new()
+        .grid_row(1)
+        .columns([
+            GridLength::Pixel(indent),
+            GridLength::Pixel(chevron_width),
+            GridLength::STAR,
+            GridLength::Auto,
+        ])
+        .column_spacing(theme::spacing::XS)
+        .children((
+            chevron,
+            StackPanel::new()
+                .grid_column(2)
+                .spacing(2.0)
+                .vertical_alignment(VerticalAlignment::Center)
+                .children((
+                    m3::text(agent.id.clone(), theme::type_scale::TITLE_SMALL),
+                    m3::muted(detail, theme::type_scale::BODY_SMALL)
+                        .text_trimming(TextTrimming::CharacterEllipsis),
+                )),
+            Border::new()
+                .grid_column(3)
+                .content(m3::status_chip(palette, &agent.state)),
+        ));
+    let caption: View = match &row.group {
+        Some(project) => m3::text(project.clone(), theme::type_scale::LABEL_MEDIUM)
+            .foreground(palette.primary())
+            .automation_heading_level(AutomationHeadingLevel::Level3)
+            .margin(Thickness::new(
+                0.0,
+                theme::spacing::XS,
+                0.0,
+                theme::spacing::XS,
+            ))
+            .into(),
+        None => View::empty(),
+    };
+    let mut name = format!(
+        "Agent {}, {}, {}, generation {}",
+        agent.id, agent.state, agent.harness, agent.generation
+    );
+    if let Some(project) = &row.group {
+        name = format!("{project}: {name}");
+    }
+    if row.depth > 0 {
+        name.push_str(&format!(", level {}", row.depth + 1));
+    }
+    ListViewItem::new().automation_name(name).content(
+        Grid::new()
+            .width(row_width)
+            .rows([GridLength::Auto, GridLength::Auto])
+            .margin(Thickness::xy(0.0, theme::spacing::SM))
+            .children((caption, main)),
+    )
 }
 
 /// Icon over label, with the M3 indicator pill behind the icon when given.

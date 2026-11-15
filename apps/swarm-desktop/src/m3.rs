@@ -29,6 +29,8 @@ pub mod glyph {
     pub const SEND: &str = "\u{E724}";
     pub const INTERRUPT: &str = "\u{E711}";
     pub const HAND_OFF: &str = "\u{E8AB}";
+    pub const CHEVRON_RIGHT: &str = "\u{E76C}";
+    pub const CHEVRON_DOWN: &str = "\u{E70D}";
 }
 
 pub fn weight(style: TypeStyle) -> FontWeight {
@@ -121,6 +123,12 @@ pub fn outlined(palette: Palette) -> Button {
 /// The text button: low-emphasis actions.
 pub fn text_button(palette: Palette) -> Button {
     Button::new().resource_overrides(palette.text_button())
+}
+
+/// The standard icon button: a low-emphasis button for one glyph
+/// (`.content(icon(..))`). Give it an accessible name.
+pub fn icon_button(palette: Palette) -> Button {
+    Button::new().resource_overrides(palette.icon_button())
 }
 
 /// A segmented choice: tonal when selected, outlined otherwise.
