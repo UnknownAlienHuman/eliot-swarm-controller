@@ -312,10 +312,13 @@ the original result is returned before live generation/topology/fanout gates, ev
 after another move or stop. A different binding rejects `id_conflict`. A lost reply
 is an unknown observation until that readback; there is no native effect to replay.
 
-### Task handoff to an existing Agent (design; not implemented)
+### Task handoff to an existing Agent (implemented)
 
 `swarm.handoff` is one Owner operation bound to explicit A/B generations, an explicit
-original-task command ID and a bounded ordered set of A's undispatched SEND IDs.
+original-task SEND command ID and an ordered set of at most 64 distinct undispatched
+SEND IDs, also bounded by the configured selector-target limit. The sole DTOs live in
+[`api/handoff.rs`](../../crates/eliot-core/src/api/handoff.rs). Empty selection transfers
+context, claims, Goal and children without successor task inputs.
 Refuse rather than implicitly wait while A has an active/unknown turn, pending
 request, dispatched/unknown command, generation transition or running/unknown Goal
 round reservation. B must be controlled, nonterminal, same-project and cleanly idle
@@ -326,18 +329,31 @@ Only plain `send` commands in `accepted|queued` state are transferable. Never tr
 in-flight, unknown, turn/request-bound controls or queued context injections; reject
 the requested set atomically if any entry has moved state. Cancel the selected
 originals with a durable no-effect outcome and admit fresh B-generation SENDs in the
-same transaction. Preserve immutable original targets/payloads and retain explicit
+same transaction. The original-task SEND may also be selected when undispatched: its
+text appears as labelled context, and exactly one successor carries its work. Preserve
+immutable original targets/payloads and retain explicit
 old-command/new-command pairs in the handoff parent's result. Use the existing
 Store-only parent/ordered-child command representation for the brief and successor
 inputs, not a second work queue. Successor IDs and ordinals are frozen at admission;
 their native dispatch uses the ordinary router after commit. Unselected work stays
 on A; stopping A is a separate explicit command.
 
-In that transaction, release A-generation claims and recreate the selected live
-globs/notes on B's generation with their remaining TTL, reporting advisory conflicts.
+In that transaction, release A-generation claims and recreate all live
+globs/notes on B's generation with their exact remaining expiry, reporting advisory
+conflicts. All live A-generation claims transfer; expired and old-generation claims do
+not. An exact live destination glob collision or destination claim-cap overflow rejects
+the operation rather than overwriting B's claim. Known secrets in notes are redacted;
+known-secret identifiers refuse the transfer.
 Claims never prove ownership or silently reassign work. Transfer only a quiescent
 Eliot Goal when B has none: clear A's Goal and install its definition/budgets/counters
-paused on B's generation with a new revision and no inherited idle/round key. Explicit
+paused on B's generation with a new revision and no inherited idle/round key. A cleared
+destination Goal row may supply the next revision; another destination Goal refuses.
+Completed/cleared source Goals stay historical; a blocked source Goal refuses until
+explicitly reset or cleared, so handoff cannot bypass its block. Without a transferable
+source Goal, B keeps its own Goal unchanged. A private additive used-turn baseline
+preserves consumed turns and charges each subsequent B turn immediately, including
+across another handoff. Cadence re-anchors at handoff; reserved continuations and
+running/unknown Goal markers on either Agent refuse. Explicit
 resume is required; reserved/unknown continuations are never copied. Native Goals
 remain `unsupported` until the relevant adapters expose them. Transfer children
 through the same re-parent validation/transaction helper and its limits, not new
@@ -349,15 +365,30 @@ command, A's latest retained final output (exact turn binding, or an explicit ab
 and pointers to A/generation/command/turn retained history. Apply existing known-secret
 filtering/redaction and SEND/frame limits; label any truncated text and history gaps.
 Never copy credentials, raw native context or an inferred successful result. B keeps
-its own native context. The brief precedes the selected successor inputs in FIFO order.
+its own native context. The brief is labelled as context only and precedes successor
+inputs in FIFO order.
+The builder reads retained source text in the transfer transaction and labels missing
+or pruned final output without inferring success. Each new input receives a fresh ULID,
+frozen in the parent result before commit, and shares its parent/ordinal representation.
 
-Local admission is atomic; native application is not. The retained parent result names
-each cancellation, claim/Goal/child transfer and admitted successor ID. Ordinary child
-command/turn readback distinguishes pending/applied/failed/unknown delivery. A failed
-or unknown brief blocks subsequent handoff inputs through existing ordered child/input
-gates; never automatically resend an uncertain input. Same-ID retry returns the frozen
-operation and child IDs, including partial native outcomes, and never repeats Store
-transfers or external effects. No compensating automatic stop/relaunch is implied.
+Local admission is atomic; native application is not. The Store-only parent is `applied`
+when the transfer transaction commits, meaning admission rather than task completion.
+The retained parent result names each cancellation, claim/Goal/child transfer and admitted successor ID. Ordinary child
+command/turn readback distinguishes pending/applied/failed/unknown delivery. Only the
+brief SEND becoming `applied` releases successor dispatch; B's ordinary
+turn/FIFO gates still apply. Failed, rejected, cancelled or unknown brief commands
+leave successors queued. Automatic native loss/restart preserves these withheld rows,
+even when B becomes terminal. Owner may assert an unknown brief applied via
+`command.resolve`; the same Owner assertion is narrowly available for a failed
+handoff brief. It records `resolution_source=owner`, invents no native receipt and
+never resends input. Owner can instead withdraw each accepted/queued handoff input
+with `command.cancel`; dispatched/unknown input cannot be cancelled. Explicit
+generation/stop lifecycle cancellation keeps its ordinary no-effect semantics.
+The parent result updates only `brief_state` and `successor_gate` as delivery settles;
+its original transfer identities and component facts remain fixed. `command.children`
+provides each actual child outcome. Same-ID retry returns those same identities and
+current brief-gate readback, and never repeats Store transfers or external effects.
+No compensating automatic stop/relaunch is implied.
 
 ### Agent switch (design; not implemented)
 
@@ -373,10 +404,9 @@ exact Agent/generation/command binding and blocks handoff; retrying the operatio
 creates another Agent or repeats the launch. Interrupted transport is not proof that
 launch failed. The native process is never transplanted between harnesses or Agents.
 
-The next increment must settle the precise DTO selection limits and how the existing
-ordered-child gate holds later successor SENDs on a failed brief; it must also decide
-whether an explicit follow-up mutation can finish a definitely launched but not yet
-handed-off switch. These are unimplemented protocol choices, not hidden recovery paths.
+A definitely launched switch that has not handed off is completed by ordinary
+`swarm.handoff` to that existing B. No special finish mutation is introduced. Agent
+switch itself remains H3; it is not implemented or advertised by H2.
 
 ## Prompt guidance
 

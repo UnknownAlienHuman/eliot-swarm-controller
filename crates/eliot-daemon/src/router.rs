@@ -9,6 +9,7 @@ mod coordination;
 mod digests;
 mod discovery;
 mod goals;
+mod handoff;
 mod hierarchy;
 mod resolution;
 mod rules;
@@ -306,6 +307,8 @@ impl Router {
             "swarm.wait" => self.swarm_wait(&params, &principal).await,
             "swarm.digest" => self.swarm_digest(&params, &principal).await,
             "swarm.reparent" => self.swarm_reparent(&params, &principal).await,
+            "swarm.handoff" => self.swarm_handoff(&params, &principal).await,
+            "command.cancel" => self.command_cancel(&params, &principal).await,
             "project.get" => self.project_get(&params, &principal).await,
             "project.list" => self.project_list(&params, &principal).await,
             "profile.list" => self.profile_list(&params, &principal).await,

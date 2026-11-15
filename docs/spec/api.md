@@ -235,7 +235,8 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `turn.get` | implemented running/completed/unknown turn read |
 | `swarm.wait` | bounded wait over a frozen child command/turn set with all/any, timeout and honest per-entry outcomes |
 | `swarm.digest` | durable digest over a frozen child set delivering one coalesced parent mailbox result with the standard mail wake |
-| `command.resolve`, `turn.resolve` | constrained owner resolution of unknown outcomes; owner-only |
+| `command.resolve`, `turn.resolve` | constrained Owner resolution of unknown outcomes; failed handoff brief may be Owner-applied |
+| `swarm.handoff`, `command.cancel` | atomic task transfer to an existing Agent; Owner withdrawal of undispatched handoff input |
 | `command.children` | implemented scoped, paged child readback for a retained expansion |
 | `project.list/get` | owner-only read of registered project authority |
 | `rule.list/get/catch_up` | owner-only paged rule list (state, timer state, canonical definition), one rule read, and finite committed-history catch-up |
@@ -834,8 +835,9 @@ drain once no live process, turn or reader backs them: the drain receipt
 lists them as retained-unresolved instead (see the drain section).
 
 `command.resolve {id, command_id, as: applied|failed, reason}` requires the target
-command to be stored `unknown`; dispatched, queued, accepted, and terminal
-commands are refused with `bad_state`. `launch` and `resume` resolve as `failed`
+command to be stored `unknown`. The one additional Owner assertion is
+`failed -> applied` for an exact handoff brief; ordinary terminal commands,
+dispatched, queued and accepted commands refuse with `bad_state`. `launch` and `resume` resolve as `failed`
 only: `applied` is refused with `bad_state`, since an applied start without its
 Agent transition is inconsistent. The command keeps any committed turn
 association and gains no invented one — including a send whose native turn
@@ -923,13 +925,44 @@ swarm [--id ULID] reparent AGENT --parent MANAGER --generation N --parent-genera
 swarm [--id ULID] reparent --children-of MANAGER_A --parent MANAGER_B --generation N --parent-generation M
 ```
 
-`swarm.handoff` and `swarm.switch` are reserved design names and return `unsupported`
-today; they have no advertised DTO, CLI or MCP discovery entry. The next increment
-must connect their Owner operation to existing durable commands: explicit A/B
-generations, original-task command and selected undispatched SEND IDs for handoff;
-source generation plus normal profile/ad-hoc launch selectors for switch. The result
-must retain component outcomes and exact child IDs, including partial or unknown
-native delivery. No field catalog is promised before those DTOs are implemented.
+`swarm.handoff` implements the existing-Agent task transfer in
+[Coordination](coordination.md#task-handoff-to-an-existing-agent-implemented).
+[`HandoffRequest` / `HandoffResponse`](../../crates/eliot-core/src/api/handoff.rs)
+are the sole wire shapes. Owner names exact source/destination generations, one
+retained original-task SEND on A's generation, and at most 64 distinct plain
+accepted/queued SEND IDs in successor order (also subject to the configured
+selector-target bound). All current live claims, the transferable Eliot Goal
+(paused on B), and all children transfer together. Active/unknown turns, pending
+requests, dispatched/unknown commands, transitions or unresolved Goal rounds refuse;
+B must have no open work. When a Goal transfers, B may have only a cleared Goal. Same-project and shared re-parent
+invariants apply. No partial Store transfer commits.
+
+The result names the applied Store-only parent, brief/ordered child ULIDs,
+original/successor pairs, claims/conflicts, paused Goal revision, moved children,
+truncation, and current `brief_state`/`successor_gate`. The parent being applied
+means admission, not task success. `command.children` and exact command/turn reads
+retain native outcomes. The gate is `queued_until_brief_applied`,
+`queued_brief_failed` (including rejected/cancelled), `queued_brief_unknown`, or
+`released`. A released gate still observes ordinary turn/FIFO/generation fences.
+Retries return the same transfer identities before live/history/secret rebuild
+checks, with current gate readback; no uncertain effect is repeated.
+
+```text
+swarm [--id ULID] handoff A --to B --generation N --to-generation M --task-command TASK_SEND [SEND_ID...]
+swarm [--id ULID] cmd cancel HANDOFF_INPUT_ID
+```
+
+`command.cancel {id,command_id}` is Owner-only and implemented only for
+accepted/queued SEND children of a handoff. It atomically records no-effect
+cancellation and a retained mutation reply; ordinary, dispatched and unknown
+commands refuse. It never interrupts a native turn. `command.resolve` can release
+an unknown brief, or narrowly assert a failed handoff brief applied, without a
+resend. These Owner recovery operations remain available during drain. MCP
+advertises both mutations and mints omitted IDs using its normal rules.
+
+`swarm.switch` remains a reserved design name returning `unsupported`, with no
+CLI or discovery entry. A definitely launched but unfinished switch will use
+ordinary `swarm.handoff` to the created B; no finish mutation is planned.
 
 ## Waiting
 
@@ -1467,7 +1500,7 @@ swarm provider clear-hold SCOPE --corrective-evidence credentials_updated|config
 swarm plugin NAME | plugin-test ... | hook ... | mcp
 ```
 
-In particular, `cmd cancel` is not an implemented CLI form. `cmd show`,
+`cmd cancel` implements only undispatched handoff-input withdrawal. `cmd show`,
 `cmd children`, `cmd resolve`, and `turn resolve` are available; `turn show`
 remains unavailable. `swarm wait` implements only the frozen `--all`/`--any` set form
 above; single-target `--for turn|idle|stopped|goal` forms remain future (`agent.wait`).

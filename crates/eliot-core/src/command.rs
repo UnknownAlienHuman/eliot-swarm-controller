@@ -51,6 +51,13 @@ pub fn command_transition_allowed(from: CommandState, to: CommandState) -> bool 
     }
 }
 
+/// Narrow Owner assertion for a failed handoff brief. Store proves the brief
+/// identity and Owner principal; this never authorizes another native SEND.
+pub fn handoff_brief_resolution_allowed(from: CommandState, to: CommandState) -> bool {
+    command_transition_allowed(from, to)
+        || (from == CommandState::Failed && to == CommandState::Applied)
+}
+
 /// Existing pre-native workspace exceptions. The caller must prove the exact
 /// preparation marker, command verb and generation before using these edges.
 /// Unknown -> Accepted additionally needs verified creation readback proving the

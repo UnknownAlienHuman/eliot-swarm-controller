@@ -208,9 +208,14 @@ Read [coordination](spec/coordination.md). Use two Codex Agents initially.
       Codex Sol manager to Antigravity Argon manager, exact next-turn wait, scoped
       tree stop, old-manager rejection and individual return moves qualified on
       2026-11-15. [Handoff](spec/coordination.md#handoff) also designs task/Agent switch.
-- [ ] **H2 Task handoff and Agent switch.** Connect the designed quiescent queued-input,
-      claim/Goal/child transfer and launch-plus-handoff operations through ordinary
-      commands; resolve the remaining protocol choices in the owning Handoff section.
+- [x] **H2 Task handoff.** Atomic transfer to an existing Agent: selected queued SENDs,
+      bounded brief first, claims, paused Goal and children through ordinary commands.
+      Failed/unknown brief holds successors for explicit Owner recovery, never resend.
+      Qualified 2026-11-15: Codex Sol A to Antigravity Argon B, ordinary brief then
+      transferred task, no-effect original cancellation, exact claim expiry preserved,
+      same-ID replay without another turn, and active-source refusal.
+- [ ] **H3 Agent switch.** Connect launch-plus-handoff. A definitely created B is
+      finished through ordinary `swarm.handoff`; no special finish mutation.
 
 **Result:** two Agents exchange an actual message, share one variable and identify each
 other's file area without a manager relay. Codex/Luna and OpenCode/OpenRouter exchanged queued

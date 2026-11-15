@@ -370,6 +370,9 @@ fn replay_goal_round_tx(
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct GoalStatePersist {
+    /// Turns consumed before the current Agent baseline (task handoff).
+    #[serde(default)]
+    transferred_turns: i64,
     status: GoalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     paused_reason: Option<String>,
@@ -404,6 +407,131 @@ struct GoalRow {
     state: GoalStatePersist,
     last_round_key: Option<String>,
     updated_at: i64,
+}
+
+/// Keep definition/counters, clear A, and install B paused with a fresh turn baseline.
+pub(super) fn transfer_goal_tx(
+    tx: &Transaction<'_>,
+    from: &Agent,
+    to: &Agent,
+    policy: &core::SecretPolicy,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<Option<i64>> {
+    let from_num = parse_agent_id(&from.id)?;
+    let to_num = parse_agent_id(&to.id)?;
+    for num in [from_num, to_num] {
+        let unsettled: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM goal_markers WHERE agent=?1 AND state IN ('running','unknown'))",
+            [num], |row| row.get(0)).map_err(sql_error)?;
+        if unsettled {
+            return Err(Error::new(
+                "busy",
+                "handoff cannot transfer an unresolved Goal round",
+            ));
+        }
+    }
+    let Some(mut source) = load_goal_row_tx(tx, from_num, "eliot")? else {
+        return Ok(None);
+    };
+    if matches!(
+        source.state.status,
+        GoalStatus::Cleared | GoalStatus::Completed
+    ) {
+        return Ok(None);
+    }
+    if source.state.status == GoalStatus::Blocked {
+        return Err(Error::new(
+            "bad_state",
+            "blocked source Goal requires an explicit set or clear before handoff",
+        ));
+    }
+    let destination = load_goal_row_tx(tx, to_num, "eliot")?;
+    if destination
+        .as_ref()
+        .is_some_and(|row| row.state.status != GoalStatus::Cleared)
+    {
+        return Err(Error::new(
+            "bad_state",
+            "destination already has an Eliot Goal",
+        ));
+    }
+    if source.generation != from.generation {
+        return Err(Error::new(
+            "stale_generation",
+            "source Goal belongs to another generation",
+        ));
+    }
+    if let Some(id) = source.state.last_continuation_command_id.as_deref()
+        && load_command(tx, id)?.is_none_or(|command| {
+            matches!(
+                command.state,
+                CommandState::Accepted
+                    | CommandState::Queued
+                    | CommandState::Dispatched
+                    | CommandState::Unknown
+            )
+        })
+    {
+        return Err(Error::new("busy", "source Goal continuation is unresolved"));
+    }
+    if policy.contains_value(
+        &serde_json::to_value(&source.definition)
+            .map_err(|_| Error::new("internal", "cannot encode Goal"))?,
+    ) {
+        return Err(Error::new(
+            "secret_in_payload",
+            "Goal contains a known secret",
+        ));
+    }
+    source.state.counters.turns_used = source.state.counters.turns_used.max(
+        source.state.transferred_turns.saturating_add(
+            count_turns(tx, from_num, from.generation)?
+                .saturating_sub(source.state.counters.turns_at_set),
+        ),
+    );
+    let total_used = source.state.counters.turns_used;
+    let mut cleared = source.state.clone();
+    cleared.status = GoalStatus::Cleared;
+    cleared.paused_reason = None;
+    cleared.last_continuation_command_id = None;
+    tx.execute("UPDATE goals SET revision=?1,state=?2,last_round_key=NULL,updated_at=?3 WHERE agent=?4 AND mode='eliot'",
+        params![source.revision.checked_add(1).ok_or_else(||Error::new("bad_state","Goal revision overflow"))?,encode_json(&cleared)?,now,from_num]).map_err(sql_error)?;
+    let revision = destination
+        .map_or(Some(1), |row| row.revision.checked_add(1))
+        .ok_or_else(|| Error::new("bad_state", "Goal revision overflow"))?;
+    source.state.status = GoalStatus::Paused;
+    source.state.counters.last_observation = source
+        .state
+        .counters
+        .last_observation
+        .as_deref()
+        .map(|text| policy.redact_text(text));
+    source.state.paused_reason = Some("handoff_requires_explicit_resume".into());
+    source.state.transferred_turns = total_used;
+    source.state.counters.turns_at_set = count_turns(tx, to_num, to.generation)?;
+    source.state.last_committed_slot = None;
+    source.state.last_continuation_command_id = None;
+    source.state.cadence_anchor_ms = source.definition.cadence_ms.map(|_| now);
+    tx.execute("INSERT INTO goals(agent,mode,generation,revision,definition,state,last_round_key,updated_at)
+        VALUES (?1,'eliot',?2,?3,?4,?5,NULL,?6) ON CONFLICT(agent,mode) DO UPDATE SET
+        generation=excluded.generation,revision=excluded.revision,definition=excluded.definition,state=excluded.state,last_round_key=NULL,updated_at=excluded.updated_at",
+        params![to_num,to.generation,revision,encode_json(&source.definition)?,encode_json(&source.state)?,now]).map_err(sql_error)?;
+    for (num, generation, status) in [
+        (from_num, from.generation, "cleared"),
+        (to_num, to.generation, "paused"),
+    ] {
+        events.push(insert_daemon_event(
+            tx,
+            now,
+            "goal.changed",
+            "goal",
+            Some(num),
+            Some(generation),
+            json!({"status":status,"handoff_from":from.id,"handoff_to":to.id}),
+        )?);
+    }
+    Ok(Some(revision))
 }
 
 impl Store {
@@ -651,7 +779,7 @@ impl Store {
             row.state.counters.turns_at_set,
             row.state.counters.turns_used,
             row.state.last_continuation_command_id.as_deref(),
-            turn_count,
+            turn_count.saturating_add(row.state.transferred_turns),
         )?;
         let view = self.goal_view(row)?;
         let probe = GoalRoundProbe {
@@ -875,6 +1003,7 @@ impl Store {
             }
             let revision = row.revision + 1;
             let state = GoalStatePersist {
+                transferred_turns: 0,
                 status: GoalStatus::Active,
                 paused_reason: None,
                 blocked_reason: None,
@@ -908,6 +1037,7 @@ impl Store {
             return Ok(view);
         }
         let state = GoalStatePersist {
+            transferred_turns: 0,
             status: GoalStatus::Active,
             paused_reason: None,
             blocked_reason: None,
@@ -1049,6 +1179,7 @@ impl Store {
             goal_view_on(&tx, &goal_holder, row)?
         } else {
             let state = GoalStatePersist {
+                transferred_turns: row.state.transferred_turns,
                 status: GoalStatus::Cleared,
                 paused_reason: None,
                 blocked_reason: None,
@@ -1183,6 +1314,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         let state = GoalStatePersist {
+            transferred_turns: row.state.transferred_turns,
             status: GoalStatus::Paused,
             paused_reason: Some(reason.to_owned()),
             blocked_reason: row.state.blocked_reason.clone(),
@@ -1249,6 +1381,7 @@ impl Store {
         if row.generation != agent_row.generation {
             if row.state.status == GoalStatus::Active {
                 let state = GoalStatePersist {
+                    transferred_turns: row.state.transferred_turns,
                     status: GoalStatus::Paused,
                     paused_reason: Some("Agent generation advanced".to_owned()),
                     blocked_reason: row.state.blocked_reason.clone(),
@@ -1355,7 +1488,8 @@ impl Store {
             row.state.counters.turns_at_set,
             row.state.counters.turns_used,
             row.state.last_continuation_command_id.as_deref(),
-            count_turns_tx(&tx, agent_num, row.generation)?,
+            count_turns_tx(&tx, agent_num, row.generation)?
+                .saturating_add(row.state.transferred_turns),
         )?;
         if live_spent != expected_spent {
             return Err(Error::new(
@@ -1628,9 +1762,11 @@ impl Store {
         }
         let turn_count = count_turns_tx(&tx, agent_num, row.generation)?;
         let mut counters = row.state.counters.clone();
-        counters.turns_used = counters
-            .turns_used
-            .max(turn_count.saturating_sub(counters.turns_at_set));
+        counters.turns_used = counters.turns_used.max(
+            row.state
+                .transferred_turns
+                .saturating_add(turn_count.saturating_sub(counters.turns_at_set)),
+        );
         let mut admission: Option<Admission> = None;
         let outcome = if let Some(check) = &commit.check {
             counters.rounds += 1;
@@ -2024,9 +2160,11 @@ impl Store {
 fn goal_view_on(connection: &Connection, goal_holder: &str, row: GoalRow) -> Result<GoalView> {
     let turn_count = count_turns(connection, row.agent_num, row.generation)?;
     let mut counters = row.state.counters.clone();
-    counters.turns_used = counters
-        .turns_used
-        .max(turn_count.saturating_sub(counters.turns_at_set));
+    counters.turns_used = counters.turns_used.max(
+        row.state
+            .transferred_turns
+            .saturating_add(turn_count.saturating_sub(counters.turns_at_set)),
+    );
     let round_marker = display_goal_marker(
         connection,
         goal_holder,

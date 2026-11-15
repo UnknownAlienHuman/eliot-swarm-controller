@@ -142,6 +142,8 @@ pub(crate) enum CliCommand {
     Digest(DigestArgs),
     /// Move one Agent subtree, or all children, to another manager (Owner only).
     Reparent(ReparentArgs),
+    /// Transfer task inputs, claims, paused Goal and children to an existing Agent.
+    Handoff(HandoffArgs),
     /// Send, read or acknowledge addressed Agent mail.
     Msg(MsgArgs),
     /// Read one page of unread mail for a mailbox.
@@ -638,6 +640,21 @@ pub(crate) struct ReparentArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct HandoffArgs {
+    pub(crate) from: String,
+    #[arg(long)]
+    pub(crate) to: String,
+    #[arg(long, value_parser=clap::value_parser!(i64).range(1..))]
+    pub(crate) generation: i64,
+    #[arg(long, value_parser=clap::value_parser!(i64).range(1..))]
+    pub(crate) to_generation: i64,
+    #[arg(long)]
+    pub(crate) task_command: String,
+    /// Ordered accepted/queued SEND command ids, at most 64.
+    pub(crate) commands: Vec<String>,
+}
+
+#[derive(Args)]
 pub(crate) struct WaitArgs {
     /// Complete when every entry is terminal.
     #[arg(long, conflicts_with = "any")]
@@ -754,6 +771,8 @@ pub(crate) enum CmdCommand {
     Children(CmdChildrenArgs),
     /// Resolve an unknown command to its owner-asserted terminal state.
     Resolve(CmdResolveArgs),
+    /// Withdraw one undispatched handoff input with no native effect.
+    Cancel(CmdShowArgs),
 }
 
 #[derive(Args)]

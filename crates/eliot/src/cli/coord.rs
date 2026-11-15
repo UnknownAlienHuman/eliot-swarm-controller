@@ -34,6 +34,30 @@ pub(crate) async fn run_cmd(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     match command {
+        CmdCommand::Cancel(CmdShowArgs { id: command_id }) => {
+            let request = eliot_core::api::CommandCancelRequest {
+                id: mutation_id(id)?,
+                command_id,
+            };
+            request
+                .validate()
+                .map_err(|error| Failure::from_core(error, true))?;
+            let response: eliot_core::api::CommandCancelResponse =
+                eliot_daemon::client_call_typed(&data_dir, "command.cancel", &request)
+                    .await
+                    .map_err(|error| Failure::from_core(error, true))?;
+            if response.command_id != request.command_id
+                || response.state != eliot_core::CommandState::Cancelled
+            {
+                return Err(Failure::new(4, "cancel response binding differs"));
+            }
+            print_value(
+                &serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "invalid cancel response"))?,
+                json_output,
+            );
+            Ok(0)
+        }
         CmdCommand::Show(CmdShowArgs { id }) => {
             let params = CommandGetRequest::new(id);
             params
