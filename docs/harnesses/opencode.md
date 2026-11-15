@@ -264,12 +264,12 @@ CLI.
 
 Requested vs observed: `requested` carries `mcp_policy` (`inherit`
 always); `effective` carries `mcp_servers` (installed-inventory names, or
-`null` when the `GET /api/mcp` read fails) and `mcp_servers_verified`
+`null` when no `GET /api/mcp` query succeeds) and `mcp_servers_verified`
 (true only when the `eliot-swarm` entry reports `connected`). Only names
 and the status word are retained — never the failure text. The requested
 set is never echoed as observed. The applied per-Agent config document is
-the qualified record; the inventory observation is best-effort and never
-fails a start.
+the qualified record; the inventory observation is best-effort — re-polled
+until `connected`, a terminal refusal, or 20s — and never fails a start.
 
 ## Worker MCP policy
 
