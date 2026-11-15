@@ -354,8 +354,10 @@ impl Router {
                         InferenceState::Unknown,
                         None,
                     );
-                    self.mark_inference_unquiescent(&request.id);
-                    false
+                    // The result is uncertain, but quiescence is a recorded
+                    // fact: only run_inference_inner, from the actual
+                    // ProcessOutcome, ever marks a call unquiescent.
+                    !self.is_inference_unquiescent(&request.id)
                 }
             }
         } else {
@@ -627,7 +629,7 @@ impl Router {
             .is_some_and(|w| !w.is_finished());
         // Cleanup stays fenced until the process family exit is established;
         // an unproven family keeps its artifacts and cleanup debt.
-        if !active && !self.inference_quiescence_unproven(&request.call_id) {
+        if !active && !self.is_inference_unquiescent(&request.call_id) {
             let _ = self.cleanup_inference(client, &request.call_id).await;
         }
         Ok(result)
@@ -647,7 +649,7 @@ impl Router {
     fn clear_inference_quiescence(&self, id: &str) {
         self.inner.inference_unquiescent.lock_recover().remove(id);
     }
-    fn inference_quiescence_unproven(&self, id: &str) -> bool {
+    fn is_inference_unquiescent(&self, id: &str) -> bool {
         self.inner.inference_unquiescent.lock_recover().contains(id)
     }
     fn inference_dispatch_fenced(&self) -> bool {
@@ -656,7 +658,7 @@ impl Router {
     async fn cleanup_inference(&self, client: &str, id: &str) -> Result<()> {
         // Never mark cleanup complete on uncertainty: an unproven process
         // family may still hold native custody of these artifacts.
-        if self.inference_quiescence_unproven(id) {
+        if self.is_inference_unquiescent(id) {
             return Err(unknown());
         }
         for kind in ["input", "result"] {
@@ -725,6 +727,56 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(store)),
             Bus::new(16),
         )
+    }
+
+    fn text_request(call_id: &str) -> InferenceTextRequest {
+        InferenceTextRequest {
+            id: call_id.to_owned(),
+            profile: INFERENCE_PROFILE.to_owned(),
+            origin: "episode:1".to_owned(),
+            disclosure: InferenceDisclosure::ProviderAllowed,
+            text: "summarize".to_owned(),
+            input_sha256: inference_sha256(b"summarize"),
+            input_bytes: 9,
+            response_format: InferenceFormat::Text,
+            max_result_bytes: 1024,
+            deadline_ms: 30000,
+        }
+    }
+
+    async fn admit_call(router: &Router) -> (String, String) {
+        let client = format!("memory:{}", ulid::Ulid::new());
+        let call_id = ulid::Ulid::new().to_string();
+        let now = now_ms();
+        let mut store = router.inner.store.lock().await;
+        store
+            .inference_credential(
+                "inference.client.install",
+                &InferenceCredentialRequest {
+                    id: ulid::Ulid::new().to_string(),
+                    client_id: client.clone(),
+                    expected_version: 0,
+                },
+                &inference_sha256(b"quiescence-test-secret"),
+                &InferenceCredentialResponse {
+                    client_id: client.clone(),
+                    token_version: 1,
+                    credential_file: "private.json".to_owned(),
+                    phase: "active".to_owned(),
+                },
+                now,
+            )
+            .unwrap();
+        store
+            .inference_text(
+                &client,
+                1,
+                &text_request(&call_id),
+                &serde_json::json!({}),
+                now,
+            )
+            .unwrap();
+        (client, call_id)
     }
 
     #[tokio::test]
@@ -846,6 +898,81 @@ mod tests {
                 .unwrap()
                 .cleanup_complete
         );
+        std::fs::remove_dir_all(&data_root).ok();
+    }
+
+    #[tokio::test]
+    async fn prespawn_error_marks_unknown_without_any_fence() {
+        let data_root =
+            std::env::temp_dir().join(format!("eliot-inference-prespawn-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&data_root).unwrap();
+        let router = test_router(data_root.clone());
+        let (client, call_id) = admit_call(&router).await;
+        // No input artifact exists, so settlement fails before any process
+        // exists. Only run_inference_inner, from an actual ProcessOutcome,
+        // may ever mark a call unquiescent.
+        router
+            .run_inference(
+                client.clone(),
+                text_request(&call_id),
+                Route {
+                    claude_executable: PathBuf::from("unused-claude"),
+                },
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            )
+            .await;
+        assert_eq!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .inference_get(&client, &call_id)
+                .unwrap()
+                .state,
+            InferenceState::Unknown
+        );
+        assert!(!router.is_inference_unquiescent(&call_id));
+        assert!(!router.inference_dispatch_fenced());
+        std::fs::remove_dir_all(&data_root).ok();
+    }
+
+    #[tokio::test]
+    async fn proven_exit_survives_a_later_settlement_error() {
+        let data_root =
+            std::env::temp_dir().join(format!("eliot-inference-proven-exit-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&data_root).unwrap();
+        let router = test_router(data_root.clone());
+        let (client, call_id) = admit_call(&router).await;
+        // An earlier unproven sighting is superseded by the proven exit that
+        // run_inference_inner records via clear_inference_quiescence.
+        router.mark_inference_unquiescent(&call_id);
+        router.clear_inference_quiescence(&call_id);
+        // The later settlement error (missing input artifact, before any new
+        // process exists) must honor the recorded proof, not override it.
+        router
+            .run_inference(
+                client.clone(),
+                text_request(&call_id),
+                Route {
+                    claude_executable: PathBuf::from("unused-claude"),
+                },
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            )
+            .await;
+        assert_eq!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .inference_get(&client, &call_id)
+                .unwrap()
+                .state,
+            InferenceState::Unknown
+        );
+        assert!(!router.is_inference_unquiescent(&call_id));
+        assert!(!router.inference_dispatch_fenced());
         std::fs::remove_dir_all(&data_root).ok();
     }
 }
