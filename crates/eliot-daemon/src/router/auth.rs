@@ -28,6 +28,14 @@ impl Router {
         let payload = envelope
             .remove("_payload")
             .ok_or_else(|| Error::new("invalid", "daemon call is missing its payload"))?;
+        if let Some(timing) = envelope.remove("_timing")
+            && !timing.is_boolean()
+        {
+            return Err(Error::new(
+                "invalid",
+                "daemon timing option must be boolean",
+            ));
+        }
         if !envelope.is_empty() || !payload.is_object() {
             return Err(Error::new("invalid", "daemon call envelope is malformed"));
         }

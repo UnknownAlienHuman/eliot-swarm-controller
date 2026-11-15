@@ -46,6 +46,18 @@ and its response; the daemon bounds that write with `RESPONSE_WRITE_TIMEOUT`
 cannot hold its connection task past the deadline. An undelivered mutation result stays
 readable by exact retry; the daemon never replays the effect to deliver it.
 
+For local performance measurement the authentication envelope may additionally
+carry `_timing: true` (boolean only). The response then includes a nonsemantic
+top-level `_timing.handle_ns`: elapsed time from complete frame receipt through
+request decode, authentication and handler completion, excluding response encoding
+and transport. `client_call_measured` separately records connect, request/reply
+and JSON decode durations. Timings do not enter method DTOs, retained writes or
+acknowledgements; absent timing metadata means unmeasured, never zero backend time.
+On Windows a busy connect waits for pipe availability within the original call
+deadline instead of a fixed polling sleep. Availability never reserves a pipe:
+only the connect may repeat, before any request bytes are sent. Send/response
+failures retain their ordinary `unknown` outcome and never trigger a new call.
+
 Background `daemon` startup reports `starting`, then waits up to 30 s for
 `daemon.status` readiness and reports `ready` with the resolved data
 directory and boot id, or the logged `daemon.failed` code with its bounded

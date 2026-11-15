@@ -201,9 +201,7 @@ impl IpcStream {
 
         #[cfg(windows)]
         {
-            use std::time::Duration;
             use tokio::net::windows::named_pipe::ClientOptions;
-            use tokio::time::sleep_until;
             use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 
             loop {
@@ -218,9 +216,10 @@ impl IpcStream {
                 match ClientOptions::new().open(endpoint) {
                     Ok(client) => return Ok(IpcStream(Box::new(client))),
                     Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
-                        // Tokio's documented connect pattern: wait for the next
-                        // listener instance. No request bytes have been written.
-                        sleep_until((Instant::now() + Duration::from_millis(50)).min(until)).await;
+                        // Wake on actual availability rather than leaving the
+                        // writer idle during a fixed retry sleep. A wake does
+                        // not reserve an instance, so retry only this connect.
+                        super::windows::wait_pipe_available(endpoint, until).await?;
                     }
                     Err(error) => return Err(io_error("connect daemon named pipe", error)),
                 }

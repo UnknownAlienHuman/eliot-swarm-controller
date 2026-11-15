@@ -16,13 +16,51 @@ use eliot_core::{
         MailSendRequest, MailSendResponse, VarGetRequest, VarGetResponse, VarSetRequest,
     },
 };
+use eliot_plugin::sync::LockExt;
 use eliot_store::{MailSendOutcome, NoticeKind, NoticePending};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::{
-    sync::watch,
+    sync::{oneshot, watch},
     time::{Duration, MissedTickBehavior, interval},
 };
+
+pub(super) struct PendingVarWrite {
+    principal: String,
+    request: VarSetRequest,
+    reply: oneshot::Sender<Result<eliot_core::api::VarSetResponse>>,
+}
+
+#[derive(Default)]
+pub(super) struct VarWriteQueue {
+    pending: std::collections::VecDeque<PendingVarWrite>,
+    active: bool,
+    closed: bool,
+}
+
+struct VarWorkerGuard {
+    router: Router,
+    armed: bool,
+}
+
+impl Drop for VarWorkerGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut queue = self.router.inner.var_writes.lock_recover();
+        queue.closed = true;
+        queue.active = false;
+        for write in queue.pending.drain(..) {
+            let _ = write.reply.send(Err(Error::new(
+                "unknown",
+                "variable writer ended without a result",
+            )));
+        }
+        drop(queue);
+        self.router.signal_progress();
+    }
+}
 
 pub(super) fn decode_coordination_request<T>(
     params: &Value,
@@ -191,16 +229,108 @@ impl Router {
             VarSetRequest::validate,
         )?;
         let name = principal_name(principal);
-        let change = {
-            let mut store = self.inner.store.lock().await;
-            let change = store.var_set(&name, &request, now_ms())?;
-            self.publish_locked(&change.events);
-            change
-        };
-        self.signal_progress();
-        request.validate_response(&change.value)?;
-        serde_json::to_value(change.value)
+        let (reply, received) = oneshot::channel();
+        {
+            let mut pending = self.inner.var_writes.lock_recover();
+            if pending.closed {
+                return Err(Error::new(
+                    "unavailable",
+                    "variable write admission is closed",
+                ));
+            }
+            if pending.pending.len() >= eliot_store::MAX_VAR_WRITE_GROUP * 2 {
+                return Err(Error::new(
+                    "busy",
+                    "variable write queue is full; nothing admitted",
+                ));
+            }
+            pending.pending.push_back(PendingVarWrite {
+                principal: name,
+                request: request.clone(),
+                reply,
+            });
+            // One owned consumer for every queued group, including after caller
+            // cancellation. Queue admission and worker retirement share this lock.
+            if !pending.active {
+                // A shutdown joiner first closes admission under this same
+                // queue lock, so an open queue can always take this guard.
+                let mut worker = self
+                    .inner
+                    .var_worker
+                    .try_lock()
+                    .expect("open variable queue has no shutdown joiner");
+                let router = self.clone();
+                pending.active = true;
+                *worker = Some(tokio::spawn(async move {
+                    router.flush_var_writes().await;
+                }));
+            }
+        }
+        let response = received
+            .await
+            .map_err(|_| Error::new("unknown", "variable write result was not delivered"))??;
+        request.validate_response(&response)?;
+        serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "variable write could not be encoded"))
+    }
+
+    async fn flush_var_writes(&self) {
+        let mut failure = VarWorkerGuard {
+            router: self.clone(),
+            armed: true,
+        };
+        loop {
+            let mut store = self.inner.store.lock().await;
+            let pending: Vec<_> = {
+                let mut queue = self.inner.var_writes.lock_recover();
+                if queue.pending.is_empty() {
+                    queue.active = false;
+                    failure.armed = false;
+                    return;
+                }
+                let count = queue.pending.len().min(eliot_store::MAX_VAR_WRITE_GROUP);
+                queue.pending.drain(..count).collect()
+            };
+            let requests: Vec<_> = pending
+                .iter()
+                .map(|write| (write.principal.clone(), write.request.clone()))
+                .collect();
+            let results = store.var_set_group(&requests, now_ms());
+            // Publish all committed rows in Store order before another writer can
+            // publish a later sequence, then deliver each caller's own outcome.
+            for change in results.iter().filter_map(|result| result.as_ref().ok()) {
+                self.publish_locked(&change.events);
+            }
+            drop(store);
+            self.signal_progress();
+            for (write, result) in pending.into_iter().zip(results) {
+                let _ = write.reply.send(result.map(|change| change.value));
+            }
+        }
+    }
+
+    pub(crate) async fn finish_var_writes(&self) {
+        // Concurrent shutdown callers join the same completion boundary.
+        {
+            let mut queue = self.inner.var_writes.lock_recover();
+            queue.closed = true;
+        }
+        // Borrow the owned handle while joining: cancellation of a shutdown
+        // caller leaves the handle here for the daemon's final barrier.
+        let mut owned = self.inner.var_worker.lock().await;
+        if let Some(worker) = owned.as_mut()
+            && worker.await.is_err()
+        {
+            let mut queue = self.inner.var_writes.lock_recover();
+            queue.active = false;
+            for write in queue.pending.drain(..) {
+                let _ = write.reply.send(Err(Error::new(
+                    "unknown",
+                    "variable writer task ended without a result",
+                )));
+            }
+        }
+        owned.take();
     }
 
     pub(super) async fn var_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -379,6 +509,118 @@ mod tests {
             std::sync::Arc::new(AsyncMutex::new(store)),
             Bus::new(16),
         )
+    }
+
+    #[tokio::test]
+    async fn admitted_variable_write_survives_caller_cancellation() {
+        let router = router();
+        let store = router.inner.store.lock().await;
+        let mut progress = router.progress_receiver();
+        let child = router.clone();
+        let caller = tokio::spawn(async move {
+            child.var_set(&json!({"id":ulid::Ulid::new().to_string(), "scope":"global", "key":"cancelled-caller", "value":1}), &Principal::Owner).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while router.inner.var_writes.lock_recover().pending.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("admitted flush reaches the held Store lock");
+        caller.abort();
+        let _ = caller.await;
+        drop(store);
+        tokio::time::timeout(Duration::from_secs(5), progress.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let value = router
+            .var_get(
+                &json!({"scope":"global", "key":"cancelled-caller"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["value"], 1);
+    }
+
+    #[tokio::test]
+    async fn variable_shutdown_joins_one_worker_and_rejects_late_admission() {
+        let router = router();
+        let store = router.inner.store.lock().await;
+        let child = router.clone();
+        let write = tokio::spawn(async move {
+            child.var_set(&json!({"id":ulid::Ulid::new().to_string(), "scope":"global", "key":"drain", "value":1}), &Principal::Owner).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while router.inner.var_writes.lock_recover().pending.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let child = router.clone();
+        let finish = tokio::spawn(async move {
+            child.finish_var_writes().await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !router.inner.var_writes.lock_recover().closed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!finish.is_finished());
+        finish.abort();
+        let _ = finish.await;
+        let child = router.clone();
+        let finish = tokio::spawn(async move {
+            child.finish_var_writes().await;
+        });
+        assert_eq!(router.var_set(&json!({"id":ulid::Ulid::new().to_string(), "scope":"global", "key":"late", "value":1}), &Principal::Owner).await.unwrap_err().code, "unavailable");
+        drop(store);
+        assert_eq!(write.await.unwrap().unwrap()["version"], 1);
+        finish.await.unwrap();
+        let queue = router.inner.var_writes.lock_recover();
+        assert!(queue.pending.is_empty());
+        assert!(!queue.active);
+        assert!(router.inner.var_worker.try_lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_variable_consumer_closes_admission_and_releases_waiters() {
+        let router = router();
+        let (reply, received) = oneshot::channel();
+        {
+            let mut queue = router.inner.var_writes.lock_recover();
+            queue.active = true;
+            queue.pending.push_back(PendingVarWrite {
+                principal: "owner".to_owned(),
+                request: VarSetRequest {
+                    id: ulid::Ulid::new().to_string(),
+                    scope: Some("global".to_owned()),
+                    key: "aborted".to_owned(),
+                    value: json!(1),
+                    expect_version: None,
+                    note: None,
+                },
+                reply,
+            });
+        }
+        let failure = VarWorkerGuard {
+            router: router.clone(),
+            armed: true,
+        };
+        let failed = tokio::spawn(async move {
+            let _failure = failure;
+            panic!("consumer failure");
+        });
+        assert!(failed.await.is_err());
+        assert_eq!(received.await.unwrap().unwrap_err().code, "unknown");
+        assert_eq!(router.var_set(&json!({"id":ulid::Ulid::new().to_string(), "scope":"global", "key":"late", "value":1}), &Principal::Owner).await.unwrap_err().code, "unavailable");
+        let queue = router.inner.var_writes.lock_recover();
+        assert!(queue.closed && !queue.active && queue.pending.is_empty());
     }
 
     async fn ready_agent(router: &Router, project: &str) -> String {

@@ -130,6 +130,7 @@ mod attribution;
 mod command_children;
 mod context;
 mod coordination;
+pub use coordination::MAX_VAR_WRITE_GROUP;
 mod digests;
 mod dispatch;
 mod git;
