@@ -41,14 +41,15 @@ use crate::native::{
         NativeApprovalUpdatedNotification, NativeHistoryNoneReason, NativeItem,
         NativeItemCompletedNotification, NativeItemReadOutputParams, NativeItemReadOutputResult,
         NativeItemStartedNotification, NativePatchRef, NativeSessionClosedNotification,
-        NativeSessionContextUsageNotification, NativeSessionStartedNotification,
-        NativeSessionTokenUsageNotification, NativeSessionViewHealthChangedNotification,
-        NativeTurnCompletedNotification, NativeTurnError, NativeTurnStartedNotification,
-        NativeTurnTerminal, NativeUnframedViewEvent, NativeUserInputAnswerResult,
-        NativeUserInputCancelResult, NativeUserInputSettledNotification, NativeViewHealth,
-        NativeViewPageParams, NativeViewPageResult, NativeViewSubscribeParams,
-        NativeViewSubscribeResult, NativeWorkflowChild, NativeWorkflowItemNotification,
-        session_usage_from_context_usage, session_usage_from_token_usage, turn_usage,
+        NativeSessionContextUsageNotification, NativeSessionReadParams, NativeSessionReadResult,
+        NativeSessionStartedNotification, NativeSessionTokenUsageNotification,
+        NativeSessionViewHealthChangedNotification, NativeTurnCompletedNotification,
+        NativeTurnError, NativeTurnStartedNotification, NativeTurnTerminal,
+        NativeUnframedViewEvent, NativeUserInputAnswerResult, NativeUserInputCancelResult,
+        NativeUserInputSettledNotification, NativeViewHealth, NativeViewPageParams,
+        NativeViewPageResult, NativeViewSubscribeParams, NativeViewSubscribeResult,
+        NativeWorkflowChild, NativeWorkflowItemNotification, session_usage_from_context_usage,
+        session_usage_from_token_usage, turn_usage,
     },
 };
 
@@ -2269,6 +2270,32 @@ impl EventProcessor {
                 }
             }
             "turn/completed" => {
+                if needs_terminal_fence(&self.status, &params) {
+                    if !self.status.view_unavailable {
+                        let session_id = self.status.session_id.clone().unwrap_or_default();
+                        let turn_id = self.status.active_turn_id.clone().unwrap_or_default();
+                        if self.projection_turn_state(&session_id, &turn_id).await
+                            == ProjectionTurnState::Idle
+                            && self.recover_projection_terminal().await
+                        {
+                            return Ok(());
+                        }
+                        self.view_unavailable(&session_id, NativeHistoryNoneReason::Unknown)
+                            .await?;
+                    }
+                    // Replay from the same unavailable projection needs the
+                    // same command-plane fence as private page readback. An
+                    // error also prevents marking this cursor applied.
+                    self.view_recovery = Some(ViewRecovery {
+                        head: None,
+                        head_seen: false,
+                        deadline: Instant::now(),
+                    });
+                    return Err(Error::new(
+                        "native_readback",
+                        "Muse unavailable-view terminal requires command-plane confirmation",
+                    ));
+                }
                 self.complete_turn(params, false).await?;
             }
             "session/tokenUsage" => {
@@ -3853,7 +3880,8 @@ impl EventProcessor {
                 .read_recovery_page(session_id, cursor.clone())
                 .await
                 .ok()?;
-            for event in &page.events {
+            // Backward pages still contain ascending events on the wire.
+            for event in page.events.iter().rev() {
                 match fold_recovery_event(&mut scan, event, session_id, turn_id) {
                     RecoveryFold::Complete => {
                         return scan
@@ -3939,10 +3967,10 @@ impl EventProcessor {
         true
     }
 
-    /// Settle the projection-gapped turn: first attempt durable recovery of
-    /// the exact terminal from the retained view, and only then settle
-    /// `unknown` through the shared turn-unknown path, never as success or
-    /// failure. The plugin host stays alive and the Agent is not marked lost:
+    /// Recheck a projection-gapped turn. The command plane can prove it still
+    /// running; only explicit idle permits a fresh terminal scan. An unproven
+    /// state/outcome settles `unknown` through the shared turn-unknown path.
+    /// The plugin host stays alive and the Agent is not marked lost:
     /// only the active turn is cleared, so a later replayed terminal for the
     /// same turn gaps instead of resurrecting it, and a later stop settles
     /// the session normally. Idempotent: with no active turn there is nothing
@@ -3958,21 +3986,35 @@ impl EventProcessor {
         ) else {
             return;
         };
-        // The live view is lost, but the durable view may still hold the
-        // exact terminal: page it before giving the turn up for unknown. A
-        // proven terminal commits through the exact live shapes with the real
-        // final message and retires recovery; only an unproven terminal
-        // settles unknown below.
-        if self.recover_projection_terminal().await {
-            return;
+        let session_id = self.status.session_id.clone().unwrap_or_default();
+        // An unavailable projection can synthesize a failed terminal for an
+        // unfinished source prefix while the native run continues. The owned
+        // host's command plane must prove this exact turn no longer running
+        // before a fresh page can supply terminal evidence.
+        match self.projection_turn_state(&session_id, &turn_id).await {
+            ProjectionTurnState::Running => {
+                self.view_recovery = Some(ViewRecovery {
+                    head: None,
+                    head_seen: false,
+                    deadline: Instant::now() + EVENT_DEADLINE,
+                });
+                return;
+            }
+            ProjectionTurnState::Idle => {
+                if self.recover_projection_terminal().await {
+                    return;
+                }
+            }
+            ProjectionTurnState::Unproven => {}
         }
+        // Neither the command plane nor a fresh idle-time scan supplied a
+        // proven terminal. Preserve uncertainty instead of a projected verdict.
         let reason_label = self
             .status
             .view_unavailable_reason
             .map(|reason| reason.label().to_owned())
             .unwrap_or_else(|| "unknown".to_owned());
         let reason = format!("{MUSE_VIEW_UNKNOWN_REASON_PREFIX} ({reason_label})");
-        let session_id = self.status.session_id.clone().unwrap_or_default();
         let data = json!({
             "command_id": command_id.clone(),
             "turn_id": turn_id.clone(),
@@ -3999,6 +4041,42 @@ impl EventProcessor {
         }
         self.status.failure = Some(reason);
         self.clear_projection_gap_turn(&command_id, &turn_id);
+    }
+
+    /// One bounded, read-only command-plane observation, independent of the
+    /// unavailable history envelope. It never supplies a terminal outcome.
+    async fn projection_turn_state(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> ProjectionTurnState {
+        let params = NativeSessionReadParams {
+            session_id: session_id.to_owned(),
+            exclude_items: Some(true),
+        };
+        let Ok(params) = serde_json::to_value(params) else {
+            return ProjectionTurnState::Unproven;
+        };
+        let Ok(result) = self
+            .native
+            .call(
+                "session/read",
+                params,
+                Instant::now() + RECOVERY_PAGE_DEADLINE,
+            )
+            .await
+        else {
+            return ProjectionTurnState::Unproven;
+        };
+        let state = projection_turn_state(&result, session_id, turn_id);
+        if let Ok(readback) = serde_json::from_value::<NativeSessionReadResult>(result)
+            && readback.session.session_id == session_id
+            && let Some(reason) = readback.history.unavailable_reason()
+            && self.view_unavailable(session_id, reason).await.is_err()
+        {
+            return ProjectionTurnState::Unproven;
+        }
+        state
     }
 
     fn clear_projection_gap_turn(&mut self, command_id: &str, turn_id: &str) {
@@ -4207,6 +4285,46 @@ fn should_arm_recovery_after_associate(status: &EventStatus, has_recovery: bool)
 struct RecoveryScan {
     turn_params: Option<Value>,
     message_params: Option<Value>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProjectionTurnState {
+    Running,
+    Idle,
+    Unproven,
+}
+
+fn needs_terminal_fence(status: &EventStatus, params: &Value) -> bool {
+    let Ok(terminal) = serde_json::from_value::<NativeTurnCompletedNotification>(params.clone())
+    else {
+        return false;
+    };
+    status.session_id.as_deref() == Some(terminal.session_id.as_str())
+        && status.active_turn_id.as_deref() == Some(terminal.turn_id.as_str())
+        && (status.view_unavailable
+            || terminal.terminal == NativeTurnTerminal::Failed && terminal.error.is_none())
+}
+
+/// The installed Session.activeTurnId is required-nullable. Check presence
+/// before decoding Option<String>, so omission never becomes idle proof.
+fn projection_turn_state(result: &Value, session_id: &str, turn_id: &str) -> ProjectionTurnState {
+    let Some(active) = result
+        .get("session")
+        .and_then(|session| session.get("activeTurnId"))
+    else {
+        return ProjectionTurnState::Unproven;
+    };
+    let Ok(readback) = serde_json::from_value::<NativeSessionReadResult>(result.clone()) else {
+        return ProjectionTurnState::Unproven;
+    };
+    if readback.session.session_id != session_id {
+        return ProjectionTurnState::Unproven;
+    }
+    match (readback.session.status.as_str(), active) {
+        ("running", Value::String(active)) if active == turn_id => ProjectionTurnState::Running,
+        ("idle", Value::Null) => ProjectionTurnState::Idle,
+        _ => ProjectionTurnState::Unproven,
+    }
 }
 
 /// One recovery-fold step over a single durable view record.
@@ -5633,6 +5751,92 @@ mod tests {
             &latched_no_turn,
             false
         ));
+    }
+
+    fn projection_session_read(status: &str, active: Value) -> Value {
+        json!({
+            "session": {"sessionId": "session-1", "status": status, "activeTurnId": active},
+            "history": {"mode": "none", "noneReason": "projectionUnavailable", "items": null, "snapshot": null},
+            "viewCursor": "cursor-1",
+        })
+    }
+
+    #[test]
+    fn projection_terminal_waits_for_the_exact_running_turn() {
+        // A page can contain a synthetic failed/incomplete for a source
+        // prefix while the same native run still produces tools/model steps.
+        let mut result = projection_session_read("running", json!("turn-1"));
+        assert_eq!(
+            projection_turn_state(&result, "session-1", "turn-1"),
+            ProjectionTurnState::Running
+        );
+        result["session"]["activeTurnId"] = json!("other-turn");
+        assert_eq!(
+            projection_turn_state(&result, "session-1", "turn-1"),
+            ProjectionTurnState::Unproven
+        );
+        result["session"]["activeTurnId"] = Value::Null;
+        assert_eq!(
+            projection_turn_state(&result, "session-1", "turn-1"),
+            ProjectionTurnState::Unproven
+        );
+        result["session"]["status"] = json!("idle");
+        // Idle permits fresh paging; this predicate supplies no verdict.
+        assert_eq!(
+            projection_turn_state(&result, "session-1", "turn-1"),
+            ProjectionTurnState::Idle
+        );
+        result["session"]["sessionId"] = json!("foreign-session");
+        assert_eq!(
+            projection_turn_state(&result, "session-1", "turn-1"),
+            ProjectionTurnState::Unproven
+        );
+    }
+
+    #[test]
+    fn projection_idle_proof_requires_explicit_null_and_a_loaded_session() {
+        let mut result = projection_session_read("idle", Value::Null);
+        result["session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("activeTurnId");
+        assert_eq!(
+            projection_turn_state(&result, "session-1", "turn-1"),
+            ProjectionTurnState::Unproven
+        );
+        result["session"]["activeTurnId"] = json!(false);
+        assert_eq!(
+            projection_turn_state(&result, "session-1", "turn-1"),
+            ProjectionTurnState::Unproven
+        );
+        result = projection_session_read("notLoaded", Value::Null);
+        assert_eq!(
+            projection_turn_state(&result, "session-1", "turn-1"),
+            ProjectionTurnState::Unproven
+        );
+    }
+
+    #[test]
+    fn synthetic_failure_requires_confirmation_even_without_a_health_push() {
+        let mut status = EventStatus {
+            session_id: Some("session-1".to_owned()),
+            active_turn_id: Some("turn-1".to_owned()),
+            ..EventStatus::default()
+        };
+        let mut terminal = json!({
+            "sessionId": "session-1", "turnId": "turn-1", "viewCursor": "cursor-1",
+            "terminal": "failed", "reason": "incomplete",
+        });
+        assert!(needs_terminal_fence(&status, &terminal));
+        terminal["error"] = json!({"kind": "internal", "message": "failed", "retryable": false});
+        assert!(!needs_terminal_fence(&status, &terminal));
+        terminal["terminal"] = json!("completed");
+        terminal.as_object_mut().unwrap().remove("error");
+        assert!(!needs_terminal_fence(&status, &terminal));
+        status.view_unavailable = true;
+        assert!(needs_terminal_fence(&status, &terminal));
+        terminal["turnId"] = json!("foreign-turn");
+        assert!(!needs_terminal_fence(&status, &terminal));
     }
 
     #[test]

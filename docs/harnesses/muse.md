@@ -170,18 +170,35 @@ exact session/turn/command binding as live delivery; a replayed cursor that was
 already applied skips normalization instead of committing twice. Only a
 successfully processed cursor after the observed subscription head, followed by
 acknowledged `ok` source health, can restore live observation; the historical
-gap stays visible. An actual replayed terminal can complete the exact turn while
-source health remains stale. An interrupt refused during the gap names the
+gap stays visible. A terminal replayed while the view remains unavailable
+requires the same command-plane fence and fresh scan described below. An
+interrupt refused during the gap names the
 unavailable-view reason explicitly.
+An exact failed terminal without a structured native error requires the same
+fence even if the best-effort health push is missing. Such synthesized
+host-death/prefix failures do not prove the run stopped. Their free-text
+reason is display-only; the adapter never branches on `incomplete` text.
+An idle, healthy readback can confirm a genuine errorless failure without
+recording a gap. Unavailable readback history, a contradictory running turn,
+or an unproven outcome retains explicit degraded coverage.
 When the recovery window expires without live proof (or recovery cannot be
-attempted), the adapter first pages the retained view backward (at most four
-`view/page` reads of up to 1000 events, newest first) for the exact active
+attempted), one bounded `session/read` first checks the owned host's command
+plane, independently of its unavailable history. An exact-session `running`
+response naming the exact active turn preserves that binding and schedules
+another bounded read after the recovery interval. A view reconstructed from
+an unfinished source prefix can contain a synthetic failed terminal while
+the native run continues; it is not sufficient terminal proof. Each retry
+requires a new exact running observation; a timer alone never renews it.
+Only explicit `idle` with a present-null `activeTurnId` permits a fresh scan
+of the retained view backward (at most four `view/page` reads of up to 1000
+events, reversed within each ascending wire page) for the exact active
 turn's durable terminal and final `agentMessage`. A proven terminal commits
 through the exact live shapes (`message.completed` with the real final
 message, then `turn.completed`), marks those records applied so a later live
 replay of the same revision skips instead of recommitting, retires the
 recovery deadline, and keeps the recorded gap and stale health latched. Only
-when no bounded page proves the terminal does the adapter settle the active
+when the command-plane observation is unproven or no fresh idle-time page
+proves the terminal does the adapter settle the active
 turn `unknown` with the recorded gap through the shared turn-unknown path
 (`turn.unknown` with the exact command/turn binding and the gap reason),
 never as success or failure. The turn binding clears only after that terminal
