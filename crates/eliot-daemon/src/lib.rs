@@ -18,7 +18,7 @@ mod plugin_host;
 mod proxy;
 mod redaction;
 mod restart_capacity;
-pub mod router;
+mod router;
 pub(crate) mod scripts;
 mod setup;
 #[cfg(test)]

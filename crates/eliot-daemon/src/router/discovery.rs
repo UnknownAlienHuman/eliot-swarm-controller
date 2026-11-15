@@ -220,12 +220,7 @@ pub fn mutation_id_methods() -> &'static [&'static str] {
 /// Whether `name` is a mutation method whose request DTO carries a
 /// caller-retained `id`. Same derivation as [`mutation_id_methods`].
 pub fn is_mutation_id_method(name: &str) -> bool {
-    for method in mutation_id_methods() {
-        if *method == name {
-            return true;
-        }
-    }
-    false
+    mutation_id_methods().contains(&name)
 }
 
 fn request_takes_id(method: &Method) -> bool {
