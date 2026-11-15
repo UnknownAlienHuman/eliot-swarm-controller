@@ -998,8 +998,10 @@ impl DesktopApp {
             );
         // Reactor 0.100.0 cannot tell whether the transcript is scrolled to
         // the bottom (no offset, extent or ViewChanged), so the chip shows
-        // whenever there is history, floating over the transcript's bottom
-        // edge, outside the composer.
+        // whenever there is history. It has its own row between the
+        // transcript and the composer, right-aligned with the composer, so
+        // it never covers a message and the transcript's last item stays
+        // fully visible.
         let jump: View = if self.chat.items.is_empty() {
             View::empty()
         } else {
@@ -1008,14 +1010,18 @@ impl DesktopApp {
             } else {
                 "Jump to latest".to_owned()
             };
-            m3::tonal(palette)
-                .grid_row(1)
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .vertical_alignment(VerticalAlignment::Bottom)
-                .margin(Thickness::new(0.0, 0.0, 0.0, theme::spacing::SM))
-                .automation_name(label.clone())
-                .on_click(context.message(Message::Chat(ChatMsg::JumpToLatest)))
-                .content(m3::icon_label(m3::glyph::ARROW_DOWN, &label))
+            Border::new()
+                .grid_row(2)
+                .max_width(theme::layout::READING_WIDTH)
+                .horizontal_alignment(HorizontalAlignment::Stretch)
+                .margin(Thickness::new(gutter, theme::spacing::SM, gutter, 0.0))
+                .content(
+                    m3::tonal(palette)
+                        .horizontal_alignment(HorizontalAlignment::Right)
+                        .automation_name(label.clone())
+                        .on_click(context.message(Message::Chat(ChatMsg::JumpToLatest)))
+                        .content(m3::icon_label(m3::glyph::ARROW_DOWN, &label)),
+                )
         };
 
         let pending_rows: Vec<KeyedView> = self
@@ -1086,7 +1092,7 @@ impl DesktopApp {
             })
             .collect();
         let pending = StackPanel::new()
-            .grid_row(2)
+            .grid_row(3)
             .spacing(theme::spacing::SM)
             .max_width(theme::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Stretch)
@@ -1098,7 +1104,7 @@ impl DesktopApp {
             View::empty()
         } else {
             Border::new()
-                .grid_row(3)
+                .grid_row(4)
                 .max_width(theme::layout::READING_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Stretch)
                 .margin(Thickness::new(gutter, theme::spacing::SM, gutter, 0.0))
@@ -1198,7 +1204,7 @@ impl DesktopApp {
                 _ => View::empty(),
             };
         let composer_card = Border::new()
-            .grid_row(4)
+            .grid_row(5)
             .background(palette.surface_container_high())
             .corner_radius(theme::shape::XL)
             .padding(Thickness::uniform(theme::spacing::SM))
@@ -1230,6 +1236,7 @@ impl DesktopApp {
             .rows([
                 GridLength::Auto,
                 GridLength::STAR,
+                GridLength::Auto,
                 GridLength::Auto,
                 GridLength::Auto,
                 GridLength::Auto,

@@ -43,6 +43,13 @@ const HIGH_CONTRAST_POLL_MS: u64 = 2_000;
 const PRIME_RETRY_MS: u64 = 16;
 /// Indent per tree level in the Agent list.
 const TREE_INDENT: f64 = 16.0;
+/// The expand chevron button: FontIcon's 20-DIP glyph inside WinUI's fixed
+/// button padding (11, 5, 11, 6) shows whole at 44 x 32.
+const CHEVRON_BUTTON: (f64, f64) = (44.0, 32.0);
+/// WinUI draws a Button's focus visual 3 DIP outside its bounds
+/// (`FocusVisualMargin` -3), and Reactor 0.100.0 cannot change that, so the
+/// chevron column holds the button plus that margin and 1 DIP on each side.
+const CHEVRON_COLUMN: f64 = CHEVRON_BUTTON.0 + 2.0 * 4.0;
 
 fn window_theme(choice: ThemeChoice) -> WindowTheme {
     match choice {
@@ -889,9 +896,6 @@ fn nav_row(row: &Row, context: &mut ViewContext<DesktopApp>, palette: Palette) -
     // row takes the list's fixed inner width to right-align the chip.
     let row_width = theme::layout::LIST_WIDTH - 2.0 * theme::spacing::LG - 40.0;
     let indent = row.depth as f64 * TREE_INDENT;
-    // FontIcon's 20-DIP glyph inside WinUI's fixed button padding (11, 5,
-    // 11, 6): 44 x 32 shows it whole.
-    let (chevron_width, chevron_height) = (44.0, 32.0);
     let chevron: View = if row.expandable() {
         let (glyph, name) = if row.expanded {
             (
@@ -905,9 +909,9 @@ fn nav_row(row: &Row, context: &mut ViewContext<DesktopApp>, palette: Palette) -
             )
         };
         m3::icon_button(palette)
-            .grid_column(1)
-            .width(chevron_width)
-            .height(chevron_height)
+            .width(CHEVRON_BUTTON.0)
+            .height(CHEVRON_BUTTON.1)
+            .horizontal_alignment(HorizontalAlignment::Center)
             .vertical_alignment(VerticalAlignment::Center)
             .automation_name(name)
             .on_click(context.message(Message::Shell(ShellMsg::ExpandToggled(
@@ -926,19 +930,23 @@ fn nav_row(row: &Row, context: &mut ViewContext<DesktopApp>, palette: Palette) -
         }
         _ => {}
     }
+    // Every row reserves the chevron column, leaf or not, and its level
+    // indent sits before it, so names of one level align and each level
+    // starts one indent further in; the name never shares the chevron's
+    // column or its focus visual.
     let main = Grid::new()
         .grid_row(1)
+        .margin(Thickness::new(indent, 0.0, 0.0, 0.0))
         .columns([
-            GridLength::Pixel(indent),
-            GridLength::Pixel(chevron_width),
+            GridLength::Pixel(CHEVRON_COLUMN),
             GridLength::STAR,
             GridLength::Auto,
         ])
-        .column_spacing(theme::spacing::XS)
+        .column_spacing(theme::spacing::SM)
         .children((
             chevron,
             StackPanel::new()
-                .grid_column(2)
+                .grid_column(1)
                 .spacing(2.0)
                 .vertical_alignment(VerticalAlignment::Center)
                 .children((
@@ -947,7 +955,7 @@ fn nav_row(row: &Row, context: &mut ViewContext<DesktopApp>, palette: Palette) -
                         .text_trimming(TextTrimming::CharacterEllipsis),
                 )),
             Border::new()
-                .grid_column(3)
+                .grid_column(2)
                 .content(m3::status_chip(palette, &agent.state)),
         ));
     let caption: View = match &row.group {
