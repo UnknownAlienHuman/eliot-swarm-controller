@@ -479,6 +479,9 @@ impl Component for DesktopApp {
                 selected: None,
                 published: 0,
                 reparent_status: String::new(),
+                confirm_force: None,
+                on_screen: Vec::new(),
+                applied_at: 0,
             },
             automation: automation_ui::AutomationState {
                 rules: Vec::new(),

@@ -1,27 +1,42 @@
 //! WinUI pane for the swarm monitor.
 //!
 //! Native controls only: a `ListView` of attention-first rows, text
-//! counters, and two small bar sparklines built from `Border`s with numeric
-//! labels beside them (a native bar sparkline; no canvas). Control buttons
-//! are real `Button`s whose messages already carry the Agent, generation
-//! and turn shown on screen, so a click acts on exactly what was displayed.
+//! counters, and two bar charts built from `Border`s (CPU and RSS, each with
+//! its latest value and a labelled scale; no canvas). Control buttons are
+//! real `Button`s whose messages already carry the Agent, generation and
+//! turn shown on screen, so a click acts on exactly what was displayed. Only
+//! the actions that apply to the shown Agent appear; Force stop asks for an
+//! inline confirmation bound to the Agent and generation of its first click.
 
 use windows_reactor::*;
 
 use crate::monitor::{
-    self, DetailRead, GRAPH_BARS, Monitor, MonitorRow, Point, bytes_label, cpu_time_label,
-    state_name, tokens_label,
+    self, DetailRead, GRAPH_BARS, Monitor, MonitorRow, bytes_label, cpu_time_label, state_name,
+    tokens_label,
 };
 use crate::theme;
 use crate::theme::winui::Palette;
 
-/// Messages the pane emits, prepared by the screen with their bindings.
+/// Messages the pane emits, prepared by the screen with their bindings. A
+/// `None` action does not apply to the shown Agent and is not offered.
 pub struct MonitorActions {
     pub select: Callback<Option<usize>>,
     pub open: Option<Callback<()>>,
     pub interrupt: Option<Callback<()>>,
     pub stop: Option<Callback<()>>,
+    /// Asks for the Force stop confirmation.
     pub force_stop: Option<Callback<()>>,
+    /// The pending Force stop confirmation, if one was asked.
+    pub confirm_force: Option<ForceConfirm>,
+    pub resume: Option<Callback<()>>,
+    pub detach: Option<Callback<()>>,
+}
+
+/// The inline Force stop confirmation: what it stops, and both answers.
+pub struct ForceConfirm {
+    pub question: String,
+    pub confirm: Callback<()>,
+    pub cancel: Callback<()>,
 }
 
 /// The "Change manager" section of the selected Agent.
@@ -110,54 +125,124 @@ fn row_view(row: &MonitorRow, palette: Palette) -> View {
         )
 }
 
-/// Native bar sparkline: one `Border` per point, unknown points drawn as a
-/// faint stub so gaps stay visible.
-fn sparkline(
-    points: &[&Point],
-    value: impl Fn(&Point) -> Option<f64>,
-    max_hint: f64,
-    palette: Palette,
+/// Plot height in DIPs; the bars stretch across the card width.
+const PLOT_HEIGHT: f64 = 64.0;
+/// Smallest CPU scale in percent, so a near-idle series is not drawn full
+/// height.
+const CPU_FLOOR_PERCENT: f64 = 5.0;
+const MIB: f64 = 1024.0 * 1024.0;
+
+/// Smallest value of the 1-2-2.5-5 x 10^n sequence that is >= `max`; 1.0
+/// for a non-finite or non-positive input.
+fn nice_ceiling(max: f64) -> f64 {
+    if !max.is_finite() || max <= 0.0 {
+        return 1.0;
+    }
+    let first = max.log10().floor() as i32 - 1;
+    (first..first + 3)
+        .flat_map(|exponent| [1.0, 2.0, 2.5, 5.0].map(|mantissa| scaled(mantissa, exponent)))
+        .find(|candidate| *candidate >= max)
+        .unwrap_or(max)
+}
+
+/// `mantissa * 10^exponent`, dividing for negative exponents so that
+/// 2 * 10^-1 is exactly the double written as `0.2`.
+fn scaled(mantissa: f64, exponent: i32) -> f64 {
+    let power = 10f64.powi(exponent.abs());
+    if exponent >= 0 {
+        mantissa * power
+    } else {
+        mantissa / power
+    }
+}
+
+/// CPU scale in percent: the nice ceiling of the observed maximum, at least
+/// 5%.
+fn cpu_ceiling(max: f64) -> f64 {
+    nice_ceiling(max).max(CPU_FLOOR_PERCENT)
+}
+
+/// RSS scale in bytes: a nice number of MiB (so the caption reads "250
+/// MiB", not "477 MiB"), at least 1 MiB.
+fn rss_ceiling(max_bytes: f64) -> f64 {
+    nice_ceiling(max_bytes / MIB).max(1.0) * MIB
+}
+
+/// Largest known value of a series, or 0 when every point is unknown.
+fn observed_max(values: &[Option<f64>]) -> f64 {
+    values.iter().flatten().copied().fold(0.0, f64::max)
+}
+
+/// The latest CPU value for the chart header: one decimal below 10%.
+fn cpu_latest_label(cpu: Option<f64>) -> String {
+    match cpu {
+        None => "—".to_owned(),
+        Some(cpu) if cpu < 10.0 => format!("{cpu:.1}%"),
+        Some(cpu) => format!("{cpu:.0}%"),
+    }
+}
+
+/// One metric card: the title and its latest value on one row, the bars in
+/// one star column each on a track as wide as the card, then the scale and
+/// what the number means. Unknown points stay a faint stub so gaps show;
+/// known values are at least 2 DIPs tall.
+#[allow(clippy::too_many_arguments)]
+fn chart_card(
+    title: &str,
+    latest: String,
+    values: &[Option<f64>],
+    ceiling: f64,
+    scale: String,
+    note: String,
     bar: Brush,
+    palette: Palette,
 ) -> View {
-    let values: Vec<Option<f64>> = points.iter().map(|point| value(point)).collect();
-    let max = values
-        .iter()
-        .flatten()
-        .copied()
-        .fold(max_hint, f64::max)
-        .max(f64::EPSILON);
-    let height = 36.0;
+    // The newest sample sits at the right edge; a short history leaves the
+    // older columns empty instead of bunching at the left.
+    let first = GRAPH_BARS.saturating_sub(values.len());
     let bars: Vec<KeyedView> = values
         .iter()
+        .take(GRAPH_BARS)
         .enumerate()
         .map(|(index, value)| {
-            let bar = match value {
+            let view = match value {
                 Some(value) => Border::new()
-                    .width(4.0)
-                    .height((value / max * height).clamp(1.0, height))
-                    .corner_radius(1.5)
-                    .vertical_alignment(VerticalAlignment::Bottom)
+                    .height((value / ceiling * PLOT_HEIGHT).clamp(2.0, PLOT_HEIGHT))
                     .background(bar),
                 None => Border::new()
-                    .width(4.0)
                     .height(2.0)
                     .opacity(0.3)
-                    .vertical_alignment(VerticalAlignment::Bottom)
                     .background(palette.outline_variant()),
             };
-            KeyedView::new(index, bar)
+            KeyedView::new(
+                index,
+                view.margin(Thickness::xy(1.0, 0.0))
+                    .corner_radius(CornerRadius::new(2.0, 2.0, 0.0, 0.0))
+                    .vertical_alignment(VerticalAlignment::Bottom)
+                    .grid_column((first + index) as i32),
+            )
         })
         .collect();
-    Border::new()
-        .height(height)
-        .width(GRAPH_BARS as f64 * 5.0)
-        .horizontal_alignment(HorizontalAlignment::Left)
-        .content(
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(1.0)
-                .keyed_children(bars),
-        )
+    StackPanel::new().spacing(theme::spacing::XS).children((
+        Grid::new()
+            .columns([GridLength::STAR, GridLength::Auto])
+            .children((
+                crate::m3::muted(title, theme::type_scale::LABEL_MEDIUM)
+                    .vertical_alignment(VerticalAlignment::Bottom),
+                crate::m3::text(latest, theme::type_scale::TITLE_MEDIUM).grid_column(1),
+            )),
+        Border::new()
+            .background(palette.surface_container_highest())
+            .corner_radius(theme::shape::SM)
+            .padding(Thickness::uniform(theme::spacing::XS))
+            .content(
+                Grid::new()
+                    .height(PLOT_HEIGHT)
+                    .columns((0..GRAPH_BARS).map(|_| GridLength::STAR))
+                    .keyed_children(bars),
+            ),
+        small(format!("{scale} · {note}")).opacity(theme::MUTED_OPACITY),
+    ))
 }
 
 fn detail_lines(read: &DetailRead) -> Vec<String> {
@@ -233,25 +318,79 @@ fn counter(value: Option<i64>) -> String {
     value.map_or_else(|| "—".to_owned(), |value| value.to_string())
 }
 
-fn action_button(
-    label: &str,
+/// The M3 treatment of one monitor action.
+#[derive(Clone, Copy)]
+enum ActionStyle {
+    Tonal,
+    /// A destructive action before confirmation (error container).
+    ErrorTonal,
+    /// The confirmed destructive action (error).
+    ErrorFilled,
+    Text,
+}
+
+/// One monitor action: its shown text, accessible name, binding and style.
+/// Without a callback it does not apply and is not shown.
+struct Action {
+    text: String,
+    name: String,
     callback: Option<Callback<()>>,
+    style: ActionStyle,
     enabled: bool,
-    palette: Palette,
-) -> View {
-    let available = callback.is_some();
-    let button = if label.contains("top") {
-        crate::m3::outlined(palette)
-    } else {
-        crate::m3::tonal(palette)
+}
+
+impl Action {
+    fn new(
+        text: impl Into<String>,
+        callback: Option<Callback<()>>,
+        style: ActionStyle,
+        enabled: bool,
+    ) -> Self {
+        let text = text.into();
+        Self {
+            name: text.clone(),
+            text,
+            callback,
+            style,
+            enabled,
+        }
     }
-    .is_enabled(enabled && available)
-    .automation_name(label.to_owned());
-    let button = match callback {
-        Some(callback) => button.on_click(callback),
-        None => button,
-    };
-    button.content(TextBlock::new().text(label.to_owned()))
+
+    /// A fuller accessible name than the shown text.
+    fn named(mut self, name: String) -> Self {
+        self.name = name;
+        self
+    }
+}
+
+/// The applicable actions in display order, as keyed buttons.
+fn action_row(actions: Vec<Action>, palette: Palette) -> View {
+    let buttons: Vec<KeyedView> = actions
+        .into_iter()
+        .filter_map(|action| {
+            let callback = action.callback?;
+            let button = match action.style {
+                ActionStyle::Tonal => crate::m3::tonal(palette),
+                ActionStyle::ErrorTonal => Button::new().resource_overrides(palette.error_tonal()),
+                ActionStyle::ErrorFilled => {
+                    Button::new().resource_overrides(palette.error_filled())
+                }
+                ActionStyle::Text => crate::m3::text_button(palette),
+            };
+            Some(KeyedView::new(
+                action.text.clone(),
+                button
+                    .is_enabled(action.enabled)
+                    .automation_name(action.name)
+                    .on_click(callback)
+                    .content(TextBlock::new().text(action.text)),
+            ))
+        })
+        .collect();
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(theme::spacing::SM)
+        .keyed_children(buttons)
 }
 
 /// The monitor pane for the right-hand column.
@@ -319,43 +458,49 @@ pub fn monitor_pane(
             Some(series) if !series.points().is_empty() => {
                 let recent = series.recent();
                 let last = recent.last().copied();
-                let cpu_label = match last.and_then(|point| point.cpu_percent) {
-                    Some(cpu) => format!(
-                        "CPU {cpu:.0}% core-equivalent (100% = one core){}",
+                let cpu_values: Vec<Option<f64>> =
+                    recent.iter().map(|point| point.cpu_percent).collect();
+                let cpu_scale = cpu_ceiling(observed_max(&cpu_values));
+                let cpu_note = match last.and_then(|point| point.cpu_percent) {
+                    Some(_) => format!(
+                        "core-equivalent, 100% = one core{}",
                         if last.is_some_and(|point| point.partial) {
                             " · partial: process set changed"
                         } else {
                             ""
                         }
                     ),
-                    None => "CPU rate unknown for the latest interval".to_owned(),
+                    None => "rate unknown for the latest interval".to_owned(),
                 };
-                details.push(KeyedView::new("cpu-label", small(cpu_label)));
                 details.push(KeyedView::new(
                     "cpu",
-                    sparkline(
-                        &recent,
-                        |point| point.cpu_percent,
-                        100.0,
-                        palette,
+                    chart_card(
+                        "CPU",
+                        cpu_latest_label(last.and_then(|point| point.cpu_percent)),
+                        &cpu_values,
+                        cpu_scale,
+                        format!("scale 0–{cpu_scale}%"),
+                        cpu_note,
                         palette.primary(),
+                        palette,
                     ),
                 ));
-                details.push(KeyedView::new(
-                    "rss-label",
-                    small(format!(
-                        "RSS {} (sum over the Agent's sampled processes; not host memory share)",
-                        bytes_label(last.and_then(|point| point.rss_bytes))
-                    )),
-                ));
+                let rss_values: Vec<Option<f64>> = recent
+                    .iter()
+                    .map(|point| point.rss_bytes.map(|bytes| bytes as f64))
+                    .collect();
+                let rss_scale = rss_ceiling(observed_max(&rss_values));
                 details.push(KeyedView::new(
                     "rss",
-                    sparkline(
-                        &recent,
-                        |point| point.rss_bytes.map(|bytes| bytes as f64),
-                        0.0,
-                        palette,
+                    chart_card(
+                        "Memory (RSS)",
+                        bytes_label(last.and_then(|point| point.rss_bytes)),
+                        &rss_values,
+                        rss_scale,
+                        format!("scale 0–{}", bytes_label(Some(rss_scale as u64))),
+                        "sum over the Agent's sampled processes, not host memory share".to_owned(),
                         palette.tertiary(),
+                        palette,
                     ),
                 ));
                 details.push(KeyedView::new(
@@ -387,25 +532,71 @@ pub fn monitor_pane(
                     .foreground(palette.error()),
             ));
         }
+        // Conversation and turn actions, then lifecycle: two rows fit the
+        // monitor's width. Stop stays tonal; Force stop takes the error role
+        // and asks first.
+        let confirm: View = match actions.confirm_force {
+            Some(confirm) => Border::new()
+                .background(palette.error_container())
+                .corner_radius(theme::shape::MD)
+                .padding(Thickness::uniform(theme::spacing::MD))
+                .content(StackPanel::new().spacing(theme::spacing::SM).children((
+                    small(confirm.question).foreground(palette.on_error_container()),
+                    action_row(
+                        vec![
+                            Action::new("Cancel", Some(confirm.cancel), ActionStyle::Text, true),
+                            Action::new(
+                                "Force stop",
+                                Some(confirm.confirm),
+                                ActionStyle::ErrorFilled,
+                                controls_enabled,
+                            ),
+                        ],
+                        palette,
+                    ),
+                ))),
+            None => View::empty(),
+        };
         details.push(KeyedView::new(
             "actions",
-            // Conversation and turn actions, then lifecycle: two rows fit the
-            // monitor's width.
             StackPanel::new().spacing(theme::spacing::SM).children((
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::SM)
-                    .children((
-                        action_button("Open conversation", actions.open, true, palette),
-                        action_button("Interrupt", actions.interrupt, controls_enabled, palette),
-                    )),
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::SM)
-                    .children((
-                        action_button("Stop", actions.stop, controls_enabled, palette),
-                        action_button("Force stop", actions.force_stop, controls_enabled, palette),
-                    )),
+                action_row(
+                    vec![
+                        Action::new("Open conversation", actions.open, ActionStyle::Tonal, true),
+                        Action::new(
+                            "Interrupt",
+                            actions.interrupt,
+                            ActionStyle::Tonal,
+                            controls_enabled,
+                        ),
+                    ],
+                    palette,
+                ),
+                action_row(
+                    vec![
+                        Action::new("Stop", actions.stop, ActionStyle::Tonal, controls_enabled),
+                        Action::new(
+                            "Force stop",
+                            actions.force_stop,
+                            ActionStyle::ErrorTonal,
+                            controls_enabled,
+                        ),
+                        Action::new(
+                            "Resume",
+                            actions.resume,
+                            ActionStyle::Tonal,
+                            controls_enabled,
+                        ),
+                        Action::new(
+                            "Detach",
+                            actions.detach,
+                            ActionStyle::Tonal,
+                            controls_enabled,
+                        ),
+                    ],
+                    palette,
+                ),
+                confirm,
             )),
         ));
         // One row per possible manager, each button already bound to that
@@ -414,29 +605,29 @@ pub fn monitor_pane(
             .rows
             .into_iter()
             .map(|row| {
-                let agent_label = format!("Move {id} under {}", row.id);
-                let children_label = format!("Move children of {id} under {}", row.id);
                 KeyedView::new(
                     row.id.clone(),
                     StackPanel::new().spacing(2.0).children((
                         small(row.label),
-                        StackPanel::new()
-                            .orientation(Orientation::Horizontal)
-                            .spacing(theme::spacing::SM)
-                            .children((
-                                action_button(
-                                    &agent_label,
+                        action_row(
+                            vec![
+                                Action::new(
+                                    format!("Move {id} here"),
                                     row.move_agent,
+                                    ActionStyle::Tonal,
                                     controls_enabled,
-                                    palette,
-                                ),
-                                action_button(
-                                    &children_label,
+                                )
+                                .named(format!("Move {id} under {}", row.id)),
+                                Action::new(
+                                    "Move its children here",
                                     row.move_children,
+                                    ActionStyle::Tonal,
                                     controls_enabled,
-                                    palette,
-                                ),
-                            )),
+                                )
+                                .named(format!("Move the children of {id} under {}", row.id)),
+                            ],
+                            palette,
+                        ),
                     )),
                 )
             })
@@ -500,4 +691,46 @@ pub fn monitor_pane(
                     ),
                 ),
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= expected.abs() * 1e-12,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn nice_ceiling_is_the_smallest_one_two_two_and_a_half_five_step_at_or_above() {
+        close(nice_ceiling(0.2), 0.2);
+        close(nice_ceiling(13.0), 20.0);
+        close(nice_ceiling(25.0), 25.0);
+        close(nice_ceiling(26.0), 50.0);
+        close(nice_ceiling(100.0), 100.0);
+        close(nice_ceiling(101.0), 200.0);
+        close(nice_ceiling(0.0), 1.0);
+        close(nice_ceiling(f64::NAN), 1.0);
+    }
+
+    #[test]
+    fn scales_have_floors_and_rss_reads_in_whole_mib_steps() {
+        close(cpu_ceiling(0.2), 5.0);
+        close(cpu_ceiling(13.0), 20.0);
+        close(rss_ceiling(0.0), MIB);
+        // 246 MiB scales to 250 MiB, not to a decimal byte count.
+        close(rss_ceiling(246.0 * MIB), 250.0 * MIB);
+    }
+
+    #[test]
+    fn the_latest_value_and_maximum_ignore_unknown_points() {
+        close(observed_max(&[None, Some(3.0), Some(7.5), None]), 7.5);
+        close(observed_max(&[None, None]), 0.0);
+        assert_eq!(cpu_latest_label(Some(13.4)), "13%");
+        assert_eq!(cpu_latest_label(Some(0.36)), "0.4%");
+        assert_eq!(cpu_latest_label(None), "—");
+    }
 }

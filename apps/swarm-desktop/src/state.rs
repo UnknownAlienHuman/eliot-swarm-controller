@@ -125,6 +125,17 @@ pub struct BoundAction {
 }
 
 impl BoundAction {
+    /// A lifecycle control (stop, resume, detach): the Agent and the
+    /// generation shown when it was armed.
+    pub fn agent_control(agent: &str, generation: i64) -> Self {
+        Self {
+            agent: agent.to_owned(),
+            generation,
+            turn: None,
+            request: None,
+        }
+    }
+
     pub fn turn_control(agent: &str, generation: i64, turn: &str) -> Self {
         Self {
             agent: agent.to_owned(),

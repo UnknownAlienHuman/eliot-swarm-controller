@@ -760,6 +760,24 @@ pub async fn submit_resume(
     submit(data_dir, &request).await
 }
 
+/// Detach an observed Agent at the generation captured at click time: the
+/// observation ends; nobody's process is stopped.
+pub async fn submit_detach(
+    data_dir: &Path,
+    mutation_id: String,
+    agent: &str,
+    generation: i64,
+) -> Result<CommandSubmitResponse> {
+    let mut request = submit_request(
+        mutation_id,
+        Some(agent.to_owned()),
+        "detach",
+        serde_json::json!({}),
+    )?;
+    request.expected_generation = Some(generation);
+    submit(data_dir, &request).await
+}
+
 /// Interrupt exactly the turn and generation captured at click time; the
 /// binding is never re-read, so a later turn cannot be interrupted instead.
 pub async fn submit_interrupt(

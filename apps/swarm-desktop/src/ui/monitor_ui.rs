@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::theme::winui::Palette;
+use eliot_core::AgentState;
 
 #[derive(Clone, Debug)]
 pub(super) enum MonitorMsg {
@@ -12,7 +13,12 @@ pub(super) enum MonitorMsg {
     ReparentSettled(reparent::MoveBinding, Fallible<ReparentResponse>),
     MonitorOpenConversation(String),
     MonitorStop(BoundAction, bool),
+    /// Force stop was clicked: confirm this exact Agent and generation.
+    ForceStopAsked(BoundAction),
+    ForceStopCancelled,
     MonitorInterrupt(BoundAction),
+    MonitorResume(BoundAction),
+    MonitorDetach(BoundAction),
 }
 
 /// The monitor pane: open state, refresh chain, rows and selection.
@@ -27,6 +33,12 @@ pub(super) struct MonitorState {
     /// selection never points past them (see `monitor_view`).
     pub(super) published: usize,
     pub(super) reparent_status: String,
+    /// The Force stop awaiting confirmation, bound at its first click.
+    pub(super) confirm_force: Option<BoundAction>,
+    /// Row ids in the order the list showed before the latest refresh, and
+    /// the render count when that refresh was applied.
+    pub(super) on_screen: Vec<String>,
+    pub(super) applied_at: u64,
 }
 
 impl DesktopApp {
@@ -58,19 +70,36 @@ impl DesktopApp {
                 }
                 if let Some(snapshot) = snapshot {
                     self.monitor.published = self.monitor.data.rows.len();
+                    // The order on screen until the next render (rows are
+                    // attention-first, so a refresh can reorder them).
+                    self.monitor.on_screen = self
+                        .monitor
+                        .data
+                        .rows
+                        .iter()
+                        .map(|row| row.id.clone())
+                        .collect();
+                    self.monitor.applied_at = self.renders.get();
                     self.monitor.data.apply(*snapshot);
                     self.spawn_monitor(context, monitor::PERIOD_MS);
                 }
             }
             MonitorMsg::MonitorSelected(index) => {
-                let id = index
-                    .and_then(|index| self.monitor.data.rows.get(index))
-                    .map(|row| row.id.clone());
+                // The index counts rows as the list shows them: before the
+                // first render after a refresh, that is the previous order.
+                let id = index.and_then(|index| {
+                    if self.renders.get() == self.monitor.applied_at {
+                        self.monitor.on_screen.get(index).cloned()
+                    } else {
+                        self.monitor.data.rows.get(index).map(|row| row.id.clone())
+                    }
+                });
                 if id.is_some() && id != self.monitor.selected {
                     // The running chain reads the new selection on its next
                     // cycle (within one period): still one refresh in flight.
                     self.monitor.selected = id;
                     self.monitor.reparent_status.clear();
+                    self.monitor.confirm_force = None;
                 }
             }
             MonitorMsg::ReparentRequested(binding) => {
@@ -144,7 +173,43 @@ impl DesktopApp {
                     }
                 }
             }
+            MonitorMsg::ForceStopAsked(bound) => self.monitor.confirm_force = Some(bound),
+            MonitorMsg::ForceStopCancelled => self.monitor.confirm_force = None,
+            MonitorMsg::MonitorResume(bound) => {
+                let key = format!("resume:{}:{}", bound.agent, bound.generation);
+                self.submit_control(context, "Resume", key, move |data_dir, mutation_id| {
+                    client::block_on(client::submit_resume(
+                        data_dir,
+                        mutation_id,
+                        &bound.agent,
+                        bound.generation,
+                        None,
+                    ))
+                    .map(|reply| submit_note(&reply))
+                    .map_err(|error| error.to_string())
+                });
+            }
+            MonitorMsg::MonitorDetach(bound) => {
+                let key = format!("detach:{}:{}", bound.agent, bound.generation);
+                self.submit_control(context, "Detach", key, move |data_dir, mutation_id| {
+                    client::block_on(client::submit_detach(
+                        data_dir,
+                        mutation_id,
+                        &bound.agent,
+                        bound.generation,
+                    ))
+                    .map(|reply| submit_note(&reply))
+                    .map_err(|error| error.to_string())
+                });
+            }
             MonitorMsg::MonitorStop(bound, force) => {
+                if force {
+                    // Only the confirmed binding, never a newer selection.
+                    if self.monitor.confirm_force.as_ref() != Some(&bound) {
+                        return;
+                    }
+                    self.monitor.confirm_force = None;
+                }
                 let what = if force { "Force stop" } else { "Stop" };
                 let key = format!("stop:{}:{}:{force}", bound.agent, bound.generation);
                 self.submit_control(context, what, key, move |data_dir, mutation_id| {
@@ -215,6 +280,19 @@ impl DesktopApp {
             .filter(|read| Some(&read.agent.agent.id) == self.monitor.selected.as_ref())
             .map(|read| &read.agent.agent);
         let controllable = shown.filter(|agent| !agent.observe_only);
+        // Lifecycle stop applies to a controlled Agent that has not ended.
+        let live = controllable.filter(|agent| {
+            !matches!(
+                agent.state,
+                AgentState::Stopped | AgentState::Failed | AgentState::Lost
+            )
+        });
+        // A pending confirmation shows only for the Agent it was asked for.
+        let confirm = self
+            .monitor
+            .confirm_force
+            .clone()
+            .filter(|bound| shown.is_some_and(|agent| agent.id == bound.agent));
         let selected = self.monitor.selected.as_deref().unwrap_or_default();
         // Each button is bound now, from what is on screen: the shown source
         // generation and that row's generation.
@@ -258,26 +336,45 @@ impl DesktopApp {
                     )))
                 })
             }),
-            stop: controllable.map(|agent| {
+            stop: live.map(|agent| {
                 context.message(Message::Monitor(MonitorMsg::MonitorStop(
-                    BoundAction {
-                        agent: agent.id.clone(),
-                        generation: agent.generation,
-                        turn: None,
-                        request: None,
-                    },
+                    BoundAction::agent_control(&agent.id, agent.generation),
                     false,
                 )))
             }),
-            force_stop: controllable.map(|agent| {
-                context.message(Message::Monitor(MonitorMsg::MonitorStop(
-                    BoundAction {
-                        agent: agent.id.clone(),
-                        generation: agent.generation,
-                        turn: None,
-                        request: None,
-                    },
+            force_stop: live
+                .filter(|_| confirm.is_none())
+                .map(|agent| {
+                    context.message(Message::Monitor(MonitorMsg::ForceStopAsked(
+                        BoundAction::agent_control(&agent.id, agent.generation),
+                    )))
+                }),
+            confirm_force: confirm.map(|bound| monitor_view::ForceConfirm {
+                question: format!(
+                    "Force stop {} (generation {})? It ends the session at once instead of a clean stop; an active turn is cut off.",
+                    bound.agent, bound.generation
+                ),
+                confirm: context.message(Message::Monitor(MonitorMsg::MonitorStop(
+                    bound.clone(),
                     true,
+                ))),
+                cancel: context.message(Message::Monitor(MonitorMsg::ForceStopCancelled)),
+            }),
+            resume: controllable
+                .filter(|agent| {
+                    matches!(
+                        agent.state,
+                        AgentState::Stopped | AgentState::Failed | AgentState::Lost
+                    ) && agent.active_turn.is_none()
+                })
+                .map(|agent| {
+                    context.message(Message::Monitor(MonitorMsg::MonitorResume(
+                        BoundAction::agent_control(&agent.id, agent.generation),
+                    )))
+                }),
+            detach: shown.filter(|agent| agent.observe_only).map(|agent| {
+                context.message(Message::Monitor(MonitorMsg::MonitorDetach(
+                    BoundAction::agent_control(&agent.id, agent.generation),
                 )))
             }),
         };

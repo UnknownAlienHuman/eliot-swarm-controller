@@ -379,6 +379,37 @@ pub mod winui {
             self.role(|s| s.error, ThemeBrush::SystemCritical)
         }
 
+        /// A destructive confirmation's surface.
+        pub fn error_container(self) -> Brush {
+            self.role(|s| s.error_container, ThemeBrush::CardBackground)
+        }
+
+        pub fn on_error_container(self) -> Brush {
+            self.role(|s| s.on_error_container, ThemeBrush::PrimaryText)
+        }
+
+        /// A destructive action before confirmation: the error container.
+        pub fn error_tonal(self) -> ResourceOverrides {
+            self.with(|s| {
+                family(
+                    s,
+                    "Button",
+                    Some(s.error_container),
+                    s.on_error_container,
+                    None,
+                )
+                .set("ControlCornerRadius", CornerRadius::from(shape::FULL))
+            })
+        }
+
+        /// The confirmed destructive action: filled in the error role.
+        pub fn error_filled(self) -> ResourceOverrides {
+            self.with(|s| {
+                family(s, "Button", Some(s.error), s.on_error, None)
+                    .set("ControlCornerRadius", CornerRadius::from(shape::FULL))
+            })
+        }
+
         /// The user's message container.
         pub fn secondary_container(self) -> Brush {
             self.role(|s| s.secondary_container, ThemeBrush::CardBackground)
