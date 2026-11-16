@@ -160,7 +160,8 @@ a source proves cleanup, not acknowledgement of an answer.
 `inject` supports system context at `next_input`, `turn_safe_point`, and `active_turn`;
 adapter capabilities determine which application points are supported. Acceptance is
 not application: see the [injection contract](docs/spec/api.md) for exact turn binding
-and outcomes. `configure` remains unsupported.
+and outcomes. `configure` switches a live Agent's model and/or effort for its next turn
+(see the [mid-run overlay](docs/spec/configuration.md#mid-run-modeleffort-overlay-configure)).
 
 An optional managed checkout uses the source repository as `--workspace`:
 
