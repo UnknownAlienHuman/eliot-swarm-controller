@@ -61,7 +61,12 @@ pub struct ProfilesActions {
     pub save: Callback<()>,
     pub reload: Callback<()>,
     pub toggle_source: Callback<()>,
+    /// One per [`FORM_FIELDS`] entry: a dropdown index picked.
+    pub choice_picked: Vec<Callback<Option<usize>>>,
 }
+
+/// The label column of the profile form.
+const FORM_LABEL_WIDTH: f64 = 160.0;
 
 /// Form labels of [`FORM_FIELDS`].
 fn field_label(key: &str) -> &str {
@@ -101,22 +106,21 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
         let select = actions.select.clone();
         rows.push(KeyedView::new(
             format!("{name}:{selected}"),
-            crate::m3::row(palette, selected)
-                .height(48.0)
+            crate::m3::nav_item(palette, selected)
                 .automation_name(format!("Profile {name}: {detail}"))
                 .on_click(move || {
                     let _ = select.call(Some(index));
                 })
-                .content(
+                .content(crate::m3::nav_content(
                     StackPanel::new()
                         .spacing(0.0)
                         .vertical_alignment(VerticalAlignment::Center)
                         .children((
-                            crate::m3::text(name.clone(), theme::type_scale::BODY_MEDIUM),
+                            crate::m3::text(name.clone(), theme::type_scale::BODY_LARGE),
                             crate::m3::muted(detail, theme::type_scale::BODY_SMALL)
                                 .text_trimming(TextTrimming::CharacterEllipsis),
                         )),
-                ),
+                )),
         ));
     }
     if rows.is_empty() {
@@ -135,7 +139,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
     if let Some(name) = data.selected.filter(|_| data.editable) {
         form.push(KeyedView::new(
             "name",
-            crate::m3::text(name.to_owned(), theme::type_scale::TITLE_SMALL),
+            crate::m3::text(name.to_owned(), theme::type_scale::TITLE_MEDIUM),
         ));
         if let Some(error) = data
             .summaries
@@ -160,41 +164,72 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                     "Complex value: edit it as TOML".to_owned(),
                 ),
             };
-            let callback = actions.field_changed.get(index).cloned();
-            let mut field = crate::m3::field(palette)
-                .text(value)
-                .placeholder_text(hint)
-                .automation_name(format!("Profile {}", field_label(key)))
-                .is_enabled(!data.busy && editable);
-            if let Some(callback) = callback.filter(|_| editable) {
-                field = field.on_text_changed(callback);
-            }
+            let choices = editable
+                .then(|| profiles::choices(key, Some(value.as_str()).filter(|v| !v.is_empty())))
+                .flatten();
+            let field: View = match (choices, actions.choice_picked.get(index).cloned()) {
+                // An enumerated field: an exposed dropdown menu. WinUI drops
+                // a ComboBox's selection when its items change, so the
+                // choices key the control.
+                (Some(choices), Some(picked)) => {
+                    let selected = choices
+                        .iter()
+                        .position(|choice| *choice == value)
+                        .unwrap_or(0);
+                    Grid::new().keyed_children(vec![KeyedView::new(
+                        choices.join("\u{1f}"),
+                        ComboBox::new()
+                            .items_source(choices)
+                            .selected_index(selected)
+                            .is_enabled(!data.busy)
+                            .automation_name(format!("Profile {}", field_label(key)))
+                            .horizontal_alignment(HorizontalAlignment::Stretch)
+                            .on_selection_changed(picked),
+                    )])
+                }
+                _ => {
+                    let callback = actions.field_changed.get(index).cloned();
+                    let mut field = crate::m3::field()
+                        .text(value)
+                        .placeholder_text(hint)
+                        .automation_name(format!("Profile {}", field_label(key)))
+                        .is_enabled(!data.busy && editable);
+                    if let Some(callback) = callback.filter(|_| editable) {
+                        field = field.on_text_changed(callback);
+                    }
+                    field.into()
+                }
+            };
             form.push(KeyedView::new(
                 format!("field-{key}"),
                 Grid::new()
-                    .columns([GridLength::Pixel(140.0), GridLength::STAR])
+                    .columns([GridLength::Pixel(FORM_LABEL_WIDTH), GridLength::STAR])
                     .children((
-                        crate::m3::text(field_label(key), theme::type_scale::BODY_MEDIUM)
+                        crate::m3::text(field_label(key), theme::type_scale::BODY_LARGE)
                             .vertical_alignment(VerticalAlignment::Center),
-                        field.grid_column(1),
+                        Border::new().grid_column(1).content(field),
                     )),
             ));
         }
         form.push(KeyedView::new(
             "duplicate",
             Grid::new()
-                .columns([GridLength::Pixel(140.0), GridLength::STAR, GridLength::Auto])
+                .columns([
+                    GridLength::Pixel(FORM_LABEL_WIDTH),
+                    GridLength::STAR,
+                    GridLength::Auto,
+                ])
                 .column_spacing(theme::spacing::SM)
                 .children((
-                    crate::m3::text("Duplicate as", theme::type_scale::BODY_MEDIUM)
+                    crate::m3::text("Duplicate as", theme::type_scale::BODY_LARGE)
                         .vertical_alignment(VerticalAlignment::Center),
-                    crate::m3::field(palette)
+                    crate::m3::field()
                         .grid_column(1)
                         .text(data.duplicate_name.to_owned())
                         .placeholder_text("New profile name")
                         .automation_name("Duplicate as")
                         .on_text_changed(actions.duplicate_name_changed),
-                    crate::m3::tonal(palette)
+                    crate::m3::outlined(palette)
                         .grid_column(2)
                         .is_enabled(!data.busy)
                         .automation_name("Duplicate profile")
@@ -226,7 +261,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                 .is_enabled(data.editable && data.dirty && !data.busy)
                 .on_click(actions.save)
                 .content(TextBlock::new().text("Save")),
-            crate::m3::text_button(palette)
+            crate::m3::outlined(palette)
                 .is_enabled(data.editable && !data.busy)
                 .on_click(actions.validate)
                 .content(TextBlock::new().text("Validate")),
@@ -234,7 +269,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                 .is_enabled(data.dirty && !data.busy)
                 .automation_name("Discard changes")
                 .on_click(actions.reload)
-                .content(TextBlock::new().text("Discard changes")),
+                .content(crate::m3::label("Discard changes")),
             crate::m3::text_button(palette)
                 .automation_name(if data.source_open {
                     "Hide the TOML source"
@@ -242,14 +277,14 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                     "Edit as TOML"
                 })
                 .on_click(actions.toggle_source)
-                .content(TextBlock::new().text(if data.source_open {
+                .content(crate::m3::label(if data.source_open {
                     "Hide TOML"
                 } else {
                     "Edit as TOML"
                 })),
         ));
     let source: View = if data.source_open {
-        crate::m3::field(palette)
+        crate::m3::field()
             .text(data.view.to_owned())
             .accepts_return(true)
             .text_wrapping(TextWrapping::NoWrap)
@@ -264,15 +299,12 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
     ScrollViewer::new()
         .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
         .content(
-            StackPanel::new().spacing(theme::spacing::SM).children((
+            StackPanel::new().spacing(theme::spacing::MD).children((
                 crate::m3::card(palette)
                     .padding(Thickness::uniform(theme::spacing::SM))
-                    .content(StackPanel::new().spacing(2.0).keyed_children(rows)),
-                crate::m3::card(palette).content(
-                    StackPanel::new()
-                        .spacing(theme::spacing::SM)
-                        .keyed_children(form),
-                ),
+                    .content(StackPanel::new().keyed_children(rows)),
+                crate::m3::card(palette)
+                    .content(StackPanel::new().spacing(12.0).keyed_children(form)),
                 small(state).opacity(theme::MUTED_OPACITY),
                 actions_row,
                 source,
@@ -576,7 +608,7 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
         ));
         parts.push(KeyedView::new(
             "source",
-            crate::m3::field(palette)
+            crate::m3::field()
                 .text(data.view.to_owned())
                 .accepts_return(true)
                 .text_wrapping(TextWrapping::NoWrap)
@@ -591,7 +623,7 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
                 .columns([GridLength::STAR, GridLength::Auto])
                 .column_spacing(theme::spacing::SM)
                 .children((
-                    crate::m3::field(palette)
+                    crate::m3::field()
                         .text(data.editor_exe.to_owned())
                         .placeholder_text("Editor .exe (absolute path)")
                         .automation_name("Editor executable")

@@ -52,7 +52,7 @@ pub(super) enum SettingsMsg {
 }
 
 /// The section list beside the shown section.
-const SECTION_LIST_WIDTH: f64 = 240.0;
+const SECTION_LIST_WIDTH: f64 = 280.0;
 
 /// The Routing picker's first entry.
 const FIRST_ALLOWED: &str = "The first launchable profile the project allows";
@@ -103,7 +103,8 @@ impl DesktopApp {
         }
     }
 
-    /// The Settings page: the section list, then the shown section.
+    /// The Settings page: the section list (navigation items), then the
+    /// shown section under its title-large title.
     pub(super) fn settings_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let rows: Vec<KeyedView> = SettingsSection::ALL
             .iter()
@@ -111,7 +112,7 @@ impl DesktopApp {
                 let selected = *section == self.settings_section;
                 KeyedView::new(
                     format!("{}:{selected}", section.label()),
-                    m3::row(palette, selected)
+                    m3::nav_item(palette, selected)
                         .automation_name(if selected {
                             format!("{} (shown)", section.label())
                         } else {
@@ -121,26 +122,29 @@ impl DesktopApp {
                             context
                                 .message(Message::Settings(SettingsMsg::SectionSelected(*section))),
                         )
-                        .content(TextBlock::new().text(section.label())),
+                        .content(m3::nav_content(
+                            TextBlock::new()
+                                .text(section.label())
+                                .text_trimming(TextTrimming::CharacterEllipsis),
+                        )),
                 )
             })
             .collect();
         let nav = StackPanel::new()
-            .spacing(2.0)
             .margin(Thickness::new(
-                theme::spacing::MD,
+                12.0,
                 theme::spacing::LG,
                 theme::spacing::SM,
                 theme::spacing::MD,
             ))
             .children((
                 m3::title("Settings", theme::type_scale::TITLE_LARGE).margin(Thickness::new(
-                    theme::spacing::SM,
+                    theme::spacing::MD,
                     0.0,
                     0.0,
                     theme::spacing::MD,
                 )),
-                StackPanel::new().spacing(2.0).keyed_children(rows),
+                StackPanel::new().keyed_children(rows),
             ));
         let section = self.settings_section;
         let body: View = match section {
@@ -149,19 +153,22 @@ impl DesktopApp {
             SettingsSection::Routing => scroll(self.routing_section(context, palette)),
             SettingsSection::Projects => scroll(self.projects_section(palette)),
             SettingsSection::Automation => self.automation_section(context, palette),
-            SettingsSection::CloudMcp => scroll(note_card(
+            SettingsSection::CloudMcp => scroll(m3::list_group(
                 palette,
-                "Cloud MCP",
-                &[
-                    "Cloud MCP is configured in config.toml under [cloud_mcp].",
-                    "The daemon has no read or write call for it yet; editing it here comes with the unified settings API.",
-                ],
+                vec![(
+                    "cloud".to_owned(),
+                    m3::list_item(
+                        "Configured in config.toml",
+                        "Cloud MCP lives under [cloud_mcp]. The daemon has no read or write call for it yet; editing it here comes with the unified settings API.",
+                        View::empty(),
+                    ),
+                )],
             )),
             SettingsSection::Advanced => scroll(self.advanced_section(context, palette)),
         };
         // The section's tree is keyed by section, so its editors are new
         // controls (see `reprime_fields`).
-        // One explicit column width, so every section's cards line up
+        // One explicit column width, so every section's groups line up
         // (content-sized until the window size is observed).
         let width = self.main_width().map(|width| {
             (width - SECTION_LIST_WIDTH - 2.0 * theme::spacing::LG)
@@ -170,7 +177,7 @@ impl DesktopApp {
         let content = Grid::new()
             .grid_column(1)
             .rows([GridLength::Auto, GridLength::STAR])
-            .row_spacing(theme::spacing::MD)
+            .row_spacing(theme::spacing::LG)
             .width(width)
             .horizontal_alignment(HorizontalAlignment::Left)
             .margin(Thickness::new(
@@ -182,7 +189,7 @@ impl DesktopApp {
             .keyed_children(vec![
                 KeyedView::new(
                     format!("title:{}", section.label()),
-                    m3::title(section.label(), theme::type_scale::TITLE_MEDIUM),
+                    m3::title(section.label(), theme::type_scale::TITLE_LARGE),
                 ),
                 KeyedView::new(
                     format!("body:{}", section.label()),
@@ -195,65 +202,58 @@ impl DesktopApp {
     }
 
     fn general_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let theme_choices: Vec<KeyedView> =
-            [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark]
-                .into_iter()
-                .map(|choice| {
-                    let selected = self.prefs.theme == choice;
-                    KeyedView::new(
-                        format!("{}:{selected}", choice.label()),
-                        m3::segment(palette, selected)
-                            .automation_name(format!(
-                                "Theme {}{}",
-                                choice.label(),
-                                if selected { " (current)" } else { "" }
-                            ))
-                            .on_click(
-                                context.message(Message::Shell(ShellMsg::ThemeChosen(choice))),
-                            )
-                            .content(TextBlock::new().text(choice.label())),
-                    )
-                })
-                .collect();
-        let startup_choices: Vec<KeyedView> = [
-            (Startup::NewTask, "New task"),
-            (Startup::LastConversation, "Last conversation"),
-        ]
-        .into_iter()
-        .map(|(choice, label)| {
-            let selected = self.prefs.startup == choice;
-            KeyedView::new(
-                format!("{label}:{selected}"),
-                m3::segment(palette, selected)
-                    .automation_name(format!(
-                        "Open at start: {label}{}",
-                        if selected { " (current)" } else { "" }
-                    ))
-                    .on_click(context.message(Message::Shell(ShellMsg::StartupChosen(choice))))
-                    .content(TextBlock::new().text(label)),
-            )
-        })
-        .collect();
-        StackPanel::new().spacing(theme::spacing::SM).children((
-            setting_card(
-                palette,
-                "Theme",
-                "System follows the Windows setting.",
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::XS)
-                    .keyed_children(theme_choices),
-            ),
-            setting_card(
-                palette,
-                "Open at start",
-                "What the window shows when it opens.",
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::XS)
-                    .keyed_children(startup_choices),
-            ),
-        ))
+        let segments: Vec<KeyedView> = [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark]
+            .into_iter()
+            .map(|choice| {
+                let selected = self.prefs.theme == choice;
+                KeyedView::new(
+                    format!("{}:{selected}", choice.label()),
+                    m3::segment(palette, selected)
+                        .automation_name(format!(
+                            "Theme {}{}",
+                            choice.label(),
+                            if selected { " (current)" } else { "" }
+                        ))
+                        .on_click(context.message(Message::Shell(ShellMsg::ThemeChosen(choice))))
+                        .content(m3::segment_label(choice.label(), selected)),
+                )
+            })
+            .collect();
+        let reopen = self.prefs.startup == Startup::LastConversation;
+        let switch = Grid::new().keyed_children(vec![KeyedView::new(
+            format!("reopen:{reopen}"),
+            ToggleSwitch::new()
+                .is_on(reopen)
+                .automation_name("Reopen the last conversation at start")
+                .on_toggled(context.callback(|on: bool| {
+                    Message::Shell(ShellMsg::StartupChosen(if on {
+                        Startup::LastConversation
+                    } else {
+                        Startup::NewTask
+                    }))
+                })),
+        )]);
+        m3::list_group(
+            palette,
+            vec![
+                (
+                    "theme".to_owned(),
+                    m3::list_item(
+                        "Theme",
+                        "System follows the Windows setting.",
+                        m3::segmented(palette, segments),
+                    ),
+                ),
+                (
+                    "reopen".to_owned(),
+                    m3::list_item(
+                        "Reopen the last conversation",
+                        "At start, open the conversation you left instead of a new task.",
+                        switch,
+                    ),
+                ),
+            ],
+        )
     }
 
     fn routing_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
@@ -282,33 +282,37 @@ impl DesktopApp {
                 .items_source(names)
                 .selected_index(selected)
                 .automation_name("Profile Auto launches")
-                .min_width(320.0)
+                .min_width(280.0)
                 .on_selection_changed(
                     context
                         .callback(|index| Message::Settings(SettingsMsg::AutoProfilePicked(index))),
                 ),
         )]);
-        StackPanel::new()
-            .spacing(theme::spacing::SM)
-            .children((
-                note_card(
-                    palette,
-                    "Automatic routing",
-                    &[
+        m3::list_group(
+            palette,
+            vec![
+                (
+                    "auto".to_owned(),
+                    m3::list_item(
+                        "Auto launches",
+                        "Used when the composer's profile chip says Auto. A profile the project does not allow is skipped.",
+                        picker,
+                    ),
+                ),
+                (
+                    "coming".to_owned(),
+                    m3::list_item(
+                        "Automatic routing",
                         "Coming: the daemon will choose the profile for each task by role and availability, and record why.",
-                    ],
+                        View::empty(),
+                    ),
                 ),
-                setting_card(
-                    palette,
-                    "Until then, Auto launches",
-                    "Used when the composer's profile chip says Auto. A profile the project does not allow is skipped.",
-                    picker,
-                ),
-            ))
+            ],
+        )
     }
 
     fn projects_section(&self, palette: Palette) -> View {
-        let mut cards: Vec<KeyedView> = self
+        let items: Vec<(String, View)> = self
             .nav
             .projects
             .iter()
@@ -318,40 +322,39 @@ impl DesktopApp {
                 } else {
                     project.profiles.join(", ")
                 };
-                KeyedView::new(
+                (
                     project.id.clone(),
-                    note_card_owned(
-                        palette,
+                    m3::list_item(
                         &project.id,
-                        vec![
-                            nav::display_path(&project.workspace).to_owned(),
-                            format!("Allowed profiles: {profiles}"),
-                        ],
+                        &format!(
+                            "{}\nAllowed profiles: {profiles}",
+                            nav::display_path(&project.workspace)
+                        ),
+                        View::empty(),
                     ),
                 )
             })
             .collect();
-        if cards.is_empty() {
-            cards.push(KeyedView::new(
-                "none",
-                m3::muted("No registered projects.", theme::type_scale::BODY_MEDIUM),
-            ));
-        }
-        cards.push(KeyedView::new(
-            "how",
-            m3::muted(
-                "Projects are registered in config.toml ([projects.ID]); automatic registration comes with the unified settings API.",
-                theme::type_scale::BODY_SMALL,
-            )
-            .text_wrapping(TextWrapping::Wrap),
-        ));
+        let list = if items.is_empty() {
+            m3::muted("No registered projects.", theme::type_scale::BODY_MEDIUM).into()
+        } else {
+            m3::list_group(palette, items)
+        };
         StackPanel::new()
-            .spacing(theme::spacing::SM)
-            .keyed_children(cards)
+            .spacing(theme::spacing::MD)
+            .children((
+                list,
+                m3::muted(
+                    "Projects are registered in config.toml ([projects.ID]); automatic registration comes with the unified settings API.",
+                    theme::type_scale::BODY_SMALL,
+                )
+                .margin(Thickness::xy(theme::spacing::MD, 0.0))
+                .text_wrapping(TextWrapping::Wrap),
+            ))
     }
 
     fn automation_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        scroll(StackPanel::new().spacing(theme::spacing::SM).children((
+        scroll(StackPanel::new().spacing(theme::spacing::LG).children((
             config_view::automation_screen(
                 &self.automation.rules,
                 &self.automation.status,
@@ -373,26 +376,35 @@ impl DesktopApp {
             || "no per-user settings folder".to_owned(),
             |path| path.display().to_string(),
         );
-        StackPanel::new().spacing(theme::spacing::SM).children((
-            note_card_owned(
-                palette,
-                "Daemon data",
-                vec![
-                    data_dir,
-                    "Every read and change goes through the daemon's authenticated local client."
-                        .to_owned(),
-                ],
-            ),
-            note_card_owned(palette, "Desktop preferences file", vec![prefs]),
-            setting_card(
-                palette,
-                "Reload",
-                "Read projects, Agents, profiles and the open conversation again.",
-                m3::tonal(palette)
-                    .on_click(context.message(Message::Shell(ShellMsg::RefreshRequested)))
-                    .content(TextBlock::new().text("Reload")),
-            ),
-        ))
+        m3::list_group(
+            palette,
+            vec![
+                (
+                    "data".to_owned(),
+                    m3::list_item(
+                        "Daemon data",
+                        &format!(
+                            "{data_dir}\nEvery read and change goes through the daemon's authenticated local client."
+                        ),
+                        View::empty(),
+                    ),
+                ),
+                (
+                    "prefs".to_owned(),
+                    m3::list_item("Desktop preferences file", &prefs, View::empty()),
+                ),
+                (
+                    "reload".to_owned(),
+                    m3::list_item(
+                        "Reload",
+                        "Read projects, Agents, profiles and the open conversation again.",
+                        m3::outlined(palette)
+                            .on_click(context.message(Message::Shell(ShellMsg::RefreshRequested)))
+                            .content(TextBlock::new().text("Reload")),
+                    ),
+                ),
+            ],
+        )
     }
 }
 
@@ -401,47 +413,4 @@ fn scroll(content: View) -> View {
     ScrollViewer::new()
         .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
         .content(content)
-}
-
-/// One setting: its name and what it does on the left, the control right.
-fn setting_card(palette: Palette, title: &str, hint: &str, control: View) -> View {
-    m3::card(palette).content(
-        Grid::new()
-            .columns([GridLength::STAR, GridLength::Auto])
-            .column_spacing(theme::spacing::MD)
-            .children((
-                StackPanel::new()
-                    .spacing(2.0)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .children((
-                        m3::text(title, theme::type_scale::TITLE_SMALL),
-                        m3::muted(hint, theme::type_scale::BODY_SMALL)
-                            .text_wrapping(TextWrapping::Wrap),
-                    )),
-                Border::new()
-                    .grid_column(1)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .content(control),
-            )),
-    )
-}
-
-/// A card of a title and plain lines.
-fn note_card(palette: Palette, title: &str, lines: &[&str]) -> View {
-    note_card_owned(
-        palette,
-        title,
-        lines.iter().map(|line| (*line).to_owned()).collect(),
-    )
-}
-
-fn note_card_owned(palette: Palette, title: &str, lines: Vec<String>) -> View {
-    m3::card(palette).content(
-        StackPanel::new().spacing(2.0).children((
-            m3::text(title, theme::type_scale::TITLE_SMALL),
-            m3::muted(lines.join("\n"), theme::type_scale::BODY_SMALL)
-                .text_wrapping(TextWrapping::Wrap)
-                .is_text_selection_enabled(true),
-        )),
-    )
 }

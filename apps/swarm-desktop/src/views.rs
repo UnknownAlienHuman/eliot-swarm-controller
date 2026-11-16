@@ -174,24 +174,24 @@ fn label(text: &str) -> TextBlock {
         .opacity(theme::MUTED_OPACITY)
 }
 
-fn body_text(text: &str, palette: Palette) -> TextBlock {
+/// Message text: M3 body-large.
+fn body_text(text: &str, foreground: Brush) -> TextBlock {
     TextBlock::new()
         .text(text.to_owned())
-        .font_size(theme::type_scale::BODY_MEDIUM.size)
+        .font_size(theme::type_scale::BODY_LARGE.size)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
-        .foreground(palette.on_surface())
+        .foreground(foreground)
 }
 
-/// WinUI's left button padding: an inline text button is pulled back by it
-/// so its content lines up with the text around it.
-const INSET: f64 = 11.0;
+/// An inline control is pulled back by this so its content lines up with
+/// the text around it (a 32-DIP icon button centres a 16-DIP glyph).
+const INSET: f64 = 8.0;
 
-/// A small icon-only copy button, named for screen readers; 36 wide so the
-/// 14-DIP glyph is whole inside WinUI's (11, 5, 11, 6) button padding.
+/// A small icon button for Copy, named for screen readers.
 fn copy_button(name: &str, palette: Palette, callback: impl Fn() + 'static) -> Button {
-    crate::m3::text_button(palette)
-        .width(36.0)
+    crate::m3::icon_button(palette)
+        .width(32.0)
         .height(32.0)
         .automation_name(name.to_owned())
         .on_click(callback)
@@ -199,15 +199,15 @@ fn copy_button(name: &str, palette: Palette, callback: impl Fn() + 'static) -> B
 
 /// The glyph of a copy button.
 fn copy_glyph() -> View {
-    Viewbox::new().width(14.0).height(14.0).slot(
-        ViewboxSlot::Child,
-        FontIcon::new().glyph(crate::m3::glyph::COPY),
-    )
+    crate::m3::icon_sized(crate::m3::glyph::COPY, 16.0)
 }
 
 fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) -> Vec<KeyedView> {
     let Some(blocks) = part.blocks.as_ref() else {
-        return vec![KeyedView::new("plain", body_text(&part.plain, palette))];
+        return vec![KeyedView::new(
+            "plain",
+            body_text(&part.plain, palette.on_surface()),
+        )];
     };
     blocks
         .iter()
@@ -216,7 +216,7 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
             let view: View = match block {
                 RenderedBlock::Rich(text) => RichTextBlock::new()
                     .paragraphs(text.clone())
-                    .font_size(theme::type_scale::BODY_MEDIUM.size)
+                    .font_size(theme::type_scale::BODY_LARGE.size)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
                     .into(),
@@ -227,7 +227,7 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
                         2 => theme::type_scale::TITLE_MEDIUM.size,
                         _ => theme::type_scale::TITLE_SMALL.size,
                     })
-                    .font_weight(FontWeight::SEMI_BOLD)
+                    .font_weight(FontWeight::MEDIUM)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
                     .automation_heading_level(match level {
@@ -243,7 +243,7 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
                     StackPanel::new().spacing(theme::spacing::XS).children((
                         Border::new()
                             .background(palette.raised())
-                            .corner_radius(theme::shape::SM)
+                            .corner_radius(theme::shape::MD)
                             .padding(Thickness::uniform(theme::spacing::MD))
                             .content(
                                 ScrollViewer::new()
@@ -252,7 +252,7 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
                                     .content(
                                         TextBlock::new()
                                             .text(text.clone())
-                                            .font_size(theme::type_scale::BODY_SMALL.size + 1.0)
+                                            .font_size(theme::type_scale::BODY_MEDIUM.size)
                                             .text_wrapping(TextWrapping::NoWrap)
                                             .is_text_selection_enabled(true),
                                     ),
@@ -260,6 +260,7 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
                         copy_button("Copy code", palette, move || {
                             let _ = copy.call((key.clone(), code_index));
                         })
+                        .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
                         .content(copy_glyph()),
                     ))
                 }
@@ -276,10 +277,10 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
 /// `anchor`, when given, binds the part's own button (Copy or the tool
 /// group header): the end anchor of the transcript.
 ///
-/// One style for every part, as in a chat: the user's message is a neutral
-/// bubble on the right; the answer is plain text on the surface; tool
-/// groups, interim notes and notices are one quiet line each; copy is a
-/// small icon button.
+/// One style for every part, as in a chat: the user's message is a
+/// secondary-container bubble on the right; the answer is plain body-large
+/// text on the surface; tool groups are one low-emphasis expandable row;
+/// interim notes and notices are quiet lines; copy is a small icon button.
 fn part_view(
     part: &RenderedPart,
     expanded: bool,
@@ -303,12 +304,19 @@ fn part_view(
             .max_width(theme::layout::READING_WIDTH * 0.8)
             .children((
                 Border::new()
-                    .background(palette.raised())
-                    .corner_radius(theme::shape::LG)
-                    .padding(Thickness::xy(theme::spacing::MD, theme::spacing::SM))
-                    .content(body_text(&part.plain, palette)),
+                    .background(palette.bubble())
+                    // M3 large corners, the small one toward the sender.
+                    .corner_radius(CornerRadius::new(
+                        theme::shape::LG,
+                        theme::shape::LG,
+                        theme::shape::XS,
+                        theme::shape::LG,
+                    ))
+                    .padding(Thickness::xy(theme::spacing::MD, 10.0))
+                    .content(body_text(&part.plain, palette.on_bubble())),
                 anchored(copy_button("Copy message", palette, copy_message))
                     .horizontal_alignment(HorizontalAlignment::Right)
+                    .margin(Thickness::new(0.0, 0.0, -INSET, 0.0))
                     .content(copy_glyph()),
             )),
         // Interim notes stay quiet.
@@ -319,49 +327,52 @@ fn part_view(
         PartKind::Tools => {
             let toggle = callbacks.toggle_tools.clone();
             let key = part.key.clone();
-            // A text button rather than a ToggleButton: Reactor 0.100.0
-            // themes only Buttons, so a checked toggle would show the system
-            // accent. The accessible name carries the state.
-            let header = anchored(crate::m3::text_button(palette))
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
-                .automation_name(format!(
-                    "Tool operations: {} ({})",
-                    part.plain,
-                    if expanded { "expanded" } else { "collapsed" }
-                ))
-                .on_click(move || {
-                    let _ = toggle.call((key.clone(), !expanded));
-                })
-                .content(
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .spacing(theme::spacing::SM)
-                        .children((
-                            Viewbox::new()
-                                .width(10.0)
-                                .height(10.0)
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .slot(
-                                    ViewboxSlot::Child,
-                                    FontIcon::new().glyph(if expanded {
-                                        crate::m3::glyph::CHEVRON_DOWN
-                                    } else {
-                                        crate::m3::glyph::CHEVRON_RIGHT
-                                    }),
-                                ),
-                            TextBlock::new()
-                                .text(part.plain.clone())
-                                .font_size(theme::type_scale::BODY_SMALL.size)
-                                .vertical_alignment(VerticalAlignment::Center),
-                        )),
-                );
+            // A low-emphasis button rather than a ToggleButton: Reactor
+            // 0.100.0 themes only Buttons, so a checked toggle would show the
+            // system accent. The accessible name carries the state.
+            let header = anchored(
+                Button::new()
+                    .resource_overrides(palette.icon_button())
+                    .height(36.0),
+            )
+            .horizontal_alignment(HorizontalAlignment::Left)
+            .margin(Thickness::new(-12.0, 0.0, 0.0, 0.0))
+            .automation_name(format!(
+                "Tool operations: {} ({})",
+                part.plain,
+                if expanded { "expanded" } else { "collapsed" }
+            ))
+            .on_click(move || {
+                let _ = toggle.call((key.clone(), !expanded));
+            })
+            .content(
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(theme::spacing::SM)
+                    .margin(Thickness::xy(-12.0, 0.0))
+                    .children((
+                        crate::m3::icon_sized(crate::m3::glyph::TOOLS, 16.0),
+                        TextBlock::new()
+                            .text(part.plain.clone())
+                            .font_size(theme::type_scale::BODY_MEDIUM.size)
+                            .font_weight(FontWeight::NORMAL)
+                            .vertical_alignment(VerticalAlignment::Center),
+                        crate::m3::icon_sized(
+                            if expanded {
+                                crate::m3::glyph::CHEVRON_DOWN
+                            } else {
+                                crate::m3::glyph::CHEVRON_RIGHT
+                            },
+                            10.0,
+                        ),
+                    )),
+            );
             if expanded {
                 StackPanel::new().spacing(theme::spacing::XS).children((
                     header,
                     Border::new()
                         .background(palette.card())
-                        .corner_radius(theme::shape::SM)
+                        .corner_radius(theme::shape::MD)
                         .padding(Thickness::uniform(theme::spacing::MD))
                         .content(
                             TextBlock::new()

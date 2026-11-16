@@ -31,18 +31,14 @@ fn small(text: impl Into<String>) -> TextBlock {
 /// resources in one muted line. The whole card opens the conversation.
 pub fn card(row: &MonitorRow, title: &str, open: Callback<()>, palette: Palette) -> View {
     let state = state_name(row.state);
-    let dot = palette
-        .dot(theme::StatusTone::of_state(state))
-        .map_or_else(View::empty, crate::m3::dot);
     let under = row
         .parent
         .as_deref()
         .map(|parent| format!(" · under {parent}"))
         .unwrap_or_default();
-    Button::new()
-        .resource_overrides(palette.card_button())
-        .horizontal_alignment(HorizontalAlignment::Stretch)
-        .horizontal_content_alignment(HorizontalAlignment::Stretch)
+    // The card style pads 16/20 at the sides; the content evens the right
+    // side and adds the card's 12-DIP top and bottom.
+    crate::m3::card_button(palette)
         .automation_name(format!(
             "{title}, {state}, {}{under}, {}",
             row.harness,
@@ -51,24 +47,23 @@ pub fn card(row: &MonitorRow, title: &str, open: Callback<()>, palette: Palette)
         .on_click(open)
         .content(
             StackPanel::new()
-                .spacing(2.0)
-                .margin(Thickness::xy(0.0, theme::spacing::XS))
+                .spacing(theme::spacing::XS)
+                .margin(Thickness::new(0.0, 12.0, -4.0, 12.0))
                 .children((
                     Grid::new()
-                        .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
+                        .columns([GridLength::STAR, GridLength::Auto])
                         .column_spacing(theme::spacing::SM)
                         .children((
                             crate::m3::text(title.to_owned(), theme::type_scale::TITLE_SMALL)
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .text_trimming(TextTrimming::CharacterEllipsis),
-                            Border::new().grid_column(1).content(dot),
-                            crate::m3::muted(state, theme::type_scale::BODY_SMALL)
-                                .grid_column(2)
-                                .vertical_alignment(VerticalAlignment::Center),
+                            Border::new()
+                                .grid_column(1)
+                                .content(crate::m3::status_chip(palette, state)),
                         )),
                     crate::m3::muted(
                         format!("{} · {}{under}", row.harness, row.operation()),
-                        theme::type_scale::BODY_SMALL,
+                        theme::type_scale::BODY_MEDIUM,
                     )
                     .text_trimming(TextTrimming::CharacterEllipsis),
                     crate::m3::muted(
@@ -192,7 +187,7 @@ fn chart_card(
                 crate::m3::text(latest, theme::type_scale::TITLE_MEDIUM).grid_column(1),
             )),
         Border::new()
-            .background(palette.field())
+            .background(palette.well())
             .corner_radius(theme::shape::SM)
             .padding(Thickness::uniform(theme::spacing::XS))
             .content(
@@ -412,7 +407,7 @@ pub fn manager_section(
         "The daemon checks cycles, fanout limits, observe-only Agents and both generations."
             .to_owned()
     };
-    crate::m3::card(palette).content(
+    crate::m3::card_high(palette).content(
         StackPanel::new().spacing(theme::spacing::SM).children((
             crate::m3::text("Change manager", theme::type_scale::TITLE_SMALL)
                 .automation_heading_level(AutomationHeadingLevel::Level3),

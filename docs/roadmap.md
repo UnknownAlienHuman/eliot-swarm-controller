@@ -345,9 +345,9 @@ of the explicitly selected release scope.
 - [x] **D1 Styled real chat.** One optional Windows package (`apps/swarm-desktop`,
       binary `swarm-desktop`) on WinUI 3 through `windows-reactor`: native window with
       one shell (see D7) and Material 3 roles generated from one seed (tonal palettes
-      through `material-colors`, also applied to WinUI's accent and list-selection
-      resources at the application root; system colors under High Contrast; a
-      System/Light/Dark switch saved per user); project/profile selection and an
+      through `material-colors`, written as WinUI lightweight-styling resources at
+      the application root for the shown scheme; system colors under High Contrast;
+      a System/Light/Dark switch saved per user); project/profile selection and an
       Agent list grouped by project with children under their manager (branches
       read through `agent.list` `parent`);
       `launch(text)` with its linked command; send to an existing Agent; the real
@@ -391,7 +391,9 @@ of the explicitly selected release scope.
       or an Owner ad-hoc harness with its catalogue's models and efforts. The
       Agent details show requested settings beside the effective native
       readback. Settings › Models and profiles keeps one draft of the
-      `[profiles.*]` source: form fields and the source view both edit it. Validate and Save go through
+      `[profiles.*]` source: form fields (dropdowns for effort, permissions and
+      approval policy, keeping a value outside the documented set) and the source
+      view both edit it. Validate and Save go through
       `config.profiles.save`, which uses the daemon parser and launch resolution,
       a revision guard and a temporary-file rename. An invalid draft is never
       written and stays in the editor. The section states that running Agents
@@ -433,8 +435,13 @@ of the explicitly selected release scope.
       default profile until daemon routing (k55) lands. Settings has General,
       Models and profiles, Routing, Projects, Automation and scripts, Cloud MCP
       and Advanced, all through one client module (`config_client`) that the
-      unified settings API replaces. One component system: one row, one chip,
-      filled/tonal/text buttons, an 8-point grid and three radii. (Refs #407)
+      unified settings API replaces. One component system in Material 3
+      components (owner review 2026-11-15: Codex layout, M3 visual language): a
+      navigation drawer with 56-DIP items and a secondary-container active pill,
+      an extended FAB for New task, outlined assist chips, filled/tonal/outlined/
+      text and icon buttons, a segmented button, switches, outlined text fields,
+      exposed dropdown menus, status chips and tonal cards, on the M3 type, shape
+      and state-layer scales. (Refs #407)
 
 ## M1 — Memory one-shot inference (#199)
 

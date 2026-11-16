@@ -1095,8 +1095,9 @@ impl DesktopApp {
                 .automation_name(primary_label.clone())
                 .content(TextBlock::new().text(primary_label)),
         };
+        // Unstyled: the application's text-button colors of the dialog's
+        // own theme.
         let close = Button::new()
-            .style(ButtonStyle::Subtle)
             .automation_name("Close")
             .on_click(context.message(Message::Handoff(HandoffMsg::Closed)))
             .content(TextBlock::new().text("Close"));

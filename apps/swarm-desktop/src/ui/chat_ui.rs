@@ -962,7 +962,7 @@ impl DesktopApp {
                     Some(project) => format!("What should we build in {project}?"),
                     None => "What should we build?".to_owned(),
                 };
-                m3::title(line, theme::type_scale::TITLE_LARGE)
+                m3::title(line, theme::type_scale::HEADLINE_SMALL)
                     .grid_row(1)
                     .horizontal_alignment(HorizontalAlignment::Center)
                     .vertical_alignment(VerticalAlignment::Center)
@@ -1005,7 +1005,7 @@ impl DesktopApp {
                         .columns([GridLength::STAR, GridLength::Auto])
                         .column_spacing(theme::spacing::SM)
                         .children((
-                            m3::text(text.clone(), theme::type_scale::BODY_SMALL)
+                            m3::text(text.clone(), theme::type_scale::BODY_MEDIUM)
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .text_wrapping(TextWrapping::Wrap)
                                 .is_text_selection_enabled(true),
@@ -1168,7 +1168,7 @@ impl DesktopApp {
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .margin(Thickness::new(0.0, 0.0, 0.0, theme::spacing::MD))
                 .on_click(context.message(Message::Chat(ChatMsg::LoadOlderRequested)))
-                .content(TextBlock::new().text("Load older messages")),
+                .content(m3::label("Load older messages")),
             _ => View::empty(),
         };
         let empty: View = if self.chat.items.is_empty() {
@@ -1266,7 +1266,7 @@ impl DesktopApp {
             .iter()
             .map(|request| {
                 let key = request.binding.request.clone().unwrap_or_default();
-                let answer_box = m3::field(palette)
+                let answer_box = m3::field()
                     .text(self.chat.answers.get(&key).cloned().unwrap_or_default())
                     .placeholder_text("{\"question\": {\"answers\": [\"…\"]}}")
                     .automation_name("Answer JSON")
@@ -1317,7 +1317,7 @@ impl DesktopApp {
                                             .on_click(context.message(Message::Chat(
                                                 ChatMsg::AnswerRequested(request.clone()),
                                             )))
-                                            .content(TextBlock::new().text("Answer")),
+                                            .content(m3::label("Answer")),
                                     )),
                             )),
                         ),
@@ -1352,13 +1352,15 @@ impl DesktopApp {
             (Some(_), Some(detail)) => (
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::XS)
+                    .spacing(theme::spacing::SM)
                     .children((
                         m3::chip_static(
+                            palette,
                             m3::glyph::FOLDER,
                             &nav::project_name(&detail.project, &self.registered_projects()),
                         ),
                         m3::chip_static(
+                            palette,
                             m3::glyph::PROFILE,
                             &if detail.settings.profile == detail.harness {
                                 detail.harness.clone()
@@ -1369,10 +1371,11 @@ impl DesktopApp {
                     )),
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::XS)
+                    .spacing(theme::spacing::SM)
                     .children((
                         self.model_chip(detail, context, palette),
                         m3::chip_static(
+                            palette,
                             m3::glyph::SHIELD,
                             &launch_ui::access_label(detail.settings.permissions.as_deref()),
                         ),
@@ -1391,6 +1394,8 @@ impl DesktopApp {
             .text(self.primed(&self.composer_text()).to_owned())
             .placeholder_text(placeholder)
             .automation_name("Message")
+            // Its text starts where the chips' icons do.
+            .margin(Thickness::new(-6.0, 0.0, 0.0, 0.0))
             .background(Brush::Solid(Color::transparent()))
             .border_thickness(Thickness::uniform(0.0))
             .accepts_return(true)
@@ -1411,9 +1416,15 @@ impl DesktopApp {
                 0.0,
                 theme::spacing::LG,
             ))
+            // An M3 search bar: surface-container-high, extra-large corner.
             .background(palette.raised())
-            .corner_radius(theme::shape::LG)
-            .padding(Thickness::uniform(theme::spacing::SM))
+            .corner_radius(theme::shape::XL)
+            .padding(Thickness::new(
+                theme::spacing::MD,
+                12.0,
+                theme::spacing::SM,
+                theme::spacing::SM,
+            ))
             .content(
                 Grid::new()
                     .rows([GridLength::Auto, GridLength::Auto, GridLength::Auto])
@@ -1481,11 +1492,11 @@ impl DesktopApp {
             None => vec![MenuItem::disabled("loading", "Reading the catalogue…")],
         };
         if self.submitting() {
-            return m3::chip_static(m3::glyph::MODEL, &label);
+            return m3::chip_static(palette, m3::glyph::MODEL, &label);
         }
         m3::chip(palette)
             .automation_name(format!("Model and effort: {label}"))
-            .content(m3::icon_label(m3::glyph::MODEL, &label))
+            .content(m3::chip_label(m3::glyph::MODEL, &label))
             .menu(Menu::new(
                 items,
                 // Capture-free for a stable menu identity (see the "…" menu).
@@ -1562,7 +1573,7 @@ impl DesktopApp {
                                 .on_click(context.message(Message::Chat(
                                     ChatMsg::InterruptRequested(bound.clone()),
                                 )))
-                                .content(m3::icon_label(m3::glyph::STOP, "Interrupt")),
+                                .content(m3::text_icon_label(m3::glyph::STOP, "Interrupt")),
                             m3::tonal(palette)
                                 .is_enabled(enabled && !draft_blank)
                                 .automation_name(format!("Steer turn {turn} with the message"))
@@ -1636,7 +1647,7 @@ impl DesktopApp {
                                     .on_click(context.message(Message::Chat(
                                         ChatMsg::ForceStopAnswered(false),
                                     )))
-                                    .content(TextBlock::new().text("Cancel")),
+                                    .content(m3::label("Cancel")),
                                 m3::danger(palette)
                                     .is_enabled(!self.submitting())
                                     .automation_name(format!(

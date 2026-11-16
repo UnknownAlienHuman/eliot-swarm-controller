@@ -9,6 +9,8 @@ pub(super) enum ProfilesMsg {
     ProfilesDraftChanged(String),
     ProfileEditSelected(Option<usize>),
     ProfileFieldChanged(usize, String),
+    /// A form dropdown (field index) picked a choice (None: items replaced).
+    ProfileChoicePicked(usize, Option<usize>),
     DuplicateNameChanged(String),
     DuplicateRequested,
     ProfilesValidateRequested,
@@ -96,6 +98,32 @@ impl DesktopApp {
                         }
                         Err(error) => self.editor.status = error,
                     }
+                }
+            }
+            ProfilesMsg::ProfileChoicePicked(field, index) => {
+                // A ComboBox reports None when its items are replaced.
+                let (Some(index), Some(name), Some(key)) =
+                    (index, self.editor.selected.clone(), FORM_FIELDS.get(field))
+                else {
+                    return;
+                };
+                let current = match profiles::field(&self.editor.draft, &name, key) {
+                    profiles::Field::Simple(value) => Some(value),
+                    _ => None,
+                };
+                let Some(choices) = profiles::choices(key, current.as_deref()) else {
+                    return;
+                };
+                let value = profiles::choice_value(&choices, index);
+                if value == current.as_deref() {
+                    return;
+                }
+                match profiles::set_field(&self.editor.draft, &name, key, value) {
+                    Ok(draft) => {
+                        self.editor.view = draft.clone();
+                        self.editor.draft = draft;
+                    }
+                    Err(error) => self.editor.status = error,
                 }
             }
             ProfilesMsg::DuplicateNameChanged(text) => self.editor.duplicate_name = text,
@@ -253,6 +281,13 @@ impl DesktopApp {
             save: context.message(Message::Profiles(ProfilesMsg::ProfilesSaveRequested)),
             reload: context.message(Message::Profiles(ProfilesMsg::ProfilesReloadRequested)),
             toggle_source: context.message(Message::Profiles(ProfilesMsg::SourceToggled)),
+            choice_picked: (0..FORM_FIELDS.len())
+                .map(|field| {
+                    context.callback(move |index: Option<usize>| {
+                        Message::Profiles(ProfilesMsg::ProfileChoicePicked(field, index))
+                    })
+                })
+                .collect(),
         };
         config_view::profiles_screen(data, actions, palette)
     }

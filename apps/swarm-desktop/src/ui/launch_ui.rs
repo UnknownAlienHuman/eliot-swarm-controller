@@ -376,13 +376,13 @@ impl DesktopApp {
         project_items.push(MenuItem::item("other", OTHER_FOLDER));
         let project = m3::chip(palette)
             .automation_name(format!("Project: {project_label}"))
-            .content(m3::icon_label(m3::glyph::FOLDER, &project_label))
+            .content(m3::chip_label(m3::glyph::FOLDER, &project_label))
             .menu(Menu::new(
                 project_items,
                 context.callback(|label: String| Message::Launch(LaunchMsg::ProjectMenu(label))),
             ));
         let folder: View = if self.launch.custom_workspace || self.nav.projects.is_empty() {
-            m3::field(palette)
+            m3::field()
                 .text(self.launch.workspace.clone())
                 .placeholder_text("Folder path")
                 .automation_name("Folder")
@@ -429,14 +429,14 @@ impl DesktopApp {
         ));
         let profile = m3::chip(palette)
             .automation_name(format!("Profile: {profile_label}"))
-            .content(m3::icon_label(m3::glyph::PROFILE, &profile_label))
+            .content(m3::chip_label(m3::glyph::PROFILE, &profile_label))
             .menu(Menu::new(
                 profile_items,
                 context.callback(|label: String| Message::Launch(LaunchMsg::ProfileMenu(label))),
             ));
         StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(theme::spacing::XS)
+            .spacing(theme::spacing::SM)
             .children((project, folder, profile))
     }
 
@@ -472,7 +472,7 @@ impl DesktopApp {
                 (
                     m3::chip(palette)
                         .automation_name(format!("Model and effort: {label}"))
-                        .content(m3::icon_label(m3::glyph::MODEL, &label))
+                        .content(m3::chip_label(m3::glyph::MODEL, &label))
                         .menu(Menu::new(
                             items,
                             context.callback(|label: String| {
@@ -484,6 +484,7 @@ impl DesktopApp {
             }
             (_, Some(profile)) => (
                 m3::chip_static(
+                    palette,
                     m3::glyph::MODEL,
                     &format!(
                         "{} · {}",
@@ -494,14 +495,17 @@ impl DesktopApp {
                 access_label(profile.permissions.as_deref()),
             ),
             (_, None) => (
-                m3::chip_static(m3::glyph::MODEL, "No profile"),
+                m3::chip_static(palette, m3::glyph::MODEL, "No profile"),
                 access_label(None),
             ),
         };
         StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(theme::spacing::XS)
-            .children((model_chip, m3::chip_static(m3::glyph::SHIELD, &access)))
+            .spacing(theme::spacing::SM)
+            .children((
+                model_chip,
+                m3::chip_static(palette, m3::glyph::SHIELD, &access),
+            ))
     }
 }
 

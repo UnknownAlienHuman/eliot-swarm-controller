@@ -345,7 +345,7 @@ impl DesktopApp {
         let resources = monitor_view::resource_views(&self.monitor.data, &id, palette);
         sections.push(KeyedView::new(
             "resources",
-            m3::card(palette).content(
+            m3::card_high(palette).content(
                 StackPanel::new().spacing(theme::spacing::SM).children((
                     m3::text("Resources", theme::type_scale::TITLE_SMALL)
                         .automation_heading_level(AutomationHeadingLevel::Level3),
@@ -435,7 +435,7 @@ impl DesktopApp {
 
 /// A details card: a title and selectable lines.
 fn section(palette: Palette, title: &str, lines: &[String]) -> View {
-    m3::card(palette).content(
+    m3::card_high(palette).content(
         StackPanel::new().spacing(theme::spacing::XS).children((
             m3::text(title, theme::type_scale::TITLE_SMALL)
                 .automation_heading_level(AutomationHeadingLevel::Level3),

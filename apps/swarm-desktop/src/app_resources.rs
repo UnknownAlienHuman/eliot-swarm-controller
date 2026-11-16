@@ -1,32 +1,47 @@
-//! WinUI accent and selection resources at the application root, from the
-//! M3 roles.
+//! Material 3 at the application root: WinUI lightweight styling from the
+//! M3 roles, shape scale and state layers.
 //!
-//! Without them every WinUI control that draws an accent (the ListView
-//! selection pill and selected row, focus underlines of text fields, combo
-//! box selections, check boxes) uses the Windows system accent next to the
-//! M3 palette. Reactor 0.100.0 applies [`windows_reactor::ResourceOverrides`]
-//! only to a `Button` (the one generated builder with `resource_overrides`;
-//! `native/winui/mod.rs` `set_resource_overrides` writes into that element's
-//! own `Resources`), and its `ResourceValue::Color` becomes a
-//! `SolidColorBrush`, so it cannot set Color resources such as
-//! `SystemAccentColor` either. The application root is reached directly:
-//! `Application.Current.Resources.ThemeDictionaries["Light"|"Dark"]` get one
-//! dictionary each, parsed by `XamlReader.Load`, the runtime equivalent of an
-//! `App.xaml` and the mechanism Reactor itself uses to compile styles
-//! (`native/winui/mod.rs`, `XamlReader::Load`).
+//! Two parts, both parsed by `XamlReader.Load` (the runtime equivalent of an
+//! `App.xaml`, the mechanism Reactor itself uses to compile styles in
+//! `native/winui/mod.rs`) and moved into the application's own resource
+//! entries, under the keys WinUI generated for them (no type key is built
+//! by hand):
 //!
-//! WinUI resolves a ThemeResource through the application's own entries and
-//! theme dictionaries before its merged `XamlControlsResources`, so these
-//! keys win; they follow the window's Light/Dark switch on their own, and
-//! under High Contrast WinUI selects the `HighContrast` dictionary, which is
-//! left alone: the system colors apply. The keys are WinUI's (lightweight
-//! styling, `microsoft.windowsappsdk.winui` 2.3.0 `Themes/generic.xaml`).
+//! - **Roles.** WinUI's own keys (`microsoft.windowsappsdk.winui` 2.3.0
+//!   `Themes/generic.xaml`) from the window's scheme: the accent ramp, list
+//!   selection, the text box as an M3 outlined text field, the combo box as
+//!   an M3 exposed dropdown menu, the toggle switch in M3 switch roles, menus
+//!   and combo-box popups on surface-container, the dialog on
+//!   surface-container-high, the tooltip on inverse-surface and the focus
+//!   ring in secondary. WinUI resolves a ThemeResource through the
+//!   application's own entries before its merged `XamlControlsResources`,
+//!   so these win, also in the templates' visual-state storyboards (the
+//!   focused text box takes the M3 outline, observed live). Theme
+//!   dictionaries inserted into `Application.Resources.ThemeDictionaries`
+//!   at run time were not consulted for these keys (observed live: own
+//!   entries applied, theme-dictionary entries did not), so the roles of
+//!   the shown scheme are written as own entries and rewritten when the
+//!   scheme changes ([`apply_scheme`]); under High Contrast they are
+//!   removed and the system colors apply.
+//! - **Styles.** The M3 shapes and paddings that WinUI's own styles fix
+//!   (`Padding="{StaticResource ButtonPadding}"`, one `ControlCornerRadius`
+//!   for every control): one button style per M3 shape under the keys
+//!   Reactor's `ButtonStyle` looks up (see [`styles_xaml`]), text fields and
+//!   combo boxes with the extra-small corner, dialogs with the extra-large
+//!   corner, switches without the On/Off words, and menus without the
+//!   acrylic backdrop, on the solid M3 container. A Reactor `Thickness` or
+//!   `CornerRadius` resource override reaches WinUI as zero (observed live),
+//!   so shapes cannot be per button.
+//!
+//! Reactor 0.100.0 applies [`windows_reactor::ResourceOverrides`] only to a
+//! `Button` (`native/winui/mod.rs` `set_resource_overrides` writes into that
+//! element's own `Resources`); everything else here has no Reactor property.
 //!
 //! Interface ids and vtable slots are those of `Microsoft.UI.Xaml.winmd`
 //! (WinUI 2.3.0 metadata): `IApplicationStatics` slot 6 `get_Current`,
-//! `IApplication` slot 6 `get_Resources`, `IResourceDictionary` slot 9
-//! `get_ThemeDictionaries`, `IXamlReaderStatics` slot 6 `Load`. Only these
-//! four calls are declared; Reactor's own bindings are crate-private.
+//! `IApplication` slot 6 `get_Resources`, `IXamlReaderStatics` slot 6
+//! `Load`. Only these three calls are declared; Reactor's own bindings are
+//! crate-private.
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
@@ -36,21 +51,36 @@ use windows_collections::IMap;
 use windows_core::{GUID, HRESULT, HSTRING, IInspectable, IUnknown, Interface, RuntimeName};
 use windows_reference::IReference;
 
-use crate::theme::{Rgb8, Scheme, shape};
+use crate::theme::{self, Rgb8, Scheme, shape, state};
 
-/// A theme resource value: a Color resource, a SolidColorBrush or a
-/// uniform CornerRadius.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A theme resource value.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Value {
     Color(Rgb8),
     /// A brush of `color` at `alpha` (0–255).
     Brush(Rgb8, u8),
-    /// A uniform corner radius in whole DIPs.
-    Radius(u8),
+    /// A uniform corner radius in DIPs.
+    Radius(f64),
+    /// A thickness (left, top, right, bottom) in DIPs.
+    Thickness([f64; 4]),
 }
 
 const fn opaque(color: Rgb8) -> Value {
     Value::Brush(color, 255)
+}
+
+/// `color` at `opacity` (0–1): an M3 state layer or disabled treatment.
+fn layer(color: Rgb8, opacity: f64) -> Value {
+    Value::Brush(color, alpha(opacity))
+}
+
+/// A brush WinUI draws as nothing.
+fn clear(s: &Scheme) -> Value {
+    Value::Brush(s.surface, 0)
+}
+
+const fn uniform(value: f64) -> Value {
+    Value::Thickness([value; 4])
 }
 
 /// `alpha` as a byte (an M3 state layer or the WinUI opacity steps).
@@ -58,13 +88,28 @@ fn alpha(value: f64) -> u8 {
     (value * 255.0).round() as u8
 }
 
+/// Keys that take one value in every state of a control.
+fn every(keys: &[&'static str], value: Value) -> Vec<(&'static str, Value)> {
+    keys.iter().map(|key| (*key, value)).collect()
+}
+
 /// The WinUI keys this window sets for one color scheme, with their values.
 pub fn entries(s: &Scheme) -> Vec<(&'static str, Value)> {
+    let mut all = accent(s);
+    all.extend(buttons(s));
+    all.extend(lists(s));
+    all.extend(text_field(s));
+    all.extend(dropdown(s));
+    all.extend(switch(s));
+    all.extend(overlays(s));
+    all
+}
+
+/// The accent ramp and accent fills (checked boxes, progress, selection).
+fn accent(s: &Scheme) -> Vec<(&'static str, Value)> {
     let [dark3, dark2, dark1, light1, light2, light3] = s.accent_ramp;
-    let selected_hover = s.secondary_container.mix(s.on_secondary_container, 0.08);
-    let selected_pressed = s.secondary_container.mix(s.on_secondary_container, 0.12);
     vec![
-        // The accent ramp: older brushes and templates read these colors.
+        // Older brushes and templates read these colors.
         ("SystemAccentColor", Value::Color(s.primary)),
         ("SystemAccentColorDark3", Value::Color(dark3)),
         ("SystemAccentColorDark2", Value::Color(dark2)),
@@ -72,7 +117,6 @@ pub fn entries(s: &Scheme) -> Vec<(&'static str, Value)> {
         ("SystemAccentColorLight1", Value::Color(light1)),
         ("SystemAccentColorLight2", Value::Color(light2)),
         ("SystemAccentColorLight3", Value::Color(light3)),
-        // Accent fills (checked boxes, focus underlines, selections).
         ("AccentFillColorDefaultBrush", opaque(s.primary)),
         (
             "AccentFillColorSecondaryBrush",
@@ -101,30 +145,88 @@ pub fn entries(s: &Scheme) -> Vec<(&'static str, Value)> {
             "TextOnAccentFillColorSelectedTextBrush",
             opaque(s.on_primary),
         ),
-        // WinUI's AccentButtonStyle as the M3 filled button (used where the
-        // window palette cannot apply, such as inside a ContentDialog).
+        // The M3 focus indicator: secondary, on the surface.
+        ("FocusStrokeColorOuter", Value::Color(s.secondary)),
+        ("FocusStrokeColorInner", Value::Color(s.surface)),
+        ("FocusStrokeColorOuterBrush", opaque(s.secondary)),
+        ("FocusStrokeColorInnerBrush", opaque(s.surface)),
+        ("SystemControlFocusVisualPrimaryBrush", opaque(s.secondary)),
+        ("SystemControlFocusVisualSecondaryBrush", opaque(s.surface)),
+    ]
+}
+
+/// Buttons without a family (inside dialogs): the M3 text button, and
+/// WinUI's AccentButtonStyle as the M3 filled button. The shape is the
+/// button's style.
+fn buttons(s: &Scheme) -> Vec<(&'static str, Value)> {
+    let mut all = vec![
+        ("ButtonBackground", clear(s)),
+        (
+            "ButtonBackgroundPointerOver",
+            layer(s.primary, state::HOVER),
+        ),
+        ("ButtonBackgroundPressed", layer(s.primary, state::PRESSED)),
+        ("ButtonBackgroundDisabled", clear(s)),
+        (
+            "ButtonForegroundDisabled",
+            layer(s.on_surface, state::DISABLED_CONTENT),
+        ),
         ("AccentButtonBackground", opaque(s.primary)),
         (
             "AccentButtonBackgroundPointerOver",
-            opaque(s.primary.mix(s.on_primary, 0.08)),
+            opaque(s.primary.mix(s.on_primary, state::HOVER)),
         ),
         (
             "AccentButtonBackgroundPressed",
-            opaque(s.primary.mix(s.on_primary, 0.12)),
+            opaque(s.primary.mix(s.on_primary, state::PRESSED)),
         ),
         (
             "AccentButtonBackgroundDisabled",
-            Value::Brush(s.on_surface, alpha(0.12)),
+            layer(s.on_surface, state::DISABLED_CONTAINER),
         ),
-        ("AccentButtonForeground", opaque(s.on_primary)),
-        ("AccentButtonForegroundPointerOver", opaque(s.on_primary)),
-        ("AccentButtonForegroundPressed", opaque(s.on_primary)),
         (
             "AccentButtonForegroundDisabled",
-            Value::Brush(s.on_surface, alpha(0.38)),
+            layer(s.on_surface, state::DISABLED_CONTENT),
         ),
-        // List selection: the M3 secondary-container row with a primary
-        // indicator, and on-surface state layers on hover and press.
+    ];
+    all.extend(every(
+        &[
+            "ButtonForeground",
+            "ButtonForegroundPointerOver",
+            "ButtonForegroundPressed",
+        ],
+        opaque(s.primary),
+    ));
+    all.extend(every(
+        &[
+            "ButtonBorderBrush",
+            "ButtonBorderBrushPointerOver",
+            "ButtonBorderBrushPressed",
+            "ButtonBorderBrushDisabled",
+        ],
+        clear(s),
+    ));
+    all.extend(every(
+        &[
+            "AccentButtonForeground",
+            "AccentButtonForegroundPointerOver",
+            "AccentButtonForegroundPressed",
+        ],
+        opaque(s.on_primary),
+    ));
+    all
+}
+
+/// List selection: the secondary-container row with a primary indicator,
+/// and on-surface state layers on hover and press.
+fn lists(s: &Scheme) -> Vec<(&'static str, Value)> {
+    let selected_hover = s
+        .secondary_container
+        .mix(s.on_secondary_container, state::HOVER);
+    let selected_pressed = s
+        .secondary_container
+        .mix(s.on_secondary_container, state::PRESSED);
+    let mut all = vec![
         (
             "ListViewItemBackgroundSelected",
             opaque(s.secondary_container),
@@ -138,54 +240,441 @@ pub fn entries(s: &Scheme) -> Vec<(&'static str, Value)> {
             opaque(selected_pressed),
         ),
         (
-            "ListViewItemForegroundSelected",
-            opaque(s.on_secondary_container),
-        ),
-        (
-            "ListViewItemForegroundSelectedPointerOver",
-            opaque(s.on_secondary_container),
-        ),
-        (
-            "ListViewItemForegroundSelectedPressed",
-            opaque(s.on_secondary_container),
-        ),
-        ("ListViewItemSelectionIndicatorBrush", opaque(s.primary)),
-        (
-            "ListViewItemSelectionIndicatorPointerOverBrush",
-            opaque(s.primary),
-        ),
-        (
-            "ListViewItemSelectionIndicatorPressedBrush",
-            opaque(s.primary),
-        ),
-        (
             "ListViewItemBackgroundPointerOver",
-            Value::Brush(s.on_surface, alpha(0.08)),
+            layer(s.on_surface, state::HOVER),
         ),
         (
             "ListViewItemBackgroundPressed",
-            Value::Brush(s.on_surface, alpha(0.12)),
+            layer(s.on_surface, state::PRESSED),
         ),
-        // The one control radius (buttons, rows, chips, fields, combo
-        // boxes). A Button's style reads `ControlCornerRadius` when the
-        // style is applied, before Reactor sets a button's own resource
-        // overrides, so it is set here, where WinUI resolves it first.
-        ("ControlCornerRadius", Value::Radius(shape::SM as u8)),
-    ]
+    ];
+    all.extend(every(
+        &[
+            "ListViewItemForegroundSelected",
+            "ListViewItemForegroundSelectedPointerOver",
+            "ListViewItemForegroundSelectedPressed",
+        ],
+        opaque(s.on_secondary_container),
+    ));
+    all.extend(every(
+        &[
+            "ListViewItemSelectionIndicatorBrush",
+            "ListViewItemSelectionIndicatorPointerOverBrush",
+            "ListViewItemSelectionIndicatorPressedBrush",
+        ],
+        opaque(s.primary),
+    ));
+    all
+}
+
+/// The text box as an M3 outlined text field: no fill, an outline that
+/// darkens on hover and becomes a 2-DIP primary line when focused.
+fn text_field(s: &Scheme) -> Vec<(&'static str, Value)> {
+    let mut all = vec![
+        ("TextControlBorderBrush", opaque(s.outline)),
+        ("TextControlBorderBrushPointerOver", opaque(s.on_surface)),
+        ("TextControlBorderBrushFocused", opaque(s.primary)),
+        (
+            "TextControlBorderBrushDisabled",
+            layer(s.on_surface, state::DISABLED_CONTAINER),
+        ),
+        ("TextControlElevationBorderBrush", opaque(s.outline)),
+        ("TextControlElevationBorderFocusedBrush", opaque(s.primary)),
+        (
+            "TextControlForegroundDisabled",
+            layer(s.on_surface, state::DISABLED_CONTENT),
+        ),
+        (
+            "TextControlPlaceholderForegroundDisabled",
+            layer(s.on_surface, state::DISABLED_CONTENT),
+        ),
+        ("TextControlHeaderForeground", opaque(s.on_surface_variant)),
+        (
+            "TextControlHeaderForegroundDisabled",
+            layer(s.on_surface, state::DISABLED_CONTENT),
+        ),
+        ("TextControlSelectionHighlightColor", opaque(s.primary)),
+        (
+            "TextControlButtonBackgroundPointerOver",
+            layer(s.on_surface, state::HOVER),
+        ),
+        (
+            "TextControlButtonBackgroundPressed",
+            layer(s.on_surface, state::PRESSED),
+        ),
+        ("TextControlBorderThemeThickness", uniform(1.0)),
+        ("TextControlBorderThemeThicknessFocused", uniform(2.0)),
+    ];
+    all.extend(every(
+        &[
+            "TextControlBackground",
+            "TextControlBackgroundPointerOver",
+            "TextControlBackgroundFocused",
+            "TextControlBackgroundDisabled",
+            "TextControlButtonBackground",
+            "TextControlButtonBorderBrush",
+            "TextControlButtonBorderBrushPointerOver",
+            "TextControlButtonBorderBrushPressed",
+        ],
+        clear(s),
+    ));
+    all.extend(every(
+        &[
+            "TextControlForeground",
+            "TextControlForegroundPointerOver",
+            "TextControlForegroundFocused",
+        ],
+        opaque(s.on_surface),
+    ));
+    all.extend(every(
+        &[
+            "TextControlPlaceholderForeground",
+            "TextControlPlaceholderForegroundPointerOver",
+            "TextControlPlaceholderForegroundFocused",
+            "TextControlButtonForeground",
+            "TextControlButtonForegroundPointerOver",
+            "TextControlButtonForegroundPressed",
+        ],
+        opaque(s.on_surface_variant),
+    ));
+    all
+}
+
+/// The combo box as an M3 exposed dropdown menu: the outlined field, and a
+/// menu on surface-container whose selected item is secondary-container.
+fn dropdown(s: &Scheme) -> Vec<(&'static str, Value)> {
+    let selected_hover = s
+        .secondary_container
+        .mix(s.on_secondary_container, state::HOVER);
+    let selected_pressed = s
+        .secondary_container
+        .mix(s.on_secondary_container, state::PRESSED);
+    let mut all = vec![
+        ("ComboBoxBorderBrush", opaque(s.outline)),
+        ("ComboBoxBorderBrushPointerOver", opaque(s.on_surface)),
+        ("ComboBoxBorderBrushPressed", opaque(s.primary)),
+        (
+            "ComboBoxBorderBrushDisabled",
+            layer(s.on_surface, state::DISABLED_CONTAINER),
+        ),
+        ("ComboBoxBackgroundBorderBrushFocused", opaque(s.primary)),
+        ("ComboBoxBackgroundBorderBrushUnfocused", opaque(s.outline)),
+        ("ComboBoxBorderThemeThickness", uniform(1.0)),
+        (
+            "ComboBoxForegroundDisabled",
+            layer(s.on_surface, state::DISABLED_CONTENT),
+        ),
+        (
+            "ComboBoxPlaceHolderForegroundDisabled",
+            layer(s.on_surface, state::DISABLED_CONTENT),
+        ),
+        ("ComboBoxHeaderForeground", opaque(s.on_surface_variant)),
+        (
+            "ComboBoxHeaderForegroundDisabled",
+            layer(s.on_surface, state::DISABLED_CONTENT),
+        ),
+        (
+            "ComboBoxDropDownBackgroundPointerOver",
+            layer(s.on_surface, state::HOVER),
+        ),
+        (
+            "ComboBoxDropDownBackgroundPointerPressed",
+            layer(s.on_surface, state::PRESSED),
+        ),
+        (
+            "ComboBoxFocusedDropDownBackgroundPointerOver",
+            layer(s.on_surface, state::HOVER),
+        ),
+        (
+            "ComboBoxFocusedDropDownBackgroundPointerPressed",
+            layer(s.on_surface, state::PRESSED),
+        ),
+        ("ComboBoxDropDownBackground", opaque(s.surface_container)),
+        ("ComboBoxDropDownForeground", opaque(s.on_surface)),
+        (
+            "ComboBoxItemBackgroundPointerOver",
+            layer(s.on_surface, state::HOVER),
+        ),
+        (
+            "ComboBoxItemBackgroundPressed",
+            layer(s.on_surface, state::PRESSED),
+        ),
+        (
+            "ComboBoxItemBackgroundSelectedPointerOver",
+            opaque(selected_hover),
+        ),
+        (
+            "ComboBoxItemBackgroundSelectedPressed",
+            opaque(selected_pressed),
+        ),
+        (
+            "ComboBoxItemForegroundDisabled",
+            layer(s.on_surface, state::DISABLED_CONTENT),
+        ),
+        (
+            "ComboBoxItemForegroundSelectedDisabled",
+            layer(s.on_surface, state::DISABLED_CONTENT),
+        ),
+    ];
+    all.extend(every(
+        &[
+            "ComboBoxBackground",
+            "ComboBoxBackgroundPointerOver",
+            "ComboBoxBackgroundPressed",
+            "ComboBoxBackgroundFocused",
+            "ComboBoxBackgroundUnfocused",
+            "ComboBoxBackgroundDisabled",
+            "ComboBoxDropDownBorderBrush",
+            "ComboBoxLightDismissOverlayBackground",
+            "ComboBoxItemBackground",
+            "ComboBoxItemBackgroundDisabled",
+            "ComboBoxItemBackgroundSelectedDisabled",
+            "ComboBoxItemPillFillBrush",
+            "ComboBoxItemBorderBrush",
+            "ComboBoxItemBorderBrushPressed",
+            "ComboBoxItemBorderBrushPointerOver",
+            "ComboBoxItemBorderBrushDisabled",
+            "ComboBoxItemBorderBrushSelected",
+            "ComboBoxItemBorderBrushSelectedUnfocused",
+            "ComboBoxItemBorderBrushSelectedPressed",
+            "ComboBoxItemBorderBrushSelectedPointerOver",
+            "ComboBoxItemBorderBrushSelectedDisabled",
+        ],
+        clear(s),
+    ));
+    all.extend(every(
+        &[
+            "ComboBoxForeground",
+            "ComboBoxForegroundPointerOver",
+            "ComboBoxForegroundPressed",
+            "ComboBoxForegroundFocused",
+            "ComboBoxForegroundFocusedPressed",
+            "ComboBoxItemForeground",
+            "ComboBoxItemForegroundPressed",
+            "ComboBoxItemForegroundPointerOver",
+        ],
+        opaque(s.on_surface),
+    ));
+    all.extend(every(
+        &[
+            "ComboBoxPlaceHolderForeground",
+            "ComboBoxPlaceHolderForegroundPointerOver",
+            "ComboBoxPlaceHolderForegroundPressed",
+            "ComboBoxPlaceHolderForegroundFocused",
+            "ComboBoxPlaceHolderForegroundFocusedPressed",
+        ],
+        opaque(s.on_surface_variant),
+    ));
+    all.extend(every(
+        &[
+            "ComboBoxItemBackgroundSelected",
+            "ComboBoxItemBackgroundSelectedUnfocused",
+        ],
+        opaque(s.secondary_container),
+    ));
+    all.extend(every(
+        &[
+            "ComboBoxItemForegroundSelected",
+            "ComboBoxItemForegroundSelectedUnfocused",
+            "ComboBoxItemForegroundSelectedPressed",
+            "ComboBoxItemForegroundSelectedPointerOver",
+        ],
+        opaque(s.on_secondary_container),
+    ));
+    all
+}
+
+/// The toggle switch in M3 switch roles: an outlined surface track with an
+/// outline handle when off, a primary track with an on-primary handle when
+/// on (primary-container on hover and press). WinUI keeps its geometry.
+fn switch(s: &Scheme) -> Vec<(&'static str, Value)> {
+    let track_off = s.surface_container_highest;
+    let mut all = vec![
+        ("ToggleSwitchFillOff", opaque(track_off)),
+        (
+            "ToggleSwitchFillOffPointerOver",
+            opaque(track_off.mix(s.on_surface, state::HOVER)),
+        ),
+        (
+            "ToggleSwitchFillOffPressed",
+            opaque(track_off.mix(s.on_surface, state::PRESSED)),
+        ),
+        (
+            "ToggleSwitchFillOffDisabled",
+            layer(s.surface_container_highest, state::DISABLED_CONTAINER),
+        ),
+        ("ToggleSwitchKnobFillOff", opaque(s.outline)),
+        (
+            "ToggleSwitchKnobFillOffPointerOver",
+            opaque(s.on_surface_variant),
+        ),
+        (
+            "ToggleSwitchKnobFillOffPressed",
+            opaque(s.on_surface_variant),
+        ),
+        (
+            "ToggleSwitchKnobFillOffDisabled",
+            layer(s.on_surface, state::DISABLED_CONTENT),
+        ),
+        (
+            "ToggleSwitchStrokeOffDisabled",
+            layer(s.on_surface, state::DISABLED_CONTAINER),
+        ),
+        ("ToggleSwitchFillOn", opaque(s.primary)),
+        ("ToggleSwitchFillOnPointerOver", opaque(s.primary)),
+        ("ToggleSwitchFillOnPressed", opaque(s.primary)),
+        (
+            "ToggleSwitchFillOnDisabled",
+            layer(s.on_surface, state::DISABLED_CONTAINER),
+        ),
+        ("ToggleSwitchKnobFillOn", opaque(s.on_primary)),
+        (
+            "ToggleSwitchKnobFillOnPointerOver",
+            opaque(s.primary_container),
+        ),
+        ("ToggleSwitchKnobFillOnPressed", opaque(s.primary_container)),
+        ("ToggleSwitchKnobFillOnDisabled", opaque(s.surface)),
+        ("ToggleSwitchContentForeground", opaque(s.on_surface)),
+        ("ToggleSwitchHeaderForeground", opaque(s.on_surface)),
+    ];
+    all.extend(every(
+        &[
+            "ToggleSwitchStrokeOff",
+            "ToggleSwitchStrokeOffPointerOver",
+            "ToggleSwitchStrokeOffPressed",
+        ],
+        opaque(s.outline),
+    ));
+    all.extend(every(
+        &[
+            "ToggleSwitchStrokeOn",
+            "ToggleSwitchStrokeOnPointerOver",
+            "ToggleSwitchStrokeOnPressed",
+        ],
+        opaque(s.primary),
+    ));
+    all.extend(every(
+        &[
+            "ToggleSwitchStrokeOnDisabled",
+            "ToggleSwitchKnobStrokeOn",
+            "ToggleSwitchContainerBackground",
+            "ToggleSwitchContainerBackgroundPointerOver",
+            "ToggleSwitchContainerBackgroundPressed",
+            "ToggleSwitchContainerBackgroundDisabled",
+        ],
+        clear(s),
+    ));
+    all
+}
+
+/// Menus and popups: menus on surface-container (M3 menu), the dialog on
+/// surface-container-high with the M3 scrim, the plain tooltip on
+/// inverse-surface; the extra-small corner for controls and overlays (the
+/// dialog's extra-large corner is in its implicit style).
+fn overlays(s: &Scheme) -> Vec<(&'static str, Value)> {
+    let mut all = vec![
+        ("MenuFlyoutPresenterBackground", opaque(s.surface_container)),
+        ("MenuFlyoutPresenterBorderBrush", opaque(s.outline_variant)),
+        ("MenuFlyoutSeparatorBackground", opaque(s.outline_variant)),
+        (
+            "MenuFlyoutItemBackgroundPointerOver",
+            layer(s.on_surface, state::HOVER),
+        ),
+        (
+            "MenuFlyoutItemBackgroundPressed",
+            layer(s.on_surface, state::PRESSED),
+        ),
+        (
+            "MenuFlyoutSubItemBackgroundPointerOver",
+            layer(s.on_surface, state::HOVER),
+        ),
+        (
+            "MenuFlyoutSubItemBackgroundPressed",
+            layer(s.on_surface, state::PRESSED),
+        ),
+        (
+            "MenuFlyoutSubItemBackgroundSubMenuOpened",
+            layer(s.on_surface, state::HOVER),
+        ),
+        (
+            "MenuFlyoutItemForegroundDisabled",
+            layer(s.on_surface, state::DISABLED_CONTENT),
+        ),
+        (
+            "MenuFlyoutSubItemForegroundDisabled",
+            layer(s.on_surface, state::DISABLED_CONTENT),
+        ),
+        (
+            "MenuFlyoutSubItemChevronDisabled",
+            layer(s.on_surface, state::DISABLED_CONTENT),
+        ),
+        ("ContentDialogBackground", opaque(s.surface_container_high)),
+        ("ContentDialogTopOverlay", opaque(s.surface_container_high)),
+        ("ContentDialogForeground", opaque(s.on_surface)),
+        (
+            "ContentDialogContentForegroundBrush",
+            opaque(s.on_surface_variant),
+        ),
+        // The M3 scrim: black at 32%.
+        (
+            "ContentDialogSmokeFill",
+            Value::Brush(Rgb8::new(0, 0, 0), alpha(0.32)),
+        ),
+        ("ContentDialogBorderWidth", uniform(0.0)),
+        ("ToolTipBackground", opaque(s.inverse_surface)),
+        ("ToolTipForeground", opaque(s.inverse_on_surface)),
+        ("ControlCornerRadius", Value::Radius(shape::XS)),
+        ("OverlayCornerRadius", Value::Radius(shape::XS)),
+    ];
+    all.extend(every(
+        &[
+            "MenuFlyoutItemBackground",
+            "MenuFlyoutItemBackgroundDisabled",
+            "MenuFlyoutSubItemBackground",
+            "MenuFlyoutSubItemBackgroundDisabled",
+            "ContentDialogBorderBrush",
+            "ContentDialogSeparatorBorderBrush",
+            "ToolTipBorderBrush",
+        ],
+        clear(s),
+    ));
+    all.extend(every(
+        &[
+            "MenuFlyoutItemForeground",
+            "MenuFlyoutItemForegroundPointerOver",
+            "MenuFlyoutItemForegroundPressed",
+            "MenuFlyoutSubItemForeground",
+            "MenuFlyoutSubItemForegroundPointerOver",
+            "MenuFlyoutSubItemForegroundPressed",
+            "MenuFlyoutSubItemForegroundSubMenuOpened",
+        ],
+        opaque(s.on_surface),
+    ));
+    all.extend(every(
+        &[
+            "MenuFlyoutItemKeyboardAcceleratorTextForeground",
+            "MenuFlyoutSubItemChevron",
+            "MenuFlyoutSubItemChevronPointerOver",
+            "MenuFlyoutSubItemChevronPressed",
+            "MenuFlyoutSubItemChevronSubMenuOpened",
+        ],
+        opaque(s.on_surface_variant),
+    ));
+    all
 }
 
 fn hex(color: Rgb8, alpha: u8) -> String {
     format!("#{alpha:02X}{:02X}{:02X}{:02X}", color.r, color.g, color.b)
 }
 
-/// One theme dictionary as XAML. Keys are fixed identifiers and values hex
-/// colors, so nothing in it needs escaping.
+const XAML_ROOT: &str = "<ResourceDictionary \
+     xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\" \
+     xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">";
+
+/// The roles of one scheme as one dictionary of XAML. Keys are fixed identifiers and values
+/// numbers or hex colors, so nothing in it needs escaping.
 pub fn dictionary_xaml(scheme: &Scheme) -> String {
-    let mut xaml = String::from(
-        "<ResourceDictionary \
-         xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\" \
-         xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">",
-    );
+    let mut xaml = String::from(XAML_ROOT);
     for (key, value) in entries(scheme) {
         let _ = match value {
             Value::Color(color) => {
@@ -202,33 +691,139 @@ pub fn dictionary_xaml(scheme: &Scheme) -> String {
                     "<CornerRadius x:Key=\"{key}\">{radius}</CornerRadius>"
                 )
             }
+            Value::Thickness([left, top, right, bottom]) => write!(
+                xaml,
+                "<Thickness x:Key=\"{key}\">{left},{top},{right},{bottom}</Thickness>"
+            ),
         };
     }
     xaml.push_str("</ResourceDictionary>");
     xaml
 }
 
-/// Install the Light and Dark dictionaries on the running application.
-/// Called once, on the UI thread, after Reactor merged
-/// `XamlControlsResources` and before the first controls are created
-/// (Reactor's `on_launched` installs those resources, then mounts the
-/// component), so every control resolves these keys from its first template.
-pub fn install() -> Result<(), String> {
-    install_native().map_err(|error| format!("{error} ({:#010X})", error.code().0))
+/// The button styles by M3 shape, under the keys Reactor's `ButtonStyle`
+/// looks up (`native/winui/generated.rs`: Accent, Subtle, TextLink), and
+/// the implicit styles of the other controls. Button colors stay with the
+/// theme keys and the button families.
+///
+/// - implicit `Button`: common buttons, navigation items and segments (full
+///   corner, 24-DIP sides, label-large weight);
+/// - `SubtleButtonStyle`: icon buttons (full corner, no padding);
+/// - `TextBlockButtonStyle`: chips (small corner, 8/16-DIP sides);
+/// - `AccentButtonStyle`: the extended FAB and card buttons (large corner),
+///   based on WinUI's own AccentButtonStyle so a button without a family
+///   (the hand-off dialog's primary) keeps its theme's filled colors.
+///
+/// None of these sets a template: WinUI applies the control's built-in
+/// style underneath, so every button keeps its states and focus visuals.
+pub fn styles_xaml() -> String {
+    let (xs, sm, lg, xl, full) = (shape::XS, shape::SM, shape::LG, shape::XL, shape::FULL);
+    let icon = theme::layout::ICON_BUTTON / 2.0;
+    format!(
+        "{XAML_ROOT}\
+         <Style TargetType=\"Button\">\
+           <Setter Property=\"CornerRadius\" Value=\"{full}\"/>\
+           <Setter Property=\"Padding\" Value=\"24,0,24,0\"/>\
+           <Setter Property=\"FontWeight\" Value=\"Medium\"/>\
+         </Style>\
+         <Style x:Key=\"SubtleButtonStyle\" TargetType=\"Button\">\
+           <Setter Property=\"CornerRadius\" Value=\"{icon}\"/>\
+           <Setter Property=\"Padding\" Value=\"0\"/>\
+         </Style>\
+         <Style x:Key=\"TextBlockButtonStyle\" TargetType=\"Button\">\
+           <Setter Property=\"CornerRadius\" Value=\"{sm}\"/>\
+           <Setter Property=\"Padding\" Value=\"8,0,16,0\"/>\
+           <Setter Property=\"FontWeight\" Value=\"Medium\"/>\
+         </Style>\
+         <Style x:Key=\"AccentButtonStyle\" TargetType=\"Button\" \
+                BasedOn=\"{{StaticResource AccentButtonStyle}}\">\
+           <Setter Property=\"CornerRadius\" Value=\"{lg}\"/>\
+           <Setter Property=\"Padding\" Value=\"16,0,20,0\"/>\
+           <Setter Property=\"FontWeight\" Value=\"Medium\"/>\
+         </Style>\
+         <Style TargetType=\"TextBox\">\
+           <Setter Property=\"CornerRadius\" Value=\"{xs}\"/>\
+           <Setter Property=\"Padding\" Value=\"14,10,10,10\"/>\
+           <Setter Property=\"MinHeight\" Value=\"44\"/>\
+         </Style>\
+         <Style TargetType=\"ComboBox\">\
+           <Setter Property=\"CornerRadius\" Value=\"{xs}\"/>\
+           <Setter Property=\"MinHeight\" Value=\"44\"/>\
+         </Style>\
+         <Style TargetType=\"ToggleSwitch\">           <Setter Property=\"OnContent\" Value=\"\"/>           <Setter Property=\"OffContent\" Value=\"\"/>           <Setter Property=\"MinWidth\" Value=\"0\"/>         </Style>         <Style TargetType=\"ContentDialog\">\
+           <Setter Property=\"CornerRadius\" Value=\"{xl}\"/>\
+         </Style>\
+         <Style TargetType=\"MenuFlyoutPresenter\">\
+           <Setter Property=\"SystemBackdrop\" Value=\"{{x:Null}}\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{xs}\"/>\
+         </Style>\
+         </ResourceDictionary>"
+    )
 }
 
-fn install_native() -> windows_core::Result<()> {
-    let application = current_application()?;
-    let themes = theme_dictionaries(&application)?;
-    for (theme, dark) in [("Light", false), ("Dark", true)] {
-        let dictionary = load_xaml(&dictionary_xaml(Scheme::of(dark)))?;
-        let key: IInspectable = IReference::<HSTRING>::from(theme).into();
-        themes.Insert(&key, &dictionary)?;
+/// Install the styles and the roles of the window's scheme (`None` under
+/// High Contrast). Called once, on the UI thread, after Reactor merged
+/// `XamlControlsResources` and before the first controls are created
+/// (Reactor's `on_launched` installs those resources, then mounts the
+/// component), so every control resolves these from its first template.
+pub fn install(scheme: Option<&Scheme>) -> Result<(), String> {
+    native(|own| {
+        insert_parsed(own, &styles_xaml())?;
+        write_scheme(own, scheme)
+    })
+}
+
+/// Rewrite the roles for a new scheme, or remove them under High Contrast
+/// (`None`) so WinUI's system colors apply. The window rebuilds its
+/// controls on a scheme change (the palette-keyed tree), and the new
+/// controls resolve the new values.
+pub fn apply_scheme(scheme: Option<&Scheme>) -> Result<(), String> {
+    native(|own| write_scheme(own, scheme))
+}
+
+type OwnEntries = IMap<IInspectable, IInspectable>;
+
+fn native(work: impl FnOnce(&OwnEntries) -> windows_core::Result<()>) -> Result<(), String> {
+    let run = || -> windows_core::Result<()> {
+        let application = current_application()?;
+        let own: OwnEntries = application_resources(&application)?.cast()?;
+        work(&own)
+    };
+    run().map_err(|error| format!("{error} ({:#010X})", error.code().0))
+}
+
+fn write_scheme(own: &OwnEntries, scheme: Option<&Scheme>) -> windows_core::Result<()> {
+    match scheme {
+        Some(scheme) => insert_parsed(own, &dictionary_xaml(scheme)),
+        None => {
+            // The keys are the same for both schemes.
+            for (key, _) in entries(Scheme::of(false)) {
+                let key: IInspectable = IReference::<HSTRING>::from(key).into();
+                if own.HasKey(&key)? {
+                    own.Remove(&key)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Parse one dictionary and move its entries, under the keys WinUI
+/// generated for them, into the application's own entries.
+fn insert_parsed(own: &OwnEntries, xaml: &str) -> windows_core::Result<()> {
+    let parsed: OwnEntries = load_xaml(xaml)?.cast()?;
+    let mut moved = Vec::new();
+    for pair in &parsed {
+        moved.push((pair.Key()?, pair.Value()?));
+    }
+    parsed.Clear()?;
+    for (key, value) in moved {
+        own.Insert(&key, &value)?;
     }
     Ok(())
 }
 
-/// A WinRT interface pointer with a hand-declared vtable.
+// A WinRT interface pointer with a hand-declared vtable.
 macro_rules! winrt_interface {
     ($name:ident, $vtable:ident, $iid:literal) => {
         #[repr(transparent)]
@@ -263,15 +858,6 @@ struct ApplicationVtbl {
 }
 
 #[repr(C)]
-struct ResourceDictionaryVtbl {
-    base: InspectableSlots,
-    source: usize,
-    set_source: usize,
-    merged_dictionaries: usize,
-    theme_dictionaries: Getter,
-}
-
-#[repr(C)]
 struct XamlReaderStaticsVtbl {
     base: InspectableSlots,
     load: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> HRESULT,
@@ -286,11 +872,6 @@ winrt_interface!(
     IApplication,
     ApplicationVtbl,
     0x06a8f4e7_1146_55af_820d_ebd55643b021
-);
-winrt_interface!(
-    IResourceDictionary,
-    ResourceDictionaryVtbl,
-    0x1b690975_a710_5783_a6e1_15836f6186c2
 );
 winrt_interface!(
     IXamlReaderStatics,
@@ -330,15 +911,9 @@ fn current_application() -> windows_core::Result<IApplication> {
     unsafe { get(&statics, statics.vtable().current) }?.cast()
 }
 
-fn theme_dictionaries(
-    application: &IApplication,
-) -> windows_core::Result<IMap<IInspectable, IInspectable>> {
+fn application_resources(application: &IApplication) -> windows_core::Result<IInspectable> {
     // SAFETY: slot 6 of IApplication is get_Resources.
-    let resources: IResourceDictionary =
-        unsafe { get(application, application.vtable().resources) }?.cast()?;
-    // SAFETY: slot 9 of IResourceDictionary is get_ThemeDictionaries, an
-    // IMap<Object, Object>.
-    unsafe { get(&resources, resources.vtable().theme_dictionaries) }?.cast()
+    unsafe { get(application, application.vtable().resources) }
 }
 
 fn load_xaml(xaml: &str) -> windows_core::Result<IInspectable> {
@@ -367,7 +942,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_scheme_sets_the_accent_list_and_text_keys_once() {
+    fn every_scheme_sets_each_key_once_including_the_control_families() {
         for dark in [false, true] {
             let entries = entries(Scheme::of(dark));
             let mut keys: Vec<&str> = entries.iter().map(|(key, _)| *key).collect();
@@ -376,10 +951,13 @@ mod tests {
                 "SystemAccentColorLight2",
                 "SystemAccentColorDark1",
                 "AccentFillColorDefaultBrush",
-                "AccentTextFillColorPrimaryBrush",
                 "TextOnAccentFillColorPrimaryBrush",
-                "ListViewItemSelectionIndicatorBrush",
                 "ListViewItemBackgroundSelected",
+                "TextControlBorderBrushFocused",
+                "ComboBoxDropDownBackground",
+                "ToggleSwitchFillOn",
+                "MenuFlyoutPresenterBackground",
+                "ContentDialogBackground",
             ] {
                 assert!(keys.contains(&required), "{required} dark={dark}");
             }
@@ -391,19 +969,28 @@ mod tests {
     }
 
     #[test]
-    fn accents_are_the_scheme_primary_not_the_system_accent() {
+    fn controls_take_m3_roles_not_the_system_accent() {
         for dark in [false, true] {
             let s = Scheme::of(dark);
             let entries = entries(s);
             let value = |key: &str| entries.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
             assert_eq!(value("SystemAccentColor"), Some(Value::Color(s.primary)));
             assert_eq!(
-                value("AccentFillColorDefaultBrush"),
+                value("ListViewItemBackgroundSelected"),
+                Some(Value::Brush(s.secondary_container, 255))
+            );
+            // Outlined text field: outline at rest, primary when focused, no fill.
+            assert_eq!(
+                value("TextControlBorderBrush"),
+                Some(Value::Brush(s.outline, 255))
+            );
+            assert_eq!(
+                value("TextControlBorderBrushFocused"),
                 Some(Value::Brush(s.primary, 255))
             );
             assert_eq!(
-                value("ListViewItemBackgroundSelected"),
-                Some(Value::Brush(s.secondary_container, 255))
+                value("TextControlBackgroundFocused"),
+                Some(Value::Brush(s.surface, 0))
             );
             // WinUI's own mapping reads the fill from Dark1 (light theme) and
             // Light2 (dark theme): the ramp keeps those on the M3 primary.
@@ -417,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn dictionary_xaml_is_one_dictionary_with_argb_values() {
+    fn dictionary_xaml_is_one_dictionary_with_typed_values() {
         let s = Scheme::of(true);
         let xaml = dictionary_xaml(s);
         assert!(xaml.starts_with("<ResourceDictionary "));
@@ -427,9 +1014,25 @@ mod tests {
             "<Color x:Key=\"SystemAccentColor\">#FF{:02X}{:02X}{:02X}</Color>",
             s.primary.r, s.primary.g, s.primary.b
         )));
-        assert!(xaml.contains(&format!(
-            "<SolidColorBrush x:Key=\"AccentFillColorSecondaryBrush\" Color=\"#E6{:02X}{:02X}{:02X}\"/>",
-            s.primary.r, s.primary.g, s.primary.b
-        )));
+        assert!(xaml.contains(
+            "<Thickness x:Key=\"TextControlBorderThemeThicknessFocused\">2,2,2,2</Thickness>"
+        ));
+        assert!(xaml.contains("<CornerRadius x:Key=\"OverlayCornerRadius\">4</CornerRadius>"));
+    }
+
+    #[test]
+    fn styles_xaml_names_one_button_style_per_shape() {
+        let xaml = styles_xaml();
+        assert!(xaml.starts_with("<ResourceDictionary "));
+        assert!(xaml.ends_with("</ResourceDictionary>"));
+        for key in [
+            "SubtleButtonStyle",
+            "TextBlockButtonStyle",
+            "AccentButtonStyle",
+        ] {
+            assert!(xaml.contains(&format!("x:Key=\"{key}\"")), "{key}");
+        }
+        assert!(!xaml.contains("ThemeResource"));
+        assert_eq!(xaml.matches("<Style ").count(), 9);
     }
 }

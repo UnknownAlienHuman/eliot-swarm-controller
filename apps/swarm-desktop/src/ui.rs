@@ -486,8 +486,8 @@ impl Component for DesktopApp {
             },
         };
         // Before the first controls exist (see `app_resources::install`).
-        if let Err(error) = crate::app_resources::install() {
-            app.status = format!("WinUI accent resources not applied: {error}");
+        if let Err(error) = crate::app_resources::install(app.palette().scheme()) {
+            app.status = format!("WinUI M3 resources not applied: {error}");
         }
         if let Ok(data_dir) = app.data_dir.clone() {
             let _task = context.spawn_background(move |_| {

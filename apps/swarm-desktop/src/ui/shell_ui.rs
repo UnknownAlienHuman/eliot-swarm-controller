@@ -73,9 +73,15 @@ const HIGH_CONTRAST_POLL_MS: u64 = 2_000;
 const PRIME_RETRY_MS: u64 = 16;
 /// Indent per tree level in the sidebar.
 const TREE_INDENT: f64 = 16.0;
-/// The expand chevron column of an Agent row: WinUI's button padding
-/// (11, 5, 11, 6) leaves a whole 10-DIP chevron at 32 x 32.
+/// The expand chevron column left of an Agent item (a 32 x 32 icon button).
 const CHEVRON: f64 = 32.0;
+/// The M3 navigation drawer's padding around its items.
+const DRAWER_PADDING: f64 = 12.0;
+/// The start inset of a navigation item's content (and of the headers).
+const ITEM_INSET: f64 = 16.0;
+/// The left edge of an Agent item: its title lines up with its project's
+/// label (16 inset + 20 icon + 12 gap = 48 = 32 + 16).
+const CHILD_INSET: f64 = 32.0;
 /// Rows in Recents.
 const RECENTS: usize = 8;
 /// Titles read per background batch.
@@ -272,6 +278,7 @@ impl DesktopApp {
                 self.appearance.high_contrast = crate::accessibility::high_contrast_on();
                 if self.palette() != before {
                     // The palette-keyed tree is rebuilt with new controls.
+                    self.apply_scheme();
                     self.reprime_fields(context);
                 }
             }
@@ -279,6 +286,7 @@ impl DesktopApp {
             ShellMsg::HighContrastRead(on) => {
                 if on != self.appearance.high_contrast {
                     self.appearance.high_contrast = on;
+                    self.apply_scheme();
                     self.reprime_fields(context);
                 }
                 self.watch_high_contrast(context);
@@ -331,6 +339,14 @@ impl DesktopApp {
                     self.post_fields_primed(epoch, PRIME_RETRY_MS, context);
                 }
             }
+        }
+    }
+
+    /// Write the shown scheme's M3 roles at the application root (removed
+    /// under High Contrast), before the palette-keyed tree is rebuilt.
+    fn apply_scheme(&mut self) {
+        if let Err(error) = crate::app_resources::apply_scheme(self.palette().scheme()) {
+            self.set_status(format!("WinUI M3 resources not applied: {error}"));
         }
     }
 
@@ -670,15 +686,16 @@ impl DesktopApp {
         Grid::new().keyed_children(vec![KeyedView::new(palette_key.to_owned(), window)])
     }
 
-    /// The sidebar: the app name, New task, the projects with their Agents,
-    /// Recents, then the fleet status and Settings at the bottom.
+    /// The navigation drawer: the app name, the New task FAB, the projects
+    /// with their Agents, Recents, then the fleet status and Settings at the
+    /// bottom. M3 navigation-drawer metrics: 12-DIP container padding,
+    /// 56-DIP items, title-small section headers at the items' 16-DIP inset.
     fn sidebar_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let gutter = theme::spacing::SM;
-        let new_task_selected = self.main == Main::Conversation && self.chat.convo.is_none();
+        let gutter = DRAWER_PADDING;
         let header = Grid::new()
             .columns([GridLength::STAR, GridLength::Auto])
             .margin(Thickness::new(
-                theme::spacing::MD,
+                gutter + theme::spacing::MD,
                 theme::spacing::MD,
                 gutter,
                 theme::spacing::SM,
@@ -692,16 +709,22 @@ impl DesktopApp {
                     .on_click(context.message(Message::Shell(ShellMsg::RefreshRequested)))
                     .content(m3::icon(m3::glyph::REFRESH)),
             ));
-        let new_task = m3::row(palette, false)
+        let new_task = m3::fab(palette)
             .grid_row(1)
-            .margin(Thickness::xy(gutter, 0.0))
+            .margin(Thickness::new(
+                gutter,
+                theme::spacing::XS,
+                gutter,
+                theme::spacing::SM,
+            ))
             .automation_name("New task")
             .on_click(context.message(Message::Shell(ShellMsg::NewTask)))
             .content(m3::icon_label(m3::glyph::NEW_TASK, "New task"));
+        let new_task_selected = self.main == Main::Conversation && self.chat.convo.is_none();
 
         let mut items: Vec<KeyedView> = vec![KeyedView::new(
             "projects-caption",
-            m3::caption("Projects").margin(caption_margin()),
+            section_header("Projects"),
         )];
         let registered: Vec<(String, String)> = self
             .nav
@@ -724,7 +747,8 @@ impl DesktopApp {
                     "Loading…"
                 } else {
                     "No projects yet"
-                }),
+                })
+                .margin(Thickness::new(ITEM_INSET, 0.0, 0.0, theme::spacing::SM)),
             ));
         }
         for section in &sections {
@@ -736,7 +760,12 @@ impl DesktopApp {
             if section.rows.is_empty() {
                 items.push(KeyedView::new(
                     format!("empty:{}", section.checkout),
-                    quiet_line("No tasks").margin(Thickness::new(40.0, 0.0, 0.0, 4.0)),
+                    quiet_line("No tasks").margin(Thickness::new(
+                        CHILD_INSET + ITEM_INSET,
+                        0.0,
+                        0.0,
+                        theme::spacing::SM,
+                    )),
                 ));
             }
             for row in &section.rows {
@@ -753,24 +782,23 @@ impl DesktopApp {
                 "more",
                 m3::text_button(palette)
                     .is_enabled(!self.nav.agents_loading)
-                    .margin(Thickness::new(32.0, 0.0, 0.0, 0.0))
+                    .margin(Thickness::new(
+                        CHILD_INSET + ITEM_INSET - 12.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ))
                     .on_click(context.message(Message::Shell(ShellMsg::MoreAgentsRequested)))
-                    .content(m3::text(
-                        format!(
-                            "Show more ({} of {})",
-                            self.nav.agents.len(),
-                            self.nav.agents_total
-                        ),
-                        theme::type_scale::BODY_SMALL,
-                    )),
+                    .content(m3::label(&format!(
+                        "Show more ({} of {})",
+                        self.nav.agents.len(),
+                        self.nav.agents_total
+                    ))),
             ));
         }
         let recents = nav::recents(&self.nav.agents, RECENTS);
         if !recents.is_empty() {
-            items.push(KeyedView::new(
-                "recents-caption",
-                m3::caption("Recents").margin(caption_margin()),
-            ));
+            items.push(KeyedView::new("recents-caption", section_header("Recents")));
             for agent in recents {
                 items.push(KeyedView::new(
                     format!("recent:{}", agent.id),
@@ -784,7 +812,6 @@ impl DesktopApp {
             .automation_name("Projects and Agents")
             .content(
                 StackPanel::new()
-                    .spacing(2.0)
                     .margin(Thickness::new(gutter, 0.0, gutter, gutter))
                     .keyed_children(items),
             );
@@ -793,19 +820,33 @@ impl DesktopApp {
         let monitor_open = self.panel == Panel::Monitor;
         let bottom = StackPanel::new()
             .grid_row(3)
-            .spacing(2.0)
-            .margin(Thickness::new(gutter, gutter, gutter, theme::spacing::MD))
+            .margin(Thickness::new(gutter, 0.0, gutter, gutter))
             .keyed_children(vec![
+                KeyedView::new(
+                    "divider",
+                    Border::new()
+                        .height(1.0)
+                        .margin(Thickness::new(
+                            theme::spacing::MD,
+                            0.0,
+                            theme::spacing::MD,
+                            theme::spacing::SM,
+                        ))
+                        .background(palette.outline_variant()),
+                ),
                 KeyedView::new(
                     format!("fleet:{monitor_open}"),
                     self.fleet_row(context, palette),
                 ),
                 KeyedView::new(
                     format!("settings:{settings_open}"),
-                    m3::row(palette, settings_open)
+                    m3::nav_item(palette, settings_open)
                         .automation_name("Settings")
                         .on_click(context.message(Message::Shell(ShellMsg::SettingsOpened)))
-                        .content(m3::icon_label(m3::glyph::SETTINGS, "Settings")),
+                        .content(m3::nav_content(m3::icon_label(
+                            m3::glyph::SETTINGS,
+                            "Settings",
+                        ))),
                 ),
             ]);
 
@@ -819,7 +860,7 @@ impl DesktopApp {
             .children((header, new_task, list, bottom))
     }
 
-    /// A project row: a new task in that project.
+    /// A project item: a new task in that project.
     fn project_row(
         &self,
         section: &Section,
@@ -827,16 +868,20 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        m3::row(palette, selected)
+        m3::nav_item(palette, selected)
             .automation_name(format!("New task in {}", section.name))
             .on_click(context.message(Message::Shell(ShellMsg::ProjectPicked(
                 section.checkout.clone(),
             ))))
-            .content(m3::icon_label(m3::glyph::FOLDER, &section.name))
+            .content(m3::nav_content(m3::icon_label(
+                m3::glyph::FOLDER,
+                &section.name,
+            )))
     }
 
-    /// An Agent row: indent, the expand chevron when it has children, its
-    /// title and a status dot when its state needs a look.
+    /// An Agent item under its project: indented to the project's label,
+    /// the expand chevron when it has workers, its title and a status dot
+    /// when its state needs a look.
     fn agent_row(
         &self,
         row: &Row,
@@ -858,7 +903,7 @@ impl DesktopApp {
                     format!("Show {} worker(s) of {title}", row.children),
                 )
             };
-            m3::text_button(palette)
+            m3::icon_button(palette)
                 .width(CHEVRON)
                 .height(CHEVRON)
                 .vertical_alignment(VerticalAlignment::Center)
@@ -867,7 +912,7 @@ impl DesktopApp {
                     agent.id.clone(),
                     !row.expanded,
                 ))))
-                .content(chevron_icon(glyph))
+                .content(m3::icon_sized(glyph, 12.0))
         } else {
             View::empty()
         };
@@ -877,7 +922,12 @@ impl DesktopApp {
         }
         let note: View = match &row.note {
             Some(note) => quiet_line(note)
-                .margin(Thickness::new(CHEVRON + theme::spacing::MD, 0.0, 0.0, 0.0))
+                .margin(Thickness::new(
+                    theme::spacing::MD,
+                    0.0,
+                    0.0,
+                    theme::spacing::XS,
+                ))
                 .grid_row(1)
                 .grid_column(1)
                 .into(),
@@ -885,7 +935,7 @@ impl DesktopApp {
         };
         Grid::new()
             .margin(Thickness::new(
-                theme::spacing::MD + row.depth as f64 * TREE_INDENT,
+                CHILD_INSET - CHEVRON + row.depth as f64 * TREE_INDENT,
                 0.0,
                 0.0,
                 0.0,
@@ -896,16 +946,19 @@ impl DesktopApp {
                 Border::new()
                     .vertical_alignment(VerticalAlignment::Center)
                     .content(chevron),
-                m3::row(palette, selected)
+                m3::nav_item(palette, selected)
                     .grid_column(1)
                     .automation_name(name)
                     .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
-                    .content(row_content(&title, m3::list_dot(palette, &agent.state))),
+                    .content(m3::nav_content(row_content(
+                        &title,
+                        m3::list_dot(palette, &agent.state),
+                    ))),
                 note,
             ))
     }
 
-    /// A Recents row: the title and its dot, no tree.
+    /// A Recents item: the title and its dot, no tree.
     fn recent_row(
         &self,
         agent: &UiAgent,
@@ -913,10 +966,13 @@ impl DesktopApp {
         palette: Palette,
     ) -> View {
         let title = self.agent_title(&agent.id);
-        m3::row(palette, false)
+        m3::nav_item(palette, false)
             .automation_name(format!("Recent: {title}, {}", agent.state))
             .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
-            .content(row_content(&title, m3::list_dot(palette, &agent.state)))
+            .content(m3::nav_content(row_content(
+                &title,
+                m3::list_dot(palette, &agent.state),
+            )))
     }
 
     /// The fleet in one line ("2 running · 1 waiting"); it opens the
@@ -925,16 +981,16 @@ impl DesktopApp {
         let (summary, tone) = fleet_summary(&self.nav.agents, self.nav.agents_total);
         let dot = palette.dot(tone).map_or_else(View::empty, m3::dot);
         let open = self.panel == Panel::Monitor;
-        m3::row(palette, open)
+        m3::nav_item(palette, open)
             .automation_name(format!(
                 "Monitor: {summary} ({})",
                 if open { "open" } else { "closed" }
             ))
             .on_click(context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Monitor))))
-            .content(
+            .content(m3::nav_content(
                 Grid::new()
                     .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-                    .column_spacing(theme::spacing::SM)
+                    .column_spacing(12.0)
                     .children((
                         m3::icon(m3::glyph::PULSE),
                         TextBlock::new()
@@ -944,7 +1000,7 @@ impl DesktopApp {
                             .text_trimming(TextTrimming::CharacterEllipsis),
                         Border::new().grid_column(2).content(dot),
                     )),
-            )
+            ))
     }
 
     /// Show a short notice above the composer (refusals, uncertain
@@ -965,26 +1021,19 @@ impl DesktopApp {
     }
 }
 
-fn caption_margin() -> Thickness {
-    Thickness::new(
-        theme::spacing::MD,
+/// A navigation-drawer section header: title-small at the items' inset.
+fn section_header(text: &str) -> TextBlock {
+    m3::caption(text).margin(Thickness::new(
+        ITEM_INSET,
         theme::spacing::MD,
         0.0,
-        theme::spacing::XS,
-    )
+        theme::spacing::SM,
+    ))
 }
 
 /// A muted one-line note in a list.
 fn quiet_line(text: &str) -> TextBlock {
     m3::muted(text, theme::type_scale::BODY_SMALL).text_trimming(TextTrimming::CharacterEllipsis)
-}
-
-/// A 12-DIP chevron for the tree toggle.
-fn chevron_icon(glyph: &str) -> View {
-    Viewbox::new()
-        .width(10.0)
-        .height(10.0)
-        .slot(ViewboxSlot::Child, FontIcon::new().glyph(glyph.to_owned()))
 }
 
 /// A row's content: the title, trimmed, and an optional trailing mark.
@@ -1004,7 +1053,7 @@ fn row_content(title: &str, trailing: View) -> View {
         ))
 }
 
-/// The fleet line and its most urgent tone, from the listed Agents.
+// The fleet line and its most urgent tone, from the listed Agents.
 pub(super) fn fleet_summary(agents: &[UiAgent], total: usize) -> (String, StatusTone) {
     let count = |tone: StatusTone| {
         agents
