@@ -370,8 +370,17 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       at or past the process-creation limit are refused with the OS error; the pipe and
       data root are current-user-only and inherited ACLs are refused; `pass_env` values
       never reach the data dir or readbacks; `max_live`, frame and page bounds hold.
-- [ ] Supported Linux behavior and honest degraded custody; adopted-service isolation
-      (with the local adopted backends). Deferred by the owner.
+- [x] Linux via the supported Docker image, with real native Agent turns, private
+      IPC/data permissions and honest degraded process custody. See [Docker](../docker/README.md).
+      Image built and Codex/Luna launch, tool turn, follow-up send and OpenCode free-model
+      tool turn qualified on 2026-11-16, including space/percent/non-ASCII paths.
+      Claude 2.1.325 with `claude-haiku-5-5` qualified on 2026-11-16 after the
+      scope-hash fix: launch, one-line tool turn (`pwd` plus `hello.txt`), follow-up
+      `send` (append `world`, verified on disk), and stop, all with the documented
+      `CLAUDE_CONFIG_DIR` credential mount; readiness commits, never unknown.
+      Muse/Antigravity Linux binaries install and run, but their authenticated
+      turns are not qualified here. Custody stays honestly degraded (see Docker README).
+- [ ] Adopted-service isolation (with the local adopted backends). Deferred by the owner.
 - [ ] Retention/WAL/backpressure and representative load. The 10,000-Agent,
       2,000-events/s owner run is a release capacity check, not a prerequisite to L2.
 

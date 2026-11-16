@@ -10,6 +10,13 @@ JSON-RPC 2.0 over UTF-8 NDJSON. Windows uses a current-user-only named pipe; Uni
 mode-0600 socket under the private data root. One daemon owns the data-directory lock.
 `daemon.json` records boot id, PID/birth identity, endpoint and diagnostic version.
 
+For the supported [Linux Docker image](../../docker/README.md), use
+`docker exec <container> swarm …` to reach its private socket. The Windows desktop
+uses named pipes and cannot attach. `workspace_custody` remains `degraded`;
+container cgroup membership does not establish exact per-Agent custody.
+The existing MCP HTTP listener binds container loopback, which ordinary Docker
+port publishing cannot reach. The image exposes no host HTTP/authentication surface.
+
 Every call has an explicit principal. Owner CLI outside a managed Agent/rule environment
 reads the private owner token automatically. Agents send id/generation/token; managed
 scripts use scoped run tokens; plugins have instance credentials. Missing/incomplete/
