@@ -46,8 +46,7 @@ use std::rc::Rc;
 use eliot_core::Command;
 use eliot_core::api::{
     AgentGetResponse, AgentListRequest, CommandSubmitResponse, ProfileListResponse, ProfileSummary,
-    ProfilesReadResponse, ProfilesSaveResponse, ReparentResponse, RuleListEntry,
-    ScriptListResponse, ScriptReadResponse, ScriptSaveResponse,
+    ReparentResponse, RuleListEntry, ScriptListResponse, ScriptReadResponse, ScriptSaveResponse,
 };
 use windows_reactor::*;
 
@@ -69,7 +68,7 @@ use launch_ui::LaunchMsg;
 use monitor_ui::MonitorMsg;
 use profiles_ui::ProfilesMsg;
 use scripts_ui::ScriptsMsg;
-use settings_ui::{SettingsMsg, SettingsSection};
+use settings_ui::{Page, SettingsMsg};
 use shell_ui::{Main, Panel, ShellMsg};
 
 use crate::chat::{Conversation, Invalidation};
@@ -191,9 +190,8 @@ struct DesktopApp {
     /// A notice for the owner above the composer, until dismissed.
     alert: Option<String>,
     appearance: shell_ui::Appearance,
-    /// Desktop preferences (theme, startup, Auto's profile, last Agent);
-    /// the theme and window size live in the daemon's `[desktop]` settings.
-    prefs: crate::settings::Settings,
+    /// The `[desktop]` preferences (theme, what opens at start).
+    prefs: crate::settings::Preferences,
     /// A preferences write is running (see `save_preferences`).
     prefs_saving: bool,
     /// The startup conversation was considered (once per window).
@@ -222,11 +220,12 @@ struct DesktopApp {
     in_flight_key: Option<String>,
     main: Main,
     panel: Panel,
-    settings_section: SettingsSection,
+    settings_page: Page,
     configure: configure_ui::ConfigureState,
     editor: profiles_ui::ProfilesEditor,
-    /// The Advanced section's editor over every settings section.
-    unified: settings_ui::SettingsEditor,
+    /// The unified settings: the read sections, the page's drafts and
+    /// each section's last save result.
+    settings: settings_ui::SettingsState,
     /// The daemon could not start in the data directory (the fresh
     /// private directory remedy is offered).
     startup_error: bool,
@@ -434,7 +433,7 @@ impl Component for DesktopApp {
             status: "Connecting to the daemon…".to_owned(),
             alert: None,
             appearance: shell_ui::Appearance::new(),
-            prefs: crate::settings::Settings::default(),
+            prefs: crate::settings::Preferences::default(),
             prefs_saving: false,
             startup_done: false,
             window_width: None,
@@ -450,10 +449,10 @@ impl Component for DesktopApp {
             in_flight_key: None,
             main: Main::Conversation,
             panel: Panel::Closed,
-            settings_section: SettingsSection::General,
+            settings_page: Page::General,
             configure: configure_ui::ConfigureState::default(),
             editor: profiles_ui::ProfilesEditor::default(),
-            unified: settings_ui::SettingsEditor::default(),
+            settings: settings_ui::SettingsState::default(),
             startup_error: false,
             scripts: scripts_ui::ScriptsEditor::default(),
             handoff: handoff_ui::DialogState::default(),

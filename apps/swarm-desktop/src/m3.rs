@@ -33,6 +33,9 @@ pub mod glyph {
     pub const CHEVRON_RIGHT: &str = "\u{E76C}";
     pub const CHEVRON_DOWN: &str = "\u{E70D}";
     pub const ARROW_DOWN: &str = "\u{E74B}";
+    pub const ARROW_UP: &str = "\u{E74A}";
+    pub const DELETE: &str = "\u{E74D}";
+    pub const HISTORY: &str = "\u{E81C}";
     pub const COPY: &str = "\u{E8C8}";
     pub const MODEL: &str = "\u{E945}";
     pub const SHIELD: &str = "\u{EA18}";

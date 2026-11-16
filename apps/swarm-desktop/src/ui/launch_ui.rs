@@ -331,7 +331,7 @@ impl DesktopApp {
             Choice::Profile(name) => Ok(LaunchTarget::Profile(name.clone())),
             Choice::Auto => self
                 .launch
-                .auto_profile(self.prefs.default_profile.as_deref())
+                .auto_profile(None)
                 .map(|profile| LaunchTarget::Profile(profile.name.clone()))
                 .ok_or_else(|| {
                     "no launchable profile is allowed here; add one in Settings, or pick a harness"
@@ -396,9 +396,7 @@ impl DesktopApp {
             View::empty()
         };
 
-        let auto = self
-            .launch
-            .auto_profile(self.prefs.default_profile.as_deref());
+        let auto = self.launch.auto_profile(None);
         let profile_label = match &self.launch.choice {
             Choice::Auto => match auto {
                 Some(profile) => format!("Auto · {}", profile.name),
@@ -443,7 +441,7 @@ impl DesktopApp {
     /// The model-and-effort chip and the access chip of a new task: read
     /// from the profile, or chosen from the ad-hoc harness's catalogue.
     pub(super) fn launch_chips(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let profile = self.launch.profile(self.prefs.default_profile.as_deref());
+        let profile = self.launch.profile(None);
         let (model_chip, access): (View, String) = match (&self.launch.choice, profile) {
             (Choice::Harness(harness), _) => {
                 let (models, efforts) = self.launch.adhoc_options();

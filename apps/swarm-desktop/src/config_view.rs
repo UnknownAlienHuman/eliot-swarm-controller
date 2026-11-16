@@ -1,12 +1,12 @@
 //! WinUI views for the Settings sections Models and profiles, and
 //! Automation and scripts.
 //!
-//! Profiles: one document draft (the `[profiles.*]` source the daemon
-//! returned) shown both as a few common form fields for the selected profile
-//! and, on request, as the full source text; both edit the same text.
-//! Validate and Save go to the daemon, which runs its own parser and launch
-//! resolution; an invalid draft stays here. Automation is read-only: no
-//! daemon operation pauses or resumes a rule or timer.
+//! Profiles: one document draft (the `profiles` settings section as
+//! `[profiles.*]` TOML) shown both as a few common form fields for the
+//! selected profile and, on request, as the full source text; both edit the
+//! same text. The Settings save bar validates and saves it through the
+//! daemon; an invalid draft stays here. Automation is read-only: no daemon
+//! operation pauses or resumes a rule or timer.
 
 use windows_reactor::*;
 
@@ -23,16 +23,8 @@ fn small(text: impl Into<String>) -> TextBlock {
         .is_text_selection_enabled(true)
 }
 
-fn short(revision: Option<&str>) -> String {
-    revision.map_or_else(
-        || "none (no config.toml)".to_owned(),
-        |revision| revision.chars().take(12).collect(),
-    )
-}
-
 /// State the Models and profiles section renders.
 pub struct ProfilesData<'a> {
-    pub revision: Option<&'a str>,
     pub file_valid: bool,
     pub file_error: Option<&'a str>,
     pub editable: bool,
@@ -40,7 +32,6 @@ pub struct ProfilesData<'a> {
     pub draft: &'a str,
     /// The source TextBox's own text, bound back unchanged.
     pub view: &'a str,
-    pub dirty: bool,
     pub selected: Option<&'a str>,
     pub duplicate_name: &'a str,
     pub status: &'a str,
@@ -57,9 +48,6 @@ pub struct ProfilesActions {
     pub field_changed: Vec<Callback<String>>,
     pub duplicate_name_changed: Callback<String>,
     pub duplicate: Callback<()>,
-    pub validate: Callback<()>,
-    pub save: Callback<()>,
-    pub reload: Callback<()>,
     pub toggle_source: Callback<()>,
     /// One per [`FORM_FIELDS`] entry: a dropdown index picked.
     pub choice_picked: Vec<Callback<Option<usize>>>,
@@ -80,8 +68,7 @@ fn field_label(key: &str) -> &str {
 }
 
 /// Models and profiles: one row per profile, the selected profile's form,
-/// Save / Validate / Discard, and the full TOML source on request. Form
-/// and source edit one draft.
+/// and the full TOML source on request. Form and source edit one draft.
 pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette: Palette) -> View {
     let names = profiles::profile_names(data.draft);
     let mut rows: Vec<KeyedView> = Vec::new();
@@ -127,9 +114,9 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
         rows.push(KeyedView::new(
             "none",
             small(if data.editable {
-                "No profiles yet: add one in the TOML source."
+                "No profiles yet: add one with Edit as TOML."
             } else {
-                "Reading profiles…"
+                "Profiles cannot be shown."
             })
             .opacity(theme::MUTED_OPACITY),
         ));
@@ -240,49 +227,30 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
     }
     let state = if !data.file_valid {
         format!(
-            "The saved file does not parse: {}. New tasks cannot start until it is fixed.",
+            "The saved settings do not parse: {}. New tasks cannot start until it is fixed.",
             data.file_error.unwrap_or("unparseable")
         )
     } else if !data.editable {
         format!("Not editable: {}", data.reason.unwrap_or("not editable"))
-    } else if data.dirty {
-        "Unsaved changes. Running Agents keep the settings they started with.".to_owned()
     } else {
-        format!(
-            "Saved (revision {}). The next task uses these settings.",
-            short(data.revision)
-        )
+        "Running Agents keep the settings they started with; the next task uses the saved ones."
+            .to_owned()
     };
     let actions_row = StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(theme::spacing::SM)
-        .children((
-            crate::m3::filled(palette)
-                .is_enabled(data.editable && data.dirty && !data.busy)
-                .on_click(actions.save)
-                .content(TextBlock::new().text("Save")),
-            crate::m3::outlined(palette)
-                .is_enabled(data.editable && !data.busy)
-                .on_click(actions.validate)
-                .content(TextBlock::new().text("Validate")),
-            crate::m3::text_button(palette)
-                .is_enabled(data.dirty && !data.busy)
-                .automation_name("Discard changes")
-                .on_click(actions.reload)
-                .content(crate::m3::label("Discard changes")),
-            crate::m3::text_button(palette)
-                .automation_name(if data.source_open {
-                    "Hide the TOML source"
-                } else {
-                    "Edit as TOML"
-                })
-                .on_click(actions.toggle_source)
-                .content(crate::m3::label(if data.source_open {
-                    "Hide TOML"
-                } else {
-                    "Edit as TOML"
-                })),
-        ));
+        .children((crate::m3::text_button(palette)
+            .automation_name(if data.source_open {
+                "Hide the TOML source"
+            } else {
+                "Edit as TOML"
+            })
+            .on_click(actions.toggle_source)
+            .content(crate::m3::label(if data.source_open {
+                "Hide TOML"
+            } else {
+                "Edit as TOML"
+            })),));
     let source: View = if data.source_open {
         crate::m3::field()
             .text(data.view.to_owned())

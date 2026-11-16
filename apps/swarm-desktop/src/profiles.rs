@@ -1,12 +1,13 @@
 //! Profile draft editing as pure text operations.
 //!
-//! The Profiles screen keeps one document draft: the `[profiles.*]` source
-//! text exactly as `config.profiles.read` returned it. The form and the
-//! source view edit that same text, so there is never a second model to
-//! reconcile. Form edits change one `key = "value"` line inside one profile
-//! block; duplicate copies a block under a new name. Validation and saving
-//! stay with the daemon (`config.profiles.save`, dry run first), which runs
-//! its own parser and launch resolution; nothing here decides validity.
+//! Models and profiles keeps one document draft: the `profiles` settings
+//! section as `[profiles.*]` TOML text (see
+//! [`crate::settings_model::profiles_toml`]). The form and the source view
+//! edit that same text, so there is never a second model to reconcile. Form
+//! edits change one `key = "value"` line inside one profile block; duplicate
+//! copies a block under a new name. Validation and saving stay with the
+//! daemon (`settings.save`, dry run first), which runs its own parser and
+//! launch resolution; nothing here decides validity.
 
 /// Common profile fields the form edits. Everything else stays source-only.
 pub const FORM_FIELDS: [&str; 4] = ["model", "effort", "permissions", "approval_policy"];

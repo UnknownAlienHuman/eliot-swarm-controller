@@ -907,10 +907,6 @@ impl DesktopApp {
         self.rebuild_items();
         self.set_status(format!("Reading retained history of {}…", agent.id));
         self.start_snapshot(context);
-        if self.prefs.last_agent.as_deref() != Some(agent.id.as_str()) {
-            self.prefs.last_agent = Some(agent.id.clone());
-            self.save_preferences(context);
-        }
     }
 
     pub(super) fn submit_control(

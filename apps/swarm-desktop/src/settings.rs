@@ -1,4 +1,9 @@
 //! Desktop preferences share the daemon settings source and revision guard.
+//!
+//! The theme, window size and what opens at start live in the daemon's
+//! `[desktop]` section; the desktop keeps no file of its own. A legacy
+//! per-user `swarm-desktop.json` is imported once when `[desktop]` is absent.
+//! RPC goes through [`crate::config_client`].
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -31,28 +36,31 @@ impl ThemeChoice {
     }
 }
 
-/// What the window opens at start.
+/// What the window opens at start (`[desktop] startup`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Startup {
     /// The empty new-task view.
     #[default]
     NewTask,
-    /// The conversation open when the window last closed.
+    /// The most recently active Agent's conversation.
     LastConversation,
 }
 
-/// The desktop preferences the window works with. The theme is read from and
-/// written to the daemon's `[desktop]` section; the others are this window's.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Settings {
+/// The `[desktop]` preferences the window applies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Preferences {
     pub theme: ThemeChoice,
     pub startup: Startup,
-    /// The profile "Auto" launches until daemon routing lands; unset means
-    /// the first launchable profile the project allows.
-    pub default_profile: Option<String>,
-    /// The Agent of the last opened conversation.
-    pub last_agent: Option<String>,
+}
+
+impl Preferences {
+    pub fn from_reply(reply: &SettingsReadResponse) -> Self {
+        Self {
+            theme: theme(reply),
+            startup: startup(reply),
+        }
+    }
 }
 
 pub async fn read(data_dir: &Path) -> eliot_core::Result<SettingsReadResponse> {
@@ -246,6 +254,15 @@ pub fn theme(reply: &SettingsReadResponse) -> ThemeChoice {
         .unwrap_or_default()
 }
 
+pub fn startup(reply: &SettingsReadResponse) -> Startup {
+    reply
+        .sections
+        .get(&SettingsSection::Desktop)
+        .and_then(|value| value.get("startup"))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default()
+}
+
 pub fn window(reply: &SettingsReadResponse) -> Option<(u32, u32)> {
     let window = reply
         .sections
@@ -267,30 +284,28 @@ pub async fn save(
     Ok(reply)
 }
 
-/// Re-read the current desktop section so a theme change preserves window preferences.
+/// Re-read the current desktop section so a preference change keeps the
+/// section's other fields.
 pub async fn save_preferences(
     data_dir: &Path,
-    choice: ThemeChoice,
+    preferences: Preferences,
     window: Option<(u32, u32)>,
-) -> eliot_core::Result<()> {
+) -> eliot_core::Result<SettingsSaveResponse> {
     let read = read(data_dir).await?;
-    let mut desktop = read
-        .sections
-        .get(&SettingsSection::Desktop)
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    desktop["theme"] = serde_json::to_value(choice).expect("theme serialization");
-    if let Some((width, height)) = window {
-        desktop["window"] = serde_json::json!({"width":width,"height":height});
-    }
+    let wire = |value: serde_json::Value| value.as_str().unwrap_or_default().to_owned();
+    let desktop = crate::settings_model::desktop_section(
+        read.sections.get(&SettingsSection::Desktop),
+        &wire(serde_json::to_value(preferences.theme).expect("theme serialization")),
+        &wire(serde_json::to_value(preferences.startup).expect("startup serialization")),
+        window,
+    );
     let request = SettingsSaveRequest {
         expected_revision: read.revision,
         sections: [(SettingsSection::Desktop, desktop)].into(),
         dry_run: false,
         client: SettingsClientSource::Desktop,
     };
-    save(data_dir, &request).await?;
-    Ok(())
+    save(data_dir, &request).await
 }
 
 #[cfg(test)]
@@ -302,6 +317,16 @@ mod tests {
             (ThemeChoice::System, "system"),
             (ThemeChoice::Light, "light"),
             (ThemeChoice::Dark, "dark"),
+        ] {
+            assert_eq!(serde_json::to_value(choice).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn startup_choices_match_wire_values() {
+        for (choice, text) in [
+            (Startup::NewTask, "new_task"),
+            (Startup::LastConversation, "last_conversation"),
         ] {
             assert_eq!(serde_json::to_value(choice).unwrap(), text);
         }

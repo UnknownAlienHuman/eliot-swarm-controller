@@ -54,6 +54,8 @@ mod scripts;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod settings;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod settings_model;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod state;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod theme;

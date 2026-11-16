@@ -1,18 +1,18 @@
 //! The one client module behind the Settings page.
 //!
-//! Every read and write the settings UI makes goes through here: the
-//! desktop preferences in the daemon's `[desktop]` section
-//! ([`crate::settings`]) and the daemon's existing configuration APIs (`profile.list`, `config.profiles.read/save`,
-//! `project.list`, `rule.list`, `script.list/read/save`, `timer.run`), each
-//! with the same request/response validators the CLI runs. When the unified
-//! `settings.read`/`settings.save` API (k55) lands it replaces these calls
-//! in this module only; the UI keeps its shape.
+//! Every setting the desktop reads or writes goes through the daemon's
+//! unified `settings.read` / `settings.save` (one store, revision-guarded,
+//! with author history), including the desktop's own `[desktop]`
+//! preferences ([`crate::settings`]). The remaining calls are the runtime
+//! reads and file-owned APIs the settings document does not cover:
+//! `profile.list` (launchability), `project.list` (resolved registrations),
+//! `routing.preview`, `rule.list`, `script.list/read/save` and `timer.run`.
+//! Each runs the same request/response validators the CLI runs.
 
 use std::path::Path;
 
 use eliot_core::api::{
-    ProfileListRequest, ProfileListResponse, ProfilesReadRequest, ProfilesReadResponse,
-    ProfilesSaveRequest, ProfilesSaveResponse, ProjectRegistrationView, RuleListEntry,
+    ProfileListRequest, ProfileListResponse, ProjectRegistrationView, RuleListEntry,
     RuleListRequest, RuleListResponse, ScriptListRequest, ScriptListResponse, ScriptReadRequest,
     ScriptReadResponse, ScriptSaveRequest, ScriptSaveResponse, SettingsReadResponse,
     SettingsSaveRequest, SettingsSaveResponse, TimerRunRequest, discovery::ProjectListRequest,
@@ -20,15 +20,15 @@ use eliot_core::api::{
 use eliot_core::{Command, Error, Result};
 use serde_json::Value;
 
-use crate::settings::{self, ThemeChoice};
+use crate::settings::{self, Preferences};
 
-/// Write the theme and window size into the daemon's `[desktop]` section.
+/// Write the `[desktop]` preferences and window size.
 pub async fn save_preferences(
     data_dir: &Path,
-    theme: ThemeChoice,
+    preferences: Preferences,
     window: Option<(u32, u32)>,
-) -> Result<()> {
-    settings::save_preferences(data_dir, theme, window).await
+) -> Result<SettingsSaveResponse> {
+    settings::save_preferences(data_dir, preferences, window).await
 }
 
 /// Every settings section, its revision and history; imports the legacy
@@ -68,36 +68,6 @@ pub async fn list_profiles(data_dir: &Path) -> Result<ProfileListResponse> {
     params.validate()?;
     let reply: ProfileListResponse =
         eliot_daemon::client_call_typed(data_dir, "profile.list", &params).await?;
-    params.validate_response(&reply)?;
-    Ok(reply)
-}
-
-/// The `[profiles.*]` source text and the file revision.
-pub async fn read_profiles_source(data_dir: &Path) -> Result<ProfilesReadResponse> {
-    let params = ProfilesReadRequest {};
-    params.validate()?;
-    let reply: ProfilesReadResponse =
-        eliot_daemon::client_call_typed(data_dir, "config.profiles.read", &params).await?;
-    params.validate_response(&reply)?;
-    Ok(reply)
-}
-
-/// Validate (dry run) or save the profile draft from `expected_revision`.
-pub async fn save_profiles(
-    data_dir: &Path,
-    expected_revision: Option<String>,
-    source: String,
-    dry_run: bool,
-) -> Result<ProfilesSaveResponse> {
-    let params = ProfilesSaveRequest {
-        client: eliot_core::api::SettingsClientSource::Desktop,
-        expected_revision,
-        source,
-        dry_run,
-    };
-    params.validate()?;
-    let reply: ProfilesSaveResponse =
-        eliot_daemon::client_call_typed(data_dir, "config.profiles.save", &params).await?;
     params.validate_response(&reply)?;
     Ok(reply)
 }

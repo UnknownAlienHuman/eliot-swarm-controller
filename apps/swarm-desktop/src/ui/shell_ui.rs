@@ -53,8 +53,6 @@ pub(super) enum ShellMsg {
     SaveWindow(u64),
     ThemeChosen(ThemeChoice),
     StartupChosen(Startup),
-    /// The profile Auto launches until routing lands (None: first allowed).
-    DefaultProfileChosen(Option<String>),
     /// The re-created editors of this re-prime exist: give them their text.
     FieldsPrimed(u64),
     /// The periodic High Contrast reading.
@@ -63,8 +61,12 @@ pub(super) enum ShellMsg {
     ExpandToggled(String, bool),
     /// Tree epoch, manager id and its direct-children page.
     BranchLoaded(u64, String, Fallible<AgentPage>),
-    /// The theme and window size written to `[desktop]` (or not).
-    PreferencesSaved(ThemeChoice, Option<(u32, u32)>, Result<(), String>),
+    /// The preferences and window size written to `[desktop]` (or not).
+    PreferencesSaved(
+        crate::settings::Preferences,
+        Option<(u32, u32)>,
+        Fallible<eliot_core::api::SettingsSaveResponse>,
+    ),
     /// Titles read from first messages (`None`: no retained input).
     TitlesLoaded(Vec<(String, Option<String>)>),
     AlertDismissed,
@@ -151,7 +153,7 @@ impl DesktopApp {
             ShellMsg::DaemonReady(result) => match result {
                 Ok((discovered, read)) => {
                     self.startup_error = false;
-                    self.prefs.theme = crate::settings::theme(&read);
+                    self.prefs = crate::settings::Preferences::from_reply(&read);
                     self.preferred_window = crate::settings::window(&read);
                     // The opened checkout, registered by discovery, is where
                     // a new task starts.
@@ -388,16 +390,29 @@ impl DesktopApp {
                 self.prefs.theme = theme;
                 self.save_preferences(context);
             }
-            ShellMsg::StartupChosen(startup) => self.prefs.startup = startup,
-            ShellMsg::DefaultProfileChosen(profile) => self.prefs.default_profile = profile,
-            ShellMsg::PreferencesSaved(theme, window, result) => {
+            ShellMsg::StartupChosen(startup) => {
+                self.prefs.startup = startup;
+                self.save_preferences(context);
+            }
+            ShellMsg::PreferencesSaved(saved, window, result) => {
                 self.prefs_saving = false;
-                if let Err(error) = result {
+                if let Err(error) = &result {
                     self.alert(format!("Preferences not saved: {error}"));
                 }
+                // A choice made on the page reports there; window-size
+                // writes stay quiet.
+                if self.main == Main::Settings || result.is_err() {
+                    self.settings.notes.insert(
+                        settings_ui::Page::General,
+                        crate::settings_model::save_note(false, &result),
+                    );
+                }
                 // A newer change arrived while this one was written.
-                if theme != self.prefs.theme || window != self.window_size {
+                if saved != self.prefs || window != self.window_size {
                     self.save_preferences(context);
+                } else if self.settings.loaded && result.is_ok() {
+                    // The revision moved: the page's drafts save against it.
+                    self.load_settings(context);
                 }
             }
             ShellMsg::TitlesLoaded(titles) => {
@@ -490,7 +505,8 @@ impl DesktopApp {
         self.launch.reconcile_choice();
     }
 
-    /// Open the last conversation once at start, when the preference asks.
+    /// Open the most recently active Agent's conversation once at start,
+    /// when the preference asks.
     fn open_startup_conversation(&mut self, context: &ComponentContext<Self>) {
         if self.startup_done {
             return;
@@ -499,13 +515,8 @@ impl DesktopApp {
         if self.prefs.startup != Startup::LastConversation || self.chat.convo.is_some() {
             return;
         }
-        let last = self
-            .prefs
-            .last_agent
-            .as_ref()
-            .and_then(|id| self.nav.agents.iter().find(|agent| &agent.id == id))
-            .cloned();
-        if let Some(agent) = last {
+        if let Some(agent) = nav::recents(&self.nav.agents, 1).first().cloned().cloned() {
+            self.nav.selection.select_agent(Some(agent.id.clone()));
             self.open_conversation(&agent, context);
         }
     }
@@ -652,11 +663,15 @@ impl DesktopApp {
             return;
         };
         self.prefs_saving = true;
-        let (theme, window) = (self.prefs.theme, self.window_size);
+        let (preferences, window) = (self.prefs, self.window_size);
         let _task = context.spawn_background(move |_| {
-            let saved = client::block_on(config_client::save_preferences(&data_dir, theme, window))
-                .map_err(|error| error.to_string());
-            Message::Shell(ShellMsg::PreferencesSaved(theme, window, saved))
+            let saved = client::block_on(config_client::save_preferences(
+                &data_dir,
+                preferences,
+                window,
+            ))
+            .map_err(|error| error.to_string());
+            Message::Shell(ShellMsg::PreferencesSaved(preferences, window, saved))
         });
     }
 
