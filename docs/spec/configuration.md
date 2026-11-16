@@ -256,9 +256,23 @@ exact tool formats are resolved separately. See the
 
 ### Worker MCP policy
 
-Every profile selects a worker MCP inheritance policy in `mcp`: `inherit`
-(the default) or `minimal`, plus an optional `mcp_allow` list of native
-server names:
+Every profile selects a worker MCP policy in `mcp`: `minimal` (the default
+where the harness maps it) or `inherit` (explicit opt-in, and the default for
+Muse and Antigravity, which have no minimal mapping), plus an optional `mcp_allow` list of native
+server names. Owner Swarm servers are identified by transport, not by name
+(`eliot_core::is_owner_swarm_server`, shared by every harness plugin in
+every policy, regardless of name or allow list): a stdio server whose
+command resolves to a Swarm executable -- by file name `swarm`/`swarm.exe`
+or the active controller binary path -- with arguments containing `mcp` but
+not `--require-agent`, or an HTTP server whose URL host equals a configured
+`cloud_mcp` hostname (the owner cloud endpoint carries Owner authority
+through Access). The Agent-scoped server Eliot generates is the only Swarm
+server a worker gets; it always carries `--require-agent`, so the identity
+rule never matches it. Swarm MCP names (`eliot_swarm`, `eliot-swarm` and the
+per-session prefix) stay reserved in every policy and can never be
+allow-listed, but the rule applies whatever the entry is named: a renamed
+owner entry is still the owner daemon identity. A worker that talks to the
+owner daemon with the owner identity is an authority leak.
 
 ```toml
 [profiles.codex-minimal]
@@ -269,34 +283,59 @@ mcp_allow = ["owner-search"]
 ```
 
 The resolved policy and allow list are frozen in the profile snapshot
-(`mcp`, `mcp_allow`) and the requested policy is reported in secret-free
-diagnostics and effective settings. Unknown policies are rejected at config
-load, and a non-empty allow list requires `minimal`.
+(`mcp`, `mcp_allow`, plus the configured cloud hostname as
+`mcp_cloud_hostname`; new freezes always record `mcp` explicitly) and the
+requested policy is reported in secret-free diagnostics and effective
+settings. Frozen snapshots without the key keep their recorded meaning
+(`inherit`); snapshots that predate `mcp_cloud_hostname` read it back as
+absent, leaving the identity HTTP arm inert. Unknown policies and reserved
+Swarm names in `mcp_allow` are rejected at config load, and a non-empty
+allow list requires `minimal`.
 
-`inherit` keeps the current behavior: the worker receives Eliot's
-Agent-scoped server in addition to the owner's native MCP surface.
-`minimal` starts only the intended MCP surface: Eliot's Agent-scoped server
-plus the explicitly allowed native servers, with every other enumerated
-`mcp_servers` entry disabled through transport-carrying per-run `-c`
-overrides, the known MCP-serving bundled plugins (`computer-use`,
-`unified-computer-use`, `codex-app-tools`) disabled when present and
-enabled, and the ChatGPT-backed Apps runtime (`codex_apps`) suppressed by
-a synthetic transport-carrying disable. An explicit `mcp_allow` entry for a
-plugin-backed server, plugin, or `codex_apps` keeps it enabled. No
+`inherit` is an explicit opt-in to the previous behavior: the worker receives
+Eliot's Agent-scoped server in addition to the owner native MCP surface,
+minus every owner Swarm identity. `minimal` starts only the intended MCP
+surface: Eliot's Agent-scoped server plus the explicitly allowed native
+servers. By harness:
+
+- Codex enumerates the effective `mcp_servers` surface pre-spawn in both
+  policies and disables every owner-identity match with a
+  transport-carrying per-run `-c` override (exact owner names stay covered
+  by synthetic transport-carrying stubs as backstop). An allow-listed name
+  that matches the identity is rejected at launch (`profile_error`)
+  instead of re-admitted. An entry whose argument vector the native layer
+  does not report counts as unknown and fails closed toward suppression;
+  an absent vector means the entry carries no argv. `minimal` additionally
+  disables every other non-allowed entry, the known MCP-serving bundled
+  plugins (`computer-use`, `unified-computer-use`, `codex-app-tools`) when
+  present and enabled, and the ChatGPT-backed Apps runtime (`codex_apps`)
+  by a synthetic transport-carrying disable. An explicit `mcp_allow` entry
+  for a plugin-backed server, plugin, or `codex_apps` keeps it enabled.
+- Claude `minimal` passes the Eliot-only per-run config plus
+  `--strict-mcp-config`, which ignores all other MCP configurations.
+  Claude `inherit` keeps the normal CLI precedence (installed 2.1.325
+  offers no per-server disable or deny switch for the per-run surface),
+  so the owner-side sources -- project `.mcp.json`, project and local
+  `.claude/settings*.json`, user `~/.claude/settings.json` and legacy
+  `~/.claude.json` -- are scanned pre-spawn for owner-identity entries
+  and a match refuses the start (`profile_error`, naming the server and
+  the source kind).
+- OpenCode serves the isolated per-Agent config (only the Agent-scoped
+  server) under isolated `XDG_CONFIG_HOME`/`XDG_DATA_HOME`, but the
+  workspace project layer (`opencode.json`/`opencode.jsonc`) still merges
+  natively, so every start scans that layer pre-create (pre-touch on
+  resume) for owner-identity entries and refuses the start on a match.
+  The settled inventory is then gated: `minimal` refuses any serving
+  unexpected server, `inherit` refuses reserved Swarm names, and
+  `mcp_servers_verified` is reported only after the gate passes with the
+  Agent-scoped entry connected.
+
+No policy edits the owner global native config or copies
+`auth.json`; no project or user file is ever edited by these scans. No
 prompt-surface flags are pinned: the policy is a tool-surface policy and
-must not silently change worker capabilities or safety context. Eliot's
-scoped `swarm mcp --require-agent` server is always present in both
-policies, and no policy edits the owner's global native config, copies
-`auth.json`, or changes native-store/observer bindings.
-
-Only the Codex and Claude harnesses implement `minimal`, each with its
-installed isolation mechanism; Muse, OpenCode and Antigravity keep
-`inherit` only and reject `minimal` as unsupported. Only Codex implements
-selective inclusion: a non-empty `mcp_allow` with `minimal` on any other
-harness is rejected as `unsupported` at config load (Claude `minimal` is the
-Eliot-only per-run config plus `--strict-mcp-config`, so an allow list
-would be silently dropped; with `inherit` an allow list is already rejected
-because it requires `minimal`). See the owning harness pages. Requested vs
+must not silently change worker capabilities or safety context. Eliot's scoped
+`swarm mcp --require-agent` server is always present in both
+policies. See the owning harness pages. Requested vs
 observed: the
 effective server set is reported from native readback only where the harness
 supports it (`mcp_servers` with `mcp_servers_verified`); otherwise it stays

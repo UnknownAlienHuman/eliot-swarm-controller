@@ -95,19 +95,31 @@ the owned CLI and is removed after confirmed stop and drain.
 
 ### Worker MCP policy
 
-The additive per-run config above is the `inherit` policy (the default):
-other native MCP sources keep Claude Code's normal behavior. Profiles may
-select `mcp = "minimal"`, frozen in the profile snapshot; a non-empty
-`mcp_allow` is rejected as `unsupported` at config load because Claude has
-no selective-inclusion mechanism. `minimal` adds the installed
-`--strict-mcp-config` flag ahead of `--mcp-config`, so only the per-run
-file applies. Verified
-read-only against Claude Code 2.1.278 (`claude --help`; that install has
-since been replaced):
-`--strict-mcp-config` means "Only use MCP servers from `--mcp-config`,
-ignoring all other MCP configurations" (flag wording re-checked against
-installed 2.1.325 on 2026-11-15). Eliot never writes Claude's user
-configuration in either policy.
+The additive per-run config above is the `inherit` policy (now an explicit
+opt-in): other native MCP sources keep Claude Code's normal behavior,
+except owner Swarm entries. Profiles default to `mcp = "minimal"`, frozen
+in the profile snapshot; a non-empty `mcp_allow` is rejected as
+`unsupported` at config load because Claude has no selective-inclusion
+mechanism. `minimal` adds the installed `--strict-mcp-config` flag ahead of
+`--mcp-config`, so only the per-run file applies. For `inherit` there is no
+safe native filter: installed 2.1.325 offers no per-server disable or deny
+switch for the per-run surface (`claude --help` shows only the
+all-or-nothing `--strict-mcp-config`; `--setting-sources` selects whole
+settings sources rather than servers and `.mcp.json` project servers sit
+outside those sources; `claude mcp --help` shows no deny list; the
+per-project disable state is interactive approval state, not a per-run
+mechanism -- all verified read-only against installed 2.1.325 on
+2026-11-16), so the owner-side sources (project `.mcp.json`, project and
+local `.claude/settings*.json`, user `~/.claude/settings.json` and legacy
+`~/.claude.json`) are scanned pre-spawn for owner-identity entries -- a
+swarm executable selecting `mcp` without `--require-agent`, or a URL on
+the configured `cloud_mcp` hostname -- and a match refuses the start
+(`profile_error`, naming the server and the source kind) in `inherit`,
+whatever the entry is named. Verified read-only: `--strict-mcp-config`
+means "Only use MCP servers from `--mcp-config`, ignoring all other MCP
+configurations" (wording re-checked against installed 2.1.325 on
+2026-11-16; earlier pins to 2.1.278 and 2.1.321 describe the same
+surface). Eliot never writes Claude's user configuration in either policy.
 
 Requested vs observed: `requested` carries `mcp_policy` and `mcp_allow`;
 `effective` carries `mcp_policy` and the server set. The `initialize`
@@ -298,7 +310,7 @@ proxy/native billing in L7. Common generation/ack/custody rules remain in the pl
 
 `swarm launch --harness claude [--model M] [--effort E] [--cmd PATH] --workspace W "prompt"`
 is Owner-only and freezes a profile-equivalent snapshot from safe defaults
-(`workspace-write`, `never`, MCP `inherit`) plus flags. An omitted `--model`
+(`workspace-write`, `never`, explicit MCP `inherit`) plus flags. An omitted `--model`
 omits `--model` so the CLI default applies; the effective model is read back
 from initialize/stream. `--effort` maps to the CLI `--effort` flag in the
 closed vocabulary `low|medium|high|xhigh|max` (validated at the same boundary
@@ -321,3 +333,22 @@ or global skill location changes, and resume spawns reuse the same argv.
 A missing or unloadable directory fails the spawn with its cause.
 Implementation: [`plugins/claude/src/host.rs`](../../plugins/claude/src/host.rs)
 (`launch_session`).
+
+## Minimal-context measurement (k61, 2026-11-16)
+
+Private daemon, identical trivial turn, CLI default model (`claude-opus-5`
+read back), installed 2.1.278. `inherit` (explicit): 5 connected MCP servers
+(`claude.ai` connectors x2, `codebase_memory`, `eliot-search`, `eliot-swarm`)
+with turn usage input 4 + cache-read 31,006 + output 85. `minimal` (default):
+exactly `eliot-swarm`, verified, with input 4 + cache-read 47,049 +
+cache-write 8,287 + output 85 (prompt caching varied between runs; the
+cache-write drop from 31,144 reflects the smaller cached surface). A
+follow-up turn under `minimal` called `api.identity` through the `swarm` tool
+(model used the native `ToolSearch` first, then the call, after one Owner
+approval) and reported principal `agent`. The installed binary contains the
+`ToolSearch` tool, an `ENABLE_TOOL_SEARCH` env switch and a
+`toolSearchEnabled` settings field, so deferred loading is natively
+supported; Swarm does not enable it per session because no per-server
+scoping exists on 2.1.278 and the strict config already bounds `minimal` to
+one server.
+

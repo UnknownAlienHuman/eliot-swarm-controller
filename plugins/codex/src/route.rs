@@ -490,11 +490,13 @@ mod tests {
                 name: "owner-a".to_owned(),
                 command: Some("a.exe".to_owned()),
                 url: None,
+                args: None,
             },
             EffectiveMcpServer {
                 name: "owner-b".to_owned(),
                 command: None,
                 url: Some("https://b.example/mcp".to_owned()),
+                args: None,
             },
         ];
         let plugin_disables = ["computer-use@openai-bundled".to_owned()];
@@ -531,6 +533,7 @@ mod tests {
                         name: "bare".to_owned(),
                         command: None,
                         url: None,
+                        args: None,
                     }],
                     &[],
                 )
@@ -547,6 +550,7 @@ mod tests {
                         name: "owner.x".to_owned(),
                         command: Some("x.exe".to_owned()),
                         url: None,
+                        args: None,
                     }],
                     &[],
                 )

@@ -1026,7 +1026,15 @@ fn resolve_profile_in(config: &FileConfig, source: &str, name: &str) -> core::Re
             format!("config.toml: profiles.{name}: profile not found"),
         )
     })?;
-    let snapshot = snapshot_from_entry(name, entry.get_ref(), entry.span().start, source)?;
+    let mut snapshot = snapshot_from_entry(name, entry.get_ref(), entry.span().start, source)?;
+    // Freeze the configured cloud MCP hostname (if any) beside the MCP
+    // policy so harness plugins can apply the owner-identity HTTP arm
+    // without reading owner config. Snapshots that predate the field read
+    // back as absent: plugins treat that as inert.
+    snapshot["mcp_cloud_hostname"] = match &config.cloud_mcp {
+        Some(cloud) => Value::String(cloud.hostname.clone()),
+        None => Value::Null,
+    };
     let snapshot = freeze_child_profiles(
         name,
         entry.get_ref(),
@@ -1109,6 +1117,27 @@ fn freeze_child_profiles(
     snapshot["child_profiles"] = Value::Array(frozen);
     Ok(snapshot)
 }
+/// Best-effort configured cloud MCP hostname for ad-hoc snapshots: the
+/// `[cloud_mcp] hostname` when the owner config parses and names one, else
+/// `None`. Never fails: ad-hoc snapshots stamp what is configured.
+pub(crate) fn cloud_mcp_hostname(data_root: &Path) -> Option<String> {
+    read_config(data_root)
+        .ok()
+        .flatten()
+        .and_then(|(config, _)| config.cloud_mcp.map(|cloud| cloud.hostname))
+}
+
+/// Stamp the configured cloud MCP hostname into a frozen snapshot
+/// (`mcp_cloud_hostname`, string or null) for ad-hoc snapshots, which
+/// freeze without the profile path. Best-effort: an unreadable config
+/// leaves a null stamp, so the owner-identity HTTP arm stays inert.
+pub(crate) fn stamp_cloud_mcp_hostname(snapshot: &mut Value, data_root: &Path) {
+    snapshot["mcp_cloud_hostname"] = match cloud_mcp_hostname(data_root) {
+        Some(hostname) => Value::String(hostname),
+        None => Value::Null,
+    };
+}
+
 fn read_config(data_root: &Path) -> core::Result<Option<(FileConfig, String)>> {
     let Some(source) = read_config_source(data_root)? else {
         return Ok(None);
@@ -2331,7 +2360,7 @@ fn opencode_snapshot_from_entry(
         source,
         McpHarnessSupport {
             harness: "OpenCode",
-            minimal: false,
+            minimal: true,
             allow: false,
         },
     )?;
@@ -2769,10 +2798,11 @@ struct McpHarnessSupport<'a> {
 
 /// Validate the worker MCP inheritance policy and freeze it with the profile
 /// snapshot. `minimal`/`allow` name whether the harness plugin implements an
-/// isolation mechanism for `minimal` (Codex, Claude) and selective inclusion
-/// of named native servers (Codex only: Claude minimal is Eliot-only config
-/// plus `--strict-mcp-config`, so an allow list would be silently dropped);
-/// other harnesses keep `inherit` only and reject `minimal` as unsupported.
+/// isolation mechanism for `minimal` (Codex, Claude, OpenCode) and selective
+/// inclusion of named native servers (Codex only: Claude and OpenCode
+/// minimal are the Eliot-only server surface with no allow mapping, so a
+/// non-empty allow list would be silently dropped); Muse and Antigravity
+/// keep `inherit` only and reject `minimal` as unsupported.
 /// A non-empty allow list always requires `minimal`, so an allowed set
 /// cannot silently ride on the default.
 fn freeze_mcp_policy(
@@ -2786,16 +2816,22 @@ fn freeze_mcp_policy(
     let harness = support.harness;
     let supports_minimal = support.minimal;
     let supports_allow = support.allow;
-    let policy = core::McpPolicy::parse(entry.mcp.as_deref()).map_err(|error| {
-        profile_field_error(
-            source,
-            table_offset,
-            name,
-            "mcp",
-            &error.message,
-            "profile_error",
-        )
-    })?;
+    // An unset `mcp` takes the default `minimal` only where the harness maps
+    // it; Muse and Antigravity have no minimal mapping, so their profiles
+    // keep loading as `inherit` instead of failing after the default change.
+    let policy = match entry.mcp.as_deref() {
+        None if !supports_minimal => core::McpPolicy::Inherit,
+        raw => core::McpPolicy::parse(raw).map_err(|error| {
+            profile_field_error(
+                source,
+                table_offset,
+                name,
+                "mcp",
+                &error.message,
+                "profile_error",
+            )
+        })?,
+    };
     let allow =
         core::validate_allow_list(entry.mcp_allow.as_deref().unwrap_or(&[])).map_err(|error| {
             profile_field_error(
@@ -3357,7 +3393,7 @@ mod tests {
             Some("self")
         );
         fixture.write(
-            "[profiles.muse-manager]\nharness = \"muse\"\nmodel = \"fixture-model\"\ncontrol = \"project\"\n\
+            "[profiles.muse-manager]\nharness = \"muse\"\nmodel = \"fixture-model\"\nmcp = \"inherit\"\ncontrol = \"project\"\n\
              cmd = \"C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe\"\n",
         );
         let snapshot = resolve_profile(&fixture.root, "muse-manager").unwrap();
@@ -4207,6 +4243,7 @@ model = "muse-spark-1.3-contributor"
 effort = "medium"
 approval = "promptUnmatched"
 pass_env = ["EXAMPLE_API_KEY"]
+mcp = "inherit"
 "#;
         let snapshot = resolve_text_profile(source, "muse").unwrap();
         assert_eq!(snapshot["harness"], "muse");
@@ -4227,6 +4264,7 @@ pass_env = ["EXAMPLE_API_KEY"]
 harness = "muse"
 cmd = "C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe"
 model = "muse-spark-1.3-contributor"
+mcp = "inherit"
 permissions = "danger-full-access"
 "#,
             "muse-full",
@@ -4240,6 +4278,7 @@ permissions = "danger-full-access"
 harness = "muse"
 cmd = "C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe"
 model = "muse-spark-1.3-contributor"
+mcp = "inherit"
 permissions = "workspace-write"
 "#,
             "muse-write",
@@ -4248,14 +4287,14 @@ permissions = "workspace-write"
         assert_eq!(explicit_write["permissions"], "workspace-write");
 
         let read_only_err = resolve_text_profile(
-            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\ncmd='C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe'\npermissions='read-only'\n",
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\ncmd='C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe'\nmcp='inherit'\npermissions='read-only'\n",
             "muse",
         )
         .expect_err("read-only unsupported");
         assert_eq!(read_only_err.code, "unsupported");
 
         let dsp_err = resolve_text_profile(
-            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\ncmd='C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe'\ndangerously_skip_permissions=true\n",
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\ncmd='C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe'\nmcp='inherit'\ndangerously_skip_permissions=true\n",
             "muse",
         )
         .expect_err("dangerously_skip_permissions unsupported");
@@ -4285,10 +4324,28 @@ permissions = "workspace-write"
     }
 
     #[test]
-    fn mcp_policy_defaults_to_inherit_and_freezes_minimal_where_supported() {
+    fn frozen_snapshot_carries_configured_cloud_hostname() {
+        let source = "[profiles.direct]\nharness='codex'\nmodel='gpt-6-luna'\n\
+            [cloud_mcp]\ncloudflared_executable='C:/Tools/cloudflared.exe'\n\
+            tunnel_id='tunnel-id'\ncredentials_file='C:/Tools/creds.json'\n\
+            hostname='mcp.example.com'\naccess_team_name='team'\naccess_audience_tag='aud'\n";
+        let config: FileConfig = toml::from_str(source).unwrap();
+        let snapshot = resolve_profile_in(&config, source, "direct").unwrap();
+        assert_eq!(snapshot["mcp_cloud_hostname"], json!("mcp.example.com"));
+
+        // Without `[cloud_mcp]` the field freezes as null, so the
+        // owner-identity HTTP arm stays inert for the plugins.
+        let plain = "[profiles.direct]\nharness='codex'\nmodel='gpt-6-luna'\n";
+        let config: FileConfig = toml::from_str(plain).unwrap();
+        let snapshot = resolve_profile_in(&config, plain, "direct").unwrap();
+        assert_eq!(snapshot["mcp_cloud_hostname"], Value::Null);
+    }
+
+    #[test]
+    fn mcp_policy_defaults_to_minimal_and_freezes_minimal_where_supported() {
         let direct = "[profiles.direct]\nharness='codex'\nmodel='gpt-6-luna'\n";
         let snapshot = resolve_text_profile(direct, "direct").unwrap();
-        assert_eq!(snapshot["mcp"], "inherit");
+        assert_eq!(snapshot["mcp"], "minimal");
         assert_eq!(snapshot["mcp_allow"], json!([]));
 
         let minimal = "[profiles.minimal]\nharness='codex'\nmodel='gpt-6-luna'\nmcp='minimal'\nmcp_allow=['owner-search']\n";
@@ -4296,22 +4353,28 @@ permissions = "workspace-write"
         assert_eq!(snapshot["mcp"], "minimal");
         assert_eq!(snapshot["mcp_allow"], json!(["owner-search"]));
 
-        // Unknown policies, dangling allow lists and malformed names fail
-        // at load; an allow list never rides on the inherit default.
+        // Unknown policies and malformed names fail at load; an explicit
+        // `inherit` still freezes verbatim for every harness.
         for source in [
             "[profiles.bad]\nharness='codex'\nmodel='gpt-6-luna'\nmcp='isolated'\n",
-            "[profiles.bad]\nharness='codex'\nmodel='gpt-6-luna'\nmcp_allow=['owner-search']\n",
             "[profiles.bad]\nharness='codex'\nmodel='gpt-6-luna'\nmcp='minimal'\nmcp_allow=['']\n",
             "[profiles.bad]\nharness='codex'\nmodel='gpt-6-luna'\nmcp='minimal'\nmcp_allow=['x', 'x']\n",
+            "[profiles.bad]\nharness='codex'\nmodel='gpt-6-luna'\nmcp='minimal'\nmcp_allow=['eliot_swarm']\n",
+            "[profiles.bad]\nharness='codex'\nmodel='gpt-6-luna'\nmcp='inherit'\nmcp_allow=['owner-search']\n",
         ] {
             let error = resolve_text_profile(source, "bad").expect_err("must reject");
             assert_eq!(error.code, "profile_error", "{source}");
         }
+        let inherit = "[profiles.ih]\nharness='codex'\nmodel='gpt-6-luna'\nmcp='inherit'\n";
+        let snapshot = resolve_text_profile(inherit, "ih").unwrap();
+        assert_eq!(snapshot["mcp"], "inherit");
+        assert_eq!(snapshot["mcp_allow"], json!([]));
 
-        // Claude implements minimal without selective inclusion, so a
-        // non-empty allow list is unsupported there; only Codex maps it.
-        // Muse, OpenCode and Antigravity keep inherit only until a harness
-        // isolation mechanism is verified.
+        // Claude and OpenCode implement minimal without selective inclusion,
+        // so a non-empty allow list is unsupported there; only Codex maps
+        // it. Muse and Antigravity keep inherit only: no harness isolation
+        // mechanism is verified, so an omitted `mcp` resolves to `inherit`
+        // there (existing profiles keep loading); explicit `minimal` fails.
         let claude_cmd = if cfg!(windows) {
             "C:/Users/test/.local/bin/claude.exe"
         } else {
@@ -4335,22 +4398,38 @@ permissions = "workspace-write"
                 format!(
                     "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='{claude_cmd}'\nmcp_allow=['owner-search']\n"
                 ),
-                "profile_error",
+                "unsupported",
             ),
         ] {
             let error = resolve_text_profile(&source, "claude").expect_err("must reject");
             assert_eq!(error.code, code, "{source}");
         }
 
-        for (name, source, code) in [
+        // OpenCode minimal resolves through the isolated per-Agent serve;
+        // its allow list stays unsupported like Claude's.
+        for (name, source) in [
             (
-                "muse",
-                "[profiles.muse]\nharness='muse'\nmodel='m'\ncmd='C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe'\nmcp='minimal'\n",
-                "unsupported",
+                "opencode",
+                "[profiles.opencode]\nharness='opencode'\nmodel='openrouter/stealth/crouton-alpha'\ncmd='C:/Tools/OpenCode/opencode.exe'\n",
             ),
             (
                 "opencode",
                 "[profiles.opencode]\nharness='opencode'\nmodel='openrouter/stealth/crouton-alpha'\ncmd='C:/Tools/OpenCode/opencode.exe'\nmcp='minimal'\n",
+            ),
+        ] {
+            let snapshot = resolve_text_profile(source, name).unwrap();
+            assert_eq!(snapshot["mcp"], "minimal");
+            assert_eq!(snapshot["mcp_allow"], json!([]));
+        }
+        for (name, source, code) in [
+            (
+                "opencode",
+                "[profiles.opencode]\nharness='opencode'\nmodel='openrouter/stealth/crouton-alpha'\ncmd='C:/Tools/OpenCode/opencode.exe'\nmcp='minimal'\nmcp_allow=['owner-search']\n",
+                "unsupported",
+            ),
+            (
+                "muse",
+                "[profiles.muse]\nharness='muse'\nmodel='m'\ncmd='C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe'\nmcp='minimal'\n",
                 "unsupported",
             ),
             (
@@ -4360,10 +4439,25 @@ permissions = "workspace-write"
             ),
             (
                 "muse",
-                "[profiles.muse]\nharness='muse'\nmodel='m'\ncmd='C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe'\nmcp_allow=['owner-search']\n",
-                "profile_error",
+                "[profiles.muse]\nharness='muse'\nmodel='m'\ncmd='C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe'\n",
+                "ok",
+            ),
+            (
+                "agy",
+                "[profiles.agy]\nharness='antigravity'\nmodel='test-model'\ncmd='C:/Tools/Agy/agy.exe'\n",
+                "ok",
+            ),
+            (
+                "muse",
+                "[profiles.muse]\nharness='muse'\nmodel='m'\ncmd='C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe'\nmcp='inherit'\n",
+                "ok",
             ),
         ] {
+            if code == "ok" {
+                let snapshot = resolve_text_profile(source, name).unwrap();
+                assert_eq!(snapshot["mcp"], "inherit");
+                continue;
+            }
             let error = resolve_text_profile(source, name).expect_err("must reject");
             assert_eq!(error.code, code, "{source}");
         }

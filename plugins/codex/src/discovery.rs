@@ -126,6 +126,7 @@ impl StoreContext {
 
 /// The host supplies the prepared workspace in launch.cwd. Capture broad diagnostic
 /// secrets independently from the credential-only metadata checks.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn profile_store(
     launch: &NativeLaunch,
     environment: &Value,
@@ -133,6 +134,8 @@ pub(crate) async fn profile_store(
     diagnostic_secrets: &[String],
     minimal: bool,
     allow: &[String],
+    controller_executable: Option<&str>,
+    cloud_mcp_hostname: Option<&str>,
     deadline: Instant,
 ) -> Result<eliot_plugin::protocol::ProfileStoreResult> {
     let (mut probe, drainer, initialized) = start_initialized_reader(
@@ -157,7 +160,13 @@ pub(crate) async fn profile_store(
         )
         .await?;
         let startup = if minimal {
-            Some(minimal_frozen_surface(&config, allow, metadata_secrets)?)
+            Some(minimal_frozen_surface(
+                &config,
+                allow,
+                metadata_secrets,
+                controller_executable,
+                cloud_mcp_hostname,
+            )?)
         } else {
             None
         };
@@ -173,18 +182,45 @@ pub(crate) async fn profile_store(
 
 /// Frozen minimal MCP surface: allowed servers persist by name only, because
 /// the worker never re-emits their transports. Only transports that a disable
-/// override will actually carry are frozen and secret-checked.
+/// override will actually carry are frozen and secret-checked. The allow
+/// list can never re-admit the owner's daemon identity: an allow-listed
+/// entry that carries the owner Swarm identity is rejected here, before
+/// its transport is stripped, while non-allowed identity entries keep
+/// their transports so the launch can suppress them with
+/// transport-carrying disables.
 pub(crate) fn minimal_frozen_surface(
     config: &Value,
     allow: &[String],
     metadata_secrets: &[String],
+    controller_executable: Option<&str>,
+    cloud_mcp_hostname: Option<&str>,
 ) -> Result<Value> {
     let mut servers = mcp_server_entries(config)?;
     let allowed: HashSet<&str> = allow.iter().map(String::as_str).collect();
+    for server in &servers {
+        if allowed.contains(server.name.as_str())
+            && eliot_core::is_owner_swarm_server(
+                server.command.as_deref(),
+                server.args.as_deref(),
+                server.url.as_deref(),
+                controller_executable,
+                cloud_mcp_hostname,
+            )
+        {
+            return Err(Error::new(
+                "profile_error",
+                format!(
+                    "mcp_allow cannot include the owner Swarm MCP server {:?}",
+                    server.name
+                ),
+            ));
+        }
+    }
     for server in &mut servers {
         if allowed.contains(server.name.as_str()) {
             server.command = None;
             server.url = None;
+            server.args = None;
         }
     }
     let surface = EffectiveMcpSurface {
@@ -721,6 +757,7 @@ fn mcp_server_entries(config_response: &Value) -> Result<Vec<crate::mcp::Effecti
                         .and_then(Value::as_str)
                         .map(str::to_owned),
                     url: table.get("url").and_then(Value::as_str).map(str::to_owned),
+                    args: projected_args(table.get("args")),
                 });
             }
             entries.sort_by(|left, right| left.name.cmp(&right.name));
@@ -731,6 +768,33 @@ fn mcp_server_entries(config_response: &Value) -> Result<Vec<crate::mcp::Effecti
             "Codex MCP server enumeration failed before worker spawn",
         )),
     }
+}
+
+/// Project one stdio argument vector for owner-identity screening only:
+/// a string array; absent or null means the native entry carries no argv
+/// (explicitly empty: it cannot select `swarm mcp`). A malformed or
+/// unbounded vector projects as unknown (fail closed toward suppression),
+/// never as a start-blocking error and never into spawn argv.
+fn projected_args(value: Option<&Value>) -> Option<Vec<String>> {
+    const MAX_ENUMERATED_ARGS: usize = 256;
+    let items = match value {
+        None | Some(Value::Null) => return Some(Vec::new()),
+        Some(Value::Array(items)) => items,
+        Some(_) => return None,
+    };
+    if items.len() > MAX_ENUMERATED_ARGS {
+        return None;
+    }
+    let mut args = Vec::with_capacity(items.len());
+    for item in items {
+        match item.as_str() {
+            Some(arg) if arg.len() <= crate::mcp::MAX_MCP_TRANSPORT_BYTES => {
+                args.push(arg.to_owned())
+            }
+            _ => return None,
+        }
+    }
+    Some(args)
 }
 
 /// Project the effective `plugins` states: each table id plus whether it
@@ -1776,7 +1840,9 @@ mod tests {
             "owner": {"command": "owner-helper"},
         }}});
         let allow = vec!["allowed".to_owned()];
-        let frozen = super::minimal_frozen_surface(&config, &allow, &[token.to_owned()]).unwrap();
+        let frozen =
+            super::minimal_frozen_surface(&config, &allow, &[token.to_owned()], None, None)
+                .unwrap();
         let servers = frozen
             .get("servers")
             .and_then(serde_json::Value::as_array)
@@ -1811,6 +1877,8 @@ mod tests {
             &allow,
             "eliot_swarm_x",
             &[token.to_owned()],
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(disables.len(), 1);
@@ -1818,8 +1886,53 @@ mod tests {
         let blocked = json!({"config": {"mcp_servers": {
             "evil": {"url": allowed_url},
         }}});
-        let error = super::minimal_frozen_surface(&blocked, &[], &[token.to_owned()]).unwrap_err();
+        let error = super::minimal_frozen_surface(&blocked, &[], &[token.to_owned()], None, None)
+            .unwrap_err();
         assert_eq!(error.code, "secret_in_payload");
+    }
+
+    #[test]
+    fn minimal_frozen_surface_rejects_allow_listed_owner_identity() {
+        // An allow-listed name that carries the owner Swarm identity is
+        // rejected at freeze time, before its transport is stripped.
+        let config = json!({"config": {"mcp_servers": {
+            "swarm": {"command": "swarm.exe", "args": ["mcp"]},
+            "plain": {"command": "plain-helper"},
+        }}});
+        let error = super::minimal_frozen_surface(&config, &["swarm".to_owned()], &[], None, None)
+            .unwrap_err();
+        assert_eq!(error.code, "profile_error");
+        assert!(error.message.contains("swarm"));
+        // The cloud-host arm rejects the same way.
+        let cloud = json!({"config": {"mcp_servers": {
+            "remote": {"url": "https://mcp.example.com/mcp"},
+        }}});
+        let error = super::minimal_frozen_surface(
+            &cloud,
+            &["remote".to_owned()],
+            &[],
+            None,
+            Some("mcp.example.com"),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "profile_error");
+        // Allowed non-matches stay name-only: no transport and no args.
+        let frozen =
+            super::minimal_frozen_surface(&config, &["plain".to_owned()], &[], None, None).unwrap();
+        let servers = frozen
+            .get("servers")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        let plain = servers
+            .iter()
+            .find(|entry| entry.get("name").and_then(serde_json::Value::as_str) == Some("plain"))
+            .expect("allowed server frozen by name");
+        for key in ["command", "url", "args"] {
+            assert!(
+                plain.get(key).is_none_or(serde_json::Value::is_null),
+                "allowed transport is not frozen"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2272,15 +2385,32 @@ mod tests {
                 .map(|entry| (
                     entry.name.as_str(),
                     entry.command.as_deref(),
-                    entry.url.as_deref()
+                    entry.url.as_deref(),
+                    entry.args.clone(),
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                ("bare", None, None),
-                ("remote", None, Some("https://remote.example/mcp")),
-                ("stdio", Some("s.exe"), None),
+                ("bare", None, None, Some(Vec::new())),
+                (
+                    "remote",
+                    None,
+                    Some("https://remote.example/mcp"),
+                    Some(Vec::new()),
+                ),
+                ("stdio", Some("s.exe"), None, Some(vec!["stdio".to_owned()])),
             ]
         );
+        // Malformed or unbounded argument vectors project as unknown, not
+        // as an enumeration error: unknown args fail closed toward
+        // suppression instead of blocking the start.
+        for response in [
+            json!({"config": {"mcp_servers": {"weird": {"command": "s.exe", "args": "mcp"}}}}),
+            json!({"config": {"mcp_servers": {"mixed": {"command": "s.exe", "args": ["mcp", 7]}}}}),
+        ] {
+            let entries = mcp_server_entries(&response).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert!(entries[0].args.is_none());
+        }
         // Non-object tables and non-string transports fail the enumeration
         // instead of projecting a partial transport.
         for response in [
