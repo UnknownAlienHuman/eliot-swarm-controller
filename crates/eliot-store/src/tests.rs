@@ -7155,7 +7155,8 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "DROP TRIGGER assignment_commands_insert;
+            "DROP INDEX commands_turn_unknown;
+             DROP TRIGGER assignment_commands_insert;
              DROP TRIGGER assignment_commands_update;
              DROP TRIGGER assignment_commands_delete;
              DROP TRIGGER assignment_turns_insert;
@@ -14367,5 +14368,206 @@ fn retained_command_and_turn_views_survive_later_revisions() {
             .expect("resolve stop view"),
         None,
         "non-native commands expose no configuration view"
+    );
+}
+
+#[test]
+fn exact_turn_unknown_mask_uses_covering_index_and_matches_per_turn() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_agent(&mut store, "turn-unknown-index", now);
+    let other_agent = ready_agent(&mut store, "turn-unknown-index-other", now + 1);
+    const SETTLED_TURNS: usize = 64;
+    let mut turn_ids = Vec::with_capacity(SETTLED_TURNS + 2);
+    for n in 0..SETTLED_TURNS {
+        let turn_id = format!("page-turn-{n:04}");
+        let send = send_request(&agent, 1, &format!("page turn {n}"));
+        let send_id = send.id.clone();
+        let base = now + 10 + n as i64;
+        store.submit("owner", send, base).expect("admit send");
+        store.dispatch(&send_id, base + 1).expect("dispatch send");
+        for (kind, native_id, data, at) in [
+            (
+                "turn.started",
+                format!("page-turn-{n:04}:started"),
+                json!({"command_id": send_id, "turn_id": turn_id}),
+                base + 2,
+            ),
+            (
+                "turn.completed",
+                format!("page-turn-{n:04}:completed"),
+                json!({"command_id": send_id, "turn_id": turn_id, "status": "completed"}),
+                base + 3,
+            ),
+        ] {
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: format!("page-turn-batch-{n:04}-{kind}"),
+                        agent_id: agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: kind.to_owned(),
+                            native_id,
+                            data,
+                        }],
+                        cursor: None,
+                    },
+                    at,
+                )
+                .expect("commit settled turn");
+        }
+        turn_ids.push(turn_id);
+    }
+    let live = now + 100_000;
+    let other_first = send_request(&other_agent, 1, "other agent primer");
+    let other_first_id = other_first.id.clone();
+    store
+        .submit("owner", other_first, live)
+        .expect("admit other primer");
+    store
+        .dispatch(&other_first_id, live + 1)
+        .expect("dispatch other primer");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "other-turn-started".to_owned(),
+                agent_id: other_agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: "other-turn:started".to_owned(),
+                    data: json!({"command_id": other_first_id, "turn_id": "other-turn"}),
+                }],
+                cursor: None,
+            },
+            live + 2,
+        )
+        .expect("commit other turn start");
+    let mut other_send = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+    other_send.target = Some(other_agent.clone());
+    other_send.expected_generation = Some(1);
+    other_send.expected_turn_id = Some("other-turn".to_owned());
+    let other_send_id = other_send.id.clone();
+    store
+        .submit("owner", other_send, live + 3)
+        .expect("admit other send");
+    store
+        .dispatch(&other_send_id, live + 4)
+        .expect("dispatch other send");
+    store
+        .settle(&other_send_id, CommandState::Unknown, None, live + 5)
+        .expect("settle other unknown");
+    let first = send_request(&agent, 1, "page active turn");
+    let first_id = first.id.clone();
+    store
+        .submit("owner", first, live + 10)
+        .expect("admit first");
+    store
+        .dispatch(&first_id, live + 11)
+        .expect("dispatch first");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "page-active-started".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: "page-active:started".to_owned(),
+                    data: json!({"command_id": first_id, "turn_id": "page-active"}),
+                }],
+                cursor: None,
+            },
+            live + 12,
+        )
+        .expect("commit page active turn");
+    let mut second = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+    second.target = Some(agent.clone());
+    second.expected_generation = Some(1);
+    second.expected_turn_id = Some("page-active".to_owned());
+    let second_id = second.id.clone();
+    store
+        .submit("owner", second, live + 13)
+        .expect("admit second");
+    store
+        .dispatch(&second_id, live + 14)
+        .expect("dispatch second");
+    let mut third = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+    third.target = Some(agent.clone());
+    third.expected_generation = Some(1);
+    third.expected_turn_id = Some("page-active".to_owned());
+    let third_id = third.id.clone();
+    store
+        .submit("owner", third, live + 15)
+        .expect("admit third");
+    store
+        .dispatch(&third_id, live + 16)
+        .expect("dispatch third");
+    store
+        .settle(&second_id, CommandState::Unknown, None, live + 17)
+        .expect("settle page unknown");
+    let memory_unknown = vec![third_id.clone()];
+    turn_ids.push("page-active".to_owned());
+    turn_ids.push("other-turn".to_owned());
+    let mut expected = std::collections::HashSet::new();
+    for turn_id in &turn_ids {
+        if store
+            .turn_has_unknown_command(&agent, 1, turn_id, &memory_unknown)
+            .expect("per-turn mask")
+        {
+            expected.insert(turn_id.clone());
+        }
+    }
+    assert_eq!(
+        expected,
+        std::collections::HashSet::from(["page-active".to_owned()])
+    );
+    let actual = store
+        .turns_with_unknown_commands(&agent, 1, &turn_ids, &memory_unknown)
+        .expect("page mask");
+    assert_eq!(actual, expected);
+    assert!(
+        store
+            .turns_with_unknown_commands(&agent, 1, &[], &memory_unknown)
+            .expect("empty page")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .turns_with_unknown_commands(&other_agent, 1, &["other-turn".to_owned()], &[])
+            .expect("other agent mask"),
+        std::collections::HashSet::from(["other-turn".to_owned()])
+    );
+    let plan: Vec<String> = store
+        .connection
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT DISTINCT turn_id FROM commands INDEXED BY commands_turn_unknown
+             WHERE target=?1 AND generation=?2 AND turn_id IN (SELECT value FROM json_each(?3))
+               AND state IN ('accepted','queued','dispatched','unknown')
+               AND (state='unknown' OR id IN (SELECT value FROM json_each(?4)))",
+        )
+        .expect("prepare plan")
+        .query_map(rusqlite::params![1_i64, 1_i64, "[]", "[]"], |row| {
+            row.get::<_, String>(3)
+        })
+        .expect("run plan")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read plan");
+    assert!(!plan.is_empty());
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("commands_turn_unknown")),
+        "plan uses covering index: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|line| line.contains("SCAN commands")),
+        "plan avoids full scan: {plan:?}"
     );
 }

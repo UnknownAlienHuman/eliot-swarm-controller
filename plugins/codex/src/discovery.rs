@@ -132,6 +132,7 @@ pub(crate) async fn profile_store(
     metadata_secrets: &[String],
     diagnostic_secrets: &[String],
     minimal: bool,
+    allow: &[String],
     deadline: Instant,
 ) -> Result<eliot_plugin::protocol::ProfileStoreResult> {
     let (mut probe, drainer, initialized) = start_initialized_reader(
@@ -156,13 +157,7 @@ pub(crate) async fn profile_store(
         )
         .await?;
         let startup = if minimal {
-            let surface = EffectiveMcpSurface {
-                servers: mcp_server_entries(&config)?,
-                plugins: mcp_plugin_states(&config)?,
-            };
-            let value = serde_json::to_value(surface).map_err(|_| invalid_page())?;
-            reject_secrets(&value, metadata_secrets)?;
-            Some(value)
+            Some(minimal_frozen_surface(&config, allow, metadata_secrets)?)
         } else {
             None
         };
@@ -174,6 +169,31 @@ pub(crate) async fn profile_store(
     .await;
     finish_reader(&mut probe, Some(drainer)).await?;
     result.map_err(|error| probe.client().diagnostic_error(error))
+}
+
+/// Frozen minimal MCP surface: allowed servers persist by name only, because
+/// the worker never re-emits their transports. Only transports that a disable
+/// override will actually carry are frozen and secret-checked.
+pub(crate) fn minimal_frozen_surface(
+    config: &Value,
+    allow: &[String],
+    metadata_secrets: &[String],
+) -> Result<Value> {
+    let mut servers = mcp_server_entries(config)?;
+    let allowed: HashSet<&str> = allow.iter().map(String::as_str).collect();
+    for server in &mut servers {
+        if allowed.contains(server.name.as_str()) {
+            server.command = None;
+            server.url = None;
+        }
+    }
+    let surface = EffectiveMcpSurface {
+        servers,
+        plugins: mcp_plugin_states(config)?,
+    };
+    let value = serde_json::to_value(&surface).map_err(|_| invalid_page())?;
+    reject_secrets(&value, metadata_secrets)?;
+    Ok(value)
 }
 
 /// Worker-visible native MCP surface for a minimal policy: the effective
@@ -1745,6 +1765,61 @@ mod tests {
                 .code,
             "profile_error"
         );
+    }
+
+    #[test]
+    fn minimal_frozen_surface_strips_allowed_transports_before_secret_check() {
+        let token = "hunter2-allowlisted-token";
+        let allowed_url = format!("https://allow.example/mcp?key={token}");
+        let config = json!({"config": {"mcp_servers": {
+            "allowed": {"url": allowed_url.clone()},
+            "owner": {"command": "owner-helper"},
+        }}});
+        let allow = vec!["allowed".to_owned()];
+        let frozen = super::minimal_frozen_surface(&config, &allow, &[token.to_owned()]).unwrap();
+        let servers = frozen
+            .get("servers")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        let allowed_entry = servers
+            .iter()
+            .find(|entry| entry.get("name").and_then(serde_json::Value::as_str) == Some("allowed"))
+            .expect("allowed server frozen by name");
+        for key in ["command", "url"] {
+            assert!(
+                allowed_entry
+                    .get(key)
+                    .is_none_or(serde_json::Value::is_null),
+                "allowed transport is not frozen"
+            );
+        }
+        let owner_entry = servers
+            .iter()
+            .find(|entry| entry.get("name").and_then(serde_json::Value::as_str) == Some("owner"))
+            .expect("disable target keeps its transport");
+        assert_eq!(
+            owner_entry
+                .get("command")
+                .and_then(serde_json::Value::as_str),
+            Some("owner-helper")
+        );
+        let encoded = serde_json::to_string(&frozen).unwrap();
+        assert!(!encoded.contains(token), "allowed transport is not logged");
+        let surface: super::EffectiveMcpSurface = serde_json::from_value(frozen).unwrap();
+        let disables = crate::mcp::compute_disables(
+            &surface.servers,
+            &allow,
+            "eliot_swarm_x",
+            &[token.to_owned()],
+        )
+        .unwrap();
+        assert_eq!(disables.len(), 1);
+        assert_eq!(disables[0].name, "owner");
+        let blocked = json!({"config": {"mcp_servers": {
+            "evil": {"url": allowed_url},
+        }}});
+        let error = super::minimal_frozen_surface(&blocked, &[], &[token.to_owned()]).unwrap_err();
+        assert_eq!(error.code, "secret_in_payload");
     }
 
     #[tokio::test]

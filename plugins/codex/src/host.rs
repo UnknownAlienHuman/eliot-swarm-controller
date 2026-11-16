@@ -583,12 +583,20 @@ impl CodexPlugin {
         let (mut launch, diagnostic_secrets, metadata_secrets) =
             self.reader_launch(&params.profile, &params.target_environment)?;
         launch.cwd = workspace.to_path_buf();
+        let profile_object = params.profile.as_object().ok_or_else(|| {
+            Error::new(
+                "profile_error",
+                "Codex profile.store requires a frozen profile object",
+            )
+        })?;
+        let (mcp_policy, mcp_allow) = policy_from_profile(profile_object)?;
         let binding = crate::discovery::profile_store(
             &launch,
             &params.target_environment,
             &metadata_secrets,
             &diagnostic_secrets,
-            params.profile.get("mcp").and_then(Value::as_str) == Some("minimal"),
+            mcp_policy == McpPolicy::Minimal,
+            &mcp_allow,
             Instant::now() + crate::discovery::READ_TIMEOUT,
         )
         .await?;

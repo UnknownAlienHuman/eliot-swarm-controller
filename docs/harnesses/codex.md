@@ -122,7 +122,8 @@ additive behavior above. `minimal` starts only Eliot's Agent-scoped server
 plus the explicitly allowed servers:
 
 - For launch, the pre-dispatch `profile.store` reader projects the worker-visible
-  `mcp_servers` entries (key plus `command`/`url` transport) and `plugins` states
+  `mcp_servers` entries (key plus `command`/`url` transport, except allow-listed
+  servers which persist by name only) and `plugins` states
   (id plus `enabled` flag) from the same `config/read` response used for verified
   store selection, using the actual prepared workspace. Store freezes this projection
   with the exact launch command ID alongside the store binding at dispatch. The worker
@@ -130,11 +131,12 @@ plus the explicitly allowed servers:
   before worker spawn. No configuration cache or ambient reselection is used.
   Resume instead enumerates through a reader pinned to its retained store, verifies
   the pin, and never reuses the old launch projection. Every enumerated
-  server outside the allow list gets its own transport plus
-  `-c mcp_servers.<name>.enabled=false` overrides; a name no `-c` path can
+  server outside the allow list keeps its own transport for its
+  `-c mcp_servers.<name>.enabled=false` override; a name no `-c` path can
   address (Codex splits override paths on literal dots before decoding), a
-  server with no usable transport, or a transport carrying a known secret
-  fails the start closed instead of silently inheriting. Plugin-backed
+  server with no usable transport, or a disable transport carrying a known secret
+  fails the start closed instead of silently inheriting. Allow-listed servers
+  never freeze or emit a transport, so their transports never trip the secret check. Plugin-backed
   builtin servers never appear in `mcp_servers`, so each suppressed bundled
   plugin (`computer-use`, `unified-computer-use`, `codex-app-tools`) gets
   its own `-c plugins.<id>.enabled=false` override when present and

@@ -5077,10 +5077,17 @@ impl Router {
         turns: &mut [Turn],
     ) -> Result<()> {
         self.clear_terminal_unknown_cache().await;
+        if turns.is_empty() {
+            return Ok(());
+        }
         let memory_unknown = self.unknown_ids();
-        let store = self.inner.store.lock().await;
+        let turn_ids: Vec<String> = turns.iter().map(|turn| turn.turn_id.clone()).collect();
+        let unknown_turns = {
+            let store = self.inner.store.lock().await;
+            store.turns_with_unknown_commands(agent, generation, &turn_ids, &memory_unknown)?
+        };
         for turn in turns {
-            if store.turn_has_unknown_command(agent, generation, &turn.turn_id, &memory_unknown)? {
+            if unknown_turns.contains(&turn.turn_id) {
                 turn.state = TurnState::Unknown;
                 turn.status = None;
             }
