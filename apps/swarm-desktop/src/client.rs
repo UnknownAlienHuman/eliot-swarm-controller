@@ -4,9 +4,9 @@
 //! (`eliot_daemon::client_call_typed` and the `eliot_core::api` DTOs) and runs
 //! the same request/response validators the CLI runs; deserialization alone
 //! is not validation. There is no second executor, no UI-owned database and
-//! no new endpoint: `project.list` is the one exception to the typed boundary
-//! because it returns a bare JSON array, so it is decoded from the raw client
-//! result with the same field checks.
+//! no new endpoint. Configuration reads and writes (profiles, projects,
+//! rules, scripts) live in [`crate::config_client`], the Settings page's one
+//! client module.
 
 use std::path::{Path, PathBuf};
 
@@ -17,12 +17,8 @@ use eliot_core::api::{
     CommandResolveResponse, CommandSubmitRequest, CommandSubmitResponse, EventsBoundsRequest,
     EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
     EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest, HandoffResponse,
-    HarnessModelsRequest, HarnessModelsResponse, ProfileListRequest, ProfileListResponse,
-    ProfilesReadRequest, ProfilesReadResponse, ProfilesSaveRequest, ProfilesSaveResponse,
-    ProjectRegistrationView, ReparentRequest, ReparentResponse, RuleListEntry, RuleListRequest,
-    RuleListResponse, ScriptListRequest, ScriptListResponse, ScriptReadRequest, ScriptReadResponse,
-    ScriptSaveRequest, ScriptSaveResponse, SwitchRequest, SwitchResponse, TimerRunRequest,
-    UsageSummaryRequest, UsageSummaryResponse, discovery::ProjectListRequest,
+    HarnessModelsRequest, HarnessModelsResponse, ReparentRequest, ReparentResponse, SwitchRequest,
+    SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -32,7 +28,6 @@ use crate::chat::{CHAT_KINDS, InputText, bound_text};
 use crate::live::WAKE_WAIT_MS;
 
 const MAX_TEXT_BYTES: usize = 512 * 1024;
-
 /// Concurrent ordinary reads issued by one worker (the issue's initial cap).
 pub const MAX_CONCURRENT_READS: usize = 4;
 /// Server-side scan bound per `events.read` call.
@@ -73,23 +68,6 @@ fn check_text(text: &str) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-/// Project registrations for the launch picker. `project.list` returns a bare
-/// array (not an object), so it cannot pass the typed object boundary; the
-/// rows get the same field validation instead.
-pub async fn list_projects(data_dir: &Path) -> Result<Vec<ProjectRegistrationView>> {
-    let params = ProjectListRequest {};
-    params.validate()?;
-    let value =
-        eliot_daemon::client_call(data_dir, "project.list", Value::Object(Default::default()))
-            .await?;
-    let registrations: Vec<ProjectRegistrationView> = serde_json::from_value(value)
-        .map_err(|_| Error::new("unknown", "project.list returned a malformed result"))?;
-    for registration in &registrations {
-        registration.validate()?;
-    }
-    Ok(registrations)
 }
 
 /// One validated `agent.list` page. The response passes the canonical
@@ -295,6 +273,8 @@ pub async fn read_command(data_dir: &Path, id: &str) -> Result<Command> {
 /// of one harness with optional model/effort (absent = native default).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchTarget {
+    /// No profile: the daemon's routing chooses at admission (role default).
+    Routed,
     Profile(String),
     Adhoc {
         harness: String,
@@ -319,6 +299,7 @@ pub async fn submit_launch(
     }
     let mut args = serde_json::json!({ "workspace": workspace });
     match target {
+        LaunchTarget::Routed => {}
         LaunchTarget::Profile(profile) if !profile.trim().is_empty() => {
             args["profile"] = Value::String(profile);
         }
@@ -386,160 +367,6 @@ pub async fn submit_configure(
     submit(data_dir, &request).await
 }
 
-/// Sanitized configured-profile summaries for the launch picker.
-pub async fn list_profiles(data_dir: &Path) -> Result<ProfileListResponse> {
-    let params = ProfileListRequest {};
-    params.validate()?;
-    let reply: ProfileListResponse =
-        eliot_daemon::client_call_typed(data_dir, "profile.list", &params).await?;
-    params.validate_response(&reply)?;
-    Ok(reply)
-}
-
-/// The `[profiles.*]` source text and the file revision.
-pub async fn read_profiles_source(data_dir: &Path) -> Result<ProfilesReadResponse> {
-    let params = ProfilesReadRequest {};
-    params.validate()?;
-    let reply: ProfilesReadResponse =
-        eliot_daemon::client_call_typed(data_dir, "config.profiles.read", &params).await?;
-    params.validate_response(&reply)?;
-    Ok(reply)
-}
-
-/// Validate (dry run) or save the profile draft from `expected_revision`.
-pub async fn save_profiles(
-    data_dir: &Path,
-    expected_revision: Option<String>,
-    source: String,
-    dry_run: bool,
-) -> Result<ProfilesSaveResponse> {
-    let params = ProfilesSaveRequest {
-        client: eliot_core::api::SettingsClientSource::Desktop,
-        expected_revision,
-        source,
-        dry_run,
-    };
-    params.validate()?;
-    let reply: ProfilesSaveResponse =
-        eliot_daemon::client_call_typed(data_dir, "config.profiles.save", &params).await?;
-    params.validate_response(&reply)?;
-    Ok(reply)
-}
-
-/// Rules of one namespace (global when `project` is absent), paging until
-/// an empty page, at most `RULE_PAGES` pages; `true` when more remain.
-pub async fn list_rules(
-    data_dir: &Path,
-    project: Option<String>,
-) -> Result<(Vec<RuleListEntry>, bool)> {
-    const RULE_PAGES: usize = 5;
-    let mut rules = Vec::new();
-    let mut after = None;
-    for _ in 0..RULE_PAGES {
-        let params = RuleListRequest {
-            project: project.clone(),
-            after: after.clone(),
-            limit: 200,
-        };
-        params.validate()?;
-        let reply: RuleListResponse =
-            eliot_daemon::client_call_typed(data_dir, "rule.list", &params).await?;
-        params.validate_response(&reply)?;
-        if reply.rules.is_empty() {
-            return Ok((rules, false));
-        }
-        after = reply.next.clone();
-        rules.extend(reply.rules);
-        if after.is_none() {
-            return Ok((rules, false));
-        }
-    }
-    Ok((rules, true))
-}
-
-/// Existing script entries under the approved Run roots.
-pub async fn list_scripts(data_dir: &Path) -> Result<ScriptListResponse> {
-    let mut params = ScriptListRequest::default();
-    let mut roots: Vec<eliot_core::api::ScriptRootView> = Vec::new();
-    loop {
-        params.validate()?;
-        let reply: ScriptListResponse =
-            eliot_daemon::client_call_typed(data_dir, "script.list", &params).await?;
-        params.validate_response(&reply)?;
-        for root in reply.roots {
-            if let Some(existing) = roots.iter_mut().find(|r| r.project == root.project) {
-                existing.entries.extend(root.entries);
-                existing.truncated |= root.truncated;
-            } else {
-                roots.push(root);
-            }
-        }
-        match reply.next_cursor {
-            Some(next) => params.cursor = Some(next),
-            None => break,
-        }
-    }
-    Ok(ScriptListResponse {
-        roots,
-        next_cursor: None,
-    })
-}
-
-/// One script entry's text and revision.
-pub async fn read_script(
-    data_dir: &Path,
-    project: Option<String>,
-    path: String,
-) -> Result<ScriptReadResponse> {
-    let params = ScriptReadRequest { project, path };
-    params.validate()?;
-    let reply: ScriptReadResponse =
-        eliot_daemon::client_call_typed(data_dir, "script.read", &params).await?;
-    params.validate_response(&reply)?;
-    Ok(reply)
-}
-
-/// Validate (dry run) or save one script entry from `expected_revision`.
-pub async fn save_script(
-    data_dir: &Path,
-    project: Option<String>,
-    path: String,
-    expected_revision: String,
-    content: String,
-    dry_run: bool,
-) -> Result<ScriptSaveResponse> {
-    let params = ScriptSaveRequest {
-        project,
-        path,
-        expected_revision,
-        content,
-        dry_run,
-    };
-    params.validate()?;
-    let reply: ScriptSaveResponse =
-        eliot_daemon::client_call_typed(data_dir, "script.save", &params).await?;
-    params.validate_response(&reply)?;
-    Ok(reply)
-}
-
-/// Run one explicit occurrence of a timer (the existing Owner Run path).
-pub async fn run_timer(
-    data_dir: &Path,
-    mutation_id: String,
-    project: Option<String>,
-    rule: &str,
-) -> Result<Command> {
-    let request = TimerRunRequest::new(mutation_id, rule);
-    let request = match project {
-        Some(project) => request.in_project(project),
-        None => request,
-    };
-    request.validate()?;
-    let reply: Command = eliot_daemon::client_call_typed(data_dir, "timer.run", &request).await?;
-    request.validate_response(&reply)?;
-    Ok(reply)
-}
-
 /// The first page of a command's retained children.
 pub async fn command_children(data_dir: &Path, id: &str) -> Result<Vec<Command>> {
     let params = CommandChildrenRequest::new(id);
@@ -574,6 +401,35 @@ pub async fn agent_sends(data_dir: &Path, agent: &str) -> Result<(Vec<Command>, 
         .collect()
         .await;
     Ok((reads.into_iter().collect::<Result<_>>()?, omitted))
+}
+
+/// Admission events read to find an Agent's first SEND for its title.
+const FIRST_INPUT_SCAN: usize = 64;
+
+/// The text of an Agent's oldest retained SEND (a launch's linked first
+/// input included), for its title in the sidebar: the first admission
+/// events after the retention floor, then that command's text. `None` when
+/// none is retained.
+pub async fn first_input(data_dir: &Path, agent: &str) -> Result<Option<String>> {
+    let filter = EventsFilter {
+        agents: vec![agent.to_owned()],
+        kinds: crate::handoff::ADMISSION_KINDS.map(str::to_owned).to_vec(),
+        sources: Vec::new(),
+    };
+    let bounds = events_bounds(data_dir, &filter).await?;
+    let page = events_read(data_dir, bounds.pruned_through, FIRST_INPUT_SCAN, &filter).await?;
+    let Some(id) = crate::handoff::send_ids(&page.events, agent)
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    let command = read_command(data_dir, &id).await?;
+    Ok(command
+        .args
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_owned))
 }
 
 /// Owner task transfer to an existing Agent. The same request (id

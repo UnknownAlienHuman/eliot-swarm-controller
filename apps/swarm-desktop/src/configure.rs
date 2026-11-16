@@ -12,13 +12,7 @@
 use eliot_core::Command;
 use eliot_core::api::{AgentConfigView, AgentGetResponse, HarnessModelsResponse};
 use serde_json::Value;
-use windows_reactor::*;
-
-use crate::theme;
-use crate::theme::winui::Palette;
-
-/// First entry of each picker: submit nothing for that field.
-pub const KEEP: &str = "Keep current";
+use windows_reactor::MenuItem;
 
 /// Settings facts of one Agent generation, read from `agent.get`.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -34,6 +28,8 @@ pub struct Settings {
     pub effective_effort: Option<String>,
     pub model_verified: bool,
     pub effort_verified: bool,
+    /// The frozen profile's permissions (absent: the native default).
+    pub permissions: Option<String>,
 }
 
 impl Settings {
@@ -64,6 +60,7 @@ impl Settings {
             effective_effort: text(effective, "effort"),
             model_verified: flag("model_verified"),
             effort_verified: flag("effort_verified"),
+            permissions: text(snapshot, "permissions"),
         }
     }
 
@@ -77,17 +74,13 @@ impl Settings {
             .or(self.profile_model.as_deref())
     }
 
-    /// One-line summary for the detail header.
-    pub fn summary(&self) -> String {
-        format!(
-            "{} · {}",
-            self.effective_model
-                .as_deref()
-                .unwrap_or("model not read back"),
-            self.effective_effort
-                .as_deref()
-                .unwrap_or("effort not read back"),
-        )
+    /// The effort the next turn carries, like [`Self::next_model`].
+    pub fn next_effort(&self) -> Option<&str> {
+        self.config
+            .as_ref()
+            .and_then(|config| config.effort.as_deref())
+            .or(self.effective_effort.as_deref())
+            .or(self.profile_effort.as_deref())
     }
 
     /// Requested, next-turn and effective values, kept apart: a request is
@@ -152,78 +145,13 @@ impl Catalog {
     pub fn is_for(&self, agent: &str, generation: i64) -> bool {
         self.agent == agent && self.generation == generation
     }
-
-    pub fn models(&self) -> Vec<String> {
-        let mut options = vec![KEEP.to_owned()];
-        if let Ok(reply) = &self.reply {
-            options.extend(reply.models.iter().map(|model| model.id.clone()));
-        }
-        options
-    }
-
-    /// Efforts the catalogue lists for `model` (the picked one, or the model
-    /// the next turn carries). No listed efforts leaves only [`KEEP`].
-    pub fn efforts(&self, model: Option<&str>) -> Vec<String> {
-        let mut options = vec![KEEP.to_owned()];
-        if let (Ok(reply), Some(model)) = (&self.reply, model)
-            && let Some(entry) = reply.models.iter().find(|entry| entry.id == model)
-        {
-            options.extend(entry.efforts.iter().flatten().cloned());
-        }
-        options
-    }
-
-    pub fn model_refusal(&self) -> Option<&str> {
-        self.reply
-            .as_ref()
-            .ok()
-            .and_then(|reply| reply.configure.model_refusal.as_deref())
-    }
-
-    pub fn effort_refusal(&self) -> Option<&str> {
-        self.reply
-            .as_ref()
-            .ok()
-            .and_then(|reply| reply.configure.effort_refusal.as_deref())
-    }
-
-    pub fn line(&self) -> String {
-        match &self.reply {
-            Ok(reply) => {
-                let mut line = format!(
-                    "Catalogue ({}): {} model(s) under {} · credential {}",
-                    reply.catalogue,
-                    reply.models.len(),
-                    reply.scope,
-                    reply.credential,
-                );
-                if let Some(note) = &reply.note {
-                    line.push_str(&format!(" · {note}"));
-                }
-                line
-            }
-            Err(error) => format!("Catalogue unavailable: {error}"),
-        }
-    }
 }
 
-/// The option at `pick`, unless it is [`KEEP`] or out of range.
+/// The option at `pick`, unless it is the first (default) entry or out of range.
 pub fn picked(options: &[String], pick: Option<usize>) -> Option<String> {
     pick.filter(|index| *index > 0)
         .and_then(|index| options.get(index))
         .cloned()
-}
-
-/// The Apply button text for the values that would be submitted.
-pub fn apply_label(model: Option<&str>, effort: Option<&str>) -> String {
-    match (model, effort) {
-        (Some(model), Some(effort)) => {
-            format!("Apply model {model} and effort {effort} for the next turn")
-        }
-        (Some(model), None) => format!("Apply model {model} for the next turn"),
-        (None, Some(effort)) => format!("Apply effort {effort} for the next turn"),
-        (None, None) => "Pick a model or an effort to apply".to_owned(),
-    }
 }
 
 /// Settled `configure` command in one line: state, the daemon's code and
@@ -252,104 +180,115 @@ pub fn outcome_line(command: &Command) -> String {
     line
 }
 
-pub struct ConfigureData<'a> {
-    pub settings: &'a Settings,
-    pub catalog_line: String,
-    pub models: Vec<String>,
-    pub model_pick: Option<usize>,
-    pub model_refusal: Option<&'a str>,
-    pub efforts: Vec<String>,
-    pub effort_pick: Option<usize>,
-    pub effort_refusal: Option<&'a str>,
-    pub can_apply: bool,
-    /// What Apply submits, e.g. "Apply effort high for the next turn".
-    pub apply_label: String,
-    pub status: &'a str,
-    pub expanded: bool,
+/// The "Default model" entry of an ad-hoc launch's model menu.
+pub const DEFAULT_MODEL: &str = "Default model";
+/// The "Default effort" entry of an ad-hoc launch's effort menu.
+pub const DEFAULT_EFFORT: &str = "Default effort";
+
+/// What one entry of the model-and-effort menu picks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pick {
+    /// A model; `None` is the harness default (ad-hoc launch only).
+    Model(Option<String>),
+    /// An effort; `None` is the harness default (ad-hoc launch only).
+    Effort(Option<String>),
 }
 
-pub struct ConfigureActions {
-    pub model: Callback<Option<usize>>,
-    pub effort: Callback<Option<usize>>,
-    pub apply: Callback<()>,
-    pub refresh: Callback<()>,
-    pub expanded: Callback<bool>,
-}
-
-fn small(text: impl Into<String>) -> TextBlock {
-    TextBlock::new()
-        .text(text.into())
-        .font_size(theme::type_scale::LABEL_MEDIUM.size)
-        .text_wrapping(TextWrapping::Wrap)
-        .is_text_selection_enabled(true)
-}
-
-/// Collapsible "Model and effort" section of the Agent detail.
-pub fn panel(data: ConfigureData<'_>, actions: ConfigureActions, palette: Palette) -> View {
-    let refusal = |reason: Option<&str>, field: &str| -> View {
-        match reason {
-            Some(reason) => small(format!("{field} cannot change: {reason}"))
-                .opacity(theme::MUTED_OPACITY)
-                .into(),
-            None => View::empty(),
+/// The one model-and-effort menu: a "Model" and an "Effort" submenu. With
+/// `defaults` each starts with its "Default …" entry (an ad-hoc launch may
+/// leave either to the harness). A refusal replaces that submenu's entries
+/// with the daemon's reason, disabled.
+pub fn menu_items(
+    models: &[String],
+    efforts: &[String],
+    defaults: bool,
+    model_refusal: Option<&str>,
+    effort_refusal: Option<&str>,
+) -> Vec<MenuItem> {
+    let entries = |prefix: &str, default: &str, values: &[String], refusal: Option<&str>| {
+        if let Some(reason) = refusal {
+            return vec![MenuItem::disabled(format!("{prefix}:refused"), reason)];
         }
+        let mut items = Vec::new();
+        if defaults {
+            items.push(MenuItem::item(format!("{prefix}:default"), default));
+        }
+        items.extend(values.iter().map(|value| {
+            let label = if prefix == "e" {
+                effort_label(value, models)
+            } else {
+                value.clone()
+            };
+            MenuItem::item(format!("{prefix}:{value}"), label)
+        }));
+        if items.is_empty() {
+            items.push(MenuItem::disabled(
+                format!("{prefix}:none"),
+                "None listed by the harness",
+            ));
+        }
+        items
     };
-    let model_picker = ComboBox::new()
-        .items_source(data.models)
-        .selected_index(data.model_pick)
-        .is_enabled(data.model_refusal.is_none())
-        .automation_name("Configure model")
-        .on_selection_changed(actions.model);
-    // The effort options follow the model. A ComboBox whose items change in
-    // place can report a selection index that differs from the item it
-    // shows, so a new option list gets a new control.
-    let effort_key = format!("effort:{}", data.efforts.join("\u{1f}"));
-    let effort_picker = ComboBox::new()
-        .items_source(data.efforts)
-        .selected_index(data.effort_pick)
-        .is_enabled(data.effort_refusal.is_none())
-        .automation_name("Configure effort")
-        .on_selection_changed(actions.effort);
-    let lines = data.settings.lines().join("\n");
-    // The button says exactly what it submits.
-    let apply = crate::m3::filled(palette)
-        .is_enabled(data.can_apply)
-        .automation_name(data.apply_label.clone())
-        .on_click(actions.apply)
-        .content(TextBlock::new().text(data.apply_label));
-    let content = StackPanel::new().spacing(theme::spacing::XS).children((
-        small(lines),
-        StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(theme::spacing::XS)
-            .keyed_children(vec![
-                KeyedView::new("model", model_picker),
-                KeyedView::new(effort_key, effort_picker),
-                KeyedView::new("apply", apply),
-                KeyedView::new(
-                    "reread",
-                    crate::m3::text_button(palette)
-                        .automation_name("Reread catalogue")
-                        .on_click(actions.refresh)
-                        .content(TextBlock::new().text("Reread catalogue")),
-                ),
-            ]),
-        refusal(data.model_refusal, "Model"),
-        refusal(data.effort_refusal, "Effort"),
-        small(data.catalog_line).opacity(theme::MUTED_OPACITY),
-        small(data.status.to_owned()),
-    ));
-    Expander::new()
-        .is_expanded(data.expanded)
-        .on_is_expanded_changed(actions.expanded)
-        .automation_name("Model and effort")
-        .slots([
-            SlotView::new(
-                ExpanderSlot::Header,
-                TextBlock::new().text(format!("Model and effort · {}", data.settings.summary())),
-            ),
-            SlotView::new(ExpanderSlot::Content, content),
-        ])
+    vec![
+        MenuItem::submenu(
+            "model",
+            "Model",
+            entries("m", DEFAULT_MODEL, models, model_refusal),
+        ),
+        MenuItem::submenu(
+            "effort",
+            "Effort",
+            entries("e", DEFAULT_EFFORT, efforts, effort_refusal),
+        ),
+    ]
+}
+
+/// An effort's menu label: its name, or "<name> effort" when a model has
+/// the same id (Reactor reports only the clicked label).
+fn effort_label(effort: &str, models: &[String]) -> String {
+    if models.iter().any(|model| model == effort) {
+        format!("{effort} effort")
+    } else {
+        effort.to_owned()
+    }
+}
+
+/// The pick a clicked menu label names (labels are unique by
+/// construction, see [`effort_label`]). Pass an empty list for a field the
+/// daemon refuses, so it can never resolve.
+pub fn resolve(label: &str, models: &[String], efforts: &[String]) -> Option<Pick> {
+    if label == DEFAULT_MODEL {
+        Some(Pick::Model(None))
+    } else if label == DEFAULT_EFFORT {
+        Some(Pick::Effort(None))
+    } else if let Some(effort) = efforts
+        .iter()
+        .find(|effort| effort_label(effort, models) == label)
+    {
+        Some(Pick::Effort(Some(effort.clone())))
+    } else if models.iter().any(|model| model == label) {
+        Some(Pick::Model(Some(label.to_owned())))
+    } else {
+        None
+    }
+}
+
+/// Models and efforts of a catalogue reply, the efforts for `model` (else
+/// the catalogue's default model).
+pub fn options(reply: &HarnessModelsResponse, model: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let models = reply.models.iter().map(|entry| entry.id.clone()).collect();
+    let model = model.or(reply.default.as_deref()).or_else(|| {
+        reply
+            .models
+            .iter()
+            .find(|entry| entry.default)
+            .map(|entry| entry.id.as_str())
+    });
+    let efforts = model
+        .and_then(|model| reply.models.iter().find(|entry| entry.id == model))
+        .map(|entry| entry.efforts.iter().flatten().cloned().collect())
+        .unwrap_or_default();
+    (models, efforts)
 }
 
 #[cfg(test)]
@@ -387,45 +326,6 @@ mod tests {
                 configure,
             }),
         }
-    }
-
-    #[test]
-    fn apply_names_exactly_what_it_submits() {
-        assert_eq!(
-            apply_label(None, Some("high")),
-            "Apply effort high for the next turn"
-        );
-        assert_eq!(
-            apply_label(Some("m2"), Some("low")),
-            "Apply model m2 and effort low for the next turn"
-        );
-        assert_eq!(
-            apply_label(None, None),
-            "Pick a model or an effort to apply"
-        );
-    }
-
-    #[test]
-    fn efforts_follow_the_model_and_keep_comes_first() {
-        let catalog = catalog(ConfigureSupport::default());
-        assert_eq!(catalog.models(), vec![KEEP, "m1", "m2"]);
-        assert_eq!(catalog.efforts(Some("m1")), vec![KEEP, "low", "high"]);
-        assert_eq!(catalog.efforts(Some("m2")), vec![KEEP]);
-        assert_eq!(catalog.efforts(None), vec![KEEP]);
-        assert_eq!(picked(&catalog.models(), Some(0)), None);
-        assert_eq!(picked(&catalog.models(), Some(2)), Some("m2".to_owned()));
-        assert_eq!(picked(&catalog.models(), Some(9)), None);
-    }
-
-    #[test]
-    fn refusals_are_the_daemon_reasons() {
-        let catalog = catalog(ConfigureSupport::for_harness("opencode"));
-        assert!(catalog.model_refusal().is_none());
-        assert!(
-            catalog
-                .effort_refusal()
-                .is_some_and(|reason| reason.contains("no native effort knob"))
-        );
     }
 
     #[test]
@@ -469,5 +369,89 @@ mod tests {
         assert!(lines[1].contains("applies at next turn · revision 2"));
         assert!(lines[1].contains("profile p had m1 / low"));
         assert_eq!(settings.next_model(), Some("m1"));
+    }
+
+    #[test]
+    fn picks_skip_the_harness_default_entry_and_out_of_range() {
+        let options = vec!["Harness default".to_owned(), "m1".to_owned()];
+        assert_eq!(picked(&options, Some(0)), None);
+        assert_eq!(picked(&options, Some(1)), Some("m1".to_owned()));
+        assert_eq!(picked(&options, Some(9)), None);
+    }
+
+    #[test]
+    fn menu_labels_resolve_to_their_pick() {
+        let models = vec!["m1".to_owned(), "m2".to_owned()];
+        let efforts = vec!["low".to_owned(), "high".to_owned()];
+        assert_eq!(
+            resolve("m2", &models, &efforts),
+            Some(Pick::Model(Some("m2".to_owned())))
+        );
+        assert_eq!(
+            resolve("high", &models, &efforts),
+            Some(Pick::Effort(Some("high".to_owned())))
+        );
+        assert_eq!(
+            resolve(DEFAULT_MODEL, &models, &efforts),
+            Some(Pick::Model(None))
+        );
+        assert_eq!(
+            resolve(DEFAULT_EFFORT, &models, &efforts),
+            Some(Pick::Effort(None))
+        );
+        assert_eq!(resolve("other", &models, &efforts), None);
+    }
+
+    #[test]
+    fn an_effort_named_like_a_model_gets_its_own_label() {
+        let models = vec!["high".to_owned(), "m1".to_owned()];
+        let efforts = vec!["low".to_owned(), "high".to_owned()];
+        let items = menu_items(&models, &efforts, false, None, None);
+        let MenuItem::Submenu { items: effort, .. } = &items[1] else {
+            panic!("effort submenu");
+        };
+        assert!(matches!(&effort[1], MenuItem::Item { label, .. } if label == "high effort"));
+        assert_eq!(
+            resolve("high effort", &models, &efforts),
+            Some(Pick::Effort(Some("high".to_owned())))
+        );
+        assert_eq!(
+            resolve("high", &models, &efforts),
+            Some(Pick::Model(Some("high".to_owned())))
+        );
+        // A refused model list resolves no model.
+        assert_eq!(resolve("m1", &[], &efforts), None);
+    }
+
+    #[test]
+    fn a_refusal_replaces_the_submenu_with_the_reason() {
+        let items = menu_items(
+            &["m1".to_owned()],
+            &[],
+            false,
+            None,
+            Some("fixed by the harness"),
+        );
+        let MenuItem::Submenu { items: model, .. } = &items[0] else {
+            panic!("model submenu");
+        };
+        assert_eq!(model.len(), 1);
+        let MenuItem::Submenu { items: effort, .. } = &items[1] else {
+            panic!("effort submenu");
+        };
+        assert!(matches!(
+            &effort[0],
+            MenuItem::Item { label, enabled: false, .. } if label == "fixed by the harness"
+        ));
+    }
+
+    #[test]
+    fn options_follow_the_chosen_model_or_the_default() {
+        let Ok(reply) = catalog(ConfigureSupport::default()).reply else {
+            panic!("catalogue");
+        };
+        assert_eq!(options(&reply, None).1, ["low", "high"]);
+        assert!(options(&reply, Some("m2")).1.is_empty());
+        assert_eq!(options(&reply, None).0, ["m1", "m2"]);
     }
 }

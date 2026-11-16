@@ -208,6 +208,15 @@ model = \"gpt-6-luna\"
         {"expected_revision":null,"sections":{"routing":{"default":["codex"]}},"dry_run":true,"client":"cli"}
     ),
     method!(
+        "routing.preview",
+        RoutingPreviewRequest,
+        RoutingPreviewResponse,
+        true,
+        false,
+        "Preview the routing decision the next launch of a role would record; advisory, nothing is admitted, frozen or reserved.",
+        {"role":"worker"}
+    ),
+    method!(
         "script.list",
         ScriptListRequest,
         ScriptListResponse,

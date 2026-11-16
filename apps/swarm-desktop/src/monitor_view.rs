@@ -1,12 +1,8 @@
-//! WinUI pane for the swarm monitor.
-//!
-//! Native controls only: a `ListView` of attention-first rows, text
-//! counters, and two bar charts built from `Border`s (CPU and RSS, each with
-//! its latest value and a labelled scale; no canvas). Control buttons are
-//! real `Button`s whose messages already carry the Agent, generation and
-//! turn shown on screen, so a click acts on exactly what was displayed. Only
-//! the actions that apply to the shown Agent appear; Force stop asks for an
-//! inline confirmation bound to the Agent and generation of its first click.
+//! WinUI pieces of the right panel: the monitor's Agent cards, the CPU and
+//! RSS charts (bars built from `Border`s, each with its latest value and a
+//! labelled scale; no canvas), the usage lines and the Change manager
+//! section. Buttons carry the Agent and generations shown on screen, so a
+//! click acts on exactly what was displayed.
 
 use windows_reactor::*;
 
@@ -17,34 +13,6 @@ use crate::monitor::{
 use crate::theme;
 use crate::theme::winui::Palette;
 
-/// Messages the pane emits, prepared by the screen with their bindings. A
-/// `None` action does not apply to the shown Agent and is not offered.
-pub struct MonitorActions {
-    pub select: Callback<Option<usize>>,
-    pub open: Option<Callback<()>>,
-    pub interrupt: Option<Callback<()>>,
-    pub stop: Option<Callback<()>>,
-    /// Asks for the Force stop confirmation.
-    pub force_stop: Option<Callback<()>>,
-    /// The pending Force stop confirmation, if one was asked.
-    pub confirm_force: Option<ForceConfirm>,
-    pub resume: Option<Callback<()>>,
-    pub detach: Option<Callback<()>>,
-}
-
-/// The inline Force stop confirmation: what it stops, and both answers.
-pub struct ForceConfirm {
-    pub question: String,
-    pub confirm: Callback<()>,
-    pub cancel: Callback<()>,
-}
-
-/// The "Change manager" section of the selected Agent.
-pub struct ReparentData<'a> {
-    pub rows: Vec<MoveRow>,
-    pub status: &'a str,
-}
-
 /// One possible new manager with its two bound moves.
 pub struct MoveRow {
     pub id: String,
@@ -54,73 +22,60 @@ pub struct MoveRow {
 }
 
 fn small(text: impl Into<String>) -> TextBlock {
-    TextBlock::new()
-        .text(text.into())
-        .font_size(theme::type_scale::LABEL_MEDIUM.size)
+    crate::m3::text(text, theme::type_scale::BODY_SMALL)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }
 
-fn utc_clock(ms: i64) -> String {
-    let seconds = ms.div_euclid(1000).rem_euclid(86_400);
-    format!(
-        "{:02}:{:02}:{:02} UTC",
-        seconds / 3600,
-        (seconds / 60) % 60,
-        seconds % 60
-    )
-}
-
-fn row_view(row: &MonitorRow, palette: Palette) -> View {
-    let manager = row
+/// One monitor card: the title with its state, what it does now, and its
+/// resources in one muted line. The whole card opens the conversation.
+pub fn card(row: &MonitorRow, title: &str, open: Callback<()>, palette: Palette) -> View {
+    let state = state_name(row.state);
+    let under = row
         .parent
         .as_deref()
         .map(|parent| format!(" · under {parent}"))
         .unwrap_or_default();
-    // ListViewItem exposes no content alignment in Reactor 0.100.0, so the
-    // row takes the pane's fixed inner width to right-align the chip.
-    let row_width = theme::layout::MONITOR_WIDTH - 2.0 * theme::spacing::LG - 40.0;
-    ListViewItem::new()
+    // The card style pads 16/20 at the sides; the content evens the right
+    // side and adds the card's 12-DIP top and bottom.
+    crate::m3::card_button(palette)
         .automation_name(format!(
-            "Agent {}, {}, {}{}, {}",
-            row.id,
-            state_name(row.state),
+            "{title}, {state}, {}{under}, {}",
             row.harness,
-            row.parent
-                .as_deref()
-                .map(|parent| format!(", under {parent}"))
-                .unwrap_or_default(),
             row.operation()
         ))
+        .on_click(open)
         .content(
             StackPanel::new()
-                .width(row_width)
-                .spacing(2.0)
-                .margin(Thickness::xy(0.0, theme::spacing::SM))
+                .spacing(theme::spacing::XS)
+                .margin(Thickness::new(0.0, 12.0, -4.0, 12.0))
                 .children((
                     Grid::new()
                         .columns([GridLength::STAR, GridLength::Auto])
                         .column_spacing(theme::spacing::SM)
                         .children((
-                            crate::m3::text(
-                                format!("{} · {}{manager}", row.id, row.harness),
-                                theme::type_scale::TITLE_SMALL,
-                            )
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .text_trimming(TextTrimming::CharacterEllipsis),
+                            crate::m3::text(title.to_owned(), theme::type_scale::TITLE_SMALL)
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .text_trimming(TextTrimming::CharacterEllipsis),
                             Border::new()
                                 .grid_column(1)
-                                .content(crate::m3::status_chip(palette, state_name(row.state))),
+                                .content(crate::m3::status_chip(palette, state)),
                         )),
-                    small(row.operation()).opacity(theme::MUTED_OPACITY),
-                    small(format!(
-                        "RSS {} · {} · {} · {}",
-                        bytes_label(row.obs.rss_bytes()),
-                        cpu_time_label(row.obs.cpu_time_ns()),
-                        row.obs.freshness(),
-                        tokens_label(row)
-                    ))
-                    .opacity(theme::MUTED_OPACITY),
+                    crate::m3::muted(
+                        format!("{} · {}{under}", row.harness, row.operation()),
+                        theme::type_scale::BODY_MEDIUM,
+                    )
+                    .text_trimming(TextTrimming::CharacterEllipsis),
+                    crate::m3::muted(
+                        format!(
+                            "{} · CPU {} · {}",
+                            bytes_label(row.obs.rss_bytes()),
+                            cpu_time_label(row.obs.cpu_time_ns()),
+                            tokens_label(row)
+                        ),
+                        theme::type_scale::BODY_SMALL,
+                    )
+                    .text_trimming(TextTrimming::CharacterEllipsis),
                 )),
         )
 }
@@ -232,7 +187,7 @@ fn chart_card(
                 crate::m3::text(latest, theme::type_scale::TITLE_MEDIUM).grid_column(1),
             )),
         Border::new()
-            .background(palette.surface_container_highest())
+            .background(palette.well())
             .corner_radius(theme::shape::SM)
             .padding(Thickness::uniform(theme::spacing::XS))
             .content(
@@ -245,7 +200,9 @@ fn chart_card(
     ))
 }
 
-fn detail_lines(read: &DetailRead) -> Vec<String> {
+/// The Agent's identity and settings from the monitor's detail read (when
+/// its conversation is not the open one).
+pub fn identity_lines(read: &DetailRead) -> Vec<String> {
     let agent = &read.agent.agent;
     let effective = agent.effective.as_ref();
     let field = |name: &str| {
@@ -255,13 +212,13 @@ fn detail_lines(read: &DetailRead) -> Vec<String> {
             .unwrap_or("not read back")
             .to_owned()
     };
-    let mut lines = vec![
+    vec![
         format!(
-            "{} · gen {} · {} · {}{}",
+            "Agent {} · generation {} · {} · {}{}",
             agent.id,
             agent.generation,
-            format!("{:?}", agent.state).to_lowercase(),
             agent.harness,
+            format!("{:?}", agent.state).to_lowercase(),
             if agent.observe_only {
                 " · observe-only"
             } else {
@@ -269,21 +226,26 @@ fn detail_lines(read: &DetailRead) -> Vec<String> {
             }
         ),
         format!(
-            "profile {} · effective model {} · effort {}",
+            "Profile {} · effective model {} · effort {}",
             agent.profile,
             field("model"),
             field("effort")
         ),
         format!(
-            "active turn {} · pending requests {}",
+            "Active turn {} · pending requests {}",
             agent.active_turn.as_deref().unwrap_or("none"),
             agent.pending.len()
         ),
-    ];
+    ]
+}
+
+/// Token usage and cost lines of the detail read.
+pub fn usage_lines(read: &DetailRead) -> Vec<String> {
+    let mut lines = Vec::new();
     match &read.usage {
         Ok(usage) => {
             lines.push(format!(
-                "usage: {} turn(s) counted, {} without usage, {} unknown excluded, {} running excluded; history {} ({}){}",
+                "{} turn(s) counted, {} without usage, {} unknown excluded, {} running excluded; history {} ({}){}",
                 usage.turns.turns_counted,
                 usage.turns.turns_without_usage,
                 usage.turns.turns_unknown_excluded,
@@ -294,7 +256,7 @@ fn detail_lines(read: &DetailRead) -> Vec<String> {
             ));
             for scope in usage.turns.by_scope.iter().take(4) {
                 lines.push(format!(
-                    "  {}: {} turn(s) · input {} · output {} · total {} tokens",
+                    "{}: {} turn(s) · input {} · output {} · total {} tokens",
                     scope.scope,
                     scope.turns_counted,
                     counter(scope.totals.input_tokens),
@@ -304,12 +266,12 @@ fn detail_lines(read: &DetailRead) -> Vec<String> {
             }
             for cost in &usage.sessions.cost_by_unit {
                 lines.push(format!(
-                    "  cost [{}]: {} over {} snapshot(s)",
+                    "Cost [{}]: {} over {} snapshot(s)",
                     cost.unit, cost.total_amount, cost.snapshots
                 ));
             }
         }
-        Err(error) => lines.push(format!("usage.summary unavailable: {error}")),
+        Err(error) => lines.push(format!("Usage unavailable: {error}")),
     }
     lines
 }
@@ -318,379 +280,144 @@ fn counter(value: Option<i64>) -> String {
     value.map_or_else(|| "—".to_owned(), |value| value.to_string())
 }
 
-/// The M3 treatment of one monitor action.
-#[derive(Clone, Copy)]
-enum ActionStyle {
-    Tonal,
-    /// A destructive action before confirmation (error container).
-    ErrorTonal,
-    /// The confirmed destructive action (error).
-    ErrorFilled,
-    Text,
-}
-
-/// One monitor action: its shown text, accessible name, binding and style.
-/// Without a callback it does not apply and is not shown.
-struct Action {
-    text: String,
-    name: String,
-    callback: Option<Callback<()>>,
-    style: ActionStyle,
-    enabled: bool,
-}
-
-impl Action {
-    fn new(
-        text: impl Into<String>,
-        callback: Option<Callback<()>>,
-        style: ActionStyle,
-        enabled: bool,
-    ) -> Self {
-        let text = text.into();
-        Self {
-            name: text.clone(),
-            text,
-            callback,
-            style,
-            enabled,
-        }
+/// The CPU and memory charts of `id`, with the sampling note.
+pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<KeyedView> {
+    let mut views: Vec<KeyedView> = Vec::new();
+    if let Some(row) = monitor.rows.iter().find(|row| row.id == id) {
+        views.push(KeyedView::new(
+            "fresh",
+            small(row.obs.freshness()).opacity(theme::MUTED_OPACITY),
+        ));
     }
-
-    /// A fuller accessible name than the shown text.
-    fn named(mut self, name: String) -> Self {
-        self.name = name;
-        self
-    }
-}
-
-/// The applicable actions in display order, as keyed buttons.
-fn action_row(actions: Vec<Action>, palette: Palette) -> View {
-    let buttons: Vec<KeyedView> = actions
-        .into_iter()
-        .filter_map(|action| {
-            let callback = action.callback?;
-            let button = match action.style {
-                ActionStyle::Tonal => crate::m3::tonal(palette),
-                ActionStyle::ErrorTonal => Button::new().resource_overrides(palette.error_tonal()),
-                ActionStyle::ErrorFilled => {
-                    Button::new().resource_overrides(palette.error_filled())
-                }
-                ActionStyle::Text => crate::m3::text_button(palette),
+    match monitor.series.get(id) {
+        Some(series) if !series.points().is_empty() => {
+            let recent = series.recent();
+            let last = recent.last().copied();
+            let cpu_values: Vec<Option<f64>> =
+                recent.iter().map(|point| point.cpu_percent).collect();
+            let cpu_scale = cpu_ceiling(observed_max(&cpu_values));
+            let cpu_note = match last.and_then(|point| point.cpu_percent) {
+                Some(_) => format!(
+                    "core-equivalent, 100% = one core{}",
+                    if last.is_some_and(|point| point.partial) {
+                        " · partial: process set changed"
+                    } else {
+                        ""
+                    }
+                ),
+                None => "rate unknown for the latest interval".to_owned(),
             };
-            Some(KeyedView::new(
-                action.text.clone(),
-                button
-                    .is_enabled(action.enabled)
-                    .automation_name(action.name)
-                    .on_click(callback)
-                    .content(TextBlock::new().text(action.text)),
-            ))
-        })
-        .collect();
-    StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .spacing(theme::spacing::SM)
-        .keyed_children(buttons)
+            views.push(KeyedView::new(
+                "cpu",
+                chart_card(
+                    "CPU",
+                    cpu_latest_label(last.and_then(|point| point.cpu_percent)),
+                    &cpu_values,
+                    cpu_scale,
+                    format!("scale 0–{cpu_scale}%"),
+                    cpu_note,
+                    palette.primary(),
+                    palette,
+                ),
+            ));
+            let rss_values: Vec<Option<f64>> = recent
+                .iter()
+                .map(|point| point.rss_bytes.map(|bytes| bytes as f64))
+                .collect();
+            let rss_scale = rss_ceiling(observed_max(&rss_values));
+            views.push(KeyedView::new(
+                "rss",
+                chart_card(
+                    "Memory (RSS)",
+                    bytes_label(last.and_then(|point| point.rss_bytes)),
+                    &rss_values,
+                    rss_scale,
+                    format!("scale 0–{}", bytes_label(Some(rss_scale as u64))),
+                    "sum over the Agent's sampled processes, not host memory share".to_owned(),
+                    palette.tertiary(),
+                    palette,
+                ),
+            ));
+            views.push(KeyedView::new(
+                "series",
+                small(format!(
+                    "{} sample(s) kept while this panel is open (capped at {}).",
+                    series.points().len(),
+                    monitor::RING_CAPACITY
+                ))
+                .opacity(theme::MUTED_OPACITY),
+            ));
+        }
+        _ => views.push(KeyedView::new(
+            "no-series",
+            small("No process samples yet.").opacity(theme::MUTED_OPACITY),
+        )),
+    }
+    views
 }
 
-/// The monitor pane for the right-hand column.
-pub fn monitor_pane(
-    monitor: &Monitor,
-    selected: Option<&str>,
-    published_rows: usize,
-    controls_enabled: bool,
-    reparent: ReparentData<'_>,
-    actions: MonitorActions,
+/// "Change manager": move the Agent with its subtree, or only its
+/// children, under another live Agent. Each button is already bound.
+pub fn manager_section(
+    id: &str,
+    rows: Vec<MoveRow>,
+    status: &str,
+    enabled: bool,
     palette: Palette,
 ) -> View {
-    // Only highlight a row index that already existed before this refresh,
-    // so the native SelectedIndex never runs ahead of the items it indexes
-    // (an index past them fails with E_INVALIDARG, which Reactor treats as
-    // fatal: 0xC0000409; see `ShellMsg::AgentsLoaded` in `ui`).
-    let selected_index = selected
-        .and_then(|id| monitor.rows.iter().position(|row| row.id == id))
-        .filter(|index| *index < published_rows);
-    let rows: Vec<KeyedView> = monitor
-        .rows
-        .iter()
-        .map(|row| KeyedView::new(row.id.clone(), row_view(row, palette)))
-        .collect();
-    let status = match monitor.read_at_ms {
-        Some(at) => format!(
-            "Refreshed {} · every {} s while open · {} refresh(es)",
-            utc_clock(at),
-            monitor::PERIOD_MS / 1000,
-            monitor.refreshes
-        ),
-        None => "Reading the swarm…".to_owned(),
-    };
-    let errors = if monitor.errors.is_empty() {
-        String::new()
-    } else {
-        format!("Read errors: {}", monitor.errors.join("; "))
-    };
-
-    let mut details: Vec<KeyedView> = Vec::new();
-    match (selected, monitor.detail.as_ref()) {
-        (None, _) => details.push(KeyedView::new(
-            "hint",
-            small("Select an Agent for details, usage and controls.").opacity(theme::MUTED_OPACITY),
-        )),
-        (Some(id), Some(Ok(read))) if read.agent.agent.id == id => {
-            for (index, line) in detail_lines(read).into_iter().enumerate() {
-                details.push(KeyedView::new(format!("line{index}"), small(line)));
-            }
-        }
-        (Some(_), Some(Err(error))) => {
-            details.push(KeyedView::new(
-                "error",
-                small(format!("Detail read failed: {error}")).foreground(palette.error()),
-            ));
-        }
-        (Some(_), _) => details.push(KeyedView::new("loading", small("Reading details…"))),
-    }
-    if let Some(id) = selected {
-        let row = monitor.rows.iter().find(|row| row.id == id);
-        if let Some(row) = row {
-            details.push(KeyedView::new("fresh", small(row.obs.freshness())));
-        }
-        match monitor.series.get(id) {
-            Some(series) if !series.points().is_empty() => {
-                let recent = series.recent();
-                let last = recent.last().copied();
-                let cpu_values: Vec<Option<f64>> =
-                    recent.iter().map(|point| point.cpu_percent).collect();
-                let cpu_scale = cpu_ceiling(observed_max(&cpu_values));
-                let cpu_note = match last.and_then(|point| point.cpu_percent) {
-                    Some(_) => format!(
-                        "core-equivalent, 100% = one core{}",
-                        if last.is_some_and(|point| point.partial) {
-                            " · partial: process set changed"
-                        } else {
-                            ""
-                        }
-                    ),
-                    None => "rate unknown for the latest interval".to_owned(),
-                };
-                details.push(KeyedView::new(
-                    "cpu",
-                    chart_card(
-                        "CPU",
-                        cpu_latest_label(last.and_then(|point| point.cpu_percent)),
-                        &cpu_values,
-                        cpu_scale,
-                        format!("scale 0–{cpu_scale}%"),
-                        cpu_note,
-                        palette.primary(),
-                        palette,
-                    ),
-                ));
-                let rss_values: Vec<Option<f64>> = recent
-                    .iter()
-                    .map(|point| point.rss_bytes.map(|bytes| bytes as f64))
-                    .collect();
-                let rss_scale = rss_ceiling(observed_max(&rss_values));
-                details.push(KeyedView::new(
-                    "rss",
-                    chart_card(
-                        "Memory (RSS)",
-                        bytes_label(last.and_then(|point| point.rss_bytes)),
-                        &rss_values,
-                        rss_scale,
-                        format!("scale 0–{}", bytes_label(Some(rss_scale as u64))),
-                        "sum over the Agent's sampled processes, not host memory share".to_owned(),
-                        palette.tertiary(),
-                        palette,
-                    ),
-                ));
-                details.push(KeyedView::new(
-                    "series",
-                    small(format!(
-                        "{} distinct sample(s) kept in this window only (UI history, capped at {}).",
-                        series.points().len(),
-                        monitor::RING_CAPACITY
-                    ))
-                    .opacity(theme::MUTED_OPACITY),
-                ));
-            }
-            _ => details.push(KeyedView::new(
-                "no-series",
-                small("No process samples for this Agent in the current rows.")
-                    .opacity(theme::MUTED_OPACITY),
-            )),
-        }
-        let observe_only = monitor
-            .detail
-            .as_ref()
-            .and_then(|detail| detail.as_ref().ok())
-            .filter(|read| read.agent.agent.id == id)
-            .is_some_and(|read| read.agent.agent.observe_only);
-        if observe_only {
-            details.push(KeyedView::new(
-                "unsupported",
-                small("Controls unavailable: observe-only Agents reject native control verbs.")
-                    .foreground(palette.error()),
-            ));
-        }
-        // Conversation and turn actions, then lifecycle: two rows fit the
-        // monitor's width. Stop stays tonal; Force stop takes the error role
-        // and asks first.
-        let confirm: View = match actions.confirm_force {
-            Some(confirm) => Border::new()
-                .background(palette.error_container())
-                .corner_radius(theme::shape::MD)
-                .padding(Thickness::uniform(theme::spacing::MD))
-                .content(StackPanel::new().spacing(theme::spacing::SM).children((
-                    small(confirm.question).foreground(palette.on_error_container()),
-                    action_row(
-                        vec![
-                            Action::new("Cancel", Some(confirm.cancel), ActionStyle::Text, true),
-                            Action::new(
-                                "Force stop",
-                                Some(confirm.confirm),
-                                ActionStyle::ErrorFilled,
-                                controls_enabled,
+    let moves: Vec<KeyedView> = rows
+        .into_iter()
+        .map(|row| {
+            let button = |text: &str, name: String, callback: Option<Callback<()>>| -> View {
+                match callback {
+                    Some(callback) => crate::m3::tonal(palette)
+                        .is_enabled(enabled)
+                        .automation_name(name)
+                        .on_click(callback)
+                        .content(TextBlock::new().text(text.to_owned())),
+                    None => View::empty(),
+                }
+            };
+            KeyedView::new(
+                row.id.clone(),
+                StackPanel::new().spacing(theme::spacing::XS).children((
+                    small(row.label.clone()),
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(theme::spacing::SM)
+                        .children((
+                            button(
+                                "Move here",
+                                format!("Move {id} under {}", row.id),
+                                row.move_agent,
                             ),
-                        ],
-                        palette,
-                    ),
-                ))),
-            None => View::empty(),
-        };
-        details.push(KeyedView::new(
-            "actions",
-            StackPanel::new().spacing(theme::spacing::SM).children((
-                action_row(
-                    vec![
-                        Action::new("Open conversation", actions.open, ActionStyle::Tonal, true),
-                        Action::new(
-                            "Interrupt",
-                            actions.interrupt,
-                            ActionStyle::Tonal,
-                            controls_enabled,
-                        ),
-                    ],
-                    palette,
-                ),
-                action_row(
-                    vec![
-                        Action::new("Stop", actions.stop, ActionStyle::Tonal, controls_enabled),
-                        Action::new(
-                            "Force stop",
-                            actions.force_stop,
-                            ActionStyle::ErrorTonal,
-                            controls_enabled,
-                        ),
-                        Action::new(
-                            "Resume",
-                            actions.resume,
-                            ActionStyle::Tonal,
-                            controls_enabled,
-                        ),
-                        Action::new(
-                            "Detach",
-                            actions.detach,
-                            ActionStyle::Tonal,
-                            controls_enabled,
-                        ),
-                    ],
-                    palette,
-                ),
-                confirm,
-            )),
-        ));
-        // One row per possible manager, each button already bound to that
-        // row's generation: no selection state can disagree with the screen.
-        let moves: Vec<KeyedView> = reparent
-            .rows
-            .into_iter()
-            .map(|row| {
-                KeyedView::new(
-                    row.id.clone(),
-                    StackPanel::new().spacing(2.0).children((
-                        small(row.label),
-                        action_row(
-                            vec![
-                                Action::new(
-                                    format!("Move {id} here"),
-                                    row.move_agent,
-                                    ActionStyle::Tonal,
-                                    controls_enabled,
-                                )
-                                .named(format!("Move {id} under {}", row.id)),
-                                Action::new(
-                                    "Move its children here",
-                                    row.move_children,
-                                    ActionStyle::Tonal,
-                                    controls_enabled,
-                                )
-                                .named(format!("Move the children of {id} under {}", row.id)),
-                            ],
-                            palette,
-                        ),
-                    )),
-                )
-            })
-            .collect();
-        details.push(KeyedView::new(
-            "reparent",
-            StackPanel::new().spacing(theme::spacing::XS).children((
-                TextBlock::new()
-                    .text("Change manager")
-                    .font_weight(FontWeight::SEMI_BOLD)
-                    .automation_heading_level(AutomationHeadingLevel::Level3),
-                small(if moves.is_empty() {
-                    "No other live Agent is shown to become the manager.".to_owned()
-                } else {
-                    format!(
-                        "Move {id} with its subtree, or only its children, under a live Agent below. The daemon checks cycles, fanout limits, observe-only Agents and both generations."
-                    )
-                })
-                .opacity(theme::MUTED_OPACITY),
-                StackPanel::new()
-                    .spacing(theme::spacing::SM)
-                    .keyed_children(moves),
-                small(reparent.status.to_owned()),
-            )),
-        ));
-    }
-
-    Grid::new()
-        .rows([
-            GridLength::Auto,
-            GridLength::Auto,
-            GridLength::Auto,
-            GridLength::STAR,
-        ])
-        .row_spacing(theme::spacing::MD)
-        .children((
-            StackPanel::new().grid_row(0).spacing(2.0).children((
-                crate::m3::title("Monitor", theme::type_scale::TITLE_LARGE),
-                small(status).opacity(theme::MUTED_OPACITY),
-                small(errors).foreground(palette.error()),
-            )),
-            small(monitor.counter_line())
-                .opacity(theme::MUTED_OPACITY)
-                .grid_row(1),
-            ListView::new()
-                .grid_row(2)
-                .max_height(320.0)
-                .selected_index(selected_index)
-                .automation_name("Monitored Agents")
-                .on_selection_changed(actions.select)
-                .collection_slot(ListViewSlot::Items, rows),
-            ScrollViewer::new()
-                .grid_row(3)
-                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                .automation_name("Agent details")
-                .content(
-                    crate::m3::card(palette).content(
-                        StackPanel::new()
-                            .spacing(theme::spacing::SM)
-                            .keyed_children(details),
-                    ),
-                ),
-        ))
+                            button(
+                                "Move its workers here",
+                                format!("Move the workers of {id} under {}", row.id),
+                                row.move_children,
+                            ),
+                        )),
+                )),
+            )
+        })
+        .collect();
+    let note = if moves.is_empty() {
+        "No other live Agent can become the manager.".to_owned()
+    } else {
+        "The daemon checks cycles, fanout limits, observe-only Agents and both generations."
+            .to_owned()
+    };
+    crate::m3::card_high(palette).content(
+        StackPanel::new().spacing(theme::spacing::SM).children((
+            crate::m3::text("Change manager", theme::type_scale::TITLE_SMALL)
+                .automation_heading_level(AutomationHeadingLevel::Level3),
+            small(note).opacity(theme::MUTED_OPACITY),
+            StackPanel::new()
+                .spacing(theme::spacing::MD)
+                .keyed_children(moves),
+            small(status.to_owned()),
+        )),
+    )
 }
 
 #[cfg(test)]

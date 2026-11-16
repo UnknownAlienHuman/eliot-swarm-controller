@@ -421,6 +421,54 @@ pub struct SettingsSaveResponse {
     pub history_revision: Option<i64>,
 }
 
+/// Request for `routing.preview`: the decision the next launch of `role`
+/// would record. An omitted role is `default`, as for `launch`.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingPreviewRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+impl RoutingPreviewRequest {
+    /// Role syntax only; the daemon owns the configured roles.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(role) = &self.role
+            && (role.is_empty()
+                || role.len() > 128
+                || !role.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                }))
+        {
+            return Err(Error::new(
+                "invalid",
+                "routing role must be 1..128 letters, digits, hyphens or underscores",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_response(&self, reply: &RoutingPreviewResponse) -> Result<()> {
+        self.validate()?;
+        let role = self.role.as_deref().unwrap_or("default");
+        if reply.decision.role != role || reply.decision.skipped.len() > 64 {
+            return Err(Error::new(
+                "invalid",
+                "routing preview does not match its request",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Response for `routing.preview`: advisory only. Nothing is admitted,
+/// frozen or reserved; admission evaluates the candidates again.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingPreviewResponse {
+    pub decision: crate::RoutingDecision,
+}
+
 /// Request for `rule.list`: one page of a rule namespace.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

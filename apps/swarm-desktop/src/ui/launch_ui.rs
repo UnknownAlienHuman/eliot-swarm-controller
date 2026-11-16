@@ -1,51 +1,195 @@
-//! The one launch picker: configured profile or ad-hoc harness/model/effort, workspace and the first message.
+//! A new task: the project it starts in, Auto / a profile / an ad-hoc
+//! harness with its model and effort, and the first message, all set from
+//! the composer's chips.
+//!
+//! "Auto" is the daemon's routing: the launch names no profile and admission
+//! picks the first available candidate of the default role (Settings,
+//! Routing). Before launch the chip shows `routing.preview`'s pick and why;
+//! after launch the Agent details show the recorded decision.
 
 use super::*;
+use crate::configure::Pick;
 use crate::theme::winui::Palette;
+use eliot_core::api::HarnessModelsResponse;
+
+/// The project chip's entry that shows the folder field.
+const OTHER_FOLDER: &str = "Other folder…";
+/// The profile chip's routing entry.
+const AUTO: &str = "Auto";
 
 #[derive(Clone, Debug)]
 pub(super) enum LaunchMsg {
     WorkspaceChanged(String),
-    ProfileTextChanged(String),
-    ProfileSelected(Option<usize>),
+    /// A project chip entry: a registered project's name or [`OTHER_FOLDER`].
+    ProjectMenu(String),
+    /// A profile chip entry: [`AUTO`], a profile name or "<harness> harness".
+    ProfileMenu(String),
+    /// A model-and-effort chip entry (ad-hoc harness).
+    ModelMenu(String),
     LaunchRequested,
     LaunchSubmitted(Fallible<LaunchOutcome>),
     ProfilesListed(Fallible<ProfileListResponse>),
-    PickerModeSelected(Option<usize>),
-    AdhocHarnessSelected(Option<usize>),
-    AdhocModelChanged(String),
-    AdhocEffortChanged(String),
-    HarnessModelsRequested,
-    HarnessModelsLoaded(String, Fallible<String>),
+    /// `routing.preview` for the default role.
+    PreviewLoaded(Box<Fallible<eliot_core::RoutingDecision>>),
+    HarnessCatalogLoaded(String, Box<Fallible<HarnessModelsResponse>>),
 }
 
-/// The launch picker and the new-conversation draft.
+/// What a new task launches.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) enum Choice {
+    /// The daemon's routing chooses at admission.
+    #[default]
+    Auto,
+    Profile(String),
+    /// An Owner ad-hoc launch of one harness.
+    Harness(String),
+}
+
+/// The new-task draft and its context.
+#[derive(Default)]
 pub(super) struct LaunchState {
+    /// The selected project's profile allowlist (empty: any profile).
     pub(super) profiles: Vec<String>,
-    pub(super) profile_idx: Option<usize>,
-    pub(super) profile_text: String,
     pub(super) workspace: String,
+    /// The folder field is shown (a path outside the registered projects).
+    pub(super) custom_workspace: bool,
     pub(super) launch_text: String,
     pub(super) launch_rev: u64,
-    /// Daemon `profile.list` summaries for the launch picker.
+    /// Daemon `profile.list` summaries.
     pub(super) profile_summaries: Vec<ProfileSummary>,
     pub(super) profile_list: Option<ProfileListResponse>,
-    pub(super) picker_adhoc: bool,
-    pub(super) adhoc_harness_idx: Option<usize>,
-    pub(super) adhoc_model: String,
-    pub(super) adhoc_effort: String,
-    pub(super) harness_hint: String,
+    pub(super) choice: Choice,
+    pub(super) adhoc_model: Option<String>,
+    pub(super) adhoc_effort: Option<String>,
+    /// The ad-hoc harness's catalogue, once read.
+    pub(super) catalog: Option<(String, Fallible<HarnessModelsResponse>)>,
+    /// What routing would pick for a new task now (advisory).
+    pub(super) preview: Option<Fallible<eliot_core::RoutingDecision>>,
+    pub(super) preview_loading: bool,
+    /// A refresh was asked for while one ran: read again when it lands.
+    pub(super) preview_again: bool,
+}
+
+impl LaunchState {
+    /// Profiles a new task may use: the daemon's summaries, narrowed to the
+    /// project's allowlist when it has one.
+    pub(super) fn allowed(&self) -> Vec<&ProfileSummary> {
+        self.profile_summaries
+            .iter()
+            .filter(|profile| self.profiles.is_empty() || self.profiles.contains(&profile.name))
+            .collect()
+    }
+
+    /// A profile choice the project no longer allows falls back to Auto.
+    pub(super) fn reconcile_choice(&mut self) {
+        if let Choice::Profile(name) = &self.choice
+            && !self.profile_summaries.is_empty()
+            && !self.allowed().iter().any(|profile| &profile.name == name)
+        {
+            self.choice = Choice::Auto;
+        }
+    }
+
+    /// The profile routing would pick now, from the last preview.
+    pub(super) fn auto_profile(&self) -> Option<&ProfileSummary> {
+        let name = self.preview.as_ref()?.as_ref().ok()?.profile.as_deref()?;
+        self.profile_summaries
+            .iter()
+            .find(|profile| profile.name == name)
+    }
+
+    /// The profile this task launches (Auto: the previewed pick), if any.
+    pub(super) fn profile(&self) -> Option<&ProfileSummary> {
+        match &self.choice {
+            Choice::Auto => self.auto_profile(),
+            Choice::Profile(name) => self
+                .profile_summaries
+                .iter()
+                .find(|profile| &profile.name == name),
+            Choice::Harness(_) => None,
+        }
+    }
+
+    /// Model and effort options of the ad-hoc harness's catalogue.
+    fn adhoc_options(&self) -> (Vec<String>, Vec<String>) {
+        match (&self.choice, &self.catalog) {
+            (Choice::Harness(harness), Some((read, Ok(reply)))) if harness == read => {
+                configure::options(reply, self.adhoc_model.as_deref())
+            }
+            _ => (Vec::new(), Vec::new()),
+        }
+    }
 }
 
 impl DesktopApp {
     pub(super) fn launch_update(&mut self, msg: LaunchMsg, context: &ComponentContext<Self>) {
         match msg {
             LaunchMsg::WorkspaceChanged(text) => self.launch.workspace = text,
-            LaunchMsg::ProfileTextChanged(text) => self.launch.profile_text = text,
-            LaunchMsg::ProfileSelected(index) => {
-                self.launch.profile_idx = index;
-                self.nav.selection.profile = index
-                    .and_then(|index| self.picker_profiles().get(index).map(|p| p.name.clone()));
+            LaunchMsg::ProjectMenu(label) => {
+                if label == OTHER_FOLDER {
+                    self.launch.custom_workspace = true;
+                    self.launch.workspace.clear();
+                    self.launch.profiles.clear();
+                    self.nav.selection.project = None;
+                } else if let Some(project) = self
+                    .nav
+                    .projects
+                    .iter()
+                    .find(|project| project.name == label)
+                    .cloned()
+                {
+                    self.launch.workspace = project.workspace.clone();
+                    self.launch.custom_workspace = false;
+                    self.launch.profiles = project.profiles.clone();
+                    self.nav.selection.project = Some(project.id.clone());
+                    self.launch.reconcile_choice();
+                }
+            }
+            LaunchMsg::ProfileMenu(label) => {
+                let choice = if label == AUTO {
+                    Choice::Auto
+                } else if let Some(harness) = label
+                    .strip_suffix(" harness")
+                    .filter(|harness| ADHOC_HARNESSES.contains(harness))
+                {
+                    Choice::Harness(harness.to_owned())
+                } else {
+                    Choice::Profile(label)
+                };
+                if let Choice::Harness(harness) = &choice {
+                    if self.launch.choice != choice {
+                        self.launch.adhoc_model = None;
+                        self.launch.adhoc_effort = None;
+                    }
+                    let held =
+                        matches!(&self.launch.catalog, Some((read, Ok(_))) if read == harness);
+                    if !held {
+                        self.read_harness_catalog(harness.clone(), context);
+                    }
+                }
+                self.nav.selection.profile = match &choice {
+                    Choice::Profile(name) => Some(name.clone()),
+                    _ => None,
+                };
+                self.launch.choice = choice;
+            }
+            LaunchMsg::ModelMenu(label) => {
+                let (models, efforts) = self.launch.adhoc_options();
+                match configure::resolve(&label, &models, &efforts) {
+                    Some(Pick::Model(model)) => {
+                        self.launch.adhoc_model = model;
+                        // Efforts belong to the model.
+                        self.launch.adhoc_effort = None;
+                    }
+                    Some(Pick::Effort(effort)) => self.launch.adhoc_effort = effort,
+                    None => {}
+                }
+            }
+            LaunchMsg::HarnessCatalogLoaded(harness, reply) => {
+                // A reply for a harness no longer chosen is dropped.
+                if self.launch.choice == Choice::Harness(harness.clone()) {
+                    self.launch.catalog = Some((harness, *reply));
+                }
             }
             LaunchMsg::LaunchRequested => {
                 if self.submitting() {
@@ -57,13 +201,17 @@ impl DesktopApp {
                 let target = match self.launch_target() {
                     Ok(target) => target,
                     Err(error) => {
-                        self.set_status(format!("Cannot launch: {error}."));
+                        self.alert(format!("Cannot start: {error}."));
                         return;
                     }
                 };
                 let text = profiles::normalize_newlines(&self.launch.launch_text);
-                if text.trim().is_empty() || self.launch.workspace.trim().is_empty() {
-                    self.set_status("Type the workspace and the first message before launching.");
+                if text.trim().is_empty() {
+                    self.alert("Type the first message.");
+                    return;
+                }
+                if self.launch.workspace.trim().is_empty() {
+                    self.alert("Choose a project or a folder for the task.");
                     return;
                 }
                 let key = format!(
@@ -74,6 +222,7 @@ impl DesktopApp {
                 self.in_flight_key = Some(key);
                 let workspace = self.launch.workspace.clone();
                 let launch_rev = self.launch.launch_rev;
+                self.alert = None;
                 self.set_status(format!("Launching ({mutation_id})…"));
                 let _task = context.spawn_background(move |_| {
                     Message::Launch(LaunchMsg::LaunchSubmitted(client::block_on(async {
@@ -85,12 +234,13 @@ impl DesktopApp {
                             Some(text.clone()),
                         )
                         .await
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| crate::settings_model::launch_error(&error))?;
                         Ok(LaunchOutcome {
-                            agent: reply
-                                .agent
-                                .clone()
-                                .ok_or_else(|| "launch admitted no agent".to_owned())?,
+                            // Admitted without an Agent id: the outcome is
+                            // unknown, so the id is kept for a same-id retry.
+                            agent: reply.agent.clone().ok_or_else(|| {
+                                "unknown: the launch was admitted without an Agent id".to_owned()
+                            })?,
                             generation: reply.generation.unwrap_or_default(),
                             command_id: reply.command_id.clone(),
                             linked_command: reply.linked_command.clone(),
@@ -120,6 +270,10 @@ impl DesktopApp {
                             self.chat.pending_local =
                                 Some((outcome.agent.clone(), linked, outcome.text.clone()));
                         }
+                        // The title is the first message, known now.
+                        self.nav
+                            .titles
+                            .insert(outcome.agent.clone(), nav::title(&outcome.text));
                         self.set_status(format!(
                             "Launched {} ({}); its first input is {}.",
                             outcome.agent,
@@ -131,145 +285,82 @@ impl DesktopApp {
                             generation: outcome.generation,
                             harness: String::new(),
                             state: "created".to_owned(),
-                            // Placed by the list reload that follows.
-                            project: String::new(),
+                            project: self.launch.workspace.clone(),
                             parent: None,
+                            updated_at: handoff_now_ms(),
                         });
                         self.nav.selection.select_agent(Some(outcome.agent));
                         self.load_agents(context, None);
+                        // Capacity changed: the next Auto pick may differ.
+                        self.load_routing_preview(context);
                     }
                     Err(error) if crate::state::uncertain(&error) => {
-                        self.set_status(format!(
-                            "Launch not confirmed (Launch again reuses its id): {error}"
+                        self.alert(format!(
+                            "Start not confirmed (sending again reuses its id): {error}"
                         ));
                     }
-                    Err(error) => self.set_status(format!("Launch refused: {error}")),
+                    Err(error) => self.alert(format!("Start refused: {error}")),
                 }
             }
             LaunchMsg::ProfilesListed(result) => match result {
                 Ok(list) => {
                     self.launch.profile_summaries = list.profiles.clone();
-                    // Keep the chosen profile by name: a refreshed list may
-                    // reorder, add or drop profiles.
-                    self.launch.profile_idx =
-                        self.nav.selection.profile.as_ref().and_then(|name| {
-                            self.picker_profiles()
-                                .iter()
-                                .position(|profile| &profile.name == name)
-                        });
-                    if self.launch.profile_idx.is_none() {
-                        self.nav.selection.profile = None;
-                    }
                     self.launch.profile_list = Some(list);
+                    self.launch.reconcile_choice();
                 }
-                Err(error) => self.set_status(format!("profile.list failed: {error}")),
+                Err(error) => self.alert(format!("Profiles not read: {error}")),
             },
-            LaunchMsg::PickerModeSelected(index) => self.launch.picker_adhoc = index == Some(1),
-            LaunchMsg::AdhocHarnessSelected(index) => {
-                self.launch.adhoc_harness_idx = index;
-                self.launch.harness_hint.clear();
-            }
-            LaunchMsg::AdhocModelChanged(text) => self.launch.adhoc_model = text,
-            LaunchMsg::AdhocEffortChanged(text) => self.launch.adhoc_effort = text,
-            LaunchMsg::HarnessModelsRequested => {
-                let (Ok(data_dir), Some(harness)) = (
-                    self.data_dir.clone(),
-                    self.launch
-                        .adhoc_harness_idx
-                        .and_then(|index| ADHOC_HARNESSES.get(index)),
-                ) else {
-                    return;
-                };
-                let harness = (*harness).to_owned();
-                self.launch.harness_hint = format!("Reading the {harness} catalogue…");
-                let _task = context.spawn_background(move |_| {
-                    let hint = client::block_on(async {
-                        client::harness_models(&data_dir, &harness, None)
-                            .await
-                            .map(|reply| {
-                                let default = reply
-                                    .models
-                                    .iter()
-                                    .find(|model| model.default)
-                                    .or_else(|| reply.models.first());
-                                let mut hint = format!(
-                                    "Unset model: {} · unset effort: {}",
-                                    reply.default.as_deref().unwrap_or("the native default"),
-                                    default
-                                        .and_then(|model| model.default_effort.as_deref())
-                                        .unwrap_or("the native default"),
-                                );
-                                if !reply.models.is_empty() {
-                                    let names: Vec<&str> = reply
-                                        .models
-                                        .iter()
-                                        .take(8)
-                                        .map(|m| m.id.as_str())
-                                        .collect();
-                                    hint.push_str(&format!(
-                                        " · {} model(s): {}{}",
-                                        reply.models.len(),
-                                        names.join(", "),
-                                        if reply.models.len() > 8 { ", …" } else { "" }
-                                    ));
-                                }
-                                if let Some(note) = reply.note {
-                                    hint.push_str(&format!(" · {note}"));
-                                }
-                                hint
-                            })
-                            .map_err(|error| error.to_string())
-                    });
-                    Message::Launch(LaunchMsg::HarnessModelsLoaded(harness, hint))
-                });
-            }
-            LaunchMsg::HarnessModelsLoaded(harness, hint) => {
-                self.launch.harness_hint = match hint {
-                    Ok(hint) => hint,
-                    Err(error) => format!("{harness} catalogue unavailable: {error}"),
-                };
+            LaunchMsg::PreviewLoaded(result) => {
+                self.launch.preview_loading = false;
+                self.launch.preview = Some(*result);
+                if std::mem::take(&mut self.launch.preview_again) {
+                    self.load_routing_preview(context);
+                }
             }
         }
     }
 
-    /// Launch-picker profiles: the daemon's summaries, narrowed to the
-    /// selected project's allowlist when one is selected.
-    pub(super) fn picker_profiles(&self) -> Vec<&ProfileSummary> {
-        self.launch
-            .profile_summaries
-            .iter()
-            .filter(|profile| {
-                self.launch.profiles.is_empty() || self.launch.profiles.contains(&profile.name)
-            })
-            .collect()
+    /// Ask routing what it would pick for a new task now.
+    pub(super) fn load_routing_preview(&mut self, context: &ComponentContext<Self>) {
+        if self.launch.preview_loading {
+            // The running read may predate the change that asked.
+            self.launch.preview_again = true;
+            return;
+        }
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        self.launch.preview_loading = true;
+        let _task = context.spawn_background(move |_| {
+            Message::Launch(LaunchMsg::PreviewLoaded(Box::new(
+                client::block_on(config_client::routing_preview(&data_dir, None))
+                    .map_err(|error| error.to_string()),
+            )))
+        });
     }
 
-    pub(super) fn launch_profile(&self) -> Option<String> {
-        if self.launch.profile_summaries.is_empty() {
-            Some(self.launch.profile_text.trim().to_owned()).filter(|profile| !profile.is_empty())
-        } else {
-            self.launch
-                .profile_idx
-                .and_then(|index| self.picker_profiles().get(index).map(|p| p.name.clone()))
-        }
+    /// Read the ad-hoc harness's model catalogue (models and efforts).
+    fn read_harness_catalog(&self, harness: String, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let _task = context.spawn_background(move |_| {
+            let reply = client::block_on(client::harness_models(&data_dir, &harness, None))
+                .map_err(|error| error.to_string());
+            Message::Launch(LaunchMsg::HarnessCatalogLoaded(harness, Box::new(reply)))
+        });
     }
 
     pub(super) fn launch_target(&self) -> Result<LaunchTarget, String> {
-        if self.launch.picker_adhoc {
-            let harness = self
-                .launch
-                .adhoc_harness_idx
-                .and_then(|index| ADHOC_HARNESSES.get(index))
-                .ok_or("choose a harness")?;
-            Ok(LaunchTarget::Adhoc {
-                harness: (*harness).to_owned(),
-                model: Some(self.launch.adhoc_model.trim().to_owned()).filter(|v| !v.is_empty()),
-                effort: Some(self.launch.adhoc_effort.trim().to_owned()).filter(|v| !v.is_empty()),
-            })
-        } else {
-            self.launch_profile()
-                .map(LaunchTarget::Profile)
-                .ok_or_else(|| "choose or type a configured profile".to_owned())
+        match &self.launch.choice {
+            Choice::Harness(harness) => Ok(LaunchTarget::Adhoc {
+                harness: harness.clone(),
+                model: self.launch.adhoc_model.clone(),
+                effort: self.launch.adhoc_effort.clone(),
+            }),
+            Choice::Profile(name) => Ok(LaunchTarget::Profile(name.clone())),
+            // Admission routes; a miss is refused there with its reasons.
+            Choice::Auto => Ok(LaunchTarget::Routed),
         }
     }
 
@@ -279,159 +370,196 @@ impl DesktopApp {
         };
         let _task = context.spawn_background(move |_| {
             Message::Launch(LaunchMsg::ProfilesListed(client::block_on(async {
-                client::list_profiles(&data_dir)
+                config_client::list_profiles(&data_dir)
                     .await
                     .map_err(|error| error.to_string())
             })))
         });
     }
 
-    /// The one launch picker beside the first message (issue #407 §1): a
-    /// configured profile with its requested summary, or an ad-hoc
-    /// harness/model/effort, plus the workspace. Requested settings only;
-    /// the Agent detail shows the effective readback after launch.
-    pub(super) fn launch_card(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let adhoc = self.launch.picker_adhoc;
-        let mode = |label: &str, name: &str, index: usize, selected: bool| {
-            m3::segment(palette, selected)
-                .automation_name(if selected {
-                    format!("{name} (selected)")
-                } else {
-                    name.to_owned()
-                })
-                .on_click(
-                    context.message(Message::Launch(LaunchMsg::PickerModeSelected(Some(index)))),
-                )
-                .content(TextBlock::new().text(label.to_owned()))
-        };
-        let modes = StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(theme::spacing::XS)
-            .children((
-                mode("Profile", "Launch mode: configured profile", 0, !adhoc),
-                mode("Ad-hoc harness", "Launch mode: ad-hoc harness", 1, adhoc),
+    /// The composer's context row for a new task: the project chip (or the
+    /// folder field) and the Auto / profile / harness chip.
+    pub(super) fn launch_context(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let project_label = self
+            .selected_project()
+            .map(|project| project.name.clone())
+            .or_else(|| {
+                (!self.launch.workspace.is_empty())
+                    .then(|| nav::project_name(&self.launch.workspace, &[]))
+            })
+            .unwrap_or_else(|| "Choose a project".to_owned());
+        let mut project_items: Vec<MenuItem> = self
+            .nav
+            .projects
+            .iter()
+            .map(|project| MenuItem::item(format!("p:{}", project.id), project.name.clone()))
+            .collect();
+        if !project_items.is_empty() {
+            project_items.push(MenuItem::separator("sep"));
+        }
+        project_items.push(MenuItem::item("other", OTHER_FOLDER));
+        let project = m3::chip(palette)
+            .automation_name(format!("Project: {project_label}"))
+            .content(m3::chip_label(m3::glyph::FOLDER, &project_label))
+            .menu(Menu::new(
+                project_items,
+                context.callback(|label: String| Message::Launch(LaunchMsg::ProjectMenu(label))),
             ));
-
-        let picker_profiles = self.picker_profiles();
-        let selected_summary = self
-            .launch
-            .profile_idx
-            .and_then(|index| picker_profiles.get(index).copied());
-        let field_width = 220.0;
-        let (inputs, note): (View, String) = if adhoc {
-            (
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::SM)
-                    .children((
-                        ComboBox::new()
-                            .items_source(ADHOC_HARNESSES.map(str::to_owned).to_vec())
-                            .selected_index(self.launch.adhoc_harness_idx)
-                            .automation_name("Ad-hoc harness")
-                            .on_selection_changed(context.callback(|value| {
-                                Message::Launch(LaunchMsg::AdhocHarnessSelected(value))
-                            })),
-                        m3::field(palette)
-                            .text(self.launch.adhoc_model.clone())
-                            .placeholder_text("Model (harness default)")
-                            .automation_name("Ad-hoc model")
-                            .width(field_width)
-                            .on_text_changed(context.callback(|value| {
-                                Message::Launch(LaunchMsg::AdhocModelChanged(value))
-                            })),
-                        m3::field(palette)
-                            .text(self.launch.adhoc_effort.clone())
-                            .placeholder_text("Effort (harness default)")
-                            .automation_name("Ad-hoc effort")
-                            .width(160.0)
-                            .on_text_changed(context.callback(|value| {
-                                Message::Launch(LaunchMsg::AdhocEffortChanged(value))
-                            })),
-                        m3::text_button(palette)
-                            .on_click(
-                                context.message(Message::Launch(LaunchMsg::HarnessModelsRequested)),
-                            )
-                            .content(TextBlock::new().text("Harness defaults")),
-                    )),
-                self.launch.harness_hint.clone(),
-            )
-        } else if !self.launch.profile_summaries.is_empty() {
-            (
-                ComboBox::new()
-                    .items_source(
-                        picker_profiles
-                            .iter()
-                            .map(|profile| profile.name.clone())
-                            .collect::<Vec<_>>(),
-                    )
-                    .selected_index(self.launch.profile_idx)
-                    .placeholder_text("Profile")
-                    .automation_name("Profile")
-                    .width(field_width)
-                    .on_selection_changed(
-                        context
-                            .callback(|value| Message::Launch(LaunchMsg::ProfileSelected(value))),
-                    )
-                    .into(),
-                selected_summary.map_or_else(
-                    || {
-                        "Pick a profile: its requested harness, model and route appear here."
-                            .to_owned()
-                    },
-                    config_view::summary_line,
-                ),
-            )
-        } else if self.launch.profiles.is_empty() {
-            (
-                m3::field(palette)
-                    .text(self.launch.profile_text.clone())
-                    .placeholder_text("Configured profile name")
-                    .automation_name("Profile")
-                    .width(field_width)
-                    .on_text_changed(
-                        context.callback(|value| {
-                            Message::Launch(LaunchMsg::ProfileTextChanged(value))
-                        }),
-                    )
-                    .into(),
-                String::new(),
-            )
+        let folder: View = if self.launch.custom_workspace || self.nav.projects.is_empty() {
+            m3::field()
+                .text(self.launch.workspace.clone())
+                .placeholder_text("Folder path")
+                .automation_name("Folder")
+                .width(280.0)
+                .vertical_alignment(VerticalAlignment::Center)
+                .on_text_changed(
+                    context.callback(|value| Message::Launch(LaunchMsg::WorkspaceChanged(value))),
+                )
+                .into()
         } else {
-            (
-                ComboBox::new()
-                    .items_source(self.launch.profiles.clone())
-                    .selected_index(self.launch.profile_idx)
-                    .placeholder_text("Profile")
-                    .automation_name("Profile")
-                    .width(field_width)
-                    .on_selection_changed(
-                        context
-                            .callback(|value| Message::Launch(LaunchMsg::ProfileSelected(value))),
-                    )
-                    .into(),
-                String::new(),
-            )
+            View::empty()
         };
-        let workspace = m3::field(palette)
-            .text(self.launch.workspace.clone())
-            .placeholder_text("Workspace path")
-            .automation_name("Workspace")
-            .on_text_changed(
-                context.callback(|value| Message::Launch(LaunchMsg::WorkspaceChanged(value))),
-            );
 
-        m3::card(palette).content(
-            StackPanel::new().spacing(theme::spacing::SM).children((
-                Grid::new()
-                    .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
-                    .column_spacing(theme::spacing::MD)
-                    .children((
-                        modes,
-                        Border::new().grid_column(1).content(inputs),
-                        workspace.grid_column(2),
-                    )),
-                m3::muted(note, theme::type_scale::BODY_SMALL).text_wrapping(TextWrapping::Wrap),
-            )),
-        )
+        let preview = self.launch.preview.as_ref();
+        let decision = preview.and_then(|preview| preview.as_ref().ok());
+        let profile_label = match &self.launch.choice {
+            Choice::Auto => match (preview, decision.and_then(|d| d.profile.as_deref())) {
+                (_, Some(profile)) => format!("Auto · {profile}"),
+                (Some(Ok(_)), None) => "Auto · no profile available".to_owned(),
+                _ => "Auto".to_owned(),
+            },
+            Choice::Profile(name) => name.clone(),
+            Choice::Harness(harness) => format!("{harness} harness"),
+        };
+        // Why Auto picks what it picks: read-only lines above the choices.
+        let why: Vec<String> = match preview {
+            Some(Ok(decision)) => {
+                let (headline, skipped) = crate::settings_model::decision_lines(decision);
+                std::iter::once(headline).chain(skipped).collect()
+            }
+            Some(Err(error)) => vec![format!("Routing preview unavailable: {error}")],
+            None => vec!["Reading what routing would pick…".to_owned()],
+        };
+        let mut profile_items: Vec<MenuItem> = why
+            .iter()
+            .enumerate()
+            .map(|(index, line)| MenuItem::disabled(format!("why:{index}"), line.clone()))
+            .collect();
+        profile_items.push(MenuItem::separator("sep-why"));
+        profile_items.push(MenuItem::item("auto", AUTO));
+        let allowed = self.launch.allowed();
+        if !allowed.is_empty() {
+            profile_items.push(MenuItem::separator("sep-profiles"));
+            profile_items.extend(allowed.iter().map(|profile| {
+                if profile.launchable {
+                    MenuItem::item(format!("p:{}", profile.name), profile.name.clone())
+                } else {
+                    MenuItem::disabled(format!("p:{}", profile.name), profile.name.clone())
+                }
+            }));
+        }
+        profile_items.push(MenuItem::separator("sep-harness"));
+        profile_items.push(MenuItem::submenu(
+            "harness",
+            "Harness",
+            ADHOC_HARNESSES.iter().map(|harness| {
+                MenuItem::item(format!("h:{harness}"), format!("{harness} harness"))
+            }),
+        ));
+        let profile = m3::chip(palette)
+            .automation_name(format!("Profile: {profile_label}. {}", why.join(". ")))
+            .content(m3::chip_label(m3::glyph::PROFILE, &profile_label))
+            .menu(Menu::new(
+                profile_items,
+                context.callback(|label: String| Message::Launch(LaunchMsg::ProfileMenu(label))),
+            ));
+        StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(theme::spacing::SM)
+            .children((project, folder, profile))
     }
+
+    /// The model-and-effort chip and the access chip of a new task: read
+    /// from the profile, or chosen from the ad-hoc harness's catalogue.
+    pub(super) fn launch_chips(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let profile = self.launch.profile();
+        let (model_chip, access): (View, String) = match (&self.launch.choice, profile) {
+            (Choice::Harness(harness), _) => {
+                let (models, efforts) = self.launch.adhoc_options();
+                let label = format!(
+                    "{} · {}",
+                    self.launch
+                        .adhoc_model
+                        .as_deref()
+                        .unwrap_or("Default model"),
+                    self.launch
+                        .adhoc_effort
+                        .as_deref()
+                        .unwrap_or("default effort")
+                );
+                let loading = !matches!(&self.launch.catalog, Some((read, _)) if read == harness);
+                let items = match &self.launch.catalog {
+                    Some((read, Err(error))) if read == harness => {
+                        vec![MenuItem::disabled(
+                            "error",
+                            format!("Catalogue unavailable: {error}"),
+                        )]
+                    }
+                    _ if loading => vec![MenuItem::disabled("loading", "Reading the catalogue…")],
+                    _ => configure::menu_items(&models, &efforts, true, None, None),
+                };
+                (
+                    m3::chip(palette)
+                        .automation_name(format!("Model and effort: {label}"))
+                        .content(m3::chip_label(m3::glyph::MODEL, &label))
+                        .menu(Menu::new(
+                            items,
+                            context.callback(|label: String| {
+                                Message::Launch(LaunchMsg::ModelMenu(label))
+                            }),
+                        )),
+                    access_label(None),
+                )
+            }
+            (_, Some(profile)) => (
+                m3::chip_static(
+                    palette,
+                    m3::glyph::MODEL,
+                    &format!(
+                        "{} · {}",
+                        profile.model.as_deref().unwrap_or("default model"),
+                        profile.effort.as_deref().unwrap_or("default effort")
+                    ),
+                ),
+                access_label(profile.permissions.as_deref()),
+            ),
+            (_, None) => (
+                m3::chip_static(palette, m3::glyph::MODEL, "No profile"),
+                access_label(None),
+            ),
+        };
+        StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(theme::spacing::SM)
+            .children((
+                model_chip,
+                m3::chip_static(palette, m3::glyph::SHIELD, &access),
+            ))
+    }
+}
+
+/// The access chip's words for a profile's permissions.
+pub(super) fn access_label(permissions: Option<&str>) -> String {
+    match permissions {
+        None => "Default access".to_owned(),
+        Some("danger-full-access") => "Full access".to_owned(),
+        Some("read-only") => "Read only".to_owned(),
+        Some("workspace-write") => "Workspace write".to_owned(),
+        Some(other) => other.replace(['-', '_'], " "),
+    }
+}
+
+/// Now in ms since the epoch, for a just-launched row's Recents order.
+fn handoff_now_ms() -> i64 {
+    crate::handoff::now_ms()
 }

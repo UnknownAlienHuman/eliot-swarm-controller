@@ -538,21 +538,23 @@ impl Monitor {
     }
 
     /// Fleet counter line: exact totals per state; "?" when a read failed.
+    /// The fleet by state, attention first, naming only states that have
+    /// Agents (and those whose count was not read): "30 busy (20 shown) ·
+    /// 3 idle".
     pub fn counter_line(&self) -> String {
         let mut counts = self.counts.clone();
         counts.sort_by_key(|count| attention_rank(count.state));
         counts
             .iter()
-            .map(|count| match count.total {
-                Some(total) if count.shown < total && count.shown > 0 => {
-                    format!(
-                        "{} {total} ({} shown)",
-                        state_name(count.state),
-                        count.shown
-                    )
-                }
-                Some(total) => format!("{} {total}", state_name(count.state)),
-                None => format!("{} ?", state_name(count.state)),
+            .filter_map(|count| match count.total {
+                Some(0) => None,
+                Some(total) if count.shown < total && count.shown > 0 => Some(format!(
+                    "{total} {} ({} shown)",
+                    state_name(count.state),
+                    count.shown
+                )),
+                Some(total) => Some(format!("{total} {}", state_name(count.state))),
+                None => Some(format!("{} not counted", state_name(count.state))),
             })
             .collect::<Vec<_>>()
             .join(" · ")
@@ -951,6 +953,25 @@ mod tests {
             ],
             ..Monitor::default()
         };
-        assert_eq!(monitor.counter_line(), "busy 30 (20 shown) · idle ?");
+        assert_eq!(
+            monitor.counter_line(),
+            "30 busy (20 shown) · idle not counted"
+        );
+        let quiet = Monitor {
+            counts: vec![
+                StateCount {
+                    state: AgentState::Waiting,
+                    total: Some(0),
+                    shown: 0,
+                },
+                StateCount {
+                    state: AgentState::Idle,
+                    total: Some(3),
+                    shown: 3,
+                },
+            ],
+            ..Monitor::default()
+        };
+        assert_eq!(quiet.counter_line(), "3 idle");
     }
 }

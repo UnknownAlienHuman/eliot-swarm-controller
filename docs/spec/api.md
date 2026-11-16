@@ -431,6 +431,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `config.profiles.read/save` | owner-only read and validated, revision-guarded replacement of the `[profiles.*]` sections of `config.toml` |
 | `settings.read/save` | owner-only unified section read/save, revision CAS, dry run, restart indication and bounded author history; see configuration |
 | `project.discover` | owner-only opened Git checkout registration through the settings writer; non-Git paths return no project |
+| `routing.preview` | owner-only advisory `RoutingDecision` for a role, computed like admission without admitting, freezing or reserving; see configuration |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
 | `goal.set/get/pause/clear/resume/round` | owner-only Eliot-mode Goal with explicit and automatic idle rounds plus explicit cadence slot rounds; automatic driving needs `max_turns` or `max_rounds`, native mode and cost limits are `unsupported` |
 | `provider.holds/clear_hold` | owner-only provider hold readback and constrained correction |

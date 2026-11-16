@@ -3,6 +3,36 @@ use super::*;
 use eliot_core::{RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision};
 
 impl Router {
+    /// `routing.preview`: run the admission selection for `role` without a
+    /// command. Nothing is admitted, frozen or reserved; the next launch
+    /// evaluates the candidates again and may decide differently.
+    pub(super) async fn routing_preview(
+        &self,
+        params: &Value,
+        principal: &Principal,
+    ) -> Result<Value> {
+        require_owner(principal)?;
+        let request: eliot_core::api::RoutingPreviewRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let mut probe = SubmitCommand::new(String::new(), "launch");
+        if let Some(role) = &request.role {
+            probe.args = json!({ "role": role });
+        }
+        let decision = match self.route_launch_profile(principal, &mut probe).await {
+            Ok(_) => serde_json::from_value(probe.args["profile_choice"].take())
+                .map_err(|_| Error::new("internal", "routing preview decision is malformed"))?,
+            Err(error) if error.code == "routing_unavailable" => *error
+                .routing
+                .ok_or_else(|| Error::new("internal", "routing refusal lost its decision"))?,
+            Err(error) => return Err(error),
+        };
+        let reply = eliot_core::api::RoutingPreviewResponse { decision };
+        request.validate_response(&reply)?;
+        serde_json::to_value(reply)
+            .map_err(|_| Error::new("internal", "routing preview could not be encoded"))
+    }
+
     pub(super) async fn route_launch_profile(
         &self,
         principal: &Principal,
@@ -318,6 +348,44 @@ mod tests {
             .unwrap();
         assert_eq!(agent.profile_choice.unwrap().role, "worker");
         drop(store);
+        drop(router);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn preview_reports_the_choice_and_misses_without_admitting() {
+        let root = std::env::temp_dir().join(format!("eliot-routing-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let cmd = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        std::fs::write(root.join("config.toml"), format!(
+            "[routing]\nworker=['full','free']\naudit=['full']\n[profiles.full]\nharness='claude'\ncmd='{cmd}'\nmax_live=0\n[profiles.free]\nharness='claude'\ncmd='{cmd}'\n"
+        )).unwrap();
+        let router = super::super::tests::router_with_data_root(root.clone());
+        let chosen = router
+            .routing_preview(&json!({"role":"worker"}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(chosen["decision"]["profile"], "free");
+        assert_eq!(chosen["decision"]["skipped"][0]["reason"], "capacity_full");
+        let missed = router
+            .routing_preview(&json!({"role":"audit"}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert!(missed["decision"]["profile"].is_null());
+        assert_eq!(missed["decision"]["skipped"][0]["profile"], "full");
+        assert!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .list_agents(None, 10)
+                .unwrap()
+                .is_empty()
+        );
         drop(router);
         std::fs::remove_dir_all(root).unwrap();
     }

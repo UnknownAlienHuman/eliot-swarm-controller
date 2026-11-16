@@ -772,8 +772,11 @@ resolved-configuration distinction.
 daemon (including limits and retention), automation, mail, cloud_mcp, desktop,
 accounts and proxies.
 Rules/scripts remain files owned by their existing APIs; settings references and
-automation policy do not create a second executor. Desktop theme/window preferences
-use `[desktop]`. If that table is absent, the desktop imports the legacy per-user
+automation policy do not create a second executor. Desktop preferences use
+`[desktop]`: `theme` (`system`, `light`, `dark`), `window` (`width`/`height`, at least
+640 by 480) and `startup` (`new_task`, or `last_conversation` to reopen the most
+recently active Agent's conversation). The desktop keeps no other preference store.
+If that table is absent, the desktop imports the legacy per-user
 `swarm-desktop.json` preferences through the revision-guarded settings writer once.
 It retires the legacy file only after successful publication; an existing `[desktop]`
 table takes precedence.
@@ -843,7 +846,10 @@ Child selection is intersected with the parent's frozen authorized child profile
 (#398), including the inherited profile where authorized. No candidate means a typed
 `routing_unavailable` refusal with an `Error.routing` decision. The choice is retained
 on the Agent as `profile_choice` for `show`, `result` and desktop API consumers even
-after launch command history expires. Same-ID replay returns the frozen choice;
+after launch command history expires. `routing.preview` (Owner) runs the same
+selection for a role without a command and returns its `RoutingDecision`; it admits,
+freezes and reserves nothing, so the next launch evaluates again and may differ. The
+desktop shows it on the composer's Auto chip. Same-ID replay returns the frozen choice;
 failure, hold or unknown delivery never causes another candidate to run. A held
 candidate never selects a different account or captured credential selector of the
 same harness. Provider holds and capacity are rechecked transactionally at admission;

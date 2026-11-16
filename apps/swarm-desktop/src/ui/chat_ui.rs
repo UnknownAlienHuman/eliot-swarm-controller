@@ -1,6 +1,10 @@
-//! The conversation: retained history and live delivery, the composer, Send/Interrupt and pending requests.
+//! The conversation: a one-line Agent header with its "…" menu, the
+//! retained history and live delivery, pending requests, and the one
+//! composer (context chips, the field, model/access chips and Send, with
+//! Interrupt and Steer while a turn runs).
 
 use super::*;
+use crate::configure::Pick;
 use crate::theme::StatusTone;
 use crate::theme::winui::Palette;
 
@@ -15,6 +19,8 @@ pub(super) enum ChatMsg {
     RereadRetry(u64),
     LoadOlderRequested,
     JumpToLatest,
+    /// Bring the latest turn into view once it is realized (epoch, tries).
+    FollowLatest(u64, u32),
     ToolsToggled(String, bool),
     CopyPart(String),
     CopyCode(String, usize),
@@ -26,7 +32,32 @@ pub(super) enum ChatMsg {
     ApprovalRequested(UiPending, bool),
     AnswerRequested(UiPending),
     ControlSubmitted(String, Fallible<String>),
+    /// A "…" menu entry (its label).
+    AgentMenu(String),
+    /// The Force stop banner's answer: true confirms the bound action.
+    ForceStopAnswered(bool),
 }
+
+/// The Agent and generation a "…" entry acts on: the header shown when the
+/// click is handled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MenuBinding {
+    agent: String,
+    generation: i64,
+}
+
+/// "…" menu entries.
+const MENU_DETAILS: &str = "Agent details";
+const MENU_HANDOFF: &str = "Hand off or switch…";
+const MENU_MANAGER: &str = "Change manager…";
+const MENU_RESUME: &str = "Resume";
+const MENU_DETACH: &str = "Detach";
+const MENU_STOP: &str = "Stop";
+const MENU_FORCE: &str = "Force stop…";
+
+/// Follow-latest retries while the newest turn is not realized yet.
+const FOLLOW_TRIES: u32 = 20;
+const FOLLOW_DELAY_MS: u64 = 50;
 
 /// What the composer's draft is submitted as, with the binding captured at
 /// click time: the Agent, and for Steer its generation and active turn, for
@@ -100,6 +131,9 @@ pub(super) struct ChatState {
     // Mutations.
     pub(super) drafts: DraftStore,
     pub(super) answers: HashMap<String, String>,
+    /// The Force stop awaiting confirmation, bound at its menu click, with
+    /// the title shown in the question.
+    pub(super) confirm_force: Option<(BoundAction, String)>,
 }
 
 impl DesktopApp {
@@ -126,9 +160,11 @@ impl DesktopApp {
                 match result {
                     Ok(snapshot) => {
                         let snapshot = *snapshot;
+                        let first_load = self.chat.items.is_empty();
                         self.chat.failures = 0;
                         self.chat.docs.extend(snapshot.docs);
                         self.chat.detail = Some(detail_from(&snapshot.detail));
+                        self.sync_open_agent();
                         self.ensure_catalog(context);
                         let cursor = snapshot.coverage.cursor;
                         if let Some(convo) = self.chat.convo.as_mut() {
@@ -146,6 +182,11 @@ impl DesktopApp {
                             });
                         }
                         self.rebuild_items();
+                        if first_load {
+                            // Opened at the newest turn, like a chat.
+                            self.chat.unseen = 0;
+                            self.follow_latest(0, context);
+                        }
                         self.set_status("Retained history loaded; following live events.");
                         self.follow_next(Next::Wake { after: cursor }, context);
                         self.queue_reread(Invalidation::default(), context);
@@ -227,6 +268,7 @@ impl DesktopApp {
                         self.chat.docs.extend(reread.docs);
                         if let Some(detail) = reread.detail.as_ref() {
                             self.chat.detail = Some(detail_from(detail));
+                            self.sync_open_agent();
                             self.ensure_catalog(context);
                         }
                         if let Some(convo) = self.chat.convo.as_mut() {
@@ -268,6 +310,17 @@ impl DesktopApp {
                     );
                 }
             }
+            ChatMsg::FollowLatest(epoch, tries) => {
+                if epoch != self.chat.epoch {
+                    return;
+                }
+                if self.chat.end_anchor.request_focus() {
+                    // The latest turn is in view; typing goes on in the composer.
+                    let _ = self.chat.composer_ref.request_focus();
+                } else if tries < FOLLOW_TRIES && !self.chat.items.is_empty() {
+                    self.follow_latest(tries + 1, context);
+                }
+            }
             ChatMsg::ToolsToggled(key, expanded) => {
                 if expanded {
                     self.chat.expanded.insert(key);
@@ -283,8 +336,8 @@ impl DesktopApp {
                     .and_then(|convo| convo.part_text(&key));
                 match text.map(|text| (text.chars().count(), crate::clipboard::set_text(&text))) {
                     Some((count, Ok(()))) => self.set_status(format!("Copied {count} characters.")),
-                    Some((_, Err(error))) => self.set_status(format!("Copy failed: {error}")),
-                    None => self.set_status("That message is no longer resident."),
+                    Some((_, Err(error))) => self.alert(format!("Copy failed: {error}")),
+                    None => self.alert("That message is no longer loaded."),
                 }
             }
             ChatMsg::CopyCode(key, index) => {
@@ -297,8 +350,8 @@ impl DesktopApp {
                     .and_then(|doc| doc.code_blocks().get(index).map(|code| (*code).to_owned()));
                 match code.map(|code| crate::clipboard::set_text(&code)) {
                     Some(Ok(())) => self.set_status("Copied code block."),
-                    Some(Err(error)) => self.set_status(format!("Copy failed: {error}")),
-                    None => self.set_status("That code block is no longer resident."),
+                    Some(Err(error)) => self.alert(format!("Copy failed: {error}")),
+                    None => self.alert("That code block is no longer loaded."),
                 }
             }
             ChatMsg::DraftRequested(action) => {
@@ -313,7 +366,7 @@ impl DesktopApp {
                 // A plain Resume needs no text; Send and Steer do.
                 let blank = text.trim().is_empty();
                 if blank && !matches!(action, DraftAction::Resume { .. }) {
-                    self.set_status(format!(
+                    self.alert(format!(
                         "Type a message before {}.",
                         if matches!(action, DraftAction::Steer(_)) {
                             "steering"
@@ -328,6 +381,7 @@ impl DesktopApp {
                 let mutation_id = self.ledger.id_for(&key);
                 self.in_flight_key = Some(key);
                 let what = action.label();
+                self.alert = None;
                 self.set_status(format!("{what} ({mutation_id})…"));
                 let _task = context.spawn_background(move |_| {
                     Message::Chat(ChatMsg::SendSubmitted(client::block_on(async {
@@ -436,85 +490,53 @@ impl DesktopApp {
                         ));
                     }
                     Err(error) if crate::state::uncertain(&error) => {
-                        self.set_status(format!(
-                            "Outcome uncertain (the same button reuses its id): {error}"
+                        self.alert(format!(
+                            "Not confirmed (sending again reuses the same id): {error}"
                         ));
                     }
-                    Err(error) => self.set_status(format!("Not admitted: {error}")),
+                    Err(error) => self.alert(format!("Not sent: {error}")),
                 }
             }
             ChatMsg::InterruptRequested(bound) => {
-                if self.submitting() {
-                    return;
-                }
-                let Ok(data_dir) = self.data_dir.clone() else {
-                    return;
-                };
                 let turn = bound.turn.clone().unwrap_or_default();
                 let key = format!("interrupt:{}:{}:{turn}", bound.agent, bound.generation);
-                let mutation_id = self.ledger.id_for(&key);
-                self.in_flight_key = Some(key);
-                self.set_status(format!("Interrupting turn {turn} ({mutation_id})…"));
-                let _task = context.spawn_background(move |_| {
-                    let result = client::block_on(async {
-                        client::submit_interrupt(
-                            &data_dir,
-                            mutation_id,
-                            &bound.agent,
-                            bound.generation,
-                            bound.turn.clone().unwrap_or_default(),
-                        )
-                        .await
-                        .map(|reply| submit_note(&reply))
-                        .map_err(|error| error.to_string())
-                    });
-                    Message::Chat(ChatMsg::ControlSubmitted("Interrupt".to_owned(), result))
+                self.submit_control(context, "Interrupt", key, move |data_dir, mutation_id| {
+                    client::block_on(client::submit_interrupt(
+                        data_dir,
+                        mutation_id,
+                        &bound.agent,
+                        bound.generation,
+                        turn,
+                    ))
+                    .map(|reply| submit_note(&reply))
+                    .map_err(|error| error.to_string())
                 });
             }
             ChatMsg::ApprovalRequested(request, approve) => {
-                if self.submitting() {
-                    return;
-                }
-                let Ok(data_dir) = self.data_dir.clone() else {
-                    return;
-                };
-                let verb = if approve { "approve" } else { "deny" };
+                let verb = if approve { "Approve" } else { "Deny" };
                 let key = format!(
                     "{verb}:{}:{}",
                     request.binding.agent,
                     request.binding.request.clone().unwrap_or_default()
                 );
-                let mutation_id = self.ledger.id_for(&key);
-                self.in_flight_key = Some(key);
-                self.set_status("Answering that exact request…");
-                let _task = context.spawn_background(move |_| {
-                    let result = client::block_on(async {
-                        client::submit_approval(
-                            &data_dir,
-                            mutation_id,
-                            client::ApprovalInput {
-                                agent: request.binding.agent.clone(),
-                                generation: request.binding.generation,
-                                request: request.binding.request.clone().unwrap_or_default(),
-                                approve,
-                                choice: None,
-                                feedback: None,
-                            },
-                        )
-                        .await
-                        .map(|reply| submit_note(&reply))
-                        .map_err(|error| error.to_string())
-                    });
-                    Message::Chat(ChatMsg::ControlSubmitted(verb.to_owned(), result))
+                self.submit_control(context, verb, key, move |data_dir, mutation_id| {
+                    client::block_on(client::submit_approval(
+                        data_dir,
+                        mutation_id,
+                        client::ApprovalInput {
+                            agent: request.binding.agent.clone(),
+                            generation: request.binding.generation,
+                            request: request.binding.request.clone().unwrap_or_default(),
+                            approve,
+                            choice: None,
+                            feedback: None,
+                        },
+                    ))
+                    .map(|reply| submit_note(&reply))
+                    .map_err(|error| error.to_string())
                 });
             }
             ChatMsg::AnswerRequested(request) => {
-                if self.submitting() {
-                    return;
-                }
-                let Ok(data_dir) = self.data_dir.clone() else {
-                    return;
-                };
                 let answer = self
                     .chat
                     .answers
@@ -524,7 +546,7 @@ impl DesktopApp {
                 let answers = match serde_json::from_str::<serde_json::Value>(&answer) {
                     Ok(answers) if answers.is_object() => answers,
                     _ => {
-                        self.set_status("Answers must be a JSON object keyed by question id.");
+                        self.alert("Answers must be a JSON object keyed by question id.");
                         return;
                     }
                 };
@@ -536,24 +558,17 @@ impl DesktopApp {
                     request.binding.request.clone().unwrap_or_default(),
                     crate::chat::text_hash(&answer)
                 );
-                let mutation_id = self.ledger.id_for(&key);
-                self.in_flight_key = Some(key);
-                self.set_status("Answering that exact request…");
-                let _task = context.spawn_background(move |_| {
-                    let result = client::block_on(async {
-                        client::submit_answer(
-                            &data_dir,
-                            mutation_id,
-                            &request.binding.agent,
-                            request.binding.generation,
-                            request.binding.request.as_deref().unwrap_or_default(),
-                            answers,
-                        )
-                        .await
-                        .map(|reply| submit_note(&reply))
-                        .map_err(|error| error.to_string())
-                    });
-                    Message::Chat(ChatMsg::ControlSubmitted("Answer".to_owned(), result))
+                self.submit_control(context, "Answer", key, move |data_dir, mutation_id| {
+                    client::block_on(client::submit_answer(
+                        data_dir,
+                        mutation_id,
+                        &request.binding.agent,
+                        request.binding.generation,
+                        request.binding.request.as_deref().unwrap_or_default(),
+                        answers,
+                    ))
+                    .map(|reply| submit_note(&reply))
+                    .map_err(|error| error.to_string())
                 });
             }
             ChatMsg::ControlSubmitted(what, outcome) => {
@@ -565,13 +580,125 @@ impl DesktopApp {
                 );
                 match outcome {
                     Ok(state) => self.set_status(format!("{what} admitted: {state}.")),
-                    Err(error) if crate::state::uncertain(&error) => self.set_status(format!(
-                        "{what}: outcome uncertain (retry reuses its id): {error}"
+                    Err(error) if crate::state::uncertain(&error) => self.alert(format!(
+                        "{what}: not confirmed (trying again reuses its id): {error}"
                     )),
-                    Err(error) => self.set_status(format!("{what} not admitted: {error}")),
+                    Err(error) => self.alert(format!("{what} refused: {error}")),
+                }
+                if self.chat.convo.is_some() {
+                    self.queue_reread(
+                        Invalidation {
+                            detail: true,
+                            ..Invalidation::default()
+                        },
+                        context,
+                    );
                 }
             }
+            ChatMsg::AgentMenu(label) => {
+                // Bound now, to the Agent and generation the header shows.
+                let binding = self.selected_agent_id().zip(self.chat.detail.as_ref()).map(
+                    |(agent, detail)| MenuBinding {
+                        agent,
+                        generation: detail.generation,
+                    },
+                );
+                if let Some(binding) = binding {
+                    self.agent_menu(&label, binding, context);
+                }
+            }
+            ChatMsg::ForceStopAnswered(confirmed) => {
+                let Some((bound, _)) = self.chat.confirm_force.take() else {
+                    return;
+                };
+                if !confirmed {
+                    return;
+                }
+                let key = format!("stop:{}:{}:true", bound.agent, bound.generation);
+                self.submit_control(context, "Force stop", key, move |data_dir, mutation_id| {
+                    client::block_on(client::submit_stop(
+                        data_dir,
+                        mutation_id,
+                        &bound.agent,
+                        bound.generation,
+                        true,
+                    ))
+                    .map(|reply| submit_note(&reply))
+                    .map_err(|error| error.to_string())
+                });
+            }
         }
+    }
+
+    /// One "…" menu entry, bound to the Agent and generation it was built for.
+    fn agent_menu(&mut self, label: &str, binding: MenuBinding, context: &ComponentContext<Self>) {
+        let bound = BoundAction::agent_control(&binding.agent, binding.generation);
+        match label {
+            MENU_DETAILS | MENU_MANAGER => self.show_details(&binding.agent, context),
+            MENU_HANDOFF => self.handoff_update(
+                handoff_ui::HandoffMsg::Open {
+                    agent: binding.agent,
+                    generation: binding.generation,
+                },
+                context,
+            ),
+            MENU_RESUME => {
+                let key = format!("resume:{}:{}", bound.agent, bound.generation);
+                self.submit_control(context, "Resume", key, move |data_dir, mutation_id| {
+                    client::block_on(client::submit_resume(
+                        data_dir,
+                        mutation_id,
+                        &bound.agent,
+                        bound.generation,
+                        None,
+                    ))
+                    .map(|reply| submit_note(&reply))
+                    .map_err(|error| error.to_string())
+                });
+            }
+            MENU_DETACH => {
+                let key = format!("detach:{}:{}", bound.agent, bound.generation);
+                self.submit_control(context, "Detach", key, move |data_dir, mutation_id| {
+                    client::block_on(client::submit_detach(
+                        data_dir,
+                        mutation_id,
+                        &bound.agent,
+                        bound.generation,
+                    ))
+                    .map(|reply| submit_note(&reply))
+                    .map_err(|error| error.to_string())
+                });
+            }
+            MENU_STOP => {
+                let key = format!("stop:{}:{}:false", bound.agent, bound.generation);
+                self.submit_control(context, "Stop", key, move |data_dir, mutation_id| {
+                    client::block_on(client::submit_stop(
+                        data_dir,
+                        mutation_id,
+                        &bound.agent,
+                        bound.generation,
+                        false,
+                    ))
+                    .map(|reply| submit_note(&reply))
+                    .map_err(|error| error.to_string())
+                });
+            }
+            MENU_FORCE => {
+                let title = self.agent_title(&binding.agent);
+                self.chat.confirm_force = Some((bound, title));
+            }
+            _ => {}
+        }
+    }
+
+    /// Bring the newest turn into view after the next render.
+    fn follow_latest(&self, tries: u32, context: &ComponentContext<Self>) {
+        let epoch = self.chat.epoch;
+        let _task = context.spawn_background(move |cancel| {
+            let cancelled = || cancel.is_cancelled();
+            let _ = feed::backoff(FOLLOW_DELAY_MS, &cancelled);
+            Message::Chat(ChatMsg::FollowLatest(epoch, tries))
+        });
     }
 
     pub(super) fn composer_text(&self) -> String {
@@ -757,11 +884,8 @@ impl DesktopApp {
 
     pub(super) fn open_conversation(&mut self, agent: &UiAgent, context: &ComponentContext<Self>) {
         self.nav.selection.select_agent(Some(agent.id.clone()));
-        // Configure picks and catalogue for one Agent never carry over.
-        self.configure = configure_ui::ConfigureState {
-            expanded: self.configure.expanded,
-            ..configure_ui::ConfigureState::default()
-        };
+        // Configure catalogue and picks for one Agent never carry over.
+        self.configure = configure_ui::ConfigureState::default();
         self.chat.convo = Some(Conversation::new(&agent.id));
         self.chat.detail = None;
         self.chat.depth = Depth::default();
@@ -769,6 +893,8 @@ impl DesktopApp {
         self.chat.unseen = 0;
         self.chat.items = Rc::new(Vec::new());
         self.chat.live = LiveStatus::Loading;
+        self.chat.confirm_force = None;
+        self.alert = None;
         if let Some((target, command, text)) = self.chat.pending_local.take() {
             if target == agent.id
                 && let Some(convo) = self.chat.convo.as_mut()
@@ -798,6 +924,7 @@ impl DesktopApp {
         };
         let mutation_id = self.ledger.id_for(&key);
         self.in_flight_key = Some(key);
+        self.alert = None;
         self.set_status(format!("{what} ({mutation_id})…"));
         let what = what.to_owned();
         let _task = context.spawn_background(move |_| {
@@ -808,129 +935,251 @@ impl DesktopApp {
         });
     }
 
-    /// The conversation pane: Agent header, transcript in a bounded reading
-    /// column, pending requests, the launch picker for a new conversation
-    /// and the composer with its primary action.
+    /// The main area for a conversation: the header, the transcript (or the
+    /// empty state of a new task), pending requests and the composer.
     pub(super) fn chat_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let gutter = theme::spacing::XL;
         let agent = self.selected_agent_id();
-        // State, harness and model as chips; generation, profile, turn and
-        // configuration details live in the monitor and the configure panel.
-        let header: View = match (&self.chat.detail, agent.as_deref()) {
-            (Some(detail), Some(agent)) => {
-                let model = detail
-                    .settings
-                    .effective_model
-                    .as_deref()
-                    .or(detail.settings.profile_model.as_deref())
-                    .unwrap_or("default model")
-                    .to_owned();
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::SM)
-                    .children((
-                        m3::title(agent.to_owned(), theme::type_scale::TITLE_LARGE)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .margin(Thickness::new(0.0, 0.0, theme::spacing::XS, 0.0))
-                            .is_text_selection_enabled(true),
-                        m3::status_chip(palette, &detail.state),
-                        m3::chip(palette, StatusTone::Neutral, &detail.harness),
-                        m3::chip(palette, StatusTone::Neutral, &model),
+        let header: View = match agent.as_deref() {
+            Some(agent) => self.header_view(agent, context, palette),
+            None => View::empty(),
+        };
+        let column = self.reading_width();
+        let body: View = match agent {
+            Some(_) => self.transcript_view(column, context, palette),
+            None => {
+                let project = self
+                    .selected_project()
+                    .map(|project| project.name.clone())
+                    .or_else(|| {
+                        (!self.launch.workspace.is_empty())
+                            .then(|| nav::project_name(&self.launch.workspace, &[]))
+                    });
+                let line = match project {
+                    Some(project) => format!("What should we build in {project}?"),
+                    None => "What should we build?".to_owned(),
+                };
+                m3::title(line, theme::type_scale::HEADLINE_SMALL)
+                    .grid_row(1)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .into()
+            }
+        };
+        let jump: View = if self.chat.unseen > 0 && !self.chat.items.is_empty() {
+            let label = format!("{} new", self.chat.unseen);
+            m3::tonal(palette)
+                .grid_row(2)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .margin(Thickness::new(0.0, theme::spacing::SM, 0.0, 0.0))
+                .automation_name(format!("Jump to latest, {label}"))
+                .on_click(context.message(Message::Chat(ChatMsg::JumpToLatest)))
+                .content(m3::icon_label(m3::glyph::ARROW_DOWN, &label))
+        } else {
+            View::empty()
+        };
+        let pending = self.pending_view(column, context, palette);
+        let alert: View = match (&self.chat.confirm_force, &self.alert) {
+            (Some((bound, title)), _) => {
+                self.force_stop_banner(bound, title, column, context, palette)
+            }
+            (None, Some(text)) => Border::new()
+                .grid_row(4)
+                .width(column)
+                .max_width(theme::layout::READING_WIDTH)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .margin(Thickness::new(0.0, theme::spacing::SM, 0.0, 0.0))
+                .background(palette.card())
+                .corner_radius(theme::shape::MD)
+                .padding(Thickness::new(
+                    theme::spacing::MD,
+                    theme::spacing::XS,
+                    theme::spacing::XS,
+                    theme::spacing::XS,
+                ))
+                .content(
+                    Grid::new()
+                        .columns([GridLength::STAR, GridLength::Auto])
+                        .column_spacing(theme::spacing::SM)
+                        .children((
+                            m3::text(text.clone(), theme::type_scale::BODY_MEDIUM)
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .text_wrapping(TextWrapping::Wrap)
+                                .is_text_selection_enabled(true),
+                            m3::icon_button(palette)
+                                .grid_column(1)
+                                .automation_name("Dismiss")
+                                .on_click(context.message(Message::Shell(ShellMsg::AlertDismissed)))
+                                .content(m3::icon(m3::glyph::CLOSE)),
+                        )),
+                ),
+            (None, None) => View::empty(),
+        };
+        let composer = self.composer_view(column, context, palette);
+
+        Grid::new()
+            .rows([
+                GridLength::Auto,
+                GridLength::STAR,
+                GridLength::Auto,
+                GridLength::Auto,
+                GridLength::Auto,
+                GridLength::Auto,
+            ])
+            .children((
+                header,
+                body,
+                jump,
+                pending,
+                alert,
+                composer,
+                self.handoff_dialog(context),
+            ))
+    }
+
+    /// The reading column's width: the reading width, or the main area less
+    /// its gutters when narrower; content-sized until the window size is
+    /// observed. Inside the ScrollViewer a stretched MaxWidth column was
+    /// arranged in a slot wider than the viewport (off center), so the
+    /// column gets an explicit width.
+    fn reading_width(&self) -> Option<f64> {
+        self.main_width().map(|width| {
+            (width - 2.0 * theme::spacing::LG - theme::spacing::MD)
+                .clamp(240.0, theme::layout::READING_WIDTH)
+        })
+    }
+
+    /// One line: the title, the status dot, a connection note when not live,
+    /// then the details toggle and the "…" menu.
+    fn header_view(&self, agent: &str, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let title = self.agent_title(agent);
+        let detail = self.chat.detail.as_ref();
+        let state = detail.map_or("reading", |detail| detail.state.as_str());
+        let tone = StatusTone::of_state(state);
+        let note = match &self.chat.live {
+            LiveStatus::Stale(_) => "Catching up…",
+            LiveStatus::Reconnecting { .. } => "Reconnecting…",
+            LiveStatus::Stopped(_) => "Live updates stopped",
+            _ => "",
+        };
+        let menu: View = match detail {
+            Some(detail) => {
+                let ended = matches!(detail.state.as_str(), "stopped" | "failed" | "lost");
+                let controllable = !detail.observe_only;
+                let mut items = vec![
+                    MenuItem::item("details", MENU_DETAILS),
+                    MenuItem::separator("s1"),
+                ];
+                if !self.submitting() {
+                    items.push(MenuItem::item("handoff", MENU_HANDOFF));
+                    items.push(MenuItem::item("manager", MENU_MANAGER));
+                    if controllable && ended && detail.active_turn.is_none() {
+                        items.push(MenuItem::item("resume", MENU_RESUME));
+                    }
+                    if detail.observe_only {
+                        items.push(MenuItem::item("detach", MENU_DETACH));
+                    }
+                    if controllable && !ended {
+                        items.push(MenuItem::separator("s2"));
+                        items.push(MenuItem::item("stop", MENU_STOP));
+                        items.push(MenuItem::item("force", MENU_FORCE));
+                    }
+                } else {
+                    items.push(MenuItem::disabled("busy", "Waiting for the last action…"));
+                }
+                m3::icon_button(palette)
+                    .automation_name("More actions")
+                    .content(m3::icon(m3::glyph::MORE))
+                    .menu(Menu::new(
+                        items,
+                        // Capture-free, so the callback keeps one identity
+                        // across renders: Reactor 0.100.0 re-sends a menu
+                        // whose callback changed, replacing the native
+                        // MenuFlyout and dropping a click on the open one.
+                        context.callback(|label: String| Message::Chat(ChatMsg::AgentMenu(label))),
                     ))
             }
-            (None, Some(agent)) => StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(theme::spacing::MD)
-                .children((
-                    m3::title(agent.to_owned(), theme::type_scale::TITLE_LARGE),
-                    m3::muted("reading…", theme::type_scale::BODY_MEDIUM)
-                        .vertical_alignment(VerticalAlignment::Center),
-                )),
-            _ => StackPanel::new().spacing(2.0).children((
-                m3::title("New conversation", theme::type_scale::TITLE_LARGE),
-                m3::muted(
-                    "Pick a profile and a workspace, then write the first message.",
-                    theme::type_scale::BODY_MEDIUM,
-                ),
-            )),
+            None => m3::icon_button(palette)
+                .is_enabled(false)
+                .automation_name("More actions")
+                .content(m3::icon(m3::glyph::MORE)),
         };
-        // A is bound when the dialog opens: the generation shown now.
-        let open_handoff = agent
-            .clone()
-            .zip(self.chat.detail.as_ref())
-            .map(|(agent, detail)| {
-                context.message(Message::Handoff(handoff_ui::HandoffMsg::Open {
-                    agent,
-                    generation: detail.generation,
-                }))
-            });
-        let hand_off = match open_handoff {
-            Some(open) => m3::tonal(palette)
-                .is_enabled(!self.submitting())
-                .on_click(open),
-            None => m3::tonal(palette).is_enabled(false),
-        }
-        .grid_column(1)
-        .automation_name("Hand off or switch")
-        .content(m3::icon_label(m3::glyph::HAND_OFF, "Hand off or switch…"));
-
-        let top = StackPanel::new()
+        let details_open = self.panel == Panel::Details;
+        Grid::new()
             .grid_row(0)
-            .spacing(theme::spacing::SM)
+            .columns([
+                GridLength::Auto,
+                GridLength::Auto,
+                GridLength::Auto,
+                GridLength::STAR,
+                GridLength::Auto,
+                GridLength::Auto,
+            ])
+            .column_spacing(theme::spacing::SM)
             .margin(Thickness::new(
-                gutter,
                 theme::spacing::LG,
-                gutter,
+                theme::spacing::SM,
+                theme::spacing::SM,
                 theme::spacing::SM,
             ))
             .children((
-                Grid::new()
-                    .columns([GridLength::STAR, GridLength::Auto])
-                    .column_spacing(theme::spacing::MD)
-                    .children((header, hand_off)),
-                self.configure_view(context, palette),
-            ));
-
-        // The start of the shown history: "Load older" centered above the
-        // first message, with the coverage it extends.
-        let history_start: View = match self.chat.convo.as_ref() {
-            Some(convo) => {
-                let coverage = convo.coverage();
-                let load_older: View = if coverage.can_load_older() {
-                    m3::text_button(palette)
-                        .is_enabled(!matches!(self.chat.live, LiveStatus::Loading))
-                        .horizontal_alignment(HorizontalAlignment::Center)
-                        .on_click(context.message(Message::Chat(ChatMsg::LoadOlderRequested)))
-                        .content(TextBlock::new().text("Load older"))
-                } else {
-                    View::empty()
-                };
-                let mut lines = coverage.lines(convo.inputs_unavailable());
-                if self.chat.items.is_empty() {
-                    lines.push("No retained turns in coverage yet.".to_owned());
-                }
-                // One centered TextBlock per line (Reactor 0.100.0 has no
-                // TextAlignment).
-                let lines: Vec<KeyedView> = lines
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, line)| {
-                        KeyedView::new(
-                            index,
-                            m3::muted(line, theme::type_scale::BODY_SMALL)
-                                .horizontal_alignment(HorizontalAlignment::Center)
-                                .text_wrapping(TextWrapping::Wrap),
-                        )
+                m3::title(title.clone(), theme::type_scale::TITLE_MEDIUM)
+                    .max_width(560.0)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .text_trimming(TextTrimming::CharacterEllipsis)
+                    .is_text_selection_enabled(true),
+                Border::new()
+                    .grid_column(1)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .automation_name(format!("State: {state}"))
+                    .content(m3::dot(palette.header_dot(tone))),
+                m3::muted(note, theme::type_scale::BODY_SMALL)
+                    .grid_column(2)
+                    .vertical_alignment(VerticalAlignment::Center),
+                m3::icon_button(palette)
+                    .grid_column(4)
+                    .automation_name(if details_open {
+                        "Hide details"
+                    } else {
+                        "Show details"
                     })
-                    .collect();
-                StackPanel::new()
-                    .spacing(theme::spacing::XS)
-                    .margin(Thickness::new(0.0, 0.0, 0.0, theme::spacing::LG))
-                    .children((load_older, StackPanel::new().keyed_children(lines)))
-            }
-            None => View::empty(),
-        };
+                    .on_click(
+                        context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Details))),
+                    )
+                    .content(m3::icon(m3::glyph::INFO)),
+                Border::new().grid_column(5).content(menu),
+            ))
+    }
 
+    /// The transcript: "Load older" when more history exists, then every
+    /// turn in the reading column; the newest turn carries the end anchor.
+    fn transcript_view(
+        &self,
+        column: Option<f64>,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let load_older: View = match self.chat.convo.as_ref() {
+            Some(convo) if convo.coverage().can_load_older() => m3::text_button(palette)
+                .is_enabled(!matches!(self.chat.live, LiveStatus::Loading))
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .margin(Thickness::new(0.0, 0.0, 0.0, theme::spacing::MD))
+                .on_click(context.message(Message::Chat(ChatMsg::LoadOlderRequested)))
+                .content(m3::label("Load older messages")),
+            _ => View::empty(),
+        };
+        let empty: View = if self.chat.items.is_empty() {
+            m3::muted(
+                match self.chat.live {
+                    LiveStatus::Loading => "Loading…",
+                    _ => "No messages yet.",
+                },
+                theme::type_scale::BODY_MEDIUM,
+            )
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .into()
+        } else {
+            View::empty()
+        };
         let callbacks = RowCallbacks {
             copy_part: context.callback(|value| Message::Chat(ChatMsg::CopyPart(value))),
             copy_code: context.callback(|(key, index): (String, usize)| {
@@ -953,34 +1202,32 @@ impl DesktopApp {
                     &callbacks,
                     palette,
                     Some(&self.chat.end_anchor),
+                    column,
                 ),
             )]),
             None => View::empty(),
         };
         let items = Rc::clone(&self.chat.items);
         let keys = Rc::clone(&self.chat.items);
-        // A palette change re-realises the rows in the new colors.
+        // A palette or width change re-realises the rows in the new colors
+        // and at the new column width.
         let palette_code = palette
             .scheme()
             .map_or(0, |scheme| 1 + u64::from(scheme.dark));
+        let width_code = column.map_or(0, |width| width.round() as u64);
         let source = VirtualSource::new(
             self.chat
                 .items_revision
                 .wrapping_mul(3)
-                .wrapping_add(palette_code),
+                .wrapping_add(palette_code)
+                .wrapping_add(width_code.wrapping_mul(0x9E37_79B9)),
             earlier,
             move |index| keys[index].key.clone(),
-            move |index| views::item_view(&items[index], &expanded, &callbacks, palette, None),
+            move |index| {
+                views::item_view(&items[index], &expanded, &callbacks, palette, None, column)
+            },
         );
-        // The reading column has the composer's width: the reading width,
-        // or the pane less its gutters and scroll bar when narrower. Inside
-        // the ScrollViewer a stretched MaxWidth column was arranged in a
-        // slot wider than the viewport (off center), so it is centered at an
-        // explicit width; content-sized until the window size is observed.
-        let column = self.chat_pane_width().map(|pane| {
-            (pane - 2.0 * gutter - theme::spacing::LG).clamp(240.0, theme::layout::READING_WIDTH)
-        });
-        let transcript = ScrollViewer::new()
+        ScrollViewer::new()
             .grid_row(1)
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .automation_name("Conversation")
@@ -989,41 +1236,23 @@ impl DesktopApp {
                     .width(column)
                     .max_width(theme::layout::READING_WIDTH)
                     .horizontal_alignment(HorizontalAlignment::Center)
-                    .margin(Thickness::xy(0.0, theme::spacing::SM))
+                    .margin(Thickness::xy(0.0, theme::spacing::MD))
                     .children((
-                        history_start,
+                        load_older,
+                        empty,
                         ItemsRepeater::new().virtual_source(source),
                         latest,
                     )),
-            );
-        // Reactor 0.100.0 cannot tell whether the transcript is scrolled to
-        // the bottom (no offset, extent or ViewChanged), so the chip shows
-        // whenever there is history. It has its own row between the
-        // transcript and the composer, right-aligned with the composer, so
-        // it never covers a message and the transcript's last item stays
-        // fully visible.
-        let jump: View = if self.chat.items.is_empty() {
-            View::empty()
-        } else {
-            let label = if self.chat.unseen > 0 {
-                format!("Jump to latest · {} new", self.chat.unseen)
-            } else {
-                "Jump to latest".to_owned()
-            };
-            Border::new()
-                .grid_row(2)
-                .max_width(theme::layout::READING_WIDTH)
-                .horizontal_alignment(HorizontalAlignment::Stretch)
-                .margin(Thickness::new(gutter, theme::spacing::SM, gutter, 0.0))
-                .content(
-                    m3::tonal(palette)
-                        .horizontal_alignment(HorizontalAlignment::Right)
-                        .automation_name(label.clone())
-                        .on_click(context.message(Message::Chat(ChatMsg::JumpToLatest)))
-                        .content(m3::icon_label(m3::glyph::ARROW_DOWN, &label)),
-                )
-        };
+            )
+    }
 
+    /// Pending requests of the open Agent: what it asks, and the answers.
+    fn pending_view(
+        &self,
+        column: Option<f64>,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
         let pending_rows: Vec<KeyedView> = self
             .chat
             .detail
@@ -1033,7 +1262,7 @@ impl DesktopApp {
             .iter()
             .map(|request| {
                 let key = request.binding.request.clone().unwrap_or_default();
-                let answer_box = TextBox::new()
+                let answer_box = m3::field()
                     .text(self.chat.answers.get(&key).cloned().unwrap_or_default())
                     .placeholder_text("{\"question\": {\"answers\": [\"…\"]}}")
                     .automation_name("Answer JSON")
@@ -1043,17 +1272,17 @@ impl DesktopApp {
                             Message::Chat(ChatMsg::AnswerChanged(key.clone(), text))
                         })
                     });
-                let (fill, on) = palette.chip(StatusTone::Attention);
+                let (fill, on) = palette.attention();
                 KeyedView::new(
                     key,
                     Border::new()
                         .background(fill)
-                        .corner_radius(theme::shape::LG)
-                        .padding(Thickness::uniform(theme::spacing::LG))
+                        .corner_radius(theme::shape::MD)
+                        .padding(Thickness::uniform(theme::spacing::MD))
                         .content(
                             StackPanel::new().spacing(theme::spacing::SM).children((
                                 m3::text(
-                                    format!("Pending {} · turn {}", request.kind, request.turn_id),
+                                    format!("The Agent asks: {}", request.kind),
                                     theme::type_scale::TITLE_SMALL,
                                 )
                                 .foreground(on),
@@ -1084,116 +1313,265 @@ impl DesktopApp {
                                             .on_click(context.message(Message::Chat(
                                                 ChatMsg::AnswerRequested(request.clone()),
                                             )))
-                                            .content(TextBlock::new().text("Answer")),
+                                            .content(m3::label("Answer")),
                                     )),
                             )),
                         ),
                 )
             })
             .collect();
-        let pending = StackPanel::new()
+        StackPanel::new()
             .grid_row(3)
             .spacing(theme::spacing::SM)
+            .width(column)
             .max_width(theme::layout::READING_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Stretch)
-            .margin(Thickness::xy(gutter, 0.0))
-            .keyed_children(pending_rows);
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .keyed_children(pending_rows)
+    }
 
-        let has_agent = agent.is_some();
-        let launch: View = if has_agent {
-            View::empty()
-        } else {
-            Border::new()
-                .grid_row(4)
-                .max_width(theme::layout::READING_WIDTH)
-                .horizontal_alignment(HorizontalAlignment::Stretch)
-                .margin(Thickness::new(gutter, theme::spacing::SM, gutter, 0.0))
-                .content(self.launch_card(context, palette))
+    /// The one composer: the context row (project and profile), the field,
+    /// then the model-and-effort and access chips with the actions on the
+    /// right (Interrupt and Steer only while a turn runs).
+    fn composer_view(
+        &self,
+        column: Option<f64>,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let agent = self.selected_agent_id();
+        let detail = self.chat.detail.as_ref();
+        let (context_row, chips): (View, View) = match (agent.as_deref(), detail) {
+            (None, _) => (
+                self.launch_context(context, palette),
+                self.launch_chips(context, palette),
+            ),
+            (Some(_), Some(detail)) => (
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(theme::spacing::SM)
+                    .children((
+                        m3::chip_static(
+                            palette,
+                            m3::glyph::FOLDER,
+                            &nav::project_name(&detail.project, &self.registered_projects()),
+                        ),
+                        m3::chip_static(
+                            palette,
+                            m3::glyph::PROFILE,
+                            &if detail.settings.profile == detail.harness {
+                                detail.harness.clone()
+                            } else {
+                                format!("{} · {}", detail.settings.profile, detail.harness)
+                            },
+                        ),
+                    )),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(theme::spacing::SM)
+                    .children((
+                        self.model_chip(detail, context, palette),
+                        m3::chip_static(
+                            palette,
+                            m3::glyph::SHIELD,
+                            &launch_ui::access_label(detail.settings.permissions.as_deref()),
+                        ),
+                    )),
+            ),
+            (Some(_), None) => (View::empty(), View::empty()),
         };
-
-        let composer = TextBox::new()
+        let placeholder = if agent.is_some() {
+            "Send a follow-up"
+        } else {
+            "Do anything"
+        };
+        let field = TextBox::new()
+            .grid_row(1)
             .element_ref(&self.chat.composer_ref)
             .text(self.primed(&self.composer_text()).to_owned())
-            .placeholder_text(if has_agent {
-                "Message the selected Agent…"
-            } else {
-                "First message for a new Agent…"
-            })
+            .placeholder_text(placeholder)
             .automation_name("Message")
-            .background(palette.surface_container_high())
+            // Its text starts where the chips' icons do.
+            .margin(Thickness::new(-6.0, 0.0, 0.0, 0.0))
+            .background(Brush::Solid(Color::transparent()))
             .border_thickness(Thickness::uniform(0.0))
             .accepts_return(true)
             .text_wrapping(TextWrapping::Wrap)
-            .height(theme::layout::COMPOSER_HEIGHT - 24.0)
+            .height(theme::layout::COMPOSER_FIELD_HEIGHT)
             .on_text_changed(
                 context.callback(|value| Message::Chat(ChatMsg::ComposerChanged(value))),
             );
-        // Turn controls are bound now, from the detail on screen: the Agent,
-        // its generation and its active turn (Steer, Interrupt) or its
-        // retained generation (Resume).
+        let actions = self.composer_actions(agent, context, palette);
+        Border::new()
+            .grid_row(5)
+            .width(column)
+            .max_width(theme::layout::READING_WIDTH)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .margin(Thickness::new(
+                0.0,
+                theme::spacing::SM,
+                0.0,
+                theme::spacing::LG,
+            ))
+            // An M3 search bar: surface-container-high, extra-large corner.
+            .background(palette.raised())
+            .corner_radius(theme::shape::XL)
+            .padding(Thickness::new(
+                theme::spacing::MD,
+                12.0,
+                theme::spacing::SM,
+                theme::spacing::SM,
+            ))
+            .content(
+                Grid::new()
+                    .rows([GridLength::Auto, GridLength::Auto, GridLength::Auto])
+                    .row_spacing(theme::spacing::XS)
+                    .children((
+                        context_row,
+                        field,
+                        Grid::new()
+                            .grid_row(2)
+                            .columns([GridLength::STAR, GridLength::Auto])
+                            .column_spacing(theme::spacing::SM)
+                            .children((
+                                Border::new()
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .content(chips),
+                                Border::new().grid_column(1).content(actions),
+                            )),
+                    )),
+            )
+    }
+
+    /// Registered (checkout, id) pairs for project names.
+    pub(super) fn registered_projects(&self) -> Vec<(String, String)> {
+        self.nav
+            .projects
+            .iter()
+            .map(|project| (project.workspace.clone(), project.name.clone()))
+            .collect()
+    }
+
+    /// The model-and-effort chip of a running Agent: the next turn's values;
+    /// its menu configures either one for the next turn.
+    fn model_chip(
+        &self,
+        detail: &UiDetail,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let label = format!(
+            "{} · {}",
+            detail.settings.next_model().unwrap_or("default model"),
+            detail.settings.next_effort().unwrap_or("default effort")
+        );
+        let agent = self.selected_agent_id().unwrap_or_default();
+        let catalog = self
+            .configure
+            .catalog
+            .as_ref()
+            .filter(|catalog| catalog.is_for(&agent, detail.generation));
+        let items = match catalog.map(|catalog| &catalog.reply) {
+            Some(Ok(reply)) => {
+                let (models, efforts) = configure::options(reply, detail.settings.next_model());
+                configure::menu_items(
+                    &models,
+                    &efforts,
+                    false,
+                    reply.configure.model_refusal.as_deref(),
+                    reply.configure.effort_refusal.as_deref(),
+                )
+            }
+            Some(Err(error)) => vec![MenuItem::disabled(
+                "error",
+                format!("Catalogue unavailable: {error}"),
+            )],
+            None => vec![MenuItem::disabled("loading", "Reading the catalogue…")],
+        };
+        if self.submitting() {
+            return m3::chip_static(palette, m3::glyph::MODEL, &label);
+        }
+        m3::chip(palette)
+            .automation_name(format!("Model and effort: {label}"))
+            .content(m3::chip_label(m3::glyph::MODEL, &label))
+            .menu(Menu::new(
+                items,
+                // Capture-free for a stable menu identity (see the "…" menu).
+                context.callback(|label: String| {
+                    Message::Configure(configure_ui::ConfigureMsg::Chosen(label))
+                }),
+            ))
+    }
+
+    /// Send (or Queue, Resume, Launch), with Interrupt and Steer while a
+    /// turn runs. Each is bound now, from the detail on screen.
+    fn composer_actions(
+        &self,
+        agent: Option<String>,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
         let detail = self.chat.detail.as_ref();
         let active_turn = detail.and_then(|detail| detail.active_turn.clone());
         let resumable = detail.is_some_and(|detail| {
             matches!(detail.state.as_str(), "stopped" | "failed" | "lost")
                 && detail.active_turn.is_none()
+                && !detail.observe_only
         });
         let draft_blank = self.composer_text().trim().is_empty();
-        let primary = match (agent.clone(), detail) {
-            (Some(agent), Some(detail)) if resumable => {
-                let label = if draft_blank {
-                    "Resume"
-                } else {
-                    "Resume with message"
-                };
-                m3::filled(palette)
-                    .is_enabled(!self.submitting())
-                    .automation_name(format!("{label} (generation {})", detail.generation))
-                    .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
-                        DraftAction::Resume {
-                            agent,
-                            generation: detail.generation,
-                        },
-                    ))))
-                    .content(m3::icon_label(m3::glyph::SEND, label))
-            }
-            (Some(agent), _) => {
-                let label = if active_turn.is_some() {
-                    "Queue"
+        let enabled = !self.submitting();
+        let primary: View = match (agent.clone(), detail) {
+            (Some(agent), Some(detail)) if resumable => m3::filled(palette)
+                .is_enabled(enabled)
+                .automation_name(format!(
+                    "{} (generation {})",
+                    if draft_blank {
+                        "Resume"
+                    } else {
+                        "Resume with message"
+                    },
+                    detail.generation
+                ))
+                .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
+                    DraftAction::Resume {
+                        agent,
+                        generation: detail.generation,
+                    },
+                ))))
+                .content(TextBlock::new().text("Resume")),
+            (Some(agent), _) => m3::filled_icon(palette)
+                .is_enabled(enabled && !draft_blank)
+                .automation_name(if active_turn.is_some() {
+                    "Queue message"
                 } else {
                     "Send"
-                };
-                m3::filled(palette)
-                    .is_enabled(!self.submitting())
-                    .automation_name(label)
-                    .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
-                        DraftAction::Send { agent },
-                    ))))
-                    .content(m3::icon_label(m3::glyph::SEND, label))
-            }
-            (None, _) => m3::filled(palette)
-                .is_enabled(!self.submitting())
-                .automation_name("Launch Agent")
+                })
+                .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
+                    DraftAction::Send { agent },
+                ))))
+                .content(m3::icon(m3::glyph::SEND)),
+            (None, _) => m3::filled_icon(palette)
+                .is_enabled(enabled && !draft_blank)
+                .automation_name("Start task")
                 .on_click(context.message(Message::Launch(LaunchMsg::LaunchRequested)))
-                .content(m3::icon_label(m3::glyph::SEND, "Launch Agent")),
+                .content(m3::icon(m3::glyph::SEND)),
         };
-        // Steer and Interrupt exist only while a turn is active.
         let turn_actions: View =
             match (agent.as_deref(), detail, active_turn.as_deref()) {
-                (Some(agent), Some(detail), Some(turn)) => {
+                (Some(agent), Some(detail), Some(turn)) if !detail.observe_only => {
                     let bound = BoundAction::turn_control(agent, detail.generation, turn);
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
-                        .spacing(theme::spacing::SM)
+                        .spacing(theme::spacing::XS)
                         .children((
-                            m3::tonal(palette)
-                                .is_enabled(!self.submitting())
+                            m3::text_button(palette)
+                                .is_enabled(enabled)
                                 .automation_name(format!("Interrupt turn {turn}"))
                                 .on_click(context.message(Message::Chat(
                                     ChatMsg::InterruptRequested(bound.clone()),
                                 )))
-                                .content(m3::icon_label(m3::glyph::INTERRUPT, "Interrupt")),
+                                .content(m3::text_icon_label(m3::glyph::STOP, "Interrupt")),
                             m3::tonal(palette)
-                                .is_enabled(!self.submitting() && !draft_blank)
+                                .is_enabled(enabled && !draft_blank)
                                 .automation_name(format!("Steer turn {turn} with the message"))
                                 .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
                                     DraftAction::Steer(bound),
@@ -1203,52 +1581,101 @@ impl DesktopApp {
                 }
                 _ => View::empty(),
             };
-        let composer_card = Border::new()
-            .grid_row(5)
-            .background(palette.surface_container_high())
-            .corner_radius(theme::shape::XL)
-            .padding(Thickness::uniform(theme::spacing::SM))
+        StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(theme::spacing::SM)
+            .children((turn_actions, primary))
+    }
+
+    /// The Force stop question above the composer, bound to the Agent and
+    /// generation of its menu click. In the window (not a ContentDialog),
+    /// so it always takes the window's theme.
+    fn force_stop_banner(
+        &self,
+        bound: &BoundAction,
+        title: &str,
+        column: Option<f64>,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        Border::new()
+            .grid_row(4)
+            .width(column)
             .max_width(theme::layout::READING_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Stretch)
-            .margin(Thickness::new(
-                gutter,
-                theme::spacing::MD,
-                gutter,
-                theme::spacing::LG,
-            ))
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .margin(Thickness::new(0.0, theme::spacing::SM, 0.0, 0.0))
+            .background(palette.error_container())
+            .corner_radius(theme::shape::MD)
+            .padding(Thickness::uniform(theme::spacing::MD))
             .content(
                 Grid::new()
-                    .rows([GridLength::Auto, GridLength::Auto])
-                    .row_spacing(theme::spacing::XS)
+                    .columns([GridLength::STAR, GridLength::Auto])
+                    .column_spacing(theme::spacing::MD)
                     .children((
-                        composer,
                         StackPanel::new()
-                            .grid_row(1)
+                            .spacing(2.0)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .children((
+                                m3::text(
+                                    format!("Force stop {title}?"),
+                                    theme::type_scale::TITLE_SMALL,
+                                )
+                                .foreground(palette.on_error_container())
+                                .text_trimming(TextTrimming::CharacterEllipsis),
+                                m3::text(
+                                    format!(
+                                        "Ends Agent {} (generation {}) at once instead of a clean stop; an active turn is cut off.",
+                                        bound.agent, bound.generation
+                                    ),
+                                    theme::type_scale::BODY_SMALL,
+                                )
+                                .foreground(palette.on_error_container())
+                                .text_wrapping(TextWrapping::Wrap),
+                            )),
+                        StackPanel::new()
+                            .grid_column(1)
                             .orientation(Orientation::Horizontal)
-                            .horizontal_alignment(HorizontalAlignment::Right)
                             .spacing(theme::spacing::SM)
-                            .children((turn_actions, primary)),
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .children((
+                                m3::error_text_button(palette)
+                                    .automation_name("Cancel force stop")
+                                    .on_click(context.message(Message::Chat(
+                                        ChatMsg::ForceStopAnswered(false),
+                                    )))
+                                    .content(m3::label("Cancel")),
+                                m3::danger(palette)
+                                    .is_enabled(!self.submitting())
+                                    .automation_name(format!(
+                                        "Force stop {} generation {}",
+                                        bound.agent, bound.generation
+                                    ))
+                                    .on_click(context.message(Message::Chat(
+                                        ChatMsg::ForceStopAnswered(true),
+                                    )))
+                                    .content(TextBlock::new().text("Force stop")),
+                            )),
                     )),
-            );
-        let dialog = self.handoff_dialog(context);
+            )
+    }
 
-        Grid::new()
-            .rows([
-                GridLength::Auto,
-                GridLength::STAR,
-                GridLength::Auto,
-                GridLength::Auto,
-                GridLength::Auto,
-                GridLength::Auto,
-            ])
-            .children((
-                top,
-                transcript,
-                jump,
-                pending,
-                launch,
-                composer_card,
-                dialog,
-            ))
+    /// The configure pick a model-chip menu label names, for `agent`.
+    pub(super) fn configure_pick(&self, agent: &str, generation: i64, label: &str) -> Option<Pick> {
+        let detail = self.chat.detail.as_ref()?;
+        let catalog = self
+            .configure
+            .catalog
+            .as_ref()
+            .filter(|catalog| catalog.is_for(agent, generation))?;
+        let reply = catalog.reply.as_ref().ok()?;
+        let (mut models, mut efforts) = configure::options(reply, detail.settings.next_model());
+        // A field the daemon refuses never resolves.
+        if reply.configure.model_refusal.is_some() {
+            models.clear();
+        }
+        if reply.configure.effort_refusal.is_some() {
+            efforts.clear();
+        }
+        configure::resolve(label, &models, &efforts)
     }
 }

@@ -362,6 +362,7 @@ impl Router {
             "config.profiles.save" => self.config_profiles_save(&params, &principal).await,
             "settings.read" => self.settings_read(&params, &principal).await,
             "settings.save" => self.settings_save(&params, &principal).await,
+            "routing.preview" => self.routing_preview(&params, &principal).await,
             "rule.list" => self.rule_list(&params, &principal).await,
             "script.list" => self.script_list(&params, &principal).await,
             "script.read" => self.script_read(&params, &principal).await,

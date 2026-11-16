@@ -1,15 +1,55 @@
 //! Profile draft editing as pure text operations.
 //!
-//! The Profiles screen keeps one document draft: the `[profiles.*]` source
-//! text exactly as `config.profiles.read` returned it. The form and the
-//! source view edit that same text, so there is never a second model to
-//! reconcile. Form edits change one `key = "value"` line inside one profile
-//! block; duplicate copies a block under a new name. Validation and saving
-//! stay with the daemon (`config.profiles.save`, dry run first), which runs
-//! its own parser and launch resolution; nothing here decides validity.
+//! Models and profiles keeps one document draft: the `profiles` settings
+//! section as `[profiles.*]` TOML text (see
+//! [`crate::settings_model::profiles_toml`]). The form and the source view
+//! edit that same text, so there is never a second model to reconcile. Form
+//! edits change one `key = "value"` line inside one profile block; duplicate
+//! copies a block under a new name. Validation and saving stay with the
+//! daemon (`settings.save`, dry run first), which runs its own parser and
+//! launch resolution; nothing here decides validity.
 
 /// Common profile fields the form edits. Everything else stays source-only.
 pub const FORM_FIELDS: [&str; 4] = ["model", "effort", "permissions", "approval_policy"];
+
+/// The first choice of an enumerated field: the key is left out, so the
+/// harness default applies.
+pub const DEFAULT_CHOICE: &str = "Harness default";
+
+/// The documented values of an enumerated form field, or `None` for a
+/// free-text field (`model`). `effort` lists the closed vocabulary the CLI
+/// documents for ad-hoc launches and the daemon enforces for Claude
+/// profiles (Codex and Muse pass a profile's value to the native
+/// catalogue); `permissions` and `approval_policy` follow
+/// `docs/spec/configuration.md`. The daemon validates per harness on
+/// Validate and Save.
+fn documented(key: &str) -> Option<&'static [&'static str]> {
+    match key {
+        "effort" => Some(&["low", "medium", "high", "xhigh", "max"]),
+        "permissions" => Some(&["read-only", "workspace-write", "danger-full-access"]),
+        "approval_policy" => Some(&["never", "on-request"]),
+        _ => None,
+    }
+}
+
+/// The dropdown choices of an enumerated field: [`DEFAULT_CHOICE`], the
+/// documented values, and the current value when it is none of them, so a
+/// form edit never drops what the source says. `None` for free-text keys.
+pub fn choices(key: &str, current: Option<&str>) -> Option<Vec<String>> {
+    let values = documented(key)?;
+    let mut all = vec![DEFAULT_CHOICE.to_owned()];
+    all.extend(values.iter().map(|value| (*value).to_owned()));
+    if let Some(current) = current.filter(|current| !values.contains(current)) {
+        all.push(current.to_owned());
+    }
+    Some(all)
+}
+
+/// The value a dropdown index sets: `None` (remove the key) for the
+/// default choice or an index outside `choices`.
+pub fn choice_value(choices: &[String], index: usize) -> Option<&str> {
+    choices.get(index).filter(|_| index > 0).map(String::as_str)
+}
 
 /// WinUI `TextBox` reports line breaks as a bare carriage return; TOML
 /// (and the daemon) need line feeds. Normalize every edit before it
@@ -228,6 +268,25 @@ pub fn duplicate(draft: &str, from: &str, to: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enumerated_fields_offer_the_default_the_documented_values_and_the_current_one() {
+        assert_eq!(choices("model", Some("gpt")), None);
+        let effort = choices("effort", None).unwrap();
+        assert_eq!(effort[0], DEFAULT_CHOICE);
+        assert_eq!(&effort[1..], ["low", "medium", "high", "xhigh", "max"]);
+        // A native value outside the vocabulary stays selectable.
+        let custom = choices("effort", Some("minimal")).unwrap();
+        assert_eq!(custom.last().map(String::as_str), Some("minimal"));
+        assert_eq!(choices("effort", Some("high")).unwrap().len(), 6);
+        assert_eq!(choice_value(&custom, 0), None);
+        assert_eq!(choice_value(&custom, 2), Some("medium"));
+        assert_eq!(choice_value(&custom, 99), None);
+        assert_eq!(
+            choices("approval_policy", None).unwrap(),
+            [DEFAULT_CHOICE, "never", "on-request"]
+        );
+    }
 
     const DRAFT: &str = "[profiles.a]\nharness = \"codex\"\nmodel = \"m1\"\n\n[profiles.a.extra]\nx = 1\n\n[profiles.b]\nharness = \"muse\" # note\nmodel = \"spark\"\n";
 

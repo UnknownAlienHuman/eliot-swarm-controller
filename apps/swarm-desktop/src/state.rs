@@ -65,10 +65,13 @@ impl DraftStore {
 
     /// Clear the draft only when `submitted` is still the current revision.
     /// Returns true when the draft was cleared. A late reply carrying an
-    /// older revision leaves newer text untouched.
+    /// older revision leaves newer text untouched. The revision itself is
+    /// kept, so the next draft never reuses a submitted revision (and the
+    /// mutation id an uncertain submission of it may still hold).
     pub fn ack(&mut self, agent: &str, submitted: u64) -> bool {
         if self.revision(agent) == submitted {
-            self.drafts.remove(agent);
+            self.drafts
+                .insert(agent.to_owned(), (String::new(), submitted));
             true
         } else {
             false
@@ -165,6 +168,15 @@ mod tests {
         let first = drafts.set("a1", "hello".to_owned());
         assert!(drafts.ack("a1", first));
         assert_eq!(drafts.get("a1"), "");
+    }
+
+    #[test]
+    fn revisions_keep_rising_after_an_ack() {
+        let mut drafts = DraftStore::default();
+        let first = drafts.set("a1", "A".to_owned());
+        assert!(drafts.ack("a1", first));
+        let next = drafts.set("a1", "C".to_owned());
+        assert!(next > first, "{next} after {first}");
     }
 
     #[test]

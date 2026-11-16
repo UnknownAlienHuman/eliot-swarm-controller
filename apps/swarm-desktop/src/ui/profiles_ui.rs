@@ -1,23 +1,24 @@
-//! Profile editing: one draft for form and source, validate, revision-checked save.
+//! Profile editing: one draft for form and source over the `profiles`
+//! settings section. Settings' save bar validates and saves it
+//! (`settings.save`, revision-checked); see [`super::settings_ui`].
 
 use super::*;
 use crate::theme::winui::Palette;
 
 #[derive(Clone, Debug)]
 pub(super) enum ProfilesMsg {
-    ProfilesSourceLoaded(Fallible<ProfilesReadResponse>),
     ProfilesDraftChanged(String),
     ProfileEditSelected(Option<usize>),
     ProfileFieldChanged(usize, String),
+    /// A form dropdown (field index) picked a choice (None: items replaced).
+    ProfileChoicePicked(usize, Option<usize>),
     DuplicateNameChanged(String),
     DuplicateRequested,
-    ProfilesValidateRequested,
-    ProfilesSaveRequested,
-    ProfilesSaved(bool, Fallible<ProfilesSaveResponse>),
-    ProfilesReloadRequested,
+    /// Show or hide the TOML source editor.
+    SourceToggled,
 }
 
-/// Profiles screen: one document draft over the daemon's profile source.
+/// One document draft: the `profiles` section as `[profiles.*]` TOML.
 #[derive(Clone, Debug, Default)]
 pub(super) struct ProfilesEditor {
     pub(super) revision: Option<String>,
@@ -31,45 +32,16 @@ pub(super) struct ProfilesEditor {
     pub(super) selected: Option<String>,
     pub(super) duplicate_name: String,
     pub(super) status: String,
-    pub(super) busy: bool,
     pub(super) loaded: bool,
+    /// The TOML source editor is shown.
+    pub(super) source_open: bool,
 }
 
 impl DesktopApp {
     pub(super) fn profiles_update(&mut self, msg: ProfilesMsg, context: &ComponentContext<Self>) {
         match msg {
-            ProfilesMsg::ProfilesSourceLoaded(result) => {
-                self.editor.busy = false;
-                self.editor.loaded = true;
-                match result {
-                    Ok(read) => {
-                        // The TextBox reports LF-normalized text; compare
-                        // drafts in that form (the daemon keeps CRLF files CRLF).
-                        let source = profiles::normalize_newlines(&read.source.unwrap_or_default());
-                        self.editor.revision = read.revision;
-                        self.editor.base = source.clone();
-                        self.editor.view = source.clone();
-                        self.editor.draft = source;
-                        self.editor.editable = read.editable;
-                        self.editor.reason = read.reason;
-                        let names = profiles::profile_names(&self.editor.draft);
-                        if self
-                            .editor
-                            .selected
-                            .as_ref()
-                            .is_none_or(|name| !names.contains(name))
-                        {
-                            self.editor.selected = names.first().cloned();
-                        }
-                    }
-                    Err(error) => {
-                        self.editor.editable = false;
-                        self.editor.reason = Some(format!("config.profiles.read failed: {error}"));
-                    }
-                }
-            }
             ProfilesMsg::ProfilesDraftChanged(text) => {
-                if self.editor.editable && !self.editor.busy {
+                if self.editor.editable {
                     self.editor.draft = profiles::normalize_newlines(&text);
                     self.editor.view = text;
                 }
@@ -94,6 +66,32 @@ impl DesktopApp {
                     }
                 }
             }
+            ProfilesMsg::ProfileChoicePicked(field, index) => {
+                // A ComboBox reports None when its items are replaced.
+                let (Some(index), Some(name), Some(key)) =
+                    (index, self.editor.selected.clone(), FORM_FIELDS.get(field))
+                else {
+                    return;
+                };
+                let current = match profiles::field(&self.editor.draft, &name, key) {
+                    profiles::Field::Simple(value) => Some(value),
+                    _ => None,
+                };
+                let Some(choices) = profiles::choices(key, current.as_deref()) else {
+                    return;
+                };
+                let value = profiles::choice_value(&choices, index);
+                if value == current.as_deref() {
+                    return;
+                }
+                match profiles::set_field(&self.editor.draft, &name, key, value) {
+                    Ok(draft) => {
+                        self.editor.view = draft.clone();
+                        self.editor.draft = draft;
+                    }
+                    Err(error) => self.editor.status = error,
+                }
+            }
             ProfilesMsg::DuplicateNameChanged(text) => self.editor.duplicate_name = text,
             ProfilesMsg::DuplicateRequested => {
                 if let Some(from) = self.editor.selected.clone() {
@@ -112,117 +110,29 @@ impl DesktopApp {
                     }
                 }
             }
-            ProfilesMsg::ProfilesValidateRequested => self.save_profiles(context, true),
-            ProfilesMsg::ProfilesSaveRequested => self.save_profiles(context, false),
-            ProfilesMsg::ProfilesSaved(dry_run, result) => {
-                self.editor.busy = false;
-                match result {
-                    Ok(reply) if dry_run => {
-                        self.editor.status = format!(
-                            "Valid: {} profile(s) parse and resolve for launch ({}). Not saved yet.",
-                            reply.profiles.len(),
-                            reply.profiles.join(", ")
-                        );
-                    }
-                    Ok(reply) => {
-                        self.editor.status = format!(
-                            "Saved revision {}; the next launch uses it ({}).",
-                            reply
-                                .revision
-                                .as_deref()
-                                .map_or("?", |r| &r[..12.min(r.len())]),
-                            reply.profiles.join(", ")
-                        );
-                        self.editor.loaded = false;
-                        self.load_profile_source(context);
-                        self.load_profile_list(context);
-                    }
-                    Err(error) if error.starts_with("unknown:") => {
-                        self.editor.status = format!(
-                            "Save outcome uncertain; Reload to see the current file (the draft is kept): {error}"
-                        );
-                    }
-                    Err(error) if error.starts_with("conflict:") => {
-                        // The file changed on disk under this draft: nothing
-                        // was written by this save, and Reload would discard
-                        // the draft, so say both.
-                        self.editor.status = format!(
-                            "Not saved: config.toml changed on disk after this draft was read. Copy what you need from the draft, then Reload to edit the current file. ({error})"
-                        );
-                    }
-                    Err(error) => {
-                        self.editor.status = format!(
-                            "{} The draft is kept and the saved file is unchanged: {error}",
-                            if dry_run { "Invalid." } else { "Not saved." }
-                        );
-                    }
-                }
-            }
-            ProfilesMsg::ProfilesReloadRequested => {
-                self.editor.status = "Reloaded the saved profile sections.".to_owned();
-                self.load_profile_source(context);
-                self.load_profile_list(context);
+            ProfilesMsg::SourceToggled => {
+                self.editor.source_open = !self.editor.source_open;
+                // A new multi-line editor gets its text one render later.
+                self.reprime_fields(context);
             }
         }
-    }
-
-    pub(super) fn load_profile_source(&mut self, context: &ComponentContext<Self>) {
-        let Ok(data_dir) = self.data_dir.clone() else {
-            return;
-        };
-        self.editor.busy = true;
-        let _task = context.spawn_background(move |_| {
-            Message::Profiles(ProfilesMsg::ProfilesSourceLoaded(client::block_on(async {
-                client::read_profiles_source(&data_dir)
-                    .await
-                    .map_err(|error| error.to_string())
-            })))
-        });
-    }
-
-    pub(super) fn save_profiles(&mut self, context: &ComponentContext<Self>, dry_run: bool) {
-        let Ok(data_dir) = self.data_dir.clone() else {
-            return;
-        };
-        if self.editor.busy || !self.editor.editable {
-            return;
-        }
-        self.editor.busy = true;
-        self.editor.status = if dry_run {
-            "Validating with the daemon parser and launch resolution…".to_owned()
-        } else {
-            "Saving…".to_owned()
-        };
-        let revision = self.editor.revision.clone();
-        let draft = self.editor.draft.clone();
-        let _task = context.spawn_background(move |_| {
-            Message::Profiles(ProfilesMsg::ProfilesSaved(
-                dry_run,
-                client::block_on(async {
-                    client::save_profiles(&data_dir, revision, draft, dry_run)
-                        .await
-                        .map_err(|error| error.to_string())
-                }),
-            ))
-        });
     }
 
     pub(super) fn profiles_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let list = self.launch.profile_list.as_ref();
         let data = ProfilesData {
-            revision: self.editor.revision.as_deref(),
             file_valid: list.is_none_or(|list| list.valid),
             file_error: list.and_then(|list| list.error.as_deref()),
             editable: self.editor.editable,
             reason: self.editor.reason.as_deref(),
             draft: &self.editor.draft,
             view: self.primed(&self.editor.view),
-            dirty: self.editor.draft != self.editor.base,
             selected: self.editor.selected.as_deref(),
             duplicate_name: &self.editor.duplicate_name,
             status: &self.editor.status,
-            busy: self.editor.busy,
+            busy: self.settings.reading,
             summaries: &self.launch.profile_summaries,
+            source_open: self.editor.source_open,
         };
         let actions = ProfilesActions {
             draft_changed: context
@@ -239,9 +149,14 @@ impl DesktopApp {
             duplicate_name_changed: context
                 .callback(|value| Message::Profiles(ProfilesMsg::DuplicateNameChanged(value))),
             duplicate: context.message(Message::Profiles(ProfilesMsg::DuplicateRequested)),
-            validate: context.message(Message::Profiles(ProfilesMsg::ProfilesValidateRequested)),
-            save: context.message(Message::Profiles(ProfilesMsg::ProfilesSaveRequested)),
-            reload: context.message(Message::Profiles(ProfilesMsg::ProfilesReloadRequested)),
+            toggle_source: context.message(Message::Profiles(ProfilesMsg::SourceToggled)),
+            choice_picked: (0..FORM_FIELDS.len())
+                .map(|field| {
+                    context.callback(move |index: Option<usize>| {
+                        Message::Profiles(ProfilesMsg::ProfileChoicePicked(field, index))
+                    })
+                })
+                .collect(),
         };
         config_view::profiles_screen(data, actions, palette)
     }
