@@ -108,39 +108,16 @@ mod process_birth {
 
     // Microsoft documents this NT telemetry record, but ships no public SDK
     // header for it. Keep the local C-layout declaration aligned with that
-    // documented field order; use only the process key and birth-time prefix.
-    #[repr(C)]
-    #[derive(Default)]
-    #[allow(dead_code)]
-    struct ProcessTelemetryIdInformation {
-        header_size: u32,
-        process_id: u32,
-        process_start_key: u64,
-        create_time: u64,
-        create_interrupt_time: u64,
-        create_unbiased_interrupt_time: u64,
-        process_sequence_number: u64,
-        session_create_time: u64,
-        session_id: u32,
-        boot_id: u32,
-        image_checksum: u32,
-        image_time_date_stamp: u32,
-        user_sid_offset: u32,
-        image_path_offset: u32,
-        package_name_offset: u32,
-        relative_app_name_offset: u32,
-        command_line_offset: u32,
-    }
-
+    // documented field order; only the process key and birth-time prefix are
+    // read. The two middle timestamps are unread padding preserving the C
+    // offsets Windows fills.
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
-    #[allow(dead_code)]
     struct ProcessTelemetryBirthPrefix {
         header_size: u32,
         process_id: u32,
         process_start_key: u64,
-        create_time: u64,
-        create_interrupt_time: u64,
+        _reserved: [u64; 2],
         create_unbiased_interrupt_time: u64,
     }
 
@@ -209,7 +186,7 @@ mod process_birth {
         // function is resolved dynamically as Microsoft requires for ntdll.
         let query: NtQueryInformationProcess = unsafe { std::mem::transmute(raw) };
 
-        let record_size = size_of::<ProcessTelemetryIdInformation>();
+        let record_size = size_of::<ProcessTelemetryBirthPrefix>();
         let mut output = vec![0u64; record_size.div_ceil(size_of::<u64>())];
 
         for attempt in 0..MAX_PROCESS_TELEMETRY_QUERY_ATTEMPTS {
