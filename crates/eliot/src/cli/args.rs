@@ -48,6 +48,10 @@ pub(crate) struct Cli {
 // function instead of accumulating every argument builder in this enum's frame.
 #[derive(Subcommand)]
 pub(crate) enum CliCommand {
+    /// Plan or apply cleanup for retained Agent artifacts.
+    Cleanup(CleanupArgs),
+    /// Register an artifact directory owned by this Agent generation.
+    Artifact(ArtifactArgs),
     /// Read or save unified daemon settings with revision checking.
     Settings(SettingsArgs),
     /// Start the local daemon, or stop it with a drain/force request.
@@ -163,6 +167,41 @@ pub(crate) enum CliCommand {
     /// Internal plugin entry point used by the daemon.
     #[command(hide = true)]
     Plugin(PluginArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct CleanupArgs {
+    #[command(subcommand)]
+    pub(crate) command: CleanupCommand,
+}
+#[derive(Subcommand)]
+pub(crate) enum CleanupCommand {
+    Plan {
+        #[arg(long, default_value="self_tree", value_parser=["self_tree","project","all"])]
+        scope: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        older_than: Option<i64>,
+    },
+    Apply {
+        plan_id: String,
+    },
+}
+#[derive(Args)]
+pub(crate) struct ArtifactArgs {
+    #[command(subcommand)]
+    pub(crate) command: ArtifactCommand,
+}
+#[derive(Subcommand)]
+pub(crate) enum ArtifactCommand {
+    Register {
+        path: String,
+        #[arg(long,value_parser=["build","data_dir","temp","other"])]
+        kind: String,
+        #[arg(long)]
+        purpose: String,
+    },
 }
 
 #[derive(Args)]

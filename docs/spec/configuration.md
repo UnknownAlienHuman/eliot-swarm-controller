@@ -1,5 +1,17 @@
 # Configuration
 
+### Artifact roots
+
+`[daemon].artifact_roots` is an optional array of at most 32 absolute local
+directories (default empty). Agent artifact registration accepts descendants of
+these Owner-configured roots, in addition to its workspace and generation's
+private artifact root. Configured roots themselves and user/native configuration
+remain protected. This does not scan or adopt existing unregistered files. See
+[registered artifacts and cleanup](coordination.md#registered-artifacts-and-cleanup-k69).
+The setting is available through the existing Daemon settings section. Cleanup
+after assignment retirement is currently off; no automatic cleanup executor or
+effective opt-in setting is implemented yet.
+
 Implement the single global Codex profile first. Project overlays, external plugins,
 services, mail and automation settings appear only with their owning roadmap layer;
 this page is the final configuration contract, not an L1 checklist.

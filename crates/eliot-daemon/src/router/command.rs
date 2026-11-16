@@ -1069,6 +1069,7 @@ impl Router {
         resume_source_state: Option<Value>,
         linked_id: Option<String>,
     ) {
+        let artifact_agent = agent.id.clone();
         let start = self
             .inner
             .plugin_host
@@ -1080,6 +1081,11 @@ impl Router {
                     self.redact_native_value(&mut value);
                     let _ = self.settle(id, CommandState::Failed, Some(value)).await;
                 } else {
+                    let artifact_snapshot =
+                        self.inner.store.lock().await.get_agent(&artifact_agent);
+                    if let Ok(Some(agent)) = artifact_snapshot {
+                        let _ = self.record_agent_artifacts(&agent).await;
+                    }
                     let _ = self
                         .settle(id, CommandState::Applied, Some(json!({"state": "ready"})))
                         .await;

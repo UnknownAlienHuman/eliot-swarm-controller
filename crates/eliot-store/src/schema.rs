@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 44;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 45;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1117,6 +1117,19 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 45 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE artifacts (id TEXT PRIMARY KEY, agent INTEGER NOT NULL REFERENCES agents(id), generation INTEGER NOT NULL, path TEXT NOT NULL UNIQUE, body TEXT NOT NULL);
+                 CREATE INDEX artifacts_owner ON artifacts(agent,generation);
+                 CREATE TABLE cleanup_plans (id TEXT PRIMARY KEY, principal TEXT NOT NULL, body TEXT NOT NULL, apply_id TEXT UNIQUE);
+                 INSERT INTO schema_migrations(version) VALUES (45);"
+            ).map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1131,7 +1144,8 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX commands_turn_unknown;
+                "DROP TABLE artifacts; DROP TABLE cleanup_plans; DELETE FROM schema_migrations WHERE version=45;
+              DROP INDEX commands_turn_unknown;
               DELETE FROM schema_migrations WHERE version=44;
               DROP TRIGGER assignment_commands_insert;
              DROP TRIGGER assignment_commands_update;
@@ -1201,7 +1215,8 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX commands_turn_unknown;
+                "DROP TABLE artifacts; DROP TABLE cleanup_plans; DELETE FROM schema_migrations WHERE version=45;
+              DROP INDEX commands_turn_unknown;
               DELETE FROM schema_migrations WHERE version=44;
               DROP TRIGGER assignment_commands_insert;
              DROP TRIGGER assignment_commands_update;

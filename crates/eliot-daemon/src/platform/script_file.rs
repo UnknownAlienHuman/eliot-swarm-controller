@@ -153,6 +153,123 @@ fn conflict() -> Error {
     )
 }
 
+/// A complete bounded tree, opened exclusively before the first delete.
+/// Ancestors cannot be renamed and leaves are opened relative to held parents.
+/// No pathname unlink fallback is available on Unix.
+#[cfg(windows)]
+pub(crate) struct CleanupTree {
+    _parent: Directory,
+    entries: Vec<File>,
+    pub(crate) identity: String,
+    pub(crate) bytes: u64,
+}
+
+#[cfg(windows)]
+impl CleanupTree {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        let parent = Directory::open(path.parent().ok_or_else(refused)?)?;
+        let name = path.file_name().ok_or_else(refused)?;
+        let root = native::open_cleanup(parent.handle(), name, true).map_err(|_| refused())?;
+        check(&root, true)?;
+        let identity = serde_json::to_string(&eliot_plugin::file_identity(&root).map_err(io)?)
+            .map_err(|_| refused())?;
+        let mut tree = Self {
+            _parent: parent,
+            entries: Vec::new(),
+            identity,
+            bytes: 0,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        tree.visit(root, 0, deadline)?;
+        Ok(tree)
+    }
+
+    fn visit(&mut self, directory: File, depth: usize, deadline: std::time::Instant) -> Result<()> {
+        if depth >= 64 {
+            return Err(Error::new("unavailable", "cleanup depth bound"));
+        }
+        for (name, is_dir) in native::children(&directory).map_err(io)? {
+            if self.entries.len() >= 10_000 || std::time::Instant::now() >= deadline {
+                return Err(Error::new("unavailable", "cleanup tree exceeds scan bound"));
+            }
+            plain(name.to_str().ok_or_else(refused)?)?;
+            let child = native::open_cleanup(&directory, &name, is_dir).map_err(|_| refused())?;
+            check(&child, is_dir)?;
+            if is_dir {
+                self.visit(child, depth + 1, deadline)?;
+            } else {
+                self.bytes = self
+                    .bytes
+                    .checked_add(child.metadata().map_err(io)?.len())
+                    .ok_or_else(refused)?;
+                self.entries.push(child);
+            }
+        }
+        self.entries.push(directory);
+        Ok(())
+    }
+
+    /// Every error after the first attempted disposition is unknown. No retry.
+    pub(crate) fn remove(mut self) -> Result<u64> {
+        for file in self.entries.drain(..) {
+            native::delete_handle(&file)
+                .map_err(|_| Error::new("unknown", "partial cleanup; no replay"))?;
+            drop(file);
+        }
+        Ok(self.bytes)
+    }
+}
+
+/// Existing directory identity with every ancestor pinned and no links followed.
+pub(crate) fn directory_identity(path: &Path) -> Result<String> {
+    let directory = Directory::open(path)?;
+    serde_json::to_string(&eliot_plugin::file_identity(directory.handle()).map_err(io)?)
+        .map_err(|_| refused())
+}
+
+#[cfg(all(test, windows))]
+mod cleanup_tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    #[test]
+    fn held_file_refuses_whole_tree_before_any_deletion() {
+        let root = std::env::temp_dir().join(format!("eliot-cleanup-{}", ulid::Ulid::new()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("held");
+        std::fs::write(&path, b"owned").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert!(CleanupTree::open(&root).is_err());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        drop(holder);
+        let tree = CleanupTree::open(&root).unwrap();
+        assert_eq!(tree.bytes, 5);
+        assert_eq!(tree.remove().unwrap(), 5);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn nested_tree_deletion_uses_opened_identity_and_counts_bytes() {
+        let parent = std::env::temp_dir().join(format!("eliot-cleanup-{}", ulid::Ulid::new()));
+        let root = parent.join("tree");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/data"), b"1234567").unwrap();
+        let original = directory_identity(&root).unwrap();
+        std::fs::rename(&root, parent.join("original")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        assert_ne!(CleanupTree::open(&root).unwrap().identity, original);
+        CleanupTree::open(&root).unwrap().remove().unwrap();
+        let held = CleanupTree::open(&parent.join("original")).unwrap();
+        assert_eq!(held.identity, original);
+        assert_eq!(held.remove().unwrap(), 7);
+        CleanupTree::open(&parent).unwrap().remove().unwrap();
+    }
+}
+
 fn plain(name: &str) -> Result<()> {
     if name.is_empty()
         || matches!(name, "." | "..")
@@ -209,7 +326,7 @@ mod native {
     use std::fs::{File, OpenOptions};
     use std::io;
     use std::os::windows::{
-        ffi::OsStrExt,
+        ffi::{OsStrExt, OsStringExt},
         fs::OpenOptionsExt,
         io::{AsRawHandle, FromRawHandle},
     };
@@ -249,6 +366,20 @@ mod native {
         directory: bool,
         create: bool,
     ) -> io::Result<File> {
+        open_mode(parent, name, directory, create, false)
+    }
+
+    pub(super) fn open_cleanup(parent: &File, name: &OsStr, directory: bool) -> io::Result<File> {
+        open_mode(parent, name, directory, false, true)
+    }
+
+    fn open_mode(
+        parent: &File,
+        name: &OsStr,
+        directory: bool,
+        create: bool,
+        cleanup: bool,
+    ) -> io::Result<File> {
         let mut wide: Vec<u16> = name.encode_wide().collect();
         let length =
             u16::try_from(wide.len() * 2).map_err(|_| io::Error::other("name too long"))?;
@@ -276,7 +407,9 @@ mod native {
         };
         // Deny ordinary file writes while read/revision handles remain open;
         // delete sharing is necessary for atomic replacement of an open entry.
-        let share = if directory {
+        let share = if cleanup {
+            0
+        } else if directory {
             FILE_SHARE_READ | FILE_SHARE_WRITE
         } else {
             FILE_SHARE_READ | FILE_SHARE_DELETE
@@ -293,7 +426,11 @@ mod native {
         let status = unsafe {
             NtCreateFile(
                 &mut handle,
-                access,
+                if cleanup {
+                    GENERIC_READ | DELETE | SYNCHRONIZE
+                } else {
+                    access
+                },
                 &attributes,
                 &mut status_block,
                 std::ptr::null(),
@@ -375,6 +512,88 @@ mod native {
                 std::mem::size_of_val(&info) as u32,
             );
         }
+    }
+    pub(super) fn delete_handle(file: &File) -> io::Result<()> {
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        if unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                (&info as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of_val(&info) as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    pub(super) fn children(file: &File) -> io::Result<Vec<(std::ffi::OsString, bool)>> {
+        let mut result = Vec::new();
+        let mut restart = true;
+        loop {
+            let mut buffer = vec![0u64; 8192];
+            let class = if restart {
+                FileIdBothDirectoryRestartInfo
+            } else {
+                FileIdBothDirectoryInfo
+            };
+            restart = false;
+            if unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    class,
+                    buffer.as_mut_ptr().cast(),
+                    (buffer.len() * 8) as u32,
+                )
+            } == 0
+            {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES as i32)
+                {
+                    break;
+                }
+                return Err(error);
+            }
+            let mut offset = 0usize;
+            loop {
+                let prefix = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+                if offset + prefix > buffer.len() * 8 {
+                    return Err(io::Error::other("directory entry truncated"));
+                }
+                let entry = unsafe {
+                    &*buffer
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(offset)
+                        .cast::<FILE_ID_BOTH_DIR_INFO>()
+                };
+                let length = entry.FileNameLength as usize;
+                if !length.is_multiple_of(2) || offset + prefix + length > buffer.len() * 8 {
+                    return Err(io::Error::other("directory name truncated"));
+                }
+                let name = std::ffi::OsString::from_wide(unsafe {
+                    std::slice::from_raw_parts(entry.FileName.as_ptr(), length / 2)
+                });
+                if name != "." && name != ".." {
+                    if entry.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                        || result.len() >= 10_000
+                    {
+                        return Err(io::Error::other("linked or oversized cleanup tree"));
+                    }
+                    result.push((name, entry.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0));
+                }
+                if entry.NextEntryOffset == 0 {
+                    break;
+                }
+                if entry.NextEntryOffset as usize <= prefix {
+                    return Err(io::Error::other("invalid directory entry"));
+                }
+                offset += entry.NextEntryOffset as usize;
+            }
+        }
+        Ok(result)
     }
     pub(super) fn sync(_: &File) -> io::Result<()> {
         Ok(())

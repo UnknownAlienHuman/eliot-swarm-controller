@@ -5,6 +5,7 @@
 mod assignment;
 mod canonical;
 mod capacity;
+mod cleanup;
 mod projects;
 mod provider_holds;
 mod rules;

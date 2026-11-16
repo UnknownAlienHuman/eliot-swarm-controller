@@ -514,6 +514,19 @@ of the explicitly selected release scope.
 
 ## Later
 
+- [ ] **K69 manager cleanup (owner clarification 2026-11-16, #384).**
+      Generation/tree artifact ledger, bounded plan/apply, handle deletion,
+      managed worktree cleanup, CLI and Advanced Settings are implemented.
+      Finish fresh-fetch branch merge verification/deletion, native archive
+      adapters, retirement-rule opt-in and exact target/private-daemon capture;
+      complete the manager/two-child live qualification before ticking K69.
+      Scoped validation on 2026-11-16: fmt, locked all-targets build and
+      warnings-denied Clippy passed for all six affected packages; 1,545 tests
+      passed. Private release qualification stopped at Codex 0.167.1 requiring
+      authentication in the isolated native home. Plan kept both candidates;
+      apply skipped both (0 bytes). Daemon drained with no owned processes;
+      scratch deletion was rejected by automatic approval review.
+
 Service continuity across daemon replacement requires an actual use case. The
 current contracts are not instructions to build that product in advance.
 The optional desktop companion is tracked above.

@@ -440,6 +440,8 @@ fn default_max_unread_messages_per_agent() -> i64 {
 #[serde(deny_unknown_fields)]
 pub(crate) struct DaemonConfig {
     #[serde(default)]
+    pub(crate) artifact_roots: Vec<String>,
+    #[serde(default)]
     pub(crate) retention: RetentionConfig,
     /// Hierarchy fanout bounds consumed by launch/selector admission. See
     /// docs/spec/configuration.md: daemon limits. Deserialized directly as
@@ -456,6 +458,7 @@ pub(crate) struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            artifact_roots: Vec::new(),
             retention: RetentionConfig::default(),
             limits: core::api::HierarchyLimits::default(),
             attention_suspicion_secs: default_attention_suspicion_secs(),
@@ -469,6 +472,17 @@ fn default_attention_suspicion_secs() -> i64 {
 
 impl DaemonConfig {
     fn validate(self) -> core::Result<Self> {
+        if self.artifact_roots.len() > 32
+            || self
+                .artifact_roots
+                .iter()
+                .any(|p| p.len() > 4096 || !std::path::Path::new(p).is_absolute())
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                "daemon.artifact_roots must contain at most 32 absolute local roots",
+            ));
+        }
         self.limits.validate().map_err(|error| {
             core::Error::new("profile_error", format!("config.toml: {}", error.message))
         })?;
@@ -479,6 +493,7 @@ impl DaemonConfig {
             ));
         }
         Ok(Self {
+            artifact_roots: self.artifact_roots,
             retention: self.retention.validate()?,
             limits: self.limits,
             attention_suspicion_secs: self.attention_suspicion_secs,
@@ -3271,6 +3286,7 @@ mod tests {
         assert_eq!(
             load_daemon_config(&fixture.root).unwrap(),
             DaemonConfig {
+                artifact_roots: Vec::new(),
                 retention: RetentionConfig {
                     events_days: Some(7),
                     commands_days: Some(14),
@@ -3285,6 +3301,7 @@ mod tests {
         assert_eq!(
             load_daemon_config(&fixture.root).unwrap(),
             DaemonConfig {
+                artifact_roots: Vec::new(),
                 retention: RetentionConfig {
                     events_days: Some(7),
                     commands_days: None,

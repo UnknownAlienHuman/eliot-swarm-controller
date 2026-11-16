@@ -2,6 +2,7 @@ mod attention;
 mod attribution;
 mod auth;
 mod catalog;
+mod cleanup;
 mod command;
 mod config_ops;
 mod context;
@@ -323,6 +324,9 @@ impl Router {
                 self.shutdown(&params, &principal).await
             }
             "maintenance.run" => self.maintenance_run(&params, &principal).await,
+            "artifact.register" => self.artifact_register(&params, &principal).await,
+            "cleanup.plan" => self.cleanup_plan(&params, &principal).await,
+            "cleanup.apply" => self.cleanup_apply(&params, &principal).await,
             "command.submit" => {
                 self.submit_bound(&params, &principal, remote.as_ref())
                     .await

@@ -2,6 +2,8 @@
 //! admission and effect handling remain in the Router and Store.
 
 mod agent_views;
+mod cleanup;
+pub use cleanup::*;
 mod config_views;
 mod coordination;
 mod digests;
