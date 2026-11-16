@@ -24,6 +24,155 @@ use std::{
 };
 use ulid::Ulid;
 
+#[test]
+fn failed_turn_records_its_command_as_preceded_by() {
+    // A non-success terminal turn links the command whose terminal event
+    // settled it; success links nothing. Legacy rows read back as None.
+    let mut store = Store::open(Path::new(":memory:")).expect("open store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let launch_id = Ulid::new().to_string();
+    let admission = store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: launch_id.clone(),
+                target: None,
+                selector: None,
+                verb: "launch".to_owned(),
+                args: json!({"project":"preceded-turn", "workspace":"synthetic-workspace", "harness":"codex", "profile":"codex-fixture", "profile_snapshot":{}}),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit launch");
+    let agent = admission.command.target.expect("launch target");
+    store.dispatch(&launch_id, now).expect("dispatch launch");
+    let plan = ["session", "turn", "message", "tool", "request"]
+        .into_iter()
+        .map(|family| (family.to_owned(), "stream".to_owned()))
+        .collect();
+    store
+        .install_plugin_sources(&agent, 1, &launch_id, &plan, now)
+        .expect("install stream source owners");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "ready".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: "ready".to_owned(),
+                    data: json!({"command_id":launch_id}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit ready");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now)
+        .expect("settle start");
+    let run_turn = |store: &mut Store, status: &str, outcome: Option<&str>| -> (String, String) {
+        let send_id = Ulid::new().to_string();
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: send_id.clone(),
+                    target: Some(agent.clone()),
+                    selector: None,
+                    verb: "send".to_owned(),
+                    args: json!({"text":"hi"}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .expect("admit send");
+        store.dispatch(&send_id, now).expect("dispatch send");
+        let turn_id = format!("turn-{send_id}");
+        for (kind, suffix, with_outcome) in [
+            ("turn.started", "started", false),
+            ("turn.completed", "terminal", true),
+        ] {
+            let mut data = json!({"command_id":send_id, "turn_id":turn_id, "status":status});
+            if with_outcome && let Some(outcome) = outcome {
+                data["outcome"] = json!(outcome);
+            }
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: format!("{turn_id}:{suffix}"),
+                        agent_id: agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: kind.to_owned(),
+                            native_id: format!("{turn_id}:{suffix}"),
+                            data,
+                        }],
+                        cursor: None,
+                    },
+                    now,
+                )
+                .expect("commit turn event");
+        }
+        (send_id, turn_id)
+    };
+    let (failed_send, failed_turn) = run_turn(&mut store, "error", Some("failure"));
+    let turn = store
+        .get_turn(&agent, 1, &failed_turn)
+        .expect("read failed turn")
+        .expect("failed turn present");
+    assert_eq!(turn.outcome, Some(TurnOutcome::Failure));
+    assert_eq!(turn.preceded_by.as_deref(), Some(failed_send.as_str()));
+    let (ok_send, ok_turn) = run_turn(&mut store, "completed", Some("success"));
+    let _ = ok_send;
+    let turn = store
+        .get_turn(&agent, 1, &ok_turn)
+        .expect("read success turn")
+        .expect("success turn present");
+    assert_eq!(turn.outcome, Some(TurnOutcome::Success));
+    assert_eq!(turn.preceded_by, None);
+}
+
+#[test]
+fn txn_stats_count_every_committed_transaction() {
+    let before = Store::open(Path::new(":memory:"))
+        .expect("open store")
+        .txn_stats();
+    let mut store = Store::open(Path::new(":memory:")).expect("open store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    store
+        .record_write(
+            &Ulid::new().to_string(),
+            "owner",
+            "test.method",
+            &json!({}),
+            &json!({}),
+            now,
+        )
+        .expect("record write");
+    let after = store.txn_stats();
+    assert!(
+        after.commits > before.commits,
+        "one write commits at least one transaction: {before:?} -> {after:?}"
+    );
+    assert_eq!(
+        after.commit_errors, before.commit_errors,
+        "the write must not fail its commit"
+    );
+}
+
 fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
     let launch_id = Ulid::new().to_string();
     let admission = store
@@ -3244,7 +3393,14 @@ fn workspace_exceptions_stay_marker_bound_across_unknown_readback() {
             1,
             WorkspaceCreationOutcome::Unknown {
                 code: "creation_readback_unknown".to_owned(),
+
                 message: "synthetic uncertainty".to_owned(),
+
+                failure_where: None,
+
+                origin: None,
+
+                origin_evidence: None,
             },
             now,
         )
@@ -7174,7 +7330,9 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
                      DELETE FROM schema_migrations WHERE version = 41;
                      DROP INDEX inference_write_inventory;
                      ALTER TABLE writes DROP COLUMN inference_seq;
-                     DELETE FROM schema_migrations WHERE version >= 39;
+                     ALTER TABLE turns DROP COLUMN preceded_by;
+             DELETE FROM schema_migrations WHERE version = 45;
+             DELETE FROM schema_migrations WHERE version >= 39;
                      DROP TABLE inference_calls;
              DROP TABLE inference_clients;
              DELETE FROM schema_migrations WHERE version = 38;
@@ -7763,7 +7921,14 @@ fn ready_retained_resume_unknown_is_typed_and_dispatched_winner_is_refused() {
                 2,
                 WorkspaceCreationOutcome::Unknown {
                     code: "retained_inspection_unknown".to_owned(),
+
                     message: "retained checkout inspection did not complete".to_owned(),
+
+                    failure_where: None,
+
+                    origin: None,
+
+                    origin_evidence: None,
                 },
                 now + 8,
             )
@@ -7881,7 +8046,14 @@ fn ready_retained_resume_unknown_is_typed_and_dispatched_winner_is_refused() {
                 2,
                 WorkspaceCreationOutcome::Unknown {
                     code: "late_retained_inspection_error".to_owned(),
+
                     message: "losing inspection completed after native dispatch".to_owned(),
+
+                    failure_where: None,
+
+                    origin: None,
+
+                    origin_evidence: None,
                 },
                 now + 9,
             )

@@ -2896,7 +2896,7 @@ do = [{ action = 'launch', role = 'worker', workspace = 'C:/work', assignment = 
         let error = evaluate(&oversized, &event).unwrap_err();
         assert_eq!(error.code, "invalid");
         assert_eq!(
-            error.message,
+            error.message.as_str(),
             "rendered send text exceeds the 64 KiB persisted-text bound"
         );
     }
@@ -3074,7 +3074,7 @@ do = [{ action = 'launch', role = 'worker', workspace = 'C:/work', assignment = 
         let error = evaluate(&rule, &event).unwrap_err();
         assert_eq!(error.code, "invalid");
         assert_eq!(
-            error.message,
+            error.message.as_str(),
             "steer expected_turn_id must match event.data.turn_id"
         );
     }
@@ -3117,7 +3117,7 @@ do = [{ action = 'launch', role = 'worker', workspace = 'C:/work', assignment = 
         let error = evaluate(&oversized, &event).unwrap_err();
         assert_eq!(error.code, "invalid");
         assert_eq!(
-            error.message,
+            error.message.as_str(),
             "rendered steer text exceeds the 512 KiB text bound"
         );
     }
@@ -3432,7 +3432,7 @@ do = [{ action = 'launch', role = 'worker', workspace = 'C:/work', assignment = 
         let error = evaluate(&rule, &event).unwrap_err();
         assert_eq!(error.code, "invalid");
         assert_eq!(
-            error.message,
+            error.message.as_str(),
             "rendered action target exceeds Agent id bounds"
         );
     }

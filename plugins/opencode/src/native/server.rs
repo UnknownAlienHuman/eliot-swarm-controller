@@ -26,7 +26,7 @@ use std::{
     time::Duration,
 };
 
-use eliot_core::{Error, Result, SecretPolicy};
+use eliot_core::{Error, FailureOrigin, Result, SecretPolicy};
 use eliot_plugin::{StderrCapture, session::paths_equal, skill, spawn_stderr};
 use tokio::{
     net::TcpListener,
@@ -366,6 +366,11 @@ impl OwnedServer {
                     "native_spawn",
                     format!("OpenCode per-Agent skill could not be written: {error}"),
                 )
+                .with_where("plugin.opencode.start.spawn")
+                .with_origin(
+                    FailureOrigin::Environment,
+                    "isolated instance directory write failed",
+                )
             })?;
         }
         // Credential preparation before `serve` starts, under the exact XDG
@@ -430,7 +435,28 @@ impl OwnedServer {
                 // fail definite, never unknown-by-deadline.
                 envelope,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                // A definite no-effect transfer failure can belong to the OS,
+                // credentials, native CLI or our validation. Preserve typed
+                // evidence; uncertainty about an import remains explicit.
+                let mut error = error.with_where("plugin.opencode.start.auth_transfer");
+                if error.origin.is_none() {
+                    if error.code == "unknown" {
+                        error = error.with_origin(
+                            FailureOrigin::Unknown,
+                            "credential transfer outcome uncertain; isolated store may be written",
+                        );
+                    } else {
+                        error = eliot_plugin::session::classify_start_failure(
+                            error,
+                            "opencode",
+                            "auth_transfer",
+                        );
+                    }
+                }
+                error
+            })?;
         }
 
         // Reserve a loopback port, then hand it to the server. A transient
@@ -444,6 +470,11 @@ impl OwnedServer {
                     "native_spawn",
                     format!("OpenCode loopback port could not be reserved: {error}"),
                 )
+                .with_where("plugin.opencode.start.spawn")
+                .with_origin(
+                    FailureOrigin::Environment,
+                    "loopback port reservation failed",
+                )
             })?
             .local_addr()
             .map_err(|error| {
@@ -451,6 +482,8 @@ impl OwnedServer {
                     "native_spawn",
                     format!("OpenCode loopback port could not be read: {error}"),
                 )
+                .with_where("plugin.opencode.start.spawn")
+                .with_origin(FailureOrigin::Environment, "loopback port readback failed")
             })?
             .port();
         let password = format!("eliot-{}-{}", ulid::Ulid::new(), ulid::Ulid::new());
@@ -485,11 +518,16 @@ impl OwnedServer {
                     "could not start the configured OpenCode serve: {error}"
                 )),
             )
+            .with_where("plugin.opencode.start.spawn")
+            .with_origin(
+                FailureOrigin::Environment,
+                "OS could not start the native serve binary",
+            )
         })?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::new("native_spawn", "OpenCode serve stdout was not piped"))?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            Error::new("native_spawn", "OpenCode serve stdout was not piped")
+                .with_where("plugin.opencode.start.spawn")
+        })?;
         let stderr = child
             .stderr
             .take()
@@ -552,6 +590,12 @@ impl OwnedServer {
                             format!(": {}", tail.lines().last().unwrap_or_default())
                         }
                     ),
+                )
+                .with_where("plugin.opencode.start.spawn")
+                .with_exit(status.code())
+                .with_origin(
+                    FailureOrigin::Environment,
+                    "native serve process exited during startup",
                 ));
             }
             match self.http.get_config(deadline).await {

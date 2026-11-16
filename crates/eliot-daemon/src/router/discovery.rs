@@ -95,6 +95,16 @@ const METHODS: &[Method] = &[
         {}
     ),
     method!("daemon.shutdown", DaemonShutdownRequest, DaemonShutdownResponse, true, true, "Request drain or force shutdown; acknowledgement is not process-exit proof.", {"id":EXAMPLE_ID,"mode":"drain"}),
+    #[cfg(debug_assertions)]
+    method!(
+        "daemon.panic_test",
+        DaemonPanicTestRequest,
+        DaemonPanicTestResponse,
+        true,
+        false,
+        "Debug builds only: force a daemon panic to test crash capture (Owner).",
+        {}
+    ),
     method!(
         "maintenance.run",
         MaintenanceRunRequest,
@@ -150,6 +160,7 @@ const METHODS: &[Method] = &[
     method!("agent.edits", AgentEditsRequest, AgentEditsResponse, false, false, "Read a bounded page of observed workspace edits.", {"id":"a1","limit":20}),
     method!("turn.get", TurnGetRequest, Turn, false, false, "Read one exact Agent/generation/turn binding.", {"agent":"a1","generation":1,"turn_id":"turn-1"}),
     method!("turn.resolve", TurnResolveRequest, TurnResolveResponse, true, true, "Record an owner resolution for one uncertain exact turn.", {"id":EXAMPLE_ID,"agent":"a1","generation":1,"turn_id":"turn-1","status":"completed","reason":"Owner verified completion."}),
+    method!("diagnose", DiagnoseRequest, DiagnoseResponse, true, false, "Explain a failed command, Agent or agent:turn: origin, where, exits, stderr tail (Owner).", {"target":"a1"}),
     method!(
         "events.bounds",
         EventsBoundsRequest,

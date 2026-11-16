@@ -227,7 +227,10 @@ mod tests {
         for params in [top_level, nested_gap] {
             let error = decode_handoff(params).unwrap_err();
             assert_eq!(error.code, "invalid");
-            assert_eq!(error.message, "source.handoff params are malformed");
+            assert_eq!(
+                error.message.as_str(),
+                "source.handoff params are malformed"
+            );
         }
     }
 }

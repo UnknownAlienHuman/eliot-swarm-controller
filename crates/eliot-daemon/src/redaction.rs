@@ -9,12 +9,11 @@ pub(crate) fn redact_value(value: &mut Value, secrets: &[String]) -> bool {
     SecretPolicy::new(secrets).redact_values(value)
 }
 
-pub(crate) fn redact_error(mut error: Error, secrets: &[String]) -> Error {
-    let policy = SecretPolicy::new(secrets);
-    error.message = policy.redact_text(&error.message);
-    redact_tails(&mut error.diagnostics, &policy);
-    bound_stderr_diagnostics(&mut error.diagnostics, MAX_STDERR_DIAGNOSTIC_BYTES);
-    error
+pub(crate) fn redact_error(error: Error, secrets: &[String]) -> Error {
+    // The boundary behind every persisted outcome, event and log record:
+    // redacted message, origin evidence and stderr tails, normalized
+    // `where`, every bound re-applied.
+    error.sanitized(&SecretPolicy::new(secrets))
 }
 
 fn take_diagnostics(value: &mut Value) -> Vec<StderrDiagnostic> {
@@ -29,7 +28,7 @@ fn take_diagnostics(value: &mut Value) -> Vec<StderrDiagnostic> {
     serde_json::from_value::<Error>(
         json!({"code": "diagnostic", "message": "", "diagnostics": raw}),
     )
-    .map(|error| error.diagnostics)
+    .map(|error| *error.diagnostics)
     .unwrap_or_default()
 }
 

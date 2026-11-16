@@ -1,4 +1,4 @@
-use eliot_core::{Error, Result};
+use eliot_core::{Error, FailureOrigin, Result, SecretPolicy};
 use eliot_plugin::protocol::{
     DecodeErrorKind, EncodeErrorKind, PrivateIncoming as Incoming, decode_private_frame,
     encode_private_frame, valid_private_id,
@@ -147,7 +147,11 @@ impl PluginClient {
             .inner
             .next_id
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| Error::new("internal", "plugin RPC id space exhausted"))?;
+            .map_err(|_| {
+                Error::new("internal", "plugin RPC id space exhausted")
+                    .with_where("plugin.command.queue")
+                    .with_origin(FailureOrigin::Swarm, "plugin RPC id space exhausted")
+            })?;
         let id = Value::String(format!("host-{sequence}"));
         let key = id_key(&id)?;
         let request = RpcRequest {
@@ -200,10 +204,32 @@ impl PluginClient {
         params: Value,
         deadline: Instant,
     ) -> Result<Value> {
-        self.begin_call(method, params, deadline)
+        // Debug mode times every daemon-to-plugin call at this choke
+        // point: method, elapsed milliseconds, ok/error. The method
+        // vocabulary is ours; params and results never enter the record.
+        let debug_started = crate::logging::is_debug().then(std::time::Instant::now);
+        let result = self
+            .begin_call(method, params, deadline)
             .await?
             .finish(Some(deadline))
-            .await
+            .await;
+        if let Some(started) = debug_started {
+            let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            let (code, error_code) = match &result {
+                Ok(_) => ("plugin.call.ok", String::new()),
+                Err(error) => ("plugin.call.error", error.code.clone()),
+            };
+            crate::logging::record_debug(
+                &SecretPolicy::default(),
+                code,
+                &[("method", method), ("code", error_code.as_str())],
+                &[
+                    ("elapsed_ms", elapsed_ms),
+                    ("ok", u64::from(result.is_ok())),
+                ],
+            );
+        }
+        result
     }
 
     pub(crate) async fn respond(
@@ -221,10 +247,22 @@ impl PluginClient {
             },
             Err(error) => {
                 let mut data = json!({"code": error.code});
-                if let Ok(value) = serde_json::to_value(&error)
-                    && let Some(diagnostics) = value.get("diagnostics")
-                {
-                    data["diagnostics"] = diagnostics.clone();
+                if let Ok(value) = serde_json::to_value(&error) {
+                    // Daemon error replies keep the typed failure location
+                    // and origin the daemon classified, so the plugin side
+                    // can report why and where without guessing from text.
+                    for key in [
+                        "where",
+                        "origin",
+                        "origin_evidence",
+                        "exit_code",
+                        "ntstatus",
+                        "diagnostics",
+                    ] {
+                        if let Some(field) = value.get(key) {
+                            data[key] = field.clone();
+                        }
+                    }
                 }
                 RpcResponse {
                     jsonrpc: "2.0".to_owned(),
@@ -232,7 +270,7 @@ impl PluginClient {
                     result: None,
                     error: Some(RpcError {
                         code: -32000,
-                        message: error.message,
+                        message: *error.message,
                         data: Some(data),
                     }),
                 }
@@ -330,6 +368,11 @@ impl PendingCall {
                     return Err(Error::new(
                         "unknown",
                         format!("plugin method {} timed out after dispatch", self.method),
+                    )
+                    .with_where(format!("plugin.command.{}", self.method))
+                    .with_origin(
+                        FailureOrigin::Swarm,
+                        "daemon plugin-call deadline elapsed while a native outcome was pending",
                     ));
                 }
             },
@@ -341,9 +384,18 @@ impl PendingCall {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => return Err(unknown_transport_error(error)),
             Err(_) => {
+                // The plugin died or the transport closed mid-call. The
+                // panic-marker attach in settlement upgrades this when the
+                // plugin left a crash marker; otherwise the origin stays
+                // unknown with the missing evidence named.
                 return Err(Error::new(
                     "unknown",
                     "plugin connection ended while a native outcome was pending",
+                )
+                .with_where("plugin.command.connection")
+                .with_origin(
+                    FailureOrigin::Unknown,
+                    "connection loss without a plugin crash marker or error reply",
                 ));
             }
         };
@@ -490,9 +542,14 @@ where
                                     "events.put outcome unknown: plugin_request_queue_closed",
                                 ))
                             }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                Some(Error::new("busy", "plugin request queue is full"))
-                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => Some(
+                                Error::new("busy", "plugin request queue is full")
+                                    .with_where("plugin.command.queue")
+                                    .with_origin(
+                                        FailureOrigin::Swarm,
+                                        "plugin request queue is full",
+                                    ),
+                            ),
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 Some(Error::new("unavailable", "plugin request queue is closed"))
                             }
@@ -567,11 +624,24 @@ fn error_from_reply(error: RpcError) -> Error {
         ),
     };
     let mut value = json!({"code": code, "message": message});
-    if let Some(diagnostics) = error.data.as_ref().and_then(|data| data.get("diagnostics")) {
-        value["diagnostics"] = diagnostics.clone();
+    if let Some(data) = error.data.as_ref() {
+        // The plugin reply carries the typed failure location and origin it
+        // classified; core drops/bounds malformed optional fields
+        // independently of the primary error. No tail may change C1
+        // classification or imply success.
+        for key in [
+            "where",
+            "origin",
+            "origin_evidence",
+            "exit_code",
+            "ntstatus",
+            "diagnostics",
+        ] {
+            if let Some(field) = data.get(key) {
+                value[key] = field.clone();
+            }
+        }
     }
-    // Core drops/bounds malformed optional diagnostics independently of the
-    // primary error. No tail may change C1 classification or imply success.
     serde_json::from_value(value).unwrap_or_else(|_| Error::new(code, message))
 }
 
@@ -602,11 +672,26 @@ fn unknown_transport_error(error: Error) -> Error {
     let message = format!("plugin outcome unknown: plugin_transport_{cause}");
     let mut error = error;
     error.code = "unknown".to_owned();
-    error.message = message;
+    error.message = message.into();
+    // A framing/connection failure is ours to name: the daemon-plugin
+    // transport, not the plugin's last known location.
+    error.failure_where = Some("plugin.command.transport".into());
+    error.origin = Some(FailureOrigin::Swarm);
+    error.origin_evidence = Some("daemon-plugin transport failure".into());
     error
 }
 
 async fn fail_connection(inner: &ClientInner, error: Error) {
+    // Transport failures are ours to name: the daemon-plugin transport, not
+    // the plugin's last known location. Explicit classification survives;
+    // only missing location/origin falls back here.
+    let mut error = error;
+    if error.failure_where.is_none() {
+        error = error.with_where("plugin.command.transport");
+    }
+    if error.origin.is_none() {
+        error = error.with_origin(FailureOrigin::Swarm, "daemon-plugin transport failure");
+    }
     let first = {
         let mut closed = inner.closed.lock().await;
         if closed.is_some() {

@@ -16,7 +16,7 @@ use eliot_core::{
 use eliot_plugin::{
     PluginManifest, StderrCapture, StderrView,
     protocol::{HookEvent, HookResponse},
-    spawn_stderr,
+    spawn_plugin_stderr,
     sync::LockExt,
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -570,10 +570,25 @@ impl PluginHost {
             ));
         };
 
-        let stderr_capture = spawn_stderr(
-            stderr,
-            Arc::new(SecretPolicy::new(source_credentials.iter())),
-        );
+        let telemetry_policy = Arc::new(SecretPolicy::new(source_credentials.iter()));
+        let debug_policy = Arc::clone(&telemetry_policy);
+        let stderr_capture = spawn_plugin_stderr(stderr, telemetry_policy, move |line| {
+            if crate::logging::is_debug()
+                && let Some(record) = eliot_plugin::parse_debug_line(line)
+            {
+                let ids: Vec<_> = record
+                    .ids
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                let fields: Vec<_> = record
+                    .fields
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), *v))
+                    .collect();
+                crate::logging::record_debug(&debug_policy, &record.code, &ids, &fields);
+            }
+        });
         let stderr_view = stderr_capture.view();
 
         let connection = PluginConnection::new(stdout, stdin);
@@ -1618,6 +1633,15 @@ async fn run_agent_inner(
     loop {
         tokio::select! {
             status = child.wait() => {
+                // The plugin process exit is process evidence: its numeric
+                // code (and NTSTATUS for crash statuses) with the redacted
+                // stderr tail is recorded on `agent.lost` below. A killed
+                // process has no code; the tail still says what it last
+                // reported.
+                let exit = eliot_core::ProcessExit::from_code(
+                    status.as_ref().ok().and_then(|status| status.code()),
+                );
+                let stderr_tail = stderr.snapshot().text;
                 if let Some(state) = state.upgrade() {
                     fence_command_routing(&state, &key);
                 }
@@ -1660,7 +1684,13 @@ async fn run_agent_inner(
                     &state, &key, drained, control_gone, gap_reason,
                 ).await.is_ok();
                 if source_settled && control_gone && !planned_exit {
-                    mark_lost_state(&state, &key).await;
+                    mark_lost_state_with_exit(
+                        &state,
+                        &key,
+                        Some(exit),
+                        Some(stderr_tail),
+                    )
+                    .await;
                 }
                 break;
             }
@@ -2844,8 +2874,26 @@ fn redact_native_error(error: Error, credentials: &[String]) -> Error {
 }
 
 fn diagnose_error(error: Error, stderr: &StderrView, credentials: &[String]) -> Error {
+    // This view is obtained from running[AgentKey] and drains exactly one
+    // owned process pipe. A disk marker from another process/generation can
+    // never enter this path. Marker evidence never replaces the effect code.
+    let snapshot = stderr.snapshot();
+    let mut error = error;
+    for line in snapshot.text.lines() {
+        if let Some(json) = line.strip_prefix("eliot_crash ")
+            && let Ok(marker) = serde_json::from_str::<eliot_core::api::CrashMarker>(json)
+            && marker.code == "plugin.panicked"
+            && marker.validate().is_ok()
+        {
+            let evidence = error
+                .origin_evidence
+                .as_deref()
+                .unwrap_or("original failure origin unclassified");
+            error.origin_evidence = Some(format!("{evidence}; {}", marker.summary()).into());
+        }
+    }
     redact_native_error(
-        error.with_stderr(StderrSource::Plugin, stderr.snapshot()),
+        error.with_stderr(StderrSource::Plugin, snapshot),
         credentials,
     )
 }
@@ -3847,7 +3895,9 @@ async fn settle_drained_source_exit(
     .await;
     settlement.map_err(|mut error: Error| {
         error.code = "unknown".to_owned();
-        error.message = "owned exit native source settlement is unconfirmed".to_owned();
+        error.message = "owned exit native source settlement is unconfirmed"
+            .to_owned()
+            .into();
         error
     })?;
     if !reader_closed {
@@ -3893,6 +3943,20 @@ async fn record_root_exit_gap(state: &Weak<HostState>, key: &AgentKey, reason: &
 }
 
 async fn mark_lost_state(state: &Weak<HostState>, key: &AgentKey) {
+    mark_lost_state_with_exit(state, key, None, None).await;
+}
+
+/// Mark an agent generation lost with its process exit evidence: the
+/// numeric exit code, the Windows NTSTATUS hex for crash statuses, and the
+/// bounded redacted stderr tail recorded on the `agent.lost` event. Exit
+/// evidence comes from the observed plugin process wait; the tail is the
+/// already-redacted capture snapshot.
+async fn mark_lost_state_with_exit(
+    state: &Weak<HostState>,
+    key: &AgentKey,
+    exit: Option<eliot_core::ProcessExit>,
+    stderr_tail: Option<String>,
+) {
     let Some(state) = state.upgrade() else {
         return;
     };
@@ -3903,7 +3967,9 @@ async fn mark_lost_state(state: &Weak<HostState>, key: &AgentKey) {
             deferred.store(true, Ordering::Release);
             return;
         }
-        if let Ok(events) = store.mark_lost(&key.id, key.generation, now_ms()) {
+        if let Ok(events) =
+            store.mark_lost_with_exit(&key.id, key.generation, now_ms(), exit, stderr_tail)
+        {
             state.bus.publish(&events);
             note_unknown_commands(&state, &events);
         }
@@ -3991,6 +4057,49 @@ pub(crate) fn forget_revoked_agent_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn plugin_panic_evidence_is_pipe_local_and_preserves_rejection() {
+        let marker = eliot_core::api::CrashMarker {
+            code: "plugin.panicked".to_owned(),
+            thread: "main".to_owned(),
+            location: "plugin.rs:42".to_owned(),
+            message: "payload omitted".to_owned(),
+            backtrace: String::new(),
+            timestamp: 1,
+        };
+        let a = eliot_plugin::spawn_stderr(
+            std::io::Cursor::new(
+                format!("eliot_crash {}\n", serde_json::to_string(&marker).unwrap()).into_bytes(),
+            ),
+            Arc::new(SecretPolicy::default()),
+        );
+        let b = eliot_plugin::spawn_stderr(
+            std::io::Cursor::new(b"ordinary stderr\n"),
+            Arc::new(SecretPolicy::default()),
+        );
+        let (view_a, view_b) = (a.view(), b.view());
+        a.finish(Instant::now() + RPC_DEADLINE).await;
+        b.finish(Instant::now() + RPC_DEADLINE).await;
+        let original = Error::new("native_not_dispatched", "no effect");
+        let other = diagnose_error(original.clone(), &view_b, &[]);
+        assert!(other.origin_evidence.is_none());
+        let owned = diagnose_error(original.clone(), &view_a, &[]);
+        assert!(
+            owned
+                .origin_evidence
+                .as_deref()
+                .unwrap()
+                .contains("plugin.rs:42")
+        );
+        for error in [owned, other] {
+            assert_eq!(error.code, original.code);
+            assert_eq!(
+                eliot_core::classify_dispatched_error(&error.code),
+                eliot_core::CommandState::Rejected
+            );
+        }
+    }
     use eliot_core::{AgentState, CommandState, NativeEvent, SubmitCommand};
 
     #[test]
@@ -4428,7 +4537,7 @@ mod tests {
 
     fn assert_secret_error(error: Error) {
         assert_eq!(error.code, "secret_in_payload");
-        assert_eq!(error.message, SECRET_ERROR);
+        assert_eq!(error.message.as_str(), SECRET_ERROR);
         assert!(!serde_json::to_string(&error).unwrap().contains(SECRET));
     }
 

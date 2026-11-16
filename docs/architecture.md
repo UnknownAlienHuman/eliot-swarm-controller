@@ -161,6 +161,13 @@ A source's `open|closed` lifecycle, health and historical gap are independent.
 Handoff transfers only the named event families; it does not imply that the previous
 source process closed. The protocol owns the exact transition rules.
 
+Crash capture and diagnosis are read paths, not stores. Panic hooks write bounded
+redacted markers beside the data directory; `diagnose` joins command outcomes,
+turn `preceded_by` links, process exits, stderr tails and the previous marker at
+read time. Debug telemetry is numeric metadata at the same choke points the
+release path already crosses: RPC timing, plugin calls, store commit counters
+and plugin channel/process records, all gated behind the debug log level.
+
 ## Scale without a cluster
 
 Historical/idle Agents are indexed records. Live harnesses consume their native process

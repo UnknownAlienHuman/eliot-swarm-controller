@@ -2005,7 +2005,7 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
             .unwrap_err();
         assert_eq!(error.code, "not_allowed");
         assert_eq!(
-            error.message,
+            error.message.as_str(),
             "project registration changed before timer admission"
         );
     }

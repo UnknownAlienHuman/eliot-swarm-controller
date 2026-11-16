@@ -339,7 +339,10 @@ mod tests {
     fn unknown(result: Result<()>) {
         let error = result.unwrap_err();
         assert_eq!(error.code, "unknown");
-        assert_eq!(error.message, "native metadata response is invalid");
+        assert_eq!(
+            error.message.as_ref(),
+            "native metadata response is invalid"
+        );
         assert!(error.diagnostics.is_empty());
     }
 
