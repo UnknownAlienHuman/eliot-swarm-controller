@@ -52,7 +52,7 @@ replies and unexpected echoes remain `unknown`.
 
 ## Native identity and generation
 
-Subject is `(canonical CLAUDE_CONFIG_DIR + project/store identity, exact session id)`.
+Subject is `(hashed canonical CLAUDE_CONFIG_DIR + project/store identity, exact session id)`; the raw directory never enters committed metadata because the daemon also holds that pass_env value as a secret.
 Resume uses that session in a new Eliot generation. Late stream-json records belong to
 the old generation and cannot affect replacement work. Native subagents normally share parent
 environment; no independent Eliot token without actual isolated environment support.
