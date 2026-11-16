@@ -210,14 +210,25 @@ pub(crate) struct UserContentBlock {
     pub is_error: Option<bool>,
 }
 
-/// Terminal `result` record. Bound to the exact active turn (single flight);
-/// the record itself carries no command uuid.
+/// Terminal `result` record. Autonomous task notifications are not terminals
+/// for a submitted input, even when another Eliot turn is active.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct ResultRecord {
     #[serde(default)]
     pub terminal_reason: String,
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub origin: Option<ResultOrigin>,
+    #[serde(default)]
+    pub user_message_uuid: Option<String>,
+    #[serde(default)]
+    pub user_message_uuids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct ResultOrigin {
+    pub kind: String,
 }
 
 /// Extract one turn's native token usage from a terminal `result` record's
