@@ -194,9 +194,11 @@ pub enum Pick {
     Effort(Option<String>),
 }
 
-/// The one model-and-effort menu: a "Model" and an "Effort" submenu. With
+/// The one model-and-effort menu, flat: a "Model" section and an "Effort"
+/// section, each under a disabled heading (no submenus: WinUI draws a
+/// submenu's chevron at a fixed 12 DIPs, off the icon scale). With
 /// `defaults` each starts with its "Default …" entry (an ad-hoc launch may
-/// leave either to the harness). A refusal replaces that submenu's entries
+/// leave either to the harness). A refusal replaces that section's entries
 /// with the daemon's reason, disabled.
 pub fn menu_items(
     models: &[String],
@@ -229,18 +231,29 @@ pub fn menu_items(
         }
         items
     };
-    vec![
-        MenuItem::submenu(
-            "model",
-            "Model",
-            entries("m", DEFAULT_MODEL, models, model_refusal),
-        ),
-        MenuItem::submenu(
-            "effort",
-            "Effort",
-            entries("e", DEFAULT_EFFORT, efforts, effort_refusal),
-        ),
-    ]
+    let mut items = vec![MenuItem::disabled("model", "Model")];
+    items.extend(entries("m", DEFAULT_MODEL, models, model_refusal));
+    items.push(MenuItem::separator("model-effort"));
+    items.push(MenuItem::disabled("effort", "Effort"));
+    items.extend(entries("e", DEFAULT_EFFORT, efforts, effort_refusal));
+    items
+}
+
+/// The entries of one section of a flat menu (after its heading, up to the
+/// next separator).
+#[cfg(test)]
+fn section<'a>(items: &'a [MenuItem], heading: &str) -> &'a [MenuItem] {
+    let start = items
+        .iter()
+        .position(
+            |item| matches!(item, MenuItem::Item { label, enabled: false, .. } if label == heading),
+        )
+        .map_or(items.len(), |index| index + 1);
+    let end = items[start..]
+        .iter()
+        .position(|item| matches!(item, MenuItem::Separator { .. }))
+        .map_or(items.len(), |offset| start + offset);
+    &items[start..end]
 }
 
 /// An effort's menu label: its name, or "<name> effort" when a model has
@@ -407,9 +420,7 @@ mod tests {
         let models = vec!["high".to_owned(), "m1".to_owned()];
         let efforts = vec!["low".to_owned(), "high".to_owned()];
         let items = menu_items(&models, &efforts, false, None, None);
-        let MenuItem::Submenu { items: effort, .. } = &items[1] else {
-            panic!("effort submenu");
-        };
+        let effort = section(&items, "Effort");
         assert!(matches!(&effort[1], MenuItem::Item { label, .. } if label == "high effort"));
         assert_eq!(
             resolve("high effort", &models, &efforts),
@@ -424,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_replaces_the_submenu_with_the_reason() {
+    fn a_refusal_replaces_the_section_with_the_reason() {
         let items = menu_items(
             &["m1".to_owned()],
             &[],
@@ -432,13 +443,9 @@ mod tests {
             None,
             Some("fixed by the harness"),
         );
-        let MenuItem::Submenu { items: model, .. } = &items[0] else {
-            panic!("model submenu");
-        };
-        assert_eq!(model.len(), 1);
-        let MenuItem::Submenu { items: effort, .. } = &items[1] else {
-            panic!("effort submenu");
-        };
+        assert_eq!(section(&items, "Model").len(), 1);
+        let effort = section(&items, "Effort");
+        assert_eq!(effort.len(), 1);
         assert!(matches!(
             &effort[0],
             MenuItem::Item { label, enabled: false, .. } if label == "fixed by the harness"

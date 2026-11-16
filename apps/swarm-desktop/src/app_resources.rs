@@ -10,9 +10,9 @@
 //! - **Roles.** WinUI's own keys (`microsoft.windowsappsdk.winui` 2.3.0
 //!   `Themes/generic.xaml`) from the window's scheme: the accent ramp, list
 //!   selection, the text box as an M3 outlined text field, the combo box as
-//!   an M3 exposed dropdown menu, the toggle switch, radio buttons and check
-//!   boxes in M3 selection-control roles, menus
-//!   and combo-box popups on surface-container, the dialog on
+//!   an M3 exposed dropdown menu, radio buttons and check boxes in M3
+//!   selection-control roles, menus and combo-box popups on
+//!   surface-container, the dialog on
 //!   surface-container-high, the tooltip on inverse-surface and the focus
 //!   ring in secondary. WinUI resolves a ThemeResource through the
 //!   application's own entries before its merged `XamlControlsResources`,
@@ -24,15 +24,15 @@
 //!   the shown scheme are written as own entries and rewritten when the
 //!   scheme changes ([`apply_scheme`]); under High Contrast they are
 //!   removed and the system colors apply.
-//! - **Styles.** The M3 shapes and paddings that WinUI's own styles fix
-//!   (`Padding="{StaticResource ButtonPadding}"`, one `ControlCornerRadius`
-//!   for every control): one button style per M3 shape under the keys
-//!   Reactor's `ButtonStyle` looks up (see [`styles_xaml`]), text fields and
-//!   combo boxes with the extra-small corner, dialogs with the extra-large
-//!   corner, switches without the On/Off words, and menus without the
-//!   acrylic backdrop, on the solid M3 container. A Reactor `Thickness` or
-//!   `CornerRadius` resource override reaches WinUI as zero (observed live),
-//!   so shapes cannot be per button.
+//! - **Styles.** The shapes, heights and paddings of `ui::tokens` that
+//!   WinUI's own styles fix (`Padding="{StaticResource ButtonPadding}"`,
+//!   one `ControlCornerRadius` for every control): one button style per
+//!   shape under the keys Reactor's `ButtonStyle` looks up (see
+//!   [`styles_xaml`]), text fields, combo boxes and check boxes, menu items
+//!   as control-height rows, dialogs and menus with the container corner,
+//!   and menus without the acrylic backdrop, on the solid M3 container. A
+//!   Reactor `Thickness` or `CornerRadius` resource override reaches WinUI as
+//!   zero (observed live), so shapes cannot be per button.
 //!
 //! Reactor 0.100.0 applies [`windows_reactor::ResourceOverrides`] only to a
 //! `Button` (`native/winui/mod.rs` `set_resource_overrides` writes into that
@@ -52,7 +52,8 @@ use windows_collections::IMap;
 use windows_core::{GUID, HRESULT, HSTRING, IInspectable, IUnknown, Interface, RuntimeName};
 use windows_reference::IReference;
 
-use crate::theme::{self, Rgb8, Scheme, shape, state};
+use crate::theme::{Rgb8, Scheme, state};
+use crate::ui::tokens::{height, radius, spacing};
 
 /// A theme resource value.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -101,7 +102,6 @@ pub fn entries(s: &Scheme) -> Vec<(&'static str, Value)> {
     all.extend(lists(s));
     all.extend(text_field(s));
     all.extend(dropdown(s));
-    all.extend(switch(s));
     all.extend(selection_controls(s));
     all.extend(overlays(s));
     all
@@ -641,93 +641,11 @@ fn selection_controls(s: &Scheme) -> Vec<(&'static str, Value)> {
     all
 }
 
-/// The toggle switch in M3 switch roles: an outlined surface track with an
-/// outline handle when off, a primary track with an on-primary handle when
-/// on (primary-container on hover and press). WinUI keeps its geometry.
-fn switch(s: &Scheme) -> Vec<(&'static str, Value)> {
-    let track_off = s.surface_container_highest;
-    let mut all = vec![
-        ("ToggleSwitchFillOff", opaque(track_off)),
-        (
-            "ToggleSwitchFillOffPointerOver",
-            opaque(track_off.mix(s.on_surface, state::HOVER)),
-        ),
-        (
-            "ToggleSwitchFillOffPressed",
-            opaque(track_off.mix(s.on_surface, state::PRESSED)),
-        ),
-        (
-            "ToggleSwitchFillOffDisabled",
-            layer(s.surface_container_highest, state::DISABLED_CONTAINER),
-        ),
-        ("ToggleSwitchKnobFillOff", opaque(s.outline)),
-        (
-            "ToggleSwitchKnobFillOffPointerOver",
-            opaque(s.on_surface_variant),
-        ),
-        (
-            "ToggleSwitchKnobFillOffPressed",
-            opaque(s.on_surface_variant),
-        ),
-        (
-            "ToggleSwitchKnobFillOffDisabled",
-            layer(s.on_surface, state::DISABLED_CONTENT),
-        ),
-        (
-            "ToggleSwitchStrokeOffDisabled",
-            layer(s.on_surface, state::DISABLED_CONTAINER),
-        ),
-        ("ToggleSwitchFillOn", opaque(s.primary)),
-        ("ToggleSwitchFillOnPointerOver", opaque(s.primary)),
-        ("ToggleSwitchFillOnPressed", opaque(s.primary)),
-        (
-            "ToggleSwitchFillOnDisabled",
-            layer(s.on_surface, state::DISABLED_CONTAINER),
-        ),
-        ("ToggleSwitchKnobFillOn", opaque(s.on_primary)),
-        (
-            "ToggleSwitchKnobFillOnPointerOver",
-            opaque(s.primary_container),
-        ),
-        ("ToggleSwitchKnobFillOnPressed", opaque(s.primary_container)),
-        ("ToggleSwitchKnobFillOnDisabled", opaque(s.surface)),
-        ("ToggleSwitchContentForeground", opaque(s.on_surface)),
-        ("ToggleSwitchHeaderForeground", opaque(s.on_surface)),
-    ];
-    all.extend(every(
-        &[
-            "ToggleSwitchStrokeOff",
-            "ToggleSwitchStrokeOffPointerOver",
-            "ToggleSwitchStrokeOffPressed",
-        ],
-        opaque(s.outline),
-    ));
-    all.extend(every(
-        &[
-            "ToggleSwitchStrokeOn",
-            "ToggleSwitchStrokeOnPointerOver",
-            "ToggleSwitchStrokeOnPressed",
-        ],
-        opaque(s.primary),
-    ));
-    all.extend(every(
-        &[
-            "ToggleSwitchStrokeOnDisabled",
-            "ToggleSwitchKnobStrokeOn",
-            "ToggleSwitchContainerBackground",
-            "ToggleSwitchContainerBackgroundPointerOver",
-            "ToggleSwitchContainerBackgroundPressed",
-            "ToggleSwitchContainerBackgroundDisabled",
-        ],
-        clear(s),
-    ));
-    all
-}
-
 /// Menus and popups: menus on surface-container (M3 menu), the dialog on
 /// surface-container-high with the M3 scrim, the plain tooltip on
-/// inverse-surface; the extra-small corner for controls and overlays (the
-/// dialog's extra-large corner is in its implicit style).
+/// inverse-surface; the control corner for every control template that
+/// reads `ControlCornerRadius` and the container corner for the popups
+/// that read `OverlayCornerRadius` (flyouts, the combo-box list).
 fn overlays(s: &Scheme) -> Vec<(&'static str, Value)> {
     let mut all = vec![
         ("MenuFlyoutPresenterBackground", opaque(s.surface_container)),
@@ -780,8 +698,8 @@ fn overlays(s: &Scheme) -> Vec<(&'static str, Value)> {
         ("ContentDialogBorderWidth", uniform(0.0)),
         ("ToolTipBackground", opaque(s.inverse_surface)),
         ("ToolTipForeground", opaque(s.inverse_on_surface)),
-        ("ControlCornerRadius", Value::Radius(shape::XS)),
-        ("OverlayCornerRadius", Value::Radius(shape::XS)),
+        ("ControlCornerRadius", Value::Radius(radius::CONTROL)),
+        ("OverlayCornerRadius", Value::Radius(radius::CONTAINER)),
     ];
     all.extend(every(
         &[
@@ -858,61 +776,79 @@ pub fn dictionary_xaml(scheme: &Scheme) -> String {
     xaml
 }
 
-/// The button styles by M3 shape, under the keys Reactor's `ButtonStyle`
-/// looks up (`native/winui/generated.rs`: Accent, Subtle, TextLink), and
-/// the implicit styles of the other controls. Button colors stay with the
-/// theme keys and the button families.
+/// The control styles from `ui::tokens`: the button styles under the keys
+/// Reactor's `ButtonStyle` looks up (`native/winui/generated.rs`: Accent,
+/// Subtle, TextLink), and the implicit styles of the other controls.
+/// Button colors stay with the theme keys and the button families.
 ///
-/// - implicit `Button`: common buttons, navigation items and segments (full
-///   corner, 24-DIP sides, label-large weight);
-/// - `SubtleButtonStyle`: icon buttons (full corner, no padding);
-/// - `TextBlockButtonStyle`: chips (small corner, 8/16-DIP sides);
-/// - `AccentButtonStyle`: the extended FAB and card buttons (large corner),
-///   based on WinUI's own AccentButtonStyle so a button without a family
-///   (the hand-off dialog's primary) keeps its theme's filled colors.
+/// - implicit `Button`: every labelled button, row, chip and segment
+///   (control corner, 12-DIP content inset, 32 DIPs, body weight);
+/// - `SubtleButtonStyle`: icon buttons (control corner, no padding);
+/// - `TextBlockButtonStyle`: the one circle, the icon-only Send button;
+/// - `AccentButtonStyle`: the hand-off dialog's primary, which keeps the
+///   theme's filled colors there (based on WinUI's own AccentButtonStyle).
 ///
-/// None of these sets a template: WinUI applies the control's built-in
-/// style underneath, so every button keeps its states and focus visuals.
+/// Text fields, dropdowns and number boxes take the control corner and
+/// height, check boxes the M3 default corner, menu items the control
+/// height, menus and dialogs the container corner. None of these sets a template: WinUI applies the
+/// control's built-in style underneath, so every control keeps its states
+/// and focus visuals.
 pub fn styles_xaml() -> String {
-    let (xs, sm, lg, xl, full) = (shape::XS, shape::SM, shape::LG, shape::XL, shape::FULL);
-    let icon = theme::layout::ICON_BUTTON / 2.0;
+    let (control, container, circle, check) = (
+        radius::CONTROL,
+        radius::CONTAINER,
+        radius::CIRCLE,
+        radius::CHECK_BOX,
+    );
+    // Menu items are control-height rows: WinUI pads them from a
+    // StaticResource (11,9,11,10), so only a style sets their height.
+    let (min, inset) = (height::CONTROL, spacing::INSET);
     format!(
         "{XAML_ROOT}\
          <Style TargetType=\"Button\">\
-           <Setter Property=\"CornerRadius\" Value=\"{full}\"/>\
-           <Setter Property=\"Padding\" Value=\"24,0,24,0\"/>\
-           <Setter Property=\"FontWeight\" Value=\"Medium\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\
+           <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
+           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
          </Style>\
          <Style x:Key=\"SubtleButtonStyle\" TargetType=\"Button\">\
-           <Setter Property=\"CornerRadius\" Value=\"{icon}\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\
            <Setter Property=\"Padding\" Value=\"0\"/>\
          </Style>\
          <Style x:Key=\"TextBlockButtonStyle\" TargetType=\"Button\">\
-           <Setter Property=\"CornerRadius\" Value=\"{sm}\"/>\
-           <Setter Property=\"Padding\" Value=\"8,0,16,0\"/>\
-           <Setter Property=\"FontWeight\" Value=\"Medium\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{circle}\"/>\
+           <Setter Property=\"Padding\" Value=\"0\"/>\
          </Style>\
          <Style x:Key=\"AccentButtonStyle\" TargetType=\"Button\" \
                 BasedOn=\"{{StaticResource AccentButtonStyle}}\">\
-           <Setter Property=\"CornerRadius\" Value=\"{lg}\"/>\
-           <Setter Property=\"Padding\" Value=\"16,0,20,0\"/>\
-           <Setter Property=\"FontWeight\" Value=\"Medium\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\
+           <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
+           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
          </Style>\
          <Style TargetType=\"TextBox\">\
-           <Setter Property=\"CornerRadius\" Value=\"{xs}\"/>\
-           <Setter Property=\"Padding\" Value=\"14,10,10,10\"/>\
-           <Setter Property=\"MinHeight\" Value=\"44\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\
+           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
          </Style>\
          <Style TargetType=\"ComboBox\">\
-           <Setter Property=\"CornerRadius\" Value=\"{xs}\"/>\
-           <Setter Property=\"MinHeight\" Value=\"44\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\
+           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
          </Style>\
-         <Style TargetType=\"ToggleSwitch\">           <Setter Property=\"OnContent\" Value=\"\"/>           <Setter Property=\"OffContent\" Value=\"\"/>           <Setter Property=\"MinWidth\" Value=\"0\"/>         </Style>         <Style TargetType=\"ContentDialog\">\
-           <Setter Property=\"CornerRadius\" Value=\"{xl}\"/>\
+         <Style TargetType=\"CheckBox\">\
+           <Setter Property=\"CornerRadius\" Value=\"{check}\"/>\
+         </Style>\
+         <Style TargetType=\"ContentDialog\">\
+           <Setter Property=\"CornerRadius\" Value=\"{container}\"/>\
+         </Style>\
+         <Style TargetType=\"MenuFlyoutItem\">\
+           <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
+           <Setter Property=\"Height\" Value=\"{min}\"/>\
+         </Style>\
+         <Style TargetType=\"MenuFlyoutSubItem\">\
+           <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
+           <Setter Property=\"Height\" Value=\"{min}\"/>\
          </Style>\
          <Style TargetType=\"MenuFlyoutPresenter\">\
            <Setter Property=\"SystemBackdrop\" Value=\"{{x:Null}}\"/>\
-           <Setter Property=\"CornerRadius\" Value=\"{xs}\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{container}\"/>\
          </Style>\
          </ResourceDictionary>"
     )
@@ -1112,7 +1048,6 @@ mod tests {
                 "ListViewItemBackgroundSelected",
                 "TextControlBorderBrushFocused",
                 "ComboBoxDropDownBackground",
-                "ToggleSwitchFillOn",
                 "MenuFlyoutPresenterBackground",
                 "ContentDialogBackground",
             ] {
@@ -1174,7 +1109,8 @@ mod tests {
         assert!(xaml.contains(
             "<Thickness x:Key=\"TextControlBorderThemeThicknessFocused\">2,2,2,2</Thickness>"
         ));
-        assert!(xaml.contains("<CornerRadius x:Key=\"OverlayCornerRadius\">4</CornerRadius>"));
+        assert!(xaml.contains("<CornerRadius x:Key=\"ControlCornerRadius\">8</CornerRadius>"));
+        assert!(xaml.contains("<CornerRadius x:Key=\"OverlayCornerRadius\">12</CornerRadius>"));
     }
 
     #[test]
@@ -1190,6 +1126,15 @@ mod tests {
             assert!(xaml.contains(&format!("x:Key=\"{key}\"")), "{key}");
         }
         assert!(!xaml.contains("ThemeResource"));
-        assert_eq!(xaml.matches("<Style ").count(), 9);
+        assert_eq!(xaml.matches("<Style ").count(), 11);
+        // Only the token radii appear: control, container, the Send circle
+        // and the M3 check box.
+        for radius in xaml
+            .split("Property=\"CornerRadius\" Value=\"")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap_or_default())
+        {
+            assert!(["8", "12", "16", "2"].contains(&radius), "{radius}");
+        }
     }
 }

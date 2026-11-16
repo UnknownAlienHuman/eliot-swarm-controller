@@ -61,6 +61,7 @@ mod profiles_ui;
 mod scripts_ui;
 mod settings_ui;
 mod shell_ui;
+pub(crate) mod tokens;
 
 use automation_ui::AutomationMsg;
 use chat_ui::ChatMsg;

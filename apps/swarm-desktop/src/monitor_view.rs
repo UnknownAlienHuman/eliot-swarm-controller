@@ -12,6 +12,7 @@ use crate::monitor::{
 };
 use crate::theme;
 use crate::theme::winui::Palette;
+use crate::ui::tokens;
 
 /// One possible new manager with its two bound moves.
 pub struct MoveRow {
@@ -21,8 +22,10 @@ pub struct MoveRow {
     pub move_children: Option<Callback<()>>,
 }
 
+/// A note: secondary size, wrapped and selectable (callers lower its
+/// emphasis where it is supporting text).
 fn small(text: impl Into<String>) -> TextBlock {
-    crate::m3::text(text, theme::type_scale::BODY_SMALL)
+    crate::m3::text(text, tokens::text::SECONDARY)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }
@@ -36,52 +39,47 @@ pub fn card(row: &MonitorRow, title: &str, open: Callback<()>, palette: Palette)
         .as_deref()
         .map(|parent| format!(" · under {parent}"))
         .unwrap_or_default();
-    // The card style pads 16/20 at the sides; the content evens the right
-    // side and adds the card's 12-DIP top and bottom.
-    crate::m3::card_button(palette)
-        .automation_name(format!(
+    // The button pads its content by the control inset; the content adds
+    // the same inset above and below.
+    crate::m3::card_button(
+        palette,
+        format!(
             "{title}, {state}, {}{under}, {}",
             row.harness,
             row.operation()
-        ))
-        .on_click(open)
-        .content(
-            StackPanel::new()
-                .spacing(theme::spacing::XS)
-                .margin(Thickness::new(0.0, 12.0, -4.0, 12.0))
-                .children((
-                    Grid::new()
-                        .columns([GridLength::STAR, GridLength::Auto])
-                        .column_spacing(theme::spacing::SM)
-                        .children((
-                            crate::m3::text(title.to_owned(), theme::type_scale::TITLE_SMALL)
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .text_trimming(TextTrimming::CharacterEllipsis),
-                            Border::new()
-                                .grid_column(1)
-                                .content(crate::m3::status_chip(palette, state)),
-                        )),
-                    crate::m3::muted(
-                        format!("{} · {}{under}", row.harness, row.operation()),
-                        theme::type_scale::BODY_MEDIUM,
-                    )
+        ),
+        open,
+        StackPanel::new()
+            .spacing(tokens::spacing::XS)
+            .margin(Thickness::xy(0.0, tokens::spacing::INSET))
+            .children((
+                Grid::new()
+                    .columns([GridLength::STAR, GridLength::Auto])
+                    .column_spacing(tokens::spacing::SM)
+                    .children((
+                        crate::m3::section_title(title.to_owned())
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .text_trimming(TextTrimming::CharacterEllipsis),
+                        Border::new()
+                            .grid_column(1)
+                            .content(crate::m3::status(palette, state)),
+                    )),
+                crate::m3::body(format!("{} · {}{under}", row.harness, row.operation()))
+                    .opacity(theme::MUTED_OPACITY)
                     .text_trimming(TextTrimming::CharacterEllipsis),
-                    crate::m3::muted(
-                        format!(
-                            "{} · CPU {} · {}",
-                            bytes_label(row.obs.rss_bytes()),
-                            cpu_time_label(row.obs.cpu_time_ns()),
-                            tokens_label(row)
-                        ),
-                        theme::type_scale::BODY_SMALL,
-                    )
-                    .text_trimming(TextTrimming::CharacterEllipsis),
-                )),
-        )
+                crate::m3::secondary(format!(
+                    "{} · CPU {} · {}",
+                    bytes_label(row.obs.rss_bytes()),
+                    cpu_time_label(row.obs.cpu_time_ns()),
+                    tokens_label(row)
+                ))
+                .text_trimming(TextTrimming::CharacterEllipsis),
+            )),
+    )
 }
 
 /// Plot height in DIPs; the bars stretch across the card width.
-const PLOT_HEIGHT: f64 = 64.0;
+const PLOT_HEIGHT: f64 = tokens::layout::PLOT_HEIGHT;
 /// Smallest CPU scale in percent, so a near-idle series is not drawn full
 /// height.
 const CPU_FLOOR_PERCENT: f64 = 5.0;
@@ -162,34 +160,36 @@ fn chart_card(
         .map(|(index, value)| {
             let view = match value {
                 Some(value) => Border::new()
-                    .height((value / ceiling * PLOT_HEIGHT).clamp(2.0, PLOT_HEIGHT))
+                    .height(
+                        (value / ceiling * PLOT_HEIGHT)
+                            .clamp(tokens::layout::PLOT_STUB, PLOT_HEIGHT),
+                    )
                     .background(bar),
                 None => Border::new()
-                    .height(2.0)
-                    .opacity(0.3)
+                    .height(tokens::layout::PLOT_STUB)
+                    .opacity(theme::MUTED_OPACITY)
                     .background(palette.outline_variant()),
             };
             KeyedView::new(
                 index,
-                view.margin(Thickness::xy(1.0, 0.0))
-                    .corner_radius(CornerRadius::new(2.0, 2.0, 0.0, 0.0))
+                view.margin(Thickness::xy(tokens::layout::PLOT_GAP, 0.0))
                     .vertical_alignment(VerticalAlignment::Bottom)
                     .grid_column((first + index) as i32),
             )
         })
         .collect();
-    StackPanel::new().spacing(theme::spacing::XS).children((
+    StackPanel::new().spacing(tokens::spacing::XS).children((
         Grid::new()
             .columns([GridLength::STAR, GridLength::Auto])
             .children((
-                crate::m3::muted(title, theme::type_scale::LABEL_MEDIUM)
+                crate::m3::muted(title, tokens::text::SECONDARY)
                     .vertical_alignment(VerticalAlignment::Bottom),
-                crate::m3::text(latest, theme::type_scale::TITLE_MEDIUM).grid_column(1),
+                crate::m3::text(latest, tokens::text::SECTION_TITLE).grid_column(1),
             )),
         Border::new()
             .background(palette.well())
-            .corner_radius(theme::shape::SM)
-            .padding(Thickness::uniform(theme::spacing::XS))
+            .corner_radius(tokens::radius::CONTAINER)
+            .padding(Thickness::uniform(tokens::spacing::SM))
             .content(
                 Grid::new()
                     .height(PLOT_HEIGHT)
@@ -370,21 +370,21 @@ pub fn manager_section(
         .map(|row| {
             let button = |text: &str, name: String, callback: Option<Callback<()>>| -> View {
                 match callback {
-                    Some(callback) => crate::m3::tonal(palette)
+                    Some(callback) => crate::m3::outlined(palette)
                         .is_enabled(enabled)
                         .automation_name(name)
                         .on_click(callback)
-                        .content(TextBlock::new().text(text.to_owned())),
+                        .content(crate::m3::label(text)),
                     None => View::empty(),
                 }
             };
             KeyedView::new(
                 row.id.clone(),
-                StackPanel::new().spacing(theme::spacing::XS).children((
+                StackPanel::new().spacing(tokens::spacing::XS).children((
                     small(row.label.clone()),
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
-                        .spacing(theme::spacing::SM)
+                        .spacing(tokens::spacing::SM)
                         .children((
                             button(
                                 "Move here",
@@ -408,12 +408,11 @@ pub fn manager_section(
             .to_owned()
     };
     crate::m3::card_high(palette).content(
-        StackPanel::new().spacing(theme::spacing::SM).children((
-            crate::m3::text("Change manager", theme::type_scale::TITLE_SMALL)
-                .automation_heading_level(AutomationHeadingLevel::Level3),
+        StackPanel::new().spacing(tokens::spacing::SM).children((
+            crate::m3::section_title("Change manager"),
             small(note).opacity(theme::MUTED_OPACITY),
             StackPanel::new()
-                .spacing(theme::spacing::MD)
+                .spacing(tokens::spacing::MD)
                 .keyed_children(moves),
             small(status.to_owned()),
         )),

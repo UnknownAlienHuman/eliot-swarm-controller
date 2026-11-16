@@ -848,17 +848,17 @@ impl DesktopApp {
                 ),
             );
             let labelled = |label: &str, picker: ComboBox| -> View {
-                StackPanel::new().spacing(2.0).children((
+                StackPanel::new().spacing(tokens::spacing::XS).children((
                     small(label.to_owned()).opacity(theme::MUTED_OPACITY),
-                    picker.min_width(136.0),
+                    picker.min_width(tokens::layout::DIALOG_PICKER_WIDTH),
                 ))
             };
             push(
                 "adhoc",
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::SM)
-                    .margin(Thickness::new(28.0, 0.0, 0.0, 0.0))
+                    .spacing(tokens::spacing::SM)
+                    .margin(Thickness::new(RADIO_INDENT, 0.0, 0.0, 0.0))
                     .keyed_children(vec![
                         KeyedView::new(
                             "harness",
@@ -925,7 +925,7 @@ impl DesktopApp {
                 "catalog",
                 small(catalog_line)
                     .opacity(theme::MUTED_OPACITY)
-                    .margin(Thickness::new(28.0, 0.0, 0.0, 0.0))
+                    .margin(Thickness::new(RADIO_INDENT, 0.0, 0.0, 0.0))
                     .into(),
             );
         }
@@ -1034,7 +1034,7 @@ impl DesktopApp {
                 push(
                     "owner-actions",
                     StackPanel::new()
-                        .spacing(theme::spacing::XS)
+                        .spacing(tokens::spacing::XS)
                         .keyed_children(owner),
                 );
             }
@@ -1107,7 +1107,7 @@ impl DesktopApp {
         let summary = self.handoff_summary(harness, model, effort);
         let summary: View = match &state.refusal {
             Some(refusal) => StackPanel::new()
-                .spacing(2.0)
+                .spacing(tokens::spacing::XS)
                 .vertical_alignment(VerticalAlignment::Center)
                 .children((
                     small(refusal.clone()).foreground(Brush::Theme(ThemeBrush::SystemCritical)),
@@ -1120,13 +1120,13 @@ impl DesktopApp {
         let footer = Grid::new()
             .grid_row(1)
             .columns([GridLength::STAR, GridLength::Auto])
-            .column_spacing(theme::spacing::LG)
+            .column_spacing(tokens::spacing::LG)
             .children((
                 summary,
                 StackPanel::new()
                     .grid_column(1)
                     .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::SM)
+                    .spacing(tokens::spacing::SM)
                     .vertical_alignment(VerticalAlignment::Bottom)
                     .children((close, primary)),
             ));
@@ -1137,15 +1137,15 @@ impl DesktopApp {
             .content(
                 Grid::new()
                     .rows([GridLength::STAR, GridLength::Auto])
-                    .row_spacing(theme::spacing::LG)
+                    .row_spacing(tokens::spacing::LG)
                     .children((
                         ScrollViewer::new()
                             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                            .max_height(520.0)
+                            .max_height(tokens::layout::DIALOG_MAX_HEIGHT)
                             .content(
                                 StackPanel::new()
-                                    .spacing(theme::spacing::XS)
-                                    .margin(Thickness::new(0.0, 0.0, theme::spacing::LG, 0.0))
+                                    .spacing(tokens::spacing::XS)
+                                    .margin(Thickness::new(0.0, 0.0, tokens::spacing::LG, 0.0))
                                     .keyed_children(sections),
                             ),
                         footer,
@@ -1256,16 +1256,18 @@ fn child_preview(command: &Command) -> String {
     )
 }
 
+/// Options under a radio button line up with its label (WinUI's 20-DIP
+/// radio glyph and its 8-DIP gap).
+const RADIO_INDENT: f64 = tokens::icon::TOOLBAR + tokens::spacing::SM;
+
 fn heading(text: &str) -> TextBlock {
-    m3::text(text.to_owned(), theme::type_scale::TITLE_SMALL)
-        .margin(Thickness::new(0.0, theme::spacing::SM, 0.0, 0.0))
-        .automation_heading_level(AutomationHeadingLevel::Level3)
+    m3::section_title(text.to_owned()).margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
 }
 
 fn small(text: impl Into<String>) -> TextBlock {
     TextBlock::new()
         .text(text.into())
-        .font_size(theme::type_scale::BODY_MEDIUM.size)
+        .font_size(tokens::text::BODY.size)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }
