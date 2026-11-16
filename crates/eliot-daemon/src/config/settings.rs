@@ -940,4 +940,28 @@ mod tests {
         ));
         assert_eq!(store.list_settings_history(100).unwrap().len(), 1);
     }
+
+    #[test]
+    fn desktop_startup_preference_is_validated() {
+        let root = TestRoot::new();
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let policy = SecretPolicy::new(Vec::<String>::new());
+        let save = |store: &mut Store, startup: &str| {
+            save_internal(
+                &root.0,
+                store,
+                None,
+                &BTreeMap::from([(
+                    SettingsSection::Desktop,
+                    serde_json::json!({"theme":"dark","startup":startup}),
+                )]),
+                SettingsAuthor::Owner(SettingsClientSource::Desktop),
+                true,
+                &policy,
+            )
+        };
+        assert!(save(&mut store, "last_conversation").is_ok());
+        assert!(save(&mut store, "new_task").is_ok());
+        assert!(save(&mut store, "yesterday").is_err());
+    }
 }

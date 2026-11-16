@@ -183,6 +183,15 @@ enum DesktopTheme {
     System,
 }
 
+/// What the desktop window opens at start.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DesktopStartup {
+    #[default]
+    NewTask,
+    LastConversation,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct DesktopWindow {
@@ -197,6 +206,8 @@ struct DesktopSettings {
     theme: DesktopTheme,
     #[serde(default)]
     window: Option<DesktopWindow>,
+    #[serde(default)]
+    startup: DesktopStartup,
 }
 
 impl DesktopSettings {
