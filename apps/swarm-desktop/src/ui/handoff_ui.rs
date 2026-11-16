@@ -539,6 +539,7 @@ impl DesktopApp {
             workspace: None,
             worktree: None,
             base: None,
+            access: None,
         };
         let switch = |launch: SwitchLaunch| {
             Submitted::Switch(SwitchRequest {
