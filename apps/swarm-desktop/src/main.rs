@@ -25,6 +25,8 @@ mod monitor_view;
 #[cfg(windows)]
 mod reparent;
 #[cfg(windows)]
+mod shortcuts;
+#[cfg(windows)]
 mod ui;
 #[cfg(windows)]
 mod views;

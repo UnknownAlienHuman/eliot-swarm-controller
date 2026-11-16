@@ -223,6 +223,7 @@ struct HostState {
     startup_gate: AsyncMutex<()>,
     startup_closed: AtomicBool,
     observers: Mutex<HashMap<AgentKey, Arc<observation::ObserverEntry>>>,
+    drift_warned: Mutex<HashSet<(String, String)>>,
     readers: Mutex<HashMap<String, discovery::Reader>>,
     discovery_closed: AtomicBool,
     reader_slots: Arc<Semaphore>,
@@ -348,6 +349,7 @@ impl PluginHost {
                 startup_gate: AsyncMutex::new(()),
                 startup_closed: AtomicBool::new(false),
                 observers: Mutex::new(HashMap::new()),
+                drift_warned: Mutex::new(HashSet::new()),
                 readers: Mutex::new(HashMap::new()),
                 discovery_closed: AtomicBool::new(false),
                 reader_slots: Arc::new(Semaphore::new(discovery::MAX_READERS)),
@@ -1319,6 +1321,40 @@ async fn run_agent(
     }
 }
 
+/// Flag a harness that behaves differently from its verified record, once
+/// per harness and installed surface per daemon run, at Agent start.
+/// Installed facts come from the read-only `--version` probe; a missing
+/// probe, an unverified harness, or a matching surface never flags and never
+/// fails the start.
+async fn flag_harness_drift(state: &HostState, agent: &eliot_core::Agent) {
+    let harness = agent.harness.clone();
+    let entry = crate::adhoc::harness_installation(&harness);
+    let installed = entry
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    // Schema fingerprints stay unset where the harness exposes no runtime
+    // marker on this base; the installed version carries the comparison.
+    let drift = eliot_core::check_harness_drift(&harness, installed.as_deref(), None);
+    let Some(drift) = drift else {
+        return;
+    };
+    let key = (harness, installed.unwrap_or_default());
+    if !state.drift_warned.lock_recover().insert(key) {
+        return;
+    }
+    let mut store = state.store.lock().await;
+    if let Ok(event) = store.commit_observe_event(
+        Some(&agent.id),
+        Some(agent.generation),
+        eliot_core::HARNESS_DRIFT_KIND,
+        drift.payload(),
+        crate::common::now_ms(),
+    ) {
+        state.bus.publish(&[event]);
+    }
+}
+
 async fn initialize_agent(actor: &AgentActorConfig, client: &PluginClient) -> Result<Value> {
     let init = client
         .call(
@@ -1350,6 +1386,12 @@ async fn initialize_agent(actor: &AgentActorConfig, client: &PluginClient) -> Re
                 actor.start_command.verb
             ),
         ));
+    }
+    // At Agent start, flag a harness that behaves differently from its
+    // verified record. A missing probe or matching surface never flags;
+    // the flag never fails the start.
+    if let Some(state) = actor.state.upgrade() {
+        flag_harness_drift(&state, &actor.agent).await;
     }
     PluginHost::install_runtime_verbs(
         &actor.state,

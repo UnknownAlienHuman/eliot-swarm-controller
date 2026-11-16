@@ -167,6 +167,11 @@ sections, and [OpenCodex](harnesses/opencodex.md) only for the proxy task.
       exact-subject attach; gap-backed `observe` to `transcript` handoff and bounded
       reconciliation. Commit ownership/cursor boundaries before publication; keep
       private history private and never replay an uncertain external effect.
+- [x] **L3.3d Observe what matters.** `activity.heavy` episodes with basename-only
+      categories, `session.growth` warnings with no auto-compact, and `harness.drift`
+      against pinned verified contracts surface in `swarm top` (`OBS`), `swarm stats`,
+      `swarm heavy`, `swarm doctor` and the desktop Details Observe section.
+
 - [x] **L3.4 Proxy/capacity.** First attach to an already-running OpenCodex endpoint.
       Add managed service launch only when actually needed. Add account/proxy caps and
       persistent provider holds with that route; freeze admitted nonsecret route/store
@@ -374,8 +379,17 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       at or past the process-creation limit are refused with the OS error; the pipe and
       data root are current-user-only and inherited ACLs are refused; `pass_env` values
       never reach the data dir or readbacks; `max_live`, frame and page bounds hold.
-- [ ] Supported Linux behavior and honest degraded custody; adopted-service isolation
-      (with the local adopted backends). Deferred by the owner.
+- [x] Linux via the supported Docker image, with real native Agent turns, private
+      IPC/data permissions and honest degraded process custody. See [Docker](../docker/README.md).
+      Image built and Codex/Luna launch, tool turn, follow-up send and OpenCode free-model
+      tool turn qualified on 2026-11-16, including space/percent/non-ASCII paths.
+      Claude 2.1.325 with `claude-haiku-5-5` qualified on 2026-11-16 after the
+      scope-hash fix: launch, one-line tool turn (`pwd` plus `hello.txt`), follow-up
+      `send` (append `world`, verified on disk), and stop, all with the documented
+      `CLAUDE_CONFIG_DIR` credential mount; readiness commits, never unknown.
+      Muse/Antigravity Linux binaries install and run, but their authenticated
+      turns are not qualified here. Custody stays honestly degraded (see Docker README).
+- [ ] Adopted-service isolation (with the local adopted backends). Deferred by the owner.
 - [ ] Retention/WAL/backpressure and representative load. The 10,000-Agent,
       2,000-events/s owner run is a release capacity check, not a prerequisite to L2.
 
@@ -464,10 +478,24 @@ of the explicitly selected release scope.
       only with the same id, and offers Owner `command.resolve`/`command.cancel`
       for a held or failed brief and an ordinary handoff to finish a switch.
 - [x] **D7 One shell.** The rail of separate screens is replaced by one shell
-      (owner review 2026-11-15, the Codex app as reference). A sidebar holds New
-      task, projects with their Agents nested (manager, then workers, collapsed),
-      Recents (titles from each Agent's first message), a fleet status line that
-      opens the monitor, and Settings. The conversation has a one-line header
+      (owner review 2026-11-15, the Codex app as reference). A sidebar holds
+      Search tasks (Ctrl+K: title, project and harness, through WinUI's
+      AutoSuggestBox), one tonal New task row (Ctrl+N), collapsible projects
+      with their Agents nested (manager, then workers, collapsed), Recents, a
+      calm fleet line that opens the monitor ("6 running"), a separate "N need
+      attention" row that lists only Agents waiting on a request or controlled
+      Agents in `unknown` (observe-only native children never count), and
+      Settings. A project is a repository: checkouts registered with the same
+      Git common directory group under the repository's name, and a task row
+      names its worktree only where the project spans several. Running tasks
+      stay on top, then newest first; stopped tasks last changed before today
+      fold into "Show N older"; a collapsed project shows its running count.
+      Titles come with each `agent.list` page (the first meaningful line of
+      the summary `preview`, Markdown removed, else the name, else
+      `<harness> · <profile>`). Collapsed projects live in memory until
+      `[desktop] collapsed_projects` exists. Reactor 0.100.0 has no key events
+      and no N/K accelerator keys, so the two shortcuts come from a keyboard
+      hook scoped to the window's thread. The conversation has a one-line header
       (title, status dot, details toggle, a "…" menu for Hand off/Switch, Change
       manager, Resume, Detach, Stop and Force stop); coverage, ids and readback
       live in the details panel. One composer carries the project and

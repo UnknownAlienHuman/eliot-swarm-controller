@@ -68,30 +68,75 @@ pub(crate) async fn run_harnesses(data_dir: PathBuf, json_output: bool) -> Resul
 }
 
 pub(crate) async fn run_models(
-    ModelsArgs { harness, profile }: ModelsArgs,
+    ModelsArgs {
+        harness,
+        profile,
+        query,
+        after,
+        limit,
+    }: ModelsArgs,
     data_dir: PathBuf,
     json_output: bool,
 ) -> Result<u8, Failure> {
-    if harness.trim().is_empty() {
-        return Err(Failure::new(2, "--harness must not be empty"));
+    use eliot_core::api::{ModelsCatalogRequest, ModelsCatalogResponse};
+    if let Some(harness) = harness {
+        if harness.trim().is_empty() {
+            return Err(Failure::new(2, "--harness must not be empty"));
+        }
+        if profile
+            .as_deref()
+            .is_some_and(|profile| profile.trim().is_empty())
+        {
+            return Err(Failure::new(2, "--profile must not be empty"));
+        }
+        if query.is_some() || after.is_some() || limit.is_some() {
+            return Err(Failure::new(
+                2,
+                "--query/--after/--limit require an omitted --harness (unified catalogue)",
+            ));
+        }
+        read_and_print!(
+            &data_dir,
+            json_output,
+            "harness.models",
+            HarnessModelsRequest {
+                harness,
+                profile,
+                agent: None,
+            },
+            HarnessModelsResponse
+        )
+    } else {
+        if profile.is_some() {
+            return Err(Failure::new(2, "--profile requires --harness"));
+        }
+        if query
+            .as_deref()
+            .is_some_and(|query| query.trim().is_empty())
+        {
+            return Err(Failure::new(2, "--query must not be empty"));
+        }
+        if after
+            .as_deref()
+            .is_some_and(|after| after.trim().is_empty())
+        {
+            return Err(Failure::new(2, "--after must not be empty"));
+        }
+        if limit.is_some_and(|limit| limit == 0 || limit > 100) {
+            return Err(Failure::new(2, "--limit must be from 1 through 100"));
+        }
+        read_and_print!(
+            &data_dir,
+            json_output,
+            "models.catalog",
+            ModelsCatalogRequest {
+                query,
+                after,
+                limit,
+            },
+            ModelsCatalogResponse
+        )
     }
-    if profile
-        .as_deref()
-        .is_some_and(|profile| profile.trim().is_empty())
-    {
-        return Err(Failure::new(2, "--profile must not be empty"));
-    }
-    read_and_print!(
-        &data_dir,
-        json_output,
-        "harness.models",
-        HarnessModelsRequest {
-            harness,
-            profile,
-            agent: None,
-        },
-        HarnessModelsResponse
-    )
 }
 
 pub(crate) async fn run_quota(
@@ -151,6 +196,7 @@ pub(crate) async fn run_launch(
         model,
         effort,
         auth,
+        access,
         cmd,
         workspace,
         worktree,
@@ -192,10 +238,15 @@ pub(crate) async fn run_launch(
         return Err(Failure::new(2, "ad-hoc launch cannot have a parent"));
     }
     if harness.is_none() {
-        if model.is_some() || effort.is_some() || auth.is_some() || cmd.is_some() {
+        if model.is_some()
+            || effort.is_some()
+            || auth.is_some()
+            || access.is_some()
+            || cmd.is_some()
+        {
             return Err(Failure::new(
                 2,
-                "--model/--effort/--auth/--cmd require --harness",
+                "--model/--effort/--auth/--access/--cmd require --harness",
             ));
         }
     } else if let Some(name) = &model
@@ -210,6 +261,10 @@ pub(crate) async fn run_launch(
         && name.trim().is_empty()
     {
         return Err(Failure::new(2, "--auth must not be empty"));
+    } else if let Some(name) = &access
+        && name.trim().is_empty()
+    {
+        return Err(Failure::new(2, "--access must not be empty"));
     } else if let Some(name) = &cmd
         && name.trim().is_empty()
     {
@@ -237,6 +292,9 @@ pub(crate) async fn run_launch(
     }
     if let Some(auth) = auth {
         args["auth"] = Value::String(auth);
+    }
+    if let Some(access) = access {
+        args["access"] = Value::String(access);
     }
     if let Some(cmd) = cmd {
         args["cmd"] = Value::String(cmd);
@@ -682,6 +740,7 @@ pub(crate) async fn run_switch(
             effort: args.effort,
             auth: args.auth,
             cmd: args.cmd,
+            access: args.access,
             workspace: args.workspace,
             worktree: args.worktree,
             base: args.base,

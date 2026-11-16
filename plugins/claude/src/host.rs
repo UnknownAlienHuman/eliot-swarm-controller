@@ -2637,14 +2637,27 @@ fn new_uuid() -> String {
     )
 }
 
-/// Native scope names the CLI config identity: the canonical
+/// Native scope names the CLI config identity: the hashed canonical
 /// `CLAUDE_CONFIG_DIR` when the target environment sets one, else the CLI
-/// default resolution, which the plugin must not guess at.
+/// default resolution, which the plugin must not guess at. The raw directory
+/// is also a pass_env secret value on the daemon, and committed scope
+/// metadata must never collide with it: the daemon rejects secret-bearing
+/// immutable metadata, which used to wedge the launch unknown on its very
+/// first batch. Same FNV-1a shape as the Codex home scope.
 fn claude_scope(config_dir: Option<&str>) -> String {
     match config_dir.filter(|dir| !dir.trim().is_empty()) {
         Some(dir) => {
             let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir));
-            format!("claude-config:{}", canonical.to_string_lossy())
+            let mut canonical = canonical.to_string_lossy().into_owned();
+            if cfg!(windows) {
+                canonical = canonical.to_lowercase();
+            }
+            let mut hash = 0xcbf29ce484222325u64;
+            for byte in canonical.bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            format!("claude-config:{hash:016x}")
         }
         None => "claude-config:default".to_owned(),
     }
@@ -2950,13 +2963,22 @@ mod tests {
     }
 
     #[test]
-    fn scope_names_the_config_identity() {
+    fn scope_hashes_the_config_identity() {
         assert_eq!(claude_scope(None), "claude-config:default");
         assert_eq!(claude_scope(Some("  ")), "claude-config:default");
         let dir = std::env::temp_dir();
-        let scope = claude_scope(Some(&dir.to_string_lossy()));
-        assert!(scope.starts_with("claude-config:"), "{scope}");
-        assert!(scope.len() > "claude-config:".len());
+        let raw = dir.to_string_lossy().into_owned();
+        let scope = claude_scope(Some(&raw));
+        let suffix = scope.strip_prefix("claude-config:").expect("scope prefix");
+        assert_eq!(suffix.len(), 16);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+        // The raw directory must not survive in committed scope metadata:
+        // the daemon also holds the pass_env directory as a secret and
+        // rejects secret-bearing immutable metadata.
+        assert!(!scope.contains(raw.as_str()));
+        assert_eq!(scope, claude_scope(Some(&raw)));
+        let other = dir.join("eliot-claude-scope-probe");
+        assert_ne!(scope, claude_scope(Some(&other.to_string_lossy())));
     }
 
     #[test]

@@ -149,6 +149,14 @@ Windows Jobs provide the specified exact custody. A Unix process group is degrad
 must report that limitation. Process exit races final output: drain the source before
 concluding loss. Silence, transport loss and missing history are not completion.
 
+The supported Linux target is the [Docker image](../docker/README.md), currently
+linux/amd64 on Debian bookworm, rather than separate distro packages. Its nonroot
+daemon uses a private Unix socket and volume. Linux custody remains degraded:
+process groups can be escaped and do not die automatically with the daemon.
+The container's cgroup v2 is not per-Agent delegated custody. Whole-container
+teardown is a separate boundary and never evidence of an exact Agent stop.
+The Windows desktop's named-pipe client cannot attach to this container daemon.
+
 A source's `open|closed` lifecycle, health and historical gap are independent.
 Handoff transfers only the named event families; it does not imply that the previous
 source process closed. The protocol owns the exact transition rules.

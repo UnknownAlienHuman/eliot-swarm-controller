@@ -32,8 +32,9 @@ use crate::native::{
         CanUseToolBody, CommandLifecycle, ControlCancelRequest, HookCallbackBody,
         HookCallbackResponse, InitMcpServer, OutboundControlResponse, OutboundControlResponseBody,
         PermissionResult, ResultRecord, assistant_model, assistant_text, assistant_tool_use_count,
-        assistant_tool_use_ids, assistant_tool_uses, attach_mcp_readback, init_mcp_servers,
-        result_session_usage, result_usage, user_tool_results,
+        assistant_tool_use_ids, assistant_tool_uses, attach_mcp_readback, frame_context_window,
+        init_mcp_servers, result_session_usage, result_usage, transcript_bytes_in,
+        transcript_config_roots, user_tool_results,
     },
 };
 
@@ -590,6 +591,11 @@ struct EventProcessor {
     /// next turn terminal so the reducer merges it into the effective set;
     /// absent until the first post-input init arrives.
     init_mcp_servers: Option<Vec<InitMcpServer>>,
+    /// Model context window from the owned stream's `system`/`init` record
+    /// where the harness reports one. Retained on observation and merged
+    /// into the terminal session fact when the result frame carries none;
+    /// absent until observed, never guessed.
+    init_context_window: Option<i64>,
     closed: bool,
     native: Option<ClaudeClient>,
     status_tx: watch::Sender<EventStatus>,
@@ -1106,6 +1112,7 @@ impl EventProcessor {
             final_text_unavailable: false,
             native_failure: None,
             init_mcp_servers: None,
+            init_context_window: None,
             closed: false,
             native: None,
             status_tx,
@@ -1536,6 +1543,9 @@ impl EventProcessor {
     fn retain_init_mcp_servers(&mut self, record: &Value) {
         if record.get("subtype").and_then(Value::as_str) != Some("init") {
             return;
+        }
+        if let Some(window) = frame_context_window(record) {
+            self.init_context_window = Some(window);
         }
         let Some(servers) = init_mcp_servers(record) else {
             return;
@@ -3216,12 +3226,30 @@ impl EventProcessor {
         // carries the readback into the effective set. Unobserved stays
         // unattached and the effective set stays unknown.
         attach_mcp_readback(&mut data, self.init_mcp_servers.as_deref());
-        // Optional session-scoped fact from the terminal record
-        // (`modelUsage` token counters plus `total_cost_usd`), held for the
-        // session fact that commits after the accepted terminal. Absent or
-        // unusable halves simply contribute nothing; with neither half there
+        // Optional session-scoped fact from the terminal record (occupancy
+        // sample from `usage`, cumulative `modelUsage` counters, cumulative
+        // `total_cost_usd`, model window where a frame reports one), held
+        // for the session fact that commits after the accepted terminal.
+        // The window prefers the terminal frame and falls back to the
+        // retained init value; the transcript file size comes from a
+        // read-only scan for the exact session filename (never a guessed
+        // slug). Absent quarters simply contribute nothing; with none there
         // is no session fact.
-        let session_usage = result_session_usage(record);
+        let mut session_usage = result_session_usage(record);
+        if let Some(usage) = session_usage.as_mut() {
+            if usage.context_window_tokens.is_none() {
+                usage.context_window_tokens = self.init_context_window;
+            }
+            let session_id = self.status.session_id.clone().unwrap_or_default();
+            if !session_id.is_empty() {
+                let roots = transcript_config_roots();
+                usage.session_file_bytes =
+                    tokio::task::spawn_blocking(move || transcript_bytes_in(&roots, &session_id))
+                        .await
+                        .ok()
+                        .flatten();
+            }
+        }
         let final_text = self.final_text.take();
         if self.final_text_unavailable {
             attach_final_text_unavailable(&mut data, &secrets);

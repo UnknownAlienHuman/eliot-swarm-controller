@@ -3291,6 +3291,7 @@ fn session_usage_from_token_usage(
         context_window_tokens: None,
         cumulative_tokens: None,
         cumulative_cost: None,
+        session_file_bytes: None,
         source: None,
         observed_at: None,
     });
@@ -3309,6 +3310,15 @@ fn session_usage_from_token_usage(
             && merged.cumulative_tokens.as_ref() != Some(&totals)
         {
             merged.cumulative_tokens = Some(totals);
+            changed = true;
+        }
+        // The cumulative per-thread `total` is the installed schema's only
+        // occupancy signal, so it projects to `context_used_tokens` against
+        // `modelContextWindow` (never derived into turn expenditure above).
+        if let Some(used) = counter(total.total_tokens)
+            && merged.context_used_tokens != Some(used)
+        {
+            merged.context_used_tokens = Some(used);
             changed = true;
         }
     }
@@ -3992,7 +4002,7 @@ mod tests {
     }
 
     #[test]
-    fn session_usage_from_token_usage_maps_cumulative_and_capacity_only() {
+    fn session_usage_from_token_usage_maps_cumulative_capacity_and_occupancy() {
         let body = NativeThreadTokenUsage {
             last: breakdown(Some(1), Some(1)),
             total: Some(NativeTokenUsageDelta {
@@ -4015,7 +4025,7 @@ mod tests {
         assert_eq!(totals.cache_read_tokens, Some(53));
         assert_eq!(totals.cache_write_tokens, Some(9));
         assert_eq!(merged.context_window_tokens, Some(200_000));
-        assert_eq!(merged.context_used_tokens, None);
+        assert_eq!(merged.context_used_tokens, Some(165));
         assert_eq!(merged.cumulative_cost, None);
         assert_eq!(
             merged.source.as_deref(),
@@ -4033,6 +4043,11 @@ mod tests {
         let resized = session_usage_from_token_usage(&window_only, Some(&merged))
             .expect("capacity change merges");
         assert_eq!(resized.context_window_tokens, Some(100_000));
+        assert_eq!(
+            resized.context_used_tokens,
+            Some(165),
+            "capacity update must keep the retained occupancy"
+        );
         assert_eq!(
             resized
                 .cumulative_tokens

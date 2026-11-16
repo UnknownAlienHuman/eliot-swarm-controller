@@ -201,6 +201,8 @@ pub fn cpu_time_label(ns: Option<u64>) -> String {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MonitorRow {
     pub id: String,
+    /// The sidebar's title for the Agent ([`crate::nav::summary_title`]).
+    pub title: String,
     pub generation: i64,
     /// Current manager (durable parent link), if any.
     pub parent: Option<String>,
@@ -243,6 +245,7 @@ impl MonitorRow {
         };
         Self {
             id: summary.id.clone(),
+            title: crate::nav::summary_title(summary),
             generation: summary.generation,
             parent: summary.parent.clone(),
             state: summary.state,
@@ -797,6 +800,9 @@ mod tests {
                 generation: 1,
                 project: "p".to_owned(),
                 harness: "codex".to_owned(),
+                name: None,
+                profile: None,
+                preview: None,
                 state,
                 parent: None,
                 root: "a7".to_owned(),
@@ -809,6 +815,8 @@ mod tests {
                 usage: None,
                 usage_scope: None,
                 updated_at: 0,
+                heavy: None,
+                session_growth: None,
             },
             observation: None,
         };
@@ -841,6 +849,9 @@ mod tests {
             generation: 1,
             project: "p".to_owned(),
             harness: "muse".to_owned(),
+            name: None,
+            profile: None,
+            preview: None,
             state: AgentState::Idle,
             parent: None,
             root: "a7".to_owned(),
@@ -853,6 +864,8 @@ mod tests {
             usage,
             usage_scope: usage_scope.map(str::to_owned),
             updated_at: 0,
+            heavy: None,
+            session_growth: None,
         };
         let make_row = |usage: Option<TurnUsage>, usage_scope: Option<&str>| {
             MonitorRow::from_list(&AgentListRow {
