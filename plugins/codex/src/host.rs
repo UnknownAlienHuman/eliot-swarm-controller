@@ -1,9 +1,9 @@
 use crate::{
     events::{self, EventConfig, EventHandle, TurnFacts},
     mcp::{
-        McpReadback, compute_disables, compute_plugin_disables, merge_status_page,
-        parse_status_page, policy_from_profile, require_minimal_own_server, synthetic_apps_disable,
-        synthetic_swarm_owner_disables,
+        McpReadback, cloud_hostname_from_profile, compute_disables, compute_owner_disables,
+        compute_plugin_disables, merge_status_page, parse_status_page, policy_from_profile,
+        require_minimal_own_server, synthetic_apps_disable, synthetic_swarm_owner_disables,
     },
     native::{
         NativeClient, NativeLaunch, NativeProcess,
@@ -837,6 +837,7 @@ impl CodexPlugin {
             ));
         }
         let (mcp_policy, mcp_allow) = policy_from_profile(profile)?;
+        let mcp_cloud_hostname = cloud_hostname_from_profile(profile);
         let workspace = params
             .workspace
             .as_deref()
@@ -901,47 +902,53 @@ impl CodexPlugin {
             .to_string()
             .to_ascii_lowercase();
         let mcp_server_name = format!("eliot_swarm_{start_command}");
-        // Minimal policy: enumerate the worker-visible native MCP surface
-        // with a short-lived metadata reader, then suppress every
-        // non-allowed server with its own transport-carrying
-        // `enabled=false` overrides. A bare `enabled=false` breaks the
-        // native bootstrap for project/plugin names (verified on 0.167.1),
-        // so each disable re-emits the enumerated `command`/`url`.
-        // Plugin-backed builtin servers never appear in `mcp_servers`, so
-        // each suppressed plugin takes its own `plugins.<id>.enabled=false`
-        // override, and the ChatGPT-backed Apps runtime (likewise absent
-        // from `mcp_servers`) takes a synthetic transport-carrying disable.
-        // Inherit keeps the additive behavior (no pre-spawn enumeration),
-        // except owner Swarm entries: those are always suppressed with the
-        // synthetic transport-carrying disables, so a worker can never talk
-        // to the owner's daemon with the owner's identity in either policy.
-        let (mcp_disables, plugin_disables) = if mcp_policy == McpPolicy::Minimal {
-            let probe = NativeLaunch {
-                program: program.clone(),
-                args: route.args()?,
-                cwd: workspace.clone(),
-                environment: environment.clone(),
-            };
-            let surface = crate::discovery::read_effective_mcp_surface(
-                &probe,
-                &frozen_store,
-                &metadata_secrets,
-                &secrets,
-                Instant::now() + RPC_TIMEOUT,
+        // Both policies enumerate the worker-visible native MCP surface
+        // with a short-lived metadata reader, then suppress with
+        // transport-carrying `enabled=false` overrides. A bare
+        // `enabled=false` breaks the native bootstrap for project/plugin
+        // names (verified on 0.167.1), so each disable re-emits the
+        // enumerated `command`/`url`. Plugin-backed builtin servers never
+        // appear in `mcp_servers`, so each suppressed plugin takes its own
+        // `plugins.<id>.enabled=false` override, and the ChatGPT-backed
+        // Apps runtime (likewise absent from `mcp_servers`) takes a
+        // synthetic transport-carrying disable. Minimal suppresses every
+        // non-allowed server with its own transport; inherit keeps the
+        // additive behavior except owner Swarm entries: every enumerated
+        // entry that carries the owner Swarm identity by transport is
+        // always suppressed, so a worker can never talk to the owner's
+        // daemon with the owner's identity in either policy, whatever the
+        // entry is named. An allow-listed name that matches the identity
+        // is rejected at launch instead of re-admitted.
+        let probe = NativeLaunch {
+            program: program.clone(),
+            args: route.args()?,
+            cwd: workspace.clone(),
+            environment: environment.clone(),
+        };
+        let surface = crate::discovery::read_effective_mcp_surface(
+            &probe,
+            &frozen_store,
+            &metadata_secrets,
+            &secrets,
+            Instant::now() + RPC_TIMEOUT,
+        )
+        .await
+        .map_err(|error| {
+            pre_dispatch_read_error(
+                error,
+                "profile_error",
+                "Codex MCP server enumeration failed before worker spawn",
             )
-            .await
-            .map_err(|error| {
-                pre_dispatch_read_error(
-                    error,
-                    "profile_error",
-                    "Codex minimal MCP server enumeration failed before worker spawn",
-                )
-            })?;
+        })?;
+        let controller_executable = swarm_executable.to_str();
+        let (mcp_disables, plugin_disables) = if mcp_policy == McpPolicy::Minimal {
             let mut disables = compute_disables(
                 &surface.servers,
                 &mcp_allow,
                 &mcp_server_name,
                 &metadata_secrets,
+                controller_executable,
+                mcp_cloud_hostname.as_deref(),
             )?;
             if let Some(apps) = synthetic_apps_disable(&mcp_allow) {
                 disables.push(apps);
@@ -954,7 +961,19 @@ impl CodexPlugin {
             }
             (disables, plugins)
         } else {
-            (synthetic_swarm_owner_disables(), Vec::new())
+            let mut disables = compute_owner_disables(
+                &surface.servers,
+                &mcp_server_name,
+                controller_executable,
+                mcp_cloud_hostname.as_deref(),
+                &metadata_secrets,
+            )?;
+            for stub in synthetic_swarm_owner_disables() {
+                if !disables.iter().any(|kept| kept.name == stub.name) {
+                    disables.push(stub);
+                }
+            }
+            (disables, Vec::new())
         };
         let launch = NativeLaunch {
             program,

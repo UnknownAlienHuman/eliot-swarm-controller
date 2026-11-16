@@ -118,12 +118,23 @@ The generated Agent MCP override adds one `mcp_servers.<name>` entry; it does
 not suppress other native servers. Profiles therefore select a policy
 (`mcp = "minimal"` by default, or `"inherit"` as an explicit opt-in) with an
 optional `mcp_allow` server list, frozen in the profile snapshot. `inherit`
-keeps the additive behavior above, except owner Swarm entries: the exact
-owner names (`eliot_swarm`, `eliot-swarm`) always take synthetic
-transport-carrying disables in both policies, because a worker that talks to
-the owner's daemon with the owner's identity is an authority leak (the owner
-file-config entry runs plain `swarm mcp` with no `--require-agent`). Swarm
-names can never be allow-listed in any policy. `minimal` starts only Eliot's
+keeps the additive behavior above, except owner Swarm entries: every
+enumerated entry that carries the owner Swarm identity by transport always
+takes a transport-carrying disable in both policies, because a worker that
+talks to the owner's daemon with the owner's identity is an authority leak
+(the owner file-config entry runs plain `swarm mcp` with no
+`--require-agent`). Identity is the transport shape, not the entry name
+(`eliot_core::is_owner_swarm_server`: a swarm executable -- file name
+`swarm`/`swarm.exe` or the controller binary path -- selecting `mcp`
+without `--require-agent`, or a URL on the configured `cloud_mcp`
+hostname): a renamed owner entry is still suppressed, and the exact owner
+names (`eliot_swarm`, `eliot-swarm`) stay covered by synthetic
+transport-carrying stubs as backstop. Swarm names can never be
+allow-listed in any policy, and an allow-listed name that matches the
+identity is rejected at launch (`profile_error`) instead of re-admitted.
+Entries whose argument vector the native layer does not report count as
+unknown and fail closed toward suppression; an absent vector means the
+entry carries no argv. `minimal` starts only Eliot's
 Agent-scoped server plus the explicitly allowed servers:
 
 - Before spawn, a short-lived metadata reader (initialize, one `config/read`

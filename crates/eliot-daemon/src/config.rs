@@ -1026,7 +1026,15 @@ fn resolve_profile_in(config: &FileConfig, source: &str, name: &str) -> core::Re
             format!("config.toml: profiles.{name}: profile not found"),
         )
     })?;
-    let snapshot = snapshot_from_entry(name, entry.get_ref(), entry.span().start, source)?;
+    let mut snapshot = snapshot_from_entry(name, entry.get_ref(), entry.span().start, source)?;
+    // Freeze the configured cloud MCP hostname (if any) beside the MCP
+    // policy so harness plugins can apply the owner-identity HTTP arm
+    // without reading owner config. Snapshots that predate the field read
+    // back as absent: plugins treat that as inert.
+    snapshot["mcp_cloud_hostname"] = match &config.cloud_mcp {
+        Some(cloud) => Value::String(cloud.hostname.clone()),
+        None => Value::Null,
+    };
     let snapshot = freeze_child_profiles(
         name,
         entry.get_ref(),
@@ -1109,6 +1117,27 @@ fn freeze_child_profiles(
     snapshot["child_profiles"] = Value::Array(frozen);
     Ok(snapshot)
 }
+/// Best-effort configured cloud MCP hostname for ad-hoc snapshots: the
+/// `[cloud_mcp] hostname` when the owner config parses and names one, else
+/// `None`. Never fails: ad-hoc snapshots stamp what is configured.
+pub(crate) fn cloud_mcp_hostname(data_root: &Path) -> Option<String> {
+    read_config(data_root)
+        .ok()
+        .flatten()
+        .and_then(|(config, _)| config.cloud_mcp.map(|cloud| cloud.hostname))
+}
+
+/// Stamp the configured cloud MCP hostname into a frozen snapshot
+/// (`mcp_cloud_hostname`, string or null) for ad-hoc snapshots, which
+/// freeze without the profile path. Best-effort: an unreadable config
+/// leaves a null stamp, so the owner-identity HTTP arm stays inert.
+pub(crate) fn stamp_cloud_mcp_hostname(snapshot: &mut Value, data_root: &Path) {
+    snapshot["mcp_cloud_hostname"] = match cloud_mcp_hostname(data_root) {
+        Some(hostname) => Value::String(hostname),
+        None => Value::Null,
+    };
+}
+
 fn read_config(data_root: &Path) -> core::Result<Option<(FileConfig, String)>> {
     let Some(source) = read_config_source(data_root)? else {
         return Ok(None);
@@ -4292,6 +4321,24 @@ permissions = "workspace-write"
             let error = resolve_text_profile(source, "muse").expect_err("must reject");
             assert_eq!(error.code, "profile_error", "{source}");
         }
+    }
+
+    #[test]
+    fn frozen_snapshot_carries_configured_cloud_hostname() {
+        let source = "[profiles.direct]\nharness='codex'\nmodel='gpt-6-luna'\n\
+            [cloud_mcp]\ncloudflared_executable='C:/Tools/cloudflared.exe'\n\
+            tunnel_id='tunnel-id'\ncredentials_file='C:/Tools/creds.json'\n\
+            hostname='mcp.example.com'\naccess_team_name='team'\naccess_audience_tag='aud'\n";
+        let config: FileConfig = toml::from_str(source).unwrap();
+        let snapshot = resolve_profile_in(&config, source, "direct").unwrap();
+        assert_eq!(snapshot["mcp_cloud_hostname"], json!("mcp.example.com"));
+
+        // Without `[cloud_mcp]` the field freezes as null, so the
+        // owner-identity HTTP arm stays inert for the plugins.
+        let plain = "[profiles.direct]\nharness='codex'\nmodel='gpt-6-luna'\n";
+        let config: FileConfig = toml::from_str(plain).unwrap();
+        let snapshot = resolve_profile_in(&config, plain, "direct").unwrap();
+        assert_eq!(snapshot["mcp_cloud_hostname"], Value::Null);
     }
 
     #[test]

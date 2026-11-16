@@ -813,6 +813,19 @@ impl ClaudePlugin {
                 "the current Eliot executable for Claude MCP is unavailable",
             ));
         }
+        // Inherit keeps the CLI normal MCP precedence, which no per-run
+        // flag narrows per server (installed 2.1.325: only the
+        // all-or-nothing `--strict-mcp-config`, reserved for minimal; see
+        // `owner_scan`). An owner Swarm entry reachable under inherit
+        // therefore fails the start closed with its name instead of
+        // leaking the owner daemon identity to the worker.
+        if requested_mcp_policy == McpPolicy::Inherit {
+            crate::owner_scan::refuse_owner_mcp_sources(
+                &workspace,
+                &swarm_binary,
+                eliot_core::parse_snapshot_cloud_hostname(profile).as_deref(),
+            )?;
+        }
         secrets.push(initialized.credential.clone());
         if let Some(subject) = resume_subject.as_ref()
             && subject.native_scope != claude_scope(config_dir.as_deref())
@@ -2320,9 +2333,13 @@ fn check_mcp_allow_empty(allow: &[String]) -> Result<()> {
 }
 
 /// MCP argv pair for the frozen policy. Minimal adds `--strict-mcp-config`
-/// ahead of the per-run config so only it applies (installed CLI 2.1.278:
+/// ahead of the per-run config so only it applies (installed CLI 2.1.325:
 /// the flag ignores all other MCP configurations); inherit passes only the
-/// additive per-run config and keeps the normal precedence.
+/// additive per-run config and keeps the normal precedence, with owner
+/// Swarm entries refused pre-spawn by the `owner_scan` gate (no per-server
+/// disable or deny switch exists on 2.1.325: `--strict-mcp-config` is
+/// all-or-nothing, `--setting-sources` selects whole sources, and `mcp`
+/// offers no deny list).
 fn mcp_argv(policy: McpPolicy, config_path: &std::ffi::OsStr) -> Vec<OsString> {
     let mut argv = Vec::with_capacity(3);
     if policy == McpPolicy::Minimal {

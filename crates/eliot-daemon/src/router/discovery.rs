@@ -442,15 +442,12 @@ impl Router {
             example["agent"] = json!("a1");
         }
         let scopes = method_scopes(method.name, principal, &identity);
-        // Compact by default: the sorted request field list stands in for
-        // the full JSON Schemas (fields, one example, limits). `full: true`
-        // restores both schemas for callers that need exact shapes.
-        let mut fields: Vec<String> = (method.input)()
-            .get("properties")
-            .and_then(Value::as_object)
-            .map(|properties| properties.keys().cloned().collect())
-            .unwrap_or_default();
-        fields.sort();
+        // Compact by default: compact field descriptors (requiredness,
+        // types, enums, nested shapes and documented constraints) stand in
+        // for the full JSON Schemas (fields, one example, limits).
+        // `full: true` restores both schemas for callers that need exact
+        // shapes.
+        let fields: Vec<String> = compact_field_descriptors(&(method.input)());
         let (request_schema, response_schema) = if request.full.unwrap_or(false) {
             ((method.input)(), (method.output)())
         } else {
@@ -468,6 +465,272 @@ impl Router {
     }
 }
 
+/// Compact field descriptors for a request DTO schema: one entry per
+/// top-level property, sorted by name, each carrying the field name,
+/// requiredness, type, enum values, nested shape and documented
+/// constraints, derived from the schemars DTO schema (draft 2020-12).
+/// Compact help carries these instead of the full JSON Schemas; `full:
+/// true` restores both schemas for callers that need exact shapes.
+fn compact_field_descriptors(schema: &Value) -> Vec<String> {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut names: Vec<&String> = properties.keys().collect();
+    names.sort();
+    names
+        .iter()
+        .map(|name| describe_field(schema, properties, name))
+        .collect()
+}
+
+/// One `name (required|optional): type [bounds] - documented constraints`
+/// descriptor. Descriptions collapse to one line; nested objects render
+/// their property names with requiredness marks one level deep.
+fn describe_field(root: &Value, properties: &serde_json::Map<String, Value>, name: &str) -> String {
+    let required = root
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| required.iter().any(|entry| entry.as_str() == Some(name)));
+    let property = properties.get(name);
+    // Types resolve through `$ref`, but documented constraints live on the
+    // property beside the reference (schemars emits `description` there),
+    // so descriptions and bounds prefer the property and fall back to the
+    // resolved target.
+    let node = property.map(|node| resolve_ref(root, node));
+    let mut descriptor = format!(
+        "{name} ({}): {}",
+        if required { "required" } else { "optional" },
+        node.map(|node| describe_type(root, node, 0))
+            .unwrap_or_else(|| "any".to_owned())
+    );
+    let bounds = property
+        .and_then(describe_bounds)
+        .or_else(|| node.and_then(describe_bounds));
+    if let Some(bounds) = bounds {
+        descriptor.push_str(&format!(" [{bounds}]"));
+    }
+    let description = property
+        .and_then(|node| node.get("description"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            node.and_then(|node| node.get("description"))
+                .and_then(Value::as_str)
+        })
+        .map(single_line)
+        .filter(|description| !description.is_empty());
+    if let Some(description) = description {
+        descriptor.push_str(&format!(" - {description}"));
+    }
+    descriptor
+}
+
+/// Follow a local `$ref` (JSON pointer under `#`) to its target, up to a
+/// small depth. An unresolvable reference returns the node itself.
+fn resolve_ref<'a>(root: &'a Value, node: &'a Value) -> &'a Value {
+    let mut current = node;
+    for _ in 0..8 {
+        let Some(target) = current.get("$ref").and_then(Value::as_str) else {
+            return current;
+        };
+        let Some(path) = target.strip_prefix('#') else {
+            return current;
+        };
+        let mut resolved = root;
+        let mut ok = true;
+        for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+            let segment = segment.replace("~1", "/").replace("~0", "~");
+            match resolved.get(&segment) {
+                Some(next) => resolved = next,
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            return current;
+        }
+        current = resolved;
+    }
+    current
+}
+
+/// A readable type for one schema node: enums render their closed value
+/// set, unions join their branches (explicit null branches are dropped:
+/// the required marker already says whether the field may be omitted),
+/// arrays name their item type and objects name their nested properties.
+fn describe_type(root: &Value, node: &Value, depth: usize) -> String {
+    let node = resolve_ref(root, node);
+    if let Some(values) = node.get("enum").and_then(Value::as_array) {
+        let mut rendered: Vec<String> = values.iter().map(render_enum_value).collect();
+        rendered.sort();
+        rendered.dedup();
+        return format!("enum({})", rendered.join("|"));
+    }
+    if node.get("const").is_some() {
+        return format!("const({})", node.get("const").expect("const value"));
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(branches) = node.get(key).and_then(Value::as_array) {
+            let mut parts = Vec::new();
+            for branch in branches {
+                let branch = resolve_ref(root, branch);
+                if branch.get("type").and_then(Value::as_str) == Some("null")
+                    || branch == &Value::Bool(false)
+                {
+                    continue;
+                }
+                if branch == &Value::Bool(true) {
+                    parts.push("any".to_owned());
+                    continue;
+                }
+                parts.push(describe_type(root, branch, depth + 1));
+            }
+            parts.sort();
+            parts.dedup();
+            if parts.is_empty() {
+                return "null".to_owned();
+            }
+            if parts.len() == 1 {
+                return parts.pop().expect("single branch");
+            }
+            return parts.join("|");
+        }
+    }
+    let mut names = Vec::new();
+    match node.get("type") {
+        Some(Value::String(name)) if name != "null" => names.push(name.clone()),
+        Some(Value::Array(list)) => {
+            for name in list.iter().filter_map(Value::as_str) {
+                if name != "null" {
+                    names.push(name.to_owned());
+                }
+            }
+        }
+        _ => {}
+    }
+    if names.is_empty() {
+        if node.get("properties").and_then(Value::as_object).is_some() {
+            names.push("object".to_owned());
+        } else if node.get("items").is_some() || node.get("prefixItems").is_some() {
+            names.push("array".to_owned());
+        } else {
+            return "any".to_owned();
+        }
+    }
+    let mut parts = Vec::new();
+    for name in names {
+        parts.push(match name.as_str() {
+            "array" => format!("array<{}>", describe_items(root, node, depth)),
+            "object" => describe_object_shape(root, node),
+            other => other.to_owned(),
+        });
+    }
+    parts.sort();
+    parts.dedup();
+    parts.join("|")
+}
+
+/// Item type for one array node: `prefixItems` renders as a tuple, a
+/// missing items schema renders as `any`.
+fn describe_items(root: &Value, node: &Value, depth: usize) -> String {
+    if depth > 3 {
+        return "any".to_owned();
+    }
+    if let Some(prefix) = node.get("prefixItems").and_then(Value::as_array) {
+        let mut parts: Vec<String> = prefix
+            .iter()
+            .map(|item| describe_type(root, item, depth + 1))
+            .collect();
+        parts.sort();
+        return format!("tuple({})", parts.join(", "));
+    }
+    match node.get("items") {
+        None | Some(Value::Bool(false)) => "any".to_owned(),
+        Some(Value::Bool(true)) => "any".to_owned(),
+        Some(items) => describe_type(root, items, depth + 1),
+    }
+}
+
+/// Nested shape for one object node: `{a, b*}` property names with
+/// requiredness marks, one level deep.
+fn describe_object_shape(root: &Value, node: &Value) -> String {
+    let node = resolve_ref(root, node);
+    let Some(properties) = node.get("properties").and_then(Value::as_object) else {
+        return "object".to_owned();
+    };
+    let mut names: Vec<String> = properties.keys().cloned().collect();
+    names.sort();
+    for name in names.iter_mut() {
+        let nested = node
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| required.iter().any(|entry| entry.as_str() == Some(name)));
+        if nested {
+            *name = format!("{name}*");
+        }
+    }
+    format!("object{{{}}}", names.join(", "))
+}
+
+/// Structured bounds carried by one schema node: string/array/numeric
+/// ranges, Eliot byte budgets, uniqueness, format and pattern. Present
+/// keys render verbatim; absent keys stay absent.
+fn describe_bounds(node: &Value) -> Option<String> {
+    let integer = |key: &str| node.get(key).and_then(Value::as_i64);
+    let mut bounds = Vec::new();
+    match (integer("minLength"), integer("maxLength")) {
+        (Some(min), Some(max)) => bounds.push(format!("len {min}..{max}")),
+        (Some(min), None) => bounds.push(format!("len {min}..")),
+        (None, Some(max)) => bounds.push(format!("len ..{max}")),
+        (None, None) => {}
+    }
+    match (integer("minItems"), integer("maxItems")) {
+        (Some(min), Some(max)) => bounds.push(format!("{min}..{max} items")),
+        (Some(min), None) => bounds.push(format!("{min}.. items")),
+        (None, Some(max)) => bounds.push(format!("..{max} items")),
+        (None, None) => {}
+    }
+    match (node.get("minimum"), node.get("maximum")) {
+        (Some(min), Some(max)) => bounds.push(format!("{min}..{max}")),
+        (Some(min), None) => bounds.push(format!("{min}..")),
+        (None, Some(max)) => bounds.push(format!("..{max}")),
+        (None, None) => {}
+    }
+    if let Some(max) = integer("x-maxBytes") {
+        bounds.push(format!("<={max}B"));
+    }
+    if let Some(min) = integer("x-minBytes") {
+        bounds.push(format!(">={min}B"));
+    }
+    if node.get("uniqueItems") == Some(&Value::Bool(true)) {
+        bounds.push("unique".to_owned());
+    }
+    if let Some(format) = node.get("format").and_then(Value::as_str) {
+        bounds.push(format!("fmt={format}"));
+    }
+    if let Some(pattern) = node.get("pattern").and_then(Value::as_str) {
+        bounds.push(format!("re={pattern}"));
+    }
+    if bounds.is_empty() {
+        None
+    } else {
+        Some(bounds.join(", "))
+    }
+}
+
+/// One enum value as compact JSON.
+fn render_enum_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Collapse a documented constraint to one line for the descriptor.
+fn single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 fn method_scopes(name: &str, principal: &Principal, identity: &IdentityResponse) -> Vec<String> {
     identity
         .allowed_scopes
@@ -674,6 +937,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compact_descriptors_render_nested_shapes_and_unions() {
+        let schema = json!({
+            "type": "object",
+            "required": ["id", "mode"],
+            "properties": {
+                "id": {"type": "string", "description": "Caller id."},
+                "mode": {"$ref": "#/$defs/Mode"},
+                "filter": {
+                    "anyOf": [
+                        {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "integer"}}, "required": ["b"]},
+                        {"type": "null"}
+                    ]
+                },
+                "tags": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Tags."},
+                "pair": {"type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}]},
+                "code": {"type": "string", "pattern": "^[A-Z]+$", "format": "upper", "description": "Code."}
+            },
+            "$defs": {
+                "Mode": {"type": "string", "enum": ["y", "x"], "description": "Closed set."}
+            }
+        });
+        assert_eq!(
+            compact_field_descriptors(&schema),
+            vec![
+                "code (optional): string [fmt=upper, re=^[A-Z]+$] - Code.".to_owned(),
+                "filter (optional): object{a, b*}".to_owned(),
+                "id (required): string - Caller id.".to_owned(),
+                "mode (required): enum(x|y) - Closed set.".to_owned(),
+                "pair (optional): array<tuple(integer, string)>".to_owned(),
+                "tags (optional): array<string> [1.. items] - Tags.".to_owned(),
+            ]
+        );
+        // A schema without properties carries no descriptors.
+        assert!(compact_field_descriptors(&json!({"type": "object"})).is_empty());
+    }
+
     #[tokio::test]
     async fn help_is_compact_by_default_and_full_on_request() {
         let router = super::super::tests::router();
@@ -681,15 +981,28 @@ mod tests {
             .method_help(&json!({"method": "mail.send"}), &Principal::Owner)
             .await
             .unwrap();
+        // Compact help keeps requiredness, types, enums and documented
+        // constraints (not bare names): the `to` descriptor carries the
+        // recipient shape and constraints, `mode` the closed value set.
         assert_eq!(
             compact["fields"],
-            json!(["id", "mode", "reply_to_delivery", "text", "thread", "to"])
+            json!([
+                "id (required): string - Caller-retained mutation id; MCP callers may omit id and the server mints a ULID, returned for retry. Otherwise use a fresh ULID for a new write.",
+                "mode (required): enum(inject|queue|send|steer) - Only queue is implemented; send/steer/inject parse but return unsupported.",
+                "reply_to_delivery (optional): string - Exact <write-id>/<recipient-agent> delivery id, at most 512 bytes, no NUL.",
+                "text (required): string [<=32768B] - Mail body, at most 32768 UTF-8 bytes, no NUL; empty text is allowed.",
+                "thread (optional): string [<=256B] - Optional nonblank thread label, no control characters.",
+                "to (required): array<string> [1..100 items, unique] - Distinct concrete canonical a<positive i64> Agent ids."
+            ])
         );
         assert!(compact["request_schema"].is_null());
         assert!(compact["response_schema"].is_null());
         assert!(compact.get("example").is_some());
         assert!(compact.get("limits").is_some());
         let wire = serde_json::to_vec(&compact).unwrap();
+        // Descriptors carry the full documented constraints and still
+        // fit the ~600-token compact budget (measured 2161 bytes on
+        // 2026-11-16; completeness did not require raising it).
         assert!(
             wire.len() <= 2400,
             "compact mail.send help exceeds 600 tokens: {} bytes",

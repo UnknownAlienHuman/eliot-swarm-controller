@@ -650,6 +650,7 @@ fn mcp_server_entries(config_response: &Value) -> Result<Vec<crate::mcp::Effecti
                         .and_then(Value::as_str)
                         .map(str::to_owned),
                     url: table.get("url").and_then(Value::as_str).map(str::to_owned),
+                    args: projected_args(table.get("args")),
                 });
             }
             entries.sort_by(|left, right| left.name.cmp(&right.name));
@@ -660,6 +661,33 @@ fn mcp_server_entries(config_response: &Value) -> Result<Vec<crate::mcp::Effecti
             "Codex MCP server enumeration failed before worker spawn",
         )),
     }
+}
+
+/// Project one stdio argument vector for owner-identity screening only:
+/// a string array; absent or null means the native entry carries no argv
+/// (explicitly empty: it cannot select `swarm mcp`). A malformed or
+/// unbounded vector projects as unknown (fail closed toward suppression),
+/// never as a start-blocking error and never into spawn argv.
+fn projected_args(value: Option<&Value>) -> Option<Vec<String>> {
+    const MAX_ENUMERATED_ARGS: usize = 256;
+    let items = match value {
+        None | Some(Value::Null) => return Some(Vec::new()),
+        Some(Value::Array(items)) => items,
+        Some(_) => return None,
+    };
+    if items.len() > MAX_ENUMERATED_ARGS {
+        return None;
+    }
+    let mut args = Vec::with_capacity(items.len());
+    for item in items {
+        match item.as_str() {
+            Some(arg) if arg.len() <= crate::mcp::MAX_MCP_TRANSPORT_BYTES => {
+                args.push(arg.to_owned())
+            }
+            _ => return None,
+        }
+    }
+    Some(args)
 }
 
 /// Project the effective `plugins` states: each table id plus whether it
@@ -2089,15 +2117,32 @@ mod tests {
                 .map(|entry| (
                     entry.name.as_str(),
                     entry.command.as_deref(),
-                    entry.url.as_deref()
+                    entry.url.as_deref(),
+                    entry.args.clone(),
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                ("bare", None, None),
-                ("remote", None, Some("https://remote.example/mcp")),
-                ("stdio", Some("s.exe"), None),
+                ("bare", None, None, Some(Vec::new())),
+                (
+                    "remote",
+                    None,
+                    Some("https://remote.example/mcp"),
+                    Some(Vec::new()),
+                ),
+                ("stdio", Some("s.exe"), None, Some(vec!["stdio".to_owned()])),
             ]
         );
+        // Malformed or unbounded argument vectors project as unknown, not
+        // as an enumeration error: unknown args fail closed toward
+        // suppression instead of blocking the start.
+        for response in [
+            json!({"config": {"mcp_servers": {"weird": {"command": "s.exe", "args": "mcp"}}}}),
+            json!({"config": {"mcp_servers": {"mixed": {"command": "s.exe", "args": ["mcp", 7]}}}}),
+        ] {
+            let entries = mcp_server_entries(&response).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert!(entries[0].args.is_none());
+        }
         // Non-object tables and non-string transports fail the enumeration
         // instead of projecting a partial transport.
         for response in [

@@ -96,18 +96,30 @@ the owned CLI and is removed after confirmed stop and drain.
 ### Worker MCP policy
 
 The additive per-run config above is the `inherit` policy (now an explicit
-opt-in): other native MCP sources keep Claude Code's normal behavior.
-Profiles default to `mcp = "minimal"`, frozen in the profile snapshot; a
-non-empty `mcp_allow` is rejected as `unsupported` at config load because
-Claude has no selective-inclusion mechanism. `minimal` adds the installed
-`--strict-mcp-config` flag ahead of `--mcp-config`, so only the per-run
-file applies. Verified
-read-only against Claude Code 2.1.278 (`claude --help`; that install has
-since been replaced):
-`--strict-mcp-config` means "Only use MCP servers from `--mcp-config`,
-ignoring all other MCP configurations" (flag wording re-checked against
-installed 2.1.325 on 2026-11-15). Eliot never writes Claude's user
-configuration in either policy.
+opt-in): other native MCP sources keep Claude Code's normal behavior,
+except owner Swarm entries. Profiles default to `mcp = "minimal"`, frozen
+in the profile snapshot; a non-empty `mcp_allow` is rejected as
+`unsupported` at config load because Claude has no selective-inclusion
+mechanism. `minimal` adds the installed `--strict-mcp-config` flag ahead of
+`--mcp-config`, so only the per-run file applies. For `inherit` there is no
+safe native filter: installed 2.1.325 offers no per-server disable or deny
+switch for the per-run surface (`claude --help` shows only the
+all-or-nothing `--strict-mcp-config`; `--setting-sources` selects whole
+settings sources rather than servers and `.mcp.json` project servers sit
+outside those sources; `claude mcp --help` shows no deny list; the
+per-project disable state is interactive approval state, not a per-run
+mechanism -- all verified read-only against installed 2.1.325 on
+2026-11-16), so the owner-side sources (project `.mcp.json`, project and
+local `.claude/settings*.json`, user `~/.claude/settings.json` and legacy
+`~/.claude.json`) are scanned pre-spawn for owner-identity entries -- a
+swarm executable selecting `mcp` without `--require-agent`, or a URL on
+the configured `cloud_mcp` hostname -- and a match refuses the start
+(`profile_error`, naming the server and the source kind) in `inherit`,
+whatever the entry is named. Verified read-only: `--strict-mcp-config`
+means "Only use MCP servers from `--mcp-config`, ignoring all other MCP
+configurations" (wording re-checked against installed 2.1.325 on
+2026-11-16; earlier pins to 2.1.278 and 2.1.321 describe the same
+surface). Eliot never writes Claude's user configuration in either policy.
 
 Requested vs observed: `requested` carries `mcp_policy` and `mcp_allow`;
 `effective` carries `mcp_policy` and the server set. The `initialize`

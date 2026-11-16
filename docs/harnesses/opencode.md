@@ -278,12 +278,25 @@ owned per-Agent `serve` never sees the owner's global config (isolated
 per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`, verified on the installed
 2.2.7 server), and the generated per-Agent config carries only Eliot's
 Agent-scoped `eliot-swarm` server, so both policies serve that surface.
-`inherit` is an explicit opt-in to the same behavior. A non-empty
-`mcp_allow` is rejected as `unsupported` at config load because OpenCode has
-no selective-inclusion mapping. Project-local workspace config still merges
-natively; that is the owner's explicit per-project choice, not global
-inheritance. The requested policy is reported in `effective.mcp_policy` and
-the observed inventory in `effective.mcp_servers` (`GET /api/mcp`).
+`inherit` is an explicit opt-in to the same behavior, minus owner Swarm
+entries. A non-empty `mcp_allow` is rejected as `unsupported` at config
+load because OpenCode has no selective-inclusion mapping. Project-local
+workspace config (`opencode.json`/`opencode.jsonc`) still merges natively
+into the owned serve despite the isolated XDG roots, so that layer is not
+covered by the generated config: every start scans it pre-create
+(pre-touch on resume) for owner-identity entries -- a swarm executable
+selecting `mcp` without `--require-agent`, or a URL on the configured
+`cloud_mcp` hostname -- and a match refuses the start (`profile_error`,
+naming the server and file) in every policy, whatever the entry is named.
+The settled inventory (`GET /api/mcp`) is then gated before the worker is
+accepted: `minimal` refuses any serving (`connected`/`pending`) unexpected
+server, so a project layer that defeats `minimal` fails the start instead
+of widening the worker; `inherit` refuses reserved Swarm names. An
+unreadable inventory reports unverified but never refuses. The requested
+policy is reported in `effective.mcp_policy`, the observed inventory in
+`effective.mcp_servers`, and `mcp_servers_verified` only after the gate
+passes with the Agent-scoped entry connected. No project file is ever
+edited by the scan.
 
 ## Ad-hoc launch
 

@@ -146,8 +146,10 @@ pub struct MethodHelpResponse {
     pub method: String,
     pub summary: String,
     pub cli_aliases: Vec<String>,
-    /// Sorted top-level request field names, derived from the request DTO.
-    /// Compact help carries these instead of the full JSON Schemas.
+    /// Sorted compact request field descriptors (`name (required|optional):
+    /// type [bounds] - documented constraints`), derived from the request
+    /// DTO schema. Compact help carries these instead of the full JSON
+    /// Schemas.
     pub fields: Vec<String>,
     pub request_schema: Value,
     pub response_schema: Value,
