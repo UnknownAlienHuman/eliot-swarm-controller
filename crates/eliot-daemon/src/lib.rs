@@ -22,6 +22,7 @@ mod restart_capacity;
 mod router;
 pub(crate) mod scripts;
 mod setup;
+mod skill;
 pub mod startup;
 #[cfg(test)]
 pub(crate) mod test_support;

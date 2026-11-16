@@ -25,6 +25,13 @@ possibly unsafe default data root. CLI and desktop share resolution order:
 pointer and target must pass the private-directory checks; failures never silently
 select another root. Selection creates and validates the fresh root before publication.
 
+After acquiring the data-directory lock and before serving, daemon startup
+materializes the bundled `eliot-swarm` Agent skill under `skills/` with a
+private ACL and atomic replace (see [Agent skill
+delivery](plugin-protocol.md#agent-skill-delivery)). Every harness plugin
+reads that copy through its own per-session mechanism; a failure to publish
+fails startup.
+
 Owner CLI callers start their private daemon when needed (`status` remains a read-only
 probe). Agent and Run callers keep their inherited identity and dispatch directly;
 they never probe Owner-only readiness or start a daemon with Owner authority.
@@ -39,6 +46,7 @@ checkout registers that workspace through the same machine-author settings write
   owner.token
   eliot.db, eliot.db-wal, eliot.db-shm
   daemon.lock, daemon.json, logs/daemon.log
+  skills/                daemon-materialized `eliot-swarm` Agent skill (private, rewritten at startup)
   plugins/                 only instantiated plugins
   worktrees/               L3 opt-in workspaces
   services/                managed services, when needed
