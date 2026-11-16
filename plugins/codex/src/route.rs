@@ -95,6 +95,7 @@ impl CodexRoute {
         Ok(args)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn args_with_agent_mcp(
         &self,
         server_name: &str,
@@ -103,6 +104,7 @@ impl CodexRoute {
         cwd: &Path,
         mcp_disables: &[crate::mcp::EffectiveMcpServer],
         plugin_disables: &[String],
+        native_subagents: Option<&str>,
     ) -> Result<Vec<OsString>> {
         if !swarm_executable.is_absolute() || !data_dir.is_absolute() || !cwd.is_absolute() {
             return Err(route_error(
@@ -142,6 +144,7 @@ impl CodexRoute {
             quote_path(cwd)?,
         );
         let mut mcp_override = Vec::new();
+        mcp_override.extend(native_subagents_argv(native_subagents));
         push_override(
             &mut mcp_override,
             &format!("mcp_servers.{server_name}"),
@@ -339,6 +342,28 @@ impl CodexRoute {
             )),
         }
     }
+
+    /// Route argv with the per-session native-subagent mapping applied
+    /// before `app-server`: `-c` overrides must precede the subcommand.
+    pub(super) fn args_with_native_subagents(
+        &self,
+        native_subagents: Option<&str>,
+    ) -> Result<Vec<OsString>> {
+        let args = self.args()?;
+        if native_subagents != Some("deny") {
+            return Ok(args);
+        }
+        let deny = native_subagents_argv(Some("deny"));
+        let pos = args
+            .iter()
+            .position(|arg| arg == OsStr::new("app-server"))
+            .unwrap_or(args.len());
+        let mut result = Vec::with_capacity(args.len() + deny.len());
+        result.extend(args[..pos].iter().cloned());
+        result.extend(deny);
+        result.extend(args[pos..].iter().cloned());
+        Ok(result)
+    }
 }
 
 fn env_name_matches(actual: &OsStr, expected: &str) -> bool {
@@ -354,6 +379,22 @@ fn env_name_matches(actual: &OsStr, expected: &str) -> bool {
 fn push_override(args: &mut Vec<OsString>, key: &str, value: String) {
     args.push(OsString::from("-c"));
     args.push(OsString::from(format!("{key}={value}")));
+}
+
+/// Per-session native-subagent mapping for the installed Codex CLI
+/// (verified on 0.167.1 with `codex features list` showing `multi_agent`
+/// stable on and `multi_agent_v2` stable off): `deny` appends both
+/// `features.multi_agent=false` and `features.multi_agent_v2=false` as
+/// `-c` overrides, keeping the v2 switch off too. `allow` adds nothing and
+/// preserves today's behavior.
+pub(super) fn native_subagents_argv(native_subagents: Option<&str>) -> Vec<OsString> {
+    if native_subagents != Some("deny") {
+        return Vec::new();
+    }
+    let mut args = Vec::with_capacity(4);
+    push_override(&mut args, "features.multi_agent", "false".to_owned());
+    push_override(&mut args, "features.multi_agent_v2", "false".to_owned());
+    args
 }
 
 fn models_catalog_url(provider_base_url: &str) -> String {
@@ -468,7 +509,7 @@ mod tests {
             )
         };
         let args = route
-            .args_with_agent_mcp("eliot_swarm_x", exe, data, cwd, &[], &[])
+            .args_with_agent_mcp("eliot_swarm_x", exe, data, cwd, &[], &[], None)
             .unwrap()
             .into_iter()
             .map(|value| value.into_string().unwrap())
@@ -490,16 +531,26 @@ mod tests {
                 name: "owner-a".to_owned(),
                 command: Some("a.exe".to_owned()),
                 url: None,
+                args: None,
             },
             EffectiveMcpServer {
                 name: "owner-b".to_owned(),
                 command: None,
                 url: Some("https://b.example/mcp".to_owned()),
+                args: None,
             },
         ];
         let plugin_disables = ["computer-use@openai-bundled".to_owned()];
         let args = route
-            .args_with_agent_mcp("eliot_swarm_x", exe, data, cwd, &disables, &plugin_disables)
+            .args_with_agent_mcp(
+                "eliot_swarm_x",
+                exe,
+                data,
+                cwd,
+                &disables,
+                &plugin_disables,
+                None,
+            )
             .unwrap()
             .into_iter()
             .map(|value| value.into_string().unwrap())
@@ -531,8 +582,10 @@ mod tests {
                         name: "bare".to_owned(),
                         command: None,
                         url: None,
+                        args: None,
                     }],
                     &[],
+                    None,
                 )
                 .is_err()
         );
@@ -547,8 +600,10 @@ mod tests {
                         name: "owner.x".to_owned(),
                         command: Some("x.exe".to_owned()),
                         url: None,
+                        args: None,
                     }],
                     &[],
+                    None,
                 )
                 .is_err()
         );
@@ -560,15 +615,81 @@ mod tests {
                     data,
                     cwd,
                     &[],
-                    &["owner.x".to_owned()]
+                    &["owner.x".to_owned()],
+                    None,
                 )
                 .is_err()
         );
         assert!(
             route
-                .args_with_agent_mcp("", exe, data, cwd, &[], &[])
+                .args_with_agent_mcp("", exe, data, cwd, &[], &[], None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn native_subagents_deny_adds_both_multi_agent_overrides_before_app_server() {
+        let route = CodexRoute::from_profile(&json!({"harness": "codex"})).unwrap();
+        let allow = route.args_with_native_subagents(Some("allow")).unwrap();
+        assert!(
+            allow
+                .iter()
+                .all(|arg| !arg.to_string_lossy().contains("multi_agent"))
+        );
+        let deny = route
+            .args_with_native_subagents(Some("deny"))
+            .unwrap()
+            .into_iter()
+            .map(|value| value.into_string().unwrap())
+            .collect::<Vec<_>>();
+        let app_server = deny.iter().position(|arg| arg == "app-server").unwrap();
+        for expected in [
+            "features.multi_agent=false",
+            "features.multi_agent_v2=false",
+        ] {
+            let position = deny
+                .iter()
+                .position(|arg| arg == expected)
+                .unwrap_or_else(|| panic!("missing {expected:?}"));
+            assert!(position < app_server);
+        }
+        let with_mcp = route
+            .args_with_agent_mcp(
+                "eliot_swarm_x",
+                Path::new(if cfg!(windows) {
+                    r"C:\Tools\Swarm\swarm.exe"
+                } else {
+                    "/bin/swarm"
+                }),
+                Path::new(if cfg!(windows) {
+                    r"C:\Data\Eliot"
+                } else {
+                    "/data/eliot"
+                }),
+                Path::new(if cfg!(windows) {
+                    r"C:\Work\proj"
+                } else {
+                    "/work/proj"
+                }),
+                &[],
+                &[],
+                Some("deny"),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|value| value.into_string().unwrap())
+            .collect::<Vec<_>>();
+        let app_server = with_mcp.iter().position(|arg| arg == "app-server").unwrap();
+        for expected in [
+            "features.multi_agent=false",
+            "features.multi_agent_v2=false",
+        ] {
+            let position = with_mcp
+                .iter()
+                .position(|arg| arg == expected)
+                .unwrap_or_else(|| panic!("missing {expected:?}"));
+            assert!(position < app_server);
+        }
     }
 
     #[test]

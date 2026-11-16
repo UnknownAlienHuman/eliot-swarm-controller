@@ -590,11 +590,12 @@ turns, no retries, no tool calls and no approval requests. Both owned hosts and
 their observed descendants exited; owner settings and trust state were
 unchanged. Existing Eliot launch behavior remains unchanged.
 
-This harness keeps `inherit` only: the frozen profile always records
-`mcp = "inherit"`, and a non-`inherit` policy is rejected as `unsupported`
-at config load. Verified read-only (`muse --help`, `muse mcp --help`): `muse
-mcp` covers OAuth login/logout only, and no `serve` isolation flag for MCP
-sources was observed, so no `minimal` mechanism is implemented.
+This harness keeps `inherit` only: a profile that omits `mcp` resolves to
+`inherit` (the `minimal` default applies only where a harness maps it), and
+an explicit non-`inherit` policy is rejected as `unsupported` at config load. Verified read-only
+(`muse --help`, `muse mcp --help`): `muse mcp` covers OAuth login/logout
+only, and no `serve` isolation flag for MCP sources was observed, so no
+`minimal` mechanism is implemented.
 
 ## Workflow children (native, observe-only)
 
@@ -649,7 +650,7 @@ No adapter-specific journal, proof receipts or secondary workflow model is impor
 
 `swarm launch --harness muse [--model M] [--effort E] [--cmd PATH]
 --workspace W "prompt"` is Owner-only and freezes a profile-equivalent
-snapshot from safe defaults (`workspace-write`, `never`, MCP `inherit`) plus
+snapshot from safe defaults (`workspace-write`, `never`, explicit MCP `inherit`) plus
 flags. An omitted `--model` defers to the server default (the catalogue names
 no default marker; an empty catalogue, e.g. Muse 1.4.20's `bundledCatalog`
 with zero models, fails honestly); the effective id is read back from the
@@ -679,3 +680,27 @@ copy fails the start. Implementation:
 (`skill_pending`) and
 [`plugins/muse/src/host/start.rs`](../../plugins/muse/src/host/start.rs)
 (`spawn_owned_session`).
+
+## Minimal-context measurement (k61, 2026-11-16)
+
+Private daemon, identical trivial turn, `muse-spark-1.3-contributor`, low
+effort, installed 1.4.0 binary, `inherit` (explicit; no minimal mapping
+exists). The session carries no MCP tools (the model confirmed no swarm tool
+is available in-session); the worker coordinates through the `swarm` CLI.
+Turn usage: session input 45,444 + output 209. A follow-up turn ran
+`swarm show` for its own record through the CLI and reported its agent id and
+state, proving Agent-scoped access. `muse serve --help` exposes no MCP
+isolation or tool-deferral surface, so both stay unsupported.
+
+## Native subagents (`native_subagents` deny): unsupported
+
+Checked against the installed Muse 1.4.20 binary (`muse --help`,
+`muse serve --help`, and the exported MSP schema
+`muse schema generate-json-schema`, which names native subagent provenance
+`subagentOrigin` / `subagentId` but no disable switch): there is no verified
+per-session switch to turn off native subagents, so
+`native_subagents = "deny"` on a Muse profile is `unsupported` at config
+load (typed, matching the existing pattern for unmapped fields). `allow` is
+accepted and preserves today's behavior. Implementation:
+`crates/eliot-daemon/src/config.rs` (`freeze_native_subagents`).
+

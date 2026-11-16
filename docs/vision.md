@@ -62,7 +62,7 @@ vendor-owned. Eliot is not another coding harness.
 | ID | Requirement | Owner point | Delivery |
 | --- | --- | --- | --- |
 | R1 | Small modular core; vendor code isolated in plugins; one binary. | 1 | all |
-| R2 | Headless launch with explicit profile/model/permissions/workspace. | 2 | L2 Codex, L6 adapters |
+| R2 | Headless launch with an explicit profile or routing role, plus model/permissions/workspace. | 2 | L2 Codex, L6 adapters |
 | R3 | Explicit OpenCodex or compatible proxy route; adopted/managed ownership. | 3 | L3 |
 | R4 | Real-time native/process/Git/fs monitoring with honest freshness/gaps. | 4 | L2–L3; hooks only where needed |
 | R5 | Uniform send/steer/inject/interrupt/stop/resume/request/configuration/Goal controls; unsupported semantics reject. | 5 | incremental L2–L6 |

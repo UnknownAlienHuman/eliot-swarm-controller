@@ -269,24 +269,42 @@ always); `effective` carries `mcp_servers` (installed-inventory names, or
 and the status word are retained — never the failure text. The requested
 set is never echoed as observed. The applied per-Agent config document is
 the qualified record; the inventory observation is best-effort — re-polled
-until `connected`, a terminal refusal, or 20s — and never fails a start.
+until `connected`, a terminal refusal, or 20s — and the Worker MCP policy gate below may still refuse the start on an unexpected or owner-identity server.
 
 ## Worker MCP policy
 
-This harness keeps `inherit` only: the frozen profile always records
-`mcp = "inherit"`, and a non-`inherit` policy is rejected as `unsupported`
-at config load. `inherit` is additive: the worker receives Eliot's
-Agent-scoped `eliot-swarm` server from the generated per-Agent config in
-addition to the owner's native MCP surface. No verified native MCP
-isolation mechanism was established for the installed server, so no
-`minimal` suppression mechanism is implemented.
+Profiles default to `mcp = "minimal"`, frozen in the profile snapshot; the
+owned per-Agent `serve` never sees the owner's global config (isolated
+per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`, verified on the installed
+2.2.7 server), and the generated per-Agent config carries only Eliot's
+Agent-scoped `eliot-swarm` server, so both policies serve that surface.
+`inherit` is an explicit opt-in to the same behavior, minus owner Swarm
+entries. A non-empty `mcp_allow` is rejected as `unsupported` at config
+load because OpenCode has no selective-inclusion mapping. Project-local
+workspace config (`opencode.json`/`opencode.jsonc`) still merges natively
+into the owned serve despite the isolated XDG roots, so that layer is not
+covered by the generated config: every start scans it pre-create
+(pre-touch on resume) for owner-identity entries -- a swarm executable
+selecting `mcp` without `--require-agent`, or a URL on the configured
+`cloud_mcp` hostname -- and a match refuses the start (`profile_error`,
+naming the server and file) in every policy, whatever the entry is named.
+The settled inventory (`GET /api/mcp`) is then gated before the worker is
+accepted: `minimal` refuses any serving (`connected`/`pending`) unexpected
+server, so a project layer that defeats `minimal` fails the start instead
+of widening the worker; `inherit` refuses reserved Swarm names. An
+unreadable inventory reports unverified but never refuses. The requested
+policy is reported in `effective.mcp_policy`, the observed inventory in
+`effective.mcp_servers`, and `mcp_servers_verified` only after the gate
+passes with the Agent-scoped entry connected. No project file is ever
+edited by the scan.
 
 ## Ad-hoc launch
 
 Ad-hoc OpenCode launch (`swarm launch --harness opencode [--model
 PROVIDER/MODEL] [--auth INTEGRATION] [--cmd PATH] --workspace W "prompt"`)
 is Owner-only and freezes a profile-equivalent snapshot from conservative
-defaults (MCP `inherit`) plus flags, with one extra rule: starting the
+defaults (explicit MCP `inherit`, since ad-hoc spans harnesses without a
+minimal mapping) plus flags, with one extra rule: starting the
 per-Agent server always transfers one stored auth integration into the
 isolated native store, so the frozen snapshot always carries
 `auth_integration`. An explicit `--auth` freezes verbatim like the profile
@@ -315,3 +333,32 @@ into the isolated per-Agent global skills directory
 canonical copy fails the start. Implementation:
 [`plugins/opencode/src/native/server.rs`](../../plugins/opencode/src/native/server.rs)
 (`OwnedServer::spawn`).
+
+## Minimal-context measurement (k61, 2026-11-16)
+
+Private daemon, identical trivial turn, `opencode/deepseek-v4.1-flash-free`,
+installed 2.2.7. Both `inherit` (explicit) and `minimal` (default) report
+exactly `eliot-swarm`, verified, confirming the owned `serve` never sees the
+owner global config (no owner MCP surface reaches the worker in either
+policy). Turn usage: message input 129 + cache-read 8,320 + output 3 under
+`inherit`; 122 + 8,320 + 3 under `minimal`. A follow-up turn under `minimal`
+called `api.identity` through the `swarm` tool and reported principal
+`agent`. `opencode --help` and `opencode serve --help` expose no
+tool-deferral surface, so deferred loading is unsupported.
+
+## Native subagents (`native_subagents` deny)
+
+Per-session mapping, verified on the installed OpenCode v2.2.7 server
+(`opencode --version` reports v2.2.7): the agent docs allow per-agent
+`tools` / `permission` control with `task` as the subagent tool. The plugin
+owns an isolated per-Agent config root (`XDG_CONFIG_HOME` /
+`XDG_DATA_HOME` under the instance directory; see
+`plugins/opencode/src/native/server.rs`). When the frozen profile carries
+`native_subagents = "deny"` (the default for profiles with a non-empty
+`child_profiles`), the generated isolated `opencode.jsonc` sets
+`permission.task` to `deny`, disabling the task tool for the session.
+`allow` omits the key and preserves today's behavior. Implementation:
+`plugins/opencode/src/native/server.rs` (`native_subagents_permission`,
+`agent_config_json`, `ServerLaunch::native_subagents`) and
+`plugins/opencode/src/host.rs` (`ParsedStart::native_subagents`).
+

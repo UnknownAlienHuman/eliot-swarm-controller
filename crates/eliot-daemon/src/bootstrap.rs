@@ -21,7 +21,7 @@ pub fn ensure_private_data_dir(path: impl AsRef<Path>) -> Result<PathBuf> {
     crate::platform::data_dir::ensure_private_data_dir(path)
 }
 
-/// Seed installed native-default profiles and one initial default route via
+/// Seed installed native-default profiles and initial default/worker routes via
 /// the unified settings writer. Existing profile and routing choices survive.
 pub(crate) async fn ensure_hot_start(
     data_root: &Path,
@@ -158,8 +158,20 @@ fn ensure_bootstrap_settings(
         .unwrap_or_default();
 
     if read.revision.is_none() && profile_names.is_empty() {
-        let profiles = installed_default_profiles();
+        let mut profiles = installed_default_profiles();
         profile_names = profiles.keys().cloned().collect();
+        let default_profile = bootstrap_default_profile(&profile_names);
+        if let Some(profile) = profiles.get_mut(&default_profile) {
+            let workers = bootstrap_worker_profiles(&profile_names, &default_profile);
+            // A manager whose harness cannot disable native subagents keeps
+            // them explicitly; the derived `deny` would make the whole
+            // bootstrap settings save (and daemon startup) fail.
+            if !workers.is_empty() && !manager_supports_native_deny(&default_profile) {
+                profile["native_subagents"] = json!("allow");
+            }
+            profile["child_profiles"] = json!(workers);
+            profile["control"] = json!("tree");
+        }
         if !profiles.is_empty() {
             sections.insert(Profiles, Value::Object(profiles));
         }
@@ -176,12 +188,20 @@ fn ensure_bootstrap_settings(
             .is_none_or(|profiles| profiles.is_empty())
         && !profile_names.is_empty()
     {
-        let default_profile = if profile_names.iter().any(|name| name == "codex") {
-            "codex".to_owned()
+        let default_profile = bootstrap_default_profile(&profile_names);
+        let workers = bootstrap_worker_profiles(&profile_names, &default_profile);
+        // With only one installed harness the inherited profile still works.
+        let workers = if workers.is_empty() {
+            vec![default_profile.clone()]
         } else {
-            profile_names[0].clone()
+            workers
         };
-        sections.insert(Routing, json!({"default": [default_profile]}));
+        let mut routing = current_routing.clone();
+        routing["default"] = json!([default_profile]);
+        if routing.get("worker").is_none() {
+            routing["worker"] = json!(workers);
+        }
+        sections.insert(Routing, routing);
     }
 
     if sections.is_empty() {
@@ -199,6 +219,35 @@ fn ensure_bootstrap_settings(
     Ok(())
 }
 
+/// Harnesses whose native subagents can be turned off per session
+/// (`native_subagents = "deny"`), in bootstrap manager preference order. A
+/// manager on one of them delegates through Swarm by default.
+const DENY_CAPABLE_MANAGERS: [&str; 3] = ["codex", "claude", "opencode"];
+
+/// The hot-start manager: the first installed deny-capable harness, else the
+/// first installed profile (Muse or Antigravity, which keep native subagents).
+fn bootstrap_default_profile(names: &[String]) -> String {
+    DENY_CAPABLE_MANAGERS
+        .iter()
+        .find_map(|preferred| names.iter().find(|name| name.as_str() == *preferred))
+        .or_else(|| names.first())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Whether a hot-start manager on this profile can disable native subagents.
+fn manager_supports_native_deny(profile: &str) -> bool {
+    DENY_CAPABLE_MANAGERS.contains(&profile)
+}
+
+fn bootstrap_worker_profiles(names: &[String], manager: &str) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| name.as_str() != manager)
+        .cloned()
+        .collect()
+}
+
 fn installed_default_profiles() -> serde_json::Map<String, Value> {
     let mut profiles = serde_json::Map::new();
     for harness in crate::adhoc::SUPPORTED_HARNESSES {
@@ -208,6 +257,16 @@ fn installed_default_profiles() -> serde_json::Map<String, Value> {
         }
         let mut profile = serde_json::Map::new();
         profile.insert("harness".to_owned(), Value::String((*harness).to_owned()));
+        // Explicit worker MCP policy per harness: the new default is
+        // `minimal` wherever the harness implements an isolation mechanism
+        // (Codex, Claude, OpenCode all serve only the Agent-scoped server);
+        // Muse and Antigravity keep an explicit `inherit` opt-in because no
+        // verified isolation mechanism exists for them.
+        let mcp = match *harness {
+            "muse" | "antigravity" => "inherit",
+            _ => "minimal",
+        };
+        profile.insert("mcp".to_owned(), Value::String(mcp.to_owned()));
         if let Some(cmd) = discovered.get("cmd").and_then(Value::as_str) {
             profile.insert("cmd".to_owned(), Value::String(cmd.to_owned()));
         } else if *harness != "codex" {
@@ -318,4 +377,115 @@ fn project_id(checkout: &str) -> String {
         let _ = write!(id, "{byte:02x}");
     }
     id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_manager_prefers_deny_capable_harnesses() {
+        let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            bootstrap_default_profile(&names(&["antigravity", "codex", "muse"])),
+            "codex"
+        );
+        assert_eq!(
+            bootstrap_default_profile(&names(&["antigravity", "claude", "muse"])),
+            "claude"
+        );
+        assert_eq!(
+            bootstrap_default_profile(&names(&["antigravity", "muse", "opencode"])),
+            "opencode"
+        );
+        // Only harnesses without a native-subagent switch: the first one
+        // manages and keeps native subagents explicitly (see ensure_bootstrap_settings).
+        let only = names(&["antigravity", "muse"]);
+        assert_eq!(bootstrap_default_profile(&only), "antigravity");
+        assert!(!manager_supports_native_deny("antigravity"));
+        assert!(!manager_supports_native_deny("muse"));
+        assert!(manager_supports_native_deny("codex"));
+    }
+
+    #[test]
+    fn non_deny_manager_with_children_resolves_with_explicit_allow() {
+        // The audited failure: an Antigravity manager granted a Muse child
+        // derived `deny`, which Antigravity rejects, aborting startup. The
+        // bootstrap now writes `native_subagents = "allow"` for it; the
+        // resulting profiles must resolve, and the derived form must not.
+        let root = std::env::temp_dir().join(format!("eliot-bootstrap-deny-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let explicit = "[profiles.antigravity]
+harness = \"antigravity\"
+model = \"test-model\"
+cmd = \"C:/Tools/Agy/agy.exe\"
+child_profiles = [\"muse\"]
+control = \"tree\"
+native_subagents = \"allow\"
+[profiles.muse]
+harness = \"muse\"
+model = \"m\"
+cmd = \"C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe\"
+";
+        std::fs::write(root.join("config.toml"), explicit).unwrap();
+        let snapshot = crate::config::resolve_profile(&root, "antigravity")
+            .expect("explicit allow keeps the Antigravity manager valid");
+        assert_eq!(snapshot["native_subagents"], "allow");
+        let derived = explicit.replace(
+            "native_subagents = \"allow\"
+",
+            "",
+        );
+        std::fs::write(root.join("config.toml"), derived).unwrap();
+        let error = crate::config::resolve_profile(&root, "antigravity")
+            .expect_err("derived deny is unsupported on Antigravity");
+        assert_eq!(error.code, "unsupported");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_bootstrap_grants_only_installed_worker_profiles_and_preserves_edits() {
+        let root = std::env::temp_dir().join(format!("eliot-bootstrap-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let policy = SecretPolicy::default();
+        ensure_bootstrap_settings(&root, &mut store, &policy).unwrap();
+        if root.join("config.toml").is_file() {
+            let source = std::fs::read_to_string(root.join("config.toml")).unwrap();
+            let config: toml::Value = toml::from_str(&source).unwrap();
+            let profiles = config["profiles"].as_table().unwrap();
+            let names = profiles.keys().cloned().collect::<Vec<_>>();
+            let manager = bootstrap_default_profile(&names);
+            let workers = bootstrap_worker_profiles(&names, &manager);
+            assert_eq!(
+                config["routing"]["default"][0].as_str(),
+                Some(manager.as_str())
+            );
+            assert_eq!(profiles[&manager]["control"].as_str(), Some("tree"));
+            let allowed: Vec<String> = profiles[&manager]["child_profiles"]
+                .clone()
+                .try_into()
+                .unwrap();
+            assert_eq!(allowed, workers);
+            let routed: Vec<String> = config["routing"]["worker"].clone().try_into().unwrap();
+            assert_eq!(
+                routed,
+                if workers.is_empty() {
+                    vec![manager]
+                } else {
+                    workers
+                }
+            );
+            // Restart never adds a new grant or overwrites an Owner edit.
+            let edited = "[profiles.only]\nharness='codex'\nchild_profiles=[]\n[routing]\ndefault=['only']\nworker=['only']\n";
+            std::fs::write(root.join("config.toml"), edited).unwrap();
+            ensure_bootstrap_settings(&root, &mut store, &policy).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join("config.toml")).unwrap(),
+                edited
+            );
+        }
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

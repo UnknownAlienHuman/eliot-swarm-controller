@@ -53,13 +53,13 @@ const METHODS: &[Method] = &[
         "Read the authenticated Memory installation identity; Memory principal only.",
         {}
     ),
-    method!("inference.client.install", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Install one private Memory credential; Owner only; exact replay reconciles the same private publication.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":0}),
-    method!("inference.client.rotate", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Stage one pending Memory credential; Owner only; no version allocation on retry.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":1}),
-    method!("inference.client.promote", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Promote pending credential after its authenticated pre-rotation call read; retain one previous credential.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":1}),
-    method!("inference.client.retire", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Retire the previous credential after restart, current-credential old-call read and release; exact retry reconciles private-file cleanup.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":2}),
-    method!("inference.text", InferenceTextRequest, InferenceReceipt, false, true, "Admit one bounded tool-free text inference; Memory principal only; exact replay never launches again.", {"id":EXAMPLE_ID,"profile":"memory-text-v1","origin":"episode:1","disclosure":"provider_allowed","text":"hello","input_sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","input_bytes":5,"response_format":"text","max_result_bytes":1024,"deadline_ms":30000}),
+    method!("inference.client.install", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Install one private Memory credential; Owner only; exact replay reconciles publication.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":0}),
+    method!("inference.client.rotate", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Stage one pending Memory credential; Owner only; no version allocation.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":1}),
+    method!("inference.client.promote", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Promote the pending credential; retain one previous credential.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":1}),
+    method!("inference.client.retire", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Retire the previous credential after restart and release.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":2}),
+    method!("inference.text", InferenceTextRequest, InferenceReceipt, false, true, "Admit one bounded tool-free text inference; Memory principal only.", {"id":EXAMPLE_ID,"profile":"memory-text-v1","origin":"episode:1","disclosure":"provider_allowed","text":"hello","input_sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","input_bytes":5,"response_format":"text","max_result_bytes":1024,"deadline_ms":30000}),
     method!("inference.get", InferenceGetRequest, InferenceCall, false, false, "Read current own-call physical state; Memory principal only.", {"call_id":EXAMPLE_ID}),
-    method!("inference.write.get", InferenceWriteGetRequest, InferenceWriteResponse, false, false, "Read an exact own mutation binding, live absence or history gap without admission.", {"id":EXAMPLE_ID}),
+    method!("inference.write.get", InferenceWriteGetRequest, InferenceWriteResponse, false, false, "Read one exact own mutation binding without admission.", {"id":EXAMPLE_ID}),
     method!(
         "inference.high_water",
         InferenceHighWaterRequest,
@@ -69,11 +69,11 @@ const METHODS: &[Method] = &[
         "Capture own monotonic call/write high-waters and retained membership cuts.",
         {}
     ),
-    method!("inference.list", InferenceListRequest, InferenceListResponse, false, false, "Page own call/write membership in fixed intervals; crossing a pruning cut returns history_gap.", {"call_after_seq":0,"call_through_seq":1,"write_after_seq":0,"write_through_seq":1,"limit":20,"cursor":null}),
-    method!("inference.retention.advance", InferenceRetentionRequest, InferenceRetentionResponse, false, true, "Advance Memory-asserted safe cuts and prune bounded released metadata; preserves live write replay.", {"id":EXAMPLE_ID,"observed_call_high_water_seq":1,"observed_write_high_water_seq":1,"safe_retain_after_seq":1,"retain_after_seq":1,"safe_write_retain_after_seq":1,"write_retain_after_seq":1,"limit":20}),
-    method!("inference.result.read", InferenceResultRequest, InferenceResultResponse, false, false, "Read an exact own-result byte range after full private digest/length verification.", {"call_id":EXAMPLE_ID,"result_sha256":"0000000000000000000000000000000000000000000000000000000000000000","offset":0,"length":1024}),
+    method!("inference.list", InferenceListRequest, InferenceListResponse, false, false, "Page own call/write membership; pruned cuts return history_gap.", {"call_after_seq":0,"call_through_seq":1,"write_after_seq":0,"write_through_seq":1,"limit":20,"cursor":null}),
+    method!("inference.retention.advance", InferenceRetentionRequest, InferenceRetentionResponse, false, true, "Advance Memory-asserted safe cuts; preserves live write replay.", {"id":EXAMPLE_ID,"observed_call_high_water_seq":1,"observed_write_high_water_seq":1,"safe_retain_after_seq":1,"retain_after_seq":1,"safe_write_retain_after_seq":1,"write_retain_after_seq":1,"limit":20}),
+    method!("inference.result.read", InferenceResultRequest, InferenceResultResponse, false, false, "Read one exact own-result byte range.", {"call_id":EXAMPLE_ID,"result_sha256":"0000000000000000000000000000000000000000000000000000000000000000","offset":0,"length":1024}),
     method!("inference.cancel", InferenceCancelRequest, InferenceMutationResponse, false, true, "Cancel an own queued call; sending calls honestly report too_late.", {"id":EXAMPLE_ID,"call_id":EXAMPLE_ID}),
-    method!("inference.release", InferenceReleaseRequest, InferenceMutationResponse, false, true, "Fence publication and clean owned copies after Memory classifies backup dependencies; controller_dependent is protected.", {"id":EXAMPLE_ID,"call_id":EXAMPLE_ID,"disposition":"abandon_for_erasure","result_sha256":null,"backup_dependency":"no_backup_dependencies"}),
+    method!("inference.release", InferenceReleaseRequest, InferenceMutationResponse, false, true, "Fence publication and clean owned copies after backup classification.", {"id":EXAMPLE_ID,"call_id":EXAMPLE_ID,"disposition":"abandon_for_erasure","result_sha256":null,"backup_dependency":"no_backup_dependencies"}),
     method!("api.methods", MethodsRequest, MethodsResponse, false, false, "List/search callable canonical methods in bounded pages.", {"query":"mail", "limit":20}),
     method!("api.help", MethodHelpRequest, MethodHelpResponse, false, false, "Read a method's DTO schemas, example and limits.", {"method":"mail.send"}),
     method!(
@@ -114,7 +114,7 @@ const METHODS: &[Method] = &[
         "Run the bounded retention pass now and report pruned counts.",
         {}
     ),
-    method!("command.submit", CommandSubmitRequest, CommandSubmitResponse, false, true, "Submit a command using the target's advertised native capabilities; launch/send/wait child verbs included.", {"id":EXAMPLE_ID,"verb":"send","target":"a1","args":{"text":"Report current progress."}}),
+    method!("command.submit", CommandSubmitRequest, CommandSubmitResponse, false, true, "Submit a command with launch/send/wait child verbs.", {"id":EXAMPLE_ID,"verb":"send","target":"a1","args":{"text":"Report current progress."}}),
     method!("command.get", CommandGetRequest, Command, false, false, "Read a retained command in your authorized scope.", {"id":EXAMPLE_ID}),
     method!("command.children", CommandChildrenRequest, CommandChildrenResponse, false, false, "Page the retained children of one command.", {"id":EXAMPLE_ID,"limit":20}),
     method!("command.resolve", CommandResolveRequest, CommandResolveResponse, true, true, "Record an owner resolution of an uncertain command; never replay its effect.", {"id":EXAMPLE_ID,"command_id":"previous-command","as":"failed","reason":"Owner verified failure."}),
@@ -126,17 +126,17 @@ const METHODS: &[Method] = &[
         HarnessListResponse,
         true,
         false,
-        "List installed harness executables with versions; starts no model turn and performs no inference.",
+        "List installed harness executables with versions.",
         {}
     ),
-    method!("harness.models", HarnessModelsRequest, HarnessModelsResponse, true, false, "Read a harness native model catalogue through its own read-only method; starts no model turn and performs no inference.", {"harness":"codex"}),
-    method!("harness.quota", HarnessQuotaRequest, HarnessQuotaResponse, true, false, "Read provider-supported account quota with timestamp, scope, status and details when supported; starts no model turn and performs no inference.", {"harness":"codex"}),
+    method!("harness.models", HarnessModelsRequest, HarnessModelsResponse, true, false, "Read a harness native model catalogue (read-only).", {"harness":"codex"}),
+    method!("harness.quota", HarnessQuotaRequest, HarnessQuotaResponse, true, false, "Read provider-supported account quota when supported.", {"harness":"codex"}),
     method!("agent.history", AgentHistoryRequest, ObservationPage, true, false, "Read a bounded native history view advertised by agent.get.", {"id":"a1","source":"native","view":"turns","limit":20}),
-    method!("agent.list", AgentListRequest, AgentListResponse, false, false, "List scoped compact Agent summaries with indexed state/project/harness/parent/root filters, counts and explicit truncation.", {"limit":20,"state":"busy"}),
+    method!("agent.list", AgentListRequest, AgentListResponse, false, false, "List scoped compact Agent summaries with filters and counts.", {"limit":20,"state":"busy"}),
     method!("agent.result", AgentResultRequest, AgentResultResponse, false, false, "Read retained turns/results for one Agent.", {"id":"a1","limit":20}),
     method!("agent.processes", AgentProcessesRequest, AgentProcessesResponse, false, false, "Read bounded process observations for one Agent.", {"id":"a1"}),
     method!("agent.stats", AgentStatsRequest, AgentStatsResponse, false, false, "Read sampled Agent statistics with freshness metadata.", {"id":"a1"}),
-    method!("usage.summary", UsageSummaryRequest, UsageSummaryResponse, false, false, "Read bounded usage totals with explicit coverage over one Agent, project or tree scope.", {"agent":"a1"}),
+    method!("usage.summary", UsageSummaryRequest, UsageSummaryResponse, false, false, "Read bounded usage totals over one Agent, project or tree scope.", {"agent":"a1"}),
     method!("agent.git", AgentGitRequest, AgentGitResponse, false, false, "Read Git observations for one Agent's workspace.", {"id":"a1"}),
     method!("agent.edits", AgentEditsRequest, AgentEditsResponse, false, false, "Read a bounded page of observed workspace edits.", {"id":"a1","limit":20}),
     method!("turn.get", TurnGetRequest, Turn, false, false, "Read one exact Agent/generation/turn binding.", {"agent":"a1","generation":1,"turn_id":"turn-1"}),
@@ -154,10 +154,10 @@ const METHODS: &[Method] = &[
     method!("events.read", EventsReadRequest, EventsReadResponse, false, false, "Read a bounded event page; history gaps remain explicit.", {"after":0,"limit":20}),
     method!("events.subscribe", EventsSubscribeRequest, EventsSubscribeResponse, false, false, "Long-poll a bounded event page, at most 30 seconds.", {"after":0,"limit":20,"wait_ms":1000}),
     method!("swarm.wait", SwarmWaitRequest, SwarmWaitResponse, false, false, "Wait up to 30 seconds for a frozen set of child commands/turns with all/any semantics.", {"commands":[EXAMPLE_ID],"turns":[],"mode":"all","wait_ms":1000}),
-    method!("swarm.digest", SwarmDigestRequest, SwarmDigestResponse, false, true, "Register a durable completion digest delivering one coalesced parent mailbox result with the standard mail wake.", {"id":EXAMPLE_ID,"to":"a1","mode":"all","commands":[EXAMPLE_ID],"turns":[]}),
-    method!("swarm.reparent", ReparentRequest, ReparentResponse, true, true, "Atomically move one Agent subtree or all children to a controlled manager; Owner only, frozen profiles unchanged.", {"id":EXAMPLE_ID,"agent":"a2","expected_generation":1,"parent":"a3","parent_generation":1}),
-    method!("swarm.switch", SwitchRequest, SwitchResponse, true, true, "Launch a new Agent session then atomically hand off task inputs, claims, paused Goal and children; Owner only.", {"id":EXAMPLE_ID,"from":"a1","from_generation":1,"task_command":"retained-task","commands":[],"launch":{"harness":"antigravity","model":"gemini-4-hydrogen-low"}}),
-    method!("swarm.handoff", HandoffRequest, HandoffResponse, true, true, "Transfer selected undispatched task inputs, claims, paused Goal and children to an existing Agent; Owner only.", {"id":EXAMPLE_ID,"from":"a1","from_generation":1,"to":"a2","to_generation":1,"task_command":"retained-task","commands":[]}),
+    method!("swarm.digest", SwarmDigestRequest, SwarmDigestResponse, false, true, "Register a durable completion digest with the standard mail wake.", {"id":EXAMPLE_ID,"to":"a1","mode":"all","commands":[EXAMPLE_ID],"turns":[]}),
+    method!("swarm.reparent", ReparentRequest, ReparentResponse, true, true, "Move one Agent subtree or all children to a controlled manager; Owner only.", {"id":EXAMPLE_ID,"agent":"a2","expected_generation":1,"parent":"a3","parent_generation":1}),
+    method!("swarm.switch", SwitchRequest, SwitchResponse, true, true, "Launch a new Agent session, then atomically hand off to it; Owner only.", {"id":EXAMPLE_ID,"from":"a1","from_generation":1,"task_command":"retained-task","commands":[],"launch":{"harness":"antigravity","model":"gemini-4-hydrogen-low"}}),
+    method!("swarm.handoff", HandoffRequest, HandoffResponse, true, true, "Transfer selected undispatched inputs and children to an Agent; Owner only.", {"id":EXAMPLE_ID,"from":"a1","from_generation":1,"to":"a2","to_generation":1,"task_command":"retained-task","commands":[]}),
     method!("command.cancel", CommandCancelRequest, CommandCancelResponse, true, true, "Withdraw one undispatched handoff input with no native effect; Owner only.", {"id":EXAMPLE_ID,"command_id":"retained-handoff/send-0"}),
     method!("project.get", ProjectGetRequest, ProjectRegistrationView, true, false, "Read one approved project registration.", {"id":"project-1"}),
     method!(
@@ -175,7 +175,7 @@ const METHODS: &[Method] = &[
         ProjectDiscoverResponse,
         true,
         true,
-        "Register an Owner-opened Git checkout with the current profile allowlist through the internal project-discovery settings author; non-Git paths are a no-op.",
+        "Register an Owner-opened Git checkout; non-Git paths are a no-op.",
         {"workspace":"C:/work/repo"}
     ),
     method!(
@@ -184,7 +184,7 @@ const METHODS: &[Method] = &[
         ProfileListResponse,
         true,
         false,
-        "List configured profiles as sanitized summaries (names, harness, model/effort, authority and route names) with launch-time resolvability; no environment or secret values.",
+        "List configured profiles as sanitized summaries with resolvability.",
         {}
     ),
     method!(
@@ -193,10 +193,10 @@ const METHODS: &[Method] = &[
         ProfilesReadResponse,
         true,
         false,
-        "Read the verbatim [profiles.*] sections of config.toml and the file revision; other sections stay server-side.",
+        "Read the verbatim [profiles.*] sections and the file revision.",
         {}
     ),
-    method!("config.profiles.save", ProfilesSaveRequest, ProfilesSaveResponse, true, true, "Validate (dry_run) or replace the [profiles.*] sections of config.toml with the daemon's own parser and launch resolution, guarded by the file revision.", {"expected_revision":null,"source":"[profiles.codex]
+    method!("config.profiles.save", ProfilesSaveRequest, ProfilesSaveResponse, true, true, "Validate (dry_run) or replace the [profiles.*] sections, guarded by revision.", {"expected_revision":null,"source":"[profiles.codex]
 harness = \"codex\"
 model = \"gpt-6-luna\"
 ","dry_run":true}),
@@ -215,7 +215,7 @@ model = \"gpt-6-luna\"
         SettingsSaveResponse,
         true,
         true,
-        "Validate (dry_run) or save complete typed settings sections with revision CAS and bounded author history.",
+        "Validate (dry_run) or save complete typed settings sections.",
         {"expected_revision":null,"sections":{"routing":{"default":["codex"]}},"dry_run":true,"client":"cli"}
     ),
     method!(
@@ -224,7 +224,7 @@ model = \"gpt-6-luna\"
         RoutingPreviewResponse,
         true,
         false,
-        "Preview the routing decision the next launch of a role would record; advisory, nothing is admitted, frozen or reserved.",
+        "Preview the routing decision for a role; advisory only.",
         {"role":"worker"}
     ),
     method!(
@@ -233,12 +233,12 @@ model = \"gpt-6-luna\"
         ScriptListResponse,
         true,
         false,
-        "Page existing script entries under approved Run roots; continue next_cursor through empty pages until absent.",
+        "Page existing script entries under approved Run roots.",
         {}
     ),
-    method!("script.read", ScriptReadRequest, ScriptReadResponse, true, false, "Read one existing script entry through a verified handle; oversized files are refused, binary or secret-bearing content is withheld.", {"project":null,"path":"check.ps1"}),
+    method!("script.read", ScriptReadRequest, ScriptReadResponse, true, false, "Read one existing script entry through a verified handle.", {"project":null,"path":"check.ps1"}),
     method!("script.save", ScriptSaveRequest, ScriptSaveResponse, true, true, "Validate (dry_run) or replace one existing script entry guarded by its revision; never executes.", {"project":null,"path":"check.ps1","expected_revision":"0000000000000000000000000000000000000000000000000000000000000000","content":"Write-Output ok\n","dry_run":true}),
-    method!("rule.list", RuleListRequest, RuleListResponse, true, false, "Page one rule namespace's stored states with canonical definitions and timer states.", {"limit":20}),
+    method!("rule.list", RuleListRequest, RuleListResponse, true, false, "Page one rule namespace's stored states and timer states.", {"limit":20}),
     method!("rule.get", RuleGetRequest, RuleStateView, true, false, "Read one rule's current and retiring cursors.", {"id":"rule-1"}),
     method!("rule.catch_up", RuleCatchUpRequest, Command, true, true, "Catch up a rule through a finite retained event interval.", {"id":EXAMPLE_ID,"rule":"rule-1","after_seq":0,"through_seq":10}),
     method!("timer.get", TimerGetRequest, TimerStateView, true, false, "Read one timer's state and next occurrence.", {"id":"timer-1"}),
@@ -453,10 +453,22 @@ impl Router {
             example["agent"] = json!("a1");
         }
         let scopes = method_scopes(method.name, principal, &identity);
+        // Compact by default: compact field descriptors (requiredness,
+        // types, enums, nested shapes and documented constraints) stand in
+        // for the full JSON Schemas (fields, one example, limits).
+        // `full: true` restores both schemas for callers that need exact
+        // shapes.
+        let fields: Vec<String> = compact_field_descriptors(&(method.input)());
+        let (request_schema, response_schema) = if request.full.unwrap_or(false) {
+            ((method.input)(), (method.output)())
+        } else {
+            (Value::Null, Value::Null)
+        };
         encode(MethodHelpResponse {
             method:method.name.to_owned(), summary:method.summary.to_owned(),
             cli_aliases:aliases.iter().map(|s| (*s).to_owned()).collect(),
-            request_schema:(method.input)(), response_schema:(method.output)(),
+            fields,
+            request_schema, response_schema,
             example:json!({"method":method.name,"params":example}),
             mutation_id:if method.name.starts_with("inference.") && method.mutation { "Supply a caller-retained literal ULID before send; do not omit it. After a lost reply retry with that same id and identical semantic payload, or read inference.write.get. Never allocate another id to recover an uncertain mutation." } else if method.mutation { "id is optional on MCP: omit it and the server mints a ULID and returns it in the reply; retry with that same id. Otherwise supply a fresh caller-retained ULID in id before the first write. Retry only with that same id, principal, method and identical semantic payload. Never mint another id after an uncertain outcome; read back the retained result. The example id is illustrative; replace it for a new write." } else { "Read-only; no mutation id is required." }.to_owned(),
             scopes, limits:format!("{} Responses retain their DTO pagination and daemon 4 MiB frame bounds; one help result is at most 256 KiB. Examples for existing resources require their actual retained ids/profile/source/view.", method_limits(method.name)), unsupported,
@@ -464,6 +476,272 @@ impl Router {
     }
 }
 
+/// Compact field descriptors for a request DTO schema: one entry per
+/// top-level property, sorted by name, each carrying the field name,
+/// requiredness, type, enum values, nested shape and documented
+/// constraints, derived from the schemars DTO schema (draft 2020-12).
+/// Compact help carries these instead of the full JSON Schemas; `full:
+/// true` restores both schemas for callers that need exact shapes.
+fn compact_field_descriptors(schema: &Value) -> Vec<String> {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut names: Vec<&String> = properties.keys().collect();
+    names.sort();
+    names
+        .iter()
+        .map(|name| describe_field(schema, properties, name))
+        .collect()
+}
+
+/// One `name (required|optional): type [bounds] - documented constraints`
+/// descriptor. Descriptions collapse to one line; nested objects render
+/// their property names with requiredness marks one level deep.
+fn describe_field(root: &Value, properties: &serde_json::Map<String, Value>, name: &str) -> String {
+    let required = root
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| required.iter().any(|entry| entry.as_str() == Some(name)));
+    let property = properties.get(name);
+    // Types resolve through `$ref`, but documented constraints live on the
+    // property beside the reference (schemars emits `description` there),
+    // so descriptions and bounds prefer the property and fall back to the
+    // resolved target.
+    let node = property.map(|node| resolve_ref(root, node));
+    let mut descriptor = format!(
+        "{name} ({}): {}",
+        if required { "required" } else { "optional" },
+        node.map(|node| describe_type(root, node, 0))
+            .unwrap_or_else(|| "any".to_owned())
+    );
+    let bounds = property
+        .and_then(describe_bounds)
+        .or_else(|| node.and_then(describe_bounds));
+    if let Some(bounds) = bounds {
+        descriptor.push_str(&format!(" [{bounds}]"));
+    }
+    let description = property
+        .and_then(|node| node.get("description"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            node.and_then(|node| node.get("description"))
+                .and_then(Value::as_str)
+        })
+        .map(single_line)
+        .filter(|description| !description.is_empty());
+    if let Some(description) = description {
+        descriptor.push_str(&format!(" - {description}"));
+    }
+    descriptor
+}
+
+/// Follow a local `$ref` (JSON pointer under `#`) to its target, up to a
+/// small depth. An unresolvable reference returns the node itself.
+fn resolve_ref<'a>(root: &'a Value, node: &'a Value) -> &'a Value {
+    let mut current = node;
+    for _ in 0..8 {
+        let Some(target) = current.get("$ref").and_then(Value::as_str) else {
+            return current;
+        };
+        let Some(path) = target.strip_prefix('#') else {
+            return current;
+        };
+        let mut resolved = root;
+        let mut ok = true;
+        for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+            let segment = segment.replace("~1", "/").replace("~0", "~");
+            match resolved.get(&segment) {
+                Some(next) => resolved = next,
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            return current;
+        }
+        current = resolved;
+    }
+    current
+}
+
+/// A readable type for one schema node: enums render their closed value
+/// set, unions join their branches (explicit null branches are dropped:
+/// the required marker already says whether the field may be omitted),
+/// arrays name their item type and objects name their nested properties.
+fn describe_type(root: &Value, node: &Value, depth: usize) -> String {
+    let node = resolve_ref(root, node);
+    if let Some(values) = node.get("enum").and_then(Value::as_array) {
+        let mut rendered: Vec<String> = values.iter().map(render_enum_value).collect();
+        rendered.sort();
+        rendered.dedup();
+        return format!("enum({})", rendered.join("|"));
+    }
+    if node.get("const").is_some() {
+        return format!("const({})", node.get("const").expect("const value"));
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(branches) = node.get(key).and_then(Value::as_array) {
+            let mut parts = Vec::new();
+            for branch in branches {
+                let branch = resolve_ref(root, branch);
+                if branch.get("type").and_then(Value::as_str) == Some("null")
+                    || branch == &Value::Bool(false)
+                {
+                    continue;
+                }
+                if branch == &Value::Bool(true) {
+                    parts.push("any".to_owned());
+                    continue;
+                }
+                parts.push(describe_type(root, branch, depth + 1));
+            }
+            parts.sort();
+            parts.dedup();
+            if parts.is_empty() {
+                return "null".to_owned();
+            }
+            if parts.len() == 1 {
+                return parts.pop().expect("single branch");
+            }
+            return parts.join("|");
+        }
+    }
+    let mut names = Vec::new();
+    match node.get("type") {
+        Some(Value::String(name)) if name != "null" => names.push(name.clone()),
+        Some(Value::Array(list)) => {
+            for name in list.iter().filter_map(Value::as_str) {
+                if name != "null" {
+                    names.push(name.to_owned());
+                }
+            }
+        }
+        _ => {}
+    }
+    if names.is_empty() {
+        if node.get("properties").and_then(Value::as_object).is_some() {
+            names.push("object".to_owned());
+        } else if node.get("items").is_some() || node.get("prefixItems").is_some() {
+            names.push("array".to_owned());
+        } else {
+            return "any".to_owned();
+        }
+    }
+    let mut parts = Vec::new();
+    for name in names {
+        parts.push(match name.as_str() {
+            "array" => format!("array<{}>", describe_items(root, node, depth)),
+            "object" => describe_object_shape(root, node),
+            other => other.to_owned(),
+        });
+    }
+    parts.sort();
+    parts.dedup();
+    parts.join("|")
+}
+
+/// Item type for one array node: `prefixItems` renders as a tuple, a
+/// missing items schema renders as `any`.
+fn describe_items(root: &Value, node: &Value, depth: usize) -> String {
+    if depth > 3 {
+        return "any".to_owned();
+    }
+    if let Some(prefix) = node.get("prefixItems").and_then(Value::as_array) {
+        let mut parts: Vec<String> = prefix
+            .iter()
+            .map(|item| describe_type(root, item, depth + 1))
+            .collect();
+        parts.sort();
+        return format!("tuple({})", parts.join(", "));
+    }
+    match node.get("items") {
+        None | Some(Value::Bool(false)) => "any".to_owned(),
+        Some(Value::Bool(true)) => "any".to_owned(),
+        Some(items) => describe_type(root, items, depth + 1),
+    }
+}
+
+/// Nested shape for one object node: `{a, b*}` property names with
+/// requiredness marks, one level deep.
+fn describe_object_shape(root: &Value, node: &Value) -> String {
+    let node = resolve_ref(root, node);
+    let Some(properties) = node.get("properties").and_then(Value::as_object) else {
+        return "object".to_owned();
+    };
+    let mut names: Vec<String> = properties.keys().cloned().collect();
+    names.sort();
+    for name in names.iter_mut() {
+        let nested = node
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| required.iter().any(|entry| entry.as_str() == Some(name)));
+        if nested {
+            *name = format!("{name}*");
+        }
+    }
+    format!("object{{{}}}", names.join(", "))
+}
+
+/// Structured bounds carried by one schema node: string/array/numeric
+/// ranges, Eliot byte budgets, uniqueness, format and pattern. Present
+/// keys render verbatim; absent keys stay absent.
+fn describe_bounds(node: &Value) -> Option<String> {
+    let integer = |key: &str| node.get(key).and_then(Value::as_i64);
+    let mut bounds = Vec::new();
+    match (integer("minLength"), integer("maxLength")) {
+        (Some(min), Some(max)) => bounds.push(format!("len {min}..{max}")),
+        (Some(min), None) => bounds.push(format!("len {min}..")),
+        (None, Some(max)) => bounds.push(format!("len ..{max}")),
+        (None, None) => {}
+    }
+    match (integer("minItems"), integer("maxItems")) {
+        (Some(min), Some(max)) => bounds.push(format!("{min}..{max} items")),
+        (Some(min), None) => bounds.push(format!("{min}.. items")),
+        (None, Some(max)) => bounds.push(format!("..{max} items")),
+        (None, None) => {}
+    }
+    match (node.get("minimum"), node.get("maximum")) {
+        (Some(min), Some(max)) => bounds.push(format!("{min}..{max}")),
+        (Some(min), None) => bounds.push(format!("{min}..")),
+        (None, Some(max)) => bounds.push(format!("..{max}")),
+        (None, None) => {}
+    }
+    if let Some(max) = integer("x-maxBytes") {
+        bounds.push(format!("<={max}B"));
+    }
+    if let Some(min) = integer("x-minBytes") {
+        bounds.push(format!(">={min}B"));
+    }
+    if node.get("uniqueItems") == Some(&Value::Bool(true)) {
+        bounds.push("unique".to_owned());
+    }
+    if let Some(format) = node.get("format").and_then(Value::as_str) {
+        bounds.push(format!("fmt={format}"));
+    }
+    if let Some(pattern) = node.get("pattern").and_then(Value::as_str) {
+        bounds.push(format!("re={pattern}"));
+    }
+    if bounds.is_empty() {
+        None
+    } else {
+        Some(bounds.join(", "))
+    }
+}
+
+/// One enum value as compact JSON.
+fn render_enum_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Collapse a documented constraint to one line for the descriptor.
+fn single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 fn method_scopes(name: &str, principal: &Principal, identity: &IdentityResponse) -> Vec<String> {
     identity
         .allowed_scopes
@@ -668,6 +946,128 @@ mod tests {
             help["mutation_id"],
             json!("Read-only; no mutation id is required.")
         );
+    }
+
+    #[test]
+    fn compact_descriptors_render_nested_shapes_and_unions() {
+        let schema = json!({
+            "type": "object",
+            "required": ["id", "mode"],
+            "properties": {
+                "id": {"type": "string", "description": "Caller id."},
+                "mode": {"$ref": "#/$defs/Mode"},
+                "filter": {
+                    "anyOf": [
+                        {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "integer"}}, "required": ["b"]},
+                        {"type": "null"}
+                    ]
+                },
+                "tags": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Tags."},
+                "pair": {"type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}]},
+                "code": {"type": "string", "pattern": "^[A-Z]+$", "format": "upper", "description": "Code."}
+            },
+            "$defs": {
+                "Mode": {"type": "string", "enum": ["y", "x"], "description": "Closed set."}
+            }
+        });
+        assert_eq!(
+            compact_field_descriptors(&schema),
+            vec![
+                "code (optional): string [fmt=upper, re=^[A-Z]+$] - Code.".to_owned(),
+                "filter (optional): object{a, b*}".to_owned(),
+                "id (required): string - Caller id.".to_owned(),
+                "mode (required): enum(x|y) - Closed set.".to_owned(),
+                "pair (optional): array<tuple(integer, string)>".to_owned(),
+                "tags (optional): array<string> [1.. items] - Tags.".to_owned(),
+            ]
+        );
+        // A schema without properties carries no descriptors.
+        assert!(compact_field_descriptors(&json!({"type": "object"})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn help_is_compact_by_default_and_full_on_request() {
+        let router = super::super::tests::router();
+        let compact = router
+            .method_help(&json!({"method": "mail.send"}), &Principal::Owner)
+            .await
+            .unwrap();
+        // Compact help keeps requiredness, types, enums and documented
+        // constraints (not bare names): the `to` descriptor carries the
+        // recipient shape and constraints, `mode` the closed value set.
+        assert_eq!(
+            compact["fields"],
+            json!([
+                "id (required): string - Caller-retained mutation id; MCP callers may omit id and the server mints a ULID, returned for retry. Otherwise use a fresh ULID for a new write.",
+                "mode (required): enum(inject|queue|send|steer) - Only queue is implemented; send/steer/inject parse but return unsupported.",
+                "reply_to_delivery (optional): string - Exact <write-id>/<recipient-agent> delivery id, at most 512 bytes, no NUL.",
+                "text (required): string [<=32768B] - Mail body, at most 32768 UTF-8 bytes, no NUL; empty text is allowed.",
+                "thread (optional): string [<=256B] - Optional nonblank thread label, no control characters.",
+                "to (required): array<string> [1..100 items, unique] - Distinct concrete canonical a<positive i64> Agent ids."
+            ])
+        );
+        assert!(compact["request_schema"].is_null());
+        assert!(compact["response_schema"].is_null());
+        assert!(compact.get("example").is_some());
+        assert!(compact.get("limits").is_some());
+        let wire = serde_json::to_vec(&compact).unwrap();
+        // Descriptors carry the full documented constraints and still
+        // fit the ~600-token compact budget (measured 2161 bytes on
+        // 2026-11-16; completeness did not require raising it).
+        assert!(
+            wire.len() <= 2400,
+            "compact mail.send help exceeds 600 tokens: {} bytes",
+            wire.len()
+        );
+        let full = router
+            .method_help(
+                &json!({"method": "mail.send", "full": true}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(full["fields"], compact["fields"]);
+        assert!(full["request_schema"].is_object());
+        assert!(full["response_schema"].is_object());
+        assert!(full["request_schema"]["properties"].get("to").is_some());
+    }
+
+    #[tokio::test]
+    async fn method_pages_carry_one_line_summaries() {
+        let router = super::super::tests::router();
+        // Owner sees every method; walk every page so all summaries hold.
+        let mut after: Option<String> = None;
+        let mut pages = 0;
+        let mut seen = 0;
+        loop {
+            let mut params = serde_json::Map::new();
+            params.insert("limit".to_owned(), json!(50));
+            if let Some(cursor) = after {
+                params.insert("after".to_owned(), json!(cursor));
+            }
+            let page = router
+                .methods(&Value::Object(params), &Principal::Owner)
+                .await
+                .unwrap();
+            pages += 1;
+            let methods = page["methods"].as_array().expect("methods page");
+            assert!(!methods.is_empty());
+            for entry in methods {
+                seen += 1;
+                let summary = entry["summary"].as_str().expect("summary text");
+                assert!(
+                    summary.len() <= 100,
+                    "{} summary exceeds one line: {summary:?}",
+                    entry["method"]
+                );
+            }
+            after = page["next"].as_str().map(str::to_owned);
+            if after.is_none() {
+                break;
+            }
+        }
+        assert!(pages >= 2, "expected more than one methods page");
+        assert!(seen >= 80, "expected the full method catalogue: {seen}");
     }
 
     #[test]

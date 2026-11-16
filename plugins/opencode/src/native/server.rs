@@ -13,7 +13,7 @@
 //!
 //! Store layout: the generated `opencode.jsonc` is per generation (under the
 //! plugin instance directory), but the session store (`XDG_DATA_HOME`) is
-//! per Agent — `opencode-{agent_id}` next to the instance directories — so
+//! per Agent â€” `opencode-{agent_id}` next to the instance directories â€” so
 //! a resumed generation serves the exact retained native session instead of
 //! an empty store. Generations of one Agent never run concurrently (the old
 //! one is terminal before resume), so one server owns the store at a time;
@@ -100,11 +100,26 @@ pub const SWARM_MCP_SERVER_NAME: &str = "eliot-swarm";
 /// `mcp.servers.<name> = {type: "local", command: [...], environment?}`,
 /// and `GET /api/config` echoes the document while `GET /api/mcp`
 /// (`mcp.list`) reports the servers with connection status.
+/// Per-session native-subagent mapping for the installed OpenCode server
+/// (verified on 2.2.7: `opencode --version` reports v2.2.7 and the agent
+/// docs allow per-agent `tools`/`permission` control with `task` as the
+/// subagent tool): `deny` sets the isolated per-Agent config
+/// `permission.task` to `deny`, disabling the task tool for the session;
+/// `allow` omits the key and preserves today's behavior.
+fn native_subagents_permission(native_subagents: Option<&str>) -> Option<serde_json::Value> {
+    if native_subagents == Some("deny") {
+        Some(serde_json::json!({"task": "deny"}))
+    } else {
+        None
+    }
+}
+
 fn agent_config_json(
     model: Option<&str>,
     local: Option<&LocalProvider>,
     swarm_executable: &str,
     swarm_data_dir: &str,
+    native_subagents: Option<&str>,
 ) -> String {
     let mut servers = serde_json::Map::new();
     servers.insert(
@@ -164,6 +179,9 @@ fn agent_config_json(
     if let Some(model) = model {
         document["model"] = serde_json::Value::String(model.to_owned());
     }
+    if let Some(permission) = native_subagents_permission(native_subagents) {
+        document["permission"] = permission;
+    }
     document.to_string()
 }
 
@@ -183,6 +201,9 @@ pub struct ServerLaunch {
     /// The Agent's owned Eliot data root for the MCP `--data-dir` argument.
     /// Absolute; start admission resolves it from the launch environment.
     pub swarm_data_dir: PathBuf,
+    /// Frozen native-subagent switch (`allow` or `deny`): `deny` disables
+    /// the `task` tool in the isolated per-Agent config.
+    pub native_subagents: Option<String>,
 }
 
 /// A running owned server: its child, HTTP client, and addresses.
@@ -215,7 +236,7 @@ impl OwnedServer {
     /// behind. The child inherits the
     /// daemon-allowlisted plugin environment plus the shared target
     /// environment the host built, the generated password, and the XDG
-    /// roots — exactly like the Codex/Muse stdio servers, with no
+    /// roots â€” exactly like the Codex/Muse stdio servers, with no
     /// `env_clear` and no third allowlist.
     pub async fn spawn(
         launch: ServerLaunch,
@@ -287,6 +308,7 @@ impl OwnedServer {
                 launch.local.as_ref(),
                 swarm_executable,
                 swarm_data_dir,
+                launch.native_subagents.as_deref(),
             ),
         )
         .map_err(|error| {
@@ -774,6 +796,7 @@ mod tests {
             None,
             executable,
             data_dir,
+            None,
         ))
         .expect("valid JSON");
         assert_eq!(parsed["model"], "opencode/big-pickle");
@@ -786,12 +809,43 @@ mod tests {
     }
 
     #[test]
+    fn native_subagents_deny_disables_task_tool_in_isolated_config() {
+        let (executable, data_dir) = swarm_fixture();
+        let allow: serde_json::Value =
+            serde_json::from_str(&agent_config_json(None, None, executable, data_dir, None))
+                .expect("valid JSON");
+        assert!(allow.get("permission").is_none(), "allow adds nothing");
+        let allow_explicit: serde_json::Value = serde_json::from_str(&agent_config_json(
+            None,
+            None,
+            executable,
+            data_dir,
+            Some("allow"),
+        ))
+        .expect("valid JSON");
+        assert!(
+            allow_explicit.get("permission").is_none(),
+            "explicit allow preserves today's behavior"
+        );
+        let deny: serde_json::Value = serde_json::from_str(&agent_config_json(
+            None,
+            None,
+            executable,
+            data_dir,
+            Some("deny"),
+        ))
+        .expect("valid JSON");
+        assert_eq!(deny["permission"]["task"], "deny");
+        assert_swarm_mcp(&deny, executable, data_dir);
+    }
+
+    #[test]
     fn generated_config_carries_no_agent_credential() {
         // Agent authentication stays in the inherited server environment
         // (the `mcp --require-agent` model): the document must never name
         // an identity variable or carry a token, even textually.
         let (executable, data_dir) = swarm_fixture();
-        let rendered = agent_config_json(None, None, executable, data_dir);
+        let rendered = agent_config_json(None, None, executable, data_dir, None);
         assert_swarm_mcp(
             &serde_json::from_str(&rendered).expect("valid JSON"),
             executable,
@@ -831,6 +885,7 @@ mod tests {
             Some(&local_provider_fixture(Some("LOCAL_LLM_KEY"))),
             executable,
             data_dir,
+            None,
         ))
         .expect("valid JSON");
         assert_eq!(parsed["model"], "eliot-local/qwen3-8b");
@@ -861,6 +916,7 @@ mod tests {
             Some(&local_provider_fixture(None)),
             executable,
             data_dir,
+            None,
         );
         let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
         let settings = &parsed["providers"]["eliot-local"]["settings"];
@@ -880,7 +936,7 @@ mod tests {
         // applies; the effective value is read back from the session.
         let (executable, data_dir) = swarm_fixture();
         let parsed: serde_json::Value =
-            serde_json::from_str(&agent_config_json(None, None, executable, data_dir))
+            serde_json::from_str(&agent_config_json(None, None, executable, data_dir, None))
                 .expect("valid JSON");
         assert!(parsed.get("model").is_none(), "native default applies");
         assert_swarm_mcp(&parsed, executable, data_dir);
@@ -892,7 +948,7 @@ mod tests {
         // providers block, so the configured native default applies.
         let (executable, data_dir) = swarm_fixture();
         let cloud: serde_json::Value =
-            serde_json::from_str(&agent_config_json(None, None, executable, data_dir))
+            serde_json::from_str(&agent_config_json(None, None, executable, data_dir, None))
                 .expect("valid JSON");
         assert!(cloud.get("model").is_none());
         assert!(cloud.get("providers").is_none());
@@ -904,6 +960,7 @@ mod tests {
             Some(&local_provider_fixture(Some("LOCAL_LLM_KEY"))),
             executable,
             data_dir,
+            None,
         ))
         .expect("valid JSON");
         assert_eq!(local["model"], "eliot-local/qwen3-8b");
