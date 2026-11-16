@@ -113,9 +113,13 @@ mechanism -- all verified read-only against installed 2.1.325 on
 local `.claude/settings*.json`, user `~/.claude/settings.json` and legacy
 `~/.claude.json`) are scanned pre-spawn for owner-identity entries -- a
 swarm executable selecting `mcp` without `--require-agent`, or a URL on
-the configured `cloud_mcp` hostname -- and a match refuses the start
-(`profile_error`, naming the server and the source kind) in `inherit`,
-whatever the entry is named. Verified read-only: `--strict-mcp-config`
+the configured `cloud_mcp` hostname -- and a match settles the launch as a
+definite failed start (proven-no-effect, never `unknown`) with a typed
+reason carrying the triggering code (`profile_error`) in `inherit`,
+whatever the entry is named. The same rule covers every other pre-spawn
+refusal -- cmd resolution, MCP config preparation, skill-root availability,
+settings validation, and CLI login -- while any failure at or after the
+native spawn keeps its honest classification. Verified read-only: `--strict-mcp-config`
 means "Only use MCP servers from `--mcp-config`, ignoring all other MCP
 configurations" (wording re-checked against installed 2.1.325 on
 2026-11-16; earlier pins to 2.1.278 and 2.1.321 describe the same
@@ -135,7 +139,7 @@ effective set with `mcp_servers_verified` true. An absent or malformed init
 inventory leaves the effective set unknown. `effective.effort` carries the
 pushed `--effort` level (null when omitted, never fabricated): the idle
 readback proves the native accepted the start carrying it, so it reads back
-`effort_verified` true; an unknown level fails admission before any spawn.
+`effort_verified` true; an unknown level settles as a definite failed start before any spawn.
 
 Resolve Windows executables explicitly; never insert an unrequested shell wrapper.
 Avoid modes that disable required hooks/instructions.
