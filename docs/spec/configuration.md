@@ -1290,4 +1290,6 @@ private directory ownership, rejects links/reparse traversal and creates a new
 Native stores and owner configuration are never created there by Eliot. Changing
 this setting affects future admissions; existing chat Agents retain their exact
 workspace and directory identity. Cleanup uses that registered identity and the
-existing artifact plan/apply path before Agent record deletion.
+existing artifact plan/apply path before Agent record deletion. A chat directory
+is kept while another Agent record references its workspace, including a stopped
+child; apply rechecks this under the Store lock before removing the directory.
