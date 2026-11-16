@@ -369,9 +369,7 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
                 "project rule is not approved for this action",
             ));
         }
-        if request.target.is_none()
-            || (request.expected_generation.is_none() && request.verb != "inject")
-        {
+        if request.target.is_none() || request.expected_generation.is_none() {
             return Err(Error::new(
                 "invalid",
                 "project action requires its frozen Agent and generation",
@@ -540,49 +538,61 @@ mod tests {
     }
 
     #[test]
-    fn project_rule_steer_requires_an_explicit_grant_and_keeps_its_fences() {
-        let checkout = std::fs::canonicalize(std::env::temp_dir())
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        let registration = eliot_core::api::ProjectRegistrationView {
-            id: "steer-project".to_owned(),
-            checkout: checkout.clone(),
-            repo_common_dir: checkout,
-            profiles: vec!["fake".to_owned()],
-            actions: vec!["steer".to_owned()],
-            interpreters: std::collections::BTreeMap::new(),
-            run_env: Vec::new(),
-            git: None,
-            revision: 1,
-        };
-        let mut request = SubmitCommand::new(String::new(), "steer");
-        request.target = Some("a1".to_owned());
-        request.args = json!({"text":"follow-up"});
-        request.expected_generation = Some(7);
-        request.expected_turn_id = Some("turn-captured".to_owned());
+    fn project_rule_steer_and_inject_require_grants_and_exact_generation() {
+        for verb in ["steer", "inject"] {
+            let checkout = std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let registration = eliot_core::api::ProjectRegistrationView {
+                id: "steer-project".to_owned(),
+                checkout: checkout.clone(),
+                repo_common_dir: checkout,
+                profiles: vec!["fake".to_owned()],
+                actions: vec![verb.to_owned()],
+                interpreters: std::collections::BTreeMap::new(),
+                run_env: Vec::new(),
+                git: None,
+                revision: 1,
+            };
+            let mut request = SubmitCommand::new(String::new(), verb);
+            request.target = Some("a1".to_owned());
+            request.args = json!({"text":"follow-up", "point":"turn_safe_point"});
+            request.expected_generation = Some(7);
+            request.expected_turn_id = Some("turn-captured".to_owned());
 
-        authorize_command(
-            &Principal::ProjectRule {
-                registration: registration.clone(),
-            },
-            &mut request,
-        )
-        .expect("explicit project STEER grant");
-        assert_eq!(request.target.as_deref(), Some("a1"));
-        assert_eq!(request.expected_generation, Some(7));
-        assert_eq!(request.expected_turn_id.as_deref(), Some("turn-captured"));
+            authorize_command(
+                &Principal::ProjectRule {
+                    registration: registration.clone(),
+                },
+                &mut request,
+            )
+            .expect("explicit project STEER grant");
+            assert_eq!(request.target.as_deref(), Some("a1"));
+            assert_eq!(request.expected_generation, Some(7));
+            assert_eq!(request.expected_turn_id.as_deref(), Some("turn-captured"));
 
-        let mut revoked = registration;
-        revoked.actions = vec!["send".to_owned()];
-        let error = authorize_command(
-            &Principal::ProjectRule {
-                registration: revoked,
-            },
-            &mut request,
-        )
-        .unwrap_err();
-        assert_eq!(error.code, "not_allowed");
+            request.expected_generation = None;
+            let error = authorize_command(
+                &Principal::ProjectRule {
+                    registration: registration.clone(),
+                },
+                &mut request,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "invalid", "{verb} requires generation");
+            request.expected_generation = Some(7);
+            let mut revoked = registration;
+            revoked.actions = vec!["send".to_owned()];
+            let error = authorize_command(
+                &Principal::ProjectRule {
+                    registration: revoked,
+                },
+                &mut request,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "not_allowed");
+        }
     }
 
     fn run_principal() -> Principal {

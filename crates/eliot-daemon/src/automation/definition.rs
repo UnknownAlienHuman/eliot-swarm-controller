@@ -1109,9 +1109,9 @@ fn submit_inject_event_command(
             "inject target must match the event-time Agent",
         ));
     }
-    // Turn binding carries the exact incarnation: hook events can report the
-    // turn's generation ahead of the retained Agent row, so generation is
-    // intentionally left unbound and Store enforces the captured turn id.
+    let generation = event
+        .generation
+        .ok_or_else(|| Error::new("invalid", "inject rule requires an event-time generation"))?;
     let text = render_text(
         &definition.text,
         &roots,
@@ -1140,7 +1140,7 @@ fn submit_inject_event_command(
     };
     let mut command = CommandSubmitRequest::new(String::new(), "inject");
     command.target = Some(target);
-    command.expected_generation = None;
+    command.expected_generation = Some(generation);
     command.expected_turn_id = expected_turn_id;
     command.args = json!({"text": text, "point": definition.at});
     command.validate()?;
@@ -3897,7 +3897,7 @@ do = [{ action = 'inject', target = '${event.agent}', at = 'next_input', text = 
             .expect("inject matches");
         assert_eq!(action.verb, "inject");
         assert_eq!(action.target.as_deref(), Some("a7"));
-        assert_eq!(action.expected_generation, None);
+        assert_eq!(action.expected_generation, Some(2));
         assert_eq!(action.expected_turn_id.as_deref(), Some("turn-1"));
         assert_eq!(action.args["point"], serde_json::json!("turn_safe_point"));
         assert_eq!(action.args["text"], serde_json::json!("ctx turn-1"));
@@ -3906,7 +3906,14 @@ do = [{ action = 'inject', target = '${event.agent}', at = 'next_input', text = 
             .expect("next evaluates")
             .expect("next matches");
         assert_eq!(action.expected_turn_id, None);
+        assert_eq!(action.expected_generation, Some(2));
         assert_eq!(action.args["point"], serde_json::json!("next_input"));
+        let mut missing_generation = hook_event();
+        missing_generation.generation = None;
+        assert_eq!(
+            evaluate(&rules[0], &missing_generation).unwrap_err().code,
+            "invalid"
+        );
         // Timer context has no event: inject is event-only.
         let timer_err = load(Cursor::new(
             "[[rule]]\nid = 't'\non = { every = '30m' }\ndo = [{ action = 'inject', target = 'a7', at = 'turn_safe_point', text = 'x' }]\n",
