@@ -357,8 +357,16 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       Qualified 2026-11-14 on Codex, Claude, Muse, OpenCode and Antigravity (release 492640C8).
 - [x] Rules/timers/hot reload, Goal limits, mail/ack, CAS, hierarchy and Git recovery.
       Qualified 2026-11-14 with real Muse Agents on a private daemon.
-- [ ] Windows Job/handles/paths; supported Linux behavior and honest degraded custody;
-      private IPC, credentials, resource bounds and adopted-service isolation.
+- [x] Windows Job/handles/paths, private IPC, credentials and resource bounds.
+      Qualified 2026-11-16 on release DCD64B86 with real Codex/Muse Agents: forced stop
+      and daemon kill leave no process of the Agent tree (tool grandchildren included)
+      and stopping one Agent spares another; only the daemon holds the Store handles;
+      space/non-ASCII workspaces and data roots past MAX_PATH work, while workspace roots
+      at or past the process-creation limit are refused with the OS error; the pipe and
+      data root are current-user-only and inherited ACLs are refused; `pass_env` values
+      never reach the data dir or readbacks; `max_live`, frame and page bounds hold.
+- [ ] Supported Linux behavior and honest degraded custody; adopted-service isolation
+      (with the local adopted backends). Deferred by the owner.
 - [ ] Retention/WAL/backpressure and representative load. The 10,000-Agent,
       2,000-events/s owner run is a release capacity check, not a prerequisite to L2.
 

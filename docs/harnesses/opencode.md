@@ -309,6 +309,17 @@ explicit install instead. `swarm models --harness opencode` lists the native
 `opencode models` catalogue (`provider/model` ids verbatim; a launch resolves
 the full provider/model pair, an omitted model leaves the configured native
 default, read back from the session echo).
+## Agent skill delivery (`eliot-swarm`)
+
+At spawn, the plugin copies the daemon-materialized canonical skill files
+into the isolated per-Agent global skills directory
+(`<instance>/config/opencode/skills/eliot-swarm/`, under the redirected
+`XDG_CONFIG_HOME`), rewritten verbatim on every start like the
+`eliot-context.ts` plugin file. The per-Agent server then loads
+`eliot-swarm` natively with no project or user file touched. A missing
+canonical copy fails the start. Implementation:
+[`plugins/opencode/src/native/server.rs`](../../plugins/opencode/src/native/server.rs)
+(`OwnedServer::spawn`).
 
 ## Minimal-context measurement (k61, 2026-11-16)
 
@@ -321,3 +332,4 @@ policy). Turn usage: message input 129 + cache-read 8,320 + output 3 under
 called `api.identity` through the `swarm` tool and reported principal
 `agent`. `opencode --help` and `opencode serve --help` expose no
 tool-deferral surface, so deferred loading is unsupported.
+

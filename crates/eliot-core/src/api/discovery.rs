@@ -158,7 +158,8 @@ pub struct MethodHelpResponse {
     pub unsupported: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IdentityResponse {
     pub principal: String,
     pub agent_id: Option<String>,

@@ -662,6 +662,24 @@ version instead (e.g. the 1.4.0 binary while the launcher marks 1.4.20).
 carries no default marker. An empty native read reports
 `catalogue: "empty"` with a note naming the binary and the `--cmd` / profile
 remedy.
+## Agent skill delivery (`eliot-swarm`): first-turn fallback
+
+`muse serve` offers no per-session skill flag: it loads each session
+workspace's skills and rules (`muse serve --help`: `--trust-workspace`,
+"Load each session workspace's skills and rules"). Writing the skill into
+the checkout is forbidden and workspace trust is a broader grant that is
+never auto-enabled, so this harness has no native skill mechanism. The
+plugin instead delivers the identical daemon-materialized skill text
+through the launch-time first-turn system context: the first accepted
+native turn carries the skill text ahead of the send text, in the same
+native slot `inject` `next_input` claims occupy. The flag clears only
+after the first turn is accepted and acknowledged, so a rejected or
+unknown first turn still retries with the skill. A missing canonical
+copy fails the start. Implementation:
+[`plugins/muse/src/host.rs`](../../plugins/muse/src/host.rs)
+(`skill_pending`) and
+[`plugins/muse/src/host/start.rs`](../../plugins/muse/src/host/start.rs)
+(`spawn_owned_session`).
 
 ## Minimal-context measurement (k61, 2026-11-16)
 
@@ -673,3 +691,4 @@ Turn usage: session input 45,444 + output 209. A follow-up turn ran
 `swarm show` for its own record through the CLI and reported its agent id and
 state, proving Agent-scoped access. `muse serve --help` exposes no MCP
 isolation or tool-deferral surface, so both stay unsupported.
+

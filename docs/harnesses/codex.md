@@ -603,3 +603,17 @@ no child allow-list) plus flags. An omitted `--model` selects the native
 native default and reports the effective readback. An unavailable requested
 model fails without substitution. `cmd` resolves via the existing `codex`
 lookup. `swarm models --harness codex` returns the live native catalogue.
+## Agent skill delivery (`eliot-swarm`)
+
+After the owned thread is live and before any input is sent, the plugin
+calls `skills/extraRoots/set` with the daemon-materialized skill root
+(`<data-dir>/skills/skills`). One app-server serves one Agent generation,
+so the process-level extra roots are effectively per-session; the checkout
+and the global skill locations stay untouched. A failed call fails the
+start. Verified against the installed 0.167.1 schema
+(`codex app-server generate-json-schema`): `SkillsExtraRootsSetParams`
+carries `extraRoots`, the method replaces "the process-level extra roots
+used to discover standalone skills without persisting them", and `skills/list`
+exposes the catalog per `cwd`. Implementation:
+[`plugins/codex/src/host.rs`](../../plugins/codex/src/host.rs)
+(`deliver_swarm_skill`).

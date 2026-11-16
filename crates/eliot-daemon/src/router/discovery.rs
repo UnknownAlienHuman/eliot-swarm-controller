@@ -390,6 +390,11 @@ impl Router {
             })?;
         let identity = self.identity(principal).await?;
         let aliases: &[&str] = match method.name {
+            "api.identity" => &["swarm identity"],
+            "who" => &["swarm who"],
+            "claim.set" => &["swarm claim set"],
+            "claim.list" => &["swarm claim list"],
+            "claim.release" => &["swarm claim release"],
             "mail.send" => &["swarm msg send"],
             "mail.inbox" => &["swarm inbox"],
             "mail.read" => &["swarm msg show"],

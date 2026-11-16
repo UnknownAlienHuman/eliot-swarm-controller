@@ -15,6 +15,7 @@ use eliot_plugin::{
         native_no_write, register_native_process, unknown_snapshot, with_claimed_context,
         with_context_points,
     },
+    skill,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -81,6 +82,10 @@ pub(crate) struct OwnedHookConfig {
     root: PathBuf,
     remove_agents_dir: bool,
     remove_root: bool,
+    /// Created skill files, removed first on cleanup.
+    skill_files: Vec<PathBuf>,
+    /// Created skill directories, innermost first.
+    skill_dirs: Vec<PathBuf>,
 }
 
 impl OwnedHookConfig {
@@ -1471,6 +1476,7 @@ pub(crate) fn stage_hook_config(
     instance_dir: &Path,
     workspace: &Path,
     helper: &Path,
+    data_dir: &Path,
 ) -> Result<HookConfigGuard> {
     let command = hook_command(helper)?;
     let private_root = fs::canonicalize(instance_dir).map_err(|_| {
@@ -1595,6 +1601,76 @@ pub(crate) fn stage_hook_config(
             "Could not write the owned Antigravity hook config",
         ));
     }
+    // The bundled coordination skill rides the same discovery root:
+    // `.agents/skills/eliot-swarm/` beside `hooks.json`, both
+    // daemon-authored static files, never instance state. A CLI that
+    // discovers skills from its `--add-dir` roots loads it natively; the
+    // checkout and the global skill locations stay untouched. A missing
+    // canonical copy fails the start rather than starting an Agent that
+    // believes it has no skill.
+    let skill_source = skill::skill_dir(data_dir);
+    let skills_dir = agents_dir.join("skills");
+    let skill_dir = skills_dir.join(skill::SKILL_NAME);
+    let mut skill_dirs = Vec::new();
+    let mut skill_files = Vec::new();
+    let skill_result = (|| {
+        for dir in [&skills_dir, &skill_dir] {
+            if fs::create_dir(dir).is_err() {
+                return Err(Error::new(
+                    "io_error",
+                    "Could not create the owned Antigravity skill directory",
+                ));
+            }
+            skill_dirs.push(dir.clone());
+        }
+        skill_dirs.reverse();
+        for file in [skill::SKILL_FILE, skill::SKILL_REFERENCE_FILE] {
+            let text = skill::read_skill_file(&skill_source.join(file)).map_err(|_| {
+                Error::new(
+                    "skill_unavailable",
+                    "Antigravity skill source is unavailable; the daemon did not materialize it",
+                )
+            })?;
+            let target = skill_dir.join(file);
+            let mut handle = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .map_err(|_| {
+                    Error::new(
+                        "io_error",
+                        "Could not create the owned Antigravity skill file",
+                    )
+                })?;
+            if handle
+                .write_all(text.as_bytes())
+                .and_then(|()| handle.flush())
+                .is_err()
+            {
+                let _ = fs::remove_file(&target);
+                return Err(Error::new(
+                    "io_error",
+                    "Could not write the owned Antigravity skill file",
+                ));
+            }
+            skill_files.push(target);
+        }
+        Ok(())
+    })();
+    if let Err(error) = skill_result {
+        for file in &skill_files {
+            let _ = fs::remove_file(file);
+        }
+        for dir in &skill_dirs {
+            let _ = fs::remove_dir(dir);
+        }
+        let _ = fs::remove_file(&path);
+        if remove_agents_dir {
+            let _ = fs::remove_dir(&agents_dir);
+        }
+        let _ = fs::remove_dir(&root);
+        return Err(error);
+    }
     // The filesystem work above ran on the canonical (possibly verbatim)
     // paths naming these same files; store the plain spelling so `--add-dir`
     // and diagnostics carry a path the native CLI can load. Deriving both
@@ -1602,11 +1678,19 @@ pub(crate) fn stage_hook_config(
     let root = without_verbatim_prefix(&root);
     let agents_dir = root.join(".agents");
     let path = agents_dir.join("hooks.json");
+    let skills_dir = agents_dir.join("skills");
+    let skill_dir = skills_dir.join(skill::SKILL_NAME);
+    let skill_files = [skill::SKILL_FILE, skill::SKILL_REFERENCE_FILE]
+        .into_iter()
+        .map(|file| skill_dir.join(file))
+        .collect();
     Ok(HookConfigGuard(Some(OwnedHookConfig {
         path,
         root,
         remove_agents_dir,
         remove_root: true,
+        skill_files,
+        skill_dirs: vec![skill_dir, skills_dir],
     })))
 }
 
@@ -1682,6 +1766,14 @@ fn hook_command(helper: &Path) -> Result<String> {
 }
 
 fn remove_hook_config(config: &OwnedHookConfig) {
+    for file in &config.skill_files {
+        let _ = fs::remove_file(file);
+    }
+    // `remove_dir` only removes an empty directory, so unexpected content
+    // is left in place rather than deleted.
+    for dir in &config.skill_dirs {
+        let _ = fs::remove_dir(dir);
+    }
     let _ = fs::remove_file(&config.path);
     if config.remove_agents_dir
         && let Some(parent) = config.path.parent()
@@ -1844,14 +1936,25 @@ mod tests {
         }
     }
 
-    fn stage_dirs(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+    fn stage_dirs(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         let base =
             std::env::temp_dir().join(format!("eliot-agy-stage-{tag}-{}", ulid::Ulid::new()));
         let instance_dir = base.join("instance-1");
         let workspace = base.join("workspace");
+        let data_dir = base.join("data");
         fs::create_dir_all(&instance_dir).unwrap();
         fs::create_dir_all(&workspace).unwrap();
-        (base, instance_dir, workspace)
+        // Fixture canonical copy standing in for the daemon-materialized
+        // skill tree; staging mechanics are identical for real bytes.
+        let skill_dir = data_dir.join("skills").join("skills").join("eliot-swarm");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: eliot-swarm\n---\ntest skill\n",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("reference.md"), "test reference\n").unwrap();
+        (base, instance_dir, workspace, data_dir)
     }
 
     fn hook_command_for(helper: &str) -> String {
@@ -1903,9 +2006,9 @@ mod tests {
     // hooks without firing. The staged root must never carry the prefix.
     #[test]
     fn staged_hook_root_has_no_verbatim_prefix() {
-        let (base, instance_dir, workspace) = stage_dirs("plain");
+        let (base, instance_dir, workspace, data_dir) = stage_dirs("plain");
         let helper = Path::new("eliot-hook-helper");
-        let guard = stage_hook_config(&instance_dir, &workspace, helper).unwrap();
+        let guard = stage_hook_config(&instance_dir, &workspace, helper, &data_dir).unwrap();
         let inner = guard.0.as_ref().unwrap();
         assert!(!has_verbatim_prefix(inner.root()));
         assert!(!has_verbatim_prefix(&inner.path));
@@ -1915,10 +2018,10 @@ mod tests {
     }
 
     #[test]
-    fn staged_hook_root_holds_only_hooks_json() {
-        let (base, instance_dir, workspace) = stage_dirs("only");
+    fn staged_hook_root_holds_hooks_and_skill() {
+        let (base, instance_dir, workspace, data_dir) = stage_dirs("only");
         let helper = Path::new("eliot-hook-helper");
-        let guard = stage_hook_config(&instance_dir, &workspace, helper).unwrap();
+        let guard = stage_hook_config(&instance_dir, &workspace, helper, &data_dir).unwrap();
         // The discovery root is a sibling of the instance directory, never
         // the instance directory itself.
         assert_ne!(guard.root(), instance_dir);
@@ -1937,7 +2040,45 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         agents_entries.sort();
-        assert_eq!(agents_entries, [std::ffi::OsString::from("hooks.json")]);
+        assert_eq!(
+            agents_entries,
+            [
+                std::ffi::OsString::from("hooks.json"),
+                std::ffi::OsString::from("skills"),
+            ]
+        );
+        // The bundled skill stages beside the hook config with its exact
+        // canonical files.
+        let mut skill_entries: Vec<_> = fs::read_dir(
+            guard
+                .root()
+                .join(".agents")
+                .join("skills")
+                .join("eliot-swarm"),
+        )
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+        skill_entries.sort();
+        assert_eq!(
+            skill_entries,
+            [
+                std::ffi::OsString::from("SKILL.md"),
+                std::ffi::OsString::from("reference.md"),
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(
+                guard
+                    .root()
+                    .join(".agents")
+                    .join("skills")
+                    .join("eliot-swarm")
+                    .join("SKILL.md")
+            )
+            .unwrap(),
+            "---\nname: eliot-swarm\n---\ntest skill\n"
+        );
         let (root, path) = {
             let inner = guard.0.as_ref().unwrap();
             (inner.root().to_owned(), inner.path.clone())
@@ -1957,9 +2098,9 @@ mod tests {
 
     #[test]
     fn dropped_guard_cleans_root_so_restaging_succeeds() {
-        let (base, instance_dir, workspace) = stage_dirs("retry");
+        let (base, instance_dir, workspace, data_dir) = stage_dirs("retry");
         let helper = Path::new("eliot-hook-helper");
-        let guard = stage_hook_config(&instance_dir, &workspace, helper).unwrap();
+        let guard = stage_hook_config(&instance_dir, &workspace, helper, &data_dir).unwrap();
         let root = guard.root().to_owned();
         assert!(root.is_dir());
         // Simulate a planning error after staging: the armed guard drops
@@ -1967,7 +2108,7 @@ mod tests {
         drop(guard);
         assert!(!root.exists());
         // A corrected start with the same instance stages cleanly again.
-        let guard = stage_hook_config(&instance_dir, &workspace, helper).unwrap();
+        let guard = stage_hook_config(&instance_dir, &workspace, helper, &data_dir).unwrap();
         assert_eq!(guard.root(), root);
         assert!(guard.root().is_dir());
         drop(guard);
@@ -1978,11 +2119,11 @@ mod tests {
 
     #[test]
     fn staging_fails_closed_on_an_existing_root() {
-        let (base, instance_dir, workspace) = stage_dirs("exists");
+        let (base, instance_dir, workspace, data_dir) = stage_dirs("exists");
         let helper = Path::new("eliot-hook-helper");
         let squat = base.join("instance-1-hooks");
         fs::create_dir_all(&squat).unwrap();
-        let error = match stage_hook_config(&instance_dir, &workspace, helper) {
+        let error = match stage_hook_config(&instance_dir, &workspace, helper, &data_dir) {
             Ok(_) => panic!("expected staging to fail on an existing root"),
             Err(error) => error,
         };
@@ -1993,12 +2134,28 @@ mod tests {
     }
 
     #[test]
+    fn staging_fails_closed_without_a_skill_source() {
+        let (base, instance_dir, workspace, _) = stage_dirs("noskill");
+        let helper = Path::new("eliot-hook-helper");
+        let missing = base.join("no-data");
+        let error = match stage_hook_config(&instance_dir, &workspace, helper, &missing) {
+            Ok(_) => panic!("expected staging to fail without a skill source"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "skill_unavailable");
+        // The withdrawn root leaves no hook config behind either.
+        assert!(!base.join("instance-1-hooks").exists());
+        assert!(fs::read_dir(&instance_dir).unwrap().next().is_none());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn staging_rejects_an_overlapping_workspace() {
-        let (base, instance_dir, _) = stage_dirs("overlap");
+        let (base, instance_dir, _, data_dir) = stage_dirs("overlap");
         let helper = Path::new("eliot-hook-helper");
         // A workspace covering the instance tree is rejected before any
         // hook root is staged.
-        let error = match stage_hook_config(&instance_dir, &base, helper) {
+        let error = match stage_hook_config(&instance_dir, &base, helper, &data_dir) {
             Ok(_) => panic!("expected staging to fail on an overlapping workspace"),
             Err(error) => error,
         };

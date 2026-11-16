@@ -310,6 +310,17 @@ desktop-app bundles under `%APPDATA%\Claude\claude-code\<version>\<hash>`;
 explicit install instead. `swarm harnesses` reports every discovered install
 newest first in `candidates`. `swarm models --harness claude` reports aliases
 plus the CLI default; no live catalogue exists.
+## Agent skill delivery (`eliot-swarm`)
+
+Every owned CLI spawn passes `--plugin-dir <data-dir>/skills`, the
+daemon-materialized skill root, which doubles as a Claude Code plugin
+directory (`.claude-plugin/plugin.json` beside `skills/eliot-swarm/`).
+The flag loads the plugin for that session only (`claude --help`:
+"Load a plugin from a directory or .zip ... (repeatable)"); no checkout
+or global skill location changes, and resume spawns reuse the same argv.
+A missing or unloadable directory fails the spawn with its cause.
+Implementation: [`plugins/claude/src/host.rs`](../../plugins/claude/src/host.rs)
+(`launch_session`).
 
 ## Minimal-context measurement (k61, 2026-11-16)
 
@@ -328,3 +339,4 @@ approval) and reported principal `agent`. The installed binary contains the
 supported; Swarm does not enable it per session because no per-server
 scoping exists on 2.1.278 and the strict config already bounds `minimal` to
 one server.
+

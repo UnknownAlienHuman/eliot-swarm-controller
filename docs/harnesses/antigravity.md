@@ -452,6 +452,20 @@ effort suffixes (`-low`/`-medium`/`-high`/`-xhigh`) map to the ACP
 `thought_level` selector at launch; any other suffix stays part of the base
 id and is verified against the advertised session options instead of guessed.
 A failing `agy models` child reports an honest typed error naming `models`.
+## Agent skill delivery (`eliot-swarm`)
+
+At staging, the plugin writes the daemon-materialized canonical skill
+files into the private hook-discovery root beside `hooks.json`
+(`<root>/.agents/skills/eliot-swarm/`), the same `--add-dir` directory
+the native CLI already discovers hooks from. Both files are
+daemon-authored static content, never instance state; the checkout and
+the global skill locations stay untouched. A missing canonical copy
+fails the start. Skill discovery from `--add-dir` roots is harness
+behavior, verified live per release; where the CLI does not surface the
+skill, the readiness transcript shows it and the fallback below applies.
+Implementation:
+[`plugins/antigravity/src/session.rs`](../../plugins/antigravity/src/session.rs)
+(`stage_hook_config`).
 
 ## Minimal-context measurement (k61, 2026-11-16)
 
@@ -463,3 +477,4 @@ cache-read 16,837 + output 559 (total 32,330). A follow-up turn called
 `api.identity` through the `swarm` tool (after one Owner approval) and
 reported principal `agent`. `agy acp --help` and `agy mcp --help` expose no
 isolation or tool-deferral surface, so both stay unsupported.
+
