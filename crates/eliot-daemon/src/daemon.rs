@@ -78,19 +78,10 @@ const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Open the private local daemon, recover durable state without replaying any
 /// external effects, and serve concurrent local RPC connections.
 pub async fn run(path: PathBuf) -> Result<()> {
-    #[cfg(unix)]
-    {
-        // Current-user-only data files from here on: the Store database and
-        // its WAL/SHM siblings, logs, crash markers and settings inherit
-        // this process-wide mask. Explicit 0600 modes at each creation site
-        // complement it; Windows keeps its ACL checks.
-        // SAFETY: the mask is set once at startup before any data file is
-        // created; no other thread changes it.
-        #[allow(unsafe_code)]
-        unsafe {
-            libc::umask(0o077);
-        }
-    }
+    // Daemon-private files carry explicit current-user-only creation modes
+    // (0600 files, 0700 directories) at each creation site; the process umask
+    // is left alone so Agents' files in shared workspaces keep the ambient
+    // mask. Windows keeps its ACL checks.
     let data_dir = DataDir::open(&path)?;
     let daemon_lock = data_dir.acquire_daemon_lock()?;
     crate::skill::materialize(data_dir.path())?;

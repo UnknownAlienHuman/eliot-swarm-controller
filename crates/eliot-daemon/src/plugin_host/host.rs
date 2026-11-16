@@ -1120,19 +1120,62 @@ impl PluginHost {
         restrict: impl FnOnce(&Path) -> std::io::Result<()>,
     ) -> Result<(PathBuf, String)> {
         let parent = self.state.data_root.join("plugins");
-        std::fs::create_dir_all(&parent).map_err(|error| {
-            Error::new(
-                "platform_io",
-                format!("create plugin instance root: {error}"),
-            )
-        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(&parent)
+                .map_err(|error| {
+                    Error::new(
+                        "platform_io",
+                        format!("create plugin instance root: {error}"),
+                    )
+                })?;
+            if parent.is_dir() {
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                    |error| {
+                        Error::new(
+                            "platform_io",
+                            format!("restrict plugin instance root: {error}"),
+                        )
+                    },
+                )?;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(&parent).map_err(|error| {
+                Error::new(
+                    "platform_io",
+                    format!("create plugin instance root: {error}"),
+                )
+            })?;
+        }
         let instance_dir = parent.join(format!("{}-g{}-{}", key.id, key.generation, Ulid::new()));
-        std::fs::create_dir(&instance_dir).map_err(|error| {
-            Error::new(
-                "platform_io",
-                format!("create plugin instance directory: {error}"),
-            )
-        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&instance_dir)
+                .map_err(|error| {
+                    Error::new(
+                        "platform_io",
+                        format!("create plugin instance directory: {error}"),
+                    )
+                })?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir(&instance_dir).map_err(|error| {
+                Error::new(
+                    "platform_io",
+                    format!("create plugin instance directory: {error}"),
+                )
+            })?;
+        }
         if let Err(error) = restrict(&instance_dir) {
             remove_empty_instance_dir(&instance_dir);
             return Err(Error::new(
