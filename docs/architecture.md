@@ -7,7 +7,7 @@ build order. Specs describe the final contract, but a layer implements only what
 ## One command path, one event path
 
 ```text
-CLI / Agent / later rules
+CLI / Agent / rules and timers
           |
           v
      daemon API -> router -> plugin host -> harness plugin -> native harness
@@ -33,7 +33,8 @@ platform to build first.
 | `eliot-store` | migrations, one writer, bounded queries | core + SQLite |
 | `eliot-plugin` | small wire types/framing shared by host and plugins | core + transport/serialization; no Store |
 | `eliot-daemon` | API, router, bus, process/plugin ownership | core, store, plugin protocol |
-| `plugins/codex` | app-server translation and native readback | plugin protocol; no daemon/Store dependency |
+| `plugins/*` (codex, claude, opencode, Muse, antigravity) | harness translation and native readback, one process per Agent generation | plugin protocol; no daemon/Store dependency |
+| `apps/swarm-desktop` | optional Windows companion UI | daemon API and `settings.*` only; keeps no other preference store |
 | `eliot` | CLI and composition/entry points | application crates and built-in plugin entry points |
 
 Inside `eliot-daemon`, keep monitoring, workspaces, automation and coordination as clear
@@ -63,9 +64,8 @@ adding forwarding traits. Retain authority, generation, idempotency and source c
 their owning boundaries. Canonical payload/ACK digests and credential hashes serve those
 contracts; file size alone is not a reason to remove them or add another integrity layer.
 
-All five native adapters (Codex, Claude, OpenCode, Muse, Antigravity) use the
-same protocol. Create crates as their callers arrive; this table is the eventual map,
-not six empty crates required for `--version`.
+All five native adapters use the same protocol through their `plugins/*` process;
+the desktop is an optional client on the daemon API and `settings.*`.
 
 ## Memory inference boundary
 
@@ -78,16 +78,20 @@ Agent, Task, service-account framework or second mutation ledger is created.
 
 ## First useful slice
 
-Completed history: L1 delivered local CLI → Store/router → temporary fake →
-bus/result. L2 replaced that fake with a per-Agent Codex app-server and added
-native controls/readback. It uses an existing workspace and account, with Luna
-selected explicitly when available. Current code has no fake runtime: the
-five native adapters each use an explicit profile and frozen captured
-selectors.
+Completed history: L1 delivered local CLI, Store/router, a temporary fake, bus and
+result. L2 replaced that fake with a per-Agent Codex app-server and added native
+controls and readback over an existing workspace and account. Current code has no fake
+runtime: the five native adapters launch from explicit profiles, or by `--role` through
+the ordered `[routing]` candidates when `--profile` is omitted, with frozen captured
+selectors. Routing runs before admission only; dispatch never reroutes, retries another
+route, or switches account on hold.
 
-L3 adds monitoring/worktrees and the optional OpenCodex route. L4 adds automation on
-Codex; L5 adds communication between two Codex Agents; L6 adds other harnesses. Neither
-mail nor timers require a second vendor. Unimplemented features are not advertised.
+L3 through L6 are implemented (monitoring, worktrees and the proxy route; automation and
+scripts; agent communication; the five harnesses with worker MCP and the `eliot-swarm`
+skill; the cloud MCP caller; diagnosis and notification), and queue assignment runs as an
+automation timer plus a completion rule, not a task engine. L7 qualification is next;
+see [roadmap](roadmap.md) for the only project status list. Neither mail nor timers
+require a second vendor. Unimplemented features are not advertised.
 
 ## Cloud MCP caller and agent-health diagnosis
 
