@@ -98,9 +98,9 @@ the owned CLI and is removed after confirmed stop and drain.
 The additive per-run config above is the `inherit` policy (now an explicit
 opt-in): other native MCP sources keep Claude Code's normal behavior,
 except owner Swarm entries. Profiles default to `mcp = "minimal"`, frozen
-in the profile snapshot; a non-empty `mcp_allow` is rejected as
-`unsupported` at config load because Claude has no selective-inclusion
-mechanism. `minimal` adds the installed `--strict-mcp-config` flag ahead of
+in the profile snapshot; a non-empty `mcp_allow` is rejected as `unsupported` at
+config load, and launch planning re-checks the frozen snapshot (`check_mcp_allow_empty`),
+so a stale snapshot fails closed. Claude has no selective-inclusion mechanism.
 `--mcp-config`, so only the per-run file applies. For `inherit` there is no
 safe native filter: installed 2.1.325 offers no per-server disable or deny
 switch for the per-run surface (`claude --help` shows only the

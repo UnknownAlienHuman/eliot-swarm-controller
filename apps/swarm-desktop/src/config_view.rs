@@ -5,8 +5,8 @@
 //! `[profiles.*]` TOML) shown both as a few common form fields for the
 //! selected profile and, on request, as the full source text; both edit the
 //! same text. The Settings save bar validates and saves it through the
-//! daemon; an invalid draft stays here. Automation is read-only: no daemon
-//! operation pauses or resumes a rule or timer.
+//! daemon; an invalid draft stays here. Rules and timers are read-only: no daemon
+//! operation pauses or resumes a rule or timer; assignments stay editable.
 
 use windows_reactor::*;
 

@@ -7,8 +7,10 @@ Eliot is a local Rust controller for coding-agent harnesses.
 The CLI and daemon connect to the Store, event bus, and the five native
 adapters — Codex (`plugins/codex`), Claude (`plugins/claude`), OpenCode
 (`plugins/opencode`), Muse (`plugins/muse`), and Antigravity
-(`plugins/antigravity`). Every launch names an explicit profile; there is no
-builtin fake profile, default profile, or automatic harness/model fallback.
+(`plugins/antigravity`). A launch names an explicit profile, or omits `--profile` to
+route by `--role` through the ordered `[routing]` candidates (an omitted role means
+`default`; see [routing](docs/spec/configuration.md#routing-policy-s3)). There is no
+builtin fake profile and no fallback after dispatch; an explicit profile bypasses routing.
 Native-store selectors are frozen into the profile snapshot at admission and
 never reselected from ambient state.
 
@@ -61,6 +63,22 @@ the branch. Existing-workspace launches remain the default.
 `status.workspace_custody` reports the current host capability. Supported Linux workspace
 custody is degraded and may leave escaped descendants unobserved.
 
+Hot start works out of the box: first use writes visible, editable native-default
+profiles for the installed harnesses through the settings writer and registers the
+opened Git checkout as a project automatically (see [native
+profiles](docs/spec/configuration.md#native-profiles-all-five-adapters) and [project
+registration](docs/spec/configuration.md#project-registration-and-rule-authority)).
+
+All human and machine edits live in one place: `<data_dir>/config.toml` is the single
+settings source, read and written through the revision-guarded `settings.read`/`settings.save`
+API covering profiles, routing, projects, daemon, automation, mail, cloud MCP and desktop
+sections (see [unified settings](docs/spec/configuration.md#unified-settings)).
+
+Queue assignment keeps a configured number of Agents busy on a brief queue: each timer
+firing emits one routing-aware launch for the next `.md` brief, with a completion rule
+retiring the Agent after its terminal turn. It runs on the existing rules and timers,
+not a task engine (see [queue assignment](docs/spec/automation.md#targetless-launch)).
+
 ## Quick start
 
 From the repository root, build the binary and replace the workspace, data-directory, and
@@ -91,12 +109,15 @@ and is never clamped; see [event replay](docs/spec/api.md#event-replay).
 On Unix, the built binary is `./target/debug/swarm`; pass the same `--data-dir` to each
 invocation.
 
-`launch` requires a named explicit profile for one of the five native
-adapters and an existing workspace. Profiles are defined in
+`launch` takes `--profile` for one of the five native adapters and an existing
+workspace, or omits `--profile` to route by `--role` through the ordered `[routing]`
+candidates (an omitted role means `default`; see
+[routing](docs/spec/configuration.md#routing-policy-s3)). Profiles are defined in
 `<data_dir>/config.toml` (see [the example](config/controller.example.toml));
-the profile supplies the harness, exact model and native executable. A missing
-or wrong-harness profile fails explicitly — Eliot never substitutes a fake or
-another model, route or account.
+the profile supplies the harness, exact model and native executable. A missing or
+wrong-harness profile fails explicitly, and an empty candidate list fails as
+`routing_unavailable`: Eliot never substitutes a fake, another model, route or account,
+and never retries an uncertain outcome on another route.
 `send --wait` and `launch ... --wait` follow the exact
 turn to its terminal result. The bounded wait is 30 seconds by default; use
 `--timeout-seconds N` to change it. A timeout does not cancel the admitted command.
@@ -139,7 +160,8 @@ a source proves cleanup, not acknowledgement of an answer.
 `inject` supports system context at `next_input`, `turn_safe_point`, and `active_turn`;
 adapter capabilities determine which application points are supported. Acceptance is
 not application: see the [injection contract](docs/spec/api.md) for exact turn binding
-and outcomes. `configure` remains unsupported.
+and outcomes. `configure` switches a live Agent's model and/or effort for its next turn
+(see the [mid-run overlay](docs/spec/configuration.md#mid-run-modeleffort-overlay-configure)).
 
 An optional managed checkout uses the source repository as `--workspace`:
 
