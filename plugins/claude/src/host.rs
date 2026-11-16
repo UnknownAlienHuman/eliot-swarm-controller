@@ -58,10 +58,102 @@ struct FailedStart {
     agent_id: String,
     generation: i64,
     command_id: String,
-    error: Error,
+    outcome: SettledStartFailure,
     /// Retained with the exact start binding after native exit and output drain;
     /// retirement does not depend on delivery of the start RPC response.
+    /// Proven-no-effect starts never spawn, so this stays false for them:
+    /// the daemon retires the plugin on the failed value instead.
     endpoint_exited: bool,
+}
+
+/// How one retained start failure replays. `Uncertain` keeps the historical
+/// error replay (the daemon settles by error code, and a native effect may
+/// have happened). `ProvenNoEffect` carries the failed-state result value:
+/// no native process was spawned by this generation, so the launch is
+/// definitely failed and the daemon retires the plugin and releases capacity
+/// on proven exit instead of pinning an unknown Agent that blocks drain.
+enum SettledStartFailure {
+    Uncertain(Error),
+    ProvenNoEffect(Value),
+}
+
+/// Where a start failure happened relative to the first native CLI spawn.
+/// Every variant except `PostSpawn` proves no native process exists yet:
+/// plan validation runs before any native resource, the MCP config write
+/// and skill-root check only touch the private instance tree, the login
+/// check runs bounded read-only probes (plus the CLI's own browser login,
+/// whose failure leaves no session or prompt), and a failed spawn by
+/// definition produced no child. `PostSpawn` is the boundary pin: anything
+/// at or after a live child keeps its honest classification and never
+/// converts. Only constructed in tests to pin the boundary: production
+/// never converts a post-spawn failure into a proven-no-effect value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartPhase {
+    /// Frozen-profile/workspace/cmd/settings validation in `plan_start`,
+    /// including the `inherit` owner-scan refusal, MCP policy checks, and
+    /// the resume-scope check. Covers the cmd-resolution and settings
+    /// pre-spawn refusals.
+    Plan,
+    /// Private per-session MCP config file creation (MCP config write).
+    McpConfig,
+    /// Daemon-materialized skill-root availability check (skill
+    /// materialization) before `--plugin-dir` is passed to the CLI.
+    Skill,
+    /// CLI auth-status probe and bounded browser login before any session.
+    Login,
+    /// Owned CLI spawn failure with no child produced.
+    Spawn,
+    /// At or after a live native child. Never proven-no-effect.
+    /// Only constructed in tests to pin the boundary.
+    #[allow(dead_code)]
+    PostSpawn,
+}
+
+/// Whether a failure in this start phase proves no native process was
+/// spawned by this generation, so the launch settles as a definite failed
+/// start instead of unknown. This is the regression anchor for the
+/// pre-spawn rule: every phase before the first spawn maps here, and no
+/// post-spawn phase may. Unlike the OpenCode auth transfer, Claude has no
+/// uncertain pre-spawn write: login probes are read-only status checks and
+/// the CLI's own bounded browser login, and every other pre-spawn step is
+/// local validation or private-tree file preparation, so all pre-spawn
+/// codes (including `unknown`) settle failed. Adding a phase forces an
+/// explicit entry in the classification test below.
+fn start_failure_is_proven_no_effect(phase: StartPhase, _code: &str) -> bool {
+    matches!(
+        phase,
+        StartPhase::Plan
+            | StartPhase::McpConfig
+            | StartPhase::Skill
+            | StartPhase::Login
+            | StartPhase::Spawn
+    )
+}
+
+/// One pre-spawn failure: where it happened and the triggering error. The
+/// caller converts this into the authoritative proven-no-effect failed
+/// start instead of an error, so the daemon settles the launch failed and
+/// retires the plugin instead of pinning an unknown Agent.
+struct PhaseFailure {
+    phase: StartPhase,
+    error: Error,
+}
+
+/// Typed reason for one proven-no-effect failed start. Static per phase
+/// plus the triggering error code (a fixed literal, never a payload):
+/// enough to tell an owner-scan refusal from a missing cmd or an
+/// unavailable login without risking secrets, endpoints, or native text
+/// in the persisted outcome.
+fn prespawn_reason(phase: StartPhase, code: &str) -> String {
+    let what = match phase {
+        StartPhase::Plan => "Claude start refused pre-spawn",
+        StartPhase::McpConfig => "Claude MCP config could not be prepared",
+        StartPhase::Skill => "Claude skill root is unavailable",
+        StartPhase::Login => "Claude CLI login is unavailable",
+        StartPhase::Spawn => "Claude CLI failed to spawn",
+        StartPhase::PostSpawn => "Claude start failed after native spawn",
+    };
+    format!("{what} ({code}); no native process was spawned by this generation")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -562,10 +654,56 @@ impl ClaudePlugin {
             agent_id: params.agent_id.clone(),
             generation: params.generation,
             command_id: params.command_id.clone(),
-            error: error.clone(),
+            outcome: SettledStartFailure::Uncertain(error.clone()),
             endpoint_exited: true,
         });
         error
+    }
+
+    /// Retain a proven-no-effect start failure and build its failed-state
+    /// result: no native process was spawned and no prompt was sent, so the
+    /// launch is definitely failed, never unknown. The reason names the
+    /// failed check in short non-secret words; it is persisted in the daemon
+    /// outcome, so it must never carry endpoints, ids, values, or secrets.
+    fn retain_proven_no_effect_start(
+        &mut self,
+        params: &AgentStartParams,
+        reason: impl Into<String>,
+    ) -> Value {
+        let value = json!({
+            "agent_id": params.agent_id,
+            "generation": params.generation,
+            "command_id": params.command_id,
+            "state": "failed",
+            "reason": reason.into(),
+        });
+        self.failed_start = Some(FailedStart {
+            agent_id: params.agent_id.clone(),
+            generation: params.generation,
+            command_id: params.command_id.clone(),
+            outcome: SettledStartFailure::ProvenNoEffect(value.clone()),
+            endpoint_exited: false,
+        });
+        value
+    }
+
+    /// Convert one pre-spawn failure into its retained failed-state result.
+    /// By construction the failure happened before the native CLI was
+    /// spawned and carries no uncertain effect, so the launch is definitely
+    /// failed: the daemon settles failed, retires the plugin, and releases
+    /// capacity on proven exit instead of pinning an unknown Agent that
+    /// blocks drain.
+    fn proven_no_effect_start(
+        &mut self,
+        params: &AgentStartParams,
+        failure: PhaseFailure,
+    ) -> Value {
+        debug_assert!(start_failure_is_proven_no_effect(
+            failure.phase,
+            &failure.error.code
+        ));
+        let reason = prespawn_reason(failure.phase, &failure.error.code);
+        self.retain_proven_no_effect_start(params, reason)
     }
 
     async fn dispatch(&mut self, request: &RpcRequest, client: &PeerClient) -> DispatchOutcome {
@@ -685,7 +823,10 @@ impl ClaudePlugin {
                 && failed.generation == params.generation
                 && failed.command_id == params.command_id
             {
-                return Some(Err(failed.error.clone()));
+                return Some(match &failed.outcome {
+                    SettledStartFailure::Uncertain(error) => Err(error.clone()),
+                    SettledStartFailure::ProvenNoEffect(value) => Ok(value.clone()),
+                });
             }
             return Some(Err(Error::new(
                 "bad_state",
@@ -1169,8 +1310,31 @@ impl ClaudePlugin {
         if let Some(replay) = self.replay_start(&params) {
             return replay;
         }
-        let plan = self.plan_start(&params)?;
-        let session = launch_session(&plan, &params, peer).await?;
+        // Every failure before the native CLI is spawned proves no native
+        // effect exists, so it settles as a definite failed start (never
+        // unknown) with a typed reason. Failures at or after spawn keep
+        // their honest classification below.
+        let plan = match self.plan_start(&params) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Ok(self.proven_no_effect_start(
+                    &params,
+                    PhaseFailure {
+                        phase: StartPhase::Plan,
+                        error,
+                    },
+                ));
+            }
+        };
+        let session = match launch_session(&plan, &params, peer).await {
+            Ok(session) => session,
+            Err(failure) => {
+                if start_failure_is_proven_no_effect(failure.phase, &failure.error.code) {
+                    return Ok(self.proven_no_effect_start(&params, failure));
+                }
+                return Err(failure.error);
+            }
+        };
         if let Err(error) = register_native_process(
             peer,
             &plan.credential,
@@ -2141,14 +2305,22 @@ async fn dispatch_send(
 }
 
 /// Spawn the owned CLI and bind the event task: the only start phase that
-/// creates native resources.
+/// creates native resources. Every failure before the spawn (MCP config
+/// write, skill-root check, login, and the spawn itself) returns a
+/// `PhaseFailure` the caller converts into the proven-no-effect failed
+/// start; a failure after the child exists keeps its honest error and the
+/// child is ended before returning.
 async fn launch_session(
     plan: &StartPlan,
     params: &AgentStartParams,
     peer: &PeerClient,
-) -> Result<AgentSession> {
+) -> std::result::Result<AgentSession, PhaseFailure> {
     let mcp_config =
-        ClaudeMcpConfigFile::create(&plan.instance_dir, &plan.swarm_binary, &plan.data_root)?;
+        ClaudeMcpConfigFile::create(&plan.instance_dir, &plan.swarm_binary, &plan.data_root)
+            .map_err(|error| PhaseFailure {
+                phase: StartPhase::McpConfig,
+                error,
+            })?;
     // Approvals always travel over stdio so every `can_use_tool` ask
     // reaches Eliot. Resume continues the exact retained session id; the
     // old prompt is never resent.
@@ -2193,21 +2365,48 @@ async fn launch_session(
     // Expose the daemon-materialized coordination skill through the CLI's
     // own plugin mechanism: the materialized skill root doubles as the
     // plugin directory, so no checkout or global skill location changes.
-    // A missing or unloadable directory fails the spawn with its cause.
+    // A missing root refuses the start pre-spawn with its typed reason
+    // instead of failing the spawn unknown.
+    let skill_root = skill::skill_root(&plan.data_root);
+    if !skill_root.is_dir() {
+        return Err(PhaseFailure {
+            phase: StartPhase::Skill,
+            error: Error::new("unavailable", "Claude skill root is unavailable"),
+        });
+    }
     argv.push(OsString::from("--plugin-dir"));
-    argv.push(OsString::from(skill::skill_root(&plan.data_root)));
+    argv.push(OsString::from(skill_root));
     // The CLI keeps its own login (not the desktop app's): check it, and run
     // its browser login when it is logged out, before any native resource.
-    crate::native::ensure_logged_in(&plan.program, &plan.workspace, &plan.environment).await?;
+    // A login failure leaves no session or prompt, so it is proven-no-effect.
+    crate::native::ensure_logged_in(&plan.program, &plan.workspace, &plan.environment)
+        .await
+        .map_err(|error| PhaseFailure {
+            phase: StartPhase::Login,
+            error,
+        })?;
     let launch = NativeLaunch {
         program: plan.program.clone(),
         args: argv,
         cwd: plan.workspace.clone(),
         environment: plan.environment.clone(),
     };
-    let mut native =
-        ClaudeProcess::spawn(launch, SecretPolicy::new(plan.secrets.iter().cloned())).await?;
-    let frames = native.take_frames()?;
+    let mut native = ClaudeProcess::spawn(launch, SecretPolicy::new(plan.secrets.iter().cloned()))
+        .await
+        .map_err(|error| PhaseFailure {
+            phase: StartPhase::Spawn,
+            error,
+        })?;
+    let frames = match native.take_frames() {
+        Ok(frames) => frames,
+        Err(error) => {
+            let _ = native.terminate(false, Instant::now() + RPC_TIMEOUT).await;
+            return Err(PhaseFailure {
+                phase: StartPhase::PostSpawn,
+                error,
+            });
+        }
+    };
     let stream = native.stream_state();
     let native_client = native.client();
     let events = events::spawn(
@@ -2454,8 +2653,9 @@ fn target_environment(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudePlugin, PendingSend, SendHistory, check_mcp_allow_empty, claude_manifest,
-        claude_scope, mcp_argv, new_uuid, retain_send_rejection, send_unknown, setter_error,
+        ClaudePlugin, PendingSend, PhaseFailure, SendHistory, StartPhase, check_mcp_allow_empty,
+        claude_manifest, claude_scope, mcp_argv, new_uuid, prespawn_reason, retain_send_rejection,
+        send_unknown, setter_error, start_failure_is_proven_no_effect,
     };
     use crate::events::TurnOutcome;
     use eliot_core::Error;
@@ -2909,5 +3109,105 @@ mod tests {
             let error = setter_error(Error::new(code, "outcome lost"), "initialize");
             assert_eq!(error.code, "unknown", "code={code}");
         }
+    }
+
+    /// Pre-spawn classification: every phase before the first native spawn
+    /// proves no native process exists and settles definite failed, for any
+    /// triggering code. Only the post-spawn boundary phase otherwise stays
+    /// uncertain. Adding a phase forces an explicit entry here.
+    #[test]
+    fn prespawn_phases_classify_failed_before_native_spawn() {
+        for phase in [
+            StartPhase::Plan,
+            StartPhase::McpConfig,
+            StartPhase::Skill,
+            StartPhase::Login,
+            StartPhase::Spawn,
+        ] {
+            for code in [
+                "profile_error",
+                "unsupported",
+                "not_allowed",
+                "platform_io",
+                "invalid",
+                "native_not_dispatched",
+                "unknown",
+            ] {
+                assert!(
+                    start_failure_is_proven_no_effect(phase, code),
+                    "pre-spawn failure must be proven-no-effect: {phase:?} {code}"
+                );
+            }
+        }
+        assert!(!start_failure_is_proven_no_effect(
+            StartPhase::PostSpawn,
+            "profile_error"
+        ));
+        assert!(!start_failure_is_proven_no_effect(
+            StartPhase::PostSpawn,
+            "unknown"
+        ));
+    }
+
+    /// Typed reason: static per phase plus the triggering error code, never
+    /// the payload. A refusal naming a server and source kind must not leak
+    /// either into the persisted reason.
+    #[test]
+    fn prespawn_reason_is_typed_static_plus_code() {
+        let reason = prespawn_reason(StartPhase::Plan, "profile_error");
+        assert!(reason.contains("Claude start refused pre-spawn"));
+        assert!(reason.contains("profile_error"));
+        assert!(reason.contains("no native process was spawned"));
+        let owner_like = Error::new(
+            "profile_error",
+            "Claude inherit MCP keeps the owner Swarm MCP server \"swarm\" from project .mcp.json",
+        );
+        let reason = prespawn_reason(StartPhase::Plan, &owner_like.code);
+        assert!(!reason.contains("swarm"));
+        assert!(!reason.contains(".mcp.json"));
+    }
+
+    /// A pre-spawn owner-scan refusal settles failed with the exact start
+    /// binding: no session is created, the endpoint-exited latch stays
+    /// false (the daemon retires the plugin on the failed value), the same
+    /// command id replays the failed value, and a different command is
+    /// refused as settled. The plugin therefore leaves `starting` without
+    /// pinning the launch unknown and without blocking drain.
+    #[test]
+    fn prespawn_owner_scan_refusal_settles_failed_and_replays() {
+        let params = eliot_plugin::AgentStartParams::new("agent-9", 1, "0199-owner-scan");
+        let mut plugin = ClaudePlugin::default();
+        let failure = PhaseFailure {
+            phase: StartPhase::Plan,
+            error: Error::new(
+                "profile_error",
+                "Claude inherit MCP keeps the owner Swarm MCP server \"swarm\" from project .mcp.json",
+            ),
+        };
+        let value = plugin.proven_no_effect_start(&params, failure);
+        assert_eq!(value["state"], "failed");
+        assert_eq!(value["agent_id"], "agent-9");
+        assert_eq!(value["generation"], 1);
+        assert_eq!(value["command_id"], "0199-owner-scan");
+        let reason = value["reason"].as_str().expect("typed reason");
+        assert!(reason.contains("profile_error"));
+        assert!(!reason.contains("swarm"));
+        assert!(plugin.session.is_none());
+        assert!(
+            !plugin
+                .failed_start
+                .as_ref()
+                .expect("retained")
+                .endpoint_exited
+        );
+        match plugin.replay_start(&params).expect("replay") {
+            Ok(replayed) => assert_eq!(replayed, value),
+            Err(error) => panic!("proven-no-effect must replay failed, got {error:?}"),
+        }
+        let newer = eliot_plugin::AgentStartParams::new("agent-9", 1, "0199-other");
+        assert_eq!(
+            plugin.replay_start(&newer).unwrap().unwrap_err().code,
+            "bad_state"
+        );
     }
 }
