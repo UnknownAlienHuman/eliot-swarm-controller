@@ -468,6 +468,7 @@ mod tests {
         // bootstrap now writes `native_subagents = "allow"` for it; the
         // resulting profiles must resolve, and the derived form must not.
         let root = std::env::temp_dir().join(format!("eliot-bootstrap-deny-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir_all(&root).unwrap();
         let explicit = "[profiles.antigravity]
 harness = \"antigravity\"
@@ -494,12 +495,12 @@ cmd = \"C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe\"
         let error = crate::config::resolve_profile(&root, "antigravity")
             .expect_err("derived deny is unsupported on Antigravity");
         assert_eq!(error.code, "unsupported");
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn fresh_bootstrap_grants_only_installed_worker_profiles_and_preserves_edits() {
         let root = std::env::temp_dir().join(format!("eliot-bootstrap-{}", ulid::Ulid::new()));
+        let _temp_2 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir_all(&root).unwrap();
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         let policy = SecretPolicy::default();
@@ -540,6 +541,5 @@ cmd = \"C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe\"
             );
         }
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1081,10 +1081,32 @@ async fn pump_sse(
 mod tests {
     use super::*;
 
+    /// Owned workspace fixture: removed on unwind so a failed
+    /// assertion never leaks it into the shared temp directory.
+    #[cfg(target_os = "linux")]
+    struct WorkspaceFixture(std::path::PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl WorkspaceFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("eliot-opencode-{}", ulid::Ulid::new()));
+            std::fs::create_dir_all(&root).expect("owned workspace");
+            Self(root)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for WorkspaceFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn directory_header_preserves_unicode_and_literal_percent() {
-        let root = std::env::temp_dir().join(format!("eliot-opencode-{}", ulid::Ulid::new()));
+        let fixture = WorkspaceFixture::new();
+        let root = fixture.0.clone();
         let directory = root.join("space %20 é 中");
         std::fs::create_dir_all(&directory).expect("Unicode workspace");
         let http = OpenCodeHttp::new(1, "unused".to_owned(), &directory).expect("client");
@@ -1092,7 +1114,6 @@ mod tests {
         assert!(header.is_ascii());
         assert!(header.ends_with("space%20%2520%20%C3%A9%20%E4%B8%AD"));
         assert!(http.directory.ends_with("space %20 é 中"));
-        std::fs::remove_dir_all(root).expect("remove owned workspace");
     }
 
     #[test]
@@ -1217,11 +1238,15 @@ mod tests {
 
         let hits = Arc::new(AtomicUsize::new(0));
         let seen = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let done = Arc::new(AtomicUsize::new(0));
+        let done_notify = Arc::new(tokio::sync::Notify::new());
 
         // Accept loop: count every TCP connect, read its request bytes,
         // then drop without any reply. Runs until the test aborts it.
         let accept_hits = hits.clone();
         let accept_seen = seen.clone();
+        let accept_done = done.clone();
+        let accept_notify = done_notify.clone();
         let accept_task = tokio::spawn(async move {
             loop {
                 let accept =
@@ -1232,6 +1257,8 @@ mod tests {
                 };
                 accept_hits.fetch_add(1, Ordering::SeqCst);
                 let seen = accept_seen.clone();
+                let done = accept_done.clone();
+                let done_notify = accept_notify.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut tmp = [0u8; 4096];
@@ -1267,6 +1294,8 @@ mod tests {
                     if let Ok(mut guard) = seen.lock() {
                         guard.extend_from_slice(&buf);
                     }
+                    done.fetch_add(1, Ordering::SeqCst);
+                    done_notify.notify_one();
                     // Drop without any reply: the write outcome stays ambiguous.
                 });
             }
@@ -1295,9 +1324,19 @@ mod tests {
             }
         }
 
-        // Give any automatic retry a window to arrive, then prove the
-        // client wrote exactly once.
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // Coordinate on both sides completing instead of sleeping: the
+        // client future resolved above, so wait for the server handler to
+        // finish reading the one request, then stop accepting. A retry
+        // would either connect before the handler completes (counted in
+        // `hits`) or fail to connect after the listener is gone; neither
+        // escapes the assertion below.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while done.load(Ordering::SeqCst) < 1 {
+                done_notify.notified().await;
+            }
+        })
+        .await
+        .expect("server never finished reading the request");
         accept_task.abort();
         assert_eq!(
             hits.load(Ordering::SeqCst),

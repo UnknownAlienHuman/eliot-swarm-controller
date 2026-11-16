@@ -801,6 +801,7 @@ mod tests {
     async fn rule_catch_up_commits_empty_range_once_without_advancing_live_cursor() {
         let root =
             std::env::temp_dir().join(format!("eliot-rule-catch-up-empty-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(root.clone());
         let rules_dir = root.join("rules");
         std::fs::create_dir_all(&rules_dir).unwrap();
         std::fs::write(
@@ -915,7 +916,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(state.revision, 2);
         assert!(state.retiring_revision.is_some());
         assert_eq!(state.current_cursor, 2);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -924,6 +924,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             "eliot-rule-catch-up-interrupt-{}",
             ulid::Ulid::new()
         ));
+        let _temp_2 = crate::test_support::TempDir::own(root.clone());
         let rules_dir = root.join("rules");
         std::fs::create_dir_all(&rules_dir).unwrap();
         let router = router_with_data_root(root.clone());
@@ -1049,8 +1050,6 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
                 .unwrap(),
             events_after_first
         );
-
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -1063,6 +1062,7 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
             "eliot-project-rule-stale-catch-up-{}",
             ulid::Ulid::new()
         ));
+        let _temp_3 = crate::test_support::TempDir::own(root.clone());
         let checkout_path = root.join("checkout");
         let data_root = root.join("owner-data");
         std::fs::create_dir_all(&checkout_path).unwrap();
@@ -1580,7 +1580,6 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
                 .expect("router remains available until child settlement");
         }
         drop(router);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

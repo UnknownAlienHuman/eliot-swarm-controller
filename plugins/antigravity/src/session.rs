@@ -2007,6 +2007,7 @@ mod tests {
     #[test]
     fn staged_hook_root_has_no_verbatim_prefix() {
         let (base, instance_dir, workspace, data_dir) = stage_dirs("plain");
+        let _temp_1 = crate::test_temp::TempDir::own(base.clone());
         let helper = Path::new("eliot-hook-helper");
         let guard = stage_hook_config(&instance_dir, &workspace, helper, &data_dir).unwrap();
         let inner = guard.0.as_ref().unwrap();
@@ -2014,12 +2015,12 @@ mod tests {
         assert!(!has_verbatim_prefix(&inner.path));
         assert_eq!(inner.path.parent().unwrap().join("hooks.json"), inner.path);
         drop(guard);
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn staged_hook_root_holds_hooks_and_skill() {
         let (base, instance_dir, workspace, data_dir) = stage_dirs("only");
+        let _temp_2 = crate::test_temp::TempDir::own(base.clone());
         let helper = Path::new("eliot-hook-helper");
         let guard = stage_hook_config(&instance_dir, &workspace, helper, &data_dir).unwrap();
         // The discovery root is a sibling of the instance directory, never
@@ -2093,12 +2094,12 @@ mod tests {
         assert!(!path.exists());
         assert!(!root.exists());
         assert!(instance_dir.is_dir());
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn dropped_guard_cleans_root_so_restaging_succeeds() {
         let (base, instance_dir, workspace, data_dir) = stage_dirs("retry");
+        let _temp_3 = crate::test_temp::TempDir::own(base.clone());
         let helper = Path::new("eliot-hook-helper");
         let guard = stage_hook_config(&instance_dir, &workspace, helper, &data_dir).unwrap();
         let root = guard.root().to_owned();
@@ -2114,12 +2115,12 @@ mod tests {
         drop(guard);
         assert!(!root.exists());
         assert!(instance_dir.is_dir());
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn staging_fails_closed_on_an_existing_root() {
         let (base, instance_dir, workspace, data_dir) = stage_dirs("exists");
+        let _temp_4 = crate::test_temp::TempDir::own(base.clone());
         let helper = Path::new("eliot-hook-helper");
         let squat = base.join("instance-1-hooks");
         fs::create_dir_all(&squat).unwrap();
@@ -2130,12 +2131,12 @@ mod tests {
         assert_eq!(error.code, "io_error");
         // The unowned directory is left untouched.
         assert!(squat.is_dir());
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn staging_fails_closed_without_a_skill_source() {
         let (base, instance_dir, workspace, _) = stage_dirs("noskill");
+        let _temp_5 = crate::test_temp::TempDir::own(base.clone());
         let helper = Path::new("eliot-hook-helper");
         let missing = base.join("no-data");
         let error = match stage_hook_config(&instance_dir, &workspace, helper, &missing) {
@@ -2146,12 +2147,12 @@ mod tests {
         // The withdrawn root leaves no hook config behind either.
         assert!(!base.join("instance-1-hooks").exists());
         assert!(fs::read_dir(&instance_dir).unwrap().next().is_none());
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn staging_rejects_an_overlapping_workspace() {
         let (base, instance_dir, _, data_dir) = stage_dirs("overlap");
+        let _temp_6 = crate::test_temp::TempDir::own(base.clone());
         let helper = Path::new("eliot-hook-helper");
         // A workspace covering the instance tree is rejected before any
         // hook root is staged.
@@ -2162,6 +2163,5 @@ mod tests {
         assert_eq!(error.code, "invalid");
         assert!(!base.join("instance-1-hooks").exists());
         assert!(base.is_dir());
-        let _ = fs::remove_dir_all(&base);
     }
 }

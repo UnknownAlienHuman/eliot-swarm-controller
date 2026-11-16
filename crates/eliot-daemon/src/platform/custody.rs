@@ -612,6 +612,7 @@ mod leaf_tests {
             PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"));
         let parent = system_root.join("System32").join("cmd.exe");
         let base = std::env::temp_dir().join(format!("eliot-leaf-long-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(base.clone());
         let long = base.join("Q".repeat(240));
         assert!(
             long.as_os_str().len() > 258,
@@ -637,7 +638,6 @@ mod leaf_tests {
             "the true spawn error must survive, not the fence code: {}",
             error.message
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 }
 
