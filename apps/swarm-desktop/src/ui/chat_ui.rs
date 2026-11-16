@@ -942,11 +942,11 @@ impl DesktopApp {
     /// empty state of a new task), pending requests and the composer.
     pub(super) fn chat_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let agent = self.selected_agent_id();
+        let column = self.reading_width();
         let header: View = match agent.as_deref() {
-            Some(agent) => self.header_view(agent, context, palette),
+            Some(agent) => self.header_view(agent, column, context, palette),
             None => View::empty(),
         };
-        let column = self.reading_width();
         let body: View = match agent {
             Some(_) => self.transcript_view(column, context, palette),
             None => {
@@ -1053,7 +1053,13 @@ impl DesktopApp {
 
     /// One line: the title, the status dot, a connection note when not live,
     /// then the details toggle and the "…" menu.
-    fn header_view(&self, agent: &str, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    fn header_view(
+        &self,
+        agent: &str,
+        column: Option<f64>,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
         let title = self.agent_title(agent);
         let detail = self.chat.detail.as_ref();
         let state = detail.map_or("reading", |detail| detail.state.as_str());
@@ -1118,15 +1124,20 @@ impl DesktopApp {
                 GridLength::Auto,
             ])
             .column_spacing(tokens::spacing::SM)
-            .margin(Thickness::new(
-                tokens::spacing::LG,
-                tokens::spacing::SM,
-                tokens::spacing::SM,
-                tokens::spacing::SM,
-            ))
+            // On the reading column, so the title starts and the toolbar
+            // ends where the messages and the composer do.
+            .width(column)
+            .max_width(tokens::layout::READING_WIDTH)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .margin(Thickness::xy(0.0, tokens::spacing::SM))
             .children((
                 m3::section_title(title.clone())
-                    .max_width(tokens::layout::READING_WIDTH)
+                    .max_width(
+                        column.unwrap_or(tokens::layout::READING_WIDTH)
+                            - 2.0 * tokens::height::CONTROL
+                            - 4.0 * tokens::spacing::SM
+                            - tokens::layout::DOT,
+                    )
                     .vertical_alignment(VerticalAlignment::Center)
                     .text_trimming(TextTrimming::CharacterEllipsis)
                     .is_text_selection_enabled(true),
@@ -1423,7 +1434,7 @@ impl DesktopApp {
             .content(
                 Grid::new()
                     .rows([GridLength::Auto, GridLength::Auto, GridLength::Auto])
-                    .row_spacing(tokens::spacing::XS)
+                    .row_spacing(tokens::spacing::SM)
                     .children((
                         context_row,
                         field,

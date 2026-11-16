@@ -51,7 +51,12 @@ pub fn card(row: &MonitorRow, title: &str, open: Callback<()>, palette: Palette)
         open,
         StackPanel::new()
             .spacing(tokens::spacing::XS)
-            .margin(Thickness::xy(0.0, tokens::spacing::INSET))
+            // The button's 1-DIP border and 12-DIP inset plus this put the
+            // text at the 16-DIP padding of every other card.
+            .margin(Thickness::xy(
+                tokens::spacing::MD - tokens::spacing::INSET - tokens::layout::HAIRLINE,
+                tokens::spacing::MD - tokens::layout::HAIRLINE,
+            ))
             .children((
                 Grid::new()
                     .columns([GridLength::STAR, GridLength::Auto])
@@ -186,8 +191,11 @@ fn chart_card(
                     .vertical_alignment(VerticalAlignment::Bottom),
                 crate::m3::text(latest, tokens::text::SECTION_TITLE).grid_column(1),
             )),
+        // The plot well in the surface color: one tonal step from the card
+        // in both schemes (the highest container nearly matched the light
+        // card).
         Border::new()
-            .background(palette.well())
+            .background(palette.surface())
             .corner_radius(tokens::radius::CONTAINER)
             .padding(Thickness::uniform(tokens::spacing::SM))
             .content(

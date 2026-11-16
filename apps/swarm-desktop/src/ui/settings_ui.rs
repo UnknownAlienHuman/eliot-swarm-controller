@@ -716,7 +716,7 @@ impl DesktopApp {
                             if selected { " (current)" } else { "" }
                         ))
                         .on_click(context.message(Message::Shell(ShellMsg::ThemeChosen(choice))))
-                        .content(m3::segment_label(choice.label(), selected)),
+                        .content(m3::segment_label(choice.label())),
                 )
             })
             .collect();
@@ -1291,7 +1291,7 @@ impl DesktopApp {
             self.save_bar(Page::Automation, dirty, context, palette),
         ));
         StackPanel::new()
-            .spacing(tokens::spacing::SM)
+            .spacing(tokens::spacing::MD)
             .keyed_children(groups)
     }
 

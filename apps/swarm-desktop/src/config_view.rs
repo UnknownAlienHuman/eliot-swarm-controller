@@ -233,7 +233,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
         } else {
             "Edit as TOML"
         }));
-    let source: View = if data.source_open {
+    let source: Option<View> = data.source_open.then(|| {
         crate::m3::field()
             .text(data.view.to_owned())
             .accepts_return(true)
@@ -244,23 +244,24 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
             .max_height(tokens::layout::SOURCE_MAX_HEIGHT)
             .on_text_changed(actions.draft_changed)
             .into()
-    } else {
-        View::empty()
-    };
-    let form: View = if form.is_empty() {
-        View::empty()
-    } else {
-        crate::m3::group(palette, form)
-    };
-    // The Settings page scrolls, so the save bar follows.
-    StackPanel::new().spacing(tokens::spacing::MD).children((
-        crate::m3::list(palette, rows),
-        form,
-        small(state),
-        toggle,
-        source,
-        small(data.status.to_owned()),
-    ))
+    });
+    // The Settings page scrolls, so the save bar follows. Only shown parts
+    // take a place, so no empty child adds a gap.
+    let mut parts = vec![KeyedView::new("profiles", crate::m3::list(palette, rows))];
+    if !form.is_empty() {
+        parts.push(KeyedView::new("form", crate::m3::group(palette, form)));
+    }
+    parts.push(KeyedView::new("state", small(state)));
+    parts.push(KeyedView::new("toggle", toggle));
+    if let Some(source) = source {
+        parts.push(KeyedView::new("source", source));
+    }
+    if !data.status.is_empty() {
+        parts.push(KeyedView::new("status", small(data.status.to_owned())));
+    }
+    StackPanel::new()
+        .spacing(tokens::spacing::MD)
+        .keyed_children(parts)
 }
 
 fn utc(ms: i64) -> String {
@@ -535,10 +536,12 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
             ),
         ));
     }
-    let picker = crate::m3::group(palette, parts);
+    let mut page = vec![KeyedView::new("picker", crate::m3::group(palette, parts))];
     let mut below: Vec<KeyedView> = Vec::new();
     if selected {
-        below.push(KeyedView::new(
+        // The source is a group of its own, 16 DIPs from the picker and
+        // from the actions under it.
+        page.push(KeyedView::new(
             "source",
             crate::m3::field()
                 .text(data.view.to_owned())
@@ -598,10 +601,15 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
             below.push(KeyedView::new(key, small(line.to_owned())));
         }
     }
-    StackPanel::new().spacing(tokens::spacing::MD).children((
-        picker,
-        StackPanel::new()
-            .spacing(tokens::spacing::SM)
-            .keyed_children(below),
-    ))
+    if !below.is_empty() {
+        page.push(KeyedView::new(
+            "below",
+            StackPanel::new()
+                .spacing(tokens::spacing::SM)
+                .keyed_children(below),
+        ));
+    }
+    StackPanel::new()
+        .spacing(tokens::spacing::MD)
+        .keyed_children(page)
 }

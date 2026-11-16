@@ -41,7 +41,6 @@ pub mod glyph {
     pub const SHIELD: &str = "\u{EA18}";
     pub const PROFILE: &str = "\u{E77B}";
     pub const PULSE: &str = "\u{E9D9}";
-    pub const CHECK: &str = "\u{E73E}";
     pub const TOOLS: &str = "\u{E90F}";
 }
 
@@ -332,13 +331,10 @@ pub fn segment(palette: Palette, selected: bool) -> Button {
     button(palette.segment(selected))
 }
 
-/// The content of a segment: a check before the selected label.
-pub fn segment_label(label: &str, selected: bool) -> View {
-    if selected {
-        icon_label(glyph::CHECK, label)
-    } else {
-        TextBlock::new().text(label.to_owned()).into()
-    }
+/// The content of a segment: its label (the fill marks the selection, so
+/// the segments keep their widths when it moves).
+pub fn segment_label(label: &str) -> View {
+    TextBlock::new().text(label.to_owned()).into()
 }
 
 /// A segmented button: the segments on one filled track of the control
@@ -366,27 +362,39 @@ pub fn field() -> TextBox {
 /// [`layout::NUMBER_WIDTH`], paths and text the full width), an optional
 /// action.
 pub fn form_row(label: &str, control: View, action: Option<View>) -> View {
-    Grid::new()
-        .min_height(height::FORM_ROW)
-        .columns([
-            GridLength::Pixel(layout::LABEL_WIDTH),
-            GridLength::STAR,
-            GridLength::Auto,
-        ])
-        .column_spacing(spacing::SM)
-        .children((
+    // No action, no column: an empty column would still take the grid gap
+    // and end the control short of the group's edge.
+    let mut columns = vec![GridLength::Pixel(layout::LABEL_WIDTH), GridLength::STAR];
+    let mut cells = vec![
+        KeyedView::new(
+            "label",
             body(label.to_owned())
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_trimming(TextTrimming::CharacterEllipsis),
+        ),
+        KeyedView::new(
+            "control",
             Border::new()
                 .grid_column(1)
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(control),
+        ),
+    ];
+    if let Some(action) = action {
+        columns.push(GridLength::Auto);
+        cells.push(KeyedView::new(
+            "action",
             Border::new()
                 .grid_column(2)
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(action.unwrap_or_else(View::empty)),
-        ))
+                .content(action),
+        ));
+    }
+    Grid::new()
+        .min_height(height::FORM_ROW)
+        .columns(columns)
+        .column_spacing(spacing::SM)
+        .keyed_children(cells)
 }
 
 /// A dropdown sized for an enum value.
@@ -404,7 +412,7 @@ pub fn help(text: impl Into<String>) -> TextBlock {
             layout::LABEL_WIDTH + spacing::SM,
             0.0,
             0.0,
-            spacing::XS,
+            spacing::SM,
         ))
 }
 
