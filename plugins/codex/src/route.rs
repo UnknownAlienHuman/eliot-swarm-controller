@@ -137,6 +137,10 @@ impl CodexRoute {
             .iter()
             .position(|arg| arg == OsStr::new("app-server"))
             .ok_or_else(|| route_error("Codex app-server route is unavailable"))?;
+        // This generated tool authenticates only as the Agent (--require-agent).
+        // Store admission and dispatch reserve ask-generation replies to the
+        // Owner, including self and manager replies; auto-approving this MCP
+        // transport therefore cannot approve the Agent's pending requests.
         let server = format!(
             "{{ enabled = true, command = {}, args = [\"mcp\", \"--require-agent\", \"--data-dir\", {}], env = {{}}, env_vars = [\"ELIOT_AGENT_ID\", \"ELIOT_AGENT_GENERATION\", \"ELIOT_AGENT_TOKEN\"], cwd = {}, tools = {{ swarm = {{ approval_mode = \"approve\" }} }} }}",
             quote_path(swarm_executable)?,

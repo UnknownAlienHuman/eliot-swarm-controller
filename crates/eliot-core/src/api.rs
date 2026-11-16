@@ -20,6 +20,7 @@ mod mutations;
 mod native_pages;
 mod native_requests;
 mod notify;
+mod observe;
 mod provider;
 mod read_validation;
 mod reads;
@@ -33,15 +34,16 @@ mod usage;
 mod waits;
 
 pub use agent_views::{
-    AgentConfigView, AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse,
-    AgentGitRequest, AgentGitResponse, AgentListRequest, AgentListResponse, AgentListRow,
-    AgentProcessesRequest, AgentProcessesResponse, AgentStatsRequest, AgentStatsResponse,
-    AgentSummary, CloudMcpCustody, CloudMcpHealth, CloudMcpStatus, DaemonStatusRequest,
-    DaemonStatusResponse, DrainReport, GitCredentialHelper, OwnedProcessKind, OwnedProcessSummary,
-    PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectDiscoverRequest, ProjectDiscoverResponse,
-    ProjectGitView, ProjectRegistrationView, RetainedUnknownSummary, RetentionView,
-    RunningTurnSummary, SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary,
-    WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
+    AGENT_PREVIEW_CHARS, AgentConfigView, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
+    AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentListRequest, AgentListResponse,
+    AgentListRow, AgentProcessesRequest, AgentProcessesResponse, AgentStatsRequest,
+    AgentStatsResponse, AgentSummary, CloudMcpCustody, CloudMcpHealth, CloudMcpStatus,
+    DaemonStatusRequest, DaemonStatusResponse, DrainReport, GitCredentialHelper, OwnedProcessKind,
+    OwnedProcessSummary, PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectDiscoverRequest,
+    ProjectDiscoverResponse, ProjectGitView, ProjectRegistrationView, RetainedUnknownSummary,
+    RetentionView, RunningTurnSummary, SourceOwner, SourceState, StatusBlocker,
+    UnsettledCommandSummary, WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
+    activity_state_name, agent_state_name,
 };
 pub use config_views::{
     CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,
@@ -88,7 +90,9 @@ pub use harness::{
     HARNESS_READ_TTL_MS, HarnessCandidate, HarnessEntry, HarnessListRequest, HarnessListResponse,
     HarnessModelEntry, HarnessModelsRequest, HarnessModelsResponse, HarnessQuotaRequest,
     HarnessQuotaResponse, MAX_HARNESS_CREDENTIAL_BYTES, MAX_HARNESS_PROFILE_BYTES,
-    MAX_HARNESS_QUOTA_NOTE_BYTES, MAX_HARNESS_SCOPE_BYTES,
+    MAX_HARNESS_QUOTA_NOTE_BYTES, MAX_HARNESS_SCOPE_BYTES, ModelsCatalogEntry,
+    ModelsCatalogRequest, ModelsCatalogResponse, catalog_cursor, catalog_display_name,
+    catalog_matches, catalog_provider,
 };
 pub use hierarchy::{
     DEFAULT_MAX_CHILDREN_PER_AGENT, DEFAULT_MAX_DEPTH, DEFAULT_MAX_SELECTOR_TARGETS,
@@ -112,6 +116,11 @@ pub use native_pages::{
 };
 pub use native_requests::{AgentDiscoverRequest, AgentHistoryRequest};
 pub use notify::{EmitDefinitionArgs, NotifyDefinitionArgs};
+pub use observe::{
+    DEFAULT_OBSERVE_WINDOW_SECS, DoctorHarnessEntry, HarnessDoctorRequest, HarnessDoctorResponse,
+    HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView, MAX_DOCTOR_HARNESSES, MAX_HEAVY_EPISODES,
+    MAX_OBSERVE_WINDOW_SECS, ObserveHeavyRequest, ObserveHeavyResponse, SessionGrowthView,
+};
 pub use provider::{
     ProviderClearHoldRequest, ProviderClearHoldResponse, ProviderCorrectiveEvidence,
     ProviderHoldsRequest, ProviderHoldsResponse,

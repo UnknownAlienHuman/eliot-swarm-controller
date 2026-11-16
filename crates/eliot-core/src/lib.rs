@@ -21,6 +21,7 @@ mod ids;
 mod mcp_policy;
 mod native_child;
 mod native_store;
+mod observe;
 mod remote_call;
 mod routing;
 mod secrets;
@@ -51,6 +52,17 @@ pub use native_child::{
     NativeChildActivityState, native_child_families_for_harness,
 };
 pub use native_store::NativeStoreBinding;
+pub use observe::{
+    ACTIVITY_HEAVY_KIND, BUILD_WORKER_PROGRAMS, CATEGORY_SOURCE_CMDLINE, CATEGORY_SOURCE_IMAGE,
+    CONSOLE_HOST_PROGRAMS, DEFAULT_HEAVY_CPU_SECS, DEFAULT_HEAVY_RSS_BYTES,
+    DEFAULT_HEAVY_WALL_SECS, DEFAULT_SESSION_FILE_BYTES, DEFAULT_SESSION_GROWTH_RATIO,
+    HARNESS_DRIFT_KIND, HarnessDrift, HeavyEpisode, HeavyThresholds, OBSERVE_LEVEL_DEBUG,
+    OBSERVE_LEVEL_STANDARD, SESSION_GROWTH_KIND, SHELL_WRAPPER_PROGRAMS, SessionGrowth,
+    SessionGrowthBasis, SessionGrowthThresholds, VERIFIED_HARNESSES, VerifiedHarness,
+    check_harness_drift, classify_heavy_command, compact_hint_for_harness, evaluate_session_growth,
+    merge_heavy_episodes, normalize_harness_version, resolve_heavy_category, split_unix_cmdline,
+    split_windows_command_line, unwrap_shell_command, verified_harness,
+};
 pub use remote_call::{RemoteCallContext, RemoteIdentity};
 pub use routing::{
     CapacityScope, ProviderHold, ProviderHoldState, ProviderRestriction, ProviderRestrictionKind,
@@ -776,7 +788,11 @@ pub struct TurnUsage {
 /// verbatim native unit (for example `usd_estimate` for an estimated USD
 /// total), never converted and never assumed to be money. `source` names the
 /// adapter and native signal (for example `codex:thread/tokenUsage/updated`);
-/// `observed_at` is native epoch milliseconds. Unknown fields are ignored so
+/// `observed_at` is native epoch milliseconds.
+/// `session_file_bytes` carries the native session file size where the
+/// harness exposes a documented size source (a transcript/rollout scan the
+/// adapter performs itself); it stays null where nothing is observable, never
+/// zero and never a guess. Unknown fields are ignored so
 /// harnesses decode forward.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionUsage {
@@ -788,6 +804,8 @@ pub struct SessionUsage {
     pub cumulative_tokens: Option<SessionTokenTotals>,
     #[serde(default)]
     pub cumulative_cost: Option<SessionCost>,
+    #[serde(default)]
+    pub session_file_bytes: Option<u64>,
     #[serde(default)]
     pub source: Option<String>,
     #[serde(default)]
@@ -2032,6 +2050,7 @@ mod session_usage_tests {
                 amount: Some(f64::INFINITY),
                 unit: Some("usd_estimate".to_owned()),
             }),
+            session_file_bytes: None,
             source: None,
             observed_at: None,
         };

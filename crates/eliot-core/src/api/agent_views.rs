@@ -1,16 +1,19 @@
 //! Public Agent/daemon read grammar and pure reply binding checks.
 //! Store authorization and the exact workspace target remain Router decisions.
 
-use super::{GitView, ObservationView, ScriptInterpreter};
+use super::{GitView, HeavySummaryView, ObservationView, ScriptInterpreter, SessionGrowthView};
 use crate::{
-    Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity, ProcessIdentity,
-    ProcessRecord, Result, SessionUsage, TurnOutcome, TurnUsage,
+    Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity,
+    NativeChildActivityState, ProcessIdentity, ProcessRecord, Result, SessionUsage, TurnOutcome,
+    TurnUsage,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const PROCESS_CURSOR_MAX_BYTES: usize = 2_048;
+/// Most characters of [`AgentSummary::preview`].
+pub const AGENT_PREVIEW_CHARS: usize = 256;
 const EDIT_CURSOR_MAX_BYTES: usize = 64 * 1_024;
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +45,14 @@ impl AgentGetRequest {
                 .config
                 .as_ref()
                 .is_some_and(|config| config.validate().is_err())
+            || reply
+                .heavy
+                .as_ref()
+                .is_some_and(|heavy| heavy.validate().is_err())
+            || reply
+                .session_growth
+                .as_ref()
+                .is_some_and(|growth| growth.validate().is_err())
             || reply.source_states.iter().any(|source| {
                 source.agent_id != self.id
                     || source.generation < 0
@@ -225,6 +236,14 @@ impl AgentListRequest {
 /// `updated_at` is the last controller-observed write: for detached or
 /// restarted sources it is freshness metadata, not proof of liveness. Full
 /// records stay available through `agent.get`.
+///
+/// `name`, `profile` and `preview` let a list show what the Agent is for
+/// without a read per row (the pattern of Codex app-server `thread/list`,
+/// whose threads carry `name` and a first-message `preview`): the Agent's
+/// name when one was set, its frozen profile name, and the first
+/// [`AGENT_PREVIEW_CHARS`] characters of its oldest retained `send` text (a
+/// launch's linked first input included). Each is absent when the Store has
+/// none; the same scope that lists the row may already read that command.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentSummary {
     pub id: String,
@@ -232,6 +251,13 @@ pub struct AgentSummary {
     pub generation: i64,
     pub project: String,
     pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 256))]
+    pub preview: Option<String>,
     pub state: AgentState,
     #[serde(deserialize_with = "nullable")]
     pub parent: Option<String>,
@@ -257,6 +283,15 @@ pub struct AgentSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_scope: Option<String>,
     pub updated_at: i64,
+    /// Heavy-work rollup for the Agent generation, when at least one heavy
+    /// episode was ever recorded. Trailing field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heavy: Option<HeavySummaryView>,
+    /// Live session-growth state for the Agent generation, present exactly
+    /// while the retained signal crosses a configured threshold. Trailing
+    /// field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_growth: Option<SessionGrowthView>,
 }
 
 impl AgentSummary {
@@ -268,6 +303,19 @@ impl AgentSummary {
         }
         text(&self.project)?;
         text(&self.harness)?;
+        for value in [&self.name, &self.profile, &self.preview]
+            .into_iter()
+            .flatten()
+        {
+            text(value)?;
+        }
+        if self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.chars().count() > AGENT_PREVIEW_CHARS)
+        {
+            return Err(Error::new("invalid", "Agent summary preview is too long"));
+        }
         text(&self.root)?;
         crate::parse_agent_id(&self.root)?;
         if let Some(parent) = &self.parent {
@@ -318,6 +366,12 @@ impl AgentSummary {
                 "Agent summary observation time is invalid",
             ));
         }
+        if let Some(heavy) = &self.heavy {
+            heavy.validate()?;
+        }
+        if let Some(growth) = &self.session_growth {
+            growth.validate()?;
+        }
         Ok(())
     }
 
@@ -352,6 +406,53 @@ impl AgentSummary {
             _ => "turn",
         };
         Some((tokens, scope))
+    }
+
+    /// Human-readable fleet STATE cell.
+    pub fn display_state(&self) -> String {
+        match &self.activity {
+            Some(activity) => format!("{} (observed)", activity_state_name(activity.state)),
+            None => agent_state_name(self.state).to_owned(),
+        }
+    }
+
+    /// Fleet counting bucket for one summary.
+    pub fn fleet_bucket(&self) -> &'static str {
+        match &self.activity {
+            Some(activity) => match activity.state {
+                NativeChildActivityState::Running => "running",
+                NativeChildActivityState::Idle => "idle",
+                NativeChildActivityState::Interrupted => "interrupted",
+                NativeChildActivityState::Unknown | NativeChildActivityState::Lost => "unknown",
+            },
+            None => agent_state_name(self.state),
+        }
+    }
+}
+
+/// Lifecycle state name shared by fleet displays and counts.
+pub fn agent_state_name(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Unknown => "unknown",
+        AgentState::Created => "created",
+        AgentState::Starting => "starting",
+        AgentState::Idle => "idle",
+        AgentState::Busy => "busy",
+        AgentState::Waiting => "waiting",
+        AgentState::Stopped => "stopped",
+        AgentState::Failed => "failed",
+        AgentState::Lost => "lost",
+    }
+}
+
+/// Read-only native observed-child activity name.
+pub fn activity_state_name(state: NativeChildActivityState) -> &'static str {
+    match state {
+        NativeChildActivityState::Running => "running",
+        NativeChildActivityState::Idle => "idle",
+        NativeChildActivityState::Interrupted => "interrupted",
+        NativeChildActivityState::Lost => "lost",
+        NativeChildActivityState::Unknown => "unknown",
     }
 }
 
@@ -504,6 +605,14 @@ impl AgentStatsRequest {
                 .session_usage
                 .as_ref()
                 .is_some_and(|usage| usage.validate().is_err())
+            || reply
+                .heavy
+                .as_ref()
+                .is_some_and(|heavy| heavy.validate().is_err())
+            || reply
+                .session_growth
+                .as_ref()
+                .is_some_and(|growth| growth.validate().is_err())
         {
             return Err(invalid_response());
         }
@@ -694,6 +803,15 @@ pub struct AgentGetResponse {
         deserialize_with = "optional_object"
     )]
     pub config: Option<AgentConfigView>,
+    /// Heavy-work rollup for the Agent generation, when at least one heavy
+    /// episode was ever recorded. Trailing field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heavy: Option<HeavySummaryView>,
+    /// Live session-growth state for the Agent generation, present exactly
+    /// while the retained signal crosses a configured threshold. Trailing
+    /// field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_growth: Option<SessionGrowthView>,
 }
 
 /// Retained model/effort overlay readback for one Agent generation. The
@@ -823,6 +941,15 @@ pub struct AgentStatsResponse {
     /// committed. Never a turn total and never billing.
     #[serde(default, deserialize_with = "optional_object")]
     pub session_usage: Option<SessionUsage>,
+    /// Heavy-work rollup for the Agent generation, when at least one heavy
+    /// episode was ever recorded. Trailing field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heavy: Option<HeavySummaryView>,
+    /// Live session-growth state for the Agent generation, present exactly
+    /// while the retained signal crosses a configured threshold. Trailing
+    /// field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_growth: Option<SessionGrowthView>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2095,6 +2222,8 @@ mod tests {
             source_states: vec![],
             session_usage: None,
             config: None,
+            heavy: None,
+            session_growth: None,
         };
         let wire = serde_json::to_value(&reply).unwrap();
         assert_eq!(wire["id"], "a1");
@@ -2155,6 +2284,9 @@ mod tests {
             generation: 0,
             project: "p".to_owned(),
             harness: "fake".to_owned(),
+            name: None,
+            profile: None,
+            preview: None,
             state: AgentState::Idle,
             parent: None,
             root: "a1".to_owned(),
@@ -2167,7 +2299,36 @@ mod tests {
             usage: None,
             usage_scope: None,
             updated_at: 7,
+            heavy: None,
+            session_growth: None,
         }
+    }
+
+    #[test]
+    fn summary_title_sources_are_optional_nonblank_and_bounded() {
+        let mut row = summary();
+        let wire = serde_json::to_value(&row).unwrap();
+        for absent in ["name", "profile", "preview"] {
+            assert!(wire.get(absent).is_none(), "{absent}");
+        }
+        row.name = Some("planner".to_owned());
+        row.profile = Some("codex-lite".to_owned());
+        row.preview = Some("é".repeat(AGENT_PREVIEW_CHARS));
+        row.validate().unwrap();
+        let read: AgentSummary =
+            serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
+        assert_eq!(read, row);
+        row.preview = Some("x".repeat(AGENT_PREVIEW_CHARS + 1));
+        assert!(row.validate().is_err());
+        row.preview = Some(
+            " 
+ "
+            .to_owned(),
+        );
+        assert!(row.validate().is_err());
+        row.preview = None;
+        row.name = Some(String::new());
+        assert!(row.validate().is_err());
     }
 
     #[test]
@@ -2246,6 +2407,52 @@ mod tests {
         scoped.usage = Some(session);
         scoped.usage_scope = Some("session".to_owned());
         assert_eq!(scoped.fleet_usage(), Some((47_231, "session")));
+    }
+
+    #[test]
+    fn observed_display_and_bucket_follow_activity_not_lifecycle_state() {
+        use crate::NativeChildActivity;
+        use crate::NativeChildActivityState as Activity;
+        let observed = |state: Activity| {
+            let mut row = summary();
+            row.state = AgentState::Unknown;
+            row.activity = Some(NativeChildActivity {
+                state,
+                has_open_turn: matches!(state, Activity::Running | Activity::Lost),
+                last_progress_at: None,
+            });
+            row
+        };
+        assert_eq!(observed(Activity::Idle).display_state(), "idle (observed)");
+        assert_eq!(
+            observed(Activity::Running).display_state(),
+            "running (observed)"
+        );
+        assert_eq!(
+            observed(Activity::Interrupted).display_state(),
+            "interrupted (observed)"
+        );
+        assert_eq!(
+            observed(Activity::Unknown).display_state(),
+            "unknown (observed)"
+        );
+        assert_eq!(observed(Activity::Lost).display_state(), "lost (observed)");
+        assert_eq!(summary().display_state(), "idle");
+        assert_eq!(observed(Activity::Idle).fleet_bucket(), "idle");
+        assert_eq!(observed(Activity::Running).fleet_bucket(), "running");
+        assert_eq!(
+            observed(Activity::Interrupted).fleet_bucket(),
+            "interrupted"
+        );
+        assert_eq!(observed(Activity::Unknown).fleet_bucket(), "unknown");
+        assert_eq!(observed(Activity::Lost).fleet_bucket(), "unknown");
+        assert_eq!(summary().fleet_bucket(), "idle");
+        let mut unknown = summary();
+        unknown.state = AgentState::Unknown;
+        assert_eq!(unknown.fleet_bucket(), "unknown");
+        let wire = serde_json::to_value(observed(Activity::Idle)).unwrap();
+        assert_eq!(wire["state"], "unknown");
+        assert_eq!(wire["activity"]["state"], "idle");
     }
 
     #[test]
@@ -2457,6 +2664,8 @@ mod tests {
             generation: 4,
             observation: observation(),
             session_usage: None,
+            heavy: None,
+            session_growth: None,
         };
         let wire = serde_json::to_value(&reply).unwrap();
         assert_eq!(wire["available"], false);
@@ -2724,6 +2933,8 @@ mod tests {
             source_states: vec![source],
             session_usage: None,
             config: None,
+            heavy: None,
+            session_growth: None,
         };
         AgentGetRequest::new("a1")
             .validate_response(&reply)

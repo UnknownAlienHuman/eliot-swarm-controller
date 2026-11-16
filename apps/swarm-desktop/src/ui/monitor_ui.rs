@@ -58,6 +58,8 @@ impl DesktopApp {
                                 project: String::new(),
                                 parent: row.parent.clone(),
                                 updated_at: 0,
+                                title: row.title.clone(),
+                                native_child: row.activity.is_some(),
                             })
                     });
                 if let Some(agent) = agent {
@@ -362,6 +364,15 @@ impl DesktopApp {
             None => vec!["Reading…".to_owned()],
         };
         sections.push(KeyedView::new("usage", section(palette, "Usage", &usage)));
+
+        let observe = match read {
+            Some(read) => monitor_view::observe_lines(read),
+            None => vec!["Reading.".to_owned()],
+        };
+        sections.push(KeyedView::new(
+            "observe",
+            section(palette, "Observe", &observe),
+        ));
 
         // Change manager: one row per possible manager, each button bound
         // to that row's generation and the shown source generation.

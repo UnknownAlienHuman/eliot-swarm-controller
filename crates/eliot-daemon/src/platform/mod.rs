@@ -16,6 +16,7 @@ pub(crate) mod windows;
 pub use custody::{CustodyGuarantee, OwnedChild, RestartCustody, restart_custody};
 pub use data_dir::DataDir;
 pub use ipc::{IpcListener, IpcStream};
+pub(crate) use process_observation::CommandClass;
 pub use process_observation::CustodyObserver;
 
 /// Whether the owner process recorded beside a private daemon lock is still

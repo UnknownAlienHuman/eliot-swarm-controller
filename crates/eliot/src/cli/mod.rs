@@ -54,6 +54,8 @@ pub(crate) async fn dispatch(
         CliCommand::Processes(args) => reads::run_processes(args, data_dir, json_output).await,
         CliCommand::Stats(args) => reads::run_stats(args, data_dir, json_output).await,
         CliCommand::Usage(args) => reads::run_usage(args, data_dir, json_output).await,
+        CliCommand::Doctor => reads::run_doctor(data_dir, json_output).await,
+        CliCommand::Heavy(args) => reads::run_heavy(args, data_dir, json_output).await,
         CliCommand::GitStatus(args) => reads::run_git_status(args, data_dir, json_output).await,
         CliCommand::Edits(args) => reads::run_edits(args, data_dir, json_output).await,
         CliCommand::Watch(args) => reads::run_watch(args, data_dir, json_output).await,

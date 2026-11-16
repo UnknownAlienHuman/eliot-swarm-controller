@@ -45,6 +45,29 @@ use tokio::{
 };
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const STEER_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A failed read is safe to refuse before input dispatch. It is never a
+/// terminal verdict, and never permission to change or replay the input.
+fn validate_steer_readback(readback: Result<Value>, session_id: &str, turn_id: &str) -> Result<()> {
+    let refusal = || {
+        Error::new(
+            "native_rejected",
+            "Muse steer refused before dispatch: session/read did not prove a readable native log and the exact running turn; no turn/steer was sent",
+        )
+    };
+    let value = readback.map_err(|_| refusal())?;
+    let read: NativeSessionReadResult = serde_json::from_value(value).map_err(|_| refusal())?;
+    if read.session.session_id != session_id
+        || read.session.status != "running"
+        || read.session.active_turn_id.as_deref() != Some(turn_id)
+        || read.view_cursor.trim().is_empty()
+        || read.history.unavailable_reason().is_some()
+    {
+        return Err(refusal());
+    }
+    Ok(())
+}
 
 /// Native `initialize` client identifier. The installed host requires a
 /// machine identifier (`^[a-z0-9_]+$`); the launch path and the read-only
@@ -1299,7 +1322,57 @@ impl MusePlugin {
             return Ok(result);
         }
         if session.phase != SessionPhase::Ready || session.events.status().source_unknown {
-            let result = rejected_control("Muse steer does not match a healthy active turn");
+            let result = rejected_control(
+                "Muse steer refused before dispatch: native source is unavailable; no turn/steer was sent",
+            );
+            settle_control(
+                session,
+                &params.command_id,
+                ControlOutcome::Rejected(result.clone()),
+            );
+            return Ok(result);
+        }
+        let Some(native_session) = session.session_id.clone() else {
+            let result = rejected_control(
+                "Muse steer refused before dispatch: session identity is unresolved",
+            );
+            settle_control(
+                session,
+                &params.command_id,
+                ControlOutcome::Rejected(result.clone()),
+            );
+            return Ok(result);
+        };
+        // A healthy local turn binding cannot prove that Muse can still read
+        // its origin log. Long-log origin failures can be admitted by steer
+        // and then fail the native turn. Probe the read-only lane first; a
+        // failed probe has no input effect and must never be sent as a steer.
+        let readback = session
+            .native_client
+            .call(
+                "session/read",
+                serde_json::to_value(NativeSessionReadParams {
+                    session_id: native_session.clone(),
+                    exclude_items: Some(true),
+                })
+                .map_err(|_| {
+                    Error::new("internal", "Muse steer read params could not be encoded")
+                })?,
+                Instant::now() + STEER_READ_DEADLINE,
+            )
+            .await;
+        if let Ok(value) = &readback
+            && let Ok(read) = serde_json::from_value::<NativeSessionReadResult>(value.clone())
+            && read.session.session_id == native_session
+            && let Some(reason) = read.history.unavailable_reason()
+        {
+            let _ = session
+                .events
+                .view_readback(native_session.clone(), Some(reason))
+                .await;
+        }
+        if let Err(error) = validate_steer_readback(readback, &native_session, turn_id) {
+            let result = rejected_control(&error.message);
             settle_control(
                 session,
                 &params.command_id,
@@ -1325,11 +1398,17 @@ impl MusePlugin {
                 "Muse turn/steer does not match the exact active turn",
             ));
         }
-        let Some(native_session) = session.session_id.clone() else {
-            let result = unknown_control("Muse session identity is unresolved");
-            settle_control(session, &params.command_id, ControlOutcome::Unknown);
+        if session.events.status().source_unknown {
+            let result = rejected_control(
+                "Muse steer refused before dispatch: native source became unavailable during readback",
+            );
+            settle_control(
+                session,
+                &params.command_id,
+                ControlOutcome::Rejected(result.clone()),
+            );
             return Ok(result);
-        };
+        }
         // `expectedTurnId` always carries the exact active turn: input meant
         // for turn A can never leak into turn B, and the ack must confirm the
         // same turn absorbed it.
@@ -2949,6 +3028,56 @@ fn muse_serve_args(permissions: &str) -> Vec<OsString> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn steer_readback_requires_the_exact_turn_and_readable_log() {
+        let readable = serde_json::json!({
+            "session": {"sessionId": "session-1", "status": "running", "activeTurnId": "turn-1"},
+            "history": {"mode": "none", "noneReason": "excluded"},
+            "viewCursor": "cursor-1",
+        });
+        assert!(
+            super::validate_steer_readback(Ok(readable.clone()), "session-1", "turn-1").is_ok()
+        );
+        for (path, value) in [
+            ("turn", serde_json::json!("another-turn")),
+            ("session", serde_json::json!("another-session")),
+            ("state", serde_json::json!("idle")),
+            ("history", serde_json::json!("projectionUnavailable")),
+            ("history", serde_json::json!("projectionReadLimit")),
+            ("history", serde_json::json!("futureReason")),
+            ("cursor", serde_json::json!("")),
+        ] {
+            let mut read = readable.clone();
+            match path {
+                "turn" => read["session"]["activeTurnId"] = value,
+                "session" => read["session"]["sessionId"] = value,
+                "state" => read["session"]["status"] = value,
+                "history" => read["history"]["noneReason"] = value,
+                "cursor" => read["viewCursor"] = value,
+                _ => unreachable!(),
+            }
+            let error =
+                super::validate_steer_readback(Ok(read), "session-1", "turn-1").unwrap_err();
+            assert_eq!(error.code, "native_rejected");
+        }
+    }
+
+    #[test]
+    fn steer_origin_read_failure_is_refused_before_dispatch() {
+        for failure in [
+            eliot_core::Error::new(
+                "unknown",
+                "Origin read requires valid checkpoint-suffix or origin-preserved full-replay authority",
+            ),
+            eliot_core::Error::new("timeout", "read timed out"),
+        ] {
+            let error =
+                super::validate_steer_readback(Err(failure), "session-1", "turn-1").unwrap_err();
+            assert_eq!(error.code, "native_rejected");
+            assert!(error.message.contains("no turn/steer was sent"));
+            assert!(!error.message.contains("Origin read requires"));
+        }
+    }
     use super::{
         MusePlugin, NATIVE_CLIENT_INFO_NAME, muse_manifest, muse_scope, muse_serve_args,
         native_initialize_params, new_command_id, select_launch_model, validate_resume_preflight,

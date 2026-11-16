@@ -83,6 +83,11 @@ parameter. Read complete error bodies; only authoritative
 rejection proves no effect. Timeout/ambiguous server response after a write is unknown.
 Catalogue preflight may retry only before any session/input may have been admitted.
 
+The native `x-opencode-directory` header is URI component encoded, including literal
+percent signs, using the same encoder as query values. Installed OpenCode 2.2.7
+decodes it once; raw UTF-8 headers turn non-ASCII directory names into mojibake and
+fail readiness with location-not-found (observed in the Linux Docker image).
+
 ## Native mapping
 
 | Eliot operation | Mechanism / settlement |
@@ -361,4 +366,13 @@ owns an isolated per-Agent config root (`XDG_CONFIG_HOME` /
 `plugins/opencode/src/native/server.rs` (`native_subagents_permission`,
 `agent_config_json`, `ServerLaunch::native_subagents`) and
 `plugins/opencode/src/host.rs` (`ParsedStart::native_subagents`).
+
+## Access levels (`--access ask|auto`)
+
+Ad-hoc `ask` and `auto` share the native permission-reply surface: permission
+requests stay pending for the Owner (`swarm approve`/`deny`). `full` has no
+verified full-access mapping and refuses with `unsupported` instead of silently
+widening. The level freezes as `access` in the snapshot. Implementation:
+[`crates/eliot-daemon/src/adhoc.rs`](../../crates/eliot-daemon/src/adhoc.rs)
+(`apply_adhoc_access`).
 
