@@ -182,13 +182,17 @@ enum Message {
 }
 
 struct DesktopApp {
+    /// The checkout the window was opened for (`--workspace` or the working
+    /// directory); it is registered through `project.discover` at start.
+    opened_workspace: PathBuf,
     data_dir: Fallible<PathBuf>,
     /// The latest status, shown in the details panel.
     status: String,
     /// A notice for the owner above the composer, until dismissed.
     alert: Option<String>,
     appearance: shell_ui::Appearance,
-    /// Desktop preferences (theme, startup, Auto's profile, last Agent).
+    /// Desktop preferences (theme, startup, Auto's profile, last Agent);
+    /// the theme and window size live in the daemon's `[desktop]` settings.
     prefs: crate::settings::Settings,
     /// A preferences write is running (see `save_preferences`).
     prefs_saving: bool,
@@ -196,6 +200,14 @@ struct DesktopApp {
     startup_done: bool,
     /// The window's client width in DIPs, once observed.
     window_width: Option<f64>,
+    /// The client size to save in `[desktop]`, once at least 640 x 480.
+    window_size: Option<(u32, u32)>,
+    /// The saved window size, applied to the window's first size.
+    preferred_window: Option<(u32, u32)>,
+    /// Tags one debounced window-size save; an older one is dropped.
+    window_epoch: u64,
+    /// `[desktop]` was read: size changes may be written back.
+    preferences_loaded: bool,
     /// False for the one render after the screen tree is re-created: the
     /// multi-line editors are then created empty (see `reprime_fields`).
     fields_primed: bool,
@@ -213,6 +225,11 @@ struct DesktopApp {
     settings_section: SettingsSection,
     configure: configure_ui::ConfigureState,
     editor: profiles_ui::ProfilesEditor,
+    /// The Advanced section's editor over every settings section.
+    unified: settings_ui::SettingsEditor,
+    /// The daemon could not start in the data directory (the fresh
+    /// private directory remedy is offered).
+    startup_error: bool,
     scripts: scripts_ui::ScriptsEditor,
     handoff: handoff_ui::DialogState,
     nav: shell_ui::ShellState,
@@ -406,20 +423,25 @@ fn submit_note(reply: &CommandSubmitResponse) -> String {
 }
 
 impl Component for DesktopApp {
-    type Input = ();
+    type Input = PathBuf;
     type Message = Message;
 
-    fn create(_input: &(), context: &ComponentContext<Self>) -> Self {
+    fn create(input: &PathBuf, context: &ComponentContext<Self>) -> Self {
         let data_dir = client::data_dir().map_err(|error| error.to_string());
         let mut app = Self {
+            opened_workspace: input.clone(),
             data_dir,
             status: "Connecting to the daemon…".to_owned(),
             alert: None,
             appearance: shell_ui::Appearance::new(),
-            prefs: config_client::load_preferences(),
+            prefs: crate::settings::Settings::default(),
             prefs_saving: false,
             startup_done: false,
             window_width: None,
+            window_size: None,
+            preferred_window: None,
+            window_epoch: 0,
+            preferences_loaded: false,
             fields_primed: true,
             prime_epoch: 0,
             renders: std::cell::Cell::new(0),
@@ -431,6 +453,8 @@ impl Component for DesktopApp {
             settings_section: SettingsSection::General,
             configure: configure_ui::ConfigureState::default(),
             editor: profiles_ui::ProfilesEditor::default(),
+            unified: settings_ui::SettingsEditor::default(),
+            startup_error: false,
             scripts: scripts_ui::ScriptsEditor::default(),
             handoff: handoff_ui::DialogState::default(),
             nav: shell_ui::ShellState {
@@ -448,7 +472,10 @@ impl Component for DesktopApp {
                 titles: HashMap::new(),
                 titles_inflight: false,
             },
-            launch: launch_ui::LaunchState::default(),
+            launch: launch_ui::LaunchState {
+                workspace: input.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
             chat: chat_ui::ChatState {
                 convo: None,
                 detail: None,
@@ -490,13 +517,8 @@ impl Component for DesktopApp {
             app.status = format!("WinUI M3 resources not applied: {error}");
         }
         if let Ok(data_dir) = app.data_dir.clone() {
-            let _task = context.spawn_background(move |_| {
-                Message::Shell(ShellMsg::ProjectsLoaded(load_projects_blocking(&data_dir)))
-            });
-            app.load_agents(context, None);
             app.watch_high_contrast(context);
-            app.watch_list(context);
-            app.load_profile_list(context);
+            app.start_connection(data_dir, context);
         }
         app
     }
@@ -509,14 +531,14 @@ impl Component for DesktopApp {
             Message::Configure(msg) => self.configure_update(msg, context),
             Message::Monitor(msg) => self.monitor_update(msg, context),
             Message::Profiles(msg) => self.profiles_update(msg, context),
+            Message::Settings(msg) => self.settings_update(msg, context),
             Message::Automation(msg) => self.automation_update(msg, context),
             Message::Scripts(msg) => self.scripts_update(msg, context),
             Message::Handoff(msg) => self.handoff_update(msg, context),
-            Message::Settings(msg) => self.settings_update(msg, context),
         }
     }
 
-    fn view(&self, _input: &(), context: &mut ViewContext<Self>) -> View {
+    fn view(&self, _input: &PathBuf, context: &mut ViewContext<Self>) -> View {
         self.renders.set(self.renders.get() + 1);
         self.shell_view(context)
     }
@@ -524,6 +546,6 @@ impl Component for DesktopApp {
 
 /// Run the single desktop window. Blocks while the WinUI message loop runs;
 /// closing the window disconnects the UI, never the Agent.
-pub fn run() -> Result<(), String> {
-    App::run_component::<DesktopApp>(()).map_err(|error| error.to_string())
+pub fn run(workspace: PathBuf) -> Result<(), String> {
+    App::run_component::<DesktopApp>(workspace).map_err(|error| error.to_string())
 }

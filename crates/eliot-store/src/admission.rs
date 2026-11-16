@@ -57,6 +57,20 @@ pub(super) fn command_payload_digest(request: &SubmitCommand) -> Result<Vec<u8>>
             .ok_or_else(|| Error::new("invalid", "attach args must be an object"))?
             .remove("profile_snapshot");
     }
+    if request.verb == "launch"
+        && semantic_args
+            .get("profile_choice")
+            .and_then(Value::as_object)
+            .and_then(|choice| choice.get("source"))
+            .and_then(Value::as_str)
+            .is_some_and(|source| source.starts_with("settings.routing."))
+    {
+        let args = semantic_args
+            .as_object_mut()
+            .ok_or_else(|| Error::new("invalid", "launch args must be an object"))?;
+        args.remove("profile_choice");
+        args.remove("profile");
+    }
     let semantic_payload = command_semantic_payload(request, semantic_args)?;
     canonical::digest(&semantic_payload)
 }
@@ -895,6 +909,21 @@ fn admit_launch_tx(
         ],
     ));
     let agent_num = tx.last_insert_rowid();
+    if let Some(choice) = request.args.get("profile_choice") {
+        let choice: core::RoutingDecision = serde_json::from_value(choice.clone())
+            .map_err(|_| Error::new("invalid", "invalid routing decision"))?;
+        if choice.profile.as_deref() != Some(profile.as_str()) {
+            return Err(Error::new(
+                "invalid",
+                "routing decision differs from launch profile",
+            ));
+        }
+        db!(tx.execute(
+            "UPDATE agents SET profile_choice=?1 WHERE id=?2",
+            params![encode_json(&choice)?, agent_num]
+        ));
+    }
+    assignment::commit_cursor_tx(tx, principal, request, now)?;
     let root_num = parent_link
         .as_ref()
         .map_or(agent_num, |parent| parent.root_num);
@@ -921,6 +950,10 @@ fn admit_launch_tx(
                 json!({"agent_id": agent_id, "project": project, "harness": harness, "profile": profile}),
             ),
         )?);
+    let mut accepted_data = json!({"command_id": request.id, "verb": "launch"});
+    if let Some(choice) = request.args.get("profile_choice") {
+        accepted_data["profile_choice"] = choice.clone();
+    }
     events.push(insert_daemon_event_input(
         tx,
         DaemonEventInput::new(
@@ -929,7 +962,7 @@ fn admit_launch_tx(
             "command",
             Some(agent_num),
             Some(0),
-            json!({"command_id": request.id, "verb": "launch"}),
+            accepted_data,
         )
         .with_cause(cause),
     )?);

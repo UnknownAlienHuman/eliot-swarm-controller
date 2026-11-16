@@ -146,6 +146,7 @@ pub(crate) async fn run_attach(
 pub(crate) async fn run_launch(
     LaunchArgs {
         profile,
+        role,
         harness,
         model,
         effort,
@@ -168,6 +169,20 @@ pub(crate) async fn run_launch(
     {
         return Err(Failure::new(2, "--profile must not be empty"));
     }
+    if let Some(name) = &role
+        && (name.trim().is_empty()
+            || name.len() > 128
+            || !name.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            }))
+    {
+        return Err(Failure::new(
+            2,
+            "--role must be a nonempty role name using letters, digits, '-' or '_'",
+        ));
+    }
+    let workspace = std::path::absolute(&workspace)
+        .map_err(|error| Failure::new(2, format!("cannot resolve launch workspace: {error}")))?;
     if let Some(name) = &harness
         && name.trim().is_empty()
     {
@@ -200,12 +215,6 @@ pub(crate) async fn run_launch(
     {
         return Err(Failure::new(2, "--cmd must not be empty"));
     }
-    if profile.is_none() && harness.is_none() && parent.is_none() {
-        return Err(Failure::new(
-            2,
-            "--profile or --harness is required for a parentless launch",
-        ));
-    }
     validate_text(prompt.as_deref())?;
     let deadline = wait_deadline(timeout_seconds)?;
     let mut args = json!({
@@ -213,6 +222,9 @@ pub(crate) async fn run_launch(
     });
     if let Some(profile) = profile {
         args["profile"] = Value::String(profile);
+    }
+    if let Some(role) = role {
+        args["role"] = Value::String(role);
     }
     if let Some(harness) = harness {
         args["harness"] = Value::String(harness);

@@ -5,6 +5,48 @@ use crate::{Agent, Error, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+/// The routing choice frozen at launch admission. `profile` is absent when
+/// policy had no available candidate; `quota_status` keeps unsupported or
+/// unavailable readback visible even when the selected candidate is usable.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingDecision {
+    pub role: String,
+    pub profile: Option<String>,
+    pub source: String,
+    pub reason: String,
+    pub skipped: Vec<RouteSkip>,
+    pub quota_status: RouteQuotaStatus,
+}
+
+/// Why an ordered routing candidate was not selected.
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteSkipReason {
+    NotInstalled,
+    ProviderHold,
+    QuotaExhausted,
+    CapacityFull,
+    Unauthorized,
+    InvalidProfile,
+}
+
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteQuotaStatus {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteSkip {
+    pub profile: String,
+    pub reason: RouteSkipReason,
+    pub quota_status: RouteQuotaStatus,
+}
+
 const MAX_NAME_BYTES: usize = 128;
 const MAX_ENV_NAME_BYTES: usize = 256;
 

@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 const OWNER_TOKEN_FILE: &str = "owner.token";
 const DAEMON_LOCK_FILE: &str = "daemon.lock";
 const DAEMON_INFO_FILE: &str = "daemon.json";
+const MAX_SELECTED_ROOT_BYTES: usize = 32 * 1024;
 
 /// The small local endpoint record consumed by the CLI during daemon discovery.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,8 +21,9 @@ pub struct DaemonInfo {
 
 /// Private local state shared by the daemon and its clients.
 ///
-/// Opening the directory validates and tightens its permissions. The daemon lock is
-/// acquired separately so clients can read the owner token while the daemon is live.
+/// Opening an existing directory validates its permissions without changing them;
+/// a new directory is created privately. The daemon lock is acquired separately so
+/// clients can read the owner token while the daemon is live.
 pub struct DataDir {
     path: PathBuf,
     owner_token: Option<String>,
@@ -37,7 +39,13 @@ impl DataDir {
     /// Open or initialize a private data root and its persistent owner token.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = absolute_path(path.as_ref())?;
-        ensure_private_root(&path)?;
+        ensure_private_root(&path).map_err(|error| {
+            if error.code == "unsafe_data_dir" {
+                unsafe_data_dir_error(&path)
+            } else {
+                error
+            }
+        })?;
         let owner_token = load_or_create_owner_token(&path)?;
         Ok(Self {
             path,
@@ -56,7 +64,13 @@ impl DataDir {
             Err(error) => return Err(io_error("inspect existing data directory", error)),
             Ok(_) => {}
         }
-        validate_private_root(&path)?;
+        validate_private_root(&path).map_err(|error| {
+            if error.code == "unsafe_data_dir" {
+                unsafe_data_dir_error(&path)
+            } else {
+                error
+            }
+        })?;
         Ok(Self {
             path,
             owner_token: None,
@@ -211,6 +225,195 @@ impl DataDir {
         validate_private_root(&directory)?;
         Ok(directory)
     }
+}
+
+fn unsafe_data_dir_error(path: &Path) -> Error {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Eliot");
+    let fresh_path = parent.join(format!("{name}-{}", ulid::Ulid::new()));
+    // PowerShell single-quoted literals double embedded apostrophes.
+    let command_path = fresh_path.to_string_lossy().replace('\'', "''");
+    Error::new(
+        "unsafe_data_dir",
+        format!(
+            "the selected data directory is unsafe and was not changed; create a fresh private directory with `swarm --data-dir '{command_path}' daemon` (the desktop offers the same remedy)"
+        ),
+    )
+}
+
+/// Persist a user-selected private data root so CLI and desktop launches share it.
+/// The pointer lives outside the data root, allowing it to redirect away from an
+/// unsafe default without changing that directory.
+pub fn persist_selected_root(path: &Path) -> Result<()> {
+    persist_selected_root_at(path, &selected_root_pointer_dir()?)
+}
+
+fn persist_selected_root_at(path: &Path, pointer_dir: &Path) -> Result<()> {
+    let selected = DataDir::open_existing(path)?;
+    ensure_private_root(pointer_dir)?;
+    validate_private_root(pointer_dir)?;
+    let root = selected.path().to_str().ok_or_else(|| {
+        Error::new(
+            "invalid_data_dir_selection",
+            "selected data directory path is not valid UTF-8",
+        )
+    })?;
+    replace_file_atomically(pointer_dir, "selected-data-dir", root.as_bytes(), true)
+}
+
+/// Resolve the durable root selection, if the user has made one.
+pub fn resolve_selected_root() -> Result<Option<PathBuf>> {
+    resolve_selected_root_at(&selected_root_pointer_dir()?)
+}
+
+fn resolve_selected_root_at(pointer_dir: &Path) -> Result<Option<PathBuf>> {
+    match fs::symlink_metadata(pointer_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error("inspect selected-root directory", error)),
+        Ok(_) => validate_private_root(pointer_dir)?,
+    }
+    let pointer = pointer_dir.join("selected-data-dir");
+    match fs::symlink_metadata(&pointer) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_error("inspect selected-root pointer", error)),
+        Ok(_) => {
+            validate_private_file(&pointer)?;
+            let bytes = read_private_bytes(&pointer, MAX_SELECTED_ROOT_BYTES).map_err(|_| {
+                Error::new(
+                    "invalid_data_dir_selection",
+                    "selected-root pointer is unsafe or exceeds its size limit",
+                )
+            })?;
+            let text = std::str::from_utf8(&bytes).map_err(|_| {
+                Error::new(
+                    "invalid_data_dir_selection",
+                    "selected-root pointer is not UTF-8",
+                )
+            })?;
+            let path = PathBuf::from(text);
+            if !path.is_absolute() || text.contains(['\n', '\r', '\0']) {
+                return Err(Error::new(
+                    "invalid_data_dir_selection",
+                    "selected-root pointer is not an absolute path",
+                ));
+            }
+            DataDir::open_existing(&path)?;
+            Ok(Some(path))
+        }
+    }
+}
+
+/// Resolve the data root shared by CLI and desktop startup. Explicit arguments
+/// and `ELIOT_HOME` take precedence over the durable user selection and default.
+pub fn resolve_data_dir(explicit: Option<&Path>) -> Result<PathBuf> {
+    let env_home = std::env::var_os("ELIOT_HOME").filter(|value| !value.is_empty());
+    resolve_data_dir_with(
+        explicit,
+        env_home.as_deref(),
+        resolve_selected_root,
+        default_data_dir,
+    )
+}
+
+fn resolve_data_dir_with(
+    explicit: Option<&Path>,
+    env_home: Option<&std::ffi::OsStr>,
+    selected: impl FnOnce() -> Result<Option<PathBuf>>,
+    default: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return absolute_path(path);
+    }
+    if let Some(path) = env_home {
+        return absolute_path(Path::new(path));
+    }
+    if let Some(path) = selected()? {
+        return absolute_path(&path);
+    }
+    default()
+}
+
+fn default_data_dir() -> Result<PathBuf> {
+    #[cfg(windows)]
+    let path = std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|path| path.join("Eliot"));
+    #[cfg(unix)]
+    let path = {
+        let xdg = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty());
+        match xdg.map(PathBuf::from) {
+            Some(path) if path.is_absolute() => Some(path.join("eliot")),
+            Some(_) => {
+                return Err(Error::new(
+                    "data_dir_unavailable",
+                    "XDG_DATA_HOME must be absolute",
+                ));
+            }
+            None => std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .map(|path| path.join(".local").join("share").join("eliot")),
+        }
+    };
+    #[cfg(not(any(windows, unix)))]
+    let path: Option<PathBuf> = None;
+    path.map(|path| absolute_path(&path))
+        .transpose()?
+        .ok_or_else(|| {
+            unavailable("cannot determine the data directory; set --data-dir or ELIOT_HOME")
+        })
+}
+
+fn selected_root_pointer_dir() -> Result<PathBuf> {
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::new("data_dir_unavailable", "LOCALAPPDATA is not set"))?;
+    #[cfg(unix)]
+    let base = {
+        let configured = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty());
+        let home = std::env::var_os("HOME").filter(|value| !value.is_empty());
+        match configured.map(PathBuf::from) {
+            Some(path) if path.is_absolute() => path,
+            Some(_) => {
+                return Err(Error::new(
+                    "data_dir_unavailable",
+                    "XDG_CONFIG_HOME must be absolute",
+                ));
+            }
+            None => PathBuf::from(
+                home.ok_or_else(|| Error::new("data_dir_unavailable", "HOME is not set"))?,
+            )
+            .join(".config"),
+        }
+    };
+    #[cfg(not(any(windows, unix)))]
+    let base = return Err(Error::new(
+        "platform_unsupported",
+        "selected data roots are unsupported on this platform",
+    ));
+    #[cfg(windows)]
+    let dirname = "Eliot-bootstrap";
+    #[cfg(unix)]
+    let dirname = "eliot-bootstrap";
+    Ok(base.join(dirname))
+}
+
+/// Create or validate a private data directory before an explicit first use.
+///
+/// This is the safe remedy for an unsafe default root: callers must pass the
+/// user's chosen fresh path. It does not repair, inspect, or copy an unsafe
+/// existing root.
+pub(crate) fn ensure_private_data_dir(path: impl AsRef<Path>) -> Result<PathBuf> {
+    let data_dir = DataDir::open(path)?;
+    Ok(data_dir.path().to_path_buf())
 }
 
 /// Creation uses the same TokenUser/protected-DACL path as owner.token on Windows.
@@ -677,6 +880,84 @@ fn unavailable(message: &str) -> Error {
     Error::new("data_dir_unavailable", message)
 }
 
+#[cfg(test)]
+mod selected_root_tests {
+    use super::*;
+
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new(label: &str) -> Self {
+            let base = fs::canonicalize(std::env::temp_dir()).expect("canonical temp directory");
+            Self(base.join(format!("eliot-{label}-{}", ulid::Ulid::new())))
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn selected_root_pointer_round_trips_without_global_config() {
+        let selected = TempRoot::new("selected-root");
+        let pointer = TempRoot::new("root-pointer");
+        DataDir::open(&selected.0).expect("create private selected root");
+
+        persist_selected_root_at(&selected.0, &pointer.0).expect("persist selected root");
+        assert_eq!(
+            resolve_selected_root_at(&pointer.0).expect("resolve pointer"),
+            Some(selected.0.clone())
+        );
+    }
+
+    #[test]
+    fn data_root_precedence_is_explicit_then_env_then_selection_then_default() {
+        let base = std::env::current_dir().expect("current directory");
+        let explicit = base.join("explicit-root");
+        let env = base.join("env-root");
+        let selected = base.join("selected-root");
+        let default = base.join("default-root");
+        let env_text = env.to_str().expect("UTF-8 fixture path");
+        assert_eq!(
+            resolve_data_dir_with(
+                Some(&explicit),
+                Some(std::ffi::OsStr::new(env_text)),
+                || Err(unavailable("must not inspect selected pointer")),
+                || Err(unavailable("must not resolve default"))
+            )
+            .expect("explicit"),
+            explicit
+        );
+        assert_eq!(
+            resolve_data_dir_with(
+                None,
+                Some(std::ffi::OsStr::new(env_text)),
+                || Err(unavailable("must not inspect selected pointer")),
+                || Err(unavailable("must not resolve default"))
+            )
+            .expect("env"),
+            env
+        );
+        assert_eq!(
+            resolve_data_dir_with(
+                None,
+                None,
+                || Ok(Some(selected.clone())),
+                || Err(unavailable("must not resolve default"))
+            )
+            .expect("selected"),
+            selected
+        );
+        assert_eq!(
+            resolve_data_dir_with(None, None, || Ok(None), || Ok(default.clone()))
+                .expect("default"),
+            default
+        );
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -779,6 +1060,27 @@ mod tests {
         assert_eq!(
             validate_private_file(&metadata_path)
                 .expect_err("read must leave the unsafe DACL in place")
+                .code,
+            "unsafe_data_dir"
+        );
+    }
+
+    #[test]
+    fn existing_unsafe_root_acl_is_rejected_without_repair() {
+        let root = TestRoot::new();
+        let data = DataDir::open(&root.path).expect("initialize private data directory");
+        super::super::windows::set_test_untrusted_file_acl(data.path())
+            .expect("install deterministic Everyone DACL");
+
+        assert_eq!(
+            ensure_private_root(data.path())
+                .expect_err("unsafe root ACL must be rejected")
+                .code,
+            "unsafe_data_dir"
+        );
+        assert_eq!(
+            validate_private_root(data.path())
+                .expect_err("root validation must leave unsafe DACL in place")
                 .code,
             "unsafe_data_dir"
         );

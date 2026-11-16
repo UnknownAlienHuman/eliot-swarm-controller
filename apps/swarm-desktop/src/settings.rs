@@ -1,19 +1,17 @@
-//! Per-user desktop preferences, persisted as small JSON (`swarm-desktop.json`).
-//!
-//! The theme, what opens at start, the profile Auto launches until daemon
-//! routing lands, and the last conversation. The unified `settings.*` API
-//! (k55) moves these into the daemon's settings store; the settings UI
-//! reaches them only through [`crate::config_client`]. Loading never fails: a missing,
-//! unreadable or invalid file yields the defaults. Unknown fields are ignored
-//! and missing fields take their defaults, so older and newer files both load.
-
+//! Desktop preferences share the daemon settings source and revision guard.
 use std::fs;
-use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use eliot_core::api::{
+    SettingsClientSource, SettingsReadRequest, SettingsReadResponse, SettingsSaveRequest,
+    SettingsSaveResponse, SettingsSection,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-const FILE_NAME: &str = "swarm-desktop.json";
+const MAX_CONFIG_BYTES: usize = 128 * 1024;
+const MAX_LEGACY_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -23,7 +21,6 @@ pub enum ThemeChoice {
     Light,
     Dark,
 }
-
 impl ThemeChoice {
     pub fn label(self) -> &'static str {
         match self {
@@ -45,198 +42,321 @@ pub enum Startup {
     LastConversation,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+/// The desktop preferences the window works with. The theme is read from and
+/// written to the daemon's `[desktop]` section; the others are this window's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
     pub theme: ThemeChoice,
     pub startup: Startup,
     /// The profile "Auto" launches until daemon routing lands; unset means
     /// the first launchable profile the project allows.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub default_profile: Option<String>,
     /// The Agent of the last opened conversation.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_agent: Option<String>,
 }
 
-/// Settings file location: `%APPDATA%`-equivalent roaming folder from the Known
-/// Folder API on Windows, `$HOME/.config/eliot` elsewhere.
-#[cfg(windows)]
-#[allow(unsafe_code)]
-pub fn path() -> Option<PathBuf> {
-    use std::ffi::c_void;
-    use std::os::windows::ffi::OsStringExt;
-
-    use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{
-        FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
-    };
-
-    let mut raw: *mut u16 = std::ptr::null_mut();
-    // SAFETY: the GUID and out-pointer are valid for the call; on success the
-    // shell allocates `raw` with CoTaskMemAlloc, which is freed below.
-    let hresult = unsafe {
-        SHGetKnownFolderPath(
-            &FOLDERID_RoamingAppData,
-            KF_FLAG_DEFAULT as u32,
-            std::ptr::null_mut(),
-            &mut raw,
-        )
-    };
-    let root = if hresult >= 0 && !raw.is_null() {
-        // SAFETY: on success `raw` points to a NUL-terminated UTF-16 string.
-        let len = unsafe { (0..).take_while(|&i| *raw.add(i) != 0).count() };
-        // SAFETY: `len` code units starting at `raw` were just measured.
-        let wide = unsafe { std::slice::from_raw_parts(raw, len) };
-        Some(PathBuf::from(std::ffi::OsString::from_wide(wide)))
-    } else {
-        None
-    };
-    if !raw.is_null() {
-        // SAFETY: `raw` was allocated by SHGetKnownFolderPath with CoTaskMemAlloc.
-        unsafe { CoTaskMemFree(raw as *const c_void) };
+pub async fn read(data_dir: &Path) -> eliot_core::Result<SettingsReadResponse> {
+    let request = SettingsReadRequest::default();
+    request.validate()?;
+    let mut consistent = None;
+    for attempt in 0..2 {
+        let reply = eliot_daemon::client_call_typed(data_dir, "settings.read", &request).await?;
+        request.validate_response(&reply)?;
+        let source = read_config_source(data_dir)?;
+        if source.as_deref().map(source_revision) == reply.revision {
+            consistent = Some((reply, source));
+            break;
+        }
+        if attempt == 1 {
+            return Err(eliot_core::Error::new(
+                "conflict",
+                "settings changed while desktop preferences were read",
+            ));
+        }
     }
-    root.map(|root| root.join("Eliot").join(FILE_NAME))
+    let (reply, source) = consistent.expect("second read either matches or returns conflict");
+    if !needs_legacy_import(source.as_deref(), reply.revision.as_deref())? {
+        return Ok(reply);
+    }
+
+    let Some(legacy_path) = legacy_path() else {
+        return Ok(reply);
+    };
+    let Ok(bytes) = read_bounded(&legacy_path, MAX_LEGACY_BYTES) else {
+        return Ok(reply);
+    };
+    let Ok(legacy) = serde_json::from_slice::<LegacySettings>(&bytes) else {
+        return Ok(reply);
+    };
+    let migration = SettingsSaveRequest {
+        expected_revision: reply.revision.clone(),
+        sections: [(
+            SettingsSection::Desktop,
+            legacy_desktop_section(legacy.theme),
+        )]
+        .into(),
+        dry_run: false,
+        client: SettingsClientSource::Desktop,
+    };
+    match save(data_dir, &migration).await {
+        Ok(saved) => {
+            // The unified file is authoritative now. If deleting the legacy file
+            // fails, the next read sees [desktop] and will not import it again.
+            let _ = retire_legacy(&legacy_path, saved.saved);
+            let current =
+                eliot_daemon::client_call_typed(data_dir, "settings.read", &request).await?;
+            request.validate_response(&current)?;
+            Ok(current)
+        }
+        Err(error) if error.code == "conflict" => {
+            let current =
+                eliot_daemon::client_call_typed(data_dir, "settings.read", &request).await?;
+            request.validate_response(&current)?;
+            Ok(current)
+        }
+        Err(error) => Err(error),
+    }
 }
 
-#[cfg(not(windows))]
-pub fn path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(|home| {
-            PathBuf::from(home)
-                .join(".config")
-                .join("eliot")
-                .join(FILE_NAME)
-        })
+fn retire_legacy(path: &Path, published: bool) -> std::io::Result<()> {
+    if published {
+        fs::remove_file(path)
+    } else {
+        Ok(())
+    }
 }
 
-/// Reads settings from `path`. Any failure (missing, unreadable, invalid JSON)
-/// returns the defaults.
-pub fn load_from(path: &Path) -> Settings {
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+fn legacy_desktop_section(theme: ThemeChoice) -> serde_json::Value {
+    serde_json::json!({"theme": theme})
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct LegacySettings {
+    theme: ThemeChoice,
+}
+
+impl Default for LegacySettings {
+    fn default() -> Self {
+        Self {
+            theme: ThemeChoice::System,
+        }
+    }
+}
+
+fn read_config_source(data_dir: &Path) -> eliot_core::Result<Option<String>> {
+    match read_bounded(&data_dir.join("config.toml"), MAX_CONFIG_BYTES) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| eliot_core::Error::new("invalid", "unified settings are not valid UTF-8")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(eliot_core::Error::new(
+            "platform_io",
+            "cannot inspect unified desktop settings",
+        )),
+    }
+}
+
+fn read_bounded(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(limit + 1);
+    file.take((limit + 1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(std::io::Error::other("file exceeds its byte limit"));
+    }
+    Ok(bytes)
+}
+
+fn source_revision(source: &str) -> String {
+    let digest = Sha256::digest(source.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn needs_legacy_import(
+    source: Option<&str>,
+    observed_revision: Option<&str>,
+) -> eliot_core::Result<bool> {
+    if source.map(source_revision).as_deref() != observed_revision {
+        return Ok(false);
+    }
+    config_has_desktop_section(source.unwrap_or_default()).map(|has_desktop| !has_desktop)
+}
+
+fn config_has_desktop_section(source: &str) -> eliot_core::Result<bool> {
+    let value: toml::Value = toml::from_str(source)
+        .map_err(|_| eliot_core::Error::new("invalid", "unified settings are invalid"))?;
+    Ok(value.get("desktop").is_some())
+}
+
+#[allow(unsafe_code)]
+fn legacy_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        use std::os::windows::ffi::OsStringExt;
+        use windows_sys::Win32::System::Com::CoTaskMemFree;
+        use windows_sys::Win32::UI::Shell::{
+            FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+        };
+
+        let mut raw: *mut u16 = std::ptr::null_mut();
+        // SAFETY: the GUID and out-pointer are valid; the shell-owned result is freed below.
+        let result = unsafe {
+            SHGetKnownFolderPath(
+                &FOLDERID_RoamingAppData,
+                KF_FLAG_DEFAULT as u32,
+                std::ptr::null_mut(),
+                &mut raw,
+            )
+        };
+        let root = if result >= 0 && !raw.is_null() {
+            // SAFETY: success returns a NUL-terminated UTF-16 string.
+            let len = unsafe { (0..).take_while(|&index| *raw.add(index) != 0).count() };
+            // SAFETY: the measured prefix is initialized UTF-16 data.
+            let text = unsafe { std::slice::from_raw_parts(raw, len) };
+            Some(PathBuf::from(std::ffi::OsString::from_wide(text)))
+        } else {
+            None
+        };
+        if !raw.is_null() {
+            // SAFETY: SHGetKnownFolderPath allocates this pointer with CoTaskMemAlloc.
+            unsafe { CoTaskMemFree(raw.cast::<c_void>()) };
+        }
+        root.map(|root| root.join("Eliot").join("swarm-desktop.json"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(|home| {
+                PathBuf::from(home)
+                    .join(".config")
+                    .join("eliot")
+                    .join("swarm-desktop.json")
+            })
+    }
+}
+
+pub fn theme(reply: &SettingsReadResponse) -> ThemeChoice {
+    reply
+        .sections
+        .get(&SettingsSection::Desktop)
+        .and_then(|value| value.get("theme"))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
         .unwrap_or_default()
 }
 
-/// Reads the per-user settings file, or the defaults when there is no path or
-/// no usable file.
-pub fn load() -> Settings {
-    path().map(|path| load_from(&path)).unwrap_or_default()
+pub fn window(reply: &SettingsReadResponse) -> Option<(u32, u32)> {
+    let window = reply
+        .sections
+        .get(&SettingsSection::Desktop)?
+        .get("window")?;
+    Some((
+        u32::try_from(window.get("width")?.as_u64()?).ok()?,
+        u32::try_from(window.get("height")?.as_u64()?).ok()?,
+    ))
 }
 
-/// Writes settings to `path` atomically: pretty JSON goes to a sibling
-/// `<name>.tmp` file that is then renamed over the target.
-pub fn save_to(path: &Path, settings: &Settings) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+pub async fn save(
+    data_dir: &Path,
+    request: &SettingsSaveRequest,
+) -> eliot_core::Result<SettingsSaveResponse> {
+    request.validate()?;
+    let reply = eliot_daemon::client_call_typed(data_dir, "settings.save", request).await?;
+    request.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// Re-read the current desktop section so a theme change preserves window preferences.
+pub async fn save_preferences(
+    data_dir: &Path,
+    choice: ThemeChoice,
+    window: Option<(u32, u32)>,
+) -> eliot_core::Result<()> {
+    let read = read(data_dir).await?;
+    let mut desktop = read
+        .sections
+        .get(&SettingsSection::Desktop)
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    desktop["theme"] = serde_json::to_value(choice).expect("theme serialization");
+    if let Some((width, height)) = window {
+        desktop["window"] = serde_json::json!({"width":width,"height":height});
     }
-    let json = serde_json::to_vec_pretty(settings).map_err(io::Error::other)?;
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    fs::write(&tmp, json)?;
-    if let Err(error) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(error);
-    }
+    let request = SettingsSaveRequest {
+        expected_revision: read.revision,
+        sections: [(SettingsSection::Desktop, desktop)].into(),
+        dry_run: false,
+        client: SettingsClientSource::Desktop,
+    };
+    save(data_dir, &request).await?;
     Ok(())
-}
-
-/// Writes settings to the per-user settings file.
-pub fn save(settings: &Settings) -> Result<(), String> {
-    let path = path().ok_or_else(|| "no per-user settings folder is available".to_owned())?;
-    save_to(&path, settings).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Unique temp directory, removed when dropped (including on panic).
-    struct ScratchDir(PathBuf);
-
-    impl ScratchDir {
-        fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "swarm-desktop-settings-{}-{name}",
-                std::process::id()
-            ));
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).expect("create scratch dir");
-            Self(dir)
-        }
-
-        fn file(&self) -> PathBuf {
-            self.0.join("nested").join(FILE_NAME)
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+    #[test]
+    fn theme_choices_match_wire_values() {
+        for (choice, text) in [
+            (ThemeChoice::System, "system"),
+            (ThemeChoice::Light, "light"),
+            (ThemeChoice::Dark, "dark"),
+        ] {
+            assert_eq!(serde_json::to_value(choice).unwrap(), text);
         }
     }
 
     #[test]
-    fn settings_round_trip_each_choice() {
-        let scratch = ScratchDir::new("round-trip");
-        for theme in [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark] {
-            let settings = Settings {
-                theme,
-                startup: Startup::LastConversation,
-                default_profile: Some("codex-lite".to_owned()),
-                last_agent: Some("a1".to_owned()),
-            };
-            save_to(&scratch.file(), &settings).expect("save");
-            assert_eq!(load_from(&scratch.file()), settings);
+    fn legacy_preferences_preserve_supported_theme() {
+        for (text, expected) in [
+            (r#"{"theme":"light"}"#, ThemeChoice::Light),
+            (r#"{"theme":"dark"}"#, ThemeChoice::Dark),
+            (r#"{}"#, ThemeChoice::System),
+        ] {
+            let legacy: LegacySettings = serde_json::from_str(text).unwrap();
+            assert_eq!(legacy.theme, expected);
         }
-    }
-
-    #[test]
-    fn settings_missing_file_loads_default() {
-        let scratch = ScratchDir::new("missing");
-        assert_eq!(load_from(&scratch.file()), Settings::default());
-        assert_eq!(Settings::default().theme, ThemeChoice::System);
-    }
-
-    #[test]
-    fn settings_invalid_json_loads_default() {
-        let scratch = ScratchDir::new("invalid");
-        fs::create_dir_all(scratch.file().parent().unwrap()).unwrap();
-        fs::write(scratch.file(), b"{ \"theme\": ").unwrap();
-        assert_eq!(load_from(&scratch.file()), Settings::default());
-    }
-
-    #[test]
-    fn settings_unknown_field_still_loads_theme() {
-        let scratch = ScratchDir::new("unknown");
-        fs::create_dir_all(scratch.file().parent().unwrap()).unwrap();
-        fs::write(scratch.file(), br#"{"theme":"dark","future":{"x":1}}"#).unwrap();
-        assert_eq!(load_from(&scratch.file()).theme, ThemeChoice::Dark);
-    }
-
-    #[test]
-    fn a_theme_only_file_from_before_startup_still_loads() {
-        let scratch = ScratchDir::new("theme-only");
-        fs::create_dir_all(scratch.file().parent().unwrap()).unwrap();
-        fs::write(scratch.file(), br#"{"theme":"light"}"#).unwrap();
-        let loaded = load_from(&scratch.file());
-        assert_eq!(loaded.theme, ThemeChoice::Light);
-        assert_eq!(loaded.startup, Startup::NewTask);
-        assert_eq!(loaded.default_profile, None);
-    }
-
-    #[test]
-    fn settings_serialized_form_is_lowercase_theme_object() {
-        let settings = Settings {
-            theme: ThemeChoice::Dark,
-            ..Settings::default()
-        };
         assert_eq!(
-            serde_json::to_value(&settings).unwrap(),
-            serde_json::json!({"theme": "dark", "startup": "new_task"})
+            legacy_desktop_section(ThemeChoice::System),
+            serde_json::json!({"theme":"system"})
         );
+    }
+
+    #[test]
+    fn migration_runs_only_when_desktop_section_is_absent() {
+        assert!(
+            needs_legacy_import(Some("[profiles]\n"), Some(&source_revision("[profiles]\n")))
+                .unwrap()
+        );
+        assert!(
+            !needs_legacy_import(
+                Some("[desktop]\ntheme = 'system'\n"),
+                Some(&source_revision("[desktop]\ntheme = 'system'\n"))
+            )
+            .unwrap()
+        );
+        assert!(!needs_legacy_import(Some("[profiles]\n"), Some("stale-revision")).unwrap());
+        assert!(!needs_legacy_import(None, Some("stale-revision")).unwrap());
+    }
+
+    #[test]
+    fn legacy_file_is_retired_only_after_publication() {
+        let path = std::env::temp_dir().join(format!(
+            "swarm-desktop-legacy-{}-{}.json",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        fs::write(&path, br#"{"theme":"dark"}"#).unwrap();
+        retire_legacy(&path, false).unwrap();
+        assert!(path.exists());
+        retire_legacy(&path, true).unwrap();
+        assert!(!path.exists());
+
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("legacy.json"), b"keep").unwrap();
+        assert!(retire_legacy(&path, true).is_err());
+        assert!(path.join("legacy.json").exists());
+        fs::remove_dir_all(path).unwrap();
     }
 }

@@ -10,6 +10,29 @@ Default `%LOCALAPPDATA%\Eliot` or `~/.local/share/eliot`; override with `ELIOT_H
 `--data-dir`. Root and private files are current-user-only. Do not accept redirected
 symlink/reparse roots or unsafe ownership.
 
+On first use, create the directory with a protected current-user ACL before publishing
+private files. An existing unsafe root is refused; never repair ownership, weaken the
+check or copy its contents silently. The error offers one explicit command selecting
+a fresh private per-user directory; the desktop offers the same remedy. The user must
+choose it. Existing roots and configuration are not overwritten by bootstrap.
+
+The desktop's explicitly chosen fresh root is retained in a private per-user pointer:
+`%LOCALAPPDATA%\Eliot-bootstrap\selected-data-dir` on Windows, or
+`$XDG_CONFIG_HOME/eliot-bootstrap/selected-data-dir` (otherwise
+`~/.config/eliot-bootstrap/selected-data-dir`) on Unix. The pointer lives outside the
+possibly unsafe default data root. CLI and desktop share resolution order:
+`--data-dir`, `ELIOT_HOME`, selected-root pointer, then the platform default. The
+pointer and target must pass the private-directory checks; failures never silently
+select another root. Selection creates and validates the fresh root before publication.
+
+Owner CLI callers start their private daemon when needed (`status` remains a read-only
+probe). Agent and Run callers keep their inherited identity and dispatch directly;
+they never probe Owner-only readiness or start a daemon with Owner authority.
+The desktop starts the sibling `swarm.exe` and waits for daemon readiness before
+loading settings. `swarm-desktop --workspace PATH` opens and registers that checkout;
+without the flag it opens the working directory. A later launch in a different
+checkout registers that workspace through the same machine-author settings writer.
+
 ```text
 <data_dir>/
   config.toml
@@ -45,11 +68,16 @@ change command settlement, source acknowledgement or process cleanup.
 ## Native profiles (all five adapters)
 
 The current product has five native adapters: Codex, Claude, OpenCode, Muse
-and Antigravity. Each profile selects one `harness` explicitly and an exact
-`model`. Only Codex may omit `cmd`, in which case it launches `codex` by name;
+and Antigravity. Each profile selects one `harness` explicitly and may pin an exact
+`model` or preserve the native default. Only Codex may omit `cmd`, in which case it launches `codex` by name;
 the other four adapters require an explicit native executable in `cmd` in a
-stored profile. There is no default profile, no builtin fake profile, and no
-automatic harness/model/route/account fallback. Profiles stay the durable
+stored profile. First use writes visible, editable native-default profiles for
+installed harnesses through the settings writer as `bootstrap`. An omitted model
+in these profiles requests the native default and retains requested/effective
+readback separately, as for an ad-hoc launch. There is no builtin fake profile.
+Before admission, an omitted profile selects the first available ordered role candidate. There is no post-dispatch harness/model/route/account
+fallback, no retry of an uncertain outcome and no hold-triggered account switch.
+Profiles stay the durable
 explicit record: ad-hoc Owner launch (`swarm launch --harness ...`) freezes an
 equivalent snapshot from built-in per-harness safe defaults plus flags (see
 below). The harness pages
@@ -112,7 +140,7 @@ Agent principals keep
 the profile and `child_profiles` rules; they cannot ad-hoc launch
 (`not_allowed`).
 
-The profile author supplies an exact model string. Reasoning effort is optional
+When supplied, the profile author's model string is exact. Reasoning effort is optional
 on every Codex route: when the profile omits `effort`, the plugin omits the
 native effort wire fields (`thread/start`/`thread/resume` config and
 `turn/start` effort) and preserves the provider/native default, reporting
@@ -163,14 +191,14 @@ that explicitly select a mode opt into `initialize.capabilities.experimentalApi`
 No global Codex configuration is changed.
 
 An Antigravity profile selects `harness = "antigravity"` with an explicit native
-`cmd`, an exact `model`, an optional `mode` (`plan`, `auto` or `accept-edits`)
+`cmd`, an optional exact `model`, an optional `mode` (`plan`, `auto` or `accept-edits`)
 and an optional `dangerously_skip_permissions` flag (default false). `effort`,
 `approval`, `collaboration_mode`, `permissions` and `approval_policy` presets have
 no mapping and are rejected. The effective permission mode and effective model come
 from native init facts; init does not establish the served model. See the
 [Antigravity page](../harnesses/antigravity.md).
 
-A Muse profile selects `harness = "muse"` with an explicit native `cmd`, an exact `model`,
+A Muse profile selects `harness = "muse"` with an explicit native `cmd`, an optional exact `model`,
 optional `effort`, optional `approval`, and `permissions` (`workspace-write`, the default,
 or `danger-full-access`; `read-only` remains unsupported). Sandbox posture is fixed at
 host birth (`--disable-sandbox` for `danger-full-access`); the MSP session wire has no
@@ -515,7 +543,12 @@ allowlist. Project Run remains confined to its separate registered-checkout
 
 ## Project registration and rule authority
 
-Only owner-global `[projects.ID]` entries register projects. `path` names the canonical
+Owner-global `[projects.ID]` entries register projects. On an Owner open or launch in
+an unregistered Git checkout, S2 creates an entry through the settings writer,
+recorded as a machine change. Its profile allowlist is the existing profiles;
+its action allowlist grants ordinary launch/send only, without script/interpreter,
+Git fetch or additional automation authority. Existing registrations are preserved.
+`path` names the canonical
 Git checkout; `profiles` and `actions` are explicit allowlists over existing global
 profiles and implemented actions. Missing or empty allowlists deny all. Project
 registration readback uses the canonical Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs);
@@ -568,7 +601,8 @@ registration and the target's approved profile, repository identity, workspace r
 and exact generation before an effect. Missing or changed authority fails closed; there
 is no Owner fallback for a project-scoped request.
 
-Project configuration changes remain owner edits to the private global config. Invalid
+Project configuration changes use the private global settings writer, with Owner or
+internal project-discovery author attribution. Invalid
 project rule reload retains the last valid definition and reports a bounded diagnostic.
 
 ## Frozen profile and route binding
@@ -731,12 +765,114 @@ model/effort, revision, provenance, profile name) resolved from the exact
 retained generation and revision for the same original-request versus
 resolved-configuration distinction.
 
+## Unified settings
+
+`<data_dir>/config.toml` is the single settings source. `settings.read` and
+`settings.save` expose typed, explicitly named sections: profiles, routing, projects,
+daemon (including limits and retention), automation, mail, cloud_mcp, desktop,
+accounts and proxies.
+Rules/scripts remain files owned by their existing APIs; settings references and
+automation policy do not create a second executor. Desktop theme/window preferences
+use `[desktop]`. If that table is absent, the desktop imports the legacy per-user
+`swarm-desktop.json` preferences through the revision-guarded settings writer once.
+It retires the legacy file only after successful publication; an existing `[desktop]`
+table takes precedence.
+
+The API reuses the profile editor's bounded source, SHA-256 revision, selected-section
+splice, strict parser, secret checks, dry run and atomic private-file replacement.
+Unselected sections keep their bytes and semantic values. A stale revision is
+`conflict`; invalid or secret-bearing drafts never replace the file. Unsupported
+later-layer fields fail validation. Legacy `config.profiles.*` uses this same writer.
+Every proxy is validated independently, including unused routes. Candidate projects
+resolve to canonical Git identities before both dry-run success and publication.
+Resolved registrations carry their source revision, rechecked under the settings
+writer lock; publication and Store reconciliation hold that lock and the Store writer
+without asynchronous Git work between them. A delayed save cannot restore older
+project authority after a newer settings save.
+An uncertain post-replacement failure is `unknown`; read the revision before retrying.
+
+Every actual save records old/new revisions, changed sections, time and authenticated
+author in bounded Store history. Public callers cannot claim `bootstrap` or another
+principal. Owner CLI and desktop identify their client source; Agent/automation
+identity comes from authentication. Settings mutation remains Owner-only in S1;
+machine bootstrap/project registration is an internal authorized operation. History
+contains metadata, not raw settings, credentials or environment values. Retain at most
+100 entries. Prepare a pending history row before file publication, then settle it
+after replacement. Reconcile pending rows against the exact old/new file hashes;
+an unrelated current revision leaves the outcome unknown. File publication and SQLite
+are separate durability domains: failed history settlement is reported as unknown,
+never as an unchanged file or permission to repeat a write blindly.
+
+Profiles, projects and routing affect future admissions; running/queued work keeps its
+frozen snapshot. Desktop preferences apply on read/save without daemon restart.
+Retention is reread by maintenance. Automation backlog limits reload live and global
+Run grants are reread before effects; automation changes require no daemon restart.
+Daemon worker limits, mail and cloud MCP listener/auth settings require restart in S1: their workers, bounded
+channels and listener ownership are constructed at startup. Save replies identify
+sections requiring restart. Admitted profile/route snapshots remain frozen; live
+authority checks continue to apply at their owning effect boundaries.
+
+### Routing policy (S3)
+
+`[routing]` holds ordered profile candidates by role (`default`, `manager`, `worker`,
+`audit`, with additional named roles). Omitted `--profile` requests that policy.
+Each role is an ordered array of existing profile names, for example:
+
+```toml
+[routing]
+default = ["codex-luna", "muse"]
+worker = ["codex-luna"]
+```
+
+Role names use letters, digits, `-` and `_`; each role allows at most 64 candidates and rejects duplicate or
+unknown profile references. The `--role` launch argument selects the role only
+when `--profile` is omitted; omission stays absent on the wire and means
+`default`. An explicit profile continues to bypass routing.
+At first admission, candidates must be installed, outside provider holds, not known
+quota-exhausted where passive readback is supported, and within configured capacity.
+Unknown quota is reported as unknown rather than fabricated availability. Freeze the
+chosen profile and selection reason on the launch command/event before dispatch.
+The retained [`RoutingDecision` and `RouteSkip` DTOs](../../crates/eliot-core/src/routing.rs)
+carry the role, optional selected profile, source and reason, ordered typed skips and
+quota readback status (`supported`, `unsupported` or `unknown`). Exhaustion is a
+typed skip reason, separate from whether the provider supplied quota readback. A decision
+with no selected profile lists the candidates that were skipped; an unconfigured
+Owner role or an explicit nondefault child role remains a routing miss. A child
+requesting an unconfigured default role uses its inherited profile as the sole candidate.
+Child selection is intersected with the parent's frozen authorized child profiles
+(#398), including the inherited profile where authorized. No candidate means a typed
+`routing_unavailable` refusal with an `Error.routing` decision. The choice is retained
+on the Agent as `profile_choice` for `show`, `result` and desktop API consumers even
+after launch command history expires. Same-ID replay returns the frozen choice;
+failure, hold or unknown delivery never causes another candidate to run. A held
+candidate never selects a different account or captured credential selector of the
+same harness. Provider holds and capacity are rechecked transactionally at admission;
+a concurrent state change can refuse an otherwise prepared choice before dispatch.
+
+### CLI editing
+
+`swarm settings read` returns the current revision, sections, restart requirements
+and bounded metadata history. To change only desktop preferences, save a JSON request
+with `swarm settings save request.json` (add `--dry-run` to validate only):
+
+```json
+{
+  "expected_revision": "<revision from settings.read>",
+  "sections": {"desktop": {"theme": "dark"}},
+  "client": "cli"
+}
+```
+
+Each named section is a complete replacement; leave unmodified sections out of the
+request. The desktop Settings screen uses the same read/save contract and reports
+conflicts without discarding the draft.
+
 ## Profile editing
 
 Launch admission resolves its profile from `config.toml` at admission (above), so the
 saved file is what the next launch uses and running or queued work keeps its frozen
 snapshot; only a successful `configure` changes a live Agent's next-turn model/effort.
-Daemon settings loaded once at startup (`[daemon]`, `[mail]`, `[automation]`) are not
+Daemon settings loaded once at startup (`[daemon]` worker limits and `[mail]`) are not
 edited through this path.
 
 `config.profiles.read` returns the file revision (lowercase hex SHA-256 of its bytes)

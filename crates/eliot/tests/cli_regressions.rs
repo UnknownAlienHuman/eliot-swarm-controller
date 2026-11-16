@@ -117,6 +117,69 @@ fn explicit_owner_credential_works_over_actual_ipc_with_renamed_token_file() {
     assert_eq!(error.code, "not_allowed");
 }
 
+#[test]
+fn inherited_agent_and_run_cli_commands_reach_running_daemon_dispatch() {
+    let mut fixture = Fixture::new("managed CLI dispatch with running daemon");
+    fixture.start();
+
+    let mut command = Command::new(CLI);
+    scrub_ambient_identity(&mut command);
+    command
+        .arg("--data-dir")
+        .arg(&fixture.data)
+        .args(["--json", "who"])
+        // Deliberately stale Agent identity: the live daemon must return its
+        // Agent-authentication error, proving the CLI did not stop at the
+        // Owner-only daemon.status startup preflight.
+        .env("ELIOT_AGENT_ID", "a9223372036854775807")
+        .env("ELIOT_AGENT_GENERATION", "1")
+        .env("ELIOT_AGENT_DATA_DIR", &fixture.data)
+        .env("ELIOT_AGENT_TOKEN", "regression-token");
+
+    let reply = run(command);
+    assert!(!reply.status.success());
+    assert!(
+        reply
+            .stderr
+            .contains("Agent generation has no live plugin owner"),
+        "expected the running daemon's Agent-authentication response; got: {}",
+        reply
+            .stderr
+            .lines()
+            .next()
+            .unwrap_or("<empty>")
+            .chars()
+            .take(240)
+            .collect::<String>()
+    );
+
+    let mut command = Command::new(CLI);
+    scrub_ambient_identity(&mut command);
+    command
+        .arg("--data-dir")
+        .arg(&fixture.data)
+        .args(["--json", "who"])
+        .env("ELIOT_RUN_COMMAND_ID", "run-cli-regression")
+        .env("ELIOT_RUN_TOKEN", "a".repeat(64));
+
+    let reply = run(command);
+    assert!(!reply.status.success());
+    assert!(
+        reply
+            .stderr
+            .contains("Run credential is invalid or revoked"),
+        "expected the running daemon's Run-authentication response; got: {}",
+        reply
+            .stderr
+            .lines()
+            .next()
+            .unwrap_or("<empty>")
+            .chars()
+            .take(240)
+            .collect::<String>()
+    );
+}
+
 fn assert_invalid_read_rpc(
     runtime: &tokio::runtime::Runtime,
     fixture: &Fixture,

@@ -21,7 +21,6 @@
 //! redaction marker is returned or accepted.
 
 use std::path::Path;
-use std::sync::Mutex;
 
 use eliot_core::SecretPolicy;
 use eliot_core::api::{
@@ -37,8 +36,6 @@ use super::{
 };
 
 /// Serializes saves within this daemon process.
-static SAVE_LOCK: Mutex<()> = Mutex::new(());
-
 /// Lowercase hexadecimal SHA-256 of the file text.
 pub(crate) fn revision_of(source: &str) -> String {
     Sha256::digest(source.as_bytes())
@@ -48,9 +45,9 @@ pub(crate) fn revision_of(source: &str) -> String {
 }
 
 /// One table block: a header line and the lines up to the next header.
-struct Block<'a> {
-    text: &'a str,
-    profile: bool,
+pub(super) struct Block<'a> {
+    pub(super) text: &'a str,
+    pub(super) section: Option<String>,
 }
 
 /// Table path of a header line, or `None` for any other line. A header is
@@ -112,61 +109,59 @@ fn header_path(line: &str) -> Option<Vec<String>> {
     }
 }
 
-fn split_blocks(source: &str) -> Vec<Block<'_>> {
-    let mut spans: Vec<(usize, usize, bool)> = Vec::new();
+pub(super) fn split_blocks(source: &str) -> Vec<Block<'_>> {
+    let mut spans: Vec<(usize, usize, Option<String>)> = Vec::new();
     let mut start = 0;
-    let mut profile = false;
+    let mut section: Option<String> = None;
     // A leading UTF-8 BOM is not TOML content: the pinned parser accepts it,
     // but the header scan must not treat it as part of the first header. Keep
     // its bytes in a leading non-profile span so reads never hand it to the
     // editor and saves preserve it byte for byte.
     if let Some(rest) = source.strip_prefix('\u{FEFF}') {
         let bom = source.len() - rest.len();
-        spans.push((0, bom, false));
+        spans.push((0, bom, None));
         start = bom;
     }
     let mut offset = start;
     for line in source[start..].split_inclusive('\n') {
         if let Some(path) = header_path(line) {
             if offset > start {
-                spans.push((start, offset, profile));
+                spans.push((start, offset, section.clone()));
             }
             start = offset;
-            profile = path.first().is_some_and(|first| first == "profiles");
+            section = path.first().cloned();
         }
         offset += line.len();
     }
     if source.len() > start {
-        spans.push((start, source.len(), profile));
+        spans.push((start, source.len(), section));
     }
-    // Comment and blank lines that end a profile block and precede another
-    // section belong to that section: they are never handed to the editor,
-    // so a save cannot drop them.
-    for index in 1..spans.len() {
-        let (block_start, block_end, is_profile) = spans[index - 1];
-        if !is_profile || spans[index].2 {
-            continue;
-        }
-        let mut split = block_end;
-        for line in source[block_start..block_end].split_inclusive('\n').rev() {
-            let trimmed = line.trim();
-            if !(trimmed.is_empty() || trimmed.starts_with('#')) {
-                break;
+    // Boundary comments and blank lines belong to neither section. Keep them
+    // as separate spans so replacing either neighbor preserves their bytes.
+    let mut blocks = Vec::new();
+    for (index, (start, end, section)) in spans.iter().enumerate() {
+        let mut split = *end;
+        if section.is_some() && spans.get(index + 1).is_some_and(|next| section != &next.2) {
+            for line in source[*start..*end].split_inclusive('\n').rev() {
+                let trimmed = line.trim();
+                if !(trimmed.is_empty() || trimmed.starts_with('#')) {
+                    break;
+                }
+                split -= line.len();
             }
-            split -= line.len();
         }
-        if split > block_start {
-            spans[index - 1].1 = split;
-            spans[index].0 = split;
+        blocks.push(Block {
+            text: &source[*start..split],
+            section: section.clone(),
+        });
+        if split < *end {
+            blocks.push(Block {
+                text: &source[split..*end],
+                section: None,
+            });
         }
     }
-    spans
-        .into_iter()
-        .map(|(start, end, profile)| Block {
-            text: &source[start..end],
-            profile,
-        })
-        .collect()
+    blocks
 }
 
 fn with_newline(text: &str) -> String {
@@ -181,7 +176,7 @@ fn with_newline(text: &str) -> String {
 fn profile_text(source: &str) -> String {
     split_blocks(source)
         .into_iter()
-        .filter(|block| block.profile)
+        .filter(|block| block.section.as_deref() == Some("profiles"))
         .map(|block| with_newline(block.text))
         .collect()
 }
@@ -193,7 +188,7 @@ fn splice(source: &str, draft: &str) -> String {
     let mut out = String::with_capacity(source.len() + draft.len());
     let mut inserted = false;
     for block in split_blocks(source) {
-        if block.profile {
+        if block.section.as_deref() == Some("profiles") {
             if !inserted {
                 out.push_str(&draft);
                 inserted = true;
@@ -424,7 +419,7 @@ fn check_draft(draft: &str) -> core::Result<toml::Table> {
             let line = line.trim();
             !line.is_empty() && !line.starts_with('#')
         });
-        if !block.profile && content {
+        if block.section.as_deref() != Some("profiles") && content {
             return Err(core::Error::new(
                 "profile_error",
                 "draft: text outside [profiles.*] tables is not accepted",
@@ -483,10 +478,11 @@ fn validated(original: &str, draft: &str) -> core::Result<(String, Vec<String>)>
 /// file through a private temporary file when its revision still matches.
 pub(crate) fn save(
     data_root: &Path,
+    store: &mut eliot_store::Store,
     request: &ProfilesSaveRequest,
     policy: &SecretPolicy,
 ) -> core::Result<ProfilesSaveResponse> {
-    let _guard = SAVE_LOCK
+    let _guard = super::settings::SETTINGS_SAVE_LOCK
         .lock()
         .map_err(|_| core::Error::new("internal", "profile save lock poisoned"))?;
     let current = read_config_source(data_root)?;
@@ -497,6 +493,7 @@ pub(crate) fn save(
             "config.toml changed since this draft was read; reload it and reapply the edit",
         ));
     }
+    store.reconcile_settings_history(current_revision.as_deref())?;
     let parsed_draft = toml::from_str::<toml::Table>(&request.source).ok();
     if has_secret(policy, &request.source, parsed_draft.as_ref()) {
         return Err(core::Error::new(
@@ -504,7 +501,7 @@ pub(crate) fn save(
             "the draft contains a known secret value or redaction marker",
         ));
     }
-    let original = current.unwrap_or_default();
+    let original = current.clone().unwrap_or_default();
     if let Some(reason) = editability(&original, policy) {
         return Err(core::Error::new("profile_error", reason));
     }
@@ -524,19 +521,18 @@ pub(crate) fn save(
             profiles,
         });
     }
-    // Recheck right before the rename: an external edit since the first read
-    // is a conflict. Another process can still write in the instant between
-    // this read and the rename; that residual window is documented.
-    if read_config_source(data_root)?.as_deref().map(revision_of) != current_revision {
-        return Err(core::Error::new(
-            "conflict",
-            "config.toml changed while this draft was validated; reload it and reapply the edit",
-        ));
-    }
-    crate::platform::data_dir::replace_private_file(data_root, "config.toml", spliced.as_bytes())?;
+    let saved = super::settings::commit_candidate_locked(
+        data_root,
+        store,
+        current.as_deref(),
+        &spliced,
+        vec![eliot_core::api::SettingsSection::Profiles],
+        Vec::new(),
+        super::settings::SettingsAuthor::Owner(request.client),
+    )?;
     Ok(ProfilesSaveResponse {
-        saved: true,
-        revision: Some(revision_of(&spliced)),
+        saved: saved.saved,
+        revision: saved.revision,
         profiles,
     })
 }

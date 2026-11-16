@@ -59,8 +59,36 @@ mod state;
 mod theme;
 
 #[cfg(windows)]
+#[derive(clap::Parser)]
+#[command(name = "swarm-desktop", version, about = "Eliot desktop companion")]
+pub(crate) struct DesktopArgs {
+    /// Open and register this Git checkout; defaults to the working directory.
+    #[arg(long, value_name = "PATH")]
+    workspace: Option<std::path::PathBuf>,
+}
+
+#[cfg(windows)]
 fn main() {
-    if let Err(error) = ui::run() {
+    use clap::Parser;
+    let args = DesktopArgs::parse();
+    let workspace = args
+        .workspace
+        .map_or_else(std::env::current_dir, Ok)
+        .and_then(std::fs::canonicalize)
+        .and_then(|path| {
+            if path.is_dir() {
+                Ok(path)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "workspace must be a directory",
+                ))
+            }
+        });
+    let result = workspace
+        .map_err(|error| error.to_string())
+        .and_then(ui::run);
+    if let Err(error) = result {
         eprintln!("swarm-desktop: {error}");
         std::process::exit(1);
     }

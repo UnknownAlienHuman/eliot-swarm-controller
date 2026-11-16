@@ -1,40 +1,48 @@
 //! The one client module behind the Settings page.
 //!
 //! Every read and write the settings UI makes goes through here: the
-//! desktop preferences file ([`crate::settings`]) and the daemon's existing
-//! configuration APIs (`profile.list`, `config.profiles.read/save`,
+//! desktop preferences in the daemon's `[desktop]` section
+//! ([`crate::settings`]) and the daemon's existing configuration APIs (`profile.list`, `config.profiles.read/save`,
 //! `project.list`, `rule.list`, `script.list/read/save`, `timer.run`), each
 //! with the same request/response validators the CLI runs. When the unified
 //! `settings.read`/`settings.save` API (k55) lands it replaces these calls
 //! in this module only; the UI keeps its shape.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use eliot_core::api::{
     ProfileListRequest, ProfileListResponse, ProfilesReadRequest, ProfilesReadResponse,
     ProfilesSaveRequest, ProfilesSaveResponse, ProjectRegistrationView, RuleListEntry,
     RuleListRequest, RuleListResponse, ScriptListRequest, ScriptListResponse, ScriptReadRequest,
-    ScriptReadResponse, ScriptSaveRequest, ScriptSaveResponse, TimerRunRequest,
-    discovery::ProjectListRequest,
+    ScriptReadResponse, ScriptSaveRequest, ScriptSaveResponse, SettingsReadResponse,
+    SettingsSaveRequest, SettingsSaveResponse, TimerRunRequest, discovery::ProjectListRequest,
 };
 use eliot_core::{Command, Error, Result};
 use serde_json::Value;
 
-use crate::settings::{self, Settings};
+use crate::settings::{self, ThemeChoice};
 
-/// The desktop preferences (defaults when there is no usable file).
-pub fn load_preferences() -> Settings {
-    settings::load()
+/// Write the theme and window size into the daemon's `[desktop]` section.
+pub async fn save_preferences(
+    data_dir: &Path,
+    theme: ThemeChoice,
+    window: Option<(u32, u32)>,
+) -> Result<()> {
+    settings::save_preferences(data_dir, theme, window).await
 }
 
-/// Write the desktop preferences.
-pub fn save_preferences(preferences: &Settings) -> std::result::Result<(), String> {
-    settings::save(preferences)
+/// Every settings section, its revision and history; imports the legacy
+/// per-user preferences file once when `[desktop]` is absent.
+pub async fn read_settings(data_dir: &Path) -> Result<SettingsReadResponse> {
+    settings::read(data_dir).await
 }
 
-/// Where the desktop preferences live, for the Advanced section.
-pub fn preferences_path() -> Option<PathBuf> {
-    settings::path()
+/// Validate (dry run) or save complete settings sections.
+pub async fn save_settings(
+    data_dir: &Path,
+    request: &SettingsSaveRequest,
+) -> Result<SettingsSaveResponse> {
+    settings::save(data_dir, request).await
 }
 
 /// Project registrations for the launch picker. `project.list` returns a bare
@@ -82,6 +90,7 @@ pub async fn save_profiles(
     dry_run: bool,
 ) -> Result<ProfilesSaveResponse> {
     let params = ProfilesSaveRequest {
+        client: eliot_core::api::SettingsClientSource::Desktop,
         expected_revision,
         source,
         dry_run,

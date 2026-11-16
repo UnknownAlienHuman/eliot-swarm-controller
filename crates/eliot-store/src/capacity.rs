@@ -346,11 +346,17 @@ pub(super) fn reserve_tx(tx: &Transaction<'_>, agent: &Agent, generation: i64) -
         None => {}
     }
 
+    require_free(tx, agent, id)?;
+
+    set_reservation_generation_tx(tx, id, None, generation)
+}
+
+fn require_free(connection: &Connection, agent: &Agent, id: i64) -> Result<()> {
     for scope in scopes(agent)? {
         let Some(max_live) = scope.max_live else {
             continue;
         };
-        let count: i64 = tx
+        let count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM agents a
                  WHERE a.capacity_generation IS NOT NULL AND a.id <> ?1
@@ -371,7 +377,32 @@ pub(super) fn reserve_tx(tx: &Transaction<'_>, agent: &Agent, generation: i64) -
         }
     }
 
-    set_reservation_generation_tx(tx, id, None, generation)
+    Ok(())
+}
+
+impl Store {
+    /// Passive admission preflight; admission still rechecks hold and reserves
+    /// capacity transactionally before acknowledging any launch.
+    pub fn routing_unavailable(
+        &self,
+        profile: &str,
+        harness: &str,
+        snapshot: &Value,
+    ) -> Result<Option<core::RouteSkipReason>> {
+        self.ensure_committed_reads()?;
+        let mut candidate = Agent::new("a1", "routing", harness, profile, 0);
+        candidate.profile_snapshot = snapshot.clone();
+        if provider_holds::profile_held(&self.connection, &candidate)? {
+            return Ok(Some(core::RouteSkipReason::ProviderHold));
+        }
+        match require_free(&self.connection, &candidate, 0) {
+            Ok(()) => Ok(None),
+            Err(error) if error.code == "capacity_unavailable" => {
+                Ok(Some(core::RouteSkipReason::CapacityFull))
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 pub(super) fn require_reservation_tx(

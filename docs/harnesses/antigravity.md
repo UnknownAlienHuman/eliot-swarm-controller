@@ -72,6 +72,13 @@ silently ignored. The launch-time permission posture remains
 `--dangerously-skip-permissions`; cwd is a launch fact (the server is
 spawned in the workspace), since the session response echoes no cwd.
 
+An omitted model preserves the native default: perform no model/thought-level
+configuration writes, and verify the session-open `configOptions` current values
+against their advertised select options. Requested model stays absent; effective
+model/level come from those current values. Missing or unadvertised current selectors
+fail startup as unknown. `agy models` supplies no default marker and is never used
+to guess one. A retained configure overlay still realigns its exact selectors on resume.
+
 A `session/request_permission` ask (`{sessionId, toolCall, options}`)
 opens a Swarm approval request with a distinct bounded local id for each
 native JSON-RPC request, bound to the exact generation and turn. The
@@ -427,7 +434,7 @@ stays in the plugin spec.
 `swarm launch --harness antigravity --model M --workspace W "prompt"` is
 Owner-only and freezes a profile-equivalent snapshot from safe defaults
 (`dangerously_skip_permissions = false`, MCP `inherit`) plus flags. A model
-is required (no native default is mapped; omission is `profile_error`).
+may be omitted to preserve the verified ACP session default described above.
 `cmd` is the installed `agy` CLI when it is on `PATH` (it serves both `acp`
 and `models`), falling back to the installed app at
 `%LOCALAPPDATA%\Programs\Antigravity\Antigravity.exe`, or `unsupported` when

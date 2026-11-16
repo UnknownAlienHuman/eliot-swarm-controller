@@ -7,6 +7,9 @@
 use super::*;
 use crate::settings::{Startup, ThemeChoice};
 use crate::theme::winui::Palette;
+use eliot_core::api::{
+    SettingsClientSource, SettingsReadResponse, SettingsSaveRequest, SettingsSaveResponse,
+};
 
 /// The sections, in page order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +52,27 @@ pub(super) enum SettingsMsg {
     SectionSelected(SettingsSection),
     /// Index into the Routing picker (0: the first allowed profile).
     AutoProfilePicked(Option<usize>),
+    /// Every section, read through `settings.read`.
+    Loaded(Fallible<SettingsReadResponse>),
+    /// The Advanced JSON draft of every section.
+    Draft(String),
+    Read,
+    /// Validate (true) or save the JSON draft.
+    Save(bool),
+    Saved(bool, Fallible<SettingsSaveResponse>),
+}
+
+/// The Advanced editor over every settings section (`settings.read` /
+/// `settings.save`); the daemon validates every section and owns history.
+#[derive(Default)]
+pub(super) struct SettingsEditor {
+    pub(super) loaded: bool,
+    pub(super) busy: bool,
+    revision: Option<String>,
+    draft: String,
+    base: String,
+    history: String,
+    status: String,
 }
 
 /// The section list beside the shown section.
@@ -80,7 +104,121 @@ impl DesktopApp {
                     self.shell_update(ShellMsg::DefaultProfileChosen(profile), context);
                 }
             }
+            SettingsMsg::Loaded(result) => {
+                self.unified.busy = false;
+                match result {
+                    Ok(read) => {
+                        self.prefs.theme = crate::settings::theme(&read);
+                        self.preferred_window = crate::settings::window(&read);
+                        self.unified.loaded = true;
+                        self.unified.revision = read.revision;
+                        self.unified.draft =
+                            serde_json::to_string_pretty(&read.sections).unwrap_or_default();
+                        self.unified.base = self.unified.draft.clone();
+                        self.unified.history =
+                            serde_json::to_string_pretty(&read.history).unwrap_or_default();
+                        self.unified.status = format!(
+                            "Loaded. Restart required for changes to: {:?}",
+                            read.restart_required
+                        );
+                    }
+                    Err(error) => self.unified.status = format!("Settings read failed: {error}"),
+                }
+            }
+            SettingsMsg::Draft(text) if !self.unified.busy => {
+                self.unified.draft = profiles::normalize_newlines(&text);
+            }
+            SettingsMsg::Draft(_) => {}
+            SettingsMsg::Read => self.load_settings(context),
+            SettingsMsg::Save(dry_run) => {
+                if self.unified.busy || !self.unified.loaded {
+                    return;
+                }
+                let mut sections: std::collections::BTreeMap<
+                    eliot_core::api::SettingsSection,
+                    serde_json::Value,
+                > = match serde_json::from_str(&self.unified.draft) {
+                    Ok(sections) => sections,
+                    Err(_) => {
+                        self.unified.status = "Invalid settings JSON; draft kept.".to_owned();
+                        return;
+                    }
+                };
+                if let Ok(base) = serde_json::from_str::<
+                    std::collections::BTreeMap<eliot_core::api::SettingsSection, serde_json::Value>,
+                >(&self.unified.base)
+                {
+                    sections.retain(|section, value| base.get(section) != Some(value));
+                }
+                if sections.is_empty() {
+                    self.unified.status = "No settings changed.".to_owned();
+                    return;
+                }
+                let request = SettingsSaveRequest {
+                    expected_revision: self.unified.revision.clone(),
+                    sections,
+                    dry_run,
+                    client: SettingsClientSource::Desktop,
+                };
+                let Ok(data_dir) = self.data_dir.clone() else {
+                    return;
+                };
+                self.unified.busy = true;
+                self.unified.status = if dry_run {
+                    "Validating…"
+                } else {
+                    "Saving…"
+                }
+                .to_owned();
+                let _task = context.spawn_background(move |_| {
+                    Message::Settings(SettingsMsg::Saved(
+                        dry_run,
+                        client::block_on(config_client::save_settings(&data_dir, &request))
+                            .map_err(|e| e.to_string()),
+                    ))
+                });
+            }
+            SettingsMsg::Saved(dry_run, result) => {
+                self.unified.busy = false;
+                match result {
+                    Ok(reply) if dry_run => {
+                        self.unified.status = format!(
+                            "Valid. Changed: {:?}; restart: {:?}",
+                            reply.changed_sections, reply.restart_required
+                        )
+                    }
+                    Ok(reply) => {
+                        self.unified.status = format!(
+                            "Saved revision {:?}; restart: {:?}",
+                            reply.revision, reply.restart_required
+                        );
+                        self.load_settings(context);
+                        self.load_profile_list(context);
+                    }
+                    Err(error) => {
+                        self.unified.status = format!(
+                            "Save failed; draft kept. Reload before retrying an uncertain save: {error}"
+                        )
+                    }
+                }
+            }
         }
+    }
+
+    pub(super) fn load_settings(&mut self, context: &ComponentContext<Self>) {
+        if self.unified.busy {
+            return;
+        }
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        self.unified.busy = true;
+        let _task = context.spawn_background(move |_| {
+            Message::Settings(SettingsMsg::Loaded(
+                client::block_on(config_client::read_settings(&data_dir))
+                    .map_err(|e| e.to_string()),
+            ))
+        });
     }
 
     /// Read what the shown section needs, once.
@@ -93,6 +231,11 @@ impl DesktopApp {
                 self.load_profile_list(context);
             }
             SettingsSection::Routing => self.load_profile_list(context),
+            SettingsSection::Advanced => {
+                if !self.unified.loaded && !self.unified.busy {
+                    self.load_settings(context);
+                }
+            }
             SettingsSection::Automation => {
                 if !self.scripts.listed {
                     self.load_scripts(context);
@@ -372,10 +515,51 @@ impl DesktopApp {
             Ok(path) => nav::display_path(&path.display().to_string()).to_owned(),
             Err(error) => format!("unavailable: {error}"),
         };
-        let prefs = config_client::preferences_path().map_or_else(
-            || "no per-user settings folder".to_owned(),
-            |path| path.display().to_string(),
-        );
+        let editor = StackPanel::new().spacing(theme::spacing::SM).children((
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(theme::spacing::SM)
+                .children((
+                    m3::text_button(palette)
+                        .is_enabled(!self.unified.busy)
+                        .automation_name("Reload settings")
+                        .on_click(context.message(Message::Settings(SettingsMsg::Read)))
+                        .content(m3::label("Reload (discard draft)")),
+                    m3::outlined(palette)
+                        .is_enabled(self.unified.loaded && !self.unified.busy)
+                        .on_click(context.message(Message::Settings(SettingsMsg::Save(true))))
+                        .content(m3::label("Validate")),
+                    m3::filled(palette)
+                        .is_enabled(
+                            self.unified.loaded
+                                && !self.unified.busy
+                                && self.unified.draft != self.unified.base,
+                        )
+                        .automation_name("Save settings")
+                        .on_click(context.message(Message::Settings(SettingsMsg::Save(false))))
+                        .content(m3::label("Save")),
+                )),
+            m3::field()
+                .accepts_return(true)
+                .text_wrapping(TextWrapping::Wrap)
+                .min_height(240.0)
+                .max_height(420.0)
+                .automation_name("Settings sections JSON")
+                .text(self.primed(&self.unified.draft))
+                .is_enabled(!self.unified.busy)
+                .on_text_changed(
+                    context.callback(|text| Message::Settings(SettingsMsg::Draft(text))),
+                ),
+            m3::muted(self.unified.status.clone(), theme::type_scale::BODY_SMALL)
+                .text_wrapping(TextWrapping::Wrap)
+                .is_text_selection_enabled(true),
+            m3::muted(
+                format!("Recent settings changes\n{}", self.unified.history),
+                theme::type_scale::BODY_SMALL,
+            )
+            .text_wrapping(TextWrapping::Wrap)
+            .is_text_selection_enabled(true),
+        ));
         m3::list_group(
             palette,
             vec![
@@ -390,9 +574,14 @@ impl DesktopApp {
                     ),
                 ),
                 (
-                    "prefs".to_owned(),
-                    m3::list_item("Desktop preferences file", &prefs, View::empty()),
+                    "all".to_owned(),
+                    m3::list_item(
+                        "All settings",
+                        "Every section of config.toml as JSON. Each save is checked by the daemon and recorded with its author.",
+                        View::empty(),
+                    ),
                 ),
+                ("all-editor".to_owned(), editor),
                 (
                     "reload".to_owned(),
                     m3::list_item(

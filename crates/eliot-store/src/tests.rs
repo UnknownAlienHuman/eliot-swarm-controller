@@ -7102,7 +7102,22 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "DROP INDEX inference_write_inventory;
+            "DROP TRIGGER assignment_commands_insert;
+             DROP TRIGGER assignment_commands_update;
+             DROP TRIGGER assignment_commands_delete;
+             DROP TRIGGER assignment_turns_insert;
+             DROP TRIGGER assignment_turns_update;
+             DROP TRIGGER assignment_turns_delete;
+             DROP VIEW assignment_busy_membership;
+             DROP INDEX commands_assignment_busy;
+             DROP INDEX commands_assignment_turn;
+             ALTER TABLE commands DROP COLUMN assignment_busy;
+             DELETE FROM schema_migrations WHERE version = 43;
+             ALTER TABLE agents DROP COLUMN profile_choice;
+             DROP INDEX settings_history_created;
+                     DROP TABLE settings_history;
+                     DELETE FROM schema_migrations WHERE version = 41;
+                     DROP INDEX inference_write_inventory;
                      ALTER TABLE writes DROP COLUMN inference_seq;
                      DELETE FROM schema_migrations WHERE version >= 39;
                      DROP TABLE inference_calls;

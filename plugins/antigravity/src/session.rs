@@ -446,6 +446,16 @@ impl Session {
             })?
         };
         let mut effective = plan.check_session(&init, &session)?;
+        self.current_base = effective
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+            .ok_or_else(|| Error::new("unknown", "Antigravity effective model was not read back"))?
+            .to_owned();
+        self.current_level = effective
+            .get("thought_level")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         // Refresh the advertised sets from this open (fresh or resumed):
         // every required write must name one of these values.
         self.advertised_models = advertised_option_values(session.config_options.as_ref(), "model");

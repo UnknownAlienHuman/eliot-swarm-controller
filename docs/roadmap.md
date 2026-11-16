@@ -12,10 +12,31 @@ This page owns stage numbers; harness pages describe capabilities, not another s
 Each checkbox is a useful increment; tick only implemented behavior.
 See AGENTS.md for the work loop.
 
+## Unified settings and hot start (2026-11-15)
+
+**Next:** L7 qualification.
+
+- [x] **S1 Settings store/API.** One revision-guarded `settings.read/save` path for
+      profiles, routing, projects, daemon limits/retention, automation, mail,
+      cloud MCP and desktop preferences; strict section validation, dry run and
+      bounded Store history with server-derived author. Replace desktop JSON.
+- [x] **S2 Hot start.** Private directory creation, visible native-default profiles
+      for installed harnesses, automatic Git project registration, daemon startup
+      from desktop, explicit safe remedy for unsafe existing roots, and a real
+      profile-free launch from a clean directory.
+- [x] **S3 Routing.** Ordered role candidates, installed/provider-hold/quota/capacity
+      selection before admission, recorded choice/reason, authorized child scope
+      and no retry or reroute after dispatch or uncertain delivery.
+- [x] **S4 Assignment through automation.** Settings-managed existing rules/timers
+      keep a configured number of Agents busy on a brief queue through ordinary
+      routing-aware launch; retain exact command identity and unknown gates.
+
+S1-S4 are implemented. The configuration and automation specs own their contracts;
+fleet-wide and longer-running qualification remains in L7.
+
 ## Repairs to implemented paths
 
-**Next:** L7 qualification. Checked layers record delivered increments, not full
-crash/load qualification.
+Checked layers record delivered increments, not full crash/load qualification.
 
 - [x] **Restart capacity recovery.** Reconcile exact prior-generation custody and release
       or transfer the reservation under the [capacity contract](spec/configuration.md#accounts-and-configured-capacity).
@@ -320,7 +341,12 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       Daemon maintenance deletes expired history via bounded Store pruning;
       queries/backlog handling alone do not. Keep open/unknown work and current
       projections; no full rewrite, forced unknown resolution or separate cleanup ledger.
-- [ ] Core/Store/API/reducer and event replay, including retention and non-reused ids.
+- [x] Core/Store/API/reducer and event replay, including retention and non-reused ids.
+      Qualified 2026-11-15 on release 70E7859B with real Muse/Codex Agents. Covered:
+      replay equal to live; restart without effect replay; a mid-turn kill settling
+      `unknown`; same-id idempotency and `id_conflict`; fresh ids and seq across
+      restarts; cursor gaps; deletion of 25 h-old rows (nonzero counts,
+      `history_gap`, preserved unknown turns and vars, idempotent second pass).
 - [x] CLI E2E on the real harness, exact generations/turns/requests, queue ordering and unknown outcomes.
       Qualified 2026-11-14 on Codex and Muse; the unknown-turn send fence it exposed was fixed (#468).
 - [x] Crash at admission, native effect, event commit, reply and source-drain boundaries;

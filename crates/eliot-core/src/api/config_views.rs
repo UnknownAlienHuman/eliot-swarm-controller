@@ -182,6 +182,9 @@ pub struct ProfilesReadResponse {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfilesSaveRequest {
+    /// Descriptive Owner client source; authority still comes from authentication.
+    #[serde(default)]
+    pub client: SettingsClientSource,
     /// Revision the draft was edited from; absent only when the file did
     /// not exist. A different current revision is `conflict`.
     #[serde(default)]
@@ -233,6 +236,189 @@ pub struct ProfilesSaveResponse {
     pub revision: Option<String>,
     /// Profile names in the accepted source.
     pub profiles: Vec<String>,
+}
+
+/// A complete, allowlisted section of the unified settings document.
+#[derive(
+    schemars::JsonSchema,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsSection {
+    Profiles,
+    Routing,
+    Projects,
+    Daemon,
+    Automation,
+    Mail,
+    CloudMcp,
+    Desktop,
+    Accounts,
+    Proxies,
+}
+
+/// Which owner-facing client initiated a settings save.
+#[derive(
+    schemars::JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsClientSource {
+    #[default]
+    Cli,
+    Desktop,
+}
+
+/// Metadata-only retained settings history; no settings values are stored here.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsHistoryEntry {
+    pub revision: i64,
+    pub previous_revision: Option<String>,
+    pub current_revision: String,
+    pub changed_sections: Vec<SettingsSection>,
+    pub author: String,
+    pub created_at: i64,
+    pub status: SettingsHistoryStatus,
+}
+
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsHistoryStatus {
+    Pending,
+    Applied,
+    NotApplied,
+    Unknown,
+}
+
+/// Request for `settings.read`. Omitted sections reads every implemented section.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsReadRequest {
+    #[serde(default)]
+    pub sections: Option<Vec<SettingsSection>>,
+}
+
+impl SettingsReadRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.sections.as_ref().is_some_and(|sections| {
+            sections.is_empty() || sections.len() > 16 || {
+                let unique: std::collections::BTreeSet<_> = sections.iter().collect();
+                unique.len() != sections.len()
+            }
+        }) {
+            return Err(Error::new(
+                "invalid",
+                "settings sections are empty, duplicated, or oversized",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_response(&self, reply: &SettingsReadResponse) -> Result<()> {
+        validate_revision(&reply.revision)?;
+        if reply.history.len() > 100
+            || reply.sections.values().any(|value| !value.is_object())
+            || self.sections.as_ref().is_some_and(|sections| {
+                reply.sections.len() != sections.len()
+                    || sections
+                        .iter()
+                        .any(|section| !reply.sections.contains_key(section))
+            })
+        {
+            return Err(Error::new(
+                "invalid",
+                "settings read response does not match its request",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Response for `settings.read`.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsReadResponse {
+    pub revision: Option<String>,
+    pub sections: std::collections::BTreeMap<SettingsSection, serde_json::Value>,
+    pub restart_required: Vec<SettingsSection>,
+    pub history: Vec<SettingsHistoryEntry>,
+}
+
+/// Request for `settings.save`. Each supplied section is a complete replacement.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsSaveRequest {
+    #[serde(default)]
+    pub expected_revision: Option<String>,
+    pub sections: std::collections::BTreeMap<SettingsSection, serde_json::Value>,
+    #[serde(default)]
+    pub dry_run: bool,
+    pub client: SettingsClientSource,
+}
+
+impl SettingsSaveRequest {
+    pub fn validate(&self) -> Result<()> {
+        validate_revision(&self.expected_revision)?;
+        if self.sections.is_empty() || self.sections.len() > 16 {
+            return Err(Error::new(
+                "invalid",
+                "settings save must replace one or more bounded sections",
+            ));
+        }
+        let encoded = serde_json::to_vec(&self.sections)
+            .map_err(|_| Error::new("invalid", "settings sections are not serializable"))?;
+        if encoded.len() > MAX_PROFILES_SOURCE_BYTES {
+            return Err(Error::new("invalid", "settings sections exceed 128 KiB"));
+        }
+        for value in self.sections.values() {
+            if !value.is_object() {
+                return Err(Error::new(
+                    "invalid",
+                    "each settings section must be an object",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_response(&self, reply: &SettingsSaveResponse) -> Result<()> {
+        validate_revision(&reply.revision)?;
+        if (self.dry_run && reply.saved)
+            || (reply.saved && (reply.revision.is_none() || reply.history_revision.is_none()))
+            || (!reply.saved && reply.history_revision.is_some())
+            || (reply.saved && reply.changed_sections.is_empty())
+            || reply
+                .changed_sections
+                .iter()
+                .any(|section| !self.sections.contains_key(section))
+        {
+            return Err(Error::new(
+                "invalid",
+                "settings save response is inconsistent",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Response for `settings.save`.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsSaveResponse {
+    pub saved: bool,
+    pub revision: Option<String>,
+    pub changed_sections: Vec<SettingsSection>,
+    pub restart_required: Vec<SettingsSection>,
+    pub history_revision: Option<i64>,
 }
 
 /// Request for `rule.list`: one page of a rule namespace.
@@ -332,6 +518,7 @@ mod tests {
     #[test]
     fn save_rejects_redaction_markers_and_bad_revisions() {
         let mut request = ProfilesSaveRequest {
+            client: SettingsClientSource::Cli,
             expected_revision: Some("ab".repeat(32)),
             source: "[profiles.a]\nharness = \"codex\"\n".to_owned(),
             dry_run: false,
@@ -364,6 +551,7 @@ mod tests {
     #[test]
     fn dry_run_never_reports_saved() {
         let request = ProfilesSaveRequest {
+            client: SettingsClientSource::Cli,
             expected_revision: None,
             source: String::new(),
             dry_run: true,

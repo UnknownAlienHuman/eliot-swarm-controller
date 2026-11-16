@@ -2909,8 +2909,24 @@ fn admit_rule_action_tx(
     let parent_cause = key.command_cause(&key.parent_id)?;
     let child_cause = key.command_cause(&key.child_id)?;
     request.id = key.child_id.clone();
+    // Ordinary admission may have inserted an Agent/cursor before a later
+    // transactional capacity gate refuses it. A rejected firing must retain
+    // none of those partial writes when its rejection is committed.
+    tx.execute_batch("SAVEPOINT rule_child_admission")
+        .map_err(sql_error)?;
     let mut child_admission =
-        admission::submit_tx(tx, key.principal, request, None, now, true, limits)?;
+        match admission::submit_tx(tx, key.principal, request, None, now, true, limits) {
+            Ok(admission) => {
+                tx.execute_batch("RELEASE rule_child_admission")
+                    .map_err(sql_error)?;
+                admission
+            }
+            Err(error) => {
+                tx.execute_batch("ROLLBACK TO rule_child_admission; RELEASE rule_child_admission")
+                    .map_err(sql_error)?;
+                return Err(error);
+            }
+        };
     if !child_admission.is_new {
         return Err(Error::new(
             "source_integrity",

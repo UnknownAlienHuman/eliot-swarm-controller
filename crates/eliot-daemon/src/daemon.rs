@@ -130,6 +130,10 @@ async fn run_owned(
         mail_config,
     );
 
+    let startup_cwd = std::env::current_dir().ok();
+    crate::bootstrap::ensure_hot_start(data_dir.path(), &store, &policy, startup_cwd.as_deref())
+        .await?;
+
     let recovered = {
         let mut store = store.lock().await;
         let events = store.recover_on_restart(now_ms())?;
@@ -1305,6 +1309,13 @@ fn caller_identity_for_target(target: &Path) -> Result<ClientIdentity> {
     )
 }
 
+/// Whether the effective inherited identity for `target` is the local Owner.
+/// Startup uses the same target scoping and malformed-identity checks as RPC
+/// calls before deciding whether it may issue the Owner-only readiness probe.
+pub(crate) fn client_is_owner(target: &Path) -> Result<bool> {
+    caller_identity_for_target(target).map(|identity| matches!(identity, ClientIdentity::Owner))
+}
+
 fn caller_identity_from(
     target: &Path,
     agent_values: [Option<std::ffi::OsString>; 3],
@@ -2270,7 +2281,6 @@ mod tests {
     #[test]
     fn daemon_failure_tail_reports_only_codes_and_ids() {
         let root = std::env::temp_dir().join(format!("eliot startup failure {}", Ulid::new()));
-        std::fs::create_dir_all(&root).expect("test root");
         struct Guard(std::path::PathBuf);
         impl Drop for Guard {
             fn drop(&mut self) {
@@ -2340,7 +2350,6 @@ mod tests {
     #[test]
     fn last_daemon_phase_names_the_newest_startup_marker() {
         let root = std::env::temp_dir().join(format!("eliot daemon phase {}", Ulid::new()));
-        std::fs::create_dir_all(&root).expect("test root");
         struct Guard(std::path::PathBuf);
         impl Drop for Guard {
             fn drop(&mut self) {

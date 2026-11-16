@@ -21,6 +21,7 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 pub(crate) mod profiles_edit;
+pub(crate) mod settings;
 
 const MAX_CONFIG_BYTES: usize = 128 * 1024;
 const MAX_PROFILE_NAME_LEN: usize = 128;
@@ -148,6 +149,70 @@ struct FileConfig {
     mail: MailConfig,
     #[serde(default)]
     cloud_mcp: Option<CloudMcpSettings>,
+    #[serde(default)]
+    routing: RoutingConfig,
+    #[serde(default)]
+    desktop: DesktopSettings,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub(crate) struct RoutingConfig {
+    #[serde(default)]
+    pub(crate) default: Vec<String>,
+    /// Additional extensible roles share the same ordered candidate syntax.
+    #[serde(flatten)]
+    pub(crate) roles: BTreeMap<String, Vec<String>>,
+}
+
+impl RoutingConfig {
+    pub(crate) fn candidates(&self, role: &str) -> Option<&[String]> {
+        if role == "default" {
+            Some(&self.default)
+        } else {
+            self.roles.get(role).map(Vec::as_slice)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DesktopTheme {
+    Light,
+    Dark,
+    #[default]
+    System,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DesktopWindow {
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DesktopSettings {
+    #[serde(default)]
+    theme: DesktopTheme,
+    #[serde(default)]
+    window: Option<DesktopWindow>,
+}
+
+impl DesktopSettings {
+    fn validate(&self) -> core::Result<()> {
+        if self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.width < 640 || window.height < 480)
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: desktop window must be at least 640 by 480",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -179,6 +244,20 @@ pub(crate) struct AutomationConfig {
     pub(crate) max_event_backlog: i64,
     #[serde(default)]
     pub(crate) run: RunGrantConfig,
+    #[serde(default)]
+    pub(crate) assignments: BTreeMap<String, AssignmentConfig>,
+}
+
+/// Settings-owned identity and bounds for a routing-aware backlog assignment.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AssignmentConfig {
+    pub(crate) folder: String,
+    pub(crate) workspace: String,
+    #[serde(default = "default_assignment_role")]
+    pub(crate) role: String,
+    pub(crate) max_busy: u32,
+    pub(crate) interval: String,
 }
 
 impl Default for AutomationConfig {
@@ -186,6 +265,7 @@ impl Default for AutomationConfig {
         Self {
             max_event_backlog: default_max_event_backlog(),
             run: RunGrantConfig::default(),
+            assignments: BTreeMap::new(),
         }
     }
 }
@@ -202,6 +282,31 @@ impl AutomationConfig {
                 "config.toml: automation.max_event_backlog must be a positive integer",
             ));
         }
+        for (key, assignment) in &self.assignments {
+            if key.is_empty()
+                || key.len() > MAX_PROFILE_NAME_LEN
+                || !key.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
+                || assignment.folder.trim().is_empty()
+                || !Path::new(&assignment.folder).is_absolute()
+                || !Path::new(&assignment.workspace).is_absolute()
+                || assignment.workspace.trim().is_empty()
+                || assignment.folder.chars().any(char::is_control)
+                || assignment.workspace.chars().any(char::is_control)
+                || assignment.max_busy == 0
+                || assignment.max_busy > 1000
+                || assignment.interval.trim() != assignment.interval
+                || assignment.interval.is_empty()
+                || crate::automation::parse_positive_duration_ms(&assignment.interval).is_err()
+            {
+                return Err(core::Error::new(
+                    "profile_error",
+                    "config.toml: automation assignment has invalid identity, paths, capacity or interval",
+                ));
+            }
+            validate_routing_role(&assignment.role)?;
+        }
         self.run = normalize_run_grant(
             &self.run.interpreters,
             &self.run.run_env,
@@ -216,6 +321,10 @@ impl AutomationConfig {
 
 fn default_max_event_backlog() -> i64 {
     100_000
+}
+
+fn default_assignment_role() -> String {
+    "worker".to_owned()
 }
 
 /// Store-size threshold for the unbounded-retention advisory: `daemon.status`
@@ -1000,7 +1109,59 @@ fn read_config(data_root: &Path) -> core::Result<Option<(FileConfig, String)>> {
 /// The one `config.toml` parser: strict (`deny_unknown_fields`) with
 /// located errors.
 fn parse_config(source: &str) -> core::Result<FileConfig> {
-    toml::from_str(source).map_err(|error| map_toml_error(source, error))
+    let config: FileConfig =
+        toml::from_str(source).map_err(|error| map_toml_error(source, error))?;
+    config.desktop.validate()?;
+    let mut role_candidates = Vec::with_capacity(config.routing.roles.len() + 1);
+    role_candidates.push(("default", &config.routing.default));
+    role_candidates.extend(
+        config
+            .routing
+            .roles
+            .iter()
+            .map(|(role, profiles)| (role.as_str(), profiles)),
+    );
+    for (role, profiles) in role_candidates {
+        validate_routing_role(role)?;
+        if profiles.len() > 64 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: routing roles allow at most 64 candidates",
+            ));
+        }
+        let mut seen = HashSet::new();
+        for profile in profiles {
+            validate_profile_name(profile)?;
+            if !seen.insert(profile) {
+                return Err(core::Error::new(
+                    "profile_error",
+                    "config.toml: routing role contains a duplicate candidate profile",
+                ));
+            }
+            if !config.profiles.contains_key(profile) {
+                return Err(core::Error::new(
+                    "profile_error",
+                    "config.toml: routing candidate names an unknown profile",
+                ));
+            }
+        }
+    }
+    Ok(config)
+}
+
+pub(crate) fn validate_routing_role(role: &str) -> core::Result<()> {
+    if role.is_empty()
+        || role.len() > MAX_PROFILE_NAME_LEN
+        || !role
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(core::Error::new(
+            "profile_error",
+            "config.toml: routing role names must be nonempty letters, digits, hyphen or underscore",
+        ));
+    }
+    Ok(())
 }
 
 /// Raw `config.toml` text within the size bound; `None` when absent.
@@ -1042,6 +1203,14 @@ pub(crate) fn load_automation_config(data_root: &Path) -> core::Result<Automatio
     config
         .automation
         .validate(&source, &route_credential_env_names)
+}
+
+pub(crate) fn routing_candidates(data_root: &Path, role: &str) -> core::Result<Vec<String>> {
+    validate_routing_role(role)?;
+    let Some((config, _)) = read_config(data_root)? else {
+        return Ok(Vec::new());
+    };
+    Ok(config.routing.candidates(role).unwrap_or_default().to_vec())
 }
 
 pub(crate) fn load_daemon_config(data_root: &Path) -> core::Result<DaemonConfig> {
@@ -1149,22 +1318,10 @@ fn snapshot_from_entry(
     if harness == "antigravity" {
         return antigravity_snapshot_from_entry(name, entry, table_offset, source);
     }
-    let model = entry
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .ok_or_else(|| {
-            profile_field_error(
-                source,
-                table_offset,
-                name,
-                "model",
-                "required non-empty model is missing",
-                "profile_error",
-            )
-        })?;
-    validate_model(name, model, source, table_offset)?;
+    let model = entry.model.as_deref();
+    if let Some(model) = model {
+        validate_model(name, model, source, table_offset)?;
+    }
     let effort = entry.effort.as_deref().map(str::trim);
     if effort.is_some_and(|value| {
         value.is_empty() || value.len() > MAX_EFFORT_LEN || value.chars().any(char::is_control)
@@ -1275,7 +1432,9 @@ fn snapshot_from_entry(
     if let Some(cmd) = cmd {
         snapshot.insert("cmd".to_owned(), Value::String(cmd));
     }
-    snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    if let Some(model) = model {
+        snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
     if let Some(effort) = effort {
         snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
     }
@@ -1429,22 +1588,10 @@ fn muse_snapshot_from_entry(
     table_offset: usize,
     source: &str,
 ) -> core::Result<Value> {
-    let model = entry
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .ok_or_else(|| {
-            profile_field_error(
-                source,
-                table_offset,
-                name,
-                "model",
-                "required non-empty model is missing",
-                "profile_error",
-            )
-        })?;
-    validate_model(name, model, source, table_offset)?;
+    let model = entry.model.as_deref();
+    if let Some(model) = model {
+        validate_model(name, model, source, table_offset)?;
+    }
     let effort = entry.effort.as_deref().map(str::trim);
     if effort.is_some_and(|value| {
         value.is_empty() || value.len() > MAX_EFFORT_LEN || value.chars().any(char::is_control)
@@ -1537,7 +1684,9 @@ fn muse_snapshot_from_entry(
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("muse".to_owned()));
-    snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    if let Some(model) = model {
+        snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
     if let Some(effort) = effort {
         snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
     }
@@ -1588,22 +1737,10 @@ fn claude_snapshot_from_entry(
     table_offset: usize,
     source: &str,
 ) -> core::Result<Value> {
-    let model = entry
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .ok_or_else(|| {
-            profile_field_error(
-                source,
-                table_offset,
-                name,
-                "model",
-                "required non-empty model is missing",
-                "profile_error",
-            )
-        })?;
-    validate_model(name, model, source, table_offset)?;
+    let model = entry.model.as_deref();
+    if let Some(model) = model {
+        validate_model(name, model, source, table_offset)?;
+    }
     // Claude Code 2.1.278 `--effort <level>`: the CLI's closed vocabulary.
     // Absent effort keeps the CLI default; no value is fabricated.
     let effort = match entry.effort.as_deref().map(str::trim) {
@@ -1748,7 +1885,9 @@ fn claude_snapshot_from_entry(
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("claude".to_owned()));
     snapshot.insert("cmd".to_owned(), Value::String(cmd));
-    snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    if let Some(model) = model {
+        snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
     snapshot.insert(
         "permissions".to_owned(),
         Value::String(PERMISSION_WORKSPACE_WRITE.to_owned()),
@@ -2083,22 +2222,11 @@ fn opencode_snapshot_from_entry(
     table_offset: usize,
     source: &str,
 ) -> core::Result<Value> {
-    let model = entry
-        .model
-        .as_deref()
-        .filter(|model| !model.is_empty())
-        .ok_or_else(|| {
-            profile_field_error(
-                source,
-                table_offset,
-                name,
-                "model",
-                "required non-empty model is missing",
-                "profile_error",
-            )
-        })?;
-    validate_model(name, model, source, table_offset)?;
-    if split_provider_model(model).is_none() {
+    let model = entry.model.as_deref();
+    if let Some(model) = model {
+        validate_model(name, model, source, table_offset)?;
+    }
+    if model.is_some_and(|model| split_provider_model(model).is_none()) {
         return Err(profile_field_error(
             source,
             table_offset,
@@ -2163,8 +2291,20 @@ fn opencode_snapshot_from_entry(
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("opencode".to_owned()));
-    snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    if let Some(model) = model {
+        snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
     if has_local_backend_fields(entry) {
+        if model.is_none() {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                "model",
+                "required non-empty model is missing for adopted local backends",
+                "profile_error",
+            ));
+        }
         freeze_local_backend(&mut snapshot, name, entry, &tail, table_offset, source)?;
     } else if let Some(selector) = entry.auth_integration.as_deref() {
         snapshot.insert(
@@ -2205,22 +2345,10 @@ fn antigravity_snapshot_from_entry(
     table_offset: usize,
     source: &str,
 ) -> core::Result<Value> {
-    let model = entry
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .ok_or_else(|| {
-            profile_field_error(
-                source,
-                table_offset,
-                name,
-                "model",
-                "required non-empty model is missing",
-                "profile_error",
-            )
-        })?;
-    validate_model(name, model, source, table_offset)?;
+    let model = entry.model.as_deref();
+    if let Some(model) = model {
+        validate_model(name, model, source, table_offset)?;
+    }
     if entry
         .effort
         .as_deref()
@@ -2285,7 +2413,9 @@ fn antigravity_snapshot_from_entry(
         "harness".to_owned(),
         Value::String("antigravity".to_owned()),
     );
-    snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    if let Some(model) = model {
+        snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
     if let Some(mode) = mode {
         snapshot.insert("mode".to_owned(), Value::String(mode.to_owned()));
     }
@@ -2522,13 +2652,16 @@ fn validate_profile_name(name: &str) -> core::Result<()> {
     Ok(())
 }
 fn validate_model(profile: &str, model: &str, source: &str, offset: usize) -> core::Result<()> {
-    if model.len() > MAX_MODEL_LEN || model.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if model.is_empty()
+        || model.len() > MAX_MODEL_LEN
+        || model.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
         return Err(profile_field_error(
             source,
             offset,
             profile,
             "model",
-            "must be a single token of at most 256 characters",
+            "must be a nonempty single token of at most 256 characters",
             "profile_error",
         ));
     }
@@ -3036,6 +3169,7 @@ mod tests {
             AutomationConfig {
                 max_event_backlog: 4096,
                 run: RunGrantConfig::default(),
+                assignments: BTreeMap::new(),
             }
         );
         assert_eq!(
@@ -3050,6 +3184,56 @@ mod tests {
                 run_env: Vec::new(),
             }]
         );
+    }
+
+    #[test]
+    fn routing_accepts_ordered_extensible_roles_and_rejects_bad_candidates() {
+        let source = "[profiles.codex-luna]\nharness='codex'\nmodel='gpt-6-luna'\n\
+            [routing]\ndefault=['codex-luna']\nworker=['codex-luna']\n";
+        let config = parse_config(source).unwrap();
+        assert_eq!(
+            config.routing.candidates("default").unwrap(),
+            ["codex-luna"]
+        );
+        assert_eq!(config.routing.candidates("worker").unwrap(), ["codex-luna"]);
+        assert!(config.routing.candidates("missing").is_none());
+
+        for routing in [
+            "default=['codex-luna','codex-luna']",
+            "worker=['missing']",
+            "\"\"=['codex-luna']",
+            "bad.role=['codex-luna']",
+        ] {
+            let source = format!(
+                "[profiles.codex-luna]\nharness='codex'\nmodel='gpt-6-luna'\n\
+                 [routing]\n{routing}\n"
+            );
+            assert!(parse_config(&source).is_err(), "accepted {routing}");
+        }
+    }
+
+    #[test]
+    fn automation_assignments_validate_and_load_from_settings_shape() {
+        let fixture = AutomationConfigFixture::new();
+        fixture.write(
+            "[automation.assignments.review-queue]\n\
+             folder='C:/work/briefs'\nworkspace='C:/work/eliot'\n\
+             role='worker'\nmax_busy=2\ninterval='30s'\n",
+        );
+        let config = load_automation_config(&fixture.root).unwrap();
+        let assignment = config.assignments.get("review-queue").unwrap();
+        assert_eq!(assignment.folder, "C:/work/briefs");
+        assert_eq!(assignment.workspace, "C:/work/eliot");
+        assert_eq!(assignment.role, "worker");
+        assert_eq!(assignment.max_busy, 2);
+        assert_eq!(assignment.interval, "30s");
+
+        fixture.write(
+            "[automation.assignments.review-queue]\n\
+             folder='C:/work/briefs'\nworkspace='C:/work/eliot'\n\
+             role='worker'\nmax_busy=0\ninterval='30s'\n",
+        );
+        assert!(load_automation_config(&fixture.root).is_err());
     }
 
     #[test]
@@ -3936,6 +4120,19 @@ base_url_for.codex = "http://127.0.0.1:10300/v1"
         let direct = resolve_text_profile(direct, "direct").unwrap();
         assert!(direct.get("effort").is_none());
         assert!(direct.get("route_binding").is_none());
+    }
+
+    #[test]
+    fn native_default_model_requires_absence_not_an_explicit_blank() {
+        let omitted = resolve_text_profile("[profiles.native]\nharness = 'codex'\n", "native")
+            .expect("omitted model keeps native default");
+        assert!(omitted.get("model").is_none());
+        for model in ["", "   "] {
+            let source = format!("[profiles.native]\nharness = 'codex'\nmodel = {model:?}\n");
+            let error = resolve_text_profile(&source, "native")
+                .expect_err("an explicitly blank model must not become native default");
+            assert_eq!(error.code, "profile_error", "{model:?}");
+        }
     }
 
     #[test]

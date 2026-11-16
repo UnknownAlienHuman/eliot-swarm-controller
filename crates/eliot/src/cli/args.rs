@@ -48,6 +48,8 @@ pub(crate) struct Cli {
 // function instead of accumulating every argument builder in this enum's frame.
 #[derive(Subcommand)]
 pub(crate) enum CliCommand {
+    /// Read or save unified daemon settings with revision checking.
+    Settings(SettingsArgs),
     /// Start the local daemon, or stop it with a drain/force request.
     Daemon(DaemonArgs),
     /// Read daemon state without starting a daemon.
@@ -162,6 +164,26 @@ pub(crate) enum CliCommand {
 }
 
 #[derive(Args)]
+pub(crate) struct SettingsArgs {
+    #[command(subcommand)]
+    pub(crate) command: SettingsCommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SettingsCommand {
+    /// Read settings sections and bounded author history.
+    Read,
+    /// Save a JSON settings.save request read from FILE (128 KiB maximum).
+    Save {
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        /// Validate without writing settings or history.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Args)]
 pub(crate) struct McpArgs {
     /// Serve StreamableHTTP on 127.0.0.1 instead of stdio.
     #[arg(long)]
@@ -266,11 +288,15 @@ pub(crate) struct AttachArgs {
 
 #[derive(Args)]
 pub(crate) struct LaunchArgs {
-    /// Named profile. Required for a parentless launch unless --harness is
-    /// given for an Owner ad-hoc launch. An Agent child reuses its parent's
+    /// Named profile. Omit profile/harness to use the configured default.
+    /// Use --harness for an Owner ad-hoc launch. An Agent child reuses its parent's
     /// frozen profile; the Owner may supply one.
     #[arg(long, value_name = "PROFILE", conflicts_with = "harness")]
     pub(crate) profile: Option<String>,
+    /// Select an ordered routing policy when --profile is omitted. Omitted
+    /// role is the default role; the CLI preserves omission for replay identity.
+    #[arg(long, value_name = "ROLE", conflicts_with_all = ["profile", "harness"])]
+    pub(crate) role: Option<String>,
     /// Ad-hoc Owner launch harness (codex|claude|muse|opencode|antigravity).
     /// The daemon freezes a profile-equivalent snapshot from built-in
     /// per-harness defaults plus --model/--effort/--auth. Owner-only.
@@ -1196,6 +1222,61 @@ mod tests {
     };
     use crate::cli::agents::approval_reply_args;
     use clap::Parser;
+    #[test]
+    fn hot_start_launch_omits_profile_and_harness() {
+        let cli =
+            Cli::try_parse_from(["swarm", "launch", "--workspace", ".", "Read README.md"]).unwrap();
+        let Some(CliCommand::Launch(args)) = cli.command else {
+            panic!("launch required")
+        };
+        assert!(args.profile.is_none());
+        assert!(args.role.is_none());
+        assert!(args.harness.is_none());
+    }
+
+    #[test]
+    fn launch_accepts_role_and_keeps_explicit_profile_conflict() {
+        let cli = Cli::try_parse_from([
+            "swarm",
+            "launch",
+            "--role",
+            "worker",
+            "--workspace",
+            ".",
+            "Review the brief",
+        ])
+        .unwrap();
+        let Some(CliCommand::Launch(args)) = cli.command else {
+            panic!("launch required");
+        };
+        assert_eq!(args.role.as_deref(), Some("worker"));
+        assert!(
+            Cli::try_parse_from([
+                "swarm",
+                "launch",
+                "--role",
+                "worker",
+                "--profile",
+                "codex",
+                "--workspace",
+                ".",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn settings_save_has_explicit_dry_run() {
+        let cli = Cli::try_parse_from(["swarm", "settings", "save", "request.json", "--dry-run"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Settings(super::SettingsArgs {
+                command: super::SettingsCommand::Save { dry_run: true, .. }
+            }))
+        ));
+    }
+
     #[test]
     fn usage_cli_selects_one_scope() {
         let cli = Cli::try_parse_from(["swarm", "usage", "--project", "p1"]).unwrap();

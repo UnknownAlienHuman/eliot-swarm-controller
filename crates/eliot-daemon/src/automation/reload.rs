@@ -41,7 +41,42 @@ impl RuleSnapshot {
 }
 
 pub(crate) fn load(data_root: &Path) -> Result<RuleSnapshot> {
-    load_rule_directory(&data_root.join("rules"))
+    let mut snapshot = load_rule_directory(&data_root.join("rules"))?;
+    let config = crate::config::load_automation_config(data_root)?;
+    if !config.assignments.is_empty() {
+        let mut definitions = snapshot.definitions;
+        for (key, assignment) in config.assignments {
+            let id = format!("assignment-{key}");
+            let toml = format!(
+                "[[rule]]\nid = {}\non = {{ every = {} }}\ndo = [{{ action = 'launch', workspace = {}, role = {}, assignment = {{ key = {}, folder = {}, max_busy = {} }} }}]\n",
+                quote_toml(&id),
+                quote_toml(&assignment.interval),
+                quote_toml(&assignment.workspace),
+                quote_toml(&assignment.role),
+                quote_toml(&key),
+                quote_toml(&assignment.folder),
+                assignment.max_busy,
+            );
+            definitions.extend(definition::load(toml.as_bytes())?);
+            // Assigned Agents own one brief. Use the existing event-rule stop
+            // action to retire the exact generation after its terminal turn,
+            // freeing configured live capacity for the next timer launch.
+            // The rule processor additionally verifies Store launch ancestry;
+            // this cause label alone is not enough to authorize cleanup.
+            let completion = format!(
+                "[[rule]]\nid = {}\non = {{ event = 'turn.completed', match = {{ 'event.cause.rule' = {} }} }}\ndo = [{{ action = 'stop', target = '${{event.agent}}', expected_generation = '${{event.generation}}' }}]\n",
+                quote_toml(&format!("{id}.complete")),
+                quote_toml(&id),
+            );
+            definitions.extend(definition::load(completion.as_bytes())?);
+        }
+        snapshot = from_definitions(definitions)?;
+    }
+    Ok(snapshot)
+}
+
+fn quote_toml(value: &str) -> String {
+    toml::Value::String(value.to_owned()).to_string()
 }
 
 /// Load the shared rule-file grammar from the registered checkout's rules path.
@@ -124,6 +159,16 @@ fn load_rule_directory(directory: &Path) -> Result<RuleSnapshot> {
 }
 
 pub(crate) fn from_definitions(definitions: Vec<RuleDefinition>) -> Result<RuleSnapshot> {
+    let mut ids = HashSet::new();
+    if definitions
+        .iter()
+        .any(|definition| !ids.insert(&definition.id))
+    {
+        return Err(Error::new(
+            "invalid",
+            "file rules and settings assignments contain duplicate IDs",
+        ));
+    }
     let mut inputs = Vec::with_capacity(definitions.len());
     for definition in &definitions {
         let canonical_value = serde_json::to_value(definition)
@@ -243,5 +288,33 @@ impl RuleWatcher {
 
     pub(crate) async fn changed(&mut self) -> std::result::Result<(), watch::error::RecvError> {
         self.changed.changed().await
+    }
+}
+
+#[cfg(test)]
+mod assignment_tests {
+    use super::*;
+
+    #[test]
+    fn settings_assignment_generates_timer_and_ancestry_gated_cleanup() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-assignment-rules-{}", ulid::Ulid::new()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("config.toml"), format!(
+            "[automation.assignments.pool]\nfolder={}\nworkspace={}\nmax_busy=2\ninterval='2s'\n",
+            quote_toml(&root.to_string_lossy()), quote_toml(&root.to_string_lossy()),
+        )).unwrap();
+        let snapshot = load(&root).unwrap();
+        assert_eq!(snapshot.inputs.len(), 2);
+        let cleanup = snapshot
+            .inputs
+            .iter()
+            .find(|rule| rule.id == "assignment-pool.complete")
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&cleanup.canonical_definition).unwrap();
+        assert_eq!(value["on"]["match"]["event.cause.rule"], "assignment-pool");
+        assert_eq!(value["do"][0]["action"], "stop");
+        assert_eq!(value["do"][0]["expected_generation"], "${event.generation}");
+        fs::remove_dir_all(root).unwrap();
     }
 }

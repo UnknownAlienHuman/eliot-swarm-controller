@@ -2,13 +2,16 @@
 
 //! Durable L1 state for Agents, commands, native events, turns, and source acks.
 
+mod assignment;
 mod canonical;
 mod capacity;
 mod projects;
 mod provider_holds;
 mod rules;
 mod scripts;
+mod settings;
 
+pub use assignment::AssignmentStatus;
 pub use attribution::WhoWorkerRow;
 pub use capacity::{RecordedProcess, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, history_expired};
@@ -96,7 +99,7 @@ const NONTERMINAL_AGENTS_WHERE: &str =
 const LIST_NONTERMINAL_AGENTS_COLUMNS: &str = "SELECT id, generation, name, project, harness, profile,
                         profile_snapshot, native_scope, native_ref, workspace, effective,
                         pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                        parent, root, depth, control, profile_inherited
+                        parent, root, depth, control, profile_inherited, profile_choice
                  FROM agents";
 const RECOVER_ACCEPTED_COMMAND_FILTER: &str =
     "state IN ('accepted', 'queued', 'dispatched', 'unknown') AND (
@@ -776,7 +779,7 @@ impl Store {
                 "SELECT id, generation, name, project, harness, profile,
                         profile_snapshot, native_scope, native_ref, workspace, effective,
                         pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                        parent, root, depth, control, profile_inherited
+                        parent, root, depth, control, profile_inherited, profile_choice
                  FROM agents WHERE id > ?1 ORDER BY id LIMIT ?2",
             )
             .map_err(sql_error)?;
@@ -980,7 +983,7 @@ impl Store {
                 "SELECT id, generation, name, project, harness, profile,
                         profile_snapshot, native_scope, native_ref, workspace, effective,
                         pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                        parent, root, depth, control, profile_inherited
+                        parent, root, depth, control, profile_inherited, profile_choice
                  FROM agents
                  WHERE id > ?1 AND observe_only = 0 AND (state IN ('busy', 'waiting')
                    OR EXISTS(SELECT 1 FROM native_child_registrations r
@@ -2986,6 +2989,7 @@ struct AgentRecord {
     depth: i64,
     control: String,
     profile_inherited: bool,
+    profile_choice: Option<String>,
 }
 
 struct CommandRecord {
@@ -3336,7 +3340,7 @@ fn agent_list_select(
         "agents.id, agents.generation, agents.name, agents.project, agents.harness, agents.profile,
                 agents.profile_snapshot, agents.native_scope, agents.native_ref, agents.workspace, agents.effective,
                 agents.pending, agents.state, agents.active_turn, agents.created_at, agents.updated_at, agents.origin, agents.observe_only, (agents.token IS NOT NULL AND agents.observe_only = 0),
-                agents.parent, agents.root, agents.depth, agents.control, agents.profile_inherited"
+                agents.parent, agents.root, agents.depth, agents.control, agents.profile_inherited, agents.profile_choice"
             .to_owned()
     };
     let mut predicates = Vec::new();
@@ -3465,6 +3469,7 @@ fn agent_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecor
         depth: row.get(21)?,
         control: row.get(22)?,
         profile_inherited: row.get(23)?,
+        profile_choice: row.get(24)?,
     })
 }
 
@@ -3497,6 +3502,14 @@ fn agent_from_record(connection: &Connection, record: AgentRecord) -> Result<Age
         profile: record.profile,
         profile_snapshot: decode_json(&record.profile_snapshot)?,
         profile_inherited: record.profile_inherited,
+        profile_choice: record
+            .profile_choice
+            .as_deref()
+            .map(decode_json)
+            .transpose()?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| Error::new("source_integrity", "stored routing decision is malformed"))?,
         native_scope: record.native_scope,
         native_ref: record.native_ref,
         workspace: record.workspace,
@@ -3537,7 +3550,7 @@ fn load_agent_by_num(connection: &Connection, id: i64) -> Result<Option<Agent>> 
             "SELECT id, generation, name, project, harness, profile,
                     profile_snapshot, native_scope, native_ref, workspace, effective,
                     pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                    parent, root, depth, control, profile_inherited
+                    parent, root, depth, control, profile_inherited, profile_choice
              FROM agents WHERE id = ?1",
             [id],
             agent_record_from_row,

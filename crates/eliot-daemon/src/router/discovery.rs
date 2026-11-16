@@ -159,6 +159,15 @@ const METHODS: &[Method] = &[
         {}
     ),
     method!(
+        "project.discover",
+        ProjectDiscoverRequest,
+        ProjectDiscoverResponse,
+        true,
+        true,
+        "Register an Owner-opened Git checkout with the current profile allowlist through the internal project-discovery settings author; non-Git paths are a no-op.",
+        {"workspace":"C:/work/repo"}
+    ),
+    method!(
         "profile.list",
         ProfileListRequest,
         ProfileListResponse,
@@ -180,6 +189,24 @@ const METHODS: &[Method] = &[
 harness = \"codex\"
 model = \"gpt-6-luna\"
 ","dry_run":true}),
+    method!(
+        "settings.read",
+        SettingsReadRequest,
+        SettingsReadResponse,
+        true,
+        false,
+        "Read typed settings sections, revision, restart classification and bounded metadata history.",
+        {}
+    ),
+    method!(
+        "settings.save",
+        SettingsSaveRequest,
+        SettingsSaveResponse,
+        true,
+        true,
+        "Validate (dry_run) or save complete typed settings sections with revision CAS and bounded author history.",
+        {"expected_revision":null,"sections":{"routing":{"default":["codex"]}},"dry_run":true,"client":"cli"}
+    ),
     method!(
         "script.list",
         ScriptListRequest,
